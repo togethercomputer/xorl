@@ -2,6 +2,8 @@ import importlib
 
 import torch
 
+from xorl.ops.linear_attention.modules.bi_contract import gdn_contract
+
 
 class _FakeKernel:
     def __init__(self):
@@ -25,8 +27,8 @@ def test_bi_contract_pins_serving_kkt_reduction_geometry(monkeypatch):
     g = torch.empty(1, 64, 32)
     beta = torch.empty(1, 64, 32)
 
-    monkeypatch.setenv("XORL_BI_GDN", "1")
-    module.chunk_scaled_dot_kkt_fwd(k=k, g=g, beta=beta)
+    with gdn_contract(True):
+        module.chunk_scaled_dot_kkt_fwd(k=k, g=g, beta=beta)
     assert not autotuned_kernel.calls
     _, kwargs = contract_kernel.calls.pop()
     assert kwargs["BK"] == 64
@@ -36,8 +38,8 @@ def test_bi_contract_pins_serving_kkt_reduction_geometry(monkeypatch):
     assert kwargs["USE_G"] is True
     assert kwargs["SAFE_EXP"] is True
 
-    monkeypatch.delenv("XORL_BI_GDN")
-    module.chunk_scaled_dot_kkt_fwd(k=k, g=g, beta=beta)
+    with gdn_contract(False):
+        module.chunk_scaled_dot_kkt_fwd(k=k, g=g, beta=beta)
     assert not contract_kernel.calls
     _, kwargs = autotuned_kernel.calls.pop()
     assert "BK" not in kwargs

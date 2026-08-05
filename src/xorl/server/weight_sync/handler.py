@@ -2214,12 +2214,12 @@ class WeightSyncHandler:
                 if isinstance(mod, MoEExpertsLoRA):
                     if proj_name in mod.lora_config.target_modules:
                         t_convert = time.perf_counter()
-                        if lora_merged_forward_enabled():
+                        if lora_merged_forward_enabled(mod):
                             # Canonical fold: ship exactly the bytes the merged
                             # forward trains with (fp32 accumulate, cast once).
                             if isinstance(param.data, DTensor):
                                 raise NotImplementedError(
-                                    "XORL_LORA_MERGED_FORWARD=1 weight sync requires plain (non-DTensor) "
+                                "Canonical merged-LoRA weight sync requires plain (non-DTensor) "
                                     "expert params (ep_fsdp_size must be 1)"
                                 )
                             local = mod.canonical_merged_proj_weight(proj_name).to(torch.bfloat16)
@@ -4206,7 +4206,7 @@ class WeightSyncHandler:
             fused_delta_spec = fused_gdn_base_deltas.get(parent_name)
             if fused_delta_spec is not None and param_leaf == "weight":
                 delta_module, start, end = fused_delta_spec
-                if lora_merged_forward_enabled():
+                if lora_merged_forward_enabled(delta_module):
                     # Ship the exact canonical bytes used by the fused-GDN
                     # merged forward: fp32 accumulate and one final cast.
                     merged = delta_module._merged_weight(
@@ -4231,7 +4231,7 @@ class WeightSyncHandler:
             if parent_name in lora_modules:
                 lora_mod = lora_modules[parent_name]
                 if isinstance(lora_mod, LoraLinear):
-                    if lora_merged_forward_enabled():
+                    if lora_merged_forward_enabled(lora_mod):
                         # Canonical fold: ship exactly the bytes the merged
                         # forward trains with (fp32 accumulate, cast once).
                         merged = lora_mod._merged_weight().to(dtype=torch.bfloat16)
@@ -4249,7 +4249,7 @@ class WeightSyncHandler:
                             # corrupt them. No non-gated MoE LoRA module exists
                             # today — fail loud if one appears.
                             raise NotImplementedError("Weight sync does not support non-gated MoE LoRA experts")
-                        if lora_merged_forward_enabled():
+                        if lora_merged_forward_enabled(lora_mod):
                             merged = lora_mod._merged_weights()[0].to(dtype=torch.bfloat16).clone()
                             buffer.append((full_name, merged))
                             continue
@@ -4264,7 +4264,7 @@ class WeightSyncHandler:
                         buffer.append((full_name, merged))
                         continue
                     if param_leaf == "down_proj":
-                        if lora_merged_forward_enabled():
+                        if lora_merged_forward_enabled(lora_mod):
                             merged = lora_mod._merged_weights()[1].to(dtype=torch.bfloat16)
                         elif "down_proj" in lora_mod.lora_config.target_modules:
                             delta = lora_mod._compute_proj_delta("down_proj")

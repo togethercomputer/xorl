@@ -2,8 +2,8 @@
 
 Ports the FlashQLA certification gates 2 (M/batch-invariance) and 4
 (chunk-chaining exactness through the fp32 pool-layout handoff) as regression
-tests: with ``auto_cp`` pinned OFF — the armed ``XORL_BI_GDN`` contract lane's
-default — the FlashQLA forward must be bitwise batch/M-invariant and bitwise
+tests: with ``auto_cp`` pinned OFF by the exact Qwen3.5 model program, the
+FlashQLA forward must be bitwise batch/M-invariant and bitwise
 chain-exact. The default (heuristic) mode is intentionally not asserted
 bitwise: its intra-card CP warmup h0-drop approximation is bitwise-breaking by
 design, which is exactly why the contract lane pins it off.
@@ -17,6 +17,7 @@ import pytest
 import torch
 
 from xorl.ops.linear_attention.backend import FLASHQLA_AUTOCP_ENV, resolve_flashqla_auto_cp
+from xorl.ops.linear_attention.modules.bi_contract import gdn_contract
 
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -47,7 +48,8 @@ def _flashqla_chunk_or_skip():
 @pytest.fixture
 def armed_contract_lane(monkeypatch):
     monkeypatch.delenv(FLASHQLA_AUTOCP_ENV, raising=False)
-    monkeypatch.setenv("XORL_BI_GDN", "1")
+    with gdn_contract(True):
+        yield
 
 
 def _make_inputs(T, *, seed, batch=1, device="cuda"):
@@ -97,17 +99,17 @@ def _assert_bitwise(got, exp, label):
 @pytest.mark.cpu
 def test_resolve_auto_cp_precedence(monkeypatch):
     monkeypatch.delenv(FLASHQLA_AUTOCP_ENV, raising=False)
-    monkeypatch.delenv("XORL_BI_GDN", raising=False)
-    assert resolve_flashqla_auto_cp(None) is True  # non-contract default: heuristic stays on
-    monkeypatch.setenv("XORL_BI_GDN", "1")
-    assert resolve_flashqla_auto_cp(None) is False  # armed contract lane pins it off
-    assert resolve_flashqla_auto_cp(True) is True  # explicit arg wins over the lane
-    monkeypatch.setenv(FLASHQLA_AUTOCP_ENV, "1")
-    assert resolve_flashqla_auto_cp(None) is True  # env overrides the lane default
-    monkeypatch.delenv("XORL_BI_GDN")
+    with gdn_contract(False):
+        assert resolve_flashqla_auto_cp(None) is True  # non-contract default: heuristic stays on
+    with gdn_contract(True):
+        assert resolve_flashqla_auto_cp(None) is False
+        assert resolve_flashqla_auto_cp(True) is False
+        monkeypatch.setenv(FLASHQLA_AUTOCP_ENV, "1")
+        assert resolve_flashqla_auto_cp(None) is False
     monkeypatch.setenv(FLASHQLA_AUTOCP_ENV, "0")
-    assert resolve_flashqla_auto_cp(None) is False
-    assert resolve_flashqla_auto_cp(False) is False
+    with gdn_contract(False):
+        assert resolve_flashqla_auto_cp(None) is False
+        assert resolve_flashqla_auto_cp(False) is False
 
 
 @requires_cuda
@@ -129,20 +131,21 @@ def test_contract_lane_pins_autocp_off(monkeypatch):
     q, k, v, g, beta = _make_inputs(4096, seed=0)
 
     monkeypatch.delenv(FLASHQLA_AUTOCP_ENV, raising=False)
-    monkeypatch.setenv("XORL_BI_GDN", "1")
-    _run(fn, q, k, v, g, beta)
+    with gdn_contract(True):
+        _run(fn, q, k, v, g, beta)
     assert not calls, "armed contract lane must pin auto_cp off"
 
-    fn(q=q, k=k, v=v, g=g, beta=beta, scale=SCALE, use_qk_l2norm_in_kernel=True, auto_cp=True)
-    assert len(calls) == 1, "explicit auto_cp=True must override the lane pin"
+    with gdn_contract(True):
+        fn(q=q, k=k, v=v, g=g, beta=beta, scale=SCALE, use_qk_l2norm_in_kernel=True, auto_cp=True)
+    assert not calls, "exact model program must ignore an explicit auto_cp override"
 
-    monkeypatch.delenv("XORL_BI_GDN")
-    _run(fn, q, k, v, g, beta)
-    assert len(calls) == 2, "default (non-contract) mode must keep the heuristic on"
+    with gdn_contract(False):
+        _run(fn, q, k, v, g, beta)
+    assert len(calls) == 1, "default (non-contract) mode must keep the heuristic on"
 
     monkeypatch.setenv(FLASHQLA_AUTOCP_ENV, "0")
     _run(fn, q, k, v, g, beta)
-    assert len(calls) == 2, "XORL_GDN_FLASHQLA_AUTOCP=0 must pin the heuristic off"
+    assert len(calls) == 1, "XORL_GDN_FLASHQLA_AUTOCP=0 must pin the heuristic off"
 
 
 @requires_cuda

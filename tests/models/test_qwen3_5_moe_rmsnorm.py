@@ -1,5 +1,3 @@
-import os
-
 import pytest
 import torch
 
@@ -14,7 +12,6 @@ from xorl.models.transformers.qwen3_5_moe.modeling_qwen3_5_moe import (
 from xorl.ops.batch_invariant_ops import (
     rms_norm_batch_invariant,
     set_batch_invariant_mode,
-    set_trunk_linear_contract,
 )
 
 
@@ -23,56 +20,28 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requir
 HIDDEN = 2048
 N_TOKENS = 512
 EPS = 1e-6
-QWEN35_MOE_GDN_DEFAULTS = {
-    "XORL_GDN_CONV_CONTRACT": "1",
-    "XORL_BI_TRUNK_LINEAR": "1",
-    "XORL_BI_RESIDUAL_NORM": "1",
-    "XORL_FAMILIES_V2": "0",
-    "XORL_FLA_L2NORM_AUTOTUNE": "0",
-    "XORL_MOE_BI_ROUTER": "1",
-}
-
-
 @pytest.mark.cpu
-def test_qwen35_moe_gdn_contract_defaults_ep8(monkeypatch):
-    class _FakePS:
-        ep_enabled = True
-        ep_size = 8
+def test_qwen35_exact_norm_selection_is_structural(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        modeling_qwen3_5_moe,
+        "fast_zero_centered_batch_invariant_residual_rms_norm",
+        lambda hidden, _weight, _eps: calls.append("exact") or hidden + 1,
+    )
+    monkeypatch.setattr(
+        modeling_qwen3_5_moe,
+        "native_zero_centered_rms_norm_without_batch_invariant",
+        lambda hidden, _weight, _eps: calls.append("legacy") or hidden + 2,
+    )
 
-    monkeypatch.setenv("XORL_BI_GDN", "1")
-    for name in QWEN35_MOE_GDN_DEFAULTS:
-        # Track an absent value so defaults installed directly through
-        # os.environ are removed when this test's monkeypatch unwinds.
-        monkeypatch.setenv(name, "")
-        monkeypatch.delenv(name, raising=False)
-    monkeypatch.setenv("XORL_MOE_SGLANG_EP_COMBINE", "")
-    monkeypatch.delenv("XORL_MOE_SGLANG_EP_COMBINE", raising=False)
-    monkeypatch.setattr(modeling_qwen3_5_moe, "get_parallel_state", lambda: _FakePS())
-
-    modeling_qwen3_5_moe._default_qwen35_moe_gdn_contract()
-
-    for name, value in QWEN35_MOE_GDN_DEFAULTS.items():
-        assert os.environ[name] == value
-    assert os.environ["XORL_MOE_SGLANG_EP_COMBINE"] == "native"
-
-
-@pytest.mark.cpu
-def test_qwen35_moe_gdn_contract_preserves_overrides_and_unproven_ep(monkeypatch):
-    class _FakePS:
-        ep_enabled = True
-        ep_size = 4
-
-    monkeypatch.setenv("XORL_BI_GDN", "1")
-    for name in QWEN35_MOE_GDN_DEFAULTS:
-        monkeypatch.setenv(name, "off")
-    monkeypatch.setenv("XORL_MOE_SGLANG_EP_COMBINE", "off")
-    monkeypatch.setattr(modeling_qwen3_5_moe, "get_parallel_state", lambda: _FakePS())
-
-    modeling_qwen3_5_moe._default_qwen35_moe_gdn_contract()
-
-    for name in QWEN35_MOE_GDN_DEFAULTS:
-        assert os.environ[name] == "off"
-    assert os.environ["XORL_MOE_SGLANG_EP_COMBINE"] == "off"
+    set_rmsnorm_mode("sglang")
+    try:
+        norm = Qwen3_5MoeRMSNorm(4, exact_contract=True)
+        x = torch.ones(2, 4)
+        assert torch.equal(norm(x, force_sglang_residual=True), x + 1)
+        assert calls == ["exact"]
+    finally:
+        set_rmsnorm_mode("native")
 
 
 def test_qwen3_5_moe_sglang_rmsnorm_keeps_no_residual_native(monkeypatch):
@@ -100,7 +69,7 @@ def test_qwen3_5_moe_sglang_rmsnorm_keeps_no_residual_native(monkeypatch):
 
     set_rmsnorm_mode("sglang")
     try:
-        norm = modeling_qwen3_5_moe.Qwen3_5MoeRMSNorm(4)
+        norm = modeling_qwen3_5_moe.Qwen3_5MoeRMSNorm(4, exact_contract=False)
 
         x = torch.ones(2, 4)
         out = norm(x)
@@ -149,10 +118,16 @@ def test_qwen3_5_moe_sglang_fused_rmsnorm_routes_same_families_as_sglang(monkeyp
         "fast_zero_centered_batch_invariant_rms_norm",
         fake_contract,
     )
+    monkeypatch.setattr(
+        modeling_qwen3_5_moe,
+        "fast_zero_centered_batch_invariant_residual_rms_norm",
+        fake_native_no_batch_invariant,
+    )
 
     set_rmsnorm_mode("sglang_fused")
     try:
-        norm = modeling_qwen3_5_moe.Qwen3_5MoeRMSNorm(4)
+        norm = modeling_qwen3_5_moe.Qwen3_5MoeRMSNorm(4, exact_contract=False)
+        exact_norm = modeling_qwen3_5_moe.Qwen3_5MoeRMSNorm(4, exact_contract=True)
         x = torch.ones(2, 4)
 
         out = norm(x)
@@ -169,19 +144,20 @@ def test_qwen3_5_moe_sglang_fused_rmsnorm_routes_same_families_as_sglang(monkeyp
         assert torch.equal(out, x + 3)
         assert calls[-1] == "native_no_batch_invariant"
 
-        # Trunk-contract lane: the no-residual (family-1) dispatch swaps to the
-        # batch-invariant contract kernel; residual/forced stay family-2.
-        set_trunk_linear_contract(True)
-        try:
-            out = norm(x)
-            assert torch.equal(out, x + 5)
-            assert calls[-1] == "contract_family1"
+        # Exact selection is module-owned: no-residual dispatch swaps to the
+        # batch-invariant family while residual/forced remains family-2.
+        out = exact_norm(x)
+        assert torch.equal(out, x + 5)
+        assert calls[-1] == "contract_family1"
 
-            out = norm(x, force_sglang_residual=True)
-            assert torch.equal(out, x + 3)
-            assert calls[-1] == "native_no_batch_invariant"
-        finally:
-            set_trunk_linear_contract(False)
+        out = exact_norm(x, force_sglang_residual=True)
+        assert torch.equal(out, x + 3)
+        assert calls[-1] == "native_no_batch_invariant"
+
+        # Exact and ordinary models may coexist without process-state leakage.
+        out = norm(x)
+        assert torch.equal(out, x + 1)
+        assert calls[-1] == "native"
     finally:
         set_rmsnorm_mode("native")
 
@@ -334,23 +310,19 @@ def test_qwen3_5_trunk_contract_family1_bit_matches_interpose_kernel():
     x = torch.randn(256, 16, head_dim, device="cuda", dtype=torch.bfloat16)
     set_rmsnorm_mode("sglang_fused")
     try:
-        norm = Qwen3_5MoeRMSNorm(head_dim, eps=EPS).to("cuda")
+        norm = Qwen3_5MoeRMSNorm(head_dim, eps=EPS, exact_contract=True).to("cuda")
     finally:
         set_rmsnorm_mode("native")
     with torch.no_grad():
         norm.weight.copy_(torch.randn(head_dim, device="cuda"))
 
-    set_trunk_linear_contract(True)
-    try:
-        with torch.no_grad():
-            out = norm(x)
-            ref = rms_norm_batch_invariant(x.float(), 1.0 + norm.weight.float(), eps=EPS).to(x.dtype)
-            with set_batch_invariant_mode(True):
-                ref_interpose = torch.nn.functional.rms_norm(
-                    x.float(), (head_dim,), 1.0 + norm.weight.float(), eps=EPS
-                ).to(x.dtype)
-    finally:
-        set_trunk_linear_contract(False)
+    with torch.no_grad():
+        out = norm(x)
+        ref = rms_norm_batch_invariant(x.float(), 1.0 + norm.weight.float(), eps=EPS).to(x.dtype)
+        with set_batch_invariant_mode(True):
+            ref_interpose = torch.nn.functional.rms_norm(
+                x.float(), (head_dim,), 1.0 + norm.weight.float(), eps=EPS
+            ).to(x.dtype)
 
     assert torch.equal(out, ref)
     assert torch.equal(out, ref_interpose), "contract-lane family-1 must equal the aten interpose lane bit-for-bit"
@@ -400,10 +372,7 @@ def test_qwen3_5_layer_forward_bit_exact_sglang_vs_fused():
 @requires_cuda
 @pytest.mark.gpu
 def test_qwen3_5_family2_residual_norm_contract(monkeypatch):
-    """XORL_BI_RESIDUAL_NORM=1: the residual-tree (family-2) norm must run the
-    eager-with-BI-mean composition (pairs with the BI-ops sampler's
-    forward_native under the interposed aten::mean.dim), and the flag off must
-    preserve the F.rms_norm path bit-for-bit."""
+    """The exact residual-tree norm matches the sampler's BI-mean composition."""
     from xorl.models.layers.normalization import (  # noqa: PLC0415
         fast_zero_centered_batch_invariant_residual_rms_norm,
         native_zero_centered_rms_norm,
@@ -418,11 +387,17 @@ def test_qwen3_5_family2_residual_norm_contract(monkeypatch):
 
     set_rmsnorm_mode("sglang_fused")
     try:
-        norm = modeling_qwen3_5_moe.Qwen3_5MoeRMSNorm(HIDDEN, eps=1e-6).to(device)
+        exact_norm = modeling_qwen3_5_moe.Qwen3_5MoeRMSNorm(
+            HIDDEN, eps=1e-6, exact_contract=True
+        ).to(device)
+        ordinary_norm = modeling_qwen3_5_moe.Qwen3_5MoeRMSNorm(
+            HIDDEN, eps=1e-6, exact_contract=False
+        ).to(device)
     finally:
         set_rmsnorm_mode("native")
     with torch.no_grad():
-        norm.weight.copy_(weight)
+        exact_norm.weight.copy_(weight)
+        ordinary_norm.weight.copy_(weight)
 
     # reference: eager fp32 composition with the BI mean kernel (the sampler's
     # forward_native under SGLANG_BATCH_INVARIANT_OPS=all)
@@ -430,16 +405,14 @@ def test_qwen3_5_family2_residual_norm_contract(monkeypatch):
     var = mean_dim(y * y, dim=-1, keepdim=True)
     ref = (y * torch.rsqrt(var + 1e-6) * (1.0 + weight.float())).to(torch.bfloat16)
 
-    monkeypatch.setenv("XORL_BI_RESIDUAL_NORM", "1")
     with torch.no_grad():
-        out_on = norm(x, residual=residual)
-    assert torch.equal(out_on, ref), "family-2 contract output != eager-with-BI-mean composition"
+        out = exact_norm(x, residual=residual)
+    assert torch.equal(out, ref), "family-2 contract output != eager-with-BI-mean composition"
 
-    monkeypatch.delenv("XORL_BI_RESIDUAL_NORM")
     with torch.no_grad():
-        out_off = norm(x, residual=residual)
-    expected_off = native_zero_centered_rms_norm(x + residual, weight, 1e-6)
-    assert torch.equal(out_off, expected_off), "flag off must preserve the native family-2 path"
+        out_native = ordinary_norm(x, residual=residual)
+    expected_native = native_zero_centered_rms_norm(x + residual, weight, 1e-6)
+    assert torch.equal(out_native, expected_native), "ordinary execution must preserve the native family-2 path"
 
     # the standalone helper equals the contract dispatch
     helper = fast_zero_centered_batch_invariant_residual_rms_norm(x + residual, weight, 1e-6)

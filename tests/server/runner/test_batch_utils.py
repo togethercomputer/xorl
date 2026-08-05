@@ -9,6 +9,20 @@ from xorl.server.runner.utils.batch_utils import convert_batch_to_tensors, simpl
 pytestmark = [pytest.mark.cpu, pytest.mark.server]
 
 
+def test_convert_batch_to_tensors_preserves_drgrpo_logprob_floats():
+    converted = convert_batch_to_tensors(
+        {
+            "old_logprobs": [[-1.25, -2.5]],
+            "ref_logprobs": [[-1.75, -3.125]],
+        }
+    )
+
+    assert converted["old_logprobs"].dtype == torch.float32
+    assert converted["ref_logprobs"].dtype == torch.float32
+    torch.testing.assert_close(converted["old_logprobs"], torch.tensor([[-1.25, -2.5]]))
+    torch.testing.assert_close(converted["ref_logprobs"], torch.tensor([[-1.75, -3.125]]))
+
+
 def test_convert_batch_to_tensors_preserves_teacher_hidden_state_floats():
     batch = {
         "teacher_hidden_states": [

@@ -54,7 +54,7 @@ def chunk_gated_delta_rule_fwd(
     auto_cp: bool | None = None,
 ):
     # auto_cp's intra-card CP heuristic (Be*H<=40 gate + warmup h0-drop approximation) breaks batch-invariance
-    # and changes math; None resolves to ON except under the armed XORL_BI_GDN contract lane (pinned OFF).
+    # and changes math; None resolves to ON except under the exact Qwen3.5 model program (pinned OFF).
     auto_cp = resolve_flashqla_auto_cp(auto_cp)
     g = chunk_local_cumsum(g, chunk_size=64, cu_seqlens=cu_seqlens)
     A = robust_kkt_solve(

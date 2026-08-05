@@ -72,6 +72,29 @@ def load_server_arguments(config_path, *args, **kwargs):
     return _load_server_arguments_impl(config_path, *args, **kwargs)
 
 
+def test_canonical_moe_and_rope_auto_defaults_serialize(tmp_path):
+    config_path = tmp_path / "server_config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {"model_path": "Qwen/Qwen3-8B"},
+                "train": {"output_dir": str(tmp_path / "outputs")},
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = load_server_arguments(str(config_path))
+    model_config = args.to_config_dict()["model"]
+    assert model_config["attn_implementation"] is None
+    assert model_config["router_fp32"] is None
+    assert model_config["lm_head_fp32"] is None
+    assert model_config["rmsnorm_mode"] is None
+    assert model_config["rope_native"] is None
+    assert model_config["rope_class_b"] is None
+    assert model_config["sparse_mla_enabled"] is None
+    assert args.to_config_dict()["train"]["ce_mode"] is None
+
+
 def test_load_server_arguments_threads_signsgd_through_nested_config(tmp_path):
     config_path = tmp_path / "server_config.yaml"
     config_path.write_text(
@@ -1838,6 +1861,39 @@ def test_load_server_arguments_preserves_runner_compatibility_fields(tmp_path):
     assert config["train"]["moe_grad_reduce_mode"] == "bf16_a2a_fp32_sum"
     assert config["train"]["optimizer_kwargs"]["muon_distributed_mode"] == "full_gradient"
     assert config["lora"]["lora_export_format"] == "sglang_shared_outer"
+
+
+def test_load_server_arguments_threads_sparse_mla_into_model_config(tmp_path):
+    config_path = tmp_path / "server_config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model_path": "zai-org/GLM-5",
+                "sparse_mla_enabled": True,
+                "sparse_mla_backend": "flashmla",
+                "output_dir": str(tmp_path / "outputs"),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    fake_qarl = types.ModuleType("xorl.qarl")
+    fake_qarl.normalize_qarl_quant_cfg = lambda value: value
+    fake_qarl.qarl_unsupported_scope_reason = lambda **_kwargs: None
+    fake_packing = types.ModuleType("xorl.server.orchestrator.packing")
+    fake_packing.ON_OVERSIZED_MODES = {"error", "skip", "truncate"}
+    fake_packing.PACKING_STRATEGIES = {"sequential", "best_fit", "balanced_dp"}
+    with patch.dict(
+        sys.modules,
+        {"xorl.qarl": fake_qarl, "xorl.server.orchestrator.packing": fake_packing},
+    ):
+        args = load_server_arguments(str(config_path))
+    model_config = args.to_config_dict()["model"]
+
+    assert args.sparse_mla_enabled is True
+    assert args.sparse_mla_backend == "flashmla"
+    assert model_config["sparse_mla_enabled"] is True
+    assert model_config["sparse_mla_backend"] == "flashmla"
 
 
 def test_load_server_arguments_threads_moe_routing_weights_before_down(tmp_path):

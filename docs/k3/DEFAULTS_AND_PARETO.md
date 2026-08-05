@@ -1,5 +1,13 @@
 # K3 defaults and Pareto matrix
 
+> **Current architecture-specific behavior.** In server-training mode, the
+> official GLM-5.2, Qwen3.5-0.8B, and Qwen3.6-35B-A3B geometries select their
+> exact numerical programs from model identity. Users do not enable component
+> environment variables. Incompatible geometry, topology, or numerical
+> overrides raise instead of silently falling back. The older component recipes
+> later in this document describe generic and historical lanes; they are not
+> launch instructions for these three models.
+
 Based on the paired families-v2 trainer/serving contract. This is the launch and
 housekeeping source of truth. It separates generic xorl defaults from the numerical profile a
 specific RL lane must select. Frozen anchors from earlier contract trees are invalid and must be
@@ -35,15 +43,39 @@ MoE, hybrid, TP-sharded, and multi-adapter models. A K3 lane must select one exa
 | Dense softmax, TP1 serving | Current families-v2 live step-0 behavior K3 exactly `0.0` over 4,096 rollouts / 65.5M valid tokens **[PROD]**; local long gate 7,239/7,239 bitwise **[LOCAL]**. Pre-v2 full-run anchors were 83/85 zero steps in v12 and 140/140 in v15. | Quiet-node v2 vs stock **[LOCAL]**: decode -1.4/+0.5/+0.1/-0.9% at bs1/8/16/64, prefill -7.5%, reuse -13.8%. RL-shape clean run was about -6.7% but interference-flaky and needs remeasurement. | Default K3 recipe for supported dense RL |
 | Softmax MoE, supported TP1 head | Bitwise scoring/replay-free zero **[GATE]**; routing replay remains the guard for value-edge flips | Composed q30 trainer measured +1.23% step / -1.21% tok/s **[LOCAL]**; sampler router cost not isolated | Use dense base plus MoE overlay and routing policy |
 | Hybrid GDN+MoE, teacher-forced | All 40 residual boundaries and teacher-forced K3 bitwise **[GATE]** on the EP8/DP-attention capture | Scoring contract is viable; EP-combine simulation is forward-only | Certification/scoring only; do not infer live zero |
-| Dense Qwen3.5 GDN live decode, TP1 | Qwen3.5-0.8B static 64/64 exact and a two-rollout DR-GRPO backward/Adam mechanics gate at behavior K3 `0.0` **[LOCAL]** | Batch-1 45+64 decode: 19.517 vs 33.762 tok/s, -42.19% throughput / 1.730x wall; no fleet result | Land the paired xorl/xorl-sglang changes and default supported Qwen3.5 on-policy RL to the contract; retain an explicit non-contract opt-out |
-| Hybrid GDN+MoE live decode | Dense GDN removes the blanket numerical floor, but MoE composition, distributed topology, production length, and current-family pairing remain ungated | Historical best recompute-decode path was 3.11x the recurrent op | Fresh full-stack exact gate and composed throughput result required |
+| Dense Qwen3.5 GDN live decode, TP1 | Qwen3.5-0.8B static 64/64 exact and a two-rollout DR-GRPO backward/Adam mechanics gate at behavior K3 `0.0` **[LOCAL]** | Batch-1 45+64 historical gate: 19.517 vs 33.762 tok/s, -42.19% throughput / 1.730x wall | The supported model selects the exact program automatically in server training; direct qualification of each released revision pair remains required |
+| Qwen3.6-35B-A3B GDN+MoE live decode | Full-model graph/radix exactness was established on the development lineage; direct public-revision qualification is the release gate **[GATE]** | The optimized graph path is substantially faster than the original recompute path; publish only the matched final-head A/B | Use the automatic official-geometry program at the admitted EP8 topology; no component flags or non-contract opt-out |
+| GLM-5.2 native-FP8 sparse MLA + MoE | Full 78-block, 64-decision trainer/sampler parity at raw float32 logprob bytes and K3 `0.0` on the development lineage **[GATE]** | Exact serving was optimized from 12.2 to 34.47 tok/s; final-head paired ruler still governs release claims | Use the automatic official-geometry program at WORLD16/EP16/CP16; direct public-revision qualification is required |
 | Conventional TP-sharded serving | No certified BI head/trunk contract when effective `attn_tp_size` or `head_tp_size` exceeds 1. Full BI deployment was about 8x worse than the measured fallback on the Wordle lane **[PROD, one-step comparison]** | Best measured EP8-trainer / 4x TP2-sampler Wordle fallback was about `2.24e-4` at step 1 and flat-floor oriented | Use the topology-specific fallback; never apply the TP1 stack blindly |
 | Single-adapter LoRA | Folded forward is contracted **[GATE]**; production zero confirmation remains pending | Serving +81% decode at small M and +16-23% prefill; trainer merged forward 3-6x faster than unmerged | Use folded single-adapter overlay |
 | Multi-adapter LoRA | Uncontracted serving path | No trustworthy zero-K3 Pareto point | Name the LoRA floor; do not claim zero |
 
-## 3. Exact dense TP1 recipe
+## 2.1 Architecture-specific exact programs
 
-Scope: dense softmax-attention Qwen3-class, `head_dim != 256`, single-GPU-servable, plain
+For the supported Qwen3.5-family and GLM-5.2 models, server training is the
+single trainer-side activation condition. The model loader resolves attention,
+RoPE, norm, router, head, expert, and distributed-combine choices before module
+construction and rejects incompatible overrides. On serving, pass only
+`--rl-on-policy-target xorl`; the architecture resolver owns the corresponding
+graph, cache, precision, routing, and transport program.
+
+The Qwen3.6 trainer geometry is WORLD16 with DP16 (two DP replicas, shard size
+8) and EP8. The GLM-5.2 trainer geometry is WORLD16/PP1/TP1/DP1/EP16/CP16 with
+Ulysses16. The dense Qwen3.5-0.8B trainer is single-rank. These are admitted
+programs, not tuning suggestions. A different topology must earn a new direct
+train-infer parity result before admission.
+
+Exact serving rejects sampling transforms the trainer does not replay,
+speculative decoding, unsupported session-state restoration, and other
+out-of-envelope features. A release qualification uses a repeatable sampler
+capture followed by teacher-forced replay of the retained token IDs and raw
+float32 behavior-logprob bytes; every retained token must be exact and K3 must
+be exactly zero.
+
+## 3. Generic exact dense TP1 recipe
+
+Scope: dense softmax-attention Qwen3-class models other than the automatic
+Qwen3.5-family programs, `head_dim != 256`, single-GPU-servable, plain
 `lm_head`. Use paired trainer and serving builds implementing the current families-v2 contract,
 with identical FlashAttention/CUTLASS/Quack builds in both environments. The certified triple is
 FlashAttention 4 `4.0.0b19`, CUTLASS DSL `4.5.2`, and Quack `0.5.0`. DeepGEMM builds must be
@@ -132,11 +164,12 @@ At trainer EP1 the SGLang-fused expert path auto-enables when its stack is impor
 Use all-to-all, not DeepEP, for the current K3 contract. Preserve rollout routing capture/replay
 as described in section 8.
 
-## 5. Hybrid GDN+MoE
+## 5. Historical hybrid GDN+MoE component recipe
 
-There is a bitwise teacher-forced certification recipe, not a zero-K3 live-decode recipe. The
-existing **[GATE]** anchor used a paired FA3 stack; do not substitute FA4 without a fresh paired
-gate.
+This section records the pre-architecture-resolver component recipe. It is not
+a launch recipe for the current Qwen3.6 exact program. The historical
+**[GATE]** anchor used a paired FA3 stack; the current automatic program uses
+its separately qualified FA4 graph/radix path.
 
 Trainer certification config:
 

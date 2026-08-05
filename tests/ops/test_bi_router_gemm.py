@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from xorl.models.layers.moe.moe_block import MoEBlock, _BIRouterGemm
-from xorl.ops.batch_invariant_ops import bi_router_gemm, bi_router_topk_weights
+from xorl.ops.batch_invariant_ops import bi_bf16_fp32_linear, bi_router_gemm, bi_router_topk_weights
 
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -69,6 +69,23 @@ def test_router_gemm_autograd_backward_matches_linear():
 
 @requires_cuda
 @pytest.mark.gpu
+def test_bf16_fp32_linear_preserves_leading_dims_and_backward():
+    hidden, weight = _inputs(6, seed=2)
+    hidden = hidden.reshape(2, 3, H).requires_grad_(True)
+    weight = weight.requires_grad_(True)
+
+    out = bi_bf16_fp32_linear(hidden, weight)
+    assert out.shape == (2, 3, E)
+    assert out.dtype is torch.float32
+    assert torch.equal(out.reshape(6, E), bi_router_gemm(hidden.detach().reshape(6, H), weight.detach()))
+
+    out.square().sum().backward()
+    assert hidden.grad is not None and hidden.grad.dtype is torch.bfloat16
+    assert weight.grad is not None and weight.grad.dtype is torch.bfloat16
+
+
+@requires_cuda
+@pytest.mark.gpu
 def test_router_gemm_rejects_non_bf16():
     hidden, weight = _inputs(8)
     with pytest.raises(AssertionError):
@@ -101,8 +118,8 @@ def test_topk_weights_requires_fp32():
 
 @requires_cuda
 @pytest.mark.gpu
-def test_moe_block_route_uses_contract_when_enabled(monkeypatch):
-    # Module-level gate: MoEBlock.route with XORL_MOE_BI_ROUTER=1 must produce
+def test_moe_block_route_uses_structural_exact_contract():
+    # Exact MoEBlock routing must produce
     # router logits equal to the standalone contract kernel, and selection/
     # weights equal to the contract post-processing on those logits.
     block = (
@@ -113,13 +130,13 @@ def test_moe_block_route_uses_contract_when_enabled(monkeypatch):
             intermediate_size=768,
             moe_implementation="eager",
             norm_topk_prob=True,
+            exact_batch_invariant_router=True,
         )
         .cuda()
         .to(torch.bfloat16)
     )
     hidden = (torch.randn(140, H, device="cuda") * 0.5).to(torch.bfloat16)
 
-    monkeypatch.setenv("XORL_MOE_BI_ROUTER", "1")
     rw, sel, logits = block.route(hidden)
 
     ref_logits = bi_router_gemm(hidden, block.gate.weight)
@@ -134,9 +151,8 @@ def test_moe_block_route_uses_contract_when_enabled(monkeypatch):
 
 @requires_cuda
 @pytest.mark.gpu
-def test_moe_block_route_default_path_unchanged(monkeypatch):
-    # Flag off -> stock gate GEMM, logits are bf16 (nn.Linear), not fp32.
-    monkeypatch.delenv("XORL_MOE_BI_ROUTER", raising=False)
+def test_moe_block_route_default_path_unchanged():
+    # Ordinary models retain the stock gate GEMM; logits are bf16, not fp32.
     block = (
         MoEBlock(
             hidden_size=H,

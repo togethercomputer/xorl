@@ -9,11 +9,6 @@ import torch.nn.functional as F
 
 _SYNTHETIC_ROUTING_ENV = "XORL_MOE_SYNTHETIC_ROUTING"
 _ROUTER_TOPK_POLICY_ENV = "XORL_MOE_ROUTER_TOPK_POLICY"
-_MOE_BI_ROUTER_ENV = "XORL_MOE_BI_ROUTER"
-
-
-def _moe_bi_router_enabled() -> bool:
-    return os.environ.get(_MOE_BI_ROUTER_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def balanced_synthetic_routing(
@@ -54,8 +49,8 @@ def _router_topk_policy() -> str:
     )
 
 
-def _topk_indices_with_policy(scores: torch.Tensor, top_k: int) -> torch.Tensor:
-    policy = _router_topk_policy()
+def _topk_indices_with_policy(scores: torch.Tensor, top_k: int, policy: str | None = None) -> torch.Tensor:
+    policy = _router_topk_policy() if policy is None else policy
     if policy == "default":
         return torch.topk(scores, top_k, dim=-1).indices
     if policy == "stable_low_id":
@@ -132,6 +127,7 @@ class TopKRouter(nn.Module):
         scoring_func: str = "softmax",
         topk_method: str | None = None,
         routed_scaling_factor: float | None = None,
+        exact_batch_invariant: bool = False,
     ):
         super().__init__()
         if scoring_func not in ("softmax", "sqrtsoftplus"):
@@ -154,7 +150,11 @@ class TopKRouter(nn.Module):
         self.scoring_func = scoring_func
         self.topk_method = topk_method
         self.routed_scaling_factor = routed_scaling_factor
-        self.synthetic_routing_mode = _synthetic_routing_mode()
+        self._exact_batch_invariant = exact_batch_invariant
+        # Exact model programs are structural and must not be redirected by
+        # process-wide diagnostic environment variables.
+        self.synthetic_routing_mode = None if exact_batch_invariant else _synthetic_routing_mode()
+        self.topk_policy = "default" if exact_batch_invariant else _router_topk_policy()
         # ``tid2eid`` is a frozen post-load buffer — validate bounds once and
         # remember the storage object so the hot path doesn't pay device->host
         # sync per forward.
@@ -228,7 +228,7 @@ class TopKRouter(nn.Module):
         )
 
     def _forward_softmax(self, router_logits: torch.Tensor, input_dtype: torch.dtype):
-        if _synthetic_routing_mode() == "balanced":
+        if self.synthetic_routing_mode == "balanced":
             return balanced_synthetic_routing(
                 router_logits.shape[0],
                 self.num_experts,
@@ -237,15 +237,15 @@ class TopKRouter(nn.Module):
                 input_dtype,
             )
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        topk_policy = _router_topk_policy()
+        topk_policy = self.topk_policy
         if topk_policy == "default":
             routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
         else:
-            selected_experts = _topk_indices_with_policy(router_logits, self.top_k)
+            selected_experts = _topk_indices_with_policy(router_logits, self.top_k, topk_policy)
             routing_weights = torch.gather(routing_weights, 1, selected_experts)
-        if _moe_bi_router_enabled():
-            # K3 router contract: fixed-order renorm + cast so the top-k weights
-            # are bit-identical to SGLang's SGLANG_BI_ROUTER path (the stock
+        if self._exact_batch_invariant:
+            # Exact router contract: fixed-order renorm + cast so the top-k weights
+            # are bit-identical to SGLang's batch-invariant path (the stock
             # sum(dim=-1) reduction is build-dependent; see bi_router_topk_weights).
             from xorl.ops.batch_invariant_ops import bi_router_topk_weights  # noqa: PLC0415
 
@@ -270,7 +270,7 @@ class TopKRouter(nn.Module):
         # are selected.
         scores = F.softplus(router_logits.float()).sqrt().type_as(router_logits)
 
-        if _synthetic_routing_mode() == "balanced":
+        if self.synthetic_routing_mode == "balanced":
             selected_experts = _balanced_selected_experts(router_logits, self.num_experts, self.top_k)
         elif tid2eid is not None:
             assert input_ids is not None, "tid2eid hash routing requires input_ids"
@@ -291,7 +291,7 @@ class TopKRouter(nn.Module):
                 scores_for_routing = scores + expert_bias
             else:
                 scores_for_routing = scores
-            selected_experts = _topk_indices_with_policy(scores_for_routing, self.top_k)
+            selected_experts = _topk_indices_with_policy(scores_for_routing, self.top_k, self.topk_policy)
 
         routing_weights = torch.gather(scores, dim=1, index=selected_experts)
         # V4 paths always renormalize.

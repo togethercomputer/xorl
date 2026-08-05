@@ -62,28 +62,6 @@ def _pin_compile_budget() -> None:
 
 _pin_compile_budget()
 
-# Engagement tally. Under Class B, ANY Class-A rope call is partial engagement and breaks the
-# contract, so both are counted and the pair is logged rather than inferred from an env var.
-_ENGAGEMENT = {"class_b": 0, "class_a": 0}
-
-
-def note_rope_engagement(which: str, where: str = "") -> None:
-    _ENGAGEMENT[which] += 1
-    total = _ENGAGEMENT["class_b"] + _ENGAGEMENT["class_a"]
-    if total <= 8 or total % 100 == 0:
-        logger.info(
-            "rope engagement: class_b=%d class_a=%d (this call: %s %s)",
-            _ENGAGEMENT["class_b"],
-            _ENGAGEMENT["class_a"],
-            which,
-            where,
-        )
-
-
-def rope_engagement_tally() -> dict:
-    return dict(_ENGAGEMENT)
-
-
 def _rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, is_neox: bool) -> torch.Tensor:
     """SGLang's ``apply_rotary_emb``, vendored.
 
@@ -159,7 +137,6 @@ def class_b_apply_rotary_pos_emb(q, k, cos, sin, *, interleaved: bool = False, d
             f"got cos={cos.dtype}, sin={sin.dtype}. A mixed-precision wrapper "
             "likely downcast the table in transit."
         )
-    note_rope_engagement("class_b")
     cos_f, sin_f = build_class_b_cos_sin(cos, sin, doubled=doubled)
     rotary_dim = 2 * cos_f.shape[-1]
     batch, seq_len = q.shape[0], q.shape[1]
@@ -180,6 +157,4 @@ def class_b_apply_rotary_pos_emb(q, k, cos, sin, *, interleaved: bool = False, d
 __all__ = [
     "build_class_b_cos_sin",
     "class_b_apply_rotary_pos_emb",
-    "note_rope_engagement",
-    "rope_engagement_tally",
 ]

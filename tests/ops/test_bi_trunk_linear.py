@@ -78,7 +78,7 @@ def test_wrap_selection_counts_and_exclusions():
     assert wrapped == dict.fromkeys(("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"), 2)
     assert not getattr(model.lm_head, "_xorl_bi_trunk_wrapped", False)
     assert all(getattr(layer.q_proj, "_xorl_bi_trunk_wrapped", False) for layer in model.layers)
-    assert is_trunk_linear_contract_enabled()
+    assert not is_trunk_linear_contract_enabled(), "wrapping one model must not mutate process-global dispatch"
 
 
 @pytest.mark.cpu

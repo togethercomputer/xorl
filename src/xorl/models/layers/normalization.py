@@ -453,11 +453,6 @@ def fast_zero_centered_batch_invariant_rms_norm(
     return output.type_as(hidden_states)
 
 
-def is_bi_residual_norm_enabled() -> bool:
-    """P5 family-2 norm contract (opt-in, no default flips)."""
-    return os.environ.get("XORL_BI_RESIDUAL_NORM", "").lower() in {"1", "true", "yes", "on"}
-
-
 class _BIEagerMeanRMSNorm(torch.autograd.Function):
     """Family-2 (residual-tree) contract Function: eager fp32 RMSNorm with the
     batch-invariant ``mean_dim`` kernel for the variance reduction.
@@ -490,7 +485,7 @@ def fast_zero_centered_batch_invariant_residual_rms_norm(
     weight: torch.Tensor,
     variance_epsilon: float,
 ) -> torch.Tensor:
-    """Family-2 term of the Qwen3.5 norm-seed contract (``XORL_BI_RESIDUAL_NORM=1``):
+    """Family-2 term of the exact Qwen3.5 norm-seed contract:
     residual-tree zero-centered norms pair with the BI-ops sampler's
     ``forward_native``-with-BI-mean composition (see :class:`_BIEagerMeanRMSNorm`).
     The bf16 residual add stays OUTSIDE (both engines add in bf16 eagerly).
@@ -653,6 +648,13 @@ class RMSNorm(nn.Module):
             elif residual is not None:
                 # Diagnostic bf16 recast path: residual already added above.
                 out = fast_sglang_rms_norm(norm_input, self.weight, self.variance_epsilon)
+            elif family == RMS_NORM_FAMILY_NO_RESIDUAL:
+                # A declared serving no-residual site is already an explicit
+                # numerical contract.  Do not make its kernel selection depend
+                # on the unrelated BF16 trunk-linear wrapper: GLM-5.2 keeps its
+                # projections in native FP8, but its q_a/kv_a norms must still
+                # execute the same v2 reduction as serving.
+                out = fast_batch_invariant_rms_norm(norm_input, self.weight, self.variance_epsilon)
             elif is_trunk_linear_contract_enabled():
                 # Trunk contract lane: no-residual norms (qk-norm) must bit-match
                 # serving's family-1 batch-invariant kernel, with real gradients.

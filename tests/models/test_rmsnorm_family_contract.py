@@ -285,7 +285,12 @@ def test_families_differ_on_seed_shape():
 @pytest.mark.parametrize("bi", [False, True])
 def test_family_declared_module_calls_match_legacy_bitwise(mode, bi):
     """Family declarations replace the legacy force_sglang_residual call-site
-    exprs without changing a single bit, in every (mode, batch-invariant) lane."""
+    exprs without changing a single bit, in every (mode, batch-invariant) lane.
+
+    The legacy trunk marker is set explicitly here; exact Qwen production no
+    longer mutates it as a model-build side effect, so test order must not
+    provide the legacy comparison state implicitly.
+    """
     x = _make(HIDDEN_SHAPE, 100)
     r = _make(HIDDEN_SHAPE, 200)
     w = _make((HIDDEN_SHAPE[-1],), 300)
@@ -296,19 +301,23 @@ def test_family_declared_module_calls_match_legacy_bitwise(mode, bi):
             norm.weight.copy_(w)
         return norm
 
-    with set_batch_invariant_mode(bi), torch.no_grad(), warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        # qk-norm / layer-0 input: declared no-residual == legacy bare call.
-        assert torch.equal(make_norm(family=RMS_NORM_FAMILY_NO_RESIDUAL)(x), make_norm()(x))
-        # input layernorm layer>0 / final norm: declared residual tree ==
-        # legacy force_sglang_residual=(mode in sglang modes).
-        legacy_force = mode in ("sglang", "sglang_fused")
-        assert torch.equal(
-            make_norm(family=RMS_NORM_FAMILY_RESIDUAL_TREE)(x),
-            make_norm()(x, force_sglang_residual=legacy_force),
-        )
-        # post-attention: declared residual tree == legacy residual call.
-        out_new, rout_new = make_norm(family=RMS_NORM_FAMILY_RESIDUAL_TREE)(x, residual=r, prenorm=True)
-        out_old, rout_old = make_norm()(x, residual=r, prenorm=True)
-        assert torch.equal(out_new, out_old)
-        assert torch.equal(rout_new, rout_old)
+    set_trunk_linear_contract(True)
+    try:
+        with set_batch_invariant_mode(bi), torch.no_grad(), warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            # qk-norm / layer-0 input: declared no-residual == legacy bare call.
+            assert torch.equal(make_norm(family=RMS_NORM_FAMILY_NO_RESIDUAL)(x), make_norm()(x))
+            # input layernorm layer>0 / final norm: declared residual tree ==
+            # legacy force_sglang_residual=(mode in sglang modes).
+            legacy_force = mode in ("sglang", "sglang_fused")
+            assert torch.equal(
+                make_norm(family=RMS_NORM_FAMILY_RESIDUAL_TREE)(x),
+                make_norm()(x, force_sglang_residual=legacy_force),
+            )
+            # post-attention: declared residual tree == legacy residual call.
+            out_new, rout_new = make_norm(family=RMS_NORM_FAMILY_RESIDUAL_TREE)(x, residual=r, prenorm=True)
+            out_old, rout_old = make_norm()(x, residual=r, prenorm=True)
+            assert torch.equal(out_new, out_old)
+            assert torch.equal(rout_new, rout_old)
+    finally:
+        set_trunk_linear_contract(False)

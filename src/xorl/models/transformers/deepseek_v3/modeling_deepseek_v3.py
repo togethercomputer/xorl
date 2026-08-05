@@ -143,6 +143,7 @@ class DeepseekV3Attention(nn.Module):
             cos,
             sin,
             interleaved=getattr(self.config, "rope_interleave", True),
+            class_b=bool(getattr(self.config, "_rope_class_b", False)),
         )
         k_rot = k_rot.expand(*k_pass.shape[:-1], -1)
 

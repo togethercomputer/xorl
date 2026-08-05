@@ -1,9 +1,11 @@
 # Qwen3.5 35B-A3B MoE/GDN contract
 
-This is the portable trainer-side contract for Qwen3.5 35B-A3B. It does not
-claim that this repository alone certifies a sampler build.
+This is the portable trainer-side contract for Qwen3.6-35B-A3B (whose model
+family is Qwen3.5 in the implementation). It does not claim that this
+repository alone certifies a sampler build.
 
-Set `XORL_BI_GDN=1`. The model then selects the paired dense-GDN defaults:
+There is no component flag recipe. In server-training mode, official model
+identity and geometry select the complete exact program:
 
 - GDN convolution and gating contracts enabled;
 - batch-invariant trunk linear and residual-norm paths enabled;
@@ -11,14 +13,16 @@ Set `XORL_BI_GDN=1`. The model then selects the paired dense-GDN defaults:
 - family-v1 GDN numerics and fixed L2Norm launch selection;
 - native ordered EP combine by default only for the certified EP8 topology.
 
-Explicit environment values always override these defaults. Native EP combine
-must enter experts through `nn.Module.__call__`; this lets FSDP materialize the
-BF16 compute parameters before the serving-layout expert kernel runs.
+Incompatible numerical overrides and any topology other than the admitted
+WORLD16/DP16 (replicate 2, shard 8)/EP8 program raise before execution. Native
+EP combine enters experts through `nn.Module.__call__`; this lets FSDP
+materialize the BF16 compute parameters before the serving-layout expert kernel
+runs.
 
-The recurrent GDN decode opt-out is a speed comparison, not a zero-K3 mode.
-The retained local attribution result reduced exact-decode overhead from 41.40%
-to 25.62% versus recurrent decode while preserving literal zero token K3. This
-is local evidence, not a fleet-throughput or production rollout claim.
+On serving, `--rl-on-policy-target xorl` is the only activation switch. The
+official geometry selects the qualified FA4 graph/radix program, exact GDN
+state handling, router/head kernels, and ordered expert combine as one unit.
+There is no public recurrent-decode opt-out.
 
 Promotion requires all of the following on the paired trainer and sampler
 revisions:

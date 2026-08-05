@@ -14,7 +14,21 @@ class TinyModel(nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.config = SimpleNamespace(model_type="tiny")
+        self.config = SimpleNamespace(
+            model_type="tiny",
+            _resolved_numerical_program={
+                "attn_implementation": "flash_attention_3",
+                "router_fp32": False,
+                "lm_head_fp32": False,
+                "rmsnorm_mode": "sglang",
+                "activation_native": True,
+                "rope_native": True,
+                "rope_class_b": True,
+                "attention_cast_bf16": True,
+                "sparse_mla_enabled": False,
+                "sparse_mla_backend": "auto",
+            },
+        )
 
 
 def _trainer_args():
@@ -46,6 +60,7 @@ def _trainer_args():
             freeze_router=False,
         ),
         train=SimpleNamespace(
+            ce_mode=None,
             enable_mixed_precision=True,
             skip_param_upcast=False,
             init_device="meta",
@@ -68,6 +83,7 @@ def test_local_trainer_forwards_model_numeric_alignment_flags(monkeypatch):
         return TinyModel()
 
     trainer = Trainer.__new__(Trainer)
+    trainer._causallm_loss_params = {}
     trainer.args = _trainer_args()
 
     monkeypatch.setattr("xorl.trainers.trainer.build_foundation_model", fake_build_foundation_model)

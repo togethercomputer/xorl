@@ -3,11 +3,11 @@
 One pinned op order for materializing merged weights ``W' = W + scaling * (A @ B)``,
 shared by every consumer that must agree bitwise:
 
-- the trainer's merged forward (``XORL_LORA_MERGED_FORWARD=1``): the adapted
+- the trainer's exact-model merged forward: the adapted
   module folds its delta and runs the BASE contract kernels on ``W'``;
-- the weight-sync merged extraction (same flag): the engine receives exactly
+- the weight-sync merged extraction: the engine receives exactly
   the bytes the trainer trains with;
-- the serving-side fold-on-receipt mirror (sglang ``SGLANG_LORA_FOLD_CANONICAL=1``).
+- the serving-side canonical fold-on-receipt mirror.
 
 Pinned order (do not reorder — the bits are the contract):
   1. upcast the low-rank factors to fp32 (contiguous),
@@ -21,25 +21,17 @@ torch 2.9.1+cu128 on H100 for the r<=64 shapes of this lane. The fold-parity
 gate should be rerun on every environment change.
 """
 
-import os
-
 import torch
 
 
-_MERGED_FORWARD_ENV = "XORL_LORA_MERGED_FORWARD"
-_MERGED_CACHE_ENV = "XORL_LORA_MERGED_FORWARD_CACHE"
-
-
-def lora_merged_forward_enabled() -> bool:
-    """Opt-in flag for the merged-forward LoRA K3 contract lane."""
-    return os.environ.get(_MERGED_FORWARD_ENV, "0") == "1"
+def lora_merged_forward_enabled(module: object) -> bool:
+    """Whether one model-owned module uses canonical merged LoRA forwards."""
+    return bool(getattr(module, "exact_merged_forward", False))
 
 
 def lora_merged_cache_enabled() -> bool:
-    """Cache folded weights per module, keyed on adapter-param versions
-    (default on). ``XORL_LORA_MERGED_FORWARD_CACHE=0`` refolds on every call
-    (bounded memory, slower)."""
-    return os.environ.get(_MERGED_CACHE_ENV, "1") == "1"
+    """Cache folded weights per module, keyed on adapter-param versions."""
+    return True
 
 
 def canonical_lora_delta_gkn(

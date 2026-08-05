@@ -3,7 +3,6 @@ from __future__ import annotations
 # Adapted from flash-linear-attention/fla/layers/gated_deltanet.py.
 # Portions of this file are adapted from flash-linear-attention, Copyright (c) 2023-2025 Songlin Yang, licensed under the MIT License.
 import math
-import os
 import warnings
 from typing import Any
 
@@ -26,7 +25,11 @@ from xorl.ops.linear_attention.modules import (
     ShortConvolution,
     causal_conv1d_qkv_contract,
 )
-from xorl.ops.linear_attention.modules.bi_contract import bi_fused_gdn_gating, is_gdn_contract_enabled
+from xorl.ops.linear_attention.modules.bi_contract import (
+    _is_gdn_contract_enabled,
+    bi_fused_gdn_gating,
+    gdn_contract,
+)
 from xorl.ops.linear_attention.ops.gated_delta_rule import (
     chunk_gated_delta_rule,
     fused_recurrent_gated_delta_rule,
@@ -38,127 +41,6 @@ def _sglang_compatible_beta_gate(b_input: torch.Tensor) -> torch.Tensor:
     if beta.dtype != b_input.dtype:
         beta = beta.to(dtype=b_input.dtype).float()
     return beta
-
-
-def _env_flag(name: str) -> bool:
-    return os.environ.get(name, "").lower() in {"1", "true", "yes", "on"}
-
-
-def _sglang_chunk_forward_diagnostic_enabled() -> bool:
-    return _env_flag("XORL_GDN_SGLANG_CHUNK_FORWARD")
-
-
-def _diagnostic_layer_enabled(env_name: str, layer_idx: int | None) -> bool:
-    split_layers = os.environ.get(env_name, "").strip()
-    if not split_layers or split_layers.lower() in {"all", "*"}:
-        return True
-    try:
-        enabled_layers = {int(item.strip()) for item in split_layers.split(",") if item.strip()}
-    except ValueError as exc:
-        raise ValueError(f"Invalid {env_name}={split_layers!r}; expected comma-separated layer indices") from exc
-    return layer_idx in enabled_layers
-
-
-def _depthwise_causal_conv_split(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor | None,
-    activation: str | None,
-    cu_seqlens: torch.LongTensor | None,
-) -> torch.Tensor:
-    def apply_one(seq: torch.Tensor) -> torch.Tensor:
-        y = F.conv1d(
-            seq.transpose(1, 2),
-            weight,
-            bias,
-            padding=weight.shape[-1] - 1,
-            groups=weight.shape[0],
-        )
-        y = y[:, :, : seq.shape[1]].transpose(1, 2)
-        if activation in {None, "identity"}:
-            return y
-        if activation in {"silu", "swish"}:
-            return F.silu(y)
-        raise ValueError(f"Unsupported activation: {activation}")
-
-    if cu_seqlens is None:
-        return apply_one(x)
-    if x.shape[0] != 1:
-        raise ValueError("Packed varlen GDN TP-split diagnostic expects batch size 1.")
-    outputs = [
-        apply_one(x[:, int(start) : int(end)])
-        for start, end in zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist(), strict=False)
-    ]
-    return torch.cat(outputs, dim=1) if outputs else x.new_zeros(x.shape)
-
-
-def _sglang_chunk_gated_delta_rule_forward_only(
-    *,
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
-    initial_state: torch.Tensor | None,
-    output_final_state: bool,
-    cu_seqlens: torch.LongTensor | None,
-    use_qk_l2norm_in_kernel: bool,
-) -> tuple[torch.Tensor, torch.Tensor | None]:
-    if torch.is_grad_enabled() and any(tensor.requires_grad for tensor in (q, k, v, g, beta)):
-        raise RuntimeError(
-            "XORL_GDN_SGLANG_CHUNK_FORWARD is a forward-only diagnostic path. "
-            "Use it only for /forward K3 replay, not forward_backward training."
-        )
-    if output_final_state:
-        raise RuntimeError("XORL_GDN_SGLANG_CHUNK_FORWARD does not support recurrent state output.")
-
-    from sglang.srt.layers.attention.fla.chunk import (  # noqa: PLC0415
-        chunk_gated_delta_rule as sglang_chunk_gated_delta_rule,
-    )
-
-    num_states = q.shape[0] if cu_seqlens is None else int(cu_seqlens.numel() - 1)
-    if initial_state is None:
-        initial_state = torch.zeros(
-            num_states,
-            v.shape[-2],
-            v.shape[-1],
-            k.shape[-1],
-            device=q.device,
-            dtype=q.dtype,
-        )
-        initial_state_indices = torch.arange(num_states, device=q.device, dtype=torch.long)
-    else:
-        if cu_seqlens is not None and initial_state.shape[0] != num_states:
-            raise ValueError(
-                "XORL_GDN_SGLANG_CHUNK_FORWARD expected one recurrent state per packed sequence: "
-                f"{initial_state.shape[0]} != {num_states}"
-            )
-        initial_state_indices = torch.arange(initial_state.shape[0], device=q.device, dtype=torch.long)
-
-    out, _, state = sglang_chunk_gated_delta_rule(
-        q=q,
-        k=k,
-        v=v,
-        g=g,
-        beta=beta,
-        initial_state=initial_state,
-        initial_state_indices=initial_state_indices,
-        cu_seqlens=cu_seqlens,
-        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
-    )
-    return out, state
-
-
-def _conv_contract_enabled() -> bool:
-    return _env_flag("XORL_GDN_CONV_CONTRACT")
-
-
-def _packed_segment_loop_enabled() -> bool:
-    return os.getenv("XORL_GDN_PACKED_SEGMENT_LOOP", "0").strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _fused_projection_enabled() -> bool:
-    return os.getenv("XORL_GDN_FUSED_PROJECTIONS", "0").strip().lower() in {"1", "true", "yes", "on"}
 
 
 class GatedDeltaNet(nn.Module):
@@ -177,6 +59,7 @@ class GatedDeltaNet(nn.Module):
         conv_bias: bool = False,
         layer_idx: int | None = None,
         norm_eps: float = 1e-5,
+        exact_contract: bool = False,
         **kwargs: Any,
     ) -> None:
         del kwargs
@@ -193,6 +76,8 @@ class GatedDeltaNet(nn.Module):
         self.head_dim = head_dim
         self.num_heads = num_heads
         self.num_v_heads = num_v_heads if num_v_heads is not None else num_heads
+        self.exact_contract = exact_contract
+        self.exact_merged_forward = exact_contract
 
         self.head_k_dim = head_dim
         self.head_v_dim = int(self.head_dim * self.expand_v)
@@ -318,177 +203,32 @@ class GatedDeltaNet(nn.Module):
 
     def _project_output_linear(self, o: torch.Tensor) -> torch.Tensor:
         output_adapter = getattr(self, "out_proj", None)
-        if output_adapter is not None and lora_merged_forward_enabled():
+        if output_adapter is not None and lora_merged_forward_enabled(self):
             folded = output_adapter.merged_weight_for_forward(self.o_proj.weight)
             return self._linear_with_contract(self.o_proj, o, folded)
 
-        split_count = int(os.environ.get("XORL_GDN_DIAGNOSTIC_O_PROJ_TP_SPLIT", "0") or 0)
-        if split_count <= 1:
-            return self._add_output_lora(o, self.o_proj(o))
-
-        split_layers = os.environ.get("XORL_GDN_DIAGNOSTIC_O_PROJ_TP_SPLIT_LAYERS", "").strip()
-        if split_layers and split_layers.lower() not in {"all", "*"}:
-            try:
-                enabled_layers = {int(item.strip()) for item in split_layers.split(",") if item.strip()}
-            except ValueError as exc:
-                raise ValueError(
-                    f"Invalid XORL_GDN_DIAGNOSTIC_O_PROJ_TP_SPLIT_LAYERS={split_layers!r}; "
-                    "expected comma-separated layer indices"
-                ) from exc
-            if self.layer_idx not in enabled_layers:
-                return self._add_output_lora(o, self.o_proj(o))
-
-        weight = self.o_proj.weight
-        input_dim = o.shape[-1]
-        if input_dim % split_count != 0 or weight.shape[1] != input_dim:
-            return self._add_output_lora(o, self.o_proj(o))
-
-        sum_fp32 = _env_flag("XORL_GDN_DIAGNOSTIC_O_PROJ_TP_SPLIT_SUM_FP32")
-        keep_fp32 = _env_flag("XORL_GDN_DIAGNOSTIC_O_PROJ_TP_SPLIT_KEEP_FP32")
-        chunk_size = input_dim // split_count
-        output = None
-        output_dtype = None
-        for idx in range(split_count):
-            start = idx * chunk_size
-            end = start + chunk_size
-            partial = F.linear(
-                o[..., start:end],
-                weight[:, start:end],
-                self.o_proj.bias if idx == 0 else None,
-            )
-            output_dtype = partial.dtype
-            if sum_fp32:
-                partial = partial.float()
-            output = partial if output is None else output + partial
-        if sum_fp32 and output_dtype is not None and not keep_fp32:
-            output = output.to(output_dtype)
-        return self._add_output_lora(o, output)
-
-    def _diagnostic_tp_split_count(self) -> int:
-        split_count = int(os.environ.get("XORL_GDN_DIAGNOSTIC_TP_SPLIT", "0") or 0)
-        if split_count <= 1:
-            return 0
-        if not _diagnostic_layer_enabled("XORL_GDN_DIAGNOSTIC_TP_SPLIT_LAYERS", self.layer_idx):
-            return 0
-        if self.num_heads % split_count != 0 or self.num_v_heads % split_count != 0:
-            return 0
-        return split_count
-
-    def _forward_diagnostic_tp_split(
-        self,
-        hidden_states: torch.Tensor,
-        *,
-        split_count: int,
-        cu_seqlens: torch.LongTensor | None,
-    ) -> torch.Tensor:
-        key_heads_per_rank = self.num_heads // split_count
-        value_heads_per_rank = self.num_v_heads // split_count
-        if value_heads_per_rank > key_heads_per_rank and value_heads_per_rank % key_heads_per_rank != 0:
-            raise ValueError(
-                "XORL_GDN_DIAGNOSTIC_TP_SPLIT requires local value heads to be divisible by local key heads: "
-                f"value_heads={value_heads_per_rank}, key_heads={key_heads_per_rank}"
-            )
-        key_dim_per_rank = key_heads_per_rank * self.head_k_dim
-        value_dim_per_rank = value_heads_per_rank * self.head_v_dim
-
-        final = hidden_states.new_zeros(*hidden_states.shape[:-1], self.hidden_size)
-        for rank in range(split_count):
-            key_start = rank * key_dim_per_rank
-            key_end = key_start + key_dim_per_rank
-            value_start = rank * value_dim_per_rank
-            value_end = value_start + value_dim_per_rank
-            value_head_start = rank * value_heads_per_rank
-            value_head_end = value_head_start + value_heads_per_rank
-
-            q_input = F.linear(hidden_states, self.q_proj.weight[key_start:key_end])
-            k_input = F.linear(hidden_states, self.k_proj.weight[key_start:key_end])
-            v_input = F.linear(hidden_states, self.v_proj.weight[value_start:value_end])
-            a_input = F.linear(hidden_states, self.a_proj.weight[value_head_start:value_head_end]).float()
-            b_input = F.linear(hidden_states, self.b_proj.weight[value_head_start:value_head_end])
-            gate_input = F.linear(hidden_states, self.g_proj.weight[value_start:value_end]) if self.use_gate else None
-
-            if self.use_short_conv:
-                q = _depthwise_causal_conv_split(
-                    q_input,
-                    self.q_conv1d.weight[key_start:key_end],
-                    self.q_conv1d.bias[key_start:key_end] if self.q_conv1d.bias is not None else None,
-                    self.q_conv1d.activation,
-                    cu_seqlens,
-                )
-                k = _depthwise_causal_conv_split(
-                    k_input,
-                    self.k_conv1d.weight[key_start:key_end],
-                    self.k_conv1d.bias[key_start:key_end] if self.k_conv1d.bias is not None else None,
-                    self.k_conv1d.activation,
-                    cu_seqlens,
-                )
-                v = _depthwise_causal_conv_split(
-                    v_input,
-                    self.v_conv1d.weight[value_start:value_end],
-                    self.v_conv1d.bias[value_start:value_end] if self.v_conv1d.bias is not None else None,
-                    self.v_conv1d.activation,
-                    cu_seqlens,
-                )
-            else:
-                q = F.silu(q_input)
-                k = F.silu(k_input)
-                v = F.silu(v_input)
-
-            q = rearrange(q, "... (h d) -> ... h d", d=self.head_k_dim)
-            k = rearrange(k, "... (h d) -> ... h d", d=self.head_k_dim)
-            v = rearrange(v, "... (h d) -> ... h d", d=self.head_v_dim)
-            if value_heads_per_rank > key_heads_per_rank:
-                repeat_factor = value_heads_per_rank // key_heads_per_rank
-                q, k = (repeat(x, "... h d -> ... (h g) d", g=repeat_factor) for x in (q, k))
-
-            beta = _sglang_compatible_beta_gate(b_input)
-            if self.allow_neg_eigval:
-                beta = beta * 2.0
-            g = -self.A_log[value_head_start:value_head_end].float().exp() * F.softplus(
-                a_input + self.dt_bias[value_head_start:value_head_end]
-            )
-
-            if _sglang_chunk_forward_diagnostic_enabled():
-                local_o, _ = _sglang_chunk_gated_delta_rule_forward_only(
-                    q=q,
-                    k=k,
-                    v=v,
-                    g=g,
-                    beta=beta,
-                    initial_state=None,
-                    output_final_state=False,
-                    cu_seqlens=cu_seqlens,
-                    use_qk_l2norm_in_kernel=True,
-                )
-            else:
-                local_o, _ = chunk_gated_delta_rule(
-                    q=q,
-                    k=k,
-                    v=v,
-                    g=g,
-                    beta=beta,
-                    initial_state=None,
-                    output_final_state=False,
-                    cu_seqlens=cu_seqlens,
-                    use_qk_l2norm_in_kernel=True,
-                )
-
-            if self.use_gate:
-                gate = rearrange(gate_input, "... (h d) -> ... h d", d=self.head_v_dim)
-                local_o = self.o_norm(local_o, gate)
-            else:
-                local_o = self.o_norm(local_o)
-
-            local_o = rearrange(local_o, "b t h d -> b t (h d)")
-            partial = F.linear(
-                local_o,
-                self.o_proj.weight[:, value_start:value_end],
-                self.o_proj.bias if rank == 0 else None,
-            )
-            final = final + partial
-        return final
+        return self._add_output_lora(o, self.o_proj(o))
 
     def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        past_key_values: Any | None = None,
+        use_cache: bool | None = False,
+        output_attentions: bool | None = False,
+        **kwargs: Any,
+    ) -> tuple[torch.Tensor, torch.Tensor | None, Any | None]:
+        with gdn_contract(self.exact_contract):
+            return self._forward_impl(
+                hidden_states,
+                attention_mask=attention_mask,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                output_attentions=output_attentions,
+                **kwargs,
+            )
+
+    def _forward_impl(
         self,
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
@@ -539,53 +279,8 @@ class GatedDeltaNet(nn.Module):
             indices, cu_seqlens, _ = get_unpad_data(attention_mask[:, -q_len:])
             hidden_states = index_first_axis(rearrange(hidden_states, "b s ... -> (b s) ..."), indices).unsqueeze(0)
 
-        diagnostic_tp_split = self._diagnostic_tp_split_count()
-        if diagnostic_tp_split:
-            if _conv_contract_enabled():
-                raise RuntimeError("XORL_GDN_CONV_CONTRACT and XORL_GDN_DIAGNOSTIC_TP_SPLIT are mutually exclusive.")
-            if cp_context is not None:
-                raise RuntimeError("XORL_GDN_DIAGNOSTIC_TP_SPLIT does not support CP.")
-            if mode != "chunk":
-                raise RuntimeError("XORL_GDN_DIAGNOSTIC_TP_SPLIT supports chunk mode only.")
-            if use_cache or last_state is not None:
-                raise RuntimeError("XORL_GDN_DIAGNOSTIC_TP_SPLIT does not support recurrent/cache state.")
-            o = self._forward_diagnostic_tp_split(
-                hidden_states,
-                split_count=diagnostic_tp_split,
-                cu_seqlens=cu_seqlens,
-            )
-            if attention_mask is not None and indices is not None:
-                o = pad_input(o.squeeze(0), indices, batch_size, q_len)
-            return o, None, past_key_values
-
         merged_input_adapter = getattr(self, "in_proj_qkvz", None)
-        if _fused_projection_enabled() and self.use_gate:
-            qkvz_weight = torch.cat(
-                (
-                    self.q_proj.weight,
-                    self.k_proj.weight,
-                    self.v_proj.weight,
-                    self.g_proj.weight,
-                ),
-                dim=0,
-            )
-            if merged_input_adapter is not None and lora_merged_forward_enabled():
-                qkvz_weight = merged_input_adapter.merged_weight_for_forward(qkvz_weight)
-            qkvz = F.linear(hidden_states, qkvz_weight)
-            q_input, k_input, v_input, gate_input = qkvz.split(
-                (self.key_dim, self.key_dim, self.value_dim, self.value_dim),
-                dim=-1,
-            )
-            ba_weight = torch.cat(
-                (self.b_proj.weight, self.a_proj.weight),
-                dim=0,
-            )
-            b_input, a_input = F.linear(hidden_states, ba_weight).split(
-                (self.num_v_heads, self.num_v_heads),
-                dim=-1,
-            )
-            a_input = a_input.float()
-        elif merged_input_adapter is not None and lora_merged_forward_enabled():
+        if merged_input_adapter is not None and lora_merged_forward_enabled(self):
             offsets = [0]
             for projection in (self.q_proj, self.k_proj, self.v_proj, self.g_proj):
                 offsets.append(offsets[-1] + projection.out_features)
@@ -615,7 +310,7 @@ class GatedDeltaNet(nn.Module):
             b_input = self.b_proj(hidden_states)
             gate_input = self.g_proj(hidden_states) if self.use_gate else None
 
-        fused_lora_delta = None if lora_merged_forward_enabled() else self._fused_qkvz_lora_delta(hidden_states)
+        fused_lora_delta = None if lora_merged_forward_enabled(self) else self._fused_qkvz_lora_delta(hidden_states)
         if fused_lora_delta is not None:
             q_delta, k_delta, v_delta, gate_delta = fused_lora_delta
             q_input = q_input + q_delta.to(q_input.dtype)
@@ -625,24 +320,15 @@ class GatedDeltaNet(nn.Module):
                 raise RuntimeError("Fused qkvz LoRA requires a gated GDN layer")
             gate_input = gate_input + gate_delta.to(gate_input.dtype)
 
-        diagnostic_capture = getattr(self, "_diagnostic_capture_component", None)
-        if diagnostic_capture is not None:
-            diagnostic_capture("gdn_q_input", q_input)
-            diagnostic_capture("gdn_k_input", k_input)
-            diagnostic_capture("gdn_v_input", v_input)
-            diagnostic_capture("gdn_a_input", a_input)
-            diagnostic_capture("gdn_b_input", b_input)
-            diagnostic_capture("gdn_gate_input", gate_input)
+        if _is_gdn_contract_enabled() and not self.use_short_conv:
+            raise RuntimeError("Exact Qwen3.5 GDN requires short convolution")
 
-        if _conv_contract_enabled() and not self.use_short_conv:
-            raise RuntimeError("XORL_GDN_CONV_CONTRACT is armed but this GatedDeltaNet has use_short_conv=False.")
-
-        if self.use_short_conv and _conv_contract_enabled():
+        if self.use_short_conv and _is_gdn_contract_enabled():
             if cp_context is not None:
-                raise RuntimeError("XORL_GDN_CONV_CONTRACT does not support CP yet (conv prefix exchange).")
+                raise RuntimeError("Exact Qwen3.5 GDN does not support CP yet (conv prefix exchange)")
             if use_cache or last_state is not None:
                 raise RuntimeError(
-                    "XORL_GDN_CONV_CONTRACT covers prefill only; conv cache/decode comes with the decode contract."
+                    "Exact Qwen3.5 trainer GDN supports packed prefill only, not recurrent cache updates"
                 )
             q, k, v = causal_conv1d_qkv_contract(
                 q_input,
@@ -685,11 +371,6 @@ class GatedDeltaNet(nn.Module):
             v = F.silu(v_input)
             conv_state_q = conv_state_k = conv_state_v = None
 
-        if diagnostic_capture is not None:
-            diagnostic_capture("gdn_conv_q", q)
-            diagnostic_capture("gdn_conv_k", k)
-            diagnostic_capture("gdn_conv_v", v)
-
         q, k = (rearrange(x, "... (h d) -> ... h d", d=self.head_k_dim) for x in (q, k))
         v = rearrange(v, "... (h d) -> ... h d", d=self.head_v_dim)
 
@@ -697,8 +378,8 @@ class GatedDeltaNet(nn.Module):
             repeat_factor = self.num_v_heads // self.num_heads
             q, k = (repeat(x, "... h d -> ... (h g) d", g=repeat_factor) for x in (q, k))
 
-        if is_gdn_contract_enabled():
-            # P5 GDN contract: serving's fused_gdn_gating kernel kills the
+        if _is_gdn_contract_enabled():
+            # The serving fused-GDN gating kernel removes the
             # 1-ULP g term (torch softplus vs tl.log(1+tl.exp)); beta is bitwise
             # either way.
             g, beta = bi_fused_gdn_gating(self.A_log, a_input, b_input, self.dt_bias)
@@ -707,10 +388,6 @@ class GatedDeltaNet(nn.Module):
             g = -self.A_log.float().exp() * F.softplus(a_input + self.dt_bias)
         if self.allow_neg_eigval:
             beta = beta * 2.0
-        if diagnostic_capture is not None:
-            diagnostic_capture("gdn_g", g)
-            diagnostic_capture("gdn_beta", beta)
-
         recurrent_state = last_state["recurrent_state"] if last_state is not None else None
 
         if mode == "chunk":
@@ -724,59 +401,20 @@ class GatedDeltaNet(nn.Module):
                 else:
                     chunk_fn = flashqla_chunk_gated_delta_rule
 
-            if _sglang_chunk_forward_diagnostic_enabled():
-                if cp_context is not None:
-                    raise RuntimeError("XORL_GDN_SGLANG_CHUNK_FORWARD does not support CP.")
-                o, recurrent_state = _sglang_chunk_gated_delta_rule_forward_only(
-                    q=q,
-                    k=k,
-                    v=v,
-                    g=g,
-                    beta=beta,
-                    initial_state=recurrent_state,
-                    output_final_state=bool(use_cache),
-                    cu_seqlens=cu_seqlens,
-                    use_qk_l2norm_in_kernel=True,
-                )
-            elif (
-                _packed_segment_loop_enabled()
-                and cu_seqlens is not None
-                and cp_context is None
-                and recurrent_state is None
-                and not use_cache
-            ):
-                outputs: list[torch.Tensor] = []
-                for start, end in zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist(), strict=False):
-                    if end <= start:
-                        continue
-                    seg_o, _ = chunk_fn(
-                        q=q[:, start:end],
-                        k=k[:, start:end],
-                        v=v[:, start:end],
-                        g=g[:, start:end],
-                        beta=beta[:, start:end],
-                        initial_state=None,
-                        output_final_state=False,
-                        cu_seqlens=None,
-                        use_qk_l2norm_in_kernel=True,
-                    )
-                    outputs.append(seg_o)
-                o = torch.cat(outputs, dim=1) if outputs else v.new_zeros(v.shape)
-            else:
-                chunk_kwargs = dict(
-                    q=q,
-                    k=k,
-                    v=v,
-                    g=g,
-                    beta=beta,
-                    initial_state=recurrent_state,
-                    output_final_state=bool(use_cache),
-                    cu_seqlens=cu_seqlens,
-                    use_qk_l2norm_in_kernel=True,
-                )
-                if cp_context is not None:
-                    chunk_kwargs["cp_context"] = cp_context
-                o, recurrent_state = chunk_fn(**chunk_kwargs)
+            chunk_kwargs = dict(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                initial_state=recurrent_state,
+                output_final_state=bool(use_cache),
+                cu_seqlens=cu_seqlens,
+                use_qk_l2norm_in_kernel=True,
+            )
+            if cp_context is not None:
+                chunk_kwargs["cp_context"] = cp_context
+            o, recurrent_state = chunk_fn(**chunk_kwargs)
 
         elif mode == "fused_recurrent":
             o, recurrent_state = fused_recurrent_gated_delta_rule(
@@ -793,9 +431,6 @@ class GatedDeltaNet(nn.Module):
         else:
             raise NotImplementedError(f"Unsupported mode `{mode}`.")
 
-        if diagnostic_capture is not None:
-            diagnostic_capture("gdn_scan_out", o)
-
         if past_key_values is not None and self.layer_idx is not None:
             past_key_values.update(
                 recurrent_state=recurrent_state,
@@ -809,9 +444,6 @@ class GatedDeltaNet(nn.Module):
             o = self.o_norm(o, gate)
         else:
             o = self.o_norm(o)
-        if diagnostic_capture is not None:
-            diagnostic_capture("gdn_normed", o)
-
         o = rearrange(o, "b t h d -> b t (h d)")
         o = self._project_output_linear(o)
         if attention_mask is not None and indices is not None:

@@ -16,7 +16,11 @@ import torch
 from xorl.lora.modules import LoraLinear
 from xorl.lora.utils import inject_lora_into_model
 from xorl.models.auto import _load_local_xorl_config, _namespace_from_dict, build_foundation_model
-from xorl.models.layers import RotaryEmbedding
+from xorl.models.layers import (
+    RMS_NORM_FAMILY_NO_RESIDUAL,
+    RMS_NORM_FAMILY_RESIDUAL_TREE,
+    RotaryEmbedding,
+)
 from xorl.models.layers.moe import MoEBlock, MoEExpertsLoRA
 from xorl.models.layers.moe.routing_replay import set_replay_stage
 from xorl.models.layers.normalization import set_rmsnorm_mode
@@ -151,6 +155,30 @@ def test_glm5_config_is_standalone():
     config = Glm5Config()
     assert isinstance(config, Glm5Config)
     assert config.model_type == "xorl_glm5"
+
+
+def test_glm5_declares_every_rmsnorm_serving_family():
+    config = _tiny_config()
+    set_rmsnorm_mode("sglang_fused")
+    try:
+        model = Glm5Model(config).eval()
+    finally:
+        set_rmsnorm_mode("eager")
+
+    for layer_idx, layer in enumerate(model.layers):
+        assert layer.self_attn.q_a_layernorm.mode == "sglang_fused"
+        assert layer.self_attn.kv_a_layernorm.mode == "sglang_fused"
+        assert layer.input_layernorm.mode == "sglang_fused"
+        assert layer.post_attention_layernorm.mode == "sglang_fused"
+        assert layer.self_attn.q_a_layernorm.family == RMS_NORM_FAMILY_NO_RESIDUAL
+        assert layer.self_attn.kv_a_layernorm.family == RMS_NORM_FAMILY_NO_RESIDUAL
+        assert layer.input_layernorm.family == (
+            RMS_NORM_FAMILY_NO_RESIDUAL if layer_idx == 0 else RMS_NORM_FAMILY_RESIDUAL_TREE
+        )
+        assert layer.post_attention_layernorm.family == RMS_NORM_FAMILY_RESIDUAL_TREE
+
+    assert model.norm.mode == "sglang_fused"
+    assert model.norm.family == RMS_NORM_FAMILY_RESIDUAL_TREE
 
 
 def test_from_hf_config_captures_mla_moe_dsa_and_mtp_fields():
@@ -293,6 +321,35 @@ def test_indexer_has_four_glm_specific_projections():
     assert indexer.k_norm.weight.shape == (config.index_head_dim,)
     assert indexer.weights_proj.in_features == config.hidden_size
     assert indexer.weights_proj.out_features == config.index_n_heads
+
+
+def test_indexer_contract_routes_head_projection_through_fp32_kernel(monkeypatch):
+    config = _tiny_config(indexer_types=["full"] * 4)
+    config._glm52_exact_contract = True
+    indexer = Glm5DsaIndexer(config).to(torch.bfloat16)
+    hidden = torch.randn(2, 3, config.hidden_size, dtype=torch.bfloat16)
+    q_compressed = torch.randn(2, 3, config.q_lora_rank, dtype=torch.bfloat16)
+    cos = torch.ones(2, 3, config.qk_rope_head_dim, dtype=torch.bfloat16)
+    sin = torch.zeros_like(cos)
+    calls = []
+
+    def fake_contract(input, weight):
+        calls.append((input.shape, weight.shape, input.dtype, weight.dtype))
+        return torch.nn.functional.linear(input.float(), weight.float())
+
+    monkeypatch.setattr("xorl.models.transformers.glm5.indexer.bi_bf16_fp32_linear", fake_contract)
+    _, _, head_weights = indexer.project(hidden, q_compressed, (cos, sin))
+
+    assert calls == [
+        (
+            torch.Size([2, 3, config.hidden_size]),
+            torch.Size([config.index_n_heads, config.hidden_size]),
+            torch.bfloat16,
+            torch.bfloat16,
+        )
+    ]
+    expected = fake_contract(hidden, indexer.weights_proj.weight) * (config.index_n_heads**-0.5)
+    assert torch.equal(head_weights, expected)
 
 
 def test_attention_carries_indexer_module():
@@ -823,6 +880,17 @@ def test_glm5_attention_sparse_matches_dense_when_topk_covers_full_seq():
     sparse_out = model(input_ids=input_ids).last_hidden_state
 
     torch.testing.assert_close(sparse_out, dense_out, atol=1e-4, rtol=1e-4)
+
+
+def test_sparse_path_rejects_distributed_lora_training_without_ownership_contract(monkeypatch):
+    config = _tiny_config(index_topk=4, max_position_embeddings=8)
+    attention = Glm5Attention(config, layer_idx=0)
+    inject_lora_into_model(attention, r=4, lora_alpha=8, target_modules=["kv_b_proj"])
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+
+    with pytest.raises(RuntimeError, match="adapter-gradient ownership contract"):
+        attention._split_kv_b_weight()
 
 
 # --------------------------------------------------------------------------- #

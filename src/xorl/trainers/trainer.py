@@ -40,7 +40,13 @@ from xorl.lora.utils import (
     inject_lora_into_model_with_moe,
     save_lora_checkpoint,
 )
-from xorl.models import build_foundation_model, build_tokenizer, save_model_assets, save_model_weights
+from xorl.models import (
+    build_foundation_model,
+    build_tokenizer,
+    resolve_cross_entropy_mode,
+    save_model_assets,
+    save_model_weights,
+)
 from xorl.models.checkpoint_handlers.buffers import get_prequantized_exclude_modules
 from xorl.models.layers.moe.aux_loss import LoadBalancingBuffer, global_load_balancing_loss_func
 from xorl.models.layers.moe.routing_replay import RoutingReplay, set_replay_stage
@@ -685,6 +691,7 @@ class Trainer:
             weights_path=args.model.model_path,
             torch_dtype=model_dtype,
             attn_implementation=args.model.attn_implementation,
+            non_glm_attn_default="flash_attention_3",
             moe_implementation=args.model.moe_implementation,
             moe_routing_weights_before_down=args.model.moe_routing_weights_before_down,
             ep_dispatch=args.model.ep_dispatch,
@@ -707,6 +714,23 @@ class Trainer:
             init_device=args.train.init_device,
         )
         self.model_config = self.model.config
+        numerical_program = self.model_config._resolved_numerical_program
+        args.model.attn_implementation = numerical_program["attn_implementation"]
+        args.model.router_fp32 = numerical_program["router_fp32"]
+        args.model.lm_head_fp32 = numerical_program["lm_head_fp32"]
+        args.model.rmsnorm_mode = numerical_program["rmsnorm_mode"]
+        args.model.activation_native = numerical_program["activation_native"]
+        args.model.rope_native = numerical_program["rope_native"]
+        args.model.rope_class_b = numerical_program["rope_class_b"]
+        args.model.attention_cast_bf16 = numerical_program["attention_cast_bf16"]
+        args.model.sparse_mla_enabled = numerical_program["sparse_mla_enabled"]
+        args.model.sparse_mla_backend = numerical_program["sparse_mla_backend"]
+        args.train.ce_mode = resolve_cross_entropy_mode(self.model_config, args.train.ce_mode)
+        self._causallm_loss_params["ce_mode"] = args.train.ce_mode
+        if args.train.ce_mode != "quack_linear":
+            self._causallm_loss_params["lm_head_fp32"] = args.model.lm_head_fp32
+        else:
+            self._causallm_loss_params.pop("lm_head_fp32", None)
         # Normalize _no_split_modules to list — some HF models (e.g. GPT-OSS) define it as a set
         if isinstance(getattr(self.model, "_no_split_modules", None), set):
             self.model._no_split_modules = list(self.model._no_split_modules)
@@ -824,16 +848,6 @@ class Trainer:
             enable_qlora=args.lora.enable_qlora,
             enable_mixed_precision=args.train.enable_mixed_precision,
         )
-
-        if os.environ.get("XORL_BI_TRUNK_LINEAR", "0") == "1":
-            from xorl.ops.batch_invariant_ops import wrap_trunk_linears_batch_invariant  # noqa: PLC0415
-
-            wrapped = wrap_trunk_linears_batch_invariant(self.model)
-            pattern = ", ".join(f"{name}x{count}" for name, count in sorted(wrapped.items()))
-            logger.info_rank0(
-                f"XORL_BI_TRUNK_LINEAR=1: wrapped {sum(wrapped.values())} trunk linears "
-                f"(fwd batch-invariant, bwd cuBLAS; qk-norm on the family-1 BI kernel): {pattern}"
-            )
 
         # Save pre-hook before parallelization (some models register optimizer hooks)
         self._optimizer_pre_hook_fn = getattr(self.model, "get_optimizer_pre_hook", None)

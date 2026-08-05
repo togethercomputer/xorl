@@ -17,8 +17,7 @@ Select the backend with the ``XORL_GDN_BACKEND`` environment variable
 the caller falls back to ``fla`` (see :func:`warn_cp_fallback_once`).
 
 ``XORL_GDN_FLASHQLA_AUTOCP`` overrides FlashQLA's ``auto_cp`` intra-card CP
-heuristic (default: on; pinned off while the ``XORL_BI_GDN`` contract lane is
-armed — see :func:`resolve_flashqla_auto_cp`).
+heuristic outside an exact Qwen3.5 model program.
 """
 
 from __future__ import annotations
@@ -39,6 +38,10 @@ _warned_cp_fallback = False
 
 def get_gdn_backend() -> str:
     """Return the configured GDN chunk backend (``"fla"`` or ``"flashqla"``)."""
+    from xorl.ops.linear_attention.modules.bi_contract import _is_gdn_contract_enabled  # noqa: PLC0415
+
+    if _is_gdn_contract_enabled():
+        return "fla"
     backend = os.environ.get(GDN_BACKEND_ENV, "fla").strip().lower()
     if backend not in _VALID_BACKENDS:
         raise ValueError(
@@ -48,21 +51,22 @@ def get_gdn_backend() -> str:
 
 
 def resolve_flashqla_auto_cp(auto_cp: bool | None) -> bool:
-    """Resolve FlashQLA's ``auto_cp`` mode: explicit arg > env > contract-lane default.
+    """Resolve FlashQLA's ``auto_cp`` mode outside the exact Qwen program.
 
     auto_cp's intra-card CP heuristic (Be*H<=40 gate + warmup h0-drop approximation)
     breaks batch-invariance and changes math, so it is pinned OFF whenever the GDN
-    bitwise contract lane (``XORL_BI_GDN``) is armed; otherwise it defaults to ON
-    (unchanged non-contract throughput behavior).
+    exact Qwen model program is active; otherwise it defaults to ON.
     """
+    from xorl.ops.linear_attention.modules.bi_contract import _is_gdn_contract_enabled  # noqa: PLC0415
+
+    if _is_gdn_contract_enabled():
+        return False
     if auto_cp is not None:
         return auto_cp
     env = os.environ.get(FLASHQLA_AUTOCP_ENV)
     if env is not None:
         return env.strip().lower() in {"1", "true", "yes", "on"}
-    from xorl.ops.linear_attention.modules.bi_contract import is_gdn_contract_enabled  # noqa: PLC0415
-
-    return not is_gdn_contract_enabled()
+    return True
 
 
 def warn_cp_fallback_once() -> None:

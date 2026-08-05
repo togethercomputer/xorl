@@ -170,7 +170,7 @@ class LoraLinear(LoraModule, nn.Linear):
         return self.active_lora_alpha / self.active_r
 
     # ------------------------------------------------------------------
-    # Merged-forward K3 contract lane (XORL_LORA_MERGED_FORWARD=1)
+    # Merged-forward exact-model contract lane
     # ------------------------------------------------------------------
 
     def invalidate_merged_weight_cache(self) -> None:
@@ -234,7 +234,7 @@ class LoraLinear(LoraModule, nn.Linear):
         Returns:
             Output tensor of shape [..., out_features]
         """
-        if lora_merged_forward_enabled():
+        if lora_merged_forward_enabled(self):
             # Merged-forward contract lane: the base kernel runs on the folded
             # weight (identical to a serving engine that received W'), and the
             # low-rank GEMM lane exits the forward entirely.

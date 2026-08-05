@@ -65,10 +65,10 @@ class ServerArguments:
     tokenizer_path: Optional[str] = field(default=None, metadata={"help": "Path to tokenizer. Defaults to config_path"})
 
     attn_implementation: Optional[Literal["eager", "sdpa", "native", "flash_attention_3", "flash_attention_4"]] = field(
-        default="flash_attention_4",
+        default=None,
         metadata={
             "help": "Attention implementation. 'native': PyTorch SDPA+cuDNN (no deps, Hopper+Blackwell). "
-            "'flash_attention_3': FA3 (Hopper). 'flash_attention_4': FA4 CUTE (Hopper+Blackwell, default)."
+            "Omitting it preserves the FA4 server default and selects the required FA4 path for canonical GLM-5.2."
         },
     )
 
@@ -135,41 +135,45 @@ class ServerArguments:
     )
 
     # SGLang numerical alignment flags
-    router_fp32: bool = field(
-        default=True, metadata={"help": "Upcast MoE router gate computation to float32 for numerical stability."}
+    router_fp32: Optional[bool] = field(
+        default=None,
+        metadata={"help": "Upcast MoE router gate computation to float32; defaults to true after model resolution."},
     )
 
-    lm_head_fp32: bool = field(
-        default=True, metadata={"help": "Upcast LM head logits computation to float32 for numerical stability."}
+    lm_head_fp32: Optional[bool] = field(
+        default=None,
+        metadata={"help": "Upcast LM head logits computation to float32; defaults to true after model resolution."},
     )
 
-    rmsnorm_mode: Literal["eager", "native", "compile", "sglang", "sglang_fused", "sglang_jit", "sglang_kernel"] = (
-        field(
-            default="native",
-            metadata={
-                "help": "RMSNorm implementation mode. 'native' uses torch.nn.functional.rms_norm "
-                "and is the default. 'compile' runs that native path through torch.compile. "
-                "'eager' uses the plain eager implementation. 'sglang' uses native RMSNorm for "
-                "no-residual calls and SGLang's native residual RMSNorm reduction order. "
-                "'sglang_fused' matches 'sglang' bit-for-bit but replaces its eager residual-style "
-                "norms with fused batch-invariant Triton kernels (faster training, K3 preserved). "
-                "'sglang_jit' uses SGLang's JIT CUDA RMSNorm kernels for forward parity diagnostics. "
-                "'sglang_kernel' uses SGLang's production sgl_kernel RMSNorm kernels for diagnostics."
-            },
-        )
+    rmsnorm_mode: Optional[
+        Literal["eager", "native", "compile", "sglang", "sglang_fused", "sglang_jit", "sglang_kernel"]
+    ] = field(
+        default=None,
+        metadata={
+            "help": "RMSNorm implementation mode. Omitted means native for ordinary models "
+            "and the serving-exact fused implementation for canonical GLM-5.2. "
+            "'compile' runs that native path through torch.compile. "
+            "'eager' uses the plain eager implementation. 'sglang' uses native RMSNorm for "
+            "no-residual calls and SGLang's native residual RMSNorm reduction order. "
+            "'sglang_fused' matches 'sglang' bit-for-bit but replaces its eager residual-style "
+            "norms with fused batch-invariant Triton kernels (faster training, K3 preserved). "
+            "'sglang_jit' uses SGLang's JIT CUDA RMSNorm kernels for forward parity diagnostics. "
+            "'sglang_kernel' uses SGLang's production sgl_kernel RMSNorm kernels for diagnostics."
+        },
     )
 
     activation_native: bool = field(
         default=False, metadata={"help": "Use native SiLU instead of fused Triton kernel for SGLang alignment."}
     )
 
-    rope_native: bool = field(
-        default=False, metadata={"help": "Use naive RoPE implementation instead of flash_attn fused kernel."}
+    rope_native: Optional[bool] = field(
+        default=None,
+        metadata={"help": "Use native RoPE. Auto-enables for canonical GLM-5.2 when omitted."},
     )
-    rope_class_b: bool = field(
-        default=False,
+    rope_class_b: Optional[bool] = field(
+        default=None,
         metadata={
-            "help": "Use compiled Class-B RoPE fp32-chain numerics aligned with SGLang's stock fused CUDA kernel."
+            "help": "Use compiled Class-B RoPE fp32-chain numerics. Auto-enables for canonical GLM-5.2 when omitted."
         },
     )
 
@@ -180,6 +184,22 @@ class ServerArguments:
     flash_attention_deterministic: bool = field(
         default=False,
         metadata={"help": "Request FlashAttention deterministic backward kernels when available."},
+    )
+
+    sparse_mla_enabled: Optional[bool] = field(
+        default=None,
+        metadata={
+            "help": "Enable the GLM-5 sparse-MLA path instead of materializing dense attention masks. "
+            "Canonical GLM-5.2 enables it structurally when omitted."
+        },
+    )
+
+    sparse_mla_backend: Literal["auto", "torch", "tilelang", "flashmla"] = field(
+        default="auto",
+        metadata={
+            "help": "Sparse-MLA backend used when sparse_mla_enabled is true. "
+            "'flashmla' selects the GLM-5.2 serving-exact forward with a separately gated TileLang backward."
+        },
     )
 
     # Multimodal model configuration
@@ -611,10 +631,11 @@ class ServerArguments:
         default="meta", metadata={"help": "Device for model initialization"}
     )
 
-    ce_mode: CrossEntropyMode = field(
-        default="compiled",
+    ce_mode: Optional[CrossEntropyMode] = field(
+        default=None,
         metadata={
-            "help": "Cross-entropy implementation: 'bi_fused' (RECOMMENDED for server RL: batch-invariant "
+            "help": "Cross-entropy implementation. Omitted means compiled for ordinary models and "
+            "bi_fused for canonical GLM-5.2. 'bi_fused' is the batch-invariant "
             "K3 lm-head contract, fp32-class; needs tp=1, no z-loss, bf16 hidden/weight, lm_head_fp32), "
             "'compiled' (torch.compile), 'quack_linear' (Quack scalar loss; return_per_token uses fused "
             "selected-logprob CE), 'fused_quack', or 'eager' (baseline, may OOM at 32K)"
@@ -1365,6 +1386,8 @@ class ServerArguments:
                 "rope_class_b": self.rope_class_b,
                 "attention_cast_bf16": self.attention_cast_bf16,
                 "flash_attention_deterministic": self.flash_attention_deterministic,
+                "sparse_mla_enabled": self.sparse_mla_enabled,
+                "sparse_mla_backend": self.sparse_mla_backend,
             },
             "train": {
                 "output_dir": self.output_dir,

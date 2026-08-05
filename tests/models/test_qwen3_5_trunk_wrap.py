@@ -1,6 +1,6 @@
-"""Trunk-contract wrap selection audit on the Qwen3.5-MoE hybrid.
+"""Exact trunk wrap selection on the Qwen3.5-MoE hybrid.
 
-``wrap_trunk_linears_batch_invariant`` (XORL_BI_TRUNK_LINEAR=1) selects modules
+``wrap_trunk_linears_batch_invariant`` selects modules
 by leaf name. On the hybrid this must wrap the full-attention q/k/v/o
 projections, the shared expert (gate_up/down AND its sigmoid gate) and the
 MoE-dense-layer MLP projections — and, because xorl's GatedDeltaNet uses the
@@ -8,7 +8,7 @@ same q/k/v/o_proj leaf names, the linear-attention in/out projections match the
 pattern too (unlike serving's fused in_proj_qkvz/in_proj_ba naming). The GDN
 a/b/g projections and short convolutions stay outside the name set (silently
 skipped: the GDN kernel chain has no serving-side contract), as do the MoE
-router gate (contracted separately via XORL_MOE_BI_ROUTER) and lm_head/embed.
+router gate (contracted separately by the exact model program) and lm_head/embed.
 """
 
 import pytest
@@ -63,7 +63,7 @@ def test_qwen3_5_hybrid_trunk_wrap_selection():
     model = _build()
     try:
         wrapped = wrap_trunk_linears_batch_invariant(model)
-        assert is_trunk_linear_contract_enabled()
+        assert not is_trunk_linear_contract_enabled(), "model wrapping must not leak numerical state process-wide"
 
         # Leaf-name counts: q/k/v/o match BOTH the full-attn layer and the
         # GatedDeltaNet layer (2 each); gate_up/down match the dense-layer MLP
@@ -105,8 +105,8 @@ def test_qwen3_5_hybrid_trunk_wrap_selection():
         assert _is_wrapped(sparse_mlp.shared_expert_gate)
         assert _is_wrapped(dense_mlp.gate_up_proj)
         assert _is_wrapped(dense_mlp.down_proj)
-        # Router gate is intentionally outside the trunk lane (XORL_MOE_BI_ROUTER
-        # owns it); routed experts hold grouped parameters (no nn.Linear leaves).
+        # Router gate is intentionally outside the trunk lane; the exact router
+        # owns it. Routed experts hold grouped parameters (no nn.Linear leaves).
         assert not _is_wrapped(sparse_mlp.gate)
         assert not any(_is_wrapped(m) for m in sparse_mlp.experts.modules())
         # lm_head / embeddings never match the name set.

@@ -2,11 +2,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from xorl.ops.linear_attention.modules.bi_contract import (
-    bi_fused_gdn_gating,
-    bi_rms_norm_gated,
-    is_gdn_contract_enabled,
-)
+from xorl.ops.linear_attention.modules.bi_contract import bi_fused_gdn_gating, bi_rms_norm_gated, gdn_contract
 from xorl.ops.linear_attention.modules.fused_norm_gate import FusedRMSNormGated
 
 
@@ -116,33 +112,31 @@ def test_gated_norm_backward_matches_autograd_reference():
 
 @requires_cuda
 @pytest.mark.gpu
-def test_fused_rms_norm_gated_module_routes_under_flag(monkeypatch):
+def test_fused_rms_norm_gated_module_routes_under_exact_model_program():
     x, z, w = _norm_inputs(128, seed=3)
     module = FusedRMSNormGated(DV, eps=1e-6).to(device="cuda", dtype=torch.bfloat16)
     with torch.no_grad():
         module.weight.copy_(w)
 
-    monkeypatch.delenv("XORL_BI_GDN", raising=False)
-    assert not is_gdn_contract_enabled()
-    y_off = module(x, z)
+    with gdn_contract(False):
+        y_off = module(x, z)
 
-    monkeypatch.setenv("XORL_BI_GDN", "1")
-    assert is_gdn_contract_enabled()
-    y_on = module(x, z)
+    with gdn_contract(True):
+        y_on = module(x, z)
     assert torch.equal(y_on, bi_rms_norm_gated(x, module.weight, z, module.eps))
     assert torch.allclose(y_on.float(), y_off.float(), rtol=1e-2, atol=1e-2)
 
     # unverified configs void the bitwise claim and must fail loud
-    with pytest.raises(NotImplementedError):
+    with gdn_contract(True), pytest.raises(NotImplementedError):
         module(x, z, residual=torch.zeros_like(x))
 
 
 @requires_cuda
 @pytest.mark.gpu
-def test_gated_deltanet_gating_routes_under_flag(monkeypatch):
+def test_gated_deltanet_gating_routes_under_exact_model_program():
     from xorl.ops.linear_attention.layers.gated_deltanet import GatedDeltaNet  # noqa: PLC0415
 
-    module = (
+    ordinary = (
         GatedDeltaNet(
             hidden_size=256,
             expand_v=1.0,
@@ -154,17 +148,34 @@ def test_gated_deltanet_gating_routes_under_flag(monkeypatch):
             use_short_conv=True,
             conv_size=4,
             norm_eps=1e-6,
+            exact_contract=False,
         )
         .to(device="cuda", dtype=torch.bfloat16)
         .train()
     )
+    exact = (
+        GatedDeltaNet(
+            hidden_size=256,
+            expand_v=1.0,
+            head_dim=64,
+            num_heads=2,
+            num_v_heads=4,
+            mode="chunk",
+            use_gate=True,
+            use_short_conv=True,
+            conv_size=4,
+            norm_eps=1e-6,
+            exact_contract=True,
+        )
+        .to(device="cuda", dtype=torch.bfloat16)
+        .train()
+    )
+    exact.load_state_dict(ordinary.state_dict())
     gen = torch.Generator(device="cuda").manual_seed(0)
     hidden = torch.randn(1, 256, 256, generator=gen, device="cuda", dtype=torch.bfloat16)
 
-    monkeypatch.delenv("XORL_BI_GDN", raising=False)
-    y_off, _, _ = module(hidden)
-    monkeypatch.setenv("XORL_BI_GDN", "1")
-    y_on, _, _ = module(hidden)
+    y_off, _, _ = ordinary(hidden)
+    y_on, _, _ = exact(hidden)
     assert y_on.shape == y_off.shape
     assert torch.allclose(y_on.float(), y_off.float(), rtol=5e-2, atol=5e-2)
 

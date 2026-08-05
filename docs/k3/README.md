@@ -1,7 +1,10 @@
 # K3 train/serve parity
 
-This directory is the current operator entry point for minimizing trainer-to-sampler logprob
-divergence without giving up measured throughput.
+This directory is the operator entry point for minimizing trainer-to-sampler
+logprob divergence without giving up measured throughput. For the official
+GLM-5.2 and Qwen3.5-family server-training models, the exact program is
+architecture-selected; the historical per-component environment recipes are
+not current launch instructions.
 
 Start with [DEFAULTS_AND_PARETO.md](DEFAULTS_AND_PARETO.md). It contains:
 
@@ -12,8 +15,8 @@ Start with [DEFAULTS_AND_PARETO.md](DEFAULTS_AND_PARETO.md). It contains:
 
 Model-family bring-up guide:
 
-- [QWEN35_GDN_ZERO_K3_RUNBOOK.md](QWEN35_GDN_ZERO_K3_RUNBOOK.md) — dense Qwen3.5 GDN live-zero
-  result, root-cause chain, exact paired contract, measured overhead, receipts, and defaults.
+- [QWEN35_GDN_ZERO_K3_RUNBOOK.md](QWEN35_GDN_ZERO_K3_RUNBOOK.md) — current Qwen3.5-family
+  automatic exact program, admitted envelope, and direct qualification gate.
 
 ## Evidence classes
 
@@ -32,17 +35,18 @@ Never promote a claim to a stronger class without new evidence. Always report th
   with the current trees.
 - Softmax-attention MoE scoring has a bitwise contract **[GATE]**. Live MoE must also preserve
   routing capture/replay and validate the serving topology.
-- Qwen3.5-MoE has a trainable native-EP ordered-combine path **[GATE]**, but it remains explicit
-  opt-in: trainer EP must mirror serving EP, every serving environment needs a fresh capture gate,
-  and no composed throughput result supports making it a generic default.
+- Qwen3.6-35B-A3B has an architecture-selected exact GDN+MoE program at its
+  admitted EP8 topology **[GATE]**. A released trainer/serving revision pair is
+  not qualified by ancestry: it still requires its own repeatable capture and
+  raw-logprob replay.
 - Dense Qwen3.5-0.8B GDN at TP1 has an exact live rollout-to-optimizer mechanics gate
   **[LOCAL]** under the correctness-oriented rescan contract. This closes the blanket claim that
   GDN live decode has an unavoidable numerical floor; it does **not** certify Qwen3.5 MoE,
   distributed serving, production length, or production throughput. See
   [QWEN35_GDN_ZERO_K3_RUNBOOK.md](QWEN35_GDN_ZERO_K3_RUNBOOK.md).
-- Hybrid GDN+MoE remains bitwise for teacher-forced prefill/scoring **[GATE]** only. Its live
-  recurrent decode, MoE composition, and production topology still need a fresh exact gate; do
-  not infer a zero-K3 production lane from the tiny dense result.
+- GLM-5.2 has a full 78-block exact native-FP8 sparse-MLA/MoE program at
+  WORLD16/EP16/CP16 **[GATE]**. Its public revision pair likewise requires a
+  direct final-head replay before release.
 - Conventional tensor-sharded serving with effective `attn_tp_size` or `head_tp_size` greater
   than 1 has no certified BI lm-head/trunk contract. Top-level TP with EP8+DP-attention can still
   have effective attention/head TP1. The validated TP2 Wordle fallback is minimum-K3, not zero.

@@ -5,7 +5,6 @@ so that every feature (QLoRA, TP, DeepEP, …) is supported in both paths
 without reimplementation.
 """
 
-import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional, Set
 
@@ -18,7 +17,6 @@ from xorl.lora import freeze_base_parameters
 from xorl.lora.utils import inject_lora_into_model, inject_lora_into_model_with_moe
 from xorl.models import build_foundation_model
 from xorl.models.checkpoint_handlers.buffers import get_prequantized_exclude_modules
-from xorl.models.layers.rope import set_rope_class_b, set_rope_native
 from xorl.models.transformers.deepseek_v3.support import (
     freeze_deepseek_v3_router_parameters,
     validate_deepseek_v3_training_mode,
@@ -112,7 +110,8 @@ def build_training_model(
     config_path: str,
     weights_path: str,
     torch_dtype: str = "bfloat16",
-    attn_implementation: str = "flash_attention_3",
+    attn_implementation: Optional[str] = None,
+    non_glm_attn_default: str = "flash_attention_3",
     moe_implementation: Optional[str] = None,
     moe_routing_weights_before_down: bool | str = "auto",
     ep_dispatch: str = "alltoall",
@@ -187,16 +186,17 @@ def build_training_model(
     # --- Training flags ---
     freeze_router: bool = False,
     # --- SGLang numerical alignment ---
-    router_fp32: bool = True,
-    lm_head_fp32: bool = True,
-    rmsnorm_mode: str = "native",
+    router_fp32: Optional[bool] = None,
+    lm_head_fp32: Optional[bool] = None,
+    rmsnorm_mode: Optional[str] = None,
     activation_native: bool = False,
-    rope_native: bool = False,
-    rope_class_b: bool = False,
+    rope_native: Optional[bool] = None,
+    rope_class_b: Optional[bool] = None,
     attention_cast_bf16: bool = False,
-    sparse_mla_enabled: bool = False,
-    sparse_mla_backend: str = "auto",
+    sparse_mla_enabled: Optional[bool] = None,
+    sparse_mla_backend: Optional[str] = None,
     flash_attention_deterministic: bool = False,
+    server_training: bool = False,
 ) -> TrainingModelResult:
     """Build, inject LoRA/QLoRA, and parallelize a training model.
 
@@ -207,7 +207,7 @@ def build_training_model(
         2. Unfuse QKV (for TP)
         3. QLoRA or LoRA injection
         4. LoRA + mixed-precision: upcast trainable params to fp32
-        5. XORL_BI_TRUNK_LINEAR trunk wrap (pre-FSDP2) + save optimizer pre-hook
+        5. Exact model-program setup (pre-FSDP2) + save optimizer pre-hook
         6. build_parallelize_model()
         7. Deferred QLoRA quantization
         8. Freeze base params (LoRA/QLoRA) + optional router freeze
@@ -216,16 +216,11 @@ def build_training_model(
     Returns a :class:`TrainingModelResult` with model, config, PP state, etc.
     """
 
-    if rope_class_b and not rope_native:
+    if rope_class_b is True and rope_native is False:
         raise ValueError(
-            "rope_class_b=True requires rope_native=True: the certified Class-B contract "
-            "uses the CPU-built SGLang-layout cos/sin cache selected by rope_native."
+            "rope_class_b=True requires rope_native=True: the Class-B contract uses "
+            "the CPU-built serving-layout cos/sin cache selected by rope_native"
         )
-    # These selectors are process globals, so every build must set both values
-    # explicitly. Otherwise a Class-B build can leak into the next model built
-    # by the same worker even when that model's config requests Class A.
-    set_rope_native(bool(rope_native))
-    set_rope_class_b(bool(rope_class_b))
 
     # ------------------------------------------------------------------
     # 1. Build foundation model
@@ -236,6 +231,7 @@ def build_training_model(
         weights_path=weights_path,
         torch_dtype=torch_dtype,
         attn_implementation=attn_implementation,
+        non_glm_attn_default=non_glm_attn_default,
         moe_implementation=moe_implementation,
         moe_routing_weights_before_down=moe_routing_weights_before_down,
         ep_dispatch=ep_dispatch,
@@ -250,17 +246,19 @@ def build_training_model(
         rmsnorm_mode=rmsnorm_mode,
         activation_native=activation_native,
         rope_native=rope_native,
+        rope_class_b=rope_class_b,
         attention_cast_bf16=attention_cast_bf16,
         sparse_mla_enabled=sparse_mla_enabled,
         sparse_mla_backend=sparse_mla_backend,
         flash_attention_deterministic=flash_attention_deterministic,
+        server_training=server_training,
         init_device=init_device,
     )
 
     # Set module-level flags for rope and activation
-    if rope_native:
+    if getattr(model.config, "_rope_native", False):
         logger.info_rank0("Using native RoPE (flash_attn fused kernel disabled)")
-    if rope_class_b:
+    if getattr(model.config, "_rope_class_b", False):
         logger.info_rank0(
             "Using compiled Class-B RoPE fp32-chain numerics aligned with SGLang's stock fused CUDA kernel"
         )
@@ -400,18 +398,23 @@ def build_training_model(
     )
 
     # ------------------------------------------------------------------
-    # 5. Scoped batch-invariant trunk-linear contract (must precede FSDP2)
+    # 5. Exact model contract / legacy scoped trunk contract (must precede FSDP2)
     # ------------------------------------------------------------------
-    if os.environ.get("XORL_BI_TRUNK_LINEAR", "0") == "1":
-        from xorl.ops.batch_invariant_ops import wrap_trunk_linears_batch_invariant  # noqa: PLC0415
+    from xorl.ops.bi_families_v2 import _select_nonexact_families  # noqa: PLC0415
 
-        wrapped = wrap_trunk_linears_batch_invariant(model)
+    _select_nonexact_families()
+    if getattr(model.config, "_glm52_exact_contract", False):
+        from xorl.ops.bi_families_v2 import _select_glm52_families_v2  # noqa: PLC0415
+
+        _select_glm52_families_v2()
+
+    apply_exact_qwen = getattr(model, "_apply_qwen35_gdn_exact", None)
+    if server_training and callable(apply_exact_qwen):
+        wrapped = apply_exact_qwen()
         pattern = ", ".join(f"{name}x{count}" for name, count in sorted(wrapped.items()))
         logger.info_rank0(
-            f"XORL_BI_TRUNK_LINEAR=1: wrapped {sum(wrapped.values())} trunk linears "
-            f"(fwd batch-invariant, bwd cuBLAS; qk-norm on the family-1 BI kernel): {pattern}"
+            f"Exact Qwen3.5-family trainer path: wrapped {sum(wrapped.values())} trunk linears; {pattern}"
         )
-
     # ------------------------------------------------------------------
     # 5b. Save optimizer pre-hook (some models register hooks)
     # ------------------------------------------------------------------

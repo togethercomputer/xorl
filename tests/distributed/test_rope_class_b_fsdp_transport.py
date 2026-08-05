@@ -16,7 +16,6 @@ from xorl.distributed.torch_parallelize import (
     _bf16_mixed_precision_policy,
     _decoder_bf16_mixed_precision_policy,
 )
-from xorl.models.layers.rope import set_rope_class_b
 from xorl.utils.device import get_nccl_backend
 
 
@@ -71,9 +70,8 @@ def _run() -> None:
     device = _setup_dist()
     mesh = dist.device_mesh.init_device_mesh("cuda", (dist.get_world_size(),), mesh_dim_names=("dp_shard",))
 
-    set_rope_class_b(True)
     model = _Root().to(device)
-    fully_shard(model.decoder, mesh=mesh, mp_policy=_decoder_bf16_mixed_precision_policy())
+    fully_shard(model.decoder, mesh=mesh, mp_policy=_decoder_bf16_mixed_precision_policy(class_b=True))
     fully_shard(model, mesh=mesh, mp_policy=_bf16_mixed_precision_policy())
 
     x = torch.randn((2, 4, 8), dtype=torch.float32, device=device, requires_grad=True)
@@ -85,8 +83,7 @@ def _run() -> None:
     assert model.decoder.proj.weight.grad is not None
     assert torch.isfinite(model.decoder.proj.weight.grad.to_local()).all()
 
-    set_rope_class_b(False)
-    control = _decoder_bf16_mixed_precision_policy()
+    control = _decoder_bf16_mixed_precision_policy(class_b=False)
     assert control.cast_forward_inputs is True, "control must retain stock FSDP input casting"
 
     dist.destroy_process_group()

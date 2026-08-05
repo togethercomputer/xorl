@@ -42,7 +42,7 @@ the Qwen team's fused TileLang kernels for Gated Delta Rule (GDN) linear attenti
    `ChunkGatedDeltaRuleFunction` thread `auto_cp: bool | None` through to
    `chunk_gated_delta_rule_fwd`; `None` resolves via
    `xorl.ops.linear_attention.backend.resolve_flashqla_auto_cp` (explicit arg >
-   `XORL_GDN_FLASHQLA_AUTOCP` env > pinned **OFF** while the `XORL_BI_GDN` GDN contract
+   `XORL_GDN_FLASHQLA_AUTOCP` env > pinned **OFF** while the exact Qwen3.5 model program
    lane is armed, ON otherwise). auto_cp's intra-card CP heuristic (`Be*H<=40` gate +
    warmup h0-drop approximation) breaks batch-invariance and changes math (GDN
    contract gates 2/4); non-contract default behavior is unchanged. Regression tests:

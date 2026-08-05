@@ -1,41 +1,29 @@
-"""Guard tests for the native-EP ordered combine lane (XORL_MOE_SGLANG_EP_COMBINE=native).
-
-The numerical bar lives in the distributed step-0 gate
-(``experiments/k3_tests/moe_ep_native_combine_gate.py``: lane output bitwise vs
-a captured EP8 serving all-reduce, grad-replay bitwise per rank). Here: flag
-parsing, the exclusivity/topology guards, and the collective-free failure modes.
-"""
+"""Guard tests for the structural Qwen3.5-MoE native-EP combine."""
 
 import pytest
 import torch
 
 from xorl.models.layers.moe.ep_native_combine import (
+    QWEN35_NATIVE_EP_COMBINE_SIZES,
     gather_ids_for_ep_combine,
     gather_tokens_for_ep_combine,
     max_rows_for_ep_combine,
-    moe_sglang_ep_combine_native_enabled,
+    validate_qwen35_native_ep_combine_size,
 )
 
 
 pytestmark = [pytest.mark.cpu]
 
-FLAG = "XORL_MOE_SGLANG_EP_COMBINE"
+
+def test_qwen35_native_combine_admits_only_ep8():
+    assert QWEN35_NATIVE_EP_COMBINE_SIZES == frozenset({8})
+    validate_qwen35_native_ep_combine_size(8)
+    for size in (1, 2, 4, 16):
+        with pytest.raises(ValueError, match="EP8"):
+            validate_qwen35_native_ep_combine_size(size)
 
 
-def test_flag_parsing(monkeypatch):
-    monkeypatch.delenv(FLAG, raising=False)
-    assert not moe_sglang_ep_combine_native_enabled()
-    for off in ("0", "false", "off", "no", ""):
-        monkeypatch.setenv(FLAG, off)
-        assert not moe_sglang_ep_combine_native_enabled()
-    monkeypatch.setenv(FLAG, "native")
-    assert moe_sglang_ep_combine_native_enabled()
-    monkeypatch.setenv(FLAG, "tree")
-    with pytest.raises(ValueError, match="native"):
-        moe_sglang_ep_combine_native_enabled()
-
-
-def _qwen_block():
+def _qwen_block(*, exact: bool = False):
     from transformers import PretrainedConfig  # noqa: PLC0415
 
     from xorl.models.transformers.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeSparseMoeBlock  # noqa: PLC0415
@@ -49,35 +37,25 @@ def _qwen_block():
         norm_topk_prob=True,
         shared_expert_intermediate_size=24,
         train_router=False,
+        _qwen35_exact_contract=exact,
     )
     return Qwen3_5MoeSparseMoeBlock(cfg, moe_implementation="eager", layer_idx=0).to(torch.bfloat16)
 
 
-def test_native_requires_trainer_ep(monkeypatch):
-    monkeypatch.setenv(FLAG, "native")
-    blk = _qwen_block()
+def test_exact_native_requires_trainer_ep():
+    blk = _qwen_block(exact=True)
     x = torch.randn(1, 4, 32, dtype=torch.bfloat16)
+    routing = torch.zeros(4, 2, dtype=torch.float32)
+    selected = torch.zeros(4, 2, dtype=torch.int64)
     with pytest.raises(RuntimeError, match="trainer EP"):
-        blk(x)
+        blk._ep_combine_native(x, routing, selected)
 
 
-def test_native_excludes_sim(monkeypatch):
-    monkeypatch.setenv(FLAG, "native")
-    monkeypatch.setenv("XORL_MOE_SGLANG_EP_COMBINE_SIM", "8")
-
-    from xorl.distributed import parallel_state as ps_mod  # noqa: PLC0415
-
-    class _FakePS:
-        ep_enabled = True
-        ep_size = 8
-        ep_rank = 0
-        ep_group = None
-
-    monkeypatch.setattr(ps_mod, "get_parallel_state", lambda: _FakePS())
-    blk = _qwen_block()
-    x = torch.randn(1, 4, 32, dtype=torch.bfloat16)
-    with pytest.raises(RuntimeError, match="exclusive"):
-        blk(x)
+def test_exact_native_combine_is_structural():
+    blk = _qwen_block(exact=True)
+    assert blk._native_ep_combine
+    assert blk._exact_batch_invariant_router
+    assert blk.router._exact_batch_invariant
 
 
 def test_native_routed_partial_enters_through_module_call(monkeypatch):

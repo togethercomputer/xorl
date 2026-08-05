@@ -13,9 +13,9 @@ from xorl.server.runner.model_runner import ModelRunner
 pytestmark = pytest.mark.cpu
 
 
-def test_effective_lm_head_uses_canonical_merged_weight_with_adapter_gradients(monkeypatch):
-    monkeypatch.setenv("XORL_LORA_MERGED_FORWARD", "1")
+def test_effective_lm_head_uses_canonical_merged_weight_with_adapter_gradients():
     head = LoraLinear(5, 7, r=2, lora_alpha=4, bias=False, dtype=torch.bfloat16)
+    head.exact_merged_forward = True
     with torch.no_grad():
         head.weight.copy_(torch.linspace(-1.0, 1.0, head.weight.numel()).reshape_as(head.weight))
         head.lora_A.copy_(torch.linspace(-0.25, 0.25, head.lora_A.numel()).reshape_as(head.lora_A))
@@ -38,8 +38,7 @@ def test_effective_lm_head_uses_canonical_merged_weight_with_adapter_gradients(m
     assert head.lora_B.grad is not None and torch.count_nonzero(head.lora_B.grad) > 0
 
 
-def test_effective_lm_head_keeps_legacy_unmerged_formula_without_contract(monkeypatch):
-    monkeypatch.delenv("XORL_LORA_MERGED_FORWARD", raising=False)
+def test_effective_lm_head_keeps_legacy_unmerged_formula_without_contract():
     head = LoraLinear(3, 4, r=2, lora_alpha=2, bias=False, dtype=torch.bfloat16)
     runner = ModelRunner.__new__(ModelRunner)
     runner.model = SimpleNamespace(lm_head=head)

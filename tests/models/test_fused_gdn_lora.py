@@ -124,8 +124,7 @@ def test_delta_linear_matches_explicit_low_rank_product():
     assert torch.allclose(module.get_delta_weight(), module.lora_B @ module.lora_A * 2)
 
 
-def test_fused_gdn_delta_merged_forward_uses_canonical_fold_and_keeps_gradients(monkeypatch):
-    monkeypatch.setenv("XORL_LORA_MERGED_FORWARD", "1")
+def test_fused_gdn_delta_merged_forward_uses_canonical_fold_and_keeps_gradients():
     module = LoraDeltaLinear(8, 12, r=2, lora_alpha=4, dtype=torch.float32)
     with torch.no_grad():
         module.lora_B.normal_()
@@ -145,8 +144,7 @@ def test_fused_gdn_delta_merged_forward_uses_canonical_fold_and_keeps_gradients(
     assert torch.count_nonzero(module.lora_B.grad[7:]) == 0
 
 
-def test_fused_gdn_merged_weight_cache_is_bounded_by_current_slices(monkeypatch):
-    monkeypatch.setenv("XORL_LORA_MERGED_FORWARD", "1")
+def test_fused_gdn_merged_weight_cache_is_bounded_by_current_slices():
     module = LoraDeltaLinear(8, 12, r=2, lora_alpha=4, dtype=torch.float32)
     first_base = torch.randn(5, 8)
     second_base = torch.randn(7, 8)
@@ -165,8 +163,7 @@ def test_fused_gdn_merged_weight_cache_is_bounded_by_current_slices(monkeypatch)
     assert all(weight is not retained for weight in previous_weights[:-2] for retained in current_weights)
 
 
-def test_fused_gdn_merged_weight_cache_releases_previous_request_generation(monkeypatch):
-    monkeypatch.setenv("XORL_LORA_MERGED_FORWARD", "1")
+def test_fused_gdn_merged_weight_cache_releases_previous_request_generation():
     module = LoraDeltaLinear(8, 12, r=2, lora_alpha=4, dtype=torch.float32)
     first_base = torch.randn(5, 8)
     second_base = torch.randn(7, 8)
@@ -188,11 +185,11 @@ def test_fused_gdn_merged_weight_cache_releases_previous_request_generation(monk
     assert all(reference() is None for reference in previous_generation)
 
 
-def test_fused_gdn_output_projection_merged_forward_matches_canonical_fold(monkeypatch):
-    monkeypatch.setenv("XORL_LORA_MERGED_FORWARD", "1")
+def test_fused_gdn_output_projection_merged_forward_matches_canonical_fold():
     model = _Model()
     inject_lora_into_model(model, r=2, lora_alpha=4, target_manifest=_manifest())
     gdn = model.model.layers[0].linear_attn
+    gdn.exact_merged_forward = True
     with torch.no_grad():
         gdn.out_proj.lora_B.normal_()
     inputs = torch.randn(2, 3, gdn.o_proj.in_features)

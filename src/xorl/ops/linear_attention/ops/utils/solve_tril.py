@@ -1,8 +1,6 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # Portions of this file are adapted from flash-linear-attention, Copyright (c) 2023-2025 Songlin Yang, licensed under the MIT License.
 
-import os
-
 import torch
 import triton
 import triton.language as tl
@@ -12,11 +10,9 @@ from xorl.ops.linear_attention.ops.utils.op import make_tensor_descriptor
 from xorl.ops.linear_attention.utils import IS_TMA_SUPPORTED, autotune_cache_kwargs, input_guard
 
 
-FLA_TRIL_PRECISION = os.environ.get("FLA_TRIL_PRECISION", "ieee")
-assert FLA_TRIL_PRECISION in ["ieee", "tf32", "tf32x3"], (
-    f"FLA_TRIL_PRECISION must be one of 'ieee', 'tf32', or 'tf32x3', but got {FLA_TRIL_PRECISION}"
-)
-DOT_PRECISION_AUTOTUNE_LIST = ["ieee"] if not IS_TMA_SUPPORTED else list({"ieee", FLA_TRIL_PRECISION})
+# The triangular solve is part of the Qwen3.5 exact recurrent composition.
+# Precision changes the reduction program, so it is not an autotuning axis.
+DOT_PRECISION_AUTOTUNE_LIST = ("ieee",)
 
 # The forward-substitution tl.sum reassociates with num_warps (measured: three
 # distinct bitwise outputs for 2/4/8 warps on Qwen3.5 shapes), so autotuning it

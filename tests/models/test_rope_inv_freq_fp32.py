@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from xorl.models.auto import build_foundation_model
-from xorl.models.layers.rope import ROPE_INIT_FUNCTIONS
+from xorl.models.layers.rope import ROPE_INIT_FUNCTIONS, RotaryEmbedding
 from xorl.models.transformers.qwen3.configuration_qwen3 import Qwen3Config
 
 
@@ -125,3 +125,53 @@ def test_contract_lane_bits_unchanged(rope_type: str):
 
     assert torch.equal(contract[0], stock[0]), f"{rope_type}: contract-lane cos moved"
     assert torch.equal(contract[1], stock[1]), f"{rope_type}: contract-lane sin moved"
+
+
+def test_native_default_cache_is_lazy_and_follows_execution_device():
+    rotary = _build("default", "float32", rope_native=True).model.rotary_emb
+    assert rotary._sglang_default_cache is None
+
+    positions = torch.tensor([[0, 663, 960, 1268, 1629]], dtype=torch.long)
+    x = torch.zeros(1, positions.shape[1], HEAD_DIM, dtype=torch.float32)
+    cos, sin = rotary(x, positions)
+
+    assert rotary._sglang_default_cache is not None
+    assert rotary._sglang_default_cache.device == x.device
+    assert rotary._sglang_default_cache.dtype == torch.float32
+    cached_cos, cached_sin = rotary._sglang_default_cache.index_select(0, positions.flatten()).chunk(2, dim=-1)
+    assert torch.equal(cos[..., : HEAD_DIM // 2].reshape_as(cached_cos), cached_cos)
+    assert torch.equal(sin[..., : HEAD_DIM // 2].reshape_as(cached_sin), cached_sin)
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_exact_architectures_build_default_rope_tables_on_their_serving_devices():
+    device = torch.device("cuda")
+
+    glm_config = _config("default")
+    glm_config._rope_native = True
+    glm_config._rope_class_b = True
+    glm_config._glm52_exact_contract = True
+    glm_config._qwen35_exact_contract = False
+    glm_rotary = RotaryEmbedding(glm_config)
+
+    qwen_config = _config("default")
+    qwen_config._rope_native = True
+    qwen_config._rope_class_b = False
+    qwen_config._glm52_exact_contract = False
+    qwen_config._qwen35_exact_contract = True
+    qwen_rotary = RotaryEmbedding(qwen_config)
+
+    base, dim = glm_rotary._default_rope_base_and_dim()
+    inv_freq_cpu = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+    cpu_positions = torch.arange(MAX_POS, dtype=torch.float32)
+    cpu_freqs = torch.einsum("i,j->ij", cpu_positions, inv_freq_cpu)
+    cpu_table = torch.cat((cpu_freqs.cos(), cpu_freqs.sin()), dim=-1).to(device)
+
+    inv_freq_cuda = inv_freq_cpu.to(device)
+    cuda_positions = torch.arange(MAX_POS, dtype=torch.float32, device=device)
+    cuda_freqs = torch.einsum("i,j->ij", cuda_positions, inv_freq_cuda)
+    cuda_table = torch.cat((cuda_freqs.cos(), cuda_freqs.sin()), dim=-1)
+
+    assert torch.equal(glm_rotary._build_sglang_default_cache(MAX_POS, device), cuda_table)
+    assert torch.equal(qwen_rotary._build_sglang_default_cache(MAX_POS, device), cpu_table)

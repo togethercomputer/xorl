@@ -513,43 +513,6 @@ def test_masked_all_masked_zero_output_and_grads():
         assert g is not None and g.shape == ref.shape and (g == 0).all(), f"{name} must be exact zeros"
 
 
-@pytest.mark.gpu
-def test_ep_sim_routed_partial_trainable_forward_unchanged():
-    """The routed-partial forward under grad must equal the no-grad forward
-    bitwise (the compaction must not touch the forward path), and double-run
-    grads must be bitwise-stable."""
-    if not torch.cuda.is_available():
-        pytest.skip("needs CUDA")
-    pytest.importorskip("sglang")
-    pytest.importorskip("sgl_kernel")
-    device = torch.device("cuda")
-    torch.manual_seed(2)
-    blk = _block("eager").to(device)
-    x = torch.randn(TOKENS, HID, dtype=torch.bfloat16, device=device)
-    gids = torch.stack([torch.randperm(NUM_EXPERTS, device=device)[:TOP_K] for _ in range(TOKENS)])
-    wts = torch.rand(TOKENS, TOP_K, dtype=torch.bfloat16, device=device)
-
-    with torch.no_grad():
-        ref = blk.experts.sglang_moe_ep_sim_routed_partial(x, wts, gids, ep_rank=1, ep_size=2)
-
-    blk.experts.requires_grad_(True)
-    runs = []
-    for _ in range(2):
-        blk.experts.gate_up_proj.grad = None
-        blk.experts.down_proj.grad = None
-        out = blk.experts.sglang_moe_ep_sim_routed_partial(x, wts, gids, ep_rank=1, ep_size=2)
-        assert torch.equal(out, ref), "trainable forward diverged from the no-grad serving forward"
-        out.backward(torch.ones_like(out))
-        runs.append((blk.experts.gate_up_proj.grad.clone(), blk.experts.down_proj.grad.clone()))
-    assert torch.equal(runs[0][0], runs[1][0]) and torch.equal(runs[0][1], runs[1][1]), (
-        "double-run grads must be bitwise-stable (deterministic scatter default)"
-    )
-    half = NUM_EXPERTS // 2
-    assert (blk.experts.gate_up_proj.grad[:half] == 0).all() and (blk.experts.down_proj.grad[:half] == 0).all(), (
-        "grads must accumulate only into the owned expert slice"
-    )
-
-
 def test_weight_cache_reuses_and_invalidates(routed_inputs, monkeypatch):
     """Cache mode: transposes are reused across forwards, invalidated on
     in-place parameter updates; transient mode makes fresh copies each forward."""

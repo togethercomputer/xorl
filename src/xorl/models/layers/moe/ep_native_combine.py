@@ -1,11 +1,12 @@
-"""Native-EP ordered combine for the serving-kernel MoE parity lane (P5).
+"""Native-EP ordered combine for the exact Qwen3.5-MoE program.
 
 The TRAINING half of the EP<n>/a2a-none BI-ops serving pairing: serving computes,
 on every rank, its contiguous expert slice's weighted contribution for ALL tokens
 plus a TP slice of the shared expert, adds them in bf16, and all-reduces — and
 NCCL's tree all-reduce over n intranode ranks is bitwise a SEQUENTIAL bf16 chain
 sum in rank order (n-1) -> 0 (identified against captured per-rank partials; see
-`experiments/k3_tests/moe_ep_combine_sim_gate.py` and PR #478).
+the exact-path component tests). The contributor order is part of the exact
+Qwen3.5 numerical program.
 
 The trainer mirrors this on its real EP group (trainer EP gives rank r exactly
 serving-rank-r's contiguous expert slice):
@@ -22,36 +23,29 @@ serving-rank-r's contiguous expert slice):
    per rank. Grad REDUCTIONS (reduce-scatter of d(x), DP grad sync) stay stock
    NCCL — only forward bits are contracted.
 
-FRAGILITY NOTE (doubly so here — this lane trains): the chain order is an NCCL
-implementation detail (version/topology). Deployments must re-validate the
-combine against one captured serving all-reduce at bring-up (the step-0 gate,
-`experiments/k3_tests/moe_ep_native_combine_gate.py`) before trusting a new
-serving environment.
-
-Enable with ``XORL_MOE_SGLANG_EP_COMBINE=native`` (opt-in; requires trainer EP
-mirroring the serving EP size). The single-GPU simulation
-(``XORL_MOE_SGLANG_EP_COMBINE_SIM``) stays the offline verification harness.
+The exact Qwen3.5-MoE model path selects this combine structurally when trainer
+EP is active. EP8 is the admitted topology because it is the topology whose
+serving reduction was captured; a different contributor count is a different
+numerical program and is rejected before collectives begin.
 """
 
 from __future__ import annotations
-
-import os
 
 import torch
 import torch.distributed as dist
 
 
-_MOE_SGLANG_EP_COMBINE_ENV = "XORL_MOE_SGLANG_EP_COMBINE"
+QWEN35_NATIVE_EP_COMBINE_SIZES = frozenset({8})
 
 
-def moe_sglang_ep_combine_native_enabled() -> bool:
-    """True when ``XORL_MOE_SGLANG_EP_COMBINE=native`` arms the training lane."""
-    raw = os.environ.get(_MOE_SGLANG_EP_COMBINE_ENV, "").strip().lower()
-    if not raw or raw in {"0", "false", "off", "no"}:
-        return False
-    if raw != "native":
-        raise ValueError(f"{_MOE_SGLANG_EP_COMBINE_ENV}={raw!r} is not supported; expected 'native' (or unset)")
-    return True
+def validate_qwen35_native_ep_combine_size(ep_size: int) -> None:
+    """Reject contributor counts not validated against Qwen serving."""
+    if ep_size not in QWEN35_NATIVE_EP_COMBINE_SIZES:
+        raise ValueError(
+            f"Qwen3.5-MoE exact ordered combine requires EP8 (expert_parallel_size=8); received {ep_size}. "
+            "A different EP size requires a serving capture and a new "
+            "byte-exact reduction-order validation."
+        )
 
 
 class _AllGatherSumBackward(torch.autograd.Function):

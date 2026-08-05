@@ -1,5 +1,3 @@
-import os
-
 import pytest
 import torch
 
@@ -7,18 +5,29 @@ from xorl.models.layers.normalization import set_rmsnorm_mode
 from xorl.models.transformers.qwen3_5 import modeling_qwen3_5
 from xorl.models.transformers.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
 from xorl.models.transformers.qwen3_5.modeling_qwen3_5 import Qwen3_5DecoderLayer, Qwen3_5TextModel
-from xorl.ops.batch_invariant_ops import set_trunk_linear_contract
 
 
-def test_qwen3_5_gdn_contract_defaults_to_certified_v1_family(monkeypatch):
-    monkeypatch.setenv("XORL_BI_GDN", "1")
-    monkeypatch.delenv("XORL_FAMILIES_V2", raising=False)
-    modeling_qwen3_5._default_qwen35_gdn_contract_family()
-    assert os.environ["XORL_FAMILIES_V2"] == "0"
+def test_qwen3_5_exact_norm_selection_is_structural(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        modeling_qwen3_5,
+        "fast_zero_centered_batch_invariant_residual_rms_norm",
+        lambda hidden, _weight, _eps: calls.append("exact") or hidden + 1,
+    )
+    monkeypatch.setattr(
+        modeling_qwen3_5,
+        "native_zero_centered_rms_norm_without_batch_invariant",
+        lambda hidden, _weight, _eps: calls.append("legacy") or hidden + 2,
+    )
 
-    monkeypatch.setenv("XORL_FAMILIES_V2", "1")
-    modeling_qwen3_5._default_qwen35_gdn_contract_family()
-    assert os.environ["XORL_FAMILIES_V2"] == "1"
+    set_rmsnorm_mode("sglang")
+    try:
+        norm = modeling_qwen3_5.Qwen3_5RMSNorm(4, exact_contract=True)
+        x = torch.ones(2, 4)
+        assert torch.equal(norm(x, force_sglang_residual=True), x + 1)
+        assert calls == ["exact"]
+    finally:
+        set_rmsnorm_mode("native")
 
 
 def test_qwen3_5_sglang_fused_rmsnorm_routes_serving_families(monkeypatch):
@@ -47,10 +56,16 @@ def test_qwen3_5_sglang_fused_rmsnorm_routes_serving_families(monkeypatch):
         "fast_zero_centered_batch_invariant_rms_norm",
         fake_family1,
     )
+    monkeypatch.setattr(
+        modeling_qwen3_5,
+        "fast_zero_centered_batch_invariant_residual_rms_norm",
+        fake_residual,
+    )
 
     set_rmsnorm_mode("sglang_fused")
     try:
-        norm = modeling_qwen3_5.Qwen3_5RMSNorm(4)
+        norm = modeling_qwen3_5.Qwen3_5RMSNorm(4, exact_contract=False)
+        exact_norm = modeling_qwen3_5.Qwen3_5RMSNorm(4, exact_contract=True)
         x = torch.ones(2, 4)
 
         assert torch.equal(norm(x), x + 1)
@@ -58,14 +73,15 @@ def test_qwen3_5_sglang_fused_rmsnorm_routes_serving_families(monkeypatch):
         assert torch.equal(norm(x, force_sglang_residual=True), x + 3)
         assert calls[-1] == "residual"
 
-        set_trunk_linear_contract(True)
-        try:
-            assert torch.equal(norm(x), x + 5)
-            assert calls[-1] == "family1"
-            assert torch.equal(norm(x, force_sglang_residual=True), x + 3)
-            assert calls[-1] == "residual"
-        finally:
-            set_trunk_linear_contract(False)
+        assert torch.equal(exact_norm(x), x + 5)
+        assert calls[-1] == "family1"
+        assert torch.equal(exact_norm(x, force_sglang_residual=True), x + 3)
+        assert calls[-1] == "residual"
+
+        # Exact and ordinary models may coexist in one process. Running the
+        # exact module must not alter the ordinary module's dispatch.
+        assert torch.equal(norm(x), x + 1)
+        assert calls[-1] == "native"
     finally:
         set_rmsnorm_mode("native")
 

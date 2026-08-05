@@ -6,11 +6,7 @@ from typing import Optional
 
 import torch
 
-from xorl.models.layers.rope import (
-    _note_class_a,
-    rope_class_b_enabled,
-    stock_fused_apply_rotary_pos_emb,
-)
+from xorl.models.layers.rope import stock_fused_apply_rotary_pos_emb
 
 
 QWEN3_5_CHECKPOINT_CONVERSION_MAPPING = {
@@ -40,6 +36,50 @@ LINEAR_ATTENTION_RING_UNSUPPORTED_MESSAGE = (
 )
 
 
+def _apply_qwen35_gdn_exact(model: torch.nn.Module) -> dict[str, int]:
+    """Apply the exact Qwen3.5-family trainer program once, before FSDP."""
+    if getattr(model, "_qwen35_gdn_exact_applied", False):
+        return dict(model._qwen35_gdn_exact_wrapped)
+
+    config = model.config
+    is_moe = getattr(config, "model_type", None) in {
+        "xorl_qwen3_5_moe",
+        "qwen3_5_moe",
+        "qwen3_5_moe_text",
+    }
+    if is_moe:
+        from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
+        from xorl.models.layers.moe.ep_native_combine import (  # noqa: PLC0415
+            validate_qwen35_native_ep_combine_size,
+        )
+
+        ps = get_parallel_state()
+        if not ps.ep_enabled:
+            raise ValueError("Exact Qwen3.5-MoE server training requires expert parallelism")
+        validate_qwen35_native_ep_combine_size(ps.ep_size)
+
+    from xorl.ops.batch_invariant_ops import wrap_trunk_linears_batch_invariant  # noqa: PLC0415
+    from xorl.ops.bi_families_v2 import _select_qwen35_families_v1  # noqa: PLC0415
+
+    # Exact Qwen reaches ce_mode='bi_fused'; its LM-head loss selects between
+    # v1 and v2 through this family pin. Keep the qualified v1 program until a
+    # direct final-head replay admits a migration.
+    _select_qwen35_families_v1()
+    for module in model.modules():
+        if hasattr(module, "_native_ep_combine"):
+            module._native_ep_combine = is_moe
+        if hasattr(module, "_exact_batch_invariant_router"):
+            module._exact_batch_invariant_router = is_moe
+            module.router._exact_batch_invariant = is_moe
+            module.router.synthetic_routing_mode = None
+            module.router.topk_policy = "default"
+
+    wrapped = wrap_trunk_linears_batch_invariant(model)
+    model._qwen35_gdn_exact_wrapped = dict(wrapped)
+    model._qwen35_gdn_exact_applied = True
+    return wrapped
+
+
 def qwen3_5_rotate_half(x: torch.Tensor, interleaved: bool = False) -> torch.Tensor:
     if not interleaved:
         x1 = x[..., : x.shape[-1] // 2]
@@ -56,11 +96,11 @@ def qwen3_5_apply_rotary_pos_emb(
     cos: torch.Tensor,
     sin: torch.Tensor,
     interleaved: bool = False,
+    class_b: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if rope_class_b_enabled() and q.is_cuda:
+    if class_b and q.is_cuda:
         return stock_fused_apply_rotary_pos_emb(q, k, cos, sin, interleaved=interleaved)
 
-    _note_class_a("qwen3_5_apply_rotary_pos_emb")
     # `interleaved` describes the q/k feature-layout convention only.
     #   - `False` (default): standard half-rotate. Used by Qwen3.5/Qwen3.6
     #     (HF/SGLang). Qwen's `mrope_interleaved` is about T/H/W frequency

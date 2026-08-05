@@ -456,10 +456,11 @@ class ModelArguments:
         metadata={"help": "Multimodal encoder config and weights."},
     )
     attn_implementation: Optional[Literal["eager", "sdpa", "native", "flash_attention_3", "flash_attention_4"]] = field(
-        default="flash_attention_3",
+        default=None,
         metadata={
             "help": "Attention implementation. 'native': PyTorch SDPA+cuDNN (no deps, Hopper+Blackwell). "
-            "'flash_attention_3': FA3 (Hopper, default). 'flash_attention_4': FA4 CUTE (Hopper+Blackwell)."
+            "Omitting it preserves the FA3 local-trainer default except that canonical GLM-5.2 "
+            "resolves structurally to FA4."
         },
     )
     flash_attention_deterministic: bool = field(
@@ -546,52 +547,57 @@ class ModelArguments:
             "(e.g., tensor parallelism, independent LoRA per projection)."
         },
     )
-    rmsnorm_mode: Literal["eager", "native", "compile", "sglang", "sglang_fused", "sglang_jit", "sglang_kernel"] = (
-        field(
-            default="native",
-            metadata={
-                "help": "RMSNorm implementation mode. 'native' uses torch.nn.functional.rms_norm "
-                "and is the default. 'compile' runs that native path through torch.compile. "
-                "'eager' uses the plain eager implementation. 'sglang' uses native RMSNorm for "
-                "no-residual calls and SGLang's native residual RMSNorm reduction order. "
-                "'sglang_fused' matches 'sglang' bit-for-bit but replaces its eager residual-style "
-                "norms with fused batch-invariant Triton kernels (faster training, K3 preserved). "
-                "'sglang_jit' uses SGLang's JIT CUDA RMSNorm kernels for forward parity diagnostics. "
-                "'sglang_kernel' uses SGLang's production sgl_kernel RMSNorm kernels for diagnostics."
-            },
-        )
+    rmsnorm_mode: Optional[
+        Literal["eager", "native", "compile", "sglang", "sglang_fused", "sglang_jit", "sglang_kernel"]
+    ] = field(
+        default=None,
+        metadata={
+            "help": "RMSNorm implementation mode. Omitted means native for ordinary models "
+            "and the serving-exact fused implementation for canonical GLM-5.2. "
+            "'compile' runs that native path through torch.compile. "
+            "'eager' uses the plain eager implementation. 'sglang' uses native RMSNorm for "
+            "no-residual calls and SGLang's native residual RMSNorm reduction order. "
+            "'sglang_fused' matches 'sglang' bit-for-bit but replaces its eager residual-style "
+            "norms with fused batch-invariant Triton kernels (faster training, K3 preserved). "
+            "'sglang_jit' uses SGLang's JIT CUDA RMSNorm kernels for forward parity diagnostics. "
+            "'sglang_kernel' uses SGLang's production sgl_kernel RMSNorm kernels for diagnostics."
+        },
     )
-    router_fp32: bool = field(
-        default=True, metadata={"help": "Upcast MoE router gate computation to float32 for numerical stability."}
+    router_fp32: Optional[bool] = field(
+        default=None,
+        metadata={"help": "Upcast MoE router gate computation to float32; defaults to true after model resolution."},
     )
-    lm_head_fp32: bool = field(
-        default=True, metadata={"help": "Upcast LM head logits computation to float32 for numerical stability."}
+    lm_head_fp32: Optional[bool] = field(
+        default=None,
+        metadata={"help": "Upcast LM head logits computation to float32; defaults to true after model resolution."},
     )
     activation_native: bool = field(
         default=False, metadata={"help": "Use native SiLU instead of fused Triton kernel for SGLang alignment."}
     )
-    rope_native: bool = field(
-        default=False, metadata={"help": "Use naive RoPE implementation instead of flash_attn fused kernel."}
+    rope_native: Optional[bool] = field(
+        default=None,
+        metadata={"help": "Use native RoPE. Auto-enables for canonical GLM-5.2 when omitted."},
     )
-    rope_class_b: bool = field(
-        default=False,
+    rope_class_b: Optional[bool] = field(
+        default=None,
         metadata={
-            "help": "Use compiled Class-B RoPE fp32-chain numerics aligned with SGLang's stock fused CUDA kernel."
+            "help": "Use compiled Class-B RoPE fp32-chain numerics. Auto-enables for canonical GLM-5.2 when omitted."
         },
     )
     attention_cast_bf16: bool = field(
         default=False, metadata={"help": "Explicitly cast Q/K to bfloat16 after RoPE for SGLang alignment."}
     )
-    sparse_mla_enabled: bool = field(
-        default=False,
+    sparse_mla_enabled: Optional[bool] = field(
+        default=None,
         metadata={
             "help": "GLM-5 only: route attention through the absorb-form sparse-MLA path "
             "that uses the DSA indexer's top-k indices via the tilelang kernel "
             "(or its torch fallback). Default-False means the dense MLA + DSA mask "
-            "path runs instead — same algebra, fewer optimisations."
+            "path runs instead — same algebra, fewer optimisations. Canonical GLM-5.2 "
+            "enables this structurally when omitted."
         },
     )
-    sparse_mla_backend: Literal["auto", "torch", "tilelang"] = field(
+    sparse_mla_backend: Literal["auto", "torch", "tilelang", "flashmla"] = field(
         default="auto",
         metadata={
             "help": "Backend for sparse-MLA dispatch when `sparse_mla_enabled=True`. "
@@ -599,7 +605,10 @@ class ModelArguments:
             "constraints hold (`dim_plus_tail_dim == 576`, `topk % 64 == 0`), else "
             "the torch reference. 'torch' is the dense-gather reference, correct but "
             "slow; useful for CPU/CI and as a fallback. 'tilelang' forces the "
-            "vendored kernel. The earlier BWD NaN was caused by "
+            "vendored kernel. 'flashmla' uses the sampler-exact public "
+            "FlashMLA forward at the GLM-5.2 production shape and the "
+            "TileLang derivative kernel for a separately gated backward. "
+            "The earlier BWD NaN was caused by "
             "TL_ENABLE_AGGRESSIVE_SHARED_MEMORY_MERGE in pass_configs aliasing "
             "acc_dkv_shared onto a buffer the dq gemm was still reading — dropping "
             "that flag restored correctness."
@@ -891,11 +900,12 @@ class TrainingArguments:
             "does not compute the load-balancing loss)."
         },
     )
-    ce_mode: CrossEntropyMode = field(
-        default="compiled",
+    ce_mode: Optional[CrossEntropyMode] = field(
+        default=None,
         metadata={
             "help": "Cross-entropy computation mode for the local-trainer path. "
-            "'compiled' (default): torch.compile + auto_chunker, avoids materializing "
+            "Omitted means compiled for ordinary models and bi_fused for canonical GLM-5.2. "
+            "'compiled': torch.compile + auto_chunker, avoids materializing "
             "the full [batch*seq, vocab] logits tensor. 'quack_linear': Quack chunked "
             "linear + cross-entropy scalar training loss; return_per_token routes through "
             "fused selected-logprob CE. 'eager': F.cross_entropy that materializes logits. "

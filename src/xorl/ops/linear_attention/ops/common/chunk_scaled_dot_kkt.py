@@ -6,7 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
-from xorl.ops.linear_attention.modules.bi_contract import is_gdn_contract_enabled
+from xorl.ops.linear_attention.modules.bi_contract import _is_gdn_contract_enabled
 from xorl.ops.linear_attention.ops.utils import prepare_chunk_indices
 from xorl.ops.linear_attention.ops.utils.op import exp
 from xorl.ops.linear_attention.utils import autotune_cache_kwargs
@@ -140,7 +140,7 @@ def chunk_scaled_dot_kkt_fwd(
         "K": K,
         "BT": BT,
     }
-    if is_gdn_contract_enabled():
+    if _is_gdn_contract_enabled():
         _chunk_scaled_dot_kkt_fwd_kernel[(NT, B * H)](
             **launch_args,
             BK=64,

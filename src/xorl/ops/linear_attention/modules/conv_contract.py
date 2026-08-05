@@ -141,9 +141,9 @@ def causal_conv1d_qkv_contract(
     activation = q_conv.activation
     for conv in convs:
         if conv.bias is not None:
-            raise NotImplementedError("XORL_GDN_CONV_CONTRACT does not support conv bias.")
+            raise NotImplementedError("Exact Qwen3.5 GDN does not support convolution bias")
         if conv.activation != activation:
-            raise ValueError("XORL_GDN_CONV_CONTRACT expects one activation across q/k/v convs.")
+            raise ValueError("Exact Qwen3.5 GDN requires one activation across q/k/v convolutions")
 
     batch_size, seq_len = q_input.shape[0], q_input.shape[1]
     x_packed = torch.cat((q_input, k_input, v_input), dim=-1)

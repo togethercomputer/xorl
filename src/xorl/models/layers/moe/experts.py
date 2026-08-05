@@ -26,8 +26,6 @@ _MOE_SGLANG_FUSED_EXPERTS_ENV = "XORL_MOE_SGLANG_FUSED_EXPERTS"
 _MOE_SGLANG_FUSED_EXPERTS_SLOT_COMBINE_ENV = "XORL_MOE_SGLANG_FUSED_EXPERTS_SLOT_COMBINE"
 _MOE_SGLANG_FUSED_EXPERTS_CACHE_ENV = "XORL_MOE_SGLANG_FUSED_EXPERTS_CACHE_WEIGHTS"
 _MOE_SGLANG_FUSED_EXPERTS_WEIGHT_MODE_ENV = "XORL_MOE_SGLANG_FUSED_EXPERTS_WEIGHT_MODE"
-_MOE_SGLANG_EP_COMBINE_SIM_ENV = "XORL_MOE_SGLANG_EP_COMBINE_SIM"
-_MOE_SGLANG_EP_COMBINE_ENV = "XORL_MOE_SGLANG_EP_COMBINE"
 _MOE_SGLANG_FUSED_EXPERTS_WEIGHT_MODES = ("transient", "cached", "strided")
 _SG_LANG_MOE_TP_SIM_ENV = "XORL_SGLANG_MOE_TP_SIM"
 _SG_LANG_MOE_TP_SIM_SIZE_ENV = "XORL_SGLANG_MOE_TP_SIM_SIZE"
@@ -179,23 +177,6 @@ def moe_sglang_fused_experts_enabled(
         "to restore the stock tree"
     )
     return True
-
-
-def moe_sglang_ep_combine_sim_size() -> int:
-    """Simulated serving EP size for the EP-combine contract (0 = off).
-
-    ``XORL_MOE_SGLANG_EP_COMBINE_SIM=<n>`` makes the Qwen3.5-MoE block reproduce
-    an EP<n>/a2a-none BI-ops serving engine's MoE output bitwise: per-rank routed
-    partials via the serving kernel on contiguous expert slices, TP-sliced shared
-    expert, bf16 per-rank adds, and the NCCL-tree-equivalent sequential bf16
-    chain sum in rank order (n-1) -> 0 (P5). The block-level sim stays
-    forward-only (its shared-expert BI GEMMs replicate serving's inference
-    lane); the routed-partial primitive itself is trainable — the native-EP8
-    training lane composes it with xorl's trainable shared expert."""
-    raw = os.environ.get(_MOE_SGLANG_EP_COMBINE_SIM_ENV, "").strip()
-    if not raw or raw.lower() in {"0", "false", "off", "no"}:
-        return 0
-    return int(raw)
 
 
 def moe_sglang_fused_experts_slot_combine_enabled() -> bool:
@@ -2269,91 +2250,6 @@ class MoEExperts(nn.Module):
             StandardTopKOutput,
         )
 
-    def sglang_moe_ep_sim_routed_partial(
-        self,
-        hidden_flat: torch.Tensor,
-        routing_flat: torch.Tensor,
-        selected_flat: torch.Tensor,
-        ep_rank: int,
-        ep_size: int,
-    ) -> torch.Tensor:
-        """One simulated EP rank's routed-expert partial through the serving kernel.
-
-        EP8/a2a-none serving computes, on every rank, the weighted contribution
-        of its contiguous ``num_experts // ep_size`` expert slice for ALL tokens
-        (global top-k ids mapped local, ``-1`` = non-local, ``filter_expert``),
-        then all-reduces the per-rank partials. This method reproduces one such
-        partial bitwise on local full-width weights (P5 EP-combine
-        simulation).
-
-        Trainable: under grad the same serving forward runs through
-        :class:`_SglangFusedExpertsTrainFunction` with ``filter_expert=True``
-        (compact-valid-slots backward — masked slots keep exact-zero
-        d(topk_weights); their gradient belongs to the rank that owns the
-        expert). Grads flow to the sliced weights and accumulate into the full
-        GKN parameters through the slice.
-        """
-        if not self.gated:
-            raise NotImplementedError(f"{_MOE_SGLANG_EP_COMBINE_SIM_ENV} supports gated MoE experts only")
-        if self.down_bias is not None or self.gate_up_bias is not None:
-            raise NotImplementedError(f"{_MOE_SGLANG_EP_COMBINE_SIM_ENV} does not support expert biases")
-        if self.num_experts % ep_size != 0:
-            raise ValueError(
-                f"{_MOE_SGLANG_EP_COMBINE_SIM_ENV}: num_experts={self.num_experts} "
-                f"not divisible by simulated ep_size={ep_size}"
-            )
-        fused_experts_impl = self._load_sglang_fused_experts_impl()
-        experts_per_rank = self.num_experts // ep_size
-        lo = ep_rank * experts_per_rank
-        mapping = torch.full((self.num_experts,), -1, dtype=torch.int32, device=selected_flat.device)
-        mapping[lo : lo + experts_per_rank] = torch.arange(
-            experts_per_rank, dtype=torch.int32, device=selected_flat.device
-        )
-        local_ids = mapping[selected_flat.long()]
-        gate_up_slice = self.gate_up_proj[lo : lo + experts_per_rank]
-        down_slice = self.down_proj[lo : lo + experts_per_rank]
-        activation = "gelu" if self.hidden_act == "gelu_tanh" else self.hidden_act
-
-        needs_grad = torch.is_grad_enabled() and (
-            hidden_flat.requires_grad
-            or routing_flat.requires_grad
-            or self.gate_up_proj.requires_grad
-            or self.down_proj.requires_grad
-        )
-        if needs_grad:
-            if self.hidden_act not in {"silu", "gelu_tanh"}:
-                raise NotImplementedError(
-                    f"{_MOE_SGLANG_EP_COMBINE_SIM_ENV} training supports silu/gelu_tanh only "
-                    f"(got hidden_act={self.hidden_act!r})"
-                )
-            return _SglangFusedExpertsTrainFunction.apply(
-                hidden_flat,
-                routing_flat,
-                local_ids,
-                gate_up_slice,
-                down_slice,
-                fused_experts_impl,
-                activation,
-                self.hidden_act,
-                self.swiglu_limit,
-                experts_per_rank,
-                None,
-                True,
-            )
-        return _sglang_fused_experts_kernel_call(
-            hidden_flat,
-            gate_up_slice,
-            down_slice,
-            routing_flat,
-            local_ids,
-            fused_experts_impl,
-            activation,
-            self.swiglu_limit,
-            None,
-            weight_cache=None,
-            filter_expert=True,
-        )
-
     def sglang_ep_native_routed_partial(
         self,
         hidden_flat: torch.Tensor,
@@ -2361,19 +2257,18 @@ class MoEExperts(nn.Module):
         local_ids: torch.Tensor,
     ) -> torch.Tensor:
         """This EP rank's routed partial for the gathered full token batch
-        (native-EP ordered combine, P5 training lane).
+        (native-EP ordered combine for the exact Qwen3.5-MoE program).
 
-        Same serving-kernel call as :meth:`sglang_moe_ep_sim_routed_partial`,
-        but on the module's LOCAL expert slice (trainer EP gives rank r exactly
+        It runs on the module's LOCAL expert slice (trainer EP gives rank r exactly
         serving-rank-r's contiguous slice) with ids already mapped local
         (``-1`` = non-local). Trainable through the masked
         :class:`_SglangFusedExpertsTrainFunction`; the no-grad path is the bare
         kernel call (identical bits).
         """
         if not self.gated:
-            raise NotImplementedError(f"{_MOE_SGLANG_EP_COMBINE_ENV} supports gated MoE experts only")
+            raise NotImplementedError("Qwen3.5-MoE exact ordered combine supports gated MoE experts only")
         if self.down_bias is not None or self.gate_up_bias is not None:
-            raise NotImplementedError(f"{_MOE_SGLANG_EP_COMBINE_ENV} does not support expert biases")
+            raise NotImplementedError("Qwen3.5-MoE exact ordered combine does not support expert biases")
         fused_experts_impl = self._load_sglang_fused_experts_impl()
         e_local = int(self.gate_up_proj.shape[0])
         activation = "gelu" if self.hidden_act == "gelu_tanh" else self.hidden_act
@@ -2387,7 +2282,7 @@ class MoEExperts(nn.Module):
         if needs_grad:
             if self.hidden_act not in {"silu", "gelu_tanh"}:
                 raise NotImplementedError(
-                    f"{_MOE_SGLANG_EP_COMBINE_ENV} training supports silu/gelu_tanh only "
+                    "Qwen3.5-MoE exact ordered-combine training supports silu/gelu_tanh only "
                     f"(got hidden_act={self.hidden_act!r})"
                 )
             return _SglangFusedExpertsTrainFunction.apply(

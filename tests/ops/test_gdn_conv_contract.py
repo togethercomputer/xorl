@@ -1,13 +1,15 @@
 import warnings
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 import xorl.ops.linear_attention.layers.gated_deltanet as gated_deltanet
 from xorl.ops.linear_attention import GatedDeltaNet
 from xorl.ops.linear_attention.modules import ShortConvolution, causal_conv1d_qkv_contract
+from xorl.ops.linear_attention.modules.bi_contract import _is_gdn_contract_enabled
 from xorl.ops.linear_attention.modules.conv_contract import _pack_conv_weight
 
 
@@ -169,21 +171,21 @@ class TestConvContractGPU:
         for a, b in zip(run(), run(), strict=True):
             assert torch.equal(a, b)
 
-    def test_end_to_end_gdn_block_grad_vs_eager(self, monkeypatch):
+    def test_end_to_end_gdn_block_grad_vs_eager(self):
         device, dtype = torch.device("cuda"), torch.bfloat16
         torch.manual_seed(6)
         layer = _tiny_gdn().to(device=device, dtype=dtype)
         hidden = torch.randn(2, 128, 256, device=device, dtype=dtype)
 
-        def run(flag: str):
-            monkeypatch.setenv("XORL_GDN_CONV_CONTRACT", flag)
+        def run(exact: bool):
+            layer.exact_contract = exact
             layer.zero_grad(set_to_none=True)
             out, _, _ = layer(hidden)
             out.float().square().mean().backward()
             return out.detach().clone(), {n: p.grad.clone() for n, p in layer.named_parameters() if p.grad is not None}
 
-        eager_out, eager_grads = run("0")
-        contract_out, contract_grads = run("1")
+        eager_out, eager_grads = run(False)
+        contract_out, contract_grads = run(True)
         assert eager_grads.keys() == contract_grads.keys()
         assert any(name.startswith("q_conv1d") for name in contract_grads)
         # The two lanes intentionally differ in forward conv bits (~1 bf16 ULP per
@@ -192,11 +194,10 @@ class TestConvContractGPU:
         for name, ref in eager_grads.items():
             torch.testing.assert_close(contract_grads[name], ref, rtol=5e-2, atol=1e-2, msg=lambda m: f"{name}: {m}")
 
-    def test_end_to_end_gdn_block_determinism(self, monkeypatch):
+    def test_end_to_end_gdn_block_determinism(self):
         device, dtype = torch.device("cuda"), torch.bfloat16
-        monkeypatch.setenv("XORL_GDN_CONV_CONTRACT", "1")
         torch.manual_seed(8)
-        layer = _tiny_gdn().to(device=device, dtype=dtype)
+        layer = _tiny_gdn(exact_contract=True).to(device=device, dtype=dtype)
         hidden = torch.randn(1, 200, 256, device=device, dtype=dtype)
         first, _, _ = layer(hidden)
         second, _, _ = layer(hidden)
@@ -251,32 +252,32 @@ class TestConvContractGuards:
         def fake_chunk(**kwargs):
             return kwargs["v"], None
 
-        monkeypatch.setenv("XORL_GDN_CONV_CONTRACT", "1")
+        def fake_gating(A_log, a, b, dt_bias):
+            return -A_log.float().exp() * F.softplus(a + dt_bias), torch.sigmoid(b)
+
         monkeypatch.setattr(gated_deltanet, "causal_conv1d_qkv_contract", fake_contract)
+        monkeypatch.setattr(gated_deltanet, "bi_fused_gdn_gating", fake_gating)
         monkeypatch.setattr(gated_deltanet, "chunk_gated_delta_rule", fake_chunk)
-        layer = _tiny_gdn(use_gate=False)
+        layer = _tiny_gdn(use_gate=False, exact_contract=True)
         out, _, _ = layer(torch.randn(1, 8, 256))
         assert len(calls) == 1
         assert out.shape == (1, 8, 256)
 
-    def test_use_cache_raises(self, monkeypatch):
-        monkeypatch.setenv("XORL_GDN_CONV_CONTRACT", "1")
-        layer = _tiny_gdn()
+    def test_use_cache_raises(self):
+        layer = _tiny_gdn(exact_contract=True)
         layer.eval()
         with pytest.raises(RuntimeError, match="prefill only"):
             layer(torch.randn(1, 128, 256), use_cache=True)
 
-    def test_cp_context_raises(self, monkeypatch):
-        monkeypatch.setenv("XORL_GDN_CONV_CONTRACT", "1")
-        layer = _tiny_gdn()
+    def test_cp_context_raises(self):
+        layer = _tiny_gdn(exact_contract=True)
         cp_context = SimpleNamespace(cu_seqlens=torch.tensor([0, 8]), group=object(), is_first_rank=True)
         with pytest.raises(RuntimeError, match="does not support CP"):
             layer(torch.randn(1, 8, 256), cp_context=cp_context)
 
-    def test_no_short_conv_raises(self, monkeypatch):
-        monkeypatch.setenv("XORL_GDN_CONV_CONTRACT", "1")
-        layer = _tiny_gdn(use_short_conv=False)
-        with pytest.raises(RuntimeError, match="use_short_conv=False"):
+    def test_no_short_conv_raises(self):
+        layer = _tiny_gdn(use_short_conv=False, exact_contract=True)
+        with pytest.raises(RuntimeError, match="requires short convolution"):
             layer(torch.randn(1, 8, 256))
 
     def test_conv_bias_raises(self):
@@ -285,9 +286,41 @@ class TestConvContractGuards:
         with pytest.raises(NotImplementedError, match="bias"):
             causal_conv1d_qkv_contract(*inputs, *convs)
 
-    def test_tp_split_diagnostic_conflict_raises(self, monkeypatch):
-        monkeypatch.setenv("XORL_GDN_CONV_CONTRACT", "1")
-        monkeypatch.setenv("XORL_GDN_DIAGNOSTIC_TP_SPLIT", "2")
-        layer = _tiny_gdn()
-        with pytest.raises(RuntimeError, match="mutually exclusive"):
-            layer(torch.randn(1, 8, 256))
+    def test_exact_and_ordinary_modules_do_not_leak_contract_state(self):
+        seen = []
+        exact = _tiny_gdn(exact_contract=True)
+        ordinary = _tiny_gdn(exact_contract=False)
+
+        def record(self, hidden_states, **_kwargs):
+            seen.append(_is_gdn_contract_enabled())
+            return hidden_states, None, None
+
+        exact._forward_impl = MethodType(record, exact)
+        ordinary._forward_impl = MethodType(record, ordinary)
+        hidden = torch.randn(1, 2, 256)
+
+        exact(hidden)
+        ordinary(hidden)
+        exact(hidden)
+
+        assert seen == [True, False, True]
+        assert not _is_gdn_contract_enabled()
+
+    def test_checkpoint_recompute_reestablishes_module_contract(self):
+        seen = []
+        exact = _tiny_gdn(exact_contract=True)
+
+        def record(self, hidden_states, **_kwargs):
+            seen.append(_is_gdn_contract_enabled())
+            return hidden_states.square(), None, None
+
+        exact._forward_impl = MethodType(record, exact)
+        hidden = torch.randn(1, 2, 256, requires_grad=True)
+
+        def run(value):
+            return exact(value)[0]
+
+        checkpoint(run, hidden, use_reentrant=True).sum().backward()
+
+        assert seen == [True, True]
+        assert not _is_gdn_contract_enabled()

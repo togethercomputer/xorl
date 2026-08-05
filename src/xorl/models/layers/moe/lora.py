@@ -224,7 +224,7 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         self.reset_lora_parameters()
 
     # ------------------------------------------------------------------
-    # Merged-forward K3 contract lane (XORL_LORA_MERGED_FORWARD=1)
+    # Merged-forward exact-model contract lane
     # ------------------------------------------------------------------
 
     def sglang_moe_tp_sim_enabled(self, parallel_state) -> bool:
@@ -233,11 +233,11 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
 
     def sglang_fused_experts_auto_supported(self) -> bool:
         """Auto-default eligibility mirror of :meth:`MoEExperts.sglang_fused_experts_auto_supported`:
-        under ``XORL_LORA_MERGED_FORWARD=1`` the adapted experts fold their delta
+        under the exact model program the adapted experts fold their delta
         (canonical fold) and run the contracted serving kernel on the merged
         weights, so the ep=1 auto-enable applies to them too."""
         return (
-            lora_merged_forward_enabled()
+            lora_merged_forward_enabled(self)
             and self.hidden_act in {"silu", "gelu", "gelu_tanh"}
             and self.swiglu_limit == 0.0
         )
@@ -268,11 +268,10 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
 
         Fold = :func:`xorl.lora.fold.canonical_lora_fold_gkn` per projection
         (fp32 accumulate, cast once) — the exact arithmetic the weight-sync
-        merged extraction ships under the same flag, so the trainer forward and
+        merged extraction ships under the same exact program, so the trainer forward and
         the serving engine see identical merged bytes. Cached per module, keyed
         on adapter/base param versions and the active rank/alpha; the optimizer
-        step's in-place update invalidates the key. ``XORL_LORA_MERGED_FORWARD_CACHE=0``
-        refolds on every call (bounded memory)."""
+        step's in-place update invalidates the key."""
         cache = getattr(self, "_merged_weight_cache", None)
         if cache is None:
             cache = {}
@@ -358,9 +357,8 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         forward on the merged weights (bit-identical to a serving engine that
         received the folded weights), backward through the low-rank factors.
 
-        Mirrors :meth:`MoEExperts.sglang_fused_experts_forward`; requires
-        ``XORL_LORA_MERGED_FORWARD=1`` (a fused-experts flag alone must not
-        silently change what the adapters train against)."""
+        Mirrors :meth:`MoEExperts.sglang_fused_experts_forward`; the exact
+        model program must select canonical merged-LoRA execution."""
         from .experts import (  # noqa: PLC0415
             _MOE_SGLANG_FUSED_EXPERTS_ENV,
             MoEExperts,
@@ -369,19 +367,18 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
             moe_sglang_fused_experts_weight_mode,
         )
 
-        if not lora_merged_forward_enabled():
+        if not lora_merged_forward_enabled(self):
             raise NotImplementedError(
-                f"{_MOE_SGLANG_FUSED_EXPERTS_ENV}=1 on LoRA-adapted experts requires the merged-forward "
-                "contract lane: set XORL_LORA_MERGED_FORWARD=1 (canonical fold + serving kernel on merged "
-                "weights), or drop the fused-experts flag to keep the stock LoRA backends."
+                f"{_MOE_SGLANG_FUSED_EXPERTS_ENV}=1 on LoRA-adapted experts requires canonical "
+                "merged-LoRA execution, selected automatically by the exact model program."
             )
         if self.hidden_act not in {"silu", "gelu_tanh"} or self.swiglu_limit != 0.0:
             raise NotImplementedError(
-                "XORL_LORA_MERGED_FORWARD=1 supports gated silu/gelu_tanh without swiglu_limit only"
+                "Canonical merged-LoRA experts support gated silu/gelu_tanh without swiglu_limit only"
             )
         if moe_sglang_fused_experts_weight_mode() == "cached":
             raise NotImplementedError(
-                "XORL_LORA_MERGED_FORWARD=1 does not compose with "
+                "Canonical merged-LoRA execution does not compose with "
                 "XORL_MOE_SGLANG_FUSED_EXPERTS_WEIGHT_MODE=cached (the transpose cache cannot track "
                 "per-step merged weights); use the strided (default) or transient mode."
             )
@@ -449,11 +446,11 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
             )
         if self.hidden_act not in {"silu", "gelu_tanh"} or self.swiglu_limit != 0.0:
             raise NotImplementedError(
-                "XORL_LORA_MERGED_FORWARD=1 supports gated silu/gelu_tanh without swiglu_limit only"
+                "Canonical merged-LoRA experts support gated silu/gelu_tanh without swiglu_limit only"
             )
         if moe_sglang_fused_experts_weight_mode() == "cached":
             raise NotImplementedError(
-                "XORL_LORA_MERGED_FORWARD=1 does not compose with WEIGHT_MODE=cached; use strided/transient."
+                "Canonical merged-LoRA execution does not compose with WEIGHT_MODE=cached; use strided/transient."
             )
         fused_experts_impl = MoEExperts._load_sglang_fused_experts_impl()
         activation = "gelu" if self.hidden_act == "gelu_tanh" else self.hidden_act
@@ -462,7 +459,7 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         permute_tokens, cumsum, ctx = EP_DISPATCH[self.ep_dispatch](**dispatch_kwargs)
         expert_scores = getattr(ctx, "expert_scores", getattr(ctx, "permuted_scores", None))
         if expert_scores is None:
-            raise ValueError("XORL_LORA_MERGED_FORWARD=1 EP compute requires dispatched expert scores")
+            raise ValueError("Canonical merged-LoRA EP compute requires dispatched expert scores")
 
         if self._merged_lora_needs_grad(permute_tokens, expert_scores):
             gate_up_w, down_w = self._merged_trainable_weights()
@@ -520,22 +517,21 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         folded-weight autograd sends gradients into the low-rank factors.
         """
         from .experts import (  # noqa: PLC0415
-            _MOE_SGLANG_EP_COMBINE_ENV,
             MoEExperts,
             _sglang_fused_experts_kernel_call,
             _SglangFusedExpertsTrainFunction,
             moe_sglang_fused_experts_weight_mode,
         )
 
-        if not lora_merged_forward_enabled():
+        if not lora_merged_forward_enabled(self):
             raise NotImplementedError(
-                f"{_MOE_SGLANG_EP_COMBINE_ENV}=native on LoRA-adapted experts requires XORL_LORA_MERGED_FORWARD=1"
+                "Native EP combine on LoRA-adapted experts requires canonical merged-LoRA execution"
             )
         if self.hidden_act not in {"silu", "gelu_tanh"} or self.swiglu_limit != 0.0:
             raise NotImplementedError("LoRA native EP combine supports gated silu/gelu_tanh without swiglu_limit only")
         if moe_sglang_fused_experts_weight_mode() == "cached":
             raise NotImplementedError(
-                "XORL_LORA_MERGED_FORWARD=1 does not compose with WEIGHT_MODE=cached; use strided/transient."
+                "Canonical merged-LoRA execution does not compose with WEIGHT_MODE=cached; use strided/transient."
             )
 
         fused_experts_impl = MoEExperts._load_sglang_fused_experts_impl()
@@ -643,20 +639,19 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         Uses the same dispatch/combine as ``MoEExperts._ep_forward()`` but
         routes to the LoRA-aware EP compute registry. Under the explicit
         ``XORL_MOE_SGLANG_FUSED_EXPERTS=1`` contract flag the merged-forward
-        lane replaces the LoRA compute (and requires
-        ``XORL_LORA_MERGED_FORWARD=1`` — mirroring MoEExperts, EP never
-        auto-enables the parity kernel).
+        lane replaces the LoRA compute; the exact model program selects that
+        lane automatically.
         """
         from .experts import _moe_sglang_fused_experts_env_state  # noqa: PLC0415
 
         explicit_sglang_fused = _moe_sglang_fused_experts_env_state()
         if explicit_sglang_fused is True:
-            if not lora_merged_forward_enabled():
+            if not lora_merged_forward_enabled(self):
                 from .experts import _MOE_SGLANG_FUSED_EXPERTS_ENV  # noqa: PLC0415
 
                 raise NotImplementedError(
                     f"{_MOE_SGLANG_FUSED_EXPERTS_ENV}=1 on LoRA-adapted experts requires "
-                    "XORL_LORA_MERGED_FORWARD=1 (canonical fold + serving kernel on merged weights); "
+                    "canonical merged-LoRA execution (canonical fold + serving kernel on merged weights); "
                     "a partially-contracted LoRA lane would silently void the contract."
                 )
             return self._merged_ep_forward(hidden_states, routing_weights, selected_experts, parallel_state)

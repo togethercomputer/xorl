@@ -1,4 +1,3 @@
-import os
 from typing import Callable, Optional, Tuple, Unpack
 
 import torch
@@ -25,7 +24,6 @@ from xorl.models.layers.normalization import (
     fast_zero_centered_batch_invariant_residual_rms_norm,
     fast_zero_centered_batch_invariant_rms_norm,
     get_rmsnorm_mode,
-    is_bi_residual_norm_enabled,
     native_zero_centered_rms_norm,
     native_zero_centered_rms_norm_without_batch_invariant,
 )
@@ -38,10 +36,10 @@ from xorl.models.transformers.qwen3_5_shared import (
     LINEAR_ATTENTION_RING_UNSUPPORTED_MESSAGE,
     QWEN3_5_CHECKPOINT_CONVERSION_MAPPING,
     QWEN3_5_CHECKPOINT_SKIP_KEY_PATTERNS,
+    _apply_qwen35_gdn_exact,
     has_linear_attention_layers,
     qwen3_5_apply_rotary_pos_emb,
 )
-from xorl.ops.batch_invariant_ops import is_trunk_linear_contract_enabled
 from xorl.ops.fused_silu_and_mul import fused_silu_and_mul
 from xorl.ops.linear_attention import GatedDeltaNet
 from xorl.ops.linear_attention.ops.cp import build_linear_attention_cp_context
@@ -51,20 +49,18 @@ from xorl.utils import logging
 logger = logging.get_logger(__name__)
 
 
-def _default_qwen35_gdn_contract_family() -> None:
-    """Keep the certified Qwen3.5 GDN pair on v1 until v2 is exact here."""
-    if os.environ.get("XORL_BI_GDN", "").lower() in {"1", "true", "yes", "on"}:
-        os.environ.setdefault("XORL_FAMILIES_V2", "0")
-
-
 def _adapt_qwen3_5_config(config):
+    exact_contract = bool(getattr(config, "_qwen35_exact_contract", False))
     if hasattr(config, "text_config"):
-        return Qwen3_5Config.from_hf_config(config)
-    if isinstance(config, Qwen3_5Config):
-        return config
-    if getattr(config, "model_type", None) in {"qwen3_5", "qwen3_5_text"}:
-        return Qwen3_5Config.from_hf_config(config)
-    return config
+        adapted = Qwen3_5Config.from_hf_config(config)
+    elif isinstance(config, Qwen3_5Config):
+        adapted = config
+    elif getattr(config, "model_type", None) in {"qwen3_5", "qwen3_5_text"}:
+        adapted = Qwen3_5Config.from_hf_config(config)
+    else:
+        adapted = config
+    adapted._qwen35_exact_contract = exact_contract
+    return adapted
 
 
 def _raise_if_ring_fla_unsupported(config: Qwen3_5Config, ps) -> None:
@@ -104,9 +100,10 @@ class Qwen3_5MLP(nn.Module):
 
 
 class Qwen3_5RMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
+    def __init__(self, dim: int, eps: float = 1e-6, exact_contract: bool = False):
         super().__init__()
         self.eps = eps
+        self.exact_contract = exact_contract
         self.weight = nn.Parameter(torch.zeros(dim))
         self.mode = get_rmsnorm_mode()
 
@@ -135,11 +132,11 @@ class Qwen3_5RMSNorm(nn.Module):
             # composition, while qk norms and the layer-0 input norm use the
             # no-residual family-1 kernel.
             if residual_out is not None or force_sglang_residual:
-                if is_bi_residual_norm_enabled():
+                if self.exact_contract:
                     out = fast_zero_centered_batch_invariant_residual_rms_norm(norm_input, self.weight, self.eps)
                 else:
                     out = native_zero_centered_rms_norm_without_batch_invariant(norm_input, self.weight, self.eps)
-            elif self.mode == "sglang_fused" and is_trunk_linear_contract_enabled():
+            elif self.mode == "sglang_fused" and self.exact_contract:
                 out = fast_zero_centered_batch_invariant_rms_norm(norm_input, self.weight, self.eps)
             else:
                 out = native_zero_centered_rms_norm(norm_input, self.weight, self.eps)
@@ -174,8 +171,9 @@ class Qwen3_5Attention(nn.Module):
         self.o_proj = nn.Linear(
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
-        self.q_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        exact_contract = bool(getattr(config, "_qwen35_exact_contract", False))
+        self.q_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps, exact_contract=exact_contract)
+        self.k_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps, exact_contract=exact_contract)
         self._attn_gate: torch.Tensor | None = None
 
     def _project_qkv(
@@ -200,7 +198,11 @@ class Qwen3_5Attention(nn.Module):
             key_states,
             cos,
             sin,
+            class_b=bool(getattr(self.config, "_rope_class_b", False)),
         )
+        if getattr(self.config, "_attention_cast_bf16", False):
+            query_states = query_states.to(torch.bfloat16)
+            key_states = key_states.to(torch.bfloat16)
         return query_states.contiguous(), key_states.contiguous(), value_states.contiguous()
 
     def _project_output(self, attn_output: torch.Tensor) -> torch.Tensor:
@@ -262,12 +264,18 @@ class Qwen3_5DecoderLayer(GradientCheckpointingLayer):
                 conv_size=config.linear_conv_kernel_dim,
                 layer_idx=layer_idx,
                 norm_eps=config.rms_norm_eps,
+                exact_contract=bool(getattr(config, "_qwen35_exact_contract", False)),
             )
         else:
             self.self_attn = Qwen3_5Attention(config=config, layer_idx=layer_idx)
         self.mlp = Qwen3_5MLP(config)
-        self.input_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        exact_contract = bool(getattr(config, "_qwen35_exact_contract", False))
+        self.input_layernorm = Qwen3_5RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, exact_contract=exact_contract
+        )
+        self.post_attention_layernorm = Qwen3_5RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, exact_contract=exact_contract
+        )
         if config.sliding_window and not is_flash_attention(config._attn_implementation):
             logger.warning_once(
                 f"Sliding Window Attention is enabled but not implemented for `{config._attn_implementation}`; "
@@ -389,7 +397,6 @@ class Qwen3_5PreTrainedModel(XorlPreTrainedModel):
 
 class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
     def __init__(self, config: Qwen3_5Config):
-        _default_qwen35_gdn_contract_family()
         config = _adapt_qwen3_5_config(config)
         super().__init__(config)
         self.padding_idx = config.pad_token_id
@@ -399,7 +406,11 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
         self.layers = nn.ModuleList(
             [Qwen3_5DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = Qwen3_5RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = Qwen3_5RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            exact_contract=bool(getattr(config, "_qwen35_exact_contract", False)),
+        )
         self.rotary_emb = RotaryEmbedding(config=config)
 
         self.gradient_checkpointing = False
@@ -526,6 +537,9 @@ class Qwen3_5ForCausalLM(Qwen3_5PreTrainedModel):
     def unfuse_for_tp(self):
         """Unfuse all fused projections for tensor parallelism compatibility."""
         parallelize.unfuse_for_tp(self)
+
+    def _apply_qwen35_gdn_exact(self) -> dict[str, int]:
+        return _apply_qwen35_gdn_exact(self)
 
     def get_input_embeddings(self):
         return self.model.embed_tokens

@@ -6,7 +6,7 @@ absorbs `W_kc` so attention scores are computed against `kv_compressed`
 directly, and the no-pe output absorbs `W_vc` after attention. The indexer's
 top-k indices select a subset of past tokens per query.
 
-Two backends share the call site:
+Three explicit backends share the call site:
 
 - **torch** — quadratic dense gather + softmax. CPU/CI-safe and used for
   tests; keeps the rest of the model unblocked when the tilelang kernel
@@ -14,13 +14,19 @@ Two backends share the call site:
 - **tilelang** — vendored from miles `glm5/ops/sparse_mla.py`. CUDA-only,
   bf16-only, requires ``dim_plus_tail_dim == 576`` (kv_lora=512 +
   qk_rope=64) and ``topk % 64 == 0`` — both hold for GLM-5 / GLM-5.1.
+- **flashmla** — the sampler's public FlashMLA sparse-prefill forward,
+  paired with the TileLang derivative kernel for training.  This is an
+  explicit production-shape zero-K3 mode; it never participates in ``auto``.
 
-`sparse_mla_dispatch` picks tilelang when available + on CUDA + the inputs
-match the kernel's constraints, else torch. The interface (and numerical
-output up to softmax precision) is the same in both.
+`sparse_mla_dispatch` preserves the existing ``auto`` policy: tilelang when
+available and compatible, otherwise torch.  All three backends implement the
+same attention algebra and tensor interface, but their floating-point bytes
+are not interchangeable; ``flashmla`` is explicit because its serving bytes
+are the zero-K3 contract.
 """
 
 import logging
+import math
 
 import torch
 
@@ -162,6 +168,87 @@ def _sparse_mla_tilelang(
     return out_flat.view(B, S_q, H, kv_lora_rank)
 
 
+def _flatten_sparse_mla_inputs(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Flatten the batch and preserve per-sample sparse-index addressing.
+
+    FlashMLA receives one flat KV address space.  Valid indices are offset
+    into their sample's KV slice; every other value is canonicalized to
+    ``-1`` before flattening so an out-of-range index from one sample cannot
+    accidentally address a later sample's KV rows.
+    """
+    B, S_q, H, D = q.shape
+    S_kv = kv.shape[1]
+    q_flat = q.reshape(B * S_q, H, D)
+    kv_flat = kv.reshape(B * S_kv, 1, D)
+
+    valid = (indices >= 0) & (indices < S_kv)
+    indices_i32 = indices.to(dtype=torch.int32)
+    offsets = (torch.arange(B, device=indices.device, dtype=torch.int32) * S_kv).view(B, 1, 1)
+    indices_flat = torch.where(valid, indices_i32 + offsets, torch.full_like(indices_i32, -1))
+    indices_flat = indices_flat.reshape(B * S_q, 1, indices.shape[-1])
+    return q_flat, kv_flat, indices_flat
+
+
+def _flashmla_constraint_error(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    scaling: float,
+    kv_lora_rank: int,
+) -> str | None:
+    """Return why inputs are outside the proven GLM-5.2 FlashMLA envelope."""
+    if q.ndim != 4 or kv.ndim != 3 or indices.ndim != 3:
+        return "requires q [B,S,H,D], kv [B,S_kv,D], and indices [B,S,topk]"
+    if q.device.type != "cuda" or kv.device.type != "cuda" or indices.device.type != "cuda":
+        return "requires CUDA q, kv, and indices"
+    if q.device != kv.device or q.device != indices.device:
+        return "requires q, kv, and indices on the same CUDA device"
+    if torch.cuda.get_device_capability(q.device)[0] != 9:
+        return "requires Hopper compute capability 9.x"
+    if q.dtype != torch.bfloat16 or kv.dtype != torch.bfloat16:
+        return "requires BF16 q and kv"
+    if indices.dtype not in (torch.int32, torch.int64):
+        return "requires int32 or int64 indices"
+    B, S_q, H, D = q.shape
+    if kv.shape[0] != B or kv.shape[-1] != D or indices.shape[:2] != (B, S_q):
+        return "requires batch/query dimensions shared by q, kv, and indices"
+    if B * kv.shape[1] > torch.iinfo(torch.int32).max:
+        return "requires the flattened KV address space to fit int32"
+    if H != 64 or D != 576 or kv_lora_rank != 512 or indices.shape[-1] != 2048:
+        return "requires H=64, D=576, value width=512, and topk=2048"
+    if not math.isfinite(scaling) or scaling <= 0:
+        return "requires a finite positive softmax scale"
+    return None
+
+
+def _sparse_mla_flashmla(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    scaling: float,
+    kv_lora_rank: int,
+    query_offset: int = 0,
+) -> torch.Tensor:
+    """Run the serving-exact sparse forward with a trainable backward."""
+    del query_offset
+    error = _flashmla_constraint_error(q, kv, indices, scaling, kv_lora_rank)
+    if error is not None:
+        raise RuntimeError(f"backend='flashmla' requested outside its certified GLM-5.2 envelope: {error}")
+
+    from xorl.ops.glm5_kernels.flashmla_sparse_mla import (  # noqa: PLC0415
+        FlashMLASparseWithTileLangBackward,
+    )
+
+    B, S_q, H, _ = q.shape
+    q_flat, kv_flat, indices_flat = _flatten_sparse_mla_inputs(q, kv, indices)
+    out_flat = FlashMLASparseWithTileLangBackward.apply(q_flat, kv_flat, indices_flat, scaling)
+    return out_flat.view(B, S_q, H, kv_lora_rank)
+
+
 def sparse_mla_dispatch(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -178,6 +265,8 @@ def sparse_mla_dispatch(
       else torch reference.
     - ``"torch"`` — always torch reference.
     - ``"tilelang"`` — always tilelang; raises if unavailable.
+    - ``"flashmla"`` — exact public sampler forward at the certified
+      GLM-5.2 shape, with the TileLang training backward.
     """
     if backend == "torch":
         return sparse_mla_torch_reference(q, kv, indices, scaling, kv_lora_rank, query_offset=query_offset)
@@ -191,6 +280,9 @@ def sparse_mla_dispatch(
                 "(requires CUDA bf16 tensors, dim_plus_tail_dim == 576, and topk % 64 == 0)"
             )
         return _sparse_mla_tilelang(q, kv, indices, scaling, kv_lora_rank, query_offset=query_offset)
+
+    if backend == "flashmla":
+        return _sparse_mla_flashmla(q, kv, indices, scaling, kv_lora_rank, query_offset=query_offset)
 
     if backend != "auto":
         raise ValueError(f"unknown sparse-MLA backend: {backend!r}")
