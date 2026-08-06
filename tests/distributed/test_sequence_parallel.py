@@ -66,20 +66,22 @@ def _run_gather_backward_worker(rank: int, port: int) -> None:
     dist.init_process_group("gloo", rank=rank, world_size=2)
     try:
         local = torch.tensor([[rank * 10.0 + 1.0, rank * 10.0 + 2.0]], requires_grad=True)
-        gathered = _Gather.apply(dist.group.WORLD, local, 1, True)
+        gathered = _Gather.apply(dist.group.WORLD, local, 1)
         weights = [
             torch.tensor([[1.0, 2.0, 3.0, 4.0]]),
             torch.tensor([[5.0, 6.0, 7.0, 8.0]]),
         ][rank]
         (gathered * weights).sum().backward()
 
+        # Each shard's gradient is the cross-rank sum of both ranks'
+        # contributions to that slice, not the local slice alone.
         expected = torch.tensor([[6.0, 8.0]]) if rank == 0 else torch.tensor([[10.0, 12.0]])
         assert torch.allclose(local.grad, expected)
     finally:
         dist.destroy_process_group()
 
 
-def test_gather_outputs_scale_grad_reduce_scatters_chunks(unused_tcp_port):
+def test_gather_backward_is_exact_cross_rank_reduction(unused_tcp_port):
     mp.start_processes(
         _run_gather_backward_worker,
         args=(unused_tcp_port,),

@@ -26,7 +26,6 @@ from .data import (
     gather_outputs,
     sequence_parallel_preprocess,
     slice_input_tensor,
-    slice_input_tensor_scale_grad,
     slice_position_embedding,
 )
 from .strategy import (
@@ -72,7 +71,6 @@ __all__ = [
     "get_unified_sequence_parallel_rank",
     "get_unified_sequence_parallel_world_size",
     "slice_input_tensor",
-    "slice_input_tensor_scale_grad",
     "slice_position_embedding",
     "sequence_parallel_preprocess",
     "gather_heads_scatter_seq",

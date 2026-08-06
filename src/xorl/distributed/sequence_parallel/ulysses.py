@@ -152,40 +152,19 @@ class _SeqAllToAll(torch.autograd.Function):
         )
 
 
-class _Slice(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx: Any, group: dist.ProcessGroup, local_input: Tensor, dim: int, scale_grad: bool) -> Tensor:
-        ctx.group = group
-        ctx.rank = dist.get_rank(group)
-        seq_world_size = dist.get_world_size(group)
-        ctx.seq_world_size = seq_world_size
-        ctx.dim = dim
-        ctx.scale_grad = scale_grad
-        dim_size = local_input.shape[dim]
-        return local_input.split(dim_size // seq_world_size, dim=dim)[ctx.rank].contiguous()
-
-    @staticmethod
-    def backward(ctx: Any, grad_output: Tensor) -> Tuple[None, Tensor, None]:
-        output, _ = _all_gather(grad_output.contiguous(), group=ctx.group)
-        gathered = torch.cat(output, dim=ctx.dim)
-        if ctx.scale_grad:
-            gathered = gathered / ctx.seq_world_size
-        return (None, gathered, None, None)
-
-
 class _Gather(torch.autograd.Function):
+    """All-gather along ``dim``; backward is the exact reduce-scatter of the output gradient."""
+
     @staticmethod
     def forward(
         ctx: Any,
         group: dist.ProcessGroup,
         local_input: Tensor,
         dim: int,
-        grad_scale: Optional[bool] = False,
     ) -> Tensor:
         ctx.group = group
         ctx.rank = dist.get_rank(group)
         ctx.dim = dim
-        ctx.grad_scale = grad_scale
         seq_world_size = dist.get_world_size(group)
         ctx.seq_world_size = seq_world_size
         output, size_list = _all_gather(local_input.contiguous(), group=ctx.group)
@@ -194,29 +173,21 @@ class _Gather(torch.autograd.Function):
         return torch.cat(output, dim=dim)
 
     @staticmethod
-    def backward(ctx: Any, grad_output: Tensor) -> Tuple[None, Tensor]:
-        if ctx.grad_scale:
-            chunks = [chunk.contiguous() for chunk in grad_output.split(ctx.dim_size_list, dim=ctx.dim)]
-            local_shape = chunks[ctx.rank].shape
-            if all(chunk.numel() == chunks[0].numel() for chunk in chunks):
-                reduce_input = torch.cat([chunk.reshape(-1) for chunk in chunks], dim=0)
-                reduce_output = torch.empty(
-                    chunks[ctx.rank].numel(), dtype=grad_output.dtype, device=grad_output.device
-                )
-                dist.reduce_scatter_tensor(reduce_output, reduce_input, op=dist.ReduceOp.SUM, group=ctx.group)
-                grad_input = reduce_output.view(local_shape)
-            else:
-                for chunk in chunks:
-                    dist.all_reduce(chunk, op=dist.ReduceOp.SUM, group=ctx.group)
-                grad_input = chunks[ctx.rank]
+    def backward(ctx: Any, grad_output: Tensor) -> Tuple[None, Tensor, None]:
+        # Ranks may consume any position of the gathered tensor, so each
+        # shard's true gradient is the cross-rank sum of its slice.
+        chunks = [chunk.contiguous() for chunk in grad_output.split(ctx.dim_size_list, dim=ctx.dim)]
+        local_shape = chunks[ctx.rank].shape
+        if all(chunk.numel() == chunks[0].numel() for chunk in chunks):
+            reduce_input = torch.cat([chunk.reshape(-1) for chunk in chunks], dim=0)
+            reduce_output = torch.empty(chunks[ctx.rank].numel(), dtype=grad_output.dtype, device=grad_output.device)
+            dist.reduce_scatter_tensor(reduce_output, reduce_input, op=dist.ReduceOp.SUM, group=ctx.group)
+            grad_input = reduce_output.view(local_shape)
         else:
-            grad_input = grad_output.split(ctx.dim_size_list, dim=ctx.dim)[ctx.rank].contiguous()
-        return (
-            None,
-            grad_input,
-            None,
-            None,
-        )
+            for chunk in chunks:
+                dist.all_reduce(chunk, op=dist.ReduceOp.SUM, group=ctx.group)
+            grad_input = chunks[ctx.rank]
+        return (None, grad_input, None)
 
 
 def gather_heads_scatter_seq(x: Tensor, head_dim: int, seq_dim: int, group: ProcessGroup = None) -> Tensor:

@@ -2025,7 +2025,6 @@ class ModelRunner:
                     gather_dim=-1,
                     padding_dim=-1,
                     unpad_dim_size=original_seq_len,
-                    scale_grad=False,
                     group=sp_group,
                 )
 
@@ -3152,7 +3151,6 @@ class ModelRunner:
             gather_dim=1,
             padding_dim=1,
             unpad_dim_size=original_seq_len,
-            scale_grad=False,
             group=sequence_group,
         )
 
@@ -3169,7 +3167,6 @@ class ModelRunner:
             gather_dim=-1,
             padding_dim=-1,
             unpad_dim_size=original_seq_len,
-            scale_grad=False,
             group=sequence_group,
         )
         micro_batch = dict(micro_batch)

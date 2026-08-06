@@ -453,11 +453,11 @@ class Glm5Attention(Glm5MlaAttention):
             raise ValueError("GLM-5 DSA does not support ring attention yet.")
 
         group = ps.ulysses_group
-        full_hidden = gather_outputs(hidden_states, gather_dim=1, scale_grad=True, group=group)
-        full_q_compressed = gather_outputs(q_compressed, gather_dim=1, scale_grad=True, group=group)
+        full_hidden = gather_outputs(hidden_states, gather_dim=1, group=group)
+        full_q_compressed = gather_outputs(q_compressed, gather_dim=1, group=group)
         cos, sin = position_embeddings
-        full_cos = gather_outputs(cos, gather_dim=1, scale_grad=False, group=group)
-        full_sin = gather_outputs(sin, gather_dim=1, scale_grad=False, group=group)
+        full_cos = gather_outputs(cos, gather_dim=1, group=group)
+        full_sin = gather_outputs(sin, gather_dim=1, group=group)
         return full_hidden, full_q_compressed, (full_cos, full_sin)
 
     def _full_attention_mask_for_dsa(
@@ -487,7 +487,6 @@ class Glm5Attention(Glm5MlaAttention):
                     return gather_outputs(
                         attention_mask,
                         gather_dim=query_dim,
-                        scale_grad=False,
                         group=ps.ulysses_group,
                     )
 
@@ -601,7 +600,7 @@ class Glm5Attention(Glm5MlaAttention):
                 )
 
         local_topk_indices = self._compute_or_consume_indices(compute_local_indices, index_share_context)
-        full_kv = gather_outputs(kv, gather_dim=1, scale_grad=True, group=group)
+        full_kv = gather_outputs(kv, gather_dim=1, group=group)
 
         attn_compressed = sparse_mla_dispatch(
             q,
