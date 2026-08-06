@@ -4,10 +4,11 @@ API Request/Response Types for REST API.
 Pydantic type definitions for FastAPI endpoints in the unified API server.
 """
 
-import math
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_serializer, model_validator
+
+from xorl.server.removed_config import reject_removed_configuration_fields
 
 
 def _map_session_id_to_model_id(data: Any) -> Any:
@@ -218,6 +219,11 @@ class LoRAConfigRequest(BaseModel):
         description="LoRA alpha override. Accepts Tinker's alpha alias.",
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_removed_fields(cls, data):
+        return reject_removed_configuration_fields(data, context="lora_config")
+
 
 class AdamParams(BaseModel):
     """Tinker-compatible AdamW optimizer parameters."""
@@ -245,43 +251,10 @@ class OptimizerConfigRequest(BaseModel):
     eps: Optional[float] = Field(default=None, description="Adam-family epsilon")
     optimizer_kwargs: Optional[Dict[str, Any]] = Field(default=None, description="Optimizer-specific kwargs")
 
-
-class ZORLConfigRequest(BaseModel):
-    """Per-session ZORL overrides accepted by create_model."""
-
-    model_config = ConfigDict(extra="allow")
-
-    enabled: Optional[bool] = Field(default=None, description="Enable ZORL for this session")
-    b_sigma: Optional[float] = Field(default=None, description="Perturbation scale applied to LoRA-B")
-    num_perturbation_pairs: Optional[int] = Field(
-        default=None,
-        description="Number of perturbation seeds per generation before antithetic expansion",
-    )
-    a_refresh_interval: Optional[int] = Field(
-        default=None,
-        description="Generations between fresh LoRA-A family refreshes (0 disables refresh)",
-    )
-    antithetic_sampling: Optional[bool] = Field(
-        default=None,
-        description="Whether each perturbation seed emits both positive and negative LoRA-B candidates",
-    )
-    a_init: Optional[Literal["gaussian_jl"]] = Field(
-        default=None,
-        description="Initialization scheme used for fresh LoRA-A families",
-    )
-    seed: Optional[int] = Field(default=None, description="Optional base RNG seed for family and perturbation planning")
-
     @model_validator(mode="before")
     @classmethod
-    def _normalize_aliases(cls, data):
-        if isinstance(data, dict):
-            if "sigma" in data and "b_sigma" not in data:
-                data["b_sigma"] = data["sigma"]
-            if "refresh_interval" in data and "a_refresh_interval" not in data:
-                data["a_refresh_interval"] = data["refresh_interval"]
-            if "num_pairs" in data and "num_perturbation_pairs" not in data:
-                data["num_perturbation_pairs"] = data["num_pairs"]
-        return data
+    def _reject_removed_fields(cls, data):
+        return reject_removed_configuration_fields(data, context="optimizer_config")
 
 
 class LoRARuntimeConfig(BaseModel):
@@ -301,27 +274,6 @@ class OptimizerRuntimeConfig(BaseModel):
     betas: Optional[List[float]] = Field(default=None, description="Adam-family beta coefficients")
     eps: Optional[float] = Field(default=None, description="Adam-family epsilon")
     optimizer_kwargs: Dict[str, Any] = Field(default_factory=dict, description="Optimizer-specific kwargs")
-
-
-class ZORLRuntimeConfig(BaseModel):
-    """Normalized ZORL runtime config returned by the API."""
-
-    enabled: bool = Field(default=True, description="Whether ZORL is enabled for the session")
-    b_sigma: float = Field(..., description="Perturbation scale applied to LoRA-B")
-    num_perturbation_pairs: int = Field(
-        ...,
-        description="Number of perturbation seeds per generation before antithetic expansion",
-    )
-    a_refresh_interval: int = Field(
-        ...,
-        description="Generations between fresh LoRA-A family refreshes (0 disables refresh)",
-    )
-    antithetic_sampling: bool = Field(
-        ...,
-        description="Whether each perturbation seed emits both positive and negative LoRA-B candidates",
-    )
-    a_init: Literal["gaussian_jl"] = Field(..., description="Initialization scheme used for fresh LoRA-A families")
-    seed: Optional[int] = Field(default=None, description="Optional base RNG seed for family and perturbation planning")
 
 
 # ============================================================================
@@ -446,185 +398,33 @@ class OptimStepResponse(BaseModel):
     info: Dict[str, Any] = Field(..., description="Additional information")
 
 
+class AbortGradientEpochRequest(BaseModel):
+    """API request to discard one unmutated adapter-gradient epoch."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    model_id: str = Field(default="default", description="Training session identifier")
+    seq_id: Optional[int] = Field(default=None, description="Sequence ID for request ordering")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _map_tinker_fields(cls, data):
+        return _map_session_id_to_model_id(data)
+
+
+class AbortGradientEpochResponse(BaseModel):
+    """Response after an idempotent whole-epoch abort."""
+
+    success: bool
+    model_id: str
+    step: int
+    forward_backward_step: int
+    info: Dict[str, Any] = Field(default_factory=dict)
+
+
 # ============================================================================
 # Generation Operations
 # ============================================================================
-
-
-class ZORLGenerationMaterialization(BaseModel):
-    """Local candidate materialization policy for sharded ZORL populations."""
-
-    mode: Literal["all", "pair_shard", "pair_range"] = Field(
-        default="all",
-        description="Whether this worker exports every pair, modulo-assigned pairs, or a contiguous pair range",
-    )
-    shard_index: Optional[int] = Field(default=None, description="Shard index for pair_shard materialization")
-    num_shards: Optional[int] = Field(default=None, description="Total shards for pair_shard materialization")
-    pair_start: Optional[int] = Field(default=None, description="Inclusive pair index start for pair_range")
-    pair_end: Optional[int] = Field(default=None, description="Exclusive pair index end for pair_range")
-
-
-class ZORLStartGenerationRequest(BaseModel):
-    """API request for planning and exporting one ZORL generation."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    model_id: str = Field(
-        default="default", description="Model identifier (must be created via /api/v1/create_model first)"
-    )
-    preload_sampling: bool = Field(
-        default=False,
-        description="If true, eagerly load all generated candidate adapters on registered inference endpoints",
-    )
-    num_pairs: Optional[int] = Field(
-        default=None,
-        description="Optional per-generation override for global perturbation-pair count",
-    )
-    materialization: Optional[ZORLGenerationMaterialization] = Field(
-        default=None,
-        description="Optional local materialization policy for sharded population scoring",
-    )
-    owner_url: Optional[str] = Field(
-        default=None,
-        description="Optional URL that owns locally materialized candidate adapters",
-    )
-
-
-class ZORLCandidateInfo(BaseModel):
-    """Metadata for one exported ZORL candidate adapter."""
-
-    candidate_id: str = Field(..., description="Stable candidate identifier within the generation")
-    perturbation_index: int = Field(..., description="Perturbation pair index for this candidate")
-    direction: Literal["positive", "negative"] = Field(..., description="Whether the perturbation is +eps or -eps")
-    model_path: str = Field(..., description="Xorl URI for the exported candidate adapter")
-    lora_name: str = Field(..., description="Relative LoRA name used by inference backends")
-    owner_url: Optional[str] = Field(default=None, description="Inference URL that owns this candidate adapter")
-
-
-class ZORLStartGenerationResponse(BaseModel):
-    """API response for starting a ZORL generation."""
-
-    model_id: str = Field(..., description="Model identifier")
-    generation_id: str = Field(..., description="Stable generation identifier")
-    generation_index: int = Field(..., description="Generation index before the next update")
-    family_id: str = Field(..., description="Active LoRA-A family identifier")
-    family_refreshed: bool = Field(..., description="Whether this generation started a fresh LoRA-A family")
-    b_sigma: float = Field(..., description="Perturbation scale applied to LoRA-B")
-    num_pairs: int = Field(..., description="Number of perturbation seeds in this generation")
-    global_num_pairs: Optional[int] = Field(
-        default=None,
-        description="Global perturbation-pair count when candidate materialization is sharded",
-    )
-    global_population: Optional[int] = Field(
-        default=None,
-        description="Global candidate count before local materialization",
-    )
-    shard_index: Optional[int] = Field(default=None, description="Shard index that produced this response")
-    num_shards: Optional[int] = Field(default=None, description="Total shard count used by this response")
-    local_num_pairs: Optional[int] = Field(default=None, description="Number of local perturbation pairs exported")
-    sampling_ready: bool = Field(
-        default=False,
-        description="Whether all generated candidate adapters were preloaded onto registered inference endpoints",
-    )
-    candidates: List[ZORLCandidateInfo] = Field(..., description="Exported candidate adapters for this generation")
-
-
-class ZORLCandidateReward(BaseModel):
-    """Aggregated reward signal for one ZORL candidate adapter."""
-
-    candidate_id: str = Field(..., description="Candidate identifier from start_generation")
-    reward_mean: float = Field(..., description="Mean reward aggregated over all rollouts for the candidate")
-    num_rollouts: Optional[int] = Field(default=None, description="Optional rollout count used to compute reward_mean")
-
-    @field_validator("reward_mean")
-    @classmethod
-    def _reward_mean_must_be_finite(cls, value: float) -> float:
-        # NaN/Inf would propagate through apply_zorl_rewards into the LoRA-B
-        # update, silently corrupting the parent adapter. Reject at the API
-        # boundary so a degenerate candidate can't poison the next step.
-        if not math.isfinite(value):
-            raise ValueError(f"reward_mean must be finite, got {value!r}")
-        return value
-
-
-class ZORLApplyRewardsRequest(BaseModel):
-    """API request for applying externally aggregated ZORL rewards."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    model_id: str = Field(
-        default="default", description="Model identifier (must be created via /api/v1/create_model first)"
-    )
-    generation_id: str = Field(..., description="Generation identifier returned by start_generation")
-    learning_rate: Optional[float] = Field(
-        default=None, description="Optional override for the parent LoRA optimizer LR"
-    )
-    candidate_rewards: List[ZORLCandidateReward] = Field(
-        default_factory=list,
-        description="Per-candidate mean rewards for the completed generation",
-    )
-    sync_after_apply: bool = Field(
-        default=False,
-        description=(
-            "If true, push the updated weights to all registered inference endpoints after the apply "
-            "via the same machinery as /api/v1/sync_inference_weights. Intended for "
-            "perturbation_mode='fresh_ab', where the update is folded into the BASE weights and the "
-            "served base on replicas becomes stale. Sync failures do not fail the apply (the trainer "
-            "update has already been committed); inspect the response 'sync' field."
-        ),
-    )
-    sync_quantization: Optional[Union[str, Dict[str, Any]]] = Field(
-        default=None,
-        description=(
-            "Optional weight-sync quantization passthrough for sync_after_apply. Either an HF "
-            "quantization_config dict (e.g. {'quant_method': 'fp8', 'weight_block_size': [128, 128]}) "
-            "or the shorthand string 'fp8'. When omitted, the sync uses the server default set via "
-            "set_sync_quantization or auto-detected from the registered endpoints."
-        ),
-    )
-
-
-class ZORLApplyRewardsResponse(BaseModel):
-    """API response for applying a ZORL update."""
-
-    model_id: str = Field(..., description="Model identifier")
-    generation_id: str = Field(..., description="Generation identifier that was applied")
-    applied: bool = Field(..., description="Whether the update was applied successfully")
-    used_pairs: int = Field(..., description="Number of perturbation pairs used for the update")
-    dropped_pairs: int = Field(..., description="Number of perturbation pairs ignored during validation")
-    family_id: str = Field(..., description="LoRA-A family identifier used by the applied generation")
-    next_generation_index: int = Field(
-        ..., description="Generation index that will be used on the next start_generation"
-    )
-    deleted_candidates: int = Field(default=0, description="How many exported candidate directories were deleted")
-    metrics: Dict[str, Any] = Field(..., description="Update metrics (reward stats, update norm, LR, etc.)")
-    sync: Optional[Dict[str, Any]] = Field(
-        default=None,
-        description=(
-            "Post-apply inference weight-sync summary (only when sync_after_apply was requested). "
-            "Contains at least 'success' and 'message'; a failed sync does NOT unwind the applied update."
-        ),
-    )
-
-
-class ZORLAbortGenerationRequest(BaseModel):
-    """API request for aborting an active ZORL generation without updating the parent adapter."""
-
-    model_config = ConfigDict(extra="ignore")
-
-    model_id: str = Field(
-        default="default", description="Model identifier (must be created via /api/v1/create_model first)"
-    )
-    generation_id: str = Field(..., description="Generation identifier returned by start_generation")
-
-
-class ZORLAbortGenerationResponse(BaseModel):
-    """API response for aborting an active ZORL generation."""
-
-    success: bool = Field(..., description="Whether the generation abort completed successfully")
-    model_id: str = Field(..., description="Model identifier")
-    generation_id: str = Field(..., description="Aborted generation identifier")
-    deleted_candidates: int = Field(default=0, description="How many exported candidate directories were deleted")
 
 
 # ============================================================================
@@ -717,9 +517,6 @@ class WeightsInfoResponse(BaseModel):
     optimizer_config: Optional[OptimizerRuntimeConfig] = Field(
         default=None, description="Normalized optimizer runtime config for LoRA checkpoints"
     )
-    zorl_config: Optional[ZORLRuntimeConfig] = Field(
-        default=None, description="Normalized ZORL runtime config for ZORL-enabled LoRA checkpoints"
-    )
 
     @model_validator(mode="after")
     def _mirror_lora_rank(self):
@@ -740,12 +537,12 @@ class CreateModelRequest(BaseModel):
     optimizer_config: Optional[OptimizerConfigRequest] = Field(
         default=None, description="Per-session optimizer configuration"
     )
-    zorl_config: Optional[ZORLConfigRequest] = Field(default=None, description="Per-session ZORL configuration")
 
     @model_validator(mode="before")
     @classmethod
     def _map_tinker_fields(cls, data):
         """Map tinker's session_id to model_id if model_id not provided."""
+        reject_removed_configuration_fields(data, context="create_model request")
         return _map_session_id_to_model_id(data)
 
 
@@ -774,6 +571,7 @@ class CreateSessionRequest(BaseModel):
     @classmethod
     def _normalize_lora_config(cls, data):
         """Normalize optional LoRA metadata for parity with create_model."""
+        reject_removed_configuration_fields(data, context="create_session request")
         return _map_model_id_to_session_id(data)
 
 
@@ -1463,6 +1261,7 @@ FutureRetrieveResponse = Union[
     ForwardBackwardResponse,
     ForwardResponse,
     OptimStepResponse,
+    AbortGradientEpochResponse,
     SaveWeightsResponse,
     LoadWeightsResponse,
     SaveWeightsForSamplerResponse,

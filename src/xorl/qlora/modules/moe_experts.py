@@ -54,6 +54,12 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
     Uses (G, K, N) weight format and backend registry for compute.
     """
 
+    @property
+    def adapter_gradient_producer_family(self) -> str:
+        """Return the fixed producer selected by this execution plan."""
+
+        return "module_managed" if self.moe_implementation == "eager" else "fused_managed"
+
     def __init__(
         self,
         num_local_experts: int,
@@ -519,7 +525,12 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
         Uses the same dispatch/combine as MoEExperts._ep_forward() but routes
         to the LoRA-aware EP compute registry.
         """
-        from xorl.models.layers.moe.backend import EP_COMBINE, EP_DISPATCH, EP_EXPERT_COMPUTE_LORA  # noqa: PLC0415
+        from xorl.models.layers.moe.backend import (  # noqa: PLC0415
+            EP_COMBINE,
+            EP_DISPATCH,
+            EP_EXPERT_COMPUTE_LORA,
+            zero_token_lora_output,
+        )
 
         if self.moe_implementation not in EP_EXPERT_COMPUTE_LORA:
             raise ValueError(
@@ -544,20 +555,32 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
         gate_proj_lora_A, gate_proj_lora_B = self._active_lora_views("gate_proj")
         up_proj_lora_A, up_proj_lora_B = self._active_lora_views("up_proj")
         down_proj_lora_A, down_proj_lora_B = self._active_lora_views("down_proj")
-        expert_output = compute_fn(
-            permute_tokens,
-            cumsum,
-            self.gate_proj.to(compute_dtype),
-            self.up_proj.to(compute_dtype),
-            self.down_proj.to(compute_dtype),
-            gate_proj_lora_A,
-            gate_proj_lora_B,
-            up_proj_lora_A,
-            up_proj_lora_B,
-            down_proj_lora_A,
-            down_proj_lora_B,
-            self._active_scaling(),
-        )
+        if permute_tokens.shape[0] == 0:
+            expert_output = zero_token_lora_output(
+                permute_tokens,
+                self.hidden_size,
+                gate_proj_lora_A,
+                gate_proj_lora_B,
+                up_proj_lora_A,
+                up_proj_lora_B,
+                down_proj_lora_A,
+                down_proj_lora_B,
+            )
+        else:
+            expert_output = compute_fn(
+                permute_tokens,
+                cumsum,
+                self.gate_proj.to(compute_dtype),
+                self.up_proj.to(compute_dtype),
+                self.down_proj.to(compute_dtype),
+                gate_proj_lora_A,
+                gate_proj_lora_B,
+                up_proj_lora_A,
+                up_proj_lora_B,
+                down_proj_lora_A,
+                down_proj_lora_B,
+                self._active_scaling(),
+            )
 
         expert_scores = getattr(ctx, "expert_scores", getattr(ctx, "permuted_scores", None))
         if expert_scores is not None:

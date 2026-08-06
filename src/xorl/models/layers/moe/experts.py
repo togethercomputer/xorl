@@ -160,7 +160,7 @@ def moe_sglang_fused_experts_enabled(
             _log_moe_sglang_fused_experts_auto_once(
                 "sglang-fused experts auto-disabled (ep=1): expert module outside the validated parity "
                 "envelope (needs gated silu/gelu_tanh, no biases, no FP8; LoRA experts require "
-                f"XORL_LORA_MERGED_FORWARD=1); set {_MOE_SGLANG_FUSED_EXPERTS_ENV}=1 to force"
+                f"their model-owned exact_merged_forward property); set {_MOE_SGLANG_FUSED_EXPERTS_ENV}=1 to force"
             )
             return False
     if not _moe_sglang_fused_experts_stack_available():

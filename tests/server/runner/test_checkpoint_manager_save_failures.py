@@ -37,6 +37,7 @@ class _FakeAdapterState:
         self.local_params = {"adapter.weight.lora_A": nn.Parameter(torch.ones(1, 1))}
         self.tensor_layouts = {}
         self.layout_fingerprint = "f" * 64
+        self.gradient_ownership_plan = None
         self.session_spec = {
             "lora_config": {
                 "lora_rank": 4,
@@ -72,6 +73,12 @@ class _FakeAdapterManager:
 
     def get_adapter_session_spec(self, model_id: str):
         return self.adapters[model_id].session_spec
+
+    def validate_weight_publication(self, model_id: str) -> None:
+        assert model_id in self.adapters
+
+    def validate_strict_checkpoint_publication(self, model_id: str) -> None:
+        assert model_id in self.adapters
 
     def switch_adapter(self, model_id: str, auto_register: bool = False) -> bool:
         return model_id in self.adapters

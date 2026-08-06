@@ -7,10 +7,37 @@ Follows the same pattern as ``layers.attention.backend.ATTENTION_FUNCTIONS``.
 
 from typing import Callable, Dict
 
+import torch
+
 from xorl.distributed.gradient_reduction import GradientReductionDomain
 
 
 MOE_EXPERT_BACKENDS: Dict[str, Callable] = {}
+
+
+class _ZeroTokenLoRAOutput(torch.autograd.Function):
+    """Keep empty expert compute connected to every active local LoRA factor."""
+
+    @staticmethod
+    def forward(ctx, permute_tokens, output_width, *lora_factors):
+        ctx.save_for_backward(permute_tokens, *lora_factors)
+        return permute_tokens.new_empty((0, int(output_width)))
+
+    @staticmethod
+    def backward(ctx, _grad_output):
+        permute_tokens, *lora_factors = ctx.saved_tensors
+        return torch.zeros_like(permute_tokens), None, *(torch.zeros_like(value) for value in lora_factors)
+
+
+def zero_token_lora_output(
+    permute_tokens: torch.Tensor,
+    output_width: int,
+    *lora_factors: torch.Tensor,
+) -> torch.Tensor:
+    """Return an empty output whose backward materializes structural zero gradients."""
+
+    return _ZeroTokenLoRAOutput.apply(permute_tokens, output_width, *lora_factors)
+
 
 # Eager is always available (no kernel deps)
 from .eager import eager_ep_compute, eager_ep_compute_lora, eager_expert_forward
@@ -442,6 +469,7 @@ __all__ = [
     "EP_COMBINE",
     "EP_EXPERT_COMPUTE_LORA",
     "MOE_EXPERT_BACKENDS_LORA",
+    "zero_token_lora_output",
     "EP_SHARED_GRADIENT_REDUCTION",
     "GradientReductionDomain",
     "ep_lora_gradient_reduction_domain",

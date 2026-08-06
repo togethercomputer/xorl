@@ -29,6 +29,7 @@ import pytest
 from xorl.server.launcher import (
     Launcher,
     parse_server_overrides,
+    validate_server_overrides,
 )
 
 
@@ -327,6 +328,11 @@ def test_parse_server_overrides_accepts_arbitrary_keys():
     # parse_ alone accepts anything that looks like --server.<key>=<value>.
     _, overrides = parse_server_overrides(["--server.bogus_key=42"])
     assert overrides == {"bogus_key": 42}
+
+
+def test_validate_server_overrides_names_removed_field_migration():
+    with pytest.raises(ValueError, match="enable_zorl.*ZORL was removed"):
+        validate_server_overrides({"enable_zorl": True})
 
 
 @_skip_if_launcher_refactored

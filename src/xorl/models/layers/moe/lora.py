@@ -39,6 +39,7 @@ from .backend import (
     EP_EXPERT_COMPUTE_LORA,
     MOE_EXPERT_BACKENDS_LORA,
     ep_lora_gradient_reduction_domain,
+    zero_token_lora_output,
 )
 from .common import split_gate_up_proj
 
@@ -75,6 +76,19 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
     When Expert Parallelism is enabled, pass ``num_local_experts`` to create
     weights at the local (sharded) shape.
     """
+
+    def adapter_gradient_producer_family(self) -> str:
+        """Return the fixed producer selected by this execution plan."""
+
+        from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
+
+        if (
+            lora_merged_forward_enabled(self)
+            or get_parallel_state().ep_enabled
+            or self.moe_implementation != "eager"
+        ):
+            return "fused_managed"
+        return "module_managed"
 
     def __init__(
         self,
@@ -461,7 +475,14 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         if expert_scores is None:
             raise ValueError("Canonical merged-LoRA EP compute requires dispatched expert scores")
 
-        if self._merged_lora_needs_grad(permute_tokens, expert_scores):
+        if permute_tokens.shape[0] == 0 and self._merged_lora_needs_grad(permute_tokens, expert_scores):
+            factors = tuple(
+                value
+                for projection in ("gate_proj", "up_proj", "down_proj")
+                for value in self._active_lora_views(projection)
+            )
+            expert_output = zero_token_lora_output(permute_tokens, self.hidden_dim, *factors)
+        elif self._merged_lora_needs_grad(permute_tokens, expert_scores):
             gate_up_w, down_w = self._merged_trainable_weights()
             expert_output = _SglangFusedExpertsEPTrainFunction.apply(
                 permute_tokens,
@@ -602,7 +623,6 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
             return self._eager_lora_forward(hidden_states, expert_idx)
 
         # Local path — registry-based
-
         fn = MOE_EXPERT_BACKENDS_LORA[self.moe_implementation]
         gate_proj = self.gate_proj.contiguous()
         up_proj = self.up_proj.contiguous()
@@ -680,21 +700,33 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         permute_tokens, cumsum, ctx = dispatch_fn(**dispatch_kwargs)
 
         # Step 2: Expert computation with LoRA
-        expert_output = compute_fn(
-            permute_tokens,
-            cumsum,
-            gate_proj,
-            up_proj,
-            self.down_proj,
-            gate_proj_lora_A,
-            gate_proj_lora_B,
-            up_proj_lora_A,
-            up_proj_lora_B,
-            down_proj_lora_A,
-            down_proj_lora_B,
-            self._active_scaling(),
-            self.swiglu_limit,
-        )
+        if permute_tokens.shape[0] == 0:
+            expert_output = zero_token_lora_output(
+                permute_tokens,
+                self.hidden_dim,
+                gate_proj_lora_A,
+                gate_proj_lora_B,
+                up_proj_lora_A,
+                up_proj_lora_B,
+                down_proj_lora_A,
+                down_proj_lora_B,
+            )
+        else:
+            expert_output = compute_fn(
+                permute_tokens,
+                cumsum,
+                gate_proj,
+                up_proj,
+                self.down_proj,
+                gate_proj_lora_A,
+                gate_proj_lora_B,
+                up_proj_lora_A,
+                up_proj_lora_B,
+                down_proj_lora_A,
+                down_proj_lora_B,
+                self._active_scaling(),
+                self.swiglu_limit,
+            )
 
         expert_scores = getattr(ctx, "expert_scores", getattr(ctx, "permuted_scores", None))
         if expert_scores is not None:

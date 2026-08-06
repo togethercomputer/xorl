@@ -4,12 +4,13 @@ LoRA Adapter Manager - Manages multiple LoRA adapters for parallel training runs
 Each model_id has exactly one active adapter. Multiple model_ids can coexist,
 enabling different training runs to interleave on the same base model and GPUs.
 
-Design (Revised - Per-Adapter Parameters + Optimizer):
+Design (Compiled Gradient Ownership + Per-Adapter Optimizer):
 - Base model stays loaded on GPUs (frozen weights)
 - Each adapter has its OWN nn.Parameter objects (separate .grad slots)
 - Each adapter has its OWN optimizer instance
-- Model params are "scratch space" - load weights before forward, capture grads after backward
-- No gradient collision because each adapter's gradients live in its own Parameters
+- Model parameters receive backward gradients; the compiled ownership plan stages
+  them into persistent per-adapter FP32 numerator storage.
+- Optimizer gradient slots exist only for the bounded finalization/mutation phase.
 """
 
 import hashlib
@@ -21,7 +22,7 @@ import time
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -32,16 +33,31 @@ from xorl.distributed.ep_gradient_diagnostics import (
     gradient_trace_enabled,
     trace_replicated_gradient_stage,
 )
-from xorl.distributed.ep_gradients import (
-    GradientSyncStats,
-    synchronize_replicated_gradient_parameters,
-)
 from xorl.lora.target_manifest import load_lora_target_manifest
 from xorl.lora.utils import (
     convert_peft_lora_state_dict,
     load_lora_checkpoint_state_dict,
 )
 from xorl.optim import build_optimizer
+from xorl.server.runner.adapters.gradient_finalizer import (
+    AdapterGradientCollectiveFailure,
+    AdapterGradientMutationFailure,
+    AdapterGradientTransportStats,
+    logical_l2_norm,
+    transport_complete_local_gradients,
+)
+from xorl.server.runner.adapters.gradient_ownership import (
+    AdapterGradientOwnershipError,
+    AdapterGradientOwnershipPlan,
+    AdapterGradientUniformRejection,
+    GradientRepresentation,
+    GradientScaleState,
+    ParameterOwnershipDeclaration,
+    ReductionAuthority,
+    ReductionAxis,
+    ReductionDomainPlan,
+    compile_adapter_gradient_ownership,
+)
 from xorl.server.runner.adapters.optimizer_reshard import (
     active_rectangle_from_layout_descriptor as _active_rectangle_from_layout_descriptor,
 )
@@ -99,6 +115,34 @@ OPTIMIZER_SHARD_MANIFEST_FILENAME = "optimizer_shards.json"
 _LEGACY_OPTIMIZER_FILENAME = "optimizer.pt"
 _OPTIMIZER_STATE_METADATA_KEY = "xorl_optimizer_state_v1"
 _OPTIMIZER_STATE_MAX_DEPTH = 64
+
+
+def _first_restore_contract_difference(checkpoint: Any, live: Any, path: str = "contract") -> Optional[str]:
+    """Return the first named field difference in two JSON-shaped contracts."""
+
+    if type(checkpoint) is not type(live):
+        return f"{path}: checkpoint type={type(checkpoint).__name__}, live type={type(live).__name__}"
+    if isinstance(checkpoint, dict):
+        checkpoint_keys = set(checkpoint)
+        live_keys = set(live)
+        if checkpoint_keys != live_keys:
+            return f"{path} keys: checkpoint={sorted(checkpoint_keys)!r}, live={sorted(live_keys)!r}"
+        for key in sorted(checkpoint):
+            difference = _first_restore_contract_difference(checkpoint[key], live[key], f"{path}.{key}")
+            if difference is not None:
+                return difference
+        return None
+    if isinstance(checkpoint, list):
+        if len(checkpoint) != len(live):
+            return f"{path} length: checkpoint={len(checkpoint)}, live={len(live)}"
+        for index, (checkpoint_item, live_item) in enumerate(zip(checkpoint, live, strict=True)):
+            difference = _first_restore_contract_difference(checkpoint_item, live_item, f"{path}[{index}]")
+            if difference is not None:
+                return difference
+        return None
+    if checkpoint != live:
+        return f"{path}: checkpoint={checkpoint!r}, live={live!r}"
+    return None
 
 
 def _optimizer_shard_rank_world() -> Tuple[int, int]:
@@ -520,6 +564,24 @@ def load_adapter_optimizer_shards(
 
 
 @dataclass
+class AdapterGradientScratch:
+    """One session's local FP32 raw-numerator image and capture ledger."""
+
+    epoch: int = 0
+    next_capture_ordinal: int = 0
+    denominator: float = 0.0
+    numerator_scale: Optional[float] = None
+    source: Optional[str] = None
+    numerators: Dict[str, torch.Tensor] = field(default_factory=dict)
+    capture_open: bool = False
+    capture_staged: bool = False
+    staged_denominator: float = 0.0
+    staged_numerator_scale: Optional[float] = None
+    staged_parameter_fqns: Tuple[str, ...] = ()
+    staged_numerators: Dict[str, torch.Tensor] = field(default_factory=dict)
+
+
+@dataclass
 class AdapterState:
     """Complete isolated state for one training run.
 
@@ -534,10 +596,16 @@ class AdapterState:
     tensor_layouts: Dict[str, AdapterTensorLayout]
     layout_fingerprint: str
     optimizer: torch.optim.Optimizer  # Per-adapter optimizer
+    registration_ordinal: int = 0
+    gradient_ownership_plan: Optional[AdapterGradientOwnershipPlan] = None
+    gradient_scratch: AdapterGradientScratch = field(default_factory=AdapterGradientScratch)
+    publication_eligible: bool = True
+    publication_pending: bool = False
+    poisoned: bool = False
+    last_transport_stats: AdapterGradientTransportStats = field(default_factory=AdapterGradientTransportStats)
     global_step: int = 0
     global_forward_backward_step: int = 0
     lr: float = 1e-5
-    gradient_source: Optional[str] = None  # "model" needs EP reduction; "logical" is already global.
     last_access_time: float = field(default_factory=time.time)  # For LRU eviction
 
     @property
@@ -559,10 +627,10 @@ class LoRAAdapterManager:
     The model's LoRA params are used as "scratch space" for forward/backward.
 
     Flow:
-    1. prepare_forward(model_id): Copy adapter weights into model
-    2. Forward + backward (gradients go to model's params)
-    3. capture_gradients(model_id): Copy model's grads to adapter's params
-    4. optim_step(model_id): Adapter's optimizer steps on adapter's params
+    1. ``prepare_forward`` copies adapter weights into the model.
+    2. Backward produces model gradients under a compiled ownership plan.
+    3. The completion rendezvous commits staged raw numerators into persistent scratch.
+    4. ``optim_step`` completes residual reductions and mutates the adapter optimizer.
     """
 
     def __init__(
@@ -581,6 +649,7 @@ class LoRAAdapterManager:
         betas: Tuple[float, float] = (0.9, 0.95),
         eps: float = 1e-8,
         optimizer_fused: Optional[bool] = None,
+        gradient_ownership_bucket_bytes: int = 64 * 1024 * 1024,
     ):
         """
         Initialize the adapter manager.
@@ -600,6 +669,7 @@ class LoRAAdapterManager:
             betas: Beta coefficients for Adam-family optimizers
             eps: Epsilon used by Adam-family optimizers
             optimizer_fused: Whether to request fused optimizer kernels
+            gradient_ownership_bucket_bytes: Maximum residual-transport bucket bytes
         """
         self.model = model
         self.device = device
@@ -615,10 +685,21 @@ class LoRAAdapterManager:
         self.betas = betas
         self.eps = eps
         self.optimizer_fused = device.type == "cuda" if optimizer_fused is None else optimizer_fused
+        if gradient_ownership_bucket_bytes <= 0:
+            raise ValueError("gradient_ownership_bucket_bytes must be positive")
+        self.gradient_ownership_bucket_bytes = int(gradient_ownership_bucket_bytes)
         self.adapters: Dict[str, AdapterState] = {}
         self.current_adapter_id: Optional[str] = None
-        self._layout_cache: Dict[int, Tuple[Dict[str, AdapterTensorLayout], str]] = {}
+        self._layout_cache: Dict[
+            int,
+            Tuple[
+                Dict[str, AdapterTensorLayout],
+                str,
+                Dict[str, tuple[tuple[int, ...], ...]],
+            ],
+        ] = {}
         self._model_param_ids: Dict[str, int] = {}
+        self._adapter_registration_ordinals: Dict[str, int] = {}
 
         # Cache the list of LoRA parameter names for efficient lookups
         self._lora_param_names: List[str] = []
@@ -633,7 +714,6 @@ class LoRAAdapterManager:
                     "dtype": param.dtype if _HAS_DTENSOR and isinstance(param, DTensor) else param.data.dtype,
                     "rank_dim": self._infer_lora_rank_dim(name, param_shape),
                 }
-
         self._pipeline_parallel_size = int(
             self.lora_config.get("pipeline_parallel_size", self.lora_config.get("pp_size", 1))
         )
@@ -652,7 +732,7 @@ class LoRAAdapterManager:
         logger.info(
             f"LoRAAdapterManager initialized with {len(self._lora_param_names)} LoRA parameters, "
             f"max_adapters={max_adapters}, auto_save_on_eviction={auto_save_on_eviction}, "
-            f"optimizer={optimizer_type}"
+            f"optimizer={optimizer_type}, adapter_gradient_ownership=compiled_authoritative"
         )
 
     @staticmethod
@@ -680,16 +760,9 @@ class LoRAAdapterManager:
 
     @staticmethod
     def _strip_optimizer_config(session_spec: Dict[str, Any]) -> Dict[str, Any]:
-        """Return the structural part of a LoRA session spec without optimizer metadata.
-
-        For weights-only restore we also strip zorl_config: the LoRA tensor
-        shapes are determined by lora_config (rank/alpha) only, so a
-        target session can change ZORL hyperparameters (num_perturbation_pairs,
-        b_sigma, etc.) without invalidating a saved set of weights.
-        """
+        """Return the structural part of a LoRA session spec without optimizer metadata."""
         stripped = deepcopy(session_spec)
         stripped.pop("optimizer_config", None)
-        stripped.pop("zorl_config", None)
         return stripped
 
     @staticmethod
@@ -700,6 +773,61 @@ class LoRAAdapterManager:
         if isinstance(optimizer_config, dict):
             optimizer_config.pop("learning_rate", None)
         return stripped
+
+    @staticmethod
+    def _validate_session_restore_compatibility(
+        checkpoint_session_spec: Dict[str, Any],
+        live_session_spec: Dict[str, Any],
+        *,
+        load_optimizer: bool,
+    ) -> None:
+        """Validate only runtime fields that define the live adapter/optimizer substrate."""
+
+        checks = (
+            ("base_model", checkpoint_session_spec.get("base_model"), live_session_spec.get("base_model")),
+            ("is_lora", checkpoint_session_spec.get("is_lora"), live_session_spec.get("is_lora")),
+            (
+                "lora_config.lora_rank",
+                checkpoint_session_spec.get("lora_config", {}).get("lora_rank"),
+                live_session_spec.get("lora_config", {}).get("lora_rank"),
+            ),
+            (
+                "lora_config.lora_alpha",
+                checkpoint_session_spec.get("lora_config", {}).get("lora_alpha"),
+                live_session_spec.get("lora_config", {}).get("lora_alpha"),
+            ),
+        )
+        for field_name, checkpoint_value, live_value in checks:
+            if checkpoint_value != live_value:
+                raise ValueError(
+                    f"Checkpoint adapter field {field_name} is incompatible with the live session: "
+                    f"checkpoint={checkpoint_value!r}, live={live_value!r}"
+                )
+        if load_optimizer:
+            checkpoint_type = str(checkpoint_session_spec.get("optimizer_config", {}).get("type", "")).lower()
+            live_type = str(live_session_spec.get("optimizer_config", {}).get("type", "")).lower()
+            if not checkpoint_type or checkpoint_type != live_type:
+                raise ValueError(
+                    "Checkpoint optimizer type is incompatible with the live session: "
+                    f"checkpoint={checkpoint_type!r}, live={live_type!r}"
+                )
+
+    @staticmethod
+    def _validate_ownership_restore_contract(
+        checkpoint_contract: Any,
+        live_plan: AdapterGradientOwnershipPlan,
+    ) -> None:
+        """Compare direct topology/producer fields; never compare the plan label."""
+
+        if not isinstance(checkpoint_contract, dict):
+            raise ValueError(
+                "Authoritative optimizer checkpoint is missing its direct ownership restore contract; "
+                "load weights-only (load_optimizer=False) and re-save it"
+            )
+        live_contract = live_plan.optimizer_restore_contract()
+        difference = _first_restore_contract_difference(checkpoint_contract, live_contract)
+        if difference is not None:
+            raise ValueError(f"Checkpoint adapter-gradient topology/producer contract is incompatible: {difference}")
 
     @staticmethod
     def _serialize_optimizer_metadata_value(value: Any) -> Any:
@@ -734,18 +862,86 @@ class LoRAAdapterManager:
             raise RuntimeError("Cannot determine LoRA rank capacity: model does not expose any LoRA parameters.")
         return min(metadata["shape"][metadata["rank_dim"]] for metadata in self._lora_param_metadata.values())
 
-    def _discover_layouts(self, session_rank: int) -> Tuple[Dict[str, AdapterTensorLayout], str]:
+    def _discover_layouts(
+        self,
+        session_rank: int,
+        *,
+        local_group_memberships: Mapping[str, tuple[int, ...]] | None = None,
+    ) -> Tuple[
+        Dict[str, AdapterTensorLayout],
+        str,
+        Dict[str, tuple[tuple[int, ...], ...]],
+    ]:
         cached = self._layout_cache.get(session_rank)
         if cached is not None:
             return cached
-        layouts, fingerprint = discover_adapter_layouts(
+        if local_group_memberships is None:
+            from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
+
+            parallel_state = get_parallel_state()
+
+            def _public_group_members(group: Any) -> tuple[int, ...]:
+                if group is None or not torch.distributed.is_available() or not torch.distributed.is_initialized():
+                    return (0,)
+                return tuple(sorted(torch.distributed.get_process_group_ranks(group)))
+
+            local_group_memberships = {}
+            sp_group = parallel_state.sp_grad_sync_group
+            output_group = getattr(parallel_state, "lm_head_tp_replica_group", None)
+            ep_group = (
+                parallel_state.ep_group
+                if bool(getattr(parallel_state, "ep_enabled", getattr(parallel_state, "ep_size", 1) > 1))
+                else None
+            )
+            if sp_group is not None:
+                local_group_memberships["sequence_parallel"] = _public_group_members(sp_group)
+            if output_group is not None:
+                local_group_memberships["output_projection_replica"] = _public_group_members(output_group)
+            if ep_group is not None:
+                local_group_memberships["expert_parallel_replica"] = _public_group_members(ep_group)
+        layouts, fingerprint, group_memberships = discover_adapter_layouts(
             self.model,
             self._lora_param_metadata,
             active_rank=session_rank,
             pipeline_parallel_size=self._pipeline_parallel_size,
+            local_group_memberships=local_group_memberships,
         )
-        self._layout_cache[session_rank] = layouts, fingerprint
-        return layouts, fingerprint
+        self._layout_cache[session_rank] = layouts, fingerprint, group_memberships
+        return layouts, fingerprint, group_memberships
+
+    def gradient_ownership_group_memberships(
+        self,
+        model_id: str,
+    ) -> Dict[str, tuple[tuple[int, ...], ...]]:
+        """Return replica-group families captured by the existing layout exchange."""
+
+        state = self.get_adapter_state(model_id)
+        session_rank = self._session_rank(state.session_spec)
+        try:
+            _layouts, _fingerprint, group_memberships = self._layout_cache[session_rank]
+        except KeyError:
+            raise RuntimeError("Adapter layout discovery metadata is unavailable") from None
+        return group_memberships
+
+    def _agree_gradient_ownership_fingerprint(self, plan: AdapterGradientOwnershipPlan) -> None:
+        """Require one registration-time plan fingerprint using fixed tensors."""
+
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            return
+        group = torch.distributed.group.WORLD
+        if torch.distributed.get_world_size(group=group) <= 1:
+            return
+        fingerprint = torch.tensor(
+            list(bytes.fromhex(plan.fingerprint)),
+            dtype=torch.uint8,
+            device=self.device,
+        )
+        minimum = fingerprint.clone()
+        maximum = fingerprint.clone()
+        torch.distributed.all_reduce(minimum, op=torch.distributed.ReduceOp.MIN, group=group)
+        torch.distributed.all_reduce(maximum, op=torch.distributed.ReduceOp.MAX, group=group)
+        if not torch.equal(minimum, maximum):
+            raise AdapterGradientOwnershipError("Adapter gradient ownership plan differs across ranks")
 
     def _validate_model_layout_identity(self, state: AdapterState) -> None:
         """Fail closed if FSDP/EP replaced or moved a parameter after discovery."""
@@ -1335,42 +1531,6 @@ class LoRAAdapterManager:
             **build_kwargs,
         )
 
-    def _reset_adapter_optimizer(self, model_id: str) -> None:
-        """Rebuild an adapter optimizer from its normalized session spec."""
-        state = self.get_adapter_state(model_id)
-        state.optimizer = self._build_adapter_optimizer_for_session(state.local_params, state.session_spec)
-
-    def reinitialize_adapter_for_zorl_family(
-        self,
-        model_id: str,
-        *,
-        a_seed: int,
-        a_init: str = "gaussian_jl",
-    ) -> None:
-        """Refresh a ZORL parent adapter with a fresh LoRA-A family and zero LoRA-B."""
-        if a_init != "gaussian_jl":
-            raise ValueError(f"Unsupported ZORL LoRA-A init: {a_init!r}")
-
-        state = self.get_adapter_state(model_id)
-        with torch.no_grad():
-            for name in sorted(state.local_params):
-                param = state.local_params[name]
-                values = deterministic_local_initialization(
-                    state.tensor_layouts[name],
-                    base_seed=a_seed,
-                    session_identity=model_id,
-                    is_lora_b=self._is_lora_b(name),
-                ).to(device=param.device, dtype=param.dtype)
-                param.copy_(values)
-                param.grad = None
-
-        self._reset_adapter_optimizer(model_id)
-        state.last_access_time = time.time()
-        logger.info(
-            f"Reinitialized ZORL family for model_id={model_id} "
-            f"(a_init={a_init}, a_seed={a_seed}, optimizer={state.session_spec['optimizer_config']['type']})"
-        )
-
     @staticmethod
     def _has_pending_gradients(state: AdapterState) -> bool:
         """Return whether an adapter has captured gradients awaiting an optimizer step."""
@@ -1429,7 +1589,8 @@ class LoRAAdapterManager:
         lr: Optional[float] = None,
         session_spec: Optional[Dict[str, Any]] = None,
         initialize_fresh: bool = True,
-    ) -> None:
+        local_group_memberships: Mapping[str, tuple[int, ...]] | None = None,
+    ) -> Dict[str, tuple[tuple[int, ...], ...]]:
         """
         Register a new LoRA adapter for a model_id.
 
@@ -1442,6 +1603,12 @@ class LoRAAdapterManager:
             session_spec: Normalized session runtime spec for this adapter
             initialize_fresh: If True, initialize with fresh random weights.
                             If False, use the current model's LoRA weights.
+            local_group_memberships: This rank's public replica groups, folded
+                into the existing distributed layout-discovery exchange.
+
+        Returns:
+            The complete group families discovered by that exchange for static
+            ownership-plan compilation.
         """
         model_id = validate_identifier(model_id, name="model_id")
         effective_lr = float(lr) if lr is not None else None
@@ -1473,7 +1640,10 @@ class LoRAAdapterManager:
         else:
             logger.info(f"Replacing existing adapter for model_id={model_id}")
 
-        layouts, layout_fp = self._discover_layouts(session_rank)
+        layouts, layout_fp, group_memberships = self._discover_layouts(
+            session_rank,
+            local_group_memberships=local_group_memberships,
+        )
         named_params = dict(self.model.named_parameters())
         local_params: Dict[str, nn.Parameter] = {}
         base_seed = self._base_initialization_seed(session_spec)
@@ -1500,6 +1670,8 @@ class LoRAAdapterManager:
 
         # Build optimizer for this adapter using the session's optimizer contract.
         optimizer = self._build_adapter_optimizer_for_session(local_params, session_spec)
+        registration_ordinal = self._adapter_registration_ordinals.get(model_id, 0) + 1
+        self._adapter_registration_ordinals[model_id] = registration_ordinal
 
         self.adapters[model_id] = AdapterState(
             model_id=model_id,
@@ -1508,6 +1680,7 @@ class LoRAAdapterManager:
             tensor_layouts=layouts,
             layout_fingerprint=layout_fp,
             optimizer=optimizer,
+            registration_ordinal=registration_ordinal,
             global_step=0,
             global_forward_backward_step=0,
             lr=effective_lr,
@@ -1519,6 +1692,392 @@ class LoRAAdapterManager:
             f"fresh_weights={initialize_fresh}, num_params={len(local_params)}, "
             f"optimizer={optimizer_config['type']})"
         )
+        return group_memberships
+
+    def compile_gradient_ownership_plan(
+        self,
+        model_id: str,
+        declarations: Mapping[str, ParameterOwnershipDeclaration],
+        *,
+        model_generation: str,
+        adapter_generation: str,
+        tensor_parallel_size: int = 1,
+        group_memberships: Mapping[str, tuple[tuple[int, ...], ...]] | None = None,
+        rank: int = 0,
+    ) -> AdapterGradientOwnershipPlan:
+        """Compile or explicitly recompile one adapter's immutable ownership plan.
+
+        This registration-bound operation records ownership only. It does not
+        capture gradients, execute collectives, or change optimizer behavior.
+        Reconfiguration is rejected while captured gradients are pending.
+        """
+
+        model_id = validate_identifier(model_id, name="model_id")
+        if model_id not in self.adapters:
+            raise KeyError(f"Adapter for model_id={model_id} not registered")
+        state = self.adapters[model_id]
+        if self._has_pending_gradients(state) or state.gradient_scratch.next_capture_ordinal:
+            raise RuntimeError("Cannot recompile adapter gradient ownership while gradients are pending")
+        model_parameters = {
+            name: parameter for name, parameter in self.model.named_parameters() if name in state.tensor_layouts
+        }
+        plan = compile_adapter_gradient_ownership(
+            layouts=state.tensor_layouts,
+            model_parameters=model_parameters,
+            optimizer_parameters=state.local_params,
+            declarations=declarations,
+            model_generation=model_generation,
+            adapter_generation=adapter_generation,
+            tensor_parallel_size=tensor_parallel_size,
+            group_memberships=group_memberships,
+            rank=rank,
+        )
+        self._agree_gradient_ownership_fingerprint(plan)
+        state.gradient_ownership_plan = plan
+        self._preallocate_gradient_scratch(state, plan)
+        logger.info(
+            "Compiled adapter gradient ownership for model_id=%s fingerprint=%s",
+            model_id,
+            plan.fingerprint,
+        )
+        return plan
+
+    @staticmethod
+    def _preallocate_gradient_scratch(
+        state: AdapterState,
+        plan: AdapterGradientOwnershipPlan,
+    ) -> None:
+        """Allocate the one persistent FP32 numerator image on the cold path."""
+
+        local_by_fqn = {canonical_parameter_name(name): parameter for name, parameter in state.local_params.items()}
+        expected = {item.fqn for item in plan.parameters}
+        if set(local_by_fqn) != expected:
+            raise AdapterGradientOwnershipError("Optimizer parameter universe differs from the compiled ownership plan")
+        existing = state.gradient_scratch.numerators
+        reusable = set(existing) == expected and all(
+            tuple(existing[fqn].shape) == tuple(local_by_fqn[fqn].shape)
+            and existing[fqn].dtype is torch.float32
+            and existing[fqn].device == local_by_fqn[fqn].device
+            for fqn in expected
+        )
+        if not reusable:
+            if state.gradient_scratch.next_capture_ordinal or state.gradient_scratch.denominator:
+                raise AdapterGradientOwnershipError(
+                    "Cannot replace persistent adapter-gradient scratch while an epoch is active"
+                )
+            state.gradient_scratch.numerators = {
+                item.fqn: torch.zeros_like(local_by_fqn[item.fqn], dtype=torch.float32) for item in plan.parameters
+            }
+        else:
+            for tensor in existing.values():
+                tensor.zero_()
+
+    def _clear_model_adapter_gradients(self, state: AdapterState) -> None:
+        owned_fqns = {canonical_parameter_name(name) for name in state.tensor_layouts}
+        for name, parameter in self.model.named_parameters():
+            if canonical_parameter_name(name) in owned_fqns:
+                parameter.grad = None
+
+    def _clear_all_adapter_gradients(self, state: AdapterState) -> None:
+        self._clear_model_adapter_gradients(state)
+        for parameter in state.local_params.values():
+            parameter.grad = None
+
+    @staticmethod
+    def _reset_gradient_scratch(state: AdapterState) -> None:
+        """Reset epoch metadata while preserving the preallocated image."""
+
+        scratch = state.gradient_scratch
+        for numerator in scratch.numerators.values():
+            numerator.zero_()
+        scratch.epoch = state.global_step
+        scratch.next_capture_ordinal = 0
+        scratch.denominator = 0.0
+        scratch.numerator_scale = None
+        scratch.source = None
+        scratch.capture_open = False
+        scratch.capture_staged = False
+        scratch.staged_denominator = 0.0
+        scratch.staged_numerator_scale = None
+        scratch.staged_parameter_fqns = ()
+        scratch.staged_numerators.clear()
+
+    def validate_weight_publication(self, model_id: str) -> None:
+        """Admit a stable weight-only surface, including a clean mid-epoch state."""
+
+        state = self.get_adapter_state(model_id)
+        if state.poisoned:
+            raise RuntimeError("A poisoned adapter session cannot publish weights; restart from checkpoint")
+        if state.publication_pending:
+            raise RuntimeError("Adapter weights cannot be published before optimizer command completion")
+
+    def validate_strict_checkpoint_publication(self, model_id: str) -> None:
+        """Admit optimizer/lifecycle checkpoints only at a completed epoch boundary."""
+
+        self.validate_weight_publication(model_id)
+        if not self.get_adapter_state(model_id).publication_eligible:
+            raise RuntimeError(
+                "Adapter state is not checkpoint-publication-eligible; abort or complete the optimizer epoch"
+            )
+
+    def begin_gradient_capture(
+        self,
+        model_id: str,
+        *,
+        scale_state: GradientScaleState,
+    ) -> bool:
+        """Open one capture ordinal under the immutable registered plan."""
+
+        state = self.get_adapter_state(model_id)
+        if state.publication_pending:
+            raise AdapterGradientOwnershipError(
+                "Cannot begin another gradient epoch before the distributed optimizer command commits"
+            )
+        plan = state.gradient_ownership_plan
+        if plan is None:
+            raise AdapterGradientOwnershipError("Adapter gradient ownership requires a compiled plan")
+        if scale_state is not GradientScaleState.RAW_NUMERATOR:
+            raise AdapterGradientUniformRejection(
+                "ADAPTER_GRADIENT_PRENORMALIZED_LOSS: authoritative ownership requires unnormalized raw numerator losses"
+            )
+        scratch = state.gradient_scratch
+        if scratch.capture_open:
+            raise AdapterGradientOwnershipError("A gradient capture ordinal is already open")
+        if scratch.epoch != state.global_step:
+            if scratch.numerators or scratch.denominator or scratch.next_capture_ordinal:
+                raise AdapterGradientOwnershipError("Stale adapter-gradient scratch crossed an optimizer epoch")
+            scratch.epoch = state.global_step
+        scratch.capture_open = True
+        state.publication_eligible = False
+        return True
+
+    def abort_gradient_capture(self, model_id: str) -> None:
+        """Discard one uncommitted capture and clear model-side gradients."""
+
+        state = self.get_adapter_state(model_id)
+        scratch = state.gradient_scratch
+        self._clear_model_adapter_gradients(state)
+        scratch.capture_open = False
+        scratch.capture_staged = False
+        scratch.staged_denominator = 0.0
+        scratch.staged_numerator_scale = None
+        scratch.staged_parameter_fqns = ()
+        scratch.staged_numerators.clear()
+
+    def gradient_capture_is_open(self, model_id: str) -> bool:
+        """Return whether one model call still owns an uncommitted capture."""
+
+        return self.get_adapter_state(model_id).gradient_scratch.capture_open
+
+    def abort_gradient_epoch(self, model_id: str) -> None:
+        """Idempotently discard one unmutated epoch and restore stable weights."""
+
+        state = self.get_adapter_state(model_id)
+        if state.poisoned:
+            raise AdapterGradientMutationFailure(
+                "A poisoned adapter session cannot be recovered in-process; restart from checkpoint"
+            )
+        if state.publication_pending:
+            raise AdapterGradientMutationFailure("Cannot abort an adapter epoch while optimizer publication is pending")
+        self._clear_all_adapter_gradients(state)
+        self._reset_gradient_scratch(state)
+        state.publication_eligible = True
+
+    def adapter_sync_exclusions(self, model_id: str, axis: ReductionAxis) -> frozenset[int]:
+        """Return live model parameters owned by the compiled finalizer."""
+        state = self.get_adapter_state(model_id)
+        plan = state.gradient_ownership_plan
+        if plan is None:
+            raise AdapterGradientOwnershipError("Authoritative ownership requires a compiled plan")
+        owned_fqns = {
+            fqn
+            for mask in plan.authority_masks
+            if mask.axis is axis and mask.authority is ReductionAuthority.ADAPTER_FINALIZER
+            for fqn in mask.fqns
+        }
+        model_parameters = {
+            canonical_parameter_name(name): parameter for name, parameter in self.model.named_parameters()
+        }
+        return frozenset(id(model_parameters[fqn]) for fqn in owned_fqns)
+
+    def _capture_local_gradient(self, state: AdapterState, item, parameter: nn.Parameter) -> torch.Tensor:
+        """Return the completed public-boundary representation without mutating `.grad`."""
+
+        raw_gradient = parameter.grad
+        assert raw_gradient is not None
+        if item.capture_domains:
+            parameter_data = parameter.data
+            if (
+                item.representation is not GradientRepresentation.DIRECT_DTENSOR_CONTRIBUTION
+                or len(item.capture_domains) != 1
+                or item.capture_domains[0].axis is not ReductionAxis.FSDP_SHARD
+                or item.capture_domains[0].authority is not ReductionAuthority.ADAPTER_CAPTURE
+                or not (_HAS_DTENSOR and isinstance(raw_gradient, DTensor) and isinstance(parameter_data, DTensor))
+            ):
+                raise AdapterGradientOwnershipError(f"Unsupported adapter capture reduction for {item.fqn!r}")
+            try:
+                raw_gradient = raw_gradient.redistribute(
+                    device_mesh=parameter_data.device_mesh,
+                    placements=parameter_data.placements,
+                )
+            except Exception as error:
+                state.poisoned = True
+                raise AdapterGradientCollectiveFailure(
+                    "Adapter-gradient DTensor placement collective failed; restart the distributed process"
+                ) from error
+        return wait_for_local_tensor(
+            raw_gradient.to_local() if _HAS_DTENSOR and isinstance(raw_gradient, DTensor) else raw_gradient
+        )
+
+    def stage_gradient_numerators(
+        self,
+        model_id: str,
+        *,
+        denominator: float,
+        numerator_scale: float = 1.0,
+        backward_completed: bool,
+    ) -> None:
+        """Validate and stage one call without mutating committed FP32 scratch."""
+
+        state = self.get_adapter_state(model_id)
+        plan = state.gradient_ownership_plan
+        if plan is None:
+            raise AdapterGradientOwnershipError("Adapter gradient ownership is not compiled")
+        scratch = state.gradient_scratch
+        if not scratch.capture_open:
+            raise AdapterGradientOwnershipError("No gradient capture ordinal is open")
+        if scratch.capture_staged:
+            raise AdapterGradientOwnershipError("The current gradient capture is already staged")
+        if not backward_completed:
+            raise AdapterGradientOwnershipError("Gradient capture requires a completed backward pass")
+        if not math.isfinite(float(denominator)) or denominator <= 0:
+            raise AdapterGradientUniformRejection(
+                "ADAPTER_GRADIENT_ZERO_DENOMINATOR: globally reduced valid-token denominator must be positive"
+            )
+        if not math.isfinite(float(numerator_scale)) or numerator_scale <= 0:
+            raise AdapterGradientOwnershipError("Gradient numerator scale must be finite and positive")
+        if scratch.source not in {None, "model"}:
+            raise AdapterGradientOwnershipError("Gradient scratch contains an unsupported source")
+        if scratch.numerator_scale is not None and scratch.numerator_scale != float(numerator_scale):
+            raise AdapterGradientOwnershipError("Streamed captures use incompatible numerator scales")
+
+        named_parameters = {
+            canonical_parameter_name(name): parameter for name, parameter in self.model.named_parameters()
+        }
+        layouts = {layout.fqn: layout for layout in state.tensor_layouts.values()}
+        staged_fqns: list[str] = []
+        staged_numerators: dict[str, torch.Tensor] = {}
+        for item in plan.parameters:
+            parameter = named_parameters[item.fqn]
+            if parameter.grad is None:
+                if item.requires_local_gradient:
+                    raise AdapterGradientOwnershipError(f"Required adapter gradient is absent for {item.fqn!r}")
+                continue
+            local_gradient = self._capture_local_gradient(state, item, parameter)
+            layout = layouts[item.fqn]
+            if tuple(local_gradient.shape) != layout.local_substrate_shape:
+                raise AdapterGradientOwnershipError(
+                    f"Local adapter gradient shape changed for {item.fqn!r}: "
+                    f"actual={tuple(local_gradient.shape)} expected={layout.local_substrate_shape}"
+                )
+            if item.requires_local_gradient and not layout.has_active_storage:
+                raise AdapterGradientOwnershipError(f"Required adapter gradient is empty for {item.fqn!r}")
+            staged_fqns.append(item.fqn)
+            packed = layout.pack_from_local(local_gradient).detach().float()
+            staged_numerators[item.fqn] = packed
+
+        scratch.capture_staged = True
+        scratch.staged_denominator = float(denominator)
+        scratch.staged_numerator_scale = float(numerator_scale)
+        scratch.staged_parameter_fqns = tuple(staged_fqns)
+        scratch.staged_numerators = staged_numerators
+
+    def commit_gradient_capture(self, model_id: str) -> tuple[int, int]:
+        """Commit one successfully completed call into the epoch accumulator."""
+
+        state = self.get_adapter_state(model_id)
+        plan = state.gradient_ownership_plan
+        if plan is None:
+            raise AdapterGradientOwnershipError("Adapter gradient ownership is not compiled")
+        scratch = state.gradient_scratch
+        if not scratch.capture_open or not scratch.capture_staged:
+            raise AdapterGradientOwnershipError("No staged gradient capture is ready to commit")
+
+        item_by_fqn = {item.fqn: item for item in plan.parameters}
+        staged_fqns = scratch.staged_parameter_fqns
+        staged_set = set(staged_fqns)
+        if len(staged_set) != len(staged_fqns) or staged_set != set(scratch.staged_numerators):
+            raise AdapterGradientOwnershipError("Staged adapter-gradient names are incomplete or duplicated")
+        if set(scratch.numerators) != set(item_by_fqn):
+            raise AdapterGradientOwnershipError("Persistent numerator image differs from the compiled plan")
+        if not math.isfinite(scratch.staged_denominator) or scratch.staged_denominator <= 0:
+            raise AdapterGradientOwnershipError("Staged gradient denominator must be finite and positive")
+        if scratch.staged_numerator_scale is None or not math.isfinite(scratch.staged_numerator_scale):
+            raise AdapterGradientOwnershipError("Staged gradient numerator scale is missing or nonfinite")
+        for fqn, item in item_by_fqn.items():
+            if item.requires_local_gradient and fqn not in staged_set:
+                raise AdapterGradientOwnershipError(f"Required staged adapter gradient is absent for {fqn!r}")
+            if fqn not in staged_set:
+                continue
+            staged = scratch.staged_numerators[fqn]
+            destination = scratch.numerators[fqn]
+            if (
+                tuple(staged.shape) != tuple(destination.shape)
+                or staged.dtype is not torch.float32
+                or staged.device != destination.device
+            ):
+                raise AdapterGradientOwnershipError(f"Staged adapter gradient destination changed for {fqn!r}")
+        try:
+            for fqn in staged_fqns:
+                packed = scratch.staged_numerators[fqn]
+                accumulator = scratch.numerators[fqn]
+                if scratch.next_capture_ordinal == 0:
+                    accumulator.copy_(packed)
+                else:
+                    accumulator.add_(packed)
+            capture_id = scratch.epoch, scratch.next_capture_ordinal
+            scratch.next_capture_ordinal += 1
+            scratch.denominator += scratch.staged_denominator
+            scratch.numerator_scale = scratch.staged_numerator_scale
+            scratch.source = "model"
+            self._clear_model_adapter_gradients(state)
+            return capture_id
+        except AdapterGradientOwnershipError:
+            raise
+        except Exception as error:
+            state.poisoned = True
+            raise AdapterGradientCollectiveFailure(
+                "Adapter-gradient capture commit failed; restart the distributed process"
+            ) from error
+        finally:
+            scratch.capture_open = False
+            scratch.capture_staged = False
+            scratch.staged_denominator = 0.0
+            scratch.staged_numerator_scale = None
+            scratch.staged_parameter_fqns = ()
+            scratch.staged_numerators.clear()
+
+    def capture_gradient_numerators(
+        self,
+        model_id: str,
+        *,
+        denominator: float,
+        numerator_scale: float = 1.0,
+        backward_completed: bool,
+    ) -> tuple[int, int]:
+        """Stage and immediately commit one capture for direct manager callers."""
+
+        try:
+            self.stage_gradient_numerators(
+                model_id,
+                denominator=denominator,
+                numerator_scale=numerator_scale,
+                backward_completed=backward_completed,
+            )
+            return self.commit_gradient_capture(model_id)
+        except BaseException:
+            self.abort_gradient_capture(model_id)
+            raise
 
     def prepare_forward(self, model_id: str) -> None:
         """
@@ -1543,6 +2102,7 @@ class LoRAAdapterManager:
             )
 
         state = self.adapters[model_id]
+        self.validate_weight_publication(model_id)
         self._validate_model_layout_identity(state)
         self._validate_replica_coherence(state, gradients=False)
         # Update last access time for LRU tracking
@@ -1563,57 +2123,6 @@ class LoRAAdapterManager:
                 state.tensor_layouts[name].unpack_to_local(state.local_params[name].data, destination=local_tensor)
 
         self.current_adapter_id = model_id
-
-    def capture_gradients(self, model_id: str) -> None:
-        """
-        Copy gradients from model params to adapter params after backward.
-
-        This captures the gradients computed during backward() and stores
-        them in the adapter's own Parameter objects (which have their own
-        .grad slots). This prevents gradient collision when multiple adapters
-        interleave.
-
-        Only the model-local gradient rectangle is copied.  No full DTensor is
-        materialized in this hot path.
-
-        Args:
-            model_id: The adapter to capture gradients for
-        """
-        model_id = validate_identifier(model_id, name="model_id")
-        if model_id not in self.adapters:
-            raise KeyError(f"Adapter for model_id={model_id} not registered")
-
-        state = self.adapters[model_id]
-        self._validate_model_layout_identity(state)
-
-        captured_any = False
-        for name, param in self.model.named_parameters():
-            if name not in state.local_params or param.grad is None:
-                continue
-            if state.gradient_source not in {None, "model"}:
-                raise RuntimeError("Cannot mix model-local and logical-coordinate gradients in one optimizer step")
-            adapter_param = state.local_params[name]
-            raw_grad = param.grad
-            local_grad = raw_grad.to_local() if _HAS_DTENSOR and isinstance(raw_grad, DTensor) else raw_grad
-            local_grad = wait_for_local_tensor(local_grad)
-            grad = state.tensor_layouts[name].pack_from_local(local_grad)
-            param.grad = None
-            if grad.numel() == 0:
-                continue
-            # Ordinary Parameters require .grad to have the same dtype as the
-            # Parameter. AnyPrecision/fused optimizers convert their state
-            # internally, so retaining FP32 here is both illegal and unnecessary.
-            self._accumulate_adapter_gradient(adapter_param, grad, accumulate=True)
-            captured_any = True
-
-        if captured_any:
-            state.gradient_source = "model"
-
-        if gradient_trace_enabled():
-            self._trace_adapter_gradient_stage(
-                state,
-                stage=f"after_adapter_accumulation_{state.global_forward_backward_step}",
-            )
 
     def _ep_group(self):
         if not torch.distributed.is_available() or not torch.distributed.is_initialized():
@@ -1658,196 +2167,188 @@ class LoRAAdapterManager:
             values[name] = layout.pack_from_local(wait_for_local_tensor(local_grad))
         trace_replicated_gradient_stage(stage=stage, values=values, ep_group=ep_group)
 
-    def synchronize_replicated_gradients(self, model_id: str) -> GradientSyncStats:
-        """Reduce accumulated shared-factor gradients across the EP group.
-
-        Model gradients are scratch state and are copied into the adapter-owned
-        parameters once per streamed ``forward_backward`` call. Reduction must
-        therefore happen on those adapter slots, after accumulation, so every
-        backend follows the same one-collective-at-the-optimizer-boundary
-        contract.
-        """
-
-        state = self.get_adapter_state(model_id)
-        replicated_parameters = [
-            state.local_params[name]
-            for name in _canonical_parameter_order(state.local_params)
-            if state.tensor_layouts[name].needs_ep_gradient_sync
-        ]
-        if not replicated_parameters:
-            return GradientSyncStats()
+    @staticmethod
+    def _distributed_world() -> tuple[object | None, int]:
         if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-            return GradientSyncStats()
+            return None, 1
+        group = torch.distributed.group.WORLD
+        return group, torch.distributed.get_world_size(group=group)
 
+    def _resolve_gradient_reduction_group(self, domain: ReductionDomainPlan):
         from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
 
         parallel_state = get_parallel_state()
-        if not parallel_state.ep_enabled:
-            return GradientSyncStats()
-        ep_group = parallel_state.ep_group
-        if ep_group is None or torch.distributed.get_world_size(ep_group) <= 1:
-            return GradientSyncStats()
-        return synchronize_replicated_gradient_parameters(replicated_parameters, ep_group=ep_group)
+        if domain.axis is ReductionAxis.SEQUENCE_PARALLEL:
+            return parallel_state.sp_grad_sync_group
+        if domain.axis is ReductionAxis.OUTPUT_PROJECTION_REPLICA:
+            return parallel_state.lm_head_tp_replica_group
+        if domain.axis is ReductionAxis.EXPERT_PARALLEL_REPLICA:
+            return parallel_state.ep_group
+        raise AdapterGradientOwnershipError(f"No residual transport resolver for axis {domain.axis.value!r}")
+
+    def _validate_authoritative_state(self, state: AdapterState, *, allow_optimizer_gradients: bool = False) -> None:
+        """Validate the local state against the immutable registered plan.
+
+        The plan fingerprint is agreed across ranks when the adapter is
+        registered or explicitly reconfigured.  The steady-state path does not
+        run a second metadata consensus protocol around every optimizer step.
+        """
+
+        plan = state.gradient_ownership_plan
+        if plan is None:
+            raise AdapterGradientOwnershipError("Authoritative finalization requires a compiled plan")
+        scratch = state.gradient_scratch
+        if state.poisoned:
+            raise AdapterGradientOwnershipError("Adapter session is poisoned and must recover from checkpoint")
+        if scratch.capture_open:
+            raise AdapterGradientOwnershipError("Cannot finalize an open gradient capture ordinal")
+        if scratch.epoch != state.global_step or scratch.next_capture_ordinal <= 0:
+            raise AdapterGradientOwnershipError("Gradient epoch or capture ordinal is stale or empty")
+        if not math.isfinite(scratch.denominator) or scratch.denominator <= 0:
+            raise AdapterGradientOwnershipError("Gradient denominator must be finite and positive")
+        if scratch.numerator_scale is None or not math.isfinite(scratch.numerator_scale):
+            raise AdapterGradientOwnershipError("Gradient numerator scale is missing or nonfinite")
+        if scratch.source != "model":
+            raise AdapterGradientOwnershipError("Compiled producer and captured gradient source disagree")
+        scratch_by_fqn = {canonical_parameter_name(name): tensor for name, tensor in scratch.numerators.items()}
+        local_by_fqn = {canonical_parameter_name(name): parameter for name, parameter in state.local_params.items()}
+        for item in plan.parameters:
+            numerator = scratch_by_fqn.get(item.fqn)
+            if numerator is None:
+                if item.requires_local_gradient:
+                    raise AdapterGradientOwnershipError(f"Required numerator is absent for {item.fqn!r}")
+                continue
+            if tuple(numerator.shape) != tuple(local_by_fqn[item.fqn].shape):
+                raise AdapterGradientOwnershipError(f"Numerator shape changed for {item.fqn!r}")
+        if not allow_optimizer_gradients and any(
+            parameter.grad is not None for parameter in state.local_params.values()
+        ):
+            raise AdapterGradientOwnershipError("Optimizer gradient slots were populated before finalization")
+
+    def _authoritative_optim_step(
+        self,
+        state: AdapterState,
+        *,
+        lr: float,
+        gradient_clip: Optional[float],
+        norm_type: float,
+    ) -> float:
+        if float(norm_type) != 2.0:
+            raise ValueError("Authoritative adapter finalization currently supports L2 norm only")
+        self._validate_authoritative_state(state)
+        self._validate_ep_owner_layout(state)
+        plan = state.gradient_ownership_plan
+        assert plan is not None
+        scratch = state.gradient_scratch
+        multiplier = float(scratch.numerator_scale) / float(scratch.denominator)
+        templates = {name: parameter.detach() for name, parameter in state.local_params.items()}
+        try:
+            gradients, transport_stats = transport_complete_local_gradients(
+                plan=plan,
+                numerators=scratch.numerators,
+                templates=templates,
+                multiplier=multiplier,
+                resolve_group=self._resolve_gradient_reduction_group,
+                bucket_bytes=self.gradient_ownership_bucket_bytes,
+                consume_numerators=True,
+            )
+            group, _world = self._distributed_world()
+            norm = logical_l2_norm(plan, gradients, world_group=group)
+        except AdapterGradientOwnershipError:
+            raise
+        except Exception as error:
+            state.poisoned = True
+            raise AdapterGradientCollectiveFailure(
+                "Adapter-gradient data collective failed; restart the distributed process"
+            ) from error
+
+        grad_norm = float(norm.item())
+        if not math.isfinite(grad_norm):
+            raise AdapterGradientOwnershipError("Transport-complete adapter gradient is nonfinite")
+        clip_coefficient = 1.0
+        if gradient_clip is not None and gradient_clip > 0:
+            clip_coefficient = min(1.0, float(gradient_clip) / (grad_norm + 1e-6))
+        local_by_fqn = {canonical_parameter_name(name): parameter for name, parameter in state.local_params.items()}
+        for item in plan.parameters:
+            parameter = local_by_fqn[item.fqn]
+            gradient = gradients[item.fqn]
+            gradient.mul_(clip_coefficient)
+            parameter.grad = gradient.to(dtype=parameter.dtype) if parameter.numel() > 0 else None
+
+        state.publication_eligible = False
+        try:
+            # LR is persistent session/optimizer state.  Update it only after
+            # transport, logical norm, nonfinite, and clipping validation have
+            # all succeeded and immediately before the mutating optimizer call.
+            self._update_state_learning_rate(state, lr)
+            state.optimizer.step()
+            if self.device.type == "cuda":
+                torch.cuda.current_stream(self.device).synchronize()
+            self._validate_replica_coherence(state, gradients=False)
+            self._validate_optimizer_replica_coherence(state)
+        except Exception as error:
+            state.poisoned = True
+            raise AdapterGradientMutationFailure(
+                "Adapter optimizer mutation failed; publish nothing and recover from the last checkpoint"
+            ) from error
+        finally:
+            try:
+                state.optimizer.zero_grad(set_to_none=True)
+            except TypeError:
+                state.optimizer.zero_grad()
+            for parameter in state.local_params.values():
+                parameter.grad = None
+
+        state.global_step += 1
+        state.last_transport_stats = transport_stats
+        # Multi-rank publication is committed by RunnerDispatcher after its
+        # existing optim_step error synchronization succeeds.  Keeping this
+        # local step pending avoids adding an ownership-specific post-step
+        # collective while ensuring a successful rank cannot publish early.
+        state.publication_pending = _world > 1
+        state.publication_eligible = not state.publication_pending
+        self._reset_gradient_scratch(state)
+        return grad_norm
+
+    def commit_optimizer_publication(self, model_id: str) -> None:
+        """Commit a completed distributed step at the server command boundary."""
+
+        state = self.get_adapter_state(model_id)
+        if not state.publication_pending:
+            return
+        if state.poisoned:
+            raise AdapterGradientMutationFailure("A poisoned adapter step cannot become publication-eligible")
+        scratch = state.gradient_scratch
+        if scratch.capture_open or scratch.next_capture_ordinal or scratch.denominator or scratch.source is not None:
+            raise AdapterGradientMutationFailure("Adapter publication commit found incomplete gradient scratch")
+        state.publication_pending = False
+        state.publication_eligible = True
 
     def optim_step(
         self,
         model_id: str,
         lr: float,
         gradient_clip: Optional[float] = None,
-        accumulated_valid_tokens: int = 0,
         norm_type: float = 2.0,
     ) -> float:
-        """
-        Run optimizer step on adapter's own parameters.
-
-        This uses the adapter's own optimizer on the adapter's own Parameters,
-        which have their own gradients from capture_gradients().
-
-        Args:
-            model_id: The adapter to step
-            lr: Learning rate to use
-            gradient_clip: Optional gradient clipping value
-            accumulated_valid_tokens: Total valid tokens accumulated across
-                forward_backward calls. If > 0, gradients are scaled by
-                1/accumulated_valid_tokens (deferred normalization).
-
-        Returns:
-            The gradient norm before clipping
-        """
+        """Finalize the compiled raw-numerator epoch and mutate its optimizer."""
         if model_id not in self.adapters:
             raise KeyError(f"Adapter for model_id={model_id} not registered")
 
         state = self.adapters[model_id]
         self._validate_model_layout_identity(state)
-
-        # Update learning rate
-        self._update_state_learning_rate(state, lr)
-
-        self._trace_adapter_gradient_stage(state, stage="before_token_normalization")
-
-        # Deferred gradient normalization: scale raw gradients by 1/accumulated_valid_tokens
-        if accumulated_valid_tokens > 0:
-            scale = 1.0 / accumulated_valid_tokens
-            for p in state.local_params.values():
-                if p.grad is not None:
-                    p.grad.mul_(scale)
-        self._trace_adapter_gradient_stage(state, stage="after_token_normalization")
-
-        # All backend backward implementations return local shared-factor
-        # gradients. Reduce the accumulated adapter slots exactly once before
-        # finite checks, coherence validation, clipping, and optimizer use.
-        sync_stats = (
-            self.synchronize_replicated_gradients(model_id) if state.gradient_source == "model" else GradientSyncStats()
-        )
-        self._trace_adapter_gradient_stage(state, stage="after_optimizer_boundary_reduction")
-        if sync_stats.configured_parameter_count and (
-            not torch.distributed.is_available()
-            or not torch.distributed.is_initialized()
-            or torch.distributed.get_rank() == 0
-        ):
-            logger.info(
-                "Adapter EP replicated gradient sync: "
-                f"configured_parameters={sync_stats.configured_parameter_count} "
-                f"participating_parameters={sync_stats.participating_parameter_count} "
-                f"buckets={sync_stats.bucket_count} "
-                f"gradient_bytes={sync_stats.gradient_bytes} "
-                f"reduced_bytes={sync_stats.reduced_bytes}"
-            )
-
-        optimizer_params = [
-            state.local_params[name]
-            for name in _canonical_parameter_order(state.local_params)
-            if state.local_params[name].numel() > 0
-        ]
-        local_grads = [param.grad for param in optimizer_params if param.grad is not None]
-        local_device = local_grads[0].device if local_grads else self.device
-        distributed = torch.distributed.is_available() and torch.distributed.is_initialized()
-        group = torch.distributed.group.WORLD if distributed else None
-        world = torch.distributed.get_world_size(group=group) if distributed else 1
-
-        if distributed and world > 1:
-            backend = torch.distributed.get_backend(group)
-            if backend == "nccl" and local_device.type != "cuda":
-                local_device = torch.device(f"cuda:{torch.cuda.current_device()}")
-            finite_checks = [torch.isfinite(grad).all().to(device=local_device) for grad in local_grads]
-            local_finite = torch.stack(finite_checks).all() if finite_checks else torch.ones((), dtype=torch.bool)
-            finite_flag = torch.tensor(
-                [1],
-                dtype=torch.int64,
-                device=local_device,
-            )
-            finite_flag.copy_(local_finite.to(dtype=torch.int64).reshape(1))
-            torch.distributed.all_reduce(finite_flag, op=torch.distributed.ReduceOp.MIN, group=group)
-            all_finite = bool(finite_flag.item())
-        else:
-            finite_checks = [torch.isfinite(grad).all() for grad in local_grads]
-            all_finite = bool(torch.stack(finite_checks).all().item()) if finite_checks else True
-
-        if not all_finite:
-            for param in state.local_params.values():
-                param.grad = None
-            state.gradient_source = None
-            raise FloatingPointError(
-                f"Non-finite adapter gradient detected for model_id={model_id}; "
-                "all ranks skipped the optimizer step and cleared gradients."
-            )
-
-        self._validate_ep_owner_layout(state)
-        self._validate_replica_coherence(state, gradients=True)
-
-        if gradient_clip is None or gradient_clip <= 0:
-            clipping_enabled = False
-        else:
-            clipping_enabled = True
-
-        if math.isinf(float(norm_type)):
-            local_max = torch.zeros((), dtype=torch.float32, device=local_device)
-            for param in optimizer_params:
-                if param.grad is not None:
-                    local_max = torch.maximum(local_max, param.grad.detach().to(torch.float32).abs().max())
-            if distributed and world > 1:
-                torch.distributed.all_reduce(local_max, op=torch.distributed.ReduceOp.MAX, group=group)
-            grad_norm = float(local_max.item())
-        elif float(norm_type) == 2.0:
-            local_sum_sq = torch.zeros((), dtype=torch.float32, device=local_device)
-            for name in sorted(state.local_params):
-                param = state.local_params[name]
-                if param.grad is None or param.numel() == 0:
-                    continue
-                grad_sum_sq = param.grad.detach().to(torch.float32).square().sum()
-                layout = state.tensor_layouts[name]
-                # Logical gradients are already global, so every physical EP
-                # replica contributes to the world norm exactly once.
-                replica_divisor = max(layout.replica_count, 1)
-                local_sum_sq = local_sum_sq + grad_sum_sq / replica_divisor
-            if distributed and world > 1:
-                torch.distributed.all_reduce(local_sum_sq, op=torch.distributed.ReduceOp.SUM, group=group)
-            grad_norm = float(torch.sqrt(local_sum_sq).item())
-        else:
-            raise ValueError(f"Unsupported adapter gradient norm type: {norm_type!r}")
-
-        clip_coefficient = 1.0
-        if clipping_enabled:
-            clip_coefficient = min(1.0, float(gradient_clip) / (grad_norm + 1e-6))
-            if clip_coefficient != 1.0:
-                for param in optimizer_params:
-                    if param.grad is not None:
-                        param.grad.mul_(clip_coefficient)
-
-        movement_probes = self._capture_factor_movement_probes(state) if self._replica_validation_enabled() else {}
-        state.optimizer.step()
-        if self.device.type == "cuda":
-            torch.cuda.current_stream(self.device).synchronize()
-        self._validate_replica_coherence(state, gradients=False)
-        self._validate_optimizer_replica_coherence(state)
-        self._log_factor_movement(state, movement_probes)
+        if state.gradient_ownership_plan is None:
+            raise AdapterGradientOwnershipError("Adapter gradient ownership requires a compiled plan")
         try:
-            state.optimizer.zero_grad(set_to_none=True)
-        except TypeError:
-            state.optimizer.zero_grad()
-        state.global_step += 1
-        state.gradient_source = None
-        return grad_norm
+            return self._authoritative_optim_step(
+                state,
+                lr=lr,
+                gradient_clip=gradient_clip,
+                norm_type=norm_type,
+            )
+        except AdapterGradientOwnershipError:
+            self.abort_gradient_epoch(model_id)
+            raise
 
     def sync_weights_to_model(self, model_id: str) -> None:
         """
@@ -2007,45 +2508,6 @@ class LoRAAdapterManager:
             for name, local_slot in packed.items():
                 state.local_params[name].data.copy_(local_slot.to(self.device, state.local_params[name].dtype))
 
-    def load_logical_gradients(
-        self,
-        model_id: str,
-        gradient_state_dict: Dict[str, torch.Tensor],
-        *,
-        accumulate: bool = True,
-    ) -> None:
-        """Pack logical gradients into local adapter slots without model scratch state."""
-
-        state = self.get_adapter_state(model_id)
-        expected_names = {canonical_parameter_name(name): name for name in state.local_params}
-        converted_by_name = {canonical_parameter_name(name): tensor for name, tensor in gradient_state_dict.items()}
-        unexpected = sorted(set(converted_by_name) - set(expected_names))
-        if unexpected:
-            raise ValueError(f"Logical gradient state contains unexpected parameters: {unexpected!r}")
-        loaded_any = False
-        with torch.no_grad():
-            for canonical_name, logical_gradient in converted_by_name.items():
-                actual_name = expected_names[canonical_name]
-                if state.gradient_source not in {None, "logical"}:
-                    raise RuntimeError("Cannot mix logical-coordinate and model-local gradients in one optimizer step")
-                layout = state.tensor_layouts[actual_name]
-                if tuple(logical_gradient.shape) != layout.logical_shape:
-                    raise ValueError(
-                        f"Logical gradient {canonical_name!r} has shape {tuple(logical_gradient.shape)}, "
-                        f"expected {layout.logical_shape}"
-                    )
-                local_gradient = pack_logical_tensor(layout, logical_gradient)
-                self._accumulate_adapter_gradient(
-                    state.local_params[actual_name],
-                    local_gradient,
-                    accumulate=accumulate,
-                )
-                loaded_any = True
-        if loaded_any:
-            state.gradient_source = "logical"
-        if gradient_trace_enabled():
-            self._trace_adapter_gradient_stage(state, stage="after_logical_gradient_accumulation")
-
     def _pack_logical_state_dict(
         self, state: AdapterState, state_dict: Dict[str, torch.Tensor]
     ) -> Dict[str, torch.Tensor]:
@@ -2128,6 +2590,7 @@ class LoRAAdapterManager:
             raise KeyError(f"Adapter for model_id={model_id} not registered")
 
         state = self.adapters[model_id]
+        self.validate_strict_checkpoint_publication(model_id)
 
         _rank, world = _optimizer_shard_rank_world()
         if world > 1:
@@ -2197,6 +2660,16 @@ class LoRAAdapterManager:
             "optimizer": deepcopy(checkpoint_session_spec["optimizer_config"]),
             "optimizer_state": self._optimizer_state_metadata(state.optimizer),
             "layout_fingerprint": state.layout_fingerprint,
+            "gradient_ownership": {
+                "plan_fingerprint": (
+                    state.gradient_ownership_plan.fingerprint if state.gradient_ownership_plan is not None else None
+                ),
+                "optimizer_restore_contract": (
+                    state.gradient_ownership_plan.optimizer_restore_contract()
+                    if state.gradient_ownership_plan is not None
+                    else None
+                ),
+            },
             "layout_descriptors": [state.tensor_layouts[name].to_json_dict() for name in sorted(state.tensor_layouts)],
         }
         metadata_path = os.path.join(path, "metadata.json")
@@ -2299,6 +2772,15 @@ class LoRAAdapterManager:
         # Determine learning rate
         effective_lr = lr if lr is not None else metadata.get("lr", 1e-5)
         registered_state = self.adapters.get(model_id)
+        if registered_state is not None and registered_state.poisoned:
+            raise RuntimeError(
+                "A poisoned adapter session cannot be recovered in-process; restart from the last committed checkpoint"
+            )
+        checkpoint_plan_fingerprint = metadata.get("gradient_ownership", {}).get("plan_fingerprint")
+        checkpoint_restore_contract = metadata.get("gradient_ownership", {}).get("optimizer_restore_contract")
+        live_plan = registered_state.gradient_ownership_plan if registered_state is not None else None
+        if load_optimizer and live_plan is not None:
+            self._validate_ownership_restore_contract(checkpoint_restore_contract, live_plan)
         expected_session_spec = deepcopy(registered_state.session_spec) if registered_state is not None else None
         if expected_session_spec is None:
             expected_session_spec = self._legacy_session_spec(lr=effective_lr)
@@ -2311,27 +2793,11 @@ class LoRAAdapterManager:
         self._validate_checkpoint_adapter_config(path)
 
         if registered_state is not None:
-            checkpoint_spec_for_compare = checkpoint_session_spec
-            registered_spec_for_compare = registered_state.session_spec
-            if lr is not None:
-                checkpoint_spec_for_compare = self._strip_optimizer_learning_rate(checkpoint_spec_for_compare)
-                registered_spec_for_compare = self._strip_optimizer_learning_rate(registered_spec_for_compare)
-
-            if load_optimizer:
-                specs_match = checkpoint_spec_for_compare == registered_spec_for_compare
-                mismatch_context = "registered multi-adapter session"
-            else:
-                specs_match = self._strip_optimizer_config(checkpoint_spec_for_compare) == self._strip_optimizer_config(
-                    registered_spec_for_compare
-                )
-                mismatch_context = "registered multi-adapter session for weights-only restore"
-
-            if not specs_match:
-                raise ValueError(
-                    "Checkpoint session spec does not match the "
-                    f"{mismatch_context}. checkpoint={checkpoint_session_spec!r}, "
-                    f"current={registered_state.session_spec!r}"
-                )
+            self._validate_session_restore_compatibility(
+                checkpoint_session_spec,
+                registered_state.session_spec,
+                load_optimizer=load_optimizer,
+            )
 
         # 2. Register adapter if not exists (this will evict if needed).
         # Track whether this call did the registration so a downstream load
@@ -2381,6 +2847,11 @@ class LoRAAdapterManager:
                         f"Adapter checkpoint at {path} declares saved optimizer state but contains no "
                         "complete optimizer checkpoint. Use load_optimizer=False for a weights-only warm start."
                     )
+                # The staged optimizer state has now passed its direct class,
+                # group, coordinate, layout, and tensor contract.  Adopt the
+                # checkpoint's optimizer metadata; an explicit LR override is
+                # applied below.
+                state.session_spec["optimizer_config"] = deepcopy(checkpoint_session_spec["optimizer_config"])
 
             # All checkpoint components are valid. Commit the LoRA tensors only
             # after optimizer restore succeeds.
@@ -2400,6 +2871,10 @@ class LoRAAdapterManager:
                 self._update_state_learning_rate(state, metadata["lr"])
 
             state.last_access_time = time.time()
+            state.publication_pending = False
+            state.publication_eligible = True
+            self._clear_all_adapter_gradients(state)
+            self._reset_gradient_scratch(state)
         except Exception:
             if registered_here:
                 try:
@@ -2438,4 +2913,5 @@ class LoRAAdapterManager:
             "model_id": model_id,
             "step": state.global_step,
             "load_time": load_time,
+            "gradient_ownership_plan_fingerprint": checkpoint_plan_fingerprint,
         }

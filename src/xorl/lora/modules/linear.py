@@ -58,6 +58,8 @@ class LoraLinear(LoraModule, nn.Linear):
         >>> isinstance(layer, nn.Linear)  # True
     """
 
+    adapter_gradient_producer_family = "module_managed"
+
     def __init__(
         self,
         in_features: int,

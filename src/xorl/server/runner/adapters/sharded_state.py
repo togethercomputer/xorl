@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections import Counter
+from collections import defaultdict
 from dataclasses import dataclass, replace
 from typing import Any, Mapping, Optional
 
@@ -166,6 +166,7 @@ class AdapterTensorLayout:
     active_local_slices: tuple[slice, ...]
     active_storage_shape: tuple[int, ...]
     replica_count: int = 1
+    replica_ranks: tuple[int, ...] = (0,)
     replica_key: tuple[Any, ...] = ()
     placement_signature: tuple[Any, ...] = ()
     gradient_reduction: GradientReductionDomain = GradientReductionDomain.NONE
@@ -222,6 +223,7 @@ class AdapterTensorLayout:
             ],
             "active_storage_shape": list(self.active_storage_shape),
             "replica_count": self.replica_count,
+            "replica_ranks": list(self.replica_ranks),
             "replica_key": list(self.replica_key),
             "placement_signature": [
                 list(item) if isinstance(item, tuple) else item for item in self.placement_signature
@@ -383,7 +385,12 @@ def discover_adapter_layouts(
     active_rank: int,
     process_group: Optional[dist.ProcessGroup] = None,
     pipeline_parallel_size: int = 1,
-) -> tuple[dict[str, AdapterTensorLayout], str]:
+    local_group_memberships: Mapping[str, tuple[int, ...]] | None = None,
+) -> tuple[
+    dict[str, AdapterTensorLayout],
+    str,
+    dict[str, tuple[tuple[int, ...], ...]],
+]:
     """Discover and validate the local layouts for one active adapter rank."""
 
     if pipeline_parallel_size > 1:
@@ -409,10 +416,17 @@ def discover_adapter_layouts(
     distributed = dist.is_available() and dist.is_initialized()
     world = dist.get_world_size(group=group) if distributed else 1
     local_descriptors = [_descriptor_from_layout(layouts[name]) for name in sorted(layouts)]
-    gathered: list[list[dict[str, Any]]] = [local_descriptors]
+    local_payload = {
+        "layouts": local_descriptors,
+        "group_memberships": {
+            str(key): tuple(int(member) for member in members)
+            for key, members in (local_group_memberships or {}).items()
+        },
+    }
+    gathered: list[dict[str, Any]] = [local_payload]
     if world > 1:
         gathered = [None] * world  # type: ignore[list-item]
-        dist.all_gather_object(gathered, local_descriptors, group=group)
+        dist.all_gather_object(gathered, local_payload, group=group)
 
     expected_names = [descriptor["fqn"] for descriptor in local_descriptors]
     expected_static = {
@@ -423,7 +437,8 @@ def discover_adapter_layouts(
         )
         for descriptor in local_descriptors
     }
-    for rank, descriptors in enumerate(gathered):
+    for rank, payload in enumerate(gathered):
+        descriptors = payload["layouts"]
         if [descriptor["fqn"] for descriptor in descriptors] != expected_names:
             raise RuntimeError(f"Rank {rank} exposed a different ordered LoRA layout")
         for descriptor in descriptors:
@@ -436,19 +451,34 @@ def discover_adapter_layouts(
             if static != expected_static[key]:
                 raise RuntimeError(f"Incompatible logical LoRA layout for {key!r} on rank {rank}")
 
-    replica_counts = Counter(
-        (
-            descriptor["fqn"],
-            tuple(descriptor["logical_shape"]),
-            tuple(descriptor["local_logical_offset"]),
-            tuple(descriptor["local_logical_shape"]),
-            descriptor["dtype"],
-        )
-        for descriptors in gathered
-        for descriptor in descriptors
-    )
+    replica_members: dict[tuple[Any, ...], list[int]] = defaultdict(list)
+    for rank, payload in enumerate(gathered):
+        descriptors = payload["layouts"]
+        for descriptor in descriptors:
+            key = (
+                descriptor["fqn"],
+                tuple(descriptor["logical_shape"]),
+                tuple(descriptor["local_logical_offset"]),
+                tuple(descriptor["local_logical_shape"]),
+                descriptor["dtype"],
+            )
+            replica_members[key].append(rank)
     for name, layout in list(layouts.items()):
-        layouts[name] = replace(layout, replica_count=replica_counts[layout.replica_key])
+        members = tuple(replica_members[layout.replica_key])
+        layouts[name] = replace(layout, replica_count=len(members), replica_ranks=members)
+
+    group_memberships: dict[str, tuple[tuple[int, ...], ...]] = {}
+    group_keys = sorted({key for payload in gathered for key in payload["group_memberships"]})
+    for key in group_keys:
+        group_memberships[key] = tuple(
+            sorted(
+                {
+                    tuple(payload["group_memberships"][key])
+                    for payload in gathered
+                    if key in payload["group_memberships"]
+                }
+            )
+        )
 
     fingerprint_payload = {
         "world_size": world,
@@ -457,7 +487,7 @@ def discover_adapter_layouts(
     fingerprint = hashlib.sha256(
         json.dumps(fingerprint_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
-    return layouts, fingerprint
+    return layouts, fingerprint, group_memberships
 
 
 def layout_fingerprint(layouts: Mapping[str, AdapterTensorLayout], *, world_size: int = 1) -> str:

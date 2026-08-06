@@ -38,6 +38,8 @@ class QLoRALinear(LoraModule, nn.Module):
     Only LoRA parameters (lora_A, lora_B) are trainable in fp32.
     """
 
+    adapter_gradient_producer_family = "module_managed"
+
     # Metadata for pre-quantized loading (set by inject_qlora_into_model)
     _is_prequantized: bool = False
     _inline_loaded: bool = False  # True when loaded via checkpoint handler (no deferred I/O needed)

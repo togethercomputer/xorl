@@ -217,6 +217,18 @@ class CheckpointManager:
             "optimizer_format": "sharded_v3" if save_optimizer else None,
             "optimizer": adapter_state.session_spec["optimizer_config"],
             "layout_fingerprint": adapter_state.layout_fingerprint,
+            "gradient_ownership": {
+                "plan_fingerprint": (
+                    adapter_state.gradient_ownership_plan.fingerprint
+                    if getattr(adapter_state, "gradient_ownership_plan", None) is not None
+                    else None
+                ),
+                "optimizer_restore_contract": (
+                    adapter_state.gradient_ownership_plan.optimizer_restore_contract()
+                    if getattr(adapter_state, "gradient_ownership_plan", None) is not None
+                    else None
+                ),
+            },
             "layout_descriptors": [
                 adapter_state.tensor_layouts[name].to_json_dict() for name in sorted(adapter_state.tensor_layouts)
             ],
@@ -236,6 +248,31 @@ class CheckpointManager:
         if self._adapter_manager is None:
             return get_lora_state_dict(self.model)
         return self._adapter_manager.materialize_logical_state_dict(model_id, destination_rank=self.rank)
+
+    def _adapter_publication_error(self, model_id: str, *, strict: bool) -> Optional[str]:
+        if self._adapter_manager is None:
+            return None
+        try:
+            if strict:
+                self._adapter_manager.validate_strict_checkpoint_publication(model_id)
+            else:
+                self._adapter_manager.validate_weight_publication(model_id)
+        except Exception as error:  # noqa: BLE001 - converted into a collective preflight failure
+            return str(error)
+        return None
+
+    def _require_collective_adapter_publication(self, model_id: str, *, strict: bool) -> None:
+        error = self._sync_collective_error(self._adapter_publication_error(model_id, strict=strict))
+        if error:
+            surface = "checkpoint" if strict else "weight"
+            raise RuntimeError(f"Adapter {surface} publication failed: {error}")
+
+    def _require_current_adapter_weight_publication(self) -> None:
+        if self._adapter_manager is None:
+            return
+        model_id = self._adapter_manager.current_adapter_id
+        if model_id is not None:
+            self._require_collective_adapter_publication(model_id, strict=False)
 
     @staticmethod
     def _infer_lora_rank_dim(name: str, tensor: torch.Tensor) -> Optional[int]:
@@ -411,6 +448,7 @@ class CheckpointManager:
 
         # Get adapter state for metadata and optimizer
         adapter_state = self._adapter_manager.get_adapter_state(model_id)
+        self._require_collective_adapter_publication(model_id, strict=True)
 
         # Use default path if not provided
         if path is None:
@@ -495,6 +533,7 @@ class CheckpointManager:
         Returns:
             Dictionary mapping parameter names to tensors (on CPU)
         """
+        self._require_current_adapter_weight_publication()
         # For FSDP2, use the proper distributed checkpoint API to get full state dict
         state_dict_options = StateDictOptions(
             full_state_dict=True,
@@ -528,6 +567,7 @@ class CheckpointManager:
         ps = get_parallel_state()
 
         if ps.ep_enabled:
+            self._require_current_adapter_weight_publication()
             # For EP-enabled models, use ModelState which handles EP dimension properly
             logger.debug(f"Rank {self.rank}: Using EP-aware ModelState for state_dict extraction...")
 
@@ -719,6 +759,7 @@ class CheckpointManager:
         - Each node writes ~12 shards
         - Expected speedup: ~6-8x for I/O phase
         """
+        self._require_current_adapter_weight_publication()
         start_time = time.time()
         ps = get_parallel_state()
 
@@ -1082,6 +1123,8 @@ class CheckpointManager:
         """
         if not self.lora_config.get("enable_lora", False):
             raise ValueError("LoRA is not enabled, cannot save LoRA-only checkpoint")
+
+        self._require_collective_adapter_publication(model_id, strict=False)
 
         start_time = time.time()
 

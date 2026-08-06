@@ -8,7 +8,7 @@
 model_path: Qwen/Qwen3-235B-A22B-Instruct-2507
 tokenizer_path: Qwen/Qwen3-235B-A22B-Instruct-2507
 attn_implementation: flash_attention_3
-moe_implementation: quack
+moe_implementation: triton
 
 # Parallelism Configuration
 data_parallel_mode: fsdp2
@@ -48,7 +48,8 @@ quant_group_size: 64
 enable_lora: true
 lora_rank: 32
 lora_alpha: 32
-lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+# Quantized expert-factor LoRA is deferred; this release adapts attention only.
+lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 # Skip initial checkpoint
 skip_initial_checkpoint: true

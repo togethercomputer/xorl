@@ -1033,6 +1033,11 @@ class ServerArguments:
 
     lora_alpha: int = field(default=16, metadata={"help": "LoRA alpha scaling parameter"})
 
+    adapter_gradient_ownership_bucket_bytes: int = field(
+        default=64 * 1024 * 1024,
+        metadata={"help": "Maximum bytes in one adapter-gradient residual-transport bucket"},
+    )
+
     lora_target_modules: Optional[List[str]] = field(
         default=None,
         metadata={
@@ -1090,45 +1095,6 @@ class ServerArguments:
             "help": "How to restore multi-adapter LoRA checkpoints. 'all_ranks': each rank loads adapter state locally. "
             "'rank0_broadcast': rank 0 loads once and broadcasts weights, metadata, and optimizer state."
         },
-    )
-
-    # ========================================================================
-    # ZORL Configuration
-    # ========================================================================
-
-    enable_zorl: bool = field(
-        default=False,
-        metadata={"help": "Enable zeroth-order LoRA search metadata and session defaults for server training."},
-    )
-
-    zorl_b_sigma: float = field(
-        default=0.01,
-        metadata={"help": "Perturbation scale applied to LoRA-B when planning ZORL candidates."},
-    )
-
-    zorl_num_perturbation_pairs: int = field(
-        default=8,
-        metadata={"help": "Number of perturbation seeds per ZORL generation before antithetic expansion."},
-    )
-
-    zorl_a_refresh_interval: int = field(
-        default=16,
-        metadata={"help": "Generations between fresh LoRA-A family refreshes. 0 disables auto-refresh."},
-    )
-
-    zorl_antithetic_sampling: bool = field(
-        default=True,
-        metadata={"help": "Emit both positive and negative LoRA-B perturbations for each ZORL seed."},
-    )
-
-    zorl_a_init: Literal["gaussian_jl"] = field(
-        default="gaussian_jl",
-        metadata={"help": "Initialization scheme used for fresh ZORL LoRA-A families."},
-    )
-
-    zorl_seed: Optional[int] = field(
-        default=None,
-        metadata={"help": "Optional base RNG seed for ZORL family refresh and perturbation planning."},
     )
 
     # ========================================================================
@@ -1304,6 +1270,11 @@ class ServerArguments:
                 "pipeline_parallel_size > 1 is not supported with multi-adapter LoRA server training. "
                 "Adapter coordination currently assumes identical local LoRA layouts on every rank."
             )
+        if (self.enable_lora or self.enable_qlora) and self.tensor_parallel_size > 1:
+            raise ValueError(
+                "tensor_parallel_size > 1 is not supported for adapter-bearing model modules; "
+                "lm_head_tensor_parallel_size is a separate output-only topology"
+            )
         if self.pipeline_parallel_size > 1:
             # Deferred import keeps server_arguments import-light (pulls in torch).
             from xorl.distributed.pipeline_parallel import validate_pp_schedule_config  # noqa: PLC0415
@@ -1320,6 +1291,8 @@ class ServerArguments:
             raise ValueError("pipeline_parallel_virtual_stages requires pipeline_parallel_size > 1.")
         if self.enable_lora and self.merge_lora_interval > 0:
             raise ValueError("merge_lora_interval is not supported with multi-adapter LoRA server training")
+        if self.adapter_gradient_ownership_bucket_bytes <= 0:
+            raise ValueError("adapter_gradient_ownership_bucket_bytes must be positive")
         if self.max_lora_rank is None:
             self.max_lora_rank = self.lora_rank
         if self.max_lora_rank < self.lora_rank:
@@ -1338,8 +1311,6 @@ class ServerArguments:
                 "load_checkpoint_path to materialize parameters from a DCP checkpoint. "
                 "Set load_checkpoint_path or choose a different load_weights_mode."
             )
-        if self.enable_zorl and not self.enable_lora:
-            raise ValueError("enable_zorl requires enable_lora=True")
         if self.receiver_kv_cache_dtype is not None:
             receiver_kv_cache_dtype = str(self.receiver_kv_cache_dtype).strip().lower()
             if receiver_kv_cache_dtype in {"", "none", "null"}:
@@ -1459,6 +1430,7 @@ class ServerArguments:
                 "adam_betas": self.adam_betas,
                 "adam_eps": self.adam_eps,
                 "optimizer_dtype": self.optimizer_dtype,
+                "adapter_gradient_ownership_bucket_bytes": self.adapter_gradient_ownership_bucket_bytes,
                 "cautious_weight_decay": self.cautious_weight_decay,
                 "muon_lr": self.muon_lr,
                 "muon_momentum": self.muon_momentum,
@@ -1519,15 +1491,6 @@ class ServerArguments:
                 "merge_lora_interval": self.merge_lora_interval,
                 "reset_optimizer_on_merge": self.reset_optimizer_on_merge,
                 "adapter_state_load_mode": self.adapter_state_load_mode,
-            },
-            "zorl": {
-                "enabled": self.enable_zorl,
-                "b_sigma": self.zorl_b_sigma,
-                "num_perturbation_pairs": self.zorl_num_perturbation_pairs,
-                "a_refresh_interval": self.zorl_a_refresh_interval,
-                "antithetic_sampling": self.zorl_antithetic_sampling,
-                "a_init": self.zorl_a_init,
-                "seed": self.zorl_seed,
             },
         }
         return config

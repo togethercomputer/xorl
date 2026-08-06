@@ -32,6 +32,7 @@ def sync_sp_gradients(
     sp_grad_sync_group,
     *,
     skip_dtensor_grads: bool = False,
+    excluded_parameter_ids: frozenset[int] = frozenset(),
 ) -> None:
     """All-reduce gradients for ring/Ulysses dims not folded into FSDP.
 
@@ -48,6 +49,8 @@ def sync_sp_gradients(
     """
     if sp_grad_sync_group is not None:
         for p in model.parameters():
+            if id(p) in excluded_parameter_ids:
+                continue
             if p.grad is None:
                 continue
             if skip_dtensor_grads and DTensor is not None and isinstance(p.grad, DTensor):
@@ -56,7 +59,12 @@ def sync_sp_gradients(
             dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=sp_grad_sync_group)
 
 
-def sync_lm_head_tp_gradient(model: torch.nn.Module, lm_head_tp_replica_group) -> None:
+def sync_lm_head_tp_gradient(
+    model: torch.nn.Module,
+    lm_head_tp_replica_group,
+    *,
+    excluded_parameter_ids: frozenset[int] = frozenset(),
+) -> None:
     """Sum the lm-head-TP weight gradient over its replica dim (cp_replica x DP).
 
     With lm-head-only TP the lm_head is FSDP-sharded over a dedicated 2-D mesh
@@ -75,6 +83,8 @@ def sync_lm_head_tp_gradient(model: torch.nn.Module, lm_head_tp_replica_group) -
         if not getattr(module, "_xorl_fsdp_sharded_lm_head_loss", False):
             continue
         for p in module.parameters(recurse=False):
+            if id(p) in excluded_parameter_ids:
+                continue
             if p.grad is None:
                 continue
             grad = p.grad.to_local() if DTensor is not None and isinstance(p.grad, DTensor) else p.grad

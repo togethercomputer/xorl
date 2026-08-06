@@ -521,7 +521,7 @@ def test_merge_per_token_outputs_rejects_replica_disagreement():
         )
 
 
-def test_gather_per_token_outputs_trims_dummy_rows_and_restores_global_order(monkeypatch):
+def test_completion_rendezvous_trims_payload_then_rank0_merges_afterward(monkeypatch):
     dispatcher = _dispatcher(rank=0, world_size=2)
     dispatcher.cpu_group = object()
     monkeypatch.setattr(dispatcher, "_batch_parallel_rank_and_size", lambda *_args: (0, 2))
@@ -554,12 +554,15 @@ def test_gather_per_token_outputs_trims_dummy_rows_and_restores_global_order(mon
         "per_sample_k3": [0.0, 0.1, 999.0],
     }
 
-    dispatcher._gather_per_token_outputs(
+    gathered = dispatcher._completion_rendezvous(
         result,
         [_batch(10, num_samples=2), _batch(20, num_samples=0)],
         _parallel_state(),
         is_rank0=True,
     )
+
+    assert result["packed_logprobs"] == [[-1.0], [999.0]]
+    dispatcher._merge_completion_payloads(result, gathered)
 
     assert result == {
         "packed_logprobs": [[-1.0], [-2.0]],

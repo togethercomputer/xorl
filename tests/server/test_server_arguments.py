@@ -9,6 +9,8 @@ import pytest
 import torch
 import yaml
 
+from xorl.server.removed_config import reject_removed_configuration_fields
+
 
 pytestmark = [pytest.mark.cpu, pytest.mark.server]
 
@@ -72,12 +74,105 @@ def load_server_arguments(config_path, *args, **kwargs):
     return _load_server_arguments_impl(config_path, *args, **kwargs)
 
 
-def test_canonical_moe_and_rope_auto_defaults_serialize(tmp_path):
+def test_flat_yaml_rejects_removed_adapter_ownership_mode(tmp_path):
+    config_path = tmp_path / "server_config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model_path": "Qwen/Qwen3-8B",
+                "adapter_gradient_ownership_mode": "observe",
+                "shared_config_key_not_owned_by_server": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="adapter_gradient_ownership_mode.*authoritative-only"):
+        load_server_arguments(str(config_path))
+
+
+def test_nested_yaml_rejects_removed_zorl_field_before_filtering(tmp_path):
     config_path = tmp_path / "server_config.yaml"
     config_path.write_text(
         yaml.safe_dump(
             {
                 "model": {"model_path": "Qwen/Qwen3-8B"},
+                "train": {"zorl_b_sigma": 0.01},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="train.zorl_b_sigma.*ZORL was removed"):
+        load_server_arguments(str(config_path))
+
+
+def test_nested_yaml_rejects_removed_zorl_section(tmp_path):
+    config_path = tmp_path / "server_config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {"model_path": "Qwen/Qwen3-8B"},
+                "zorl": {"enabled": True, "sigma": 0.01},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="zorl.*ZORL was removed"):
+        load_server_arguments(str(config_path))
+
+
+def test_load_server_arguments_rejects_removed_cli_override(tmp_path):
+    config_path = tmp_path / "server_config.yaml"
+    config_path.write_text(yaml.safe_dump({"model_path": "Qwen/Qwen3-8B"}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="adapter_gradient_ownership_shadow_canary.*authoritative-only"):
+        load_server_arguments(
+            str(config_path),
+            overrides={"adapter_gradient_ownership_shadow_canary": True},
+        )
+
+
+def test_removed_field_inventory_allows_unrelated_unknown_fields():
+    payload = {"shared_config_key_not_owned_by_server": {"future_nested_key": True}}
+    assert reject_removed_configuration_fields(payload, context="test config") is payload
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    (
+        "examples/server/configs/lora/qwen3_5_35b_a3b_lora.yaml",
+        "examples/server/configs/lora/qwen3_coder_30b_a3b_lora.yaml",
+    ),
+)
+def test_shipped_moe_lora_examples_select_certified_triton(relative_path):
+    config = yaml.safe_load((Path(__file__).resolve().parents[2] / relative_path).read_text(encoding="utf-8"))
+    assert config["moe_implementation"] == "triton"
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    (
+        "examples/server/configs/qlora/qwen3_235b_a22b_qlora_nf4.yaml",
+        "examples/server/configs/qlora/qwen3_235b_a22b_qlora_nvfp4.yaml",
+        "examples/server/configs/qlora/qwen3_30b_a3b_qlora_nf4.yaml",
+        "examples/server/configs/qlora/qwen3_30b_a3b_qlora_nvfp4.yaml",
+        "examples/server/configs/qlora/qwen3_coder_30b_a3b_qlora.yaml",
+    ),
+)
+def test_shipped_quantized_moe_examples_defer_expert_factors(relative_path):
+    config = yaml.safe_load((Path(__file__).resolve().parents[2] / relative_path).read_text(encoding="utf-8"))
+    assert config["moe_implementation"] == "triton"
+    assert config["lora_target_modules"] == ["q_proj", "k_proj", "v_proj", "o_proj"]
+
+
+def test_canonical_moe_and_rope_auto_defaults_serialize(tmp_path):
+    config_path = tmp_path / "server_config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {"model_path": "synthetic"},
                 "train": {"output_dir": str(tmp_path / "outputs")},
             }
         ),
@@ -794,6 +889,37 @@ def test_load_server_arguments_threads_lm_head_tp_loss_fields(tmp_path):
     assert train_config["lm_head_tensor_parallel_size"] == 8
     assert train_config["fsdp_sharded_lm_head_loss"] is True
     assert train_config["fsdp_sharded_lm_head_loss_num_chunks"] == 4
+
+
+def test_model_tensor_parallel_lora_is_rejected_but_output_head_tp_remains_distinct(tmp_path):
+    rejected_path = tmp_path / "rejected.yaml"
+    rejected_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {"model_path": "synthetic"},
+                "train": {"tensor_parallel_size": 2},
+                "lora": {"enable_lora": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="tensor_parallel_size > 1"):
+        load_server_arguments(str(rejected_path))
+
+    admitted_path = tmp_path / "output_head.yaml"
+    admitted_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {"model_path": "synthetic"},
+                "train": {"lm_head_tensor_parallel_size": 2},
+                "lora": {"enable_lora": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = load_server_arguments(str(admitted_path))
+    assert args.tensor_parallel_size == 1
+    assert args.lm_head_tensor_parallel_size == 2
 
 
 def test_qwen3_8b_fp8_bf16_islands_example_config_loads():

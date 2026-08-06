@@ -3,6 +3,7 @@
 import importlib.util
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -47,11 +48,15 @@ class _FakeAdapterManager:
     def get_adapter_session_spec(self, model_id: str) -> dict:
         return deepcopy(self.session_specs[model_id])
 
+    def get_adapter_state(self, model_id: str):
+        assert model_id in self.session_specs
+        return SimpleNamespace(gradient_ownership_plan=None)
+
     def get_lr(self, model_id: str) -> float:
         return self.session_specs[model_id]["optimizer_config"]["learning_rate"]
 
-    def optim_step(self, model_id: str, lr: float, clip_value: float, *, accumulated_valid_tokens: int = 0) -> float:
-        self.optim_step_calls.append((model_id, lr, clip_value, accumulated_valid_tokens))
+    def optim_step(self, model_id: str, lr: float, clip_value: float) -> float:
+        self.optim_step_calls.append((model_id, lr, clip_value))
         self.session_specs[model_id]["optimizer_config"]["learning_rate"] = lr
         return 7.5
 
@@ -111,7 +116,7 @@ def test_optim_step_syncs_registered_lora_session_spec(monkeypatch):
     result = ModelRunner.optim_step(runner, gradient_clip=1.0, lr=0.25, model_id="policy-a")
 
     assert result["lr"] == pytest.approx(0.25)
-    assert runner._adapter_manager.optim_step_calls == [("policy-a", 0.25, 1.0, 11)]
+    assert runner._adapter_manager.optim_step_calls == [("policy-a", 0.25, 1.0)]
     assert runner._lora_session_specs["policy-a"]["optimizer_config"]["learning_rate"] == pytest.approx(0.25)
 
 
@@ -119,6 +124,8 @@ def test_load_adapter_state_syncs_registered_lora_session_spec():
     runner = _build_runner()
     runner._adapter_manager = _FakeAdapterManager(lr=0.25)
     runner._checkpoint_mgr = _FakeCheckpointManager()
+    compiled_model_ids = []
+    runner._compile_registered_adapter_gradient_ownership = compiled_model_ids.append
 
     result = ModelRunner.load_adapter_state(
         runner,
@@ -137,6 +144,7 @@ def test_load_adapter_state_syncs_registered_lora_session_spec():
     assert runner.global_step == 11
     assert runner.global_forward_backward_step == 13
     assert runner._lora_session_specs["policy-a"]["optimizer_config"]["learning_rate"] == pytest.approx(0.25)
+    assert compiled_model_ids == ["policy-a"]
 
 
 def test_optim_step_preserves_distsignsgd_scaling_and_clip(monkeypatch):

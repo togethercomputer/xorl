@@ -1,8 +1,6 @@
 """Focused algebra and hot-path regressions for topology-preserving adapters."""
 
-import inspect
 import os
-from pathlib import Path
 
 import pytest
 import torch
@@ -203,149 +201,6 @@ def test_manager_owns_local_active_slots_and_capture_hot_path_has_no_full_tensor
     assert state.layout_fingerprint
 
 
-def test_capture_source_contract_excludes_full_tensor():
-    source = inspect.getsource(LoRAAdapterManager.capture_gradients)
-    assert "full_tensor" not in source
-
-
-@pytest.mark.parametrize("adapter_dtype", [torch.float16, torch.bfloat16])
-def test_capture_gradients_accepts_low_precision_adapter_parameters(tmp_path, adapter_dtype):
-    model = _DummyLoRAModel().to(dtype=adapter_dtype)
-    manager = LoRAAdapterManager(
-        model,
-        device=torch.device("cpu"),
-        checkpoint_dir=str(tmp_path / "adapters"),
-        auto_save_on_eviction=False,
-        optimizer_type="sgd",
-        optimizer_dtype="bf16",
-    )
-    manager.register_adapter(
-        "low-precision",
-        session_spec=_session_spec(rank=4, alpha=16, optimizer_type="sgd", lr=0.1),
-        initialize_fresh=True,
-    )
-    state = manager.get_adapter_state("low-precision")
-    for name, param in model.named_parameters():
-        if name in state.local_params:
-            param.grad = torch.ones_like(param)
-
-    manager.capture_gradients("low-precision")
-    assert all(param.grad is None for param in model.parameters())
-    assert all(
-        state.local_params[name].grad is not None
-        and state.local_params[name].grad.dtype == state.local_params[name].dtype
-        for name in state.local_params
-        if state.local_params[name].numel() > 0
-    )
-
-
-@pytest.mark.parametrize("adapter_dtype", [torch.float16, torch.bfloat16])
-def test_load_logical_gradients_accumulates_low_precision_and_steps(tmp_path, adapter_dtype):
-    model = _DummyLoRAModel().to(dtype=adapter_dtype)
-    manager = LoRAAdapterManager(
-        model,
-        device=torch.device("cpu"),
-        checkpoint_dir=str(tmp_path / "adapters"),
-        auto_save_on_eviction=False,
-        optimizer_type="sgd",
-        optimizer_dtype="bf16",
-    )
-    manager.register_adapter(
-        "logical-low-precision",
-        session_spec=_session_spec(rank=4, alpha=16, optimizer_type="sgd", lr=0.1),
-        initialize_fresh=True,
-    )
-    state = manager.get_adapter_state("logical-low-precision")
-    logical_grads = {
-        name: torch.ones(layout.logical_shape, dtype=torch.float32) for name, layout in state.tensor_layouts.items()
-    }
-
-    manager.load_logical_gradients("logical-low-precision", logical_grads, accumulate=False)
-    manager.load_logical_gradients(
-        "logical-low-precision",
-        {name: gradient * 2 for name, gradient in logical_grads.items()},
-        accumulate=True,
-    )
-    before = {name: param.detach().clone() for name, param in state.local_params.items()}
-    for name, param in state.local_params.items():
-        if param.numel() > 0:
-            assert param.grad is not None
-            assert param.grad.dtype == param.dtype
-            assert torch.equal(param.grad, torch.full_like(param, 3))
-
-    norm = manager.optim_step("logical-low-precision", lr=0.1)
-    assert norm > 0.0
-    assert state.global_step == 1
-    assert all(param.grad is None for param in state.local_params.values())
-    assert any(not torch.equal(before[name], param) for name, param in state.local_params.items())
-
-
-def test_forward_and_capture_hot_paths_have_no_collective_or_full_materialization():
-    for method in (LoRAAdapterManager.prepare_forward, LoRAAdapterManager.capture_gradients):
-        source = inspect.getsource(method)
-        assert "full_tensor" not in source
-        assert "all_gather" not in source
-        assert "all_reduce" not in source
-        assert "broadcast" not in source
-
-
-def test_capture_eight_microbatches_matches_one_combined_gradient(tmp_path):
-    repeated = _build_manager(tmp_path / "repeated", optimizer_type="sgd")
-    combined = _build_manager(tmp_path / "combined", optimizer_type="sgd")
-    spec = _session_spec(rank=4, alpha=16, optimizer_type="sgd", lr=0.1)
-    repeated.register_adapter("repeated", session_spec=spec, initialize_fresh=True)
-    combined.register_adapter("combined", session_spec=spec, initialize_fresh=True)
-
-    repeated_state = repeated.get_adapter_state("repeated")
-    combined_state = combined.get_adapter_state("combined")
-    repeated_grads = {
-        name: torch.arange(param.numel(), dtype=torch.float32).reshape(param.shape) + 1
-        for name, param in repeated_state.local_params.items()
-    }
-    for _ in range(8):
-        for name, param in repeated.model.named_parameters():
-            if name in repeated_grads:
-                param.grad = repeated_grads[name].clone()
-        repeated.capture_gradients("repeated")
-
-    for name, param in combined.model.named_parameters():
-        if name in repeated_grads:
-            param.grad = repeated_grads[name] * 8
-    combined.capture_gradients("combined")
-
-    for name in repeated_state.local_params:
-        assert torch.equal(repeated_state.local_params[name].grad, combined_state.local_params[name].grad)
-
-
-def test_norm_clipping_disabled_large_norm_and_nonfinite_retry_policy(tmp_path):
-    manager = _build_manager(tmp_path / "clip", optimizer_type="sgd")
-    spec = _session_spec(rank=4, alpha=16, optimizer_type="sgd", lr=0.1)
-    manager.register_adapter("clip", session_spec=spec, initialize_fresh=True)
-    state = manager.get_adapter_state("clip")
-    parameter = next(param for param in state.local_params.values() if param.numel())
-    parameter.data.zero_()
-    parameter.grad = torch.zeros_like(parameter)
-    parameter.grad.view(-1)[0] = 13.0
-    assert manager.optim_step("clip", lr=0.1, gradient_clip=1.0) == pytest.approx(13.0)
-
-    parameter.grad = torch.zeros_like(parameter)
-    parameter.grad.view(-1)[0] = 12001.0
-    before = parameter.detach().clone()
-    assert manager.optim_step("clip", lr=0.1, gradient_clip=None) == pytest.approx(12001.0)
-    expected = before.clone()
-    expected.view(-1)[0] -= 0.1 * 12001.0
-    assert torch.allclose(parameter, expected, atol=1e-3)
-
-    before_weights = {name: param.detach().clone() for name, param in state.local_params.items()}
-    state_step = state.global_step
-    parameter.grad = torch.full_like(parameter, float("nan"))
-    with pytest.raises(FloatingPointError, match="all ranks skipped"):
-        manager.optim_step("clip", lr=0.1, gradient_clip=1.0)
-    assert state.global_step == state_step
-    assert all(torch.equal(param, before_weights[name]) for name, param in state.local_params.items())
-    assert all(param.grad is None for param in state.local_params.values())
-
-
 def test_real_gloo_uneven_dtensor_layout_and_logical_pack():
     from tests.distributed.distributed_utils import run_distributed_script
 
@@ -356,31 +211,6 @@ def test_real_gloo_uneven_dtensor_layout_and_logical_pack():
         extra_env={"XORL_SHARDED_LAYOUT_WORKER": "1"},
     )
     result.assert_success("real two-rank Gloo DTensor layout test")
-
-
-def test_real_gloo_collective_finite_and_norm_gate():
-    from tests.distributed.distributed_utils import run_distributed_script
-
-    result = run_distributed_script(
-        __file__,
-        num_gpus=2,
-        timeout=120,
-        extra_env={"XORL_SHARDED_OPT_WORKER": "1"},
-    )
-    result.assert_success("real two-rank Gloo adapter finite/norm gate")
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="NCCL fused adapter gate requires CUDA")
-def test_nccl_fused_adapter_optimizer_gate_with_replicated_dummy_model():
-    from tests.distributed.distributed_utils import run_distributed_script
-
-    result = run_distributed_script(
-        __file__,
-        num_gpus=2,
-        timeout=120,
-        extra_env={"XORL_SHARDED_CUDA_WORKER": "1"},
-    )
-    result.assert_success("two-rank NCCL fused adapter optimizer gate with replicated dummy model")
 
 
 class _FakeEpMesh:
@@ -407,7 +237,7 @@ def test_layout_discovery_composes_explicit_ep_shard_and_ignores_generic_replica
     expert_model._fqn2spec_info = {
         "expert_lora_A": _FakeSpecInfo(Shard(0), _FakeEpMesh()),
     }
-    expert_layouts, _ = discover_adapter_layouts(
+    expert_layouts, _, _ = discover_adapter_layouts(
         expert_model,
         {"expert_lora_A": {"rank_dim": 0}},
         active_rank=3,
@@ -422,7 +252,7 @@ def test_layout_discovery_composes_explicit_ep_shard_and_ignores_generic_replica
     dense_model._fqn2spec_info = {
         "dense_lora_A": _FakeSpecInfo(torch.distributed._tensor.Replicate(), _FakeEpMesh()),
     }
-    dense_layouts, _ = discover_adapter_layouts(
+    dense_layouts, _, _ = discover_adapter_layouts(
         dense_model,
         {"dense_lora_A": {"rank_dim": 0}},
         active_rank=2,
@@ -443,7 +273,7 @@ def _run_gloo_layout_worker() -> None:
     dtensor = DTensor.from_local(local, mesh, [Shard(0)], shape=(5, 4), stride=(4, 1), run_check=False)
     model = nn.Module()
     model.register_parameter("lora_A", nn.Parameter(dtensor))
-    layouts, fingerprint = discover_adapter_layouts(
+    layouts, fingerprint, _ = discover_adapter_layouts(
         model,
         {"lora_A": {"rank_dim": 0}},
         active_rank=5,
@@ -461,109 +291,5 @@ def _run_gloo_layout_worker() -> None:
     dist.destroy_process_group()
 
 
-def _run_gloo_optimizer_worker() -> None:
-    dist.init_process_group("gloo")
-    rank = dist.get_rank()
-    world = dist.get_world_size()
-    expected_world = int(os.environ.get("XORL_EXPECTED_WORLD", "2"))
-    assert world == expected_world
-    from xorl.distributed.parallel_state import init_parallel_state
-
-    init_parallel_state(dp_size=world, dp_mode="none", device_type="cpu")
-    manager = _build_manager(Path("/tmp") / f"xorl-sharded-opt-{rank}", optimizer_type="sgd")
-    manager.register_adapter(
-        "distributed",
-        session_spec=_session_spec(rank=4, alpha=16, optimizer_type="sgd", lr=0.1),
-        initialize_fresh=True,
-    )
-    state = manager.get_adapter_state("distributed")
-    for param in state.local_params.values():
-        param.grad = torch.full_like(param, float("nan") if rank == 0 else rank + 1.0)
-    try:
-        manager.optim_step("distributed", lr=0.1, gradient_clip=None)
-    except FloatingPointError:
-        pass
-    else:
-        raise AssertionError("collective non-finite gate did not reject the update")
-    assert state.global_step == 0
-    assert all(param.grad is None for param in state.local_params.values())
-
-    for param in state.local_params.values():
-        param.grad = torch.full_like(param, float(rank + 1))
-    norm = manager.optim_step("distributed", lr=0.1, gradient_clip=None)
-    expected_local_elements = sum(param.numel() for param in state.local_params.values())
-    expected = (sum(float(index + 1) ** 2 for index in range(world)) * expected_local_elements / world) ** 0.5
-    assert norm == pytest.approx(expected)
-    assert state.global_step == 1
-    dist.destroy_process_group()
-
-
-def _run_nccl_fused_worker() -> None:
-    rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(rank)
-    dist.init_process_group("nccl")
-    from xorl.distributed.parallel_state import init_parallel_state
-
-    init_parallel_state(dp_size=2, dp_mode="none", device_type="cuda")
-    model = _DummyLoRAModel().to(device="cuda")
-    manager = LoRAAdapterManager(
-        model,
-        device=torch.device("cuda"),
-        checkpoint_dir=str(Path("/tmp") / f"xorl-sharded-cuda-{rank}"),
-        auto_save_on_eviction=False,
-        optimizer_type="adamw",
-        optimizer_fused=True,
-    )
-    manager.register_adapter(
-        "fused",
-        session_spec=_session_spec(rank=4, alpha=16, optimizer_type="adamw", lr=1e-3),
-        initialize_fresh=True,
-    )
-    state = manager.get_adapter_state("fused")
-    inputs = torch.arange(32, dtype=torch.float32, device="cuda").reshape(4, 8) / 8.0
-    target = torch.ones(4, 8, dtype=torch.float32, device="cuda")
-    torch.cuda.reset_peak_memory_stats()
-
-    def capture_real_backward() -> None:
-        manager.prepare_forward("fused")
-        model.zero_grad(set_to_none=True)
-        loss = torch.nn.functional.mse_loss(model(inputs), target)
-        loss.backward()
-        assert any(param.grad is not None for param in model.parameters())
-        manager.capture_gradients("fused")
-        assert all(param.grad is None for param in model.parameters())
-
-    # Accumulate two real forward/backward captures before the first step.
-    capture_real_backward()
-    capture_real_backward()
-    norm = manager.optim_step("fused", lr=1e-3, gradient_clip=0.1)
-    assert norm > 0.0
-    assert state.global_step == 1
-
-    capture_real_backward()
-    second_norm = manager.optim_step("fused", lr=1e-3, gradient_clip=0.1)
-    assert second_norm > 0.0
-    assert state.global_step == 2
-    torch.cuda.synchronize()
-
-    gathered = [None] * dist.get_world_size()
-    dist.all_gather_object(gathered, {name: param.detach().cpu() for name, param in state.local_params.items()})
-    for name, value in gathered[0].items():
-        for replica in gathered[1:]:
-            assert torch.equal(value, replica[name]), name
-    peak_memory = torch.tensor([torch.cuda.max_memory_allocated()], dtype=torch.int64, device="cuda")
-    dist.all_reduce(peak_memory, op=dist.ReduceOp.MAX)
-    if rank == 0:
-        print(
-            "NCCL fused adapter gate: world_size=2 steps=2 captures_before_first_step=2 "
-            f"peak_memory_bytes={int(peak_memory.item())}"
-        )
-    dist.destroy_process_group()
-
-
 if os.environ.get("XORL_SHARDED_LAYOUT_WORKER") == "1":
     _run_gloo_layout_worker()
-if os.environ.get("XORL_SHARDED_OPT_WORKER") == "1":
-    _run_gloo_optimizer_worker()
-if os.environ.get("XORL_SHARDED_CUDA_WORKER") == "1":
-    _run_nccl_fused_worker()

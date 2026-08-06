@@ -12,8 +12,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn as nn
 
+from xorl.lora import LoraLinear
 from xorl.server.runner.adapters import manager as adapter_manager_module
+from xorl.server.runner.adapters.gradient_ownership import GradientScaleState
 from xorl.server.runner.adapters.manager import (
     OPTIMIZER_SHARD_MANIFEST_FILENAME,
     AdapterState,
@@ -33,6 +36,7 @@ from xorl.server.runner.adapters.optimizer_reshard import (
     same_optimizer_value as _same_optimizer_value,
 )
 from xorl.server.runner.adapters.sharded_state import AdapterTensorLayout
+from xorl.server.runner.model_runner import ModelRunner
 
 from .test_adapter_manager import _build_manager, _session_spec
 
@@ -64,8 +68,17 @@ def _fill_params(manager: LoRAAdapterManager, model_id: str, seed: int) -> None:
 def _apply_step(manager: LoRAAdapterManager, model_id: str, seed: int, lr: float = 1e-2) -> None:
     generator = torch.Generator().manual_seed(seed)
     state = manager.get_adapter_state(model_id)
-    for param in state.lora_params.values():
-        param.grad = torch.randn(param.shape, generator=generator, dtype=param.dtype)
+    model_parameters = dict(manager.model.named_parameters())
+    assert manager.begin_gradient_capture(model_id, scale_state=GradientScaleState.RAW_NUMERATOR)
+    for name, layout in state.tensor_layouts.items():
+        parameter = model_parameters[name]
+        parameter.grad = torch.randn(
+            layout.local_substrate_shape,
+            generator=generator,
+            dtype=parameter.dtype,
+            device=parameter.device,
+        )
+    manager.capture_gradient_numerators(model_id, denominator=1.0, backward_completed=True)
     manager.optim_step(model_id, lr=lr)
 
 
@@ -77,6 +90,60 @@ def _moment_tensors(manager: LoRAAdapterManager, model_id: str) -> dict:
         for key, value in param_state.items()
         if isinstance(value, torch.Tensor)
     }
+
+
+def _build_public_runner(tmp_path: Path) -> tuple[ModelRunner, LoRAAdapterManager]:
+    class _ResumeModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.adapter = LoraLinear(8, 8, r=4, lora_alpha=16)
+
+    model = _ResumeModel()
+    manager = LoRAAdapterManager(
+        model,
+        device=torch.device("cpu"),
+        checkpoint_dir=str(tmp_path / "adapters"),
+        auto_save_on_eviction=False,
+        optimizer_type="adamw",
+        optimizer_dtype="fp32",
+        optimizer_fused=False,
+    )
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.model = model
+    runner.rank = 0
+    runner.train_config = {"tensor_parallel_size": 1}
+    runner._adapter_manager = manager
+    return runner, manager
+
+
+def _register_public_runner(runner: ModelRunner, manager: LoRAAdapterManager, model_id: str) -> None:
+    manager.register_adapter(
+        model_id=model_id,
+        session_spec=_session_spec(rank=4, alpha=16, optimizer_type="adamw", lr=1e-2),
+        initialize_fresh=True,
+    )
+    runner._compile_registered_adapter_gradient_ownership(model_id)
+
+
+def _load_through_public_runner(
+    runner: ModelRunner,
+    manager: LoRAAdapterManager,
+    model_id: str,
+    path: str,
+    *,
+    lr: float | None = None,
+) -> None:
+    runner._checkpoint_mgr = SimpleNamespace(
+        load_adapter_state=lambda loaded_model_id, loaded_path, load_optimizer, lr=None: manager.load_adapter_state(
+            loaded_model_id,
+            loaded_path,
+            load_optimizer=load_optimizer,
+            lr=lr,
+        )
+    )
+    runner._sync_from_checkpoint_state = lambda: None
+    runner._sync_registered_lora_session_spec = lambda _model_id: None
+    runner.load_adapter_state(model_id, path, load_optimizer=True, lr=lr)
 
 
 def test_adapter_optimizer_parameter_map_is_canonical_ordered():
@@ -264,6 +331,94 @@ def test_resume_matches_uninterrupted_run_bitwise(tmp_path: Path):
         resumed_moments = _moment_tensors(resumed, "resume-c")
         for key, tensor in full_moments.items():
             assert torch.equal(resumed_moments[key], tensor), f"moment diverges: {key}"
+    finally:
+        torch.use_deterministic_algorithms(False)
+
+
+def test_public_scheduled_lr_load_after_evict_matches_uninterrupted_next_step(tmp_path: Path):
+    """Scheduled LR state is mutable metadata, not restore identity."""
+
+    torch.use_deterministic_algorithms(True)
+    try:
+        uninterrupted_runner, uninterrupted = _build_public_runner(tmp_path / "uninterrupted")
+        _register_public_runner(uninterrupted_runner, uninterrupted, "resume-public")
+        _fill_params(uninterrupted, "resume-public", seed=71)
+        for seed, lr in ((73, 8e-3), (79, 6e-3), (83, 4e-3)):
+            _apply_step(uninterrupted, "resume-public", seed=seed, lr=lr)
+
+        resumed_runner, resumed = _build_public_runner(tmp_path / "resumed")
+        _register_public_runner(resumed_runner, resumed, "resume-public")
+        _fill_params(resumed, "resume-public", seed=71)
+        for seed, lr in ((73, 8e-3), (79, 6e-3)):
+            _apply_step(resumed, "resume-public", seed=seed, lr=lr)
+        checkpoint_path = resumed.save_adapter_state("resume-public")["path"]
+        checkpoint_fingerprint = resumed.get_adapter_state("resume-public").gradient_ownership_plan.fingerprint
+        assert resumed.get_adapter_state("resume-public").lr == pytest.approx(6e-3)
+
+        resumed.remove_adapter("resume-public")
+        _register_public_runner(resumed_runner, resumed, "resume-public")
+        re_registered = resumed.get_adapter_state("resume-public")
+        assert re_registered.registration_ordinal == 2
+        assert re_registered.gradient_ownership_plan.fingerprint == checkpoint_fingerprint
+
+        _load_through_public_runner(resumed_runner, resumed, "resume-public", checkpoint_path)
+        restored = resumed.get_adapter_state("resume-public")
+        assert restored.lr == pytest.approx(6e-3)
+        assert restored.gradient_ownership_plan.fingerprint == checkpoint_fingerprint
+        _apply_step(resumed, "resume-public", seed=83, lr=4e-3)
+
+        expected = uninterrupted.get_adapter_state("resume-public")
+        actual = resumed.get_adapter_state("resume-public")
+        assert actual.global_step == expected.global_step == 3
+        for name, parameter in expected.local_params.items():
+            assert torch.equal(actual.local_params[name], parameter), f"next-step parameter mismatch: {name}"
+        expected_moments = _moment_tensors(uninterrupted, "resume-public")
+        actual_moments = _moment_tensors(resumed, "resume-public")
+        assert actual_moments.keys() == expected_moments.keys()
+        for name, tensor in expected_moments.items():
+            assert torch.equal(actual_moments[name], tensor), f"next-step optimizer-state mismatch: {name}"
+    finally:
+        torch.use_deterministic_algorithms(False)
+
+
+def test_public_lr_override_restore_matches_uninterrupted_next_step(tmp_path: Path):
+    torch.use_deterministic_algorithms(True)
+    try:
+        source_runner, source = _build_public_runner(tmp_path / "source")
+        _register_public_runner(source_runner, source, "resume-override")
+        _fill_params(source, "resume-override", seed=101)
+        _apply_step(source, "resume-override", seed=103, lr=7e-3)
+        _apply_step(source, "resume-override", seed=107, lr=5e-3)
+        checkpoint_path = source.save_adapter_state("resume-override")["path"]
+
+        target_runner, target = _build_public_runner(tmp_path / "target")
+        _register_public_runner(target_runner, target, "resume-override")
+        _fill_params(target, "resume-override", seed=109)
+        _apply_step(target, "resume-override", seed=113, lr=9e-3)
+
+        _load_through_public_runner(
+            target_runner,
+            target,
+            "resume-override",
+            checkpoint_path,
+            lr=3e-3,
+        )
+        restored = target.get_adapter_state("resume-override")
+        assert restored.lr == pytest.approx(3e-3)
+        assert restored.session_spec["optimizer_config"]["learning_rate"] == pytest.approx(3e-3)
+        assert all(group["lr"] == pytest.approx(3e-3) for group in restored.optimizer.param_groups)
+
+        _apply_step(source, "resume-override", seed=127, lr=3e-3)
+        _apply_step(target, "resume-override", seed=127, lr=3e-3)
+        expected = source.get_adapter_state("resume-override")
+        actual = target.get_adapter_state("resume-override")
+        for name, parameter in expected.local_params.items():
+            assert torch.equal(actual.local_params[name], parameter), f"LR-override parameter mismatch: {name}"
+        expected_moments = _moment_tensors(source, "resume-override")
+        actual_moments = _moment_tensors(target, "resume-override")
+        assert actual_moments.keys() == expected_moments.keys()
+        for name, tensor in expected_moments.items():
+            assert torch.equal(actual_moments[name], tensor), f"LR-override optimizer-state mismatch: {name}"
     finally:
         torch.use_deterministic_algorithms(False)
 

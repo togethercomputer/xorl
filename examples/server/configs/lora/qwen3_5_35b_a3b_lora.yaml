@@ -12,7 +12,7 @@
 model_path: Qwen/Qwen3.5-35B-A3B
 tokenizer_path: Qwen/Qwen3.5-35B-A3B
 attn_implementation: flash_attention_3
-moe_implementation: quack
+moe_implementation: triton
 ep_dispatch: deepep
 
 data_parallel_mode: fsdp2

@@ -27,6 +27,8 @@ class LoraDeltaLinear(LoraModule, nn.Module):
     renaming the trainer's base weights.
     """
 
+    adapter_gradient_producer_family = "fused_managed"
+
     def __init__(
         self,
         in_features: int,

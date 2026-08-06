@@ -2072,8 +2072,8 @@ def wrap_trunk_linears_batch_invariant(
         if isinstance(module, LoraModule):
             raise NotImplementedError(
                 f"XORL_BI_TRUNK_LINEAR: {module_name} is adapter-wrapped ({type(module).__qualname__}); "
-                "the trunk contract composes with LoRA only under XORL_LORA_MERGED_FORWARD=1 "
-                "(plain LoraLinear) — set the merged-forward flag or exclude the adapter."
+                "the canonical merged-LoRA trunk contract composes only with a plain LoraLinear whose "
+                "model-owned exact_merged_forward property is true — enable it on that module or exclude the adapter."
             )
         if type(module) is not torch.nn.Linear:
             raise NotImplementedError(
@@ -2099,6 +2099,7 @@ def wrap_trunk_linears_batch_invariant(
             "XORL_BI_TRUNK_LINEAR=1 matched no trunk linears; expected leaf names "
             f"{sorted(names)} — wire the model's projections or drop the flag."
         )
+    set_trunk_linear_contract(True)
     return wrapped
 
 

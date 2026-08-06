@@ -143,10 +143,11 @@ def test_default_adapter_initialization_never_snapshots_uninitialized_storage():
         def has_adapter(self, _model_id):
             return False
 
-        def register_adapter(self, *, model_id, session_spec, initialize_fresh):
+        def register_adapter(self, *, model_id, session_spec, initialize_fresh, local_group_memberships):
             if not initialize_fresh:
                 raise AssertionError("would snapshot uninitialized to_empty storage")
             self.register_calls.append((model_id, session_spec, initialize_fresh))
+            return {}
 
     class FakeCheckpointManager:
         _adapter_manager = None
@@ -158,7 +159,10 @@ def test_default_adapter_initialization_never_snapshots_uninitialized_storage():
     runner.lora_config = {"enable_lora": True}
     runner._default_lora_session_spec = {"base_model": "example/model"}
     runner._lora_session_specs = {}
-    runner._zorl_sessions = {}
+    compiled_model_ids = []
+    runner._compile_registered_adapter_gradient_ownership = lambda model_id, **_kwargs: compiled_model_ids.append(
+        model_id
+    )
 
     with pytest.raises(RuntimeError, match="requires completed base checkpoint restoration"):
         runner._initialize_default_lora_adapter()
@@ -172,3 +176,4 @@ def test_default_adapter_initialization_never_snapshots_uninitialized_storage():
     ]
     assert runner._adapter_manager.current_adapter_id == "default"
     assert runner._checkpoint_mgr._adapter_manager is runner._adapter_manager
+    assert compiled_model_ids == ["default"]

@@ -9,7 +9,7 @@
 model_path: Qwen/Qwen3-Coder-30B-A3B-Instruct
 tokenizer_path: Qwen/Qwen3-Coder-30B-A3B-Instruct
 attn_implementation: flash_attention_3  # eager, sdpa, native, flash_attention_3, flash_attention_4
-moe_implementation: quack  # eager, triton, native, quack
+moe_implementation: triton  # certified expert-factor LoRA backend
 
 # ============================================================================
 # Parallelism Configuration

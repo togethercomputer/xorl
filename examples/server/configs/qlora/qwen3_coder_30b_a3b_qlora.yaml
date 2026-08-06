@@ -9,7 +9,7 @@
 model_path: Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8
 tokenizer_path: Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8
 attn_implementation: flash_attention_3
-moe_implementation: quack
+moe_implementation: triton
 
 # ============================================================================
 # Parallelism Configuration
@@ -62,7 +62,8 @@ quant_group_size: 128
 enable_lora: true
 lora_rank: 32
 lora_alpha: 32
-# Use default target_modules (fused: qkv_proj, o_proj, gate_up_proj, down_proj)
+# Quantized expert-factor LoRA is deferred; this release adapts attention only.
+lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 # ============================================================================
 # Skip initial checkpoint (workaround for ZMQ timeout on first save)

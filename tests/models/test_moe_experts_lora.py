@@ -10,6 +10,7 @@ import torch.nn as nn
 from xorl.lora import LoraLinear, inject_lora_into_model
 from xorl.lora.mapping import can_apply_lora, get_lora_class_for_module
 from xorl.models.layers.moe import MOE_EXPERT_BACKENDS, MoEBlock, MoEExperts, MoEExpertsLoRA, MoELoRAConfig
+from xorl.models.layers.moe.backend import zero_token_lora_output
 from xorl.models.transformers.qwen3_moe.modeling_qwen3_moe import (
     Qwen3MoeSparseExperts,
     Qwen3MoeTritonExperts,
@@ -17,6 +18,20 @@ from xorl.models.transformers.qwen3_moe.modeling_qwen3_moe import (
 
 
 pytestmark = [pytest.mark.cpu, pytest.mark.gpu]
+
+
+def test_zero_token_output_materializes_structural_gradients_for_every_local_factor():
+    tokens = torch.empty(0, 4, requires_grad=True)
+    factors = tuple(nn.Parameter(torch.randn(shape)) for shape in ((1, 4, 2), (2, 2, 6), (2, 6, 2)))
+
+    output = zero_token_lora_output(tokens, 4, *factors)
+    output.sum().backward()
+
+    assert output.shape == (0, 4)
+    assert tokens.grad is not None and tokens.grad.shape == tokens.shape
+    for factor in factors:
+        assert factor.grad is not None
+        assert torch.equal(factor.grad, torch.zeros_like(factor))
 
 
 class MockConfig:

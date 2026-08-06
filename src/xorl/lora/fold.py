@@ -14,7 +14,7 @@ Pinned order (do not reorder — the bits are the contract):
   2. ``delta = bmm(A_gkn, B_gkn) * float(scaling)`` in the GKN orientation
      ``[E, in, r] @ [E, r, out]`` (dense: ``B @ A`` in ``[out, r] @ [r, in]``),
   3. ``W' = (W.to(fp32) + delta).to(W.dtype)`` — fp32 accumulate, cast ONCE
-     (the PR #164 / ZORL fp32-master doctrine; never bf16(W) + bf16(delta)).
+     (the PR #164 fp32-master doctrine; never bf16(W) + bf16(delta)).
 
 Cross-venv note: step 2 measured bit-identical between torch 2.12.1+cu132 and
 torch 2.9.1+cu128 on H100 for the r<=64 shapes of this lane. The fold-parity

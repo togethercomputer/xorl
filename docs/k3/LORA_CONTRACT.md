@@ -21,10 +21,9 @@ the contracted fused-experts kernel too.
   `base + (x@A)@B*scaling` in bf16, silu in bf16 (local) / fp32 (EP), routing
   weights pre-down (local) — a different reduction tree end-to-end, and the
   contracted `sglang_fused_experts_forward` explicitly excluded LoRA modules.
-- **Folds already in-tree** (three inconsistent generations): `merge_weights`
-  (fp32-accumulate cast-once, PR #164), weight-sync extraction (bf16(W) +
-  bf16(delta) double-rounding), sglang ZORL fold-on-receipt (fp32 delta,
-  bf16-add).
+- **Folds already in-tree**: `merge_weights` (fp32-accumulate cast-once,
+  PR #164) and weight-sync extraction (bf16(W) + bf16(delta)
+  double-rounding).
 
 ## Measured pre-contract term (real Q3.5-35B-A3B layer-1 weights, Wordle adapter
 shape r=16/alpha=16 hybrid_shared, nonzero B at trained magnitude)
