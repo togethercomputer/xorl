@@ -62,6 +62,7 @@ from xorl.lora.fold import lora_merged_forward_enabled
 from xorl.models import resolve_cross_entropy_mode
 from xorl.models.layers.moe.routing_replay import set_replay_stage
 from xorl.models.transformers.deepseek_v3.support import deepseek_v3_default_lora_targets
+from xorl.models.transformers.glm5.index_share import IndexShareMode
 from xorl.models.transformers.glm5.support import glm5_default_lora_targets
 from xorl.ops.batch_invariant_ops import enable_batch_invariant_mode, get_batch_invariant_ops
 from xorl.ops.loss import (
@@ -724,6 +725,7 @@ class ModelRunner:
         managed_fsdp_parameter_ids: set[int] = set()
         producer_by_parameter_id: dict[int, ProducerFamily] = {}
         merged_forward_by_parameter_id: dict[int, bool] = {}
+        expert_guard_by_parameter_id: dict[int, dict[str, Any]] = {}
 
         def _walk_module_tree(module: nn.Module, *, inherited_fsdp: bool = False, direct: bool = False) -> None:
             managed_fsdp = inherited_fsdp or isinstance(module, FSDPModule)
@@ -731,33 +733,65 @@ class ModelRunner:
             selector = getattr(module, "adapter_gradient_producer_family", None)
             selected = selector() if callable(selector) else selector
             producer = None
+            expert_guard: dict[str, Any] | None = None
+            has_expert_adapter_factors = any(
+                "_proj_lora_A" in local_name or "_proj_lora_B" in local_name
+                for local_name, _parameter in module.named_parameters(recurse=False)
+            )
             if selected is not None:
                 try:
                     producer = ProducerFamily(str(selected))
                 except ValueError as error:
                     raise RuntimeError(f"Unsupported adapter-gradient producer property {selected!r}") from error
+                direct = direct or producer is ProducerFamily.DIRECT_OUTPUT_PROJECTION
                 expert_backend = getattr(module, "moe_implementation", None)
-                has_expert_adapter_factors = any(
-                    "_proj_lora_A" in local_name or "_proj_lora_B" in local_name
-                    for local_name, _parameter in module.named_parameters(recurse=False)
-                )
                 if has_expert_adapter_factors:
                     quant_format = getattr(module, "quant_format", None)
                     if quant_format is not None:
-                        raise AdapterGradientOwnershipError(
-                            "Quantized expert-factor LoRA is not certified in this release; "
-                            f"got quant_format={quant_format!r}, expert_backend={expert_backend!r}"
+                        from xorl.qlora.modules.moe_experts import BlockFP8QLoRAMoeExperts  # noqa: PLC0415
+
+                        ep_dispatch = getattr(module, "ep_dispatch", None)
+                        hybrid_shared = getattr(module, "hybrid_shared", None)
+                        certified_glm52_block_fp8 = (
+                            type(module) is BlockFP8QLoRAMoeExperts
+                            and quant_format == "block_fp8"
+                            and expert_backend == "triton"
+                            and ep_dispatch == "deepep"
+                            and hybrid_shared is True
                         )
-                    if expert_backend not in {"eager", "triton"}:
+                        if not certified_glm52_block_fp8:
+                            raise AdapterGradientOwnershipError(
+                                "Quantized expert-factor LoRA is admitted only for the certified GLM-5.2 "
+                                "BlockFP8QLoRAMoeExperts lane with block_fp8 + triton + DeepEP + hybrid-shared; "
+                                f"got type={type(module).__qualname__}, quant_format={quant_format!r}, "
+                                f"expert_backend={expert_backend!r}, ep_dispatch={ep_dispatch!r}, "
+                                f"hybrid_shared={hybrid_shared!r}"
+                            )
+                        expert_guard = {
+                            "expert_module": "BlockFP8QLoRAMoeExperts",
+                            "expert_quant_format": quant_format,
+                            "expert_backend": expert_backend,
+                            "expert_ep_dispatch": ep_dispatch,
+                            "expert_hybrid_shared": hybrid_shared,
+                        }
+                    elif expert_backend not in {"eager", "triton"}:
                         raise AdapterGradientOwnershipError(
                             "Authoritative adapter-gradient ownership admits only the analytically "
                             f"certified eager/triton expert backends, got {expert_backend!r}"
                         )
+                    else:
+                        expert_guard = {
+                            "expert_module": type(module).__qualname__,
+                            "expert_quant_format": "none",
+                            "expert_backend": expert_backend,
+                        }
             for local_name, parameter in module.named_parameters(recurse=False):
                 if "lora_A" in local_name or "lora_B" in local_name:
                     merged_forward_by_parameter_id[id(parameter)] = bool(lora_merged_forward_enabled(module))
                     if producer is not None:
                         producer_by_parameter_id[id(parameter)] = producer
+                    if expert_guard is not None:
+                        expert_guard_by_parameter_id[id(parameter)] = dict(expert_guard)
                     if direct:
                         direct_parameter_ids.add(id(parameter))
                     if managed_fsdp and hasattr(parameter, "to_local") and hasattr(parameter, "placements"):
@@ -867,6 +901,7 @@ class ModelRunner:
                 "lora_rank": int(state.session_spec["lora_config"]["lora_rank"]),
                 "lora_alpha": int(state.session_spec["lora_config"]["lora_alpha"]),
             }
+            guard_payload.update(expert_guard_by_parameter_id.get(id(parameter), {}))
             guard_payloads[name] = guard_payload
             declarations[name] = ParameterOwnershipDeclaration(
                 topology=topology,
@@ -1118,9 +1153,19 @@ class ModelRunner:
         lora_enabled = self.lora_config.get("enable_lora", False)
         enable_mixed_precision = self.train_config.get("enable_mixed_precision", False)
         enable_qlora = self.lora_config.get("enable_qlora", False)
+        block_fp8_qlora_training = self.lora_config.get("block_fp8_qlora_training", False)
 
-        # Resolve target_modules from Tinker-style or flat config
-        target_modules = self._resolve_lora_target_modules() if lora_enabled else None
+        # The strict GLM lane owns its complete target set and must not depend
+        # on permissive discovery or a remote-config lookup. Other adapter
+        # modes retain the existing Tinker/flat-config resolution.
+        target_modules = (
+            glm5_default_lora_targets(train_attn=True, train_mlp=True, train_unembed=True)
+            if block_fp8_qlora_training
+            else self._resolve_lora_target_modules()
+            if lora_enabled
+            else None
+        )
+        construction_target_modules = None if block_fp8_qlora_training else target_modules
 
         model_dtype = resolve_training_model_dtype(
             enable_lora=lora_enabled,
@@ -1152,10 +1197,11 @@ class ModelRunner:
             enable_lora=lora_enabled,
             lora_rank=self.lora_config.get("max_lora_rank", self.lora_config.get("lora_rank", 32)),
             lora_alpha=self.lora_config.get("lora_alpha", 16),
-            lora_target_modules=target_modules,
+            lora_target_modules=construction_target_modules,
             lora_target_manifest=self.lora_config.get("lora_target_manifest"),
             moe_hybrid_shared_lora=self.lora_config.get("moe_hybrid_shared_lora", False),
             enable_qlora=enable_qlora,
+            block_fp8_qlora_training=block_fp8_qlora_training,
             quant_format=self.lora_config.get("quant_format", "nvfp4"),
             quant_group_size=self.lora_config.get("quant_group_size", 16),
             qlora_exclude_modules=self.lora_config.get("exclude_modules"),
@@ -1255,6 +1301,7 @@ class ModelRunner:
         self.is_prequantized = result.is_prequantized
         self.checkpoint_quant_format = result.checkpoint_quant_format
         self.exclude_modules = result.exclude_modules
+        self.glm52_adapter_inventory = getattr(result, "glm52_adapter_inventory", None)
 
         # Save LoRA metadata for checkpoint manager
         if lora_enabled or enable_qlora:
@@ -2989,7 +3036,12 @@ class ModelRunner:
 
             t_forward = _now()
             with self.model_fwd_context:
-                outputs = self.model(**model_inputs, use_cache=False, output_hidden_states=False)
+                outputs = self.model(
+                    **model_inputs,
+                    use_cache=False,
+                    output_hidden_states=False,
+                    **self._index_share_forward_kwargs(IndexShareMode.FORWARD_ONLY),
+                )
             hidden_states, micro_batch = self._gather_teacher_cache_sequences(
                 outputs.last_hidden_state, micro_batch, ps
             )
@@ -3604,7 +3656,12 @@ class ModelRunner:
 
         # Frozen teacher: weights are shared with the student, so a no_grad forward is
         # the only thing that keeps it out of the autograd graph.
-        fwd_kwargs = {"input_ids": fwd_ids, "use_cache": False, "output_hidden_states": False}
+        fwd_kwargs = {
+            "input_ids": fwd_ids,
+            "use_cache": False,
+            "output_hidden_states": False,
+            **self._index_share_forward_kwargs(IndexShareMode.FORWARD_ONLY),
+        }
         # Block-diagonal (per-sample) teacher attention under PACKING: teacher_position_ids
         # resets to 0 at each packed sample (built by the server packer). Derive varlen
         # cu_seqlens so the teacher forward does NOT attend across packed samples — matching
@@ -5148,6 +5205,22 @@ class ModelRunner:
             return torch.zeros((), dtype=torch.float32, device=tensor.device)
         return tensor.reshape(-1)[:1].float().sum() * 0.0
 
+    def _index_share_forward_kwargs(self, mode: IndexShareMode) -> Dict[str, IndexShareMode]:
+        if callable(getattr(self.model, "release_index_share_context", None)):
+            return {"index_share_mode": mode}
+        return {}
+
+    def _release_index_share_contexts(self) -> None:
+        candidates = [getattr(self, "model", None), *(getattr(self, "model_parts", None) or [])]
+        seen: set[int] = set()
+        for model_part in candidates:
+            if model_part is None or id(model_part) in seen:
+                continue
+            seen.add(id(model_part))
+            release = getattr(model_part, "release_index_share_context", None)
+            if callable(release):
+                release()
+
     @staticmethod
     def _clear_diagnostic_decode_cache(model: nn.Module) -> None:
         for module in model.modules():
@@ -5244,6 +5317,7 @@ class ModelRunner:
                     past_key_values=past_key_values,
                     output_hidden_states=diagnostic_hidden_states,
                     diagnostic_decode_cache=True,
+                    **self._index_share_forward_kwargs(IndexShareMode.FORWARD_ONLY),
                 )
                 returned_past_key_values = getattr(outputs, "past_key_values", None)
                 if returned_past_key_values is not None:
@@ -5352,7 +5426,14 @@ class ModelRunner:
                 per_token_outputs["token_diagnostics"] = token_diagnostics
         return result.loss, per_token_outputs, None, None, outputs
 
-    def _compute_micro_batch_loss(self, micro_batch, loss_fn, loss_fn_params):
+    def _compute_micro_batch_loss(
+        self,
+        micro_batch,
+        loss_fn,
+        loss_fn_params,
+        *,
+        index_share_mode: IndexShareMode = IndexShareMode.FORWARD_ONLY,
+    ):
         """Compute loss for a single micro-batch."""
         params = loss_fn_params or {}
         return_per_token = params.get("return_per_token", True)
@@ -5512,6 +5593,7 @@ class ModelRunner:
                     output_hidden_states=(
                         diagnostic_hidden_states or (capture_student_layers and not use_opd_selected_layer_hooks)
                     ),
+                    **self._index_share_forward_kwargs(index_share_mode),
                 )
         finally:
             for handle in opd_selected_layer_handles:
@@ -5986,6 +6068,32 @@ class ModelRunner:
         model_id="default",
         abort_callback=None,
     ):
+        try:
+            return self._forward_loop_impl(
+                micro_batches,
+                loss_fn,
+                loss_fn_params,
+                compute_backward=compute_backward,
+                r3_enabled=r3_enabled,
+                model_id=model_id,
+                abort_callback=abort_callback,
+            )
+        finally:
+            # A successful backward releases each micro-batch below. This
+            # boundary owns setup/loss failures after a successful forward.
+            self._release_index_share_contexts()
+
+    def _forward_loop_impl(
+        self,
+        micro_batches,
+        loss_fn,
+        loss_fn_params,
+        *,
+        compute_backward=True,
+        r3_enabled=False,
+        model_id="default",
+        abort_callback=None,
+    ):
         """Core forward (+ optional backward) loop shared between forward and forward_backward."""
         params = loss_fn_params or {}
         use_distsignsgd = getattr(self, "_use_distsignsgd", False)
@@ -6075,7 +6183,12 @@ class ModelRunner:
             profile_start = _profile_phase_now() if profile_phase_timings else 0.0
             with self.model_fwd_context:
                 local_loss_sum, per_token_outputs, is_metrics, is_metric_ops, outputs = self._compute_micro_batch_loss(
-                    micro_batch, loss_fn, params
+                    micro_batch,
+                    loss_fn,
+                    params,
+                    index_share_mode=(
+                        IndexShareMode.TRAINING_WITH_BACKWARD if compute_backward else IndexShareMode.FORWARD_ONLY
+                    ),
                 )
             if profile_phase_timings:
                 forward_compute_time += _profile_phase_elapsed(profile_start)
@@ -6189,8 +6302,11 @@ class ModelRunner:
                     defer_hsdp_all_reduce,
                     is_last_micro_batch=batch_idx == len(micro_batches) - 1,
                 ):
-                    with self.model_bwd_context:
-                        backward_loss.backward()
+                    try:
+                        with self.model_bwd_context:
+                            backward_loss.backward()
+                    finally:
+                        self._release_index_share_contexts()
                 if profile_phase_timings:
                     backward_compute_time += _profile_phase_elapsed(profile_start)
 
@@ -6848,7 +6964,12 @@ class ModelRunner:
                     }
 
                     with self.model_fwd_context:
-                        outputs = self.model(**model_inputs, use_cache=False, output_hidden_states=False)
+                        outputs = self.model(
+                            **model_inputs,
+                            use_cache=False,
+                            output_hidden_states=False,
+                            **self._index_share_forward_kwargs(IndexShareMode.FORWARD_ONLY),
+                        )
                     hidden_states = outputs.last_hidden_state
 
                     effective_weight = self._get_effective_lm_head_weight()

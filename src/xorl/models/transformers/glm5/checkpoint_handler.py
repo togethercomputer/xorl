@@ -9,7 +9,7 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 import torch
 
 from ...checkpoint_handlers.base import CheckpointHandler
-from ...checkpoint_handlers.buffers import ExpertWeightBuffer, parse_expert_key
+from ...checkpoint_handlers.buffers import ExpertWeightBuffer, parse_expert_full_key, parse_expert_key
 from .native_fp8 import NativeBlockFP8ExpertPairBuffer, NativeBlockFP8PairBuffer, native_fp8_dense_source_map
 
 
@@ -316,10 +316,10 @@ class Glm5CheckpointHandler(CheckpointHandler):
                 _, expert_idx, _, _ = compressed
                 return expert_idx < ep_start or expert_idx >= ep_end
 
-            parsed = parse_expert_key(normalized_key)
+            parsed = parse_expert_full_key(normalized_key)
             if parsed is None:
                 return False
-            _, expert_idx, _ = parsed
+            _, expert_idx, _, _ = parsed
             return expert_idx < ep_start or expert_idx >= ep_end
 
         return _should_skip

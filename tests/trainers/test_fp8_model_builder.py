@@ -147,6 +147,61 @@ def test_build_training_model_threads_sharded_lm_head_loss_to_parallelize(monkey
     assert captured["fsdp_sharded_lm_head_loss"] is True
 
 
+def test_build_training_model_threads_glm52_block_fp8_qlora_mode(monkeypatch):
+    captured = {}
+    inventory = object()
+
+    def fake_build_foundation_model(**kwargs):
+        captured["foundation_flag"] = kwargs["block_fp8_qlora_training"]
+        return TinyDenseOnlyModel()
+
+    def fake_inject_qlora(model, **kwargs):
+        captured["inject_flag"] = kwargs["block_fp8_qlora_training"]
+        captured["quant_format"] = kwargs["quant_format"]
+        captured["quant_group_size"] = kwargs["quant_group_size"]
+        model._glm52_adapter_inventory = inventory
+        return True, "block_fp8", set()
+
+    monkeypatch.setattr("xorl.trainers.model_builder.build_foundation_model", fake_build_foundation_model)
+    monkeypatch.setattr("xorl.trainers.model_builder._inject_qlora", fake_inject_qlora)
+    monkeypatch.setattr("xorl.trainers.model_builder._deferred_qlora_quantize", lambda *args, **kwargs: None)
+    monkeypatch.setattr("xorl.trainers.model_builder._parallelize", lambda model, **_kwargs: model)
+    monkeypatch.setattr("xorl.trainers.model_builder.helper.print_device_mem_info", lambda *args, **kwargs: None)
+
+    result = build_training_model(
+        config_path="unused",
+        weights_path="unused",
+        moe_implementation="triton",
+        ep_dispatch="deepep",
+        enable_lora=True,
+        enable_qlora=True,
+        block_fp8_qlora_training=True,
+        quant_format="block_fp8",
+        quant_group_size=128,
+        moe_hybrid_shared_lora=True,
+        freeze_router=True,
+        enable_mixed_precision=False,
+        enable_gradient_checkpointing=False,
+    )
+
+    assert captured == {
+        "foundation_flag": True,
+        "inject_flag": True,
+        "quant_format": "block_fp8",
+        "quant_group_size": 128,
+    }
+    assert result.glm52_adapter_inventory is inventory
+
+
+def test_build_training_model_rejects_glm52_block_fp8_mode_without_qlora():
+    with pytest.raises(ValueError, match="requires enable_lora=True and enable_qlora=True"):
+        build_training_model(
+            config_path="unused",
+            weights_path="unused",
+            block_fp8_qlora_training=True,
+        )
+
+
 def test_build_training_model_rejects_fp8_with_adapters(monkeypatch):
     monkeypatch.setattr("xorl.trainers.model_builder.build_foundation_model", lambda **_kwargs: TinyDenseMoEModel())
     monkeypatch.setattr("xorl.trainers.model_builder.helper.print_device_mem_info", lambda *args, **kwargs: None)

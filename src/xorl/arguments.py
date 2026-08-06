@@ -1877,6 +1877,13 @@ class LoRAArguments:
         default=False,
         metadata={"help": "Enable QLoRA (quantized base weights + trainable LoRA). Implies enable_lora=True."},
     )
+    block_fp8_qlora_training: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable the complete official GLM-5.2 block-FP8 QLoRA target set. "
+            "Requires block_fp8, Triton experts, DeepEP, and hybrid-shared expert LoRA."
+        },
+    )
     quant_format: str = field(
         default="nvfp4",
         metadata={"help": "Quantization format for QLoRA. Supported: 'nvfp4', 'block_fp8', 'nf4'"},
@@ -2339,6 +2346,33 @@ class Arguments:
             raise ValueError("enable_fp8_training is a full-weight mode and cannot be combined with LoRA or QLoRA")
         if self.train.enable_qarl and (self.lora.enable_lora or self.lora.enable_qlora):
             raise ValueError("enable_qarl is a full-weight mode and cannot be combined with LoRA or QLoRA")
+        if self.lora.block_fp8_qlora_training:
+            requirements = {
+                "lora.enable_lora": (self.lora.enable_lora, True),
+                "lora.enable_qlora": (self.lora.enable_qlora, True),
+                "lora.quant_format": (self.lora.quant_format, "block_fp8"),
+                "lora.quant_group_size": (self.lora.quant_group_size, 128),
+                "lora.moe_hybrid_shared_lora": (self.lora.moe_hybrid_shared_lora, True),
+                "model.moe_implementation": (self.model.moe_implementation, "triton"),
+                "model.ep_dispatch": (self.model.ep_dispatch, "deepep"),
+                "model.freeze_router": (self.model.freeze_router, True),
+                "model.merge_qkv": (self.model.merge_qkv, True),
+            }
+            mismatches = [
+                f"{name}={actual!r} (requires {expected!r})"
+                for name, (actual, expected) in requirements.items()
+                if actual != expected
+            ]
+            if mismatches:
+                raise ValueError("GLM-5.2 block-FP8 QLoRA rejects unsupported configuration: " + ", ".join(mismatches))
+            if self.lora.lora_target_modules is not None or self.lora.lora_target_manifest is not None:
+                raise ValueError("GLM-5.2 block-FP8 QLoRA uses its complete deterministic target set")
+            if self.lora.exclude_modules is not None:
+                raise ValueError("GLM-5.2 block-FP8 QLoRA derives checkpoint exclusions and rejects user overrides")
+            if self.lora.enable_aqn:
+                raise ValueError("GLM-5.2 block-FP8 QLoRA does not admit Adaptive Quantization Noise")
+            if self.lora.merge_lora_interval:
+                raise ValueError("GLM-5.2 block-FP8 QLoRA publishes dynamic adapters and does not merge into the base")
         if self.train.enable_qarl:
             unsupported_reason = qarl_unsupported_scope_reason(
                 model_config=self.model.foundation,

@@ -42,6 +42,7 @@ from xorl.models.transformers.glm5.sparse_mla import (
     sparse_mla_dispatch,
     sparse_mla_torch_reference,
 )
+from xorl.qlora.modules.block_fp8_linear import BlockFP8QLoRALinear
 
 
 pytestmark = [pytest.mark.cpu]
@@ -882,15 +883,91 @@ def test_glm5_attention_sparse_matches_dense_when_topk_covers_full_seq():
     torch.testing.assert_close(sparse_out, dense_out, atol=1e-4, rtol=1e-4)
 
 
-def test_sparse_path_rejects_distributed_lora_training_without_ownership_contract(monkeypatch):
+def test_sparse_kv_b_lora_keeps_differentiable_factors_in_distributed_execution(monkeypatch):
     config = _tiny_config(index_topk=4, max_position_embeddings=8)
     attention = Glm5Attention(config, layer_idx=0)
     inject_lora_into_model(attention, r=4, lora_alpha=8, target_modules=["kv_b_proj"])
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
 
-    with pytest.raises(RuntimeError, match="adapter-gradient ownership contract"):
-        attention._split_kv_b_weight()
+    torch.nn.init.normal_(attention.kv_b_proj.lora_B, std=0.05)
+    w_kc, w_vc = attention._split_kv_b_weight()
+    (w_kc.sum() + w_vc.sum()).backward()
+
+    assert attention.kv_b_proj.lora_A.grad is not None
+    assert attention.kv_b_proj.lora_B.grad is not None
+    assert torch.count_nonzero(attention.kv_b_proj.lora_A.grad)
+    assert torch.count_nonzero(attention.kv_b_proj.lora_B.grad)
+
+
+def test_sparse_kv_b_block_fp8_qlora_dequantizes_base_and_keeps_factor_gradients(monkeypatch):
+    config = _tiny_config(index_topk=4, max_position_embeddings=8)
+    attention = Glm5Attention(config, layer_idx=0)
+    projection = BlockFP8QLoRALinear(
+        config.kv_lora_rank,
+        config.num_attention_heads * (config.qk_nope_head_dim + config.v_head_dim),
+        r=4,
+        lora_alpha=8,
+        device=torch.device("cpu"),
+    )
+    base = torch.randn(projection.out_features, projection.in_features)
+    monkeypatch.setattr(projection, "_dequantize_weight", lambda: base)
+    torch.nn.init.normal_(projection.lora_B, std=0.05)
+    attention.kv_b_proj = projection
+
+    w_kc, w_vc = attention._split_kv_b_weight()
+
+    expected = base + (projection.lora_B @ projection.lora_A) * projection.scaling
+    expected = expected.view(
+        config.num_attention_heads,
+        config.qk_nope_head_dim + config.v_head_dim,
+        config.kv_lora_rank,
+    )
+    torch.testing.assert_close(w_kc, expected[:, : config.qk_nope_head_dim])
+    torch.testing.assert_close(w_vc, expected[:, config.qk_nope_head_dim :])
+
+    (w_kc.sum() + w_vc.sum()).backward()
+    assert projection.lora_A.grad is not None
+    assert projection.lora_B.grad is not None
+
+
+def test_sparse_kv_b_block_fp8_qlora_absorb_weights_follow_bf16_compute_dtype(monkeypatch):
+    config = _tiny_config(index_topk=4, max_position_embeddings=8)
+    attention = Glm5Attention(config, layer_idx=0)
+    projection = BlockFP8QLoRALinear(
+        config.kv_lora_rank,
+        config.num_attention_heads * (config.qk_nope_head_dim + config.v_head_dim),
+        r=4,
+        lora_alpha=8,
+        device=torch.device("cpu"),
+    )
+    base = torch.randn(projection.out_features, projection.in_features, dtype=torch.float32)
+    monkeypatch.setattr(projection, "_dequantize_weight", lambda: base)
+    torch.nn.init.normal_(projection.lora_B, std=0.05)
+    attention.kv_b_proj = projection
+
+    w_kc, w_vc = attention._split_kv_b_weight(compute_dtype=torch.bfloat16)
+    assert w_kc.dtype == torch.bfloat16
+    assert w_vc.dtype == torch.bfloat16
+    expected = (base + (projection.lora_B @ projection.lora_A) * projection.scaling).to(torch.bfloat16)
+    expected = expected.view(
+        config.num_attention_heads,
+        config.qk_nope_head_dim + config.v_head_dim,
+        config.kv_lora_rank,
+    )
+    torch.testing.assert_close(w_kc, expected[:, : config.qk_nope_head_dim])
+    torch.testing.assert_close(w_vc, expected[:, config.qk_nope_head_dim :])
+
+    q_no_pe = torch.randn(1, 2, config.num_attention_heads, config.qk_nope_head_dim, dtype=torch.bfloat16)
+    attn_compressed = torch.randn(1, 2, config.num_attention_heads, config.kv_lora_rank, dtype=torch.bfloat16)
+    q_absorbed = torch.einsum("bshd,hdc->bshc", q_no_pe, w_kc)
+    attn_out = torch.einsum("bshk,hdk->bshd", attn_compressed, w_vc)
+    (q_absorbed.float().sum() + attn_out.float().sum()).backward()
+
+    assert projection.lora_A.grad is not None
+    assert projection.lora_B.grad is not None
+    assert torch.count_nonzero(projection.lora_A.grad)
+    assert torch.count_nonzero(projection.lora_B.grad)
 
 
 # --------------------------------------------------------------------------- #
@@ -995,6 +1072,17 @@ def test_glm5_checkpoint_handler_skip_key_fn_short_circuits_disk_reads():
     assert skip("model.layers.4.self_attn.q_a_proj.weight") is True  # MTP layer
     assert skip("model.layers.78.embed_tokens.weight") is True
     assert skip("model.embed_tokens.weight") is False
+
+
+def test_glm5_checkpoint_handler_ep_filter_skips_complete_fp8_expert_pairs():
+    handler = Glm5CheckpointHandler(num_experts=8, ep_rank=1, ep_size=2)
+    skip = handler.get_skip_key_fn()
+
+    assert skip is not None
+    assert skip("model.layers.3.mlp.experts.0.down_proj.weight") is True
+    assert skip("model.layers.3.mlp.experts.0.down_proj.weight_scale_inv") is True
+    assert skip("model.layers.3.mlp.experts.4.down_proj.weight") is False
+    assert skip("model.layers.3.mlp.experts.4.down_proj.weight_scale_inv") is False
 
 
 @torch.no_grad()

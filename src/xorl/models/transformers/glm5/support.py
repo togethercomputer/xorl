@@ -48,11 +48,33 @@ def validate_glm5_training_mode(
     enable_qlora: bool,
     freeze_router: bool,
     merge_qkv: bool,
+    block_fp8_qlora_training: bool = False,
+    quant_format: str = "nvfp4",
+    quant_group_size: int = 16,
+    moe_implementation: str | None = None,
+    ep_dispatch: str = "alltoall",
+    moe_hybrid_shared_lora: bool = False,
 ) -> None:
     if not is_glm5_config(config):
         return
-    if enable_qlora:
-        raise ValueError("GLM-5 does not support enable_qlora=True yet.")
+    if block_fp8_qlora_training:
+        requirements = {
+            "enable_qlora": (enable_qlora, True),
+            "quant_format": (quant_format, "block_fp8"),
+            "quant_group_size": (quant_group_size, 128),
+            "moe_implementation": (moe_implementation, "triton"),
+            "ep_dispatch": (ep_dispatch, "deepep"),
+            "moe_hybrid_shared_lora": (moe_hybrid_shared_lora, True),
+        }
+        mismatches = [
+            f"{name}={actual!r} (requires {expected!r})"
+            for name, (actual, expected) in requirements.items()
+            if actual != expected
+        ]
+        if mismatches:
+            raise ValueError("GLM-5.2 block-FP8 QLoRA rejects unsupported configuration: " + ", ".join(mismatches))
+    elif enable_qlora:
+        raise ValueError("GLM-5 QLoRA requires the explicit block_fp8_qlora_training mode")
     if not freeze_router:
         raise ValueError("GLM-5 requires freeze_router=True.")
     if not merge_qkv:

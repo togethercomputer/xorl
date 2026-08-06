@@ -13,9 +13,9 @@ from xorl.models.transformers.glm5.index_share import CanonicalLogicalIndices
 
 GLM52_SELECTOR_VERSION = "glm52_fp8_sampler_selector_v1"
 GLM52_SELECTION_IMPORT = "sglang.srt.layers.attention.nsa.glm52_selector.select_canonical_logical_topk"
-GLM52_HADAMARD_IMPORT = "sglang.jit_kernel.hadamard.hadamard_transform"
-GLM52_QUERY_QUANT_IMPORT = "sglang.srt.layers.attention.nsa.triton_kernel.act_quant"
-GLM52_KEY_CACHE_QUANT_IMPORT = "sglang.jit_kernel.fused_store_index_cache.fused_store_index_k_cache"
+GLM52_HADAMARD_IMPORT = "sglang.kernels.ops.quantization.hadamard.hadamard_transform"
+GLM52_QUERY_QUANT_IMPORT = "sglang.kernels.ops.attention.dsa.triton_kernel.act_quant"
+GLM52_KEY_CACHE_QUANT_IMPORT = "sglang.kernels.ops.attention.fused_store_index_cache.fused_store_index_k_cache"
 GLM52_SCORE_KERNEL_IMPORT = "deep_gemm.fp8_mqa_logits"
 FP8_E4M3_MAX = 448.0
 
@@ -32,7 +32,7 @@ class Glm52Selection:
 
 
 def _load_sparse_hadamard() -> NativeScoreKernel:
-    module = importlib.import_module("sglang.jit_kernel.hadamard")
+    module = importlib.import_module("sglang.kernels.ops.quantization.hadamard")
     kernel = getattr(module, "hadamard_transform", None)
     if not callable(kernel):
         raise RuntimeError(f"GLM-5.2 sparse selection requires {GLM52_HADAMARD_IMPORT}")
@@ -52,7 +52,7 @@ def _load_sparse_selection() -> NativeScoreKernel:
 
 
 def _load_sparse_query_quantizer() -> NativeQuantKernel:
-    module = importlib.import_module("sglang.srt.layers.attention.nsa.triton_kernel")
+    module = importlib.import_module("sglang.kernels.ops.attention.dsa.triton_kernel")
     kernel = getattr(module, "act_quant", None)
     if not callable(kernel):
         raise RuntimeError(f"GLM-5.2 sparse selection requires {GLM52_QUERY_QUANT_IMPORT}")
@@ -60,7 +60,7 @@ def _load_sparse_query_quantizer() -> NativeQuantKernel:
 
 
 def _load_sparse_key_cache_quantizer() -> NativeKeyCacheKernel:
-    module = importlib.import_module("sglang.jit_kernel.fused_store_index_cache")
+    module = importlib.import_module("sglang.kernels.ops.attention.fused_store_index_cache")
     kernel = getattr(module, "fused_store_index_k_cache", None)
     if not callable(kernel):
         raise RuntimeError(f"GLM-5.2 sparse selection requires {GLM52_KEY_CACHE_QUANT_IMPORT}")

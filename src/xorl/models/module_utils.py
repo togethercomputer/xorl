@@ -2010,17 +2010,21 @@ def grouped_load_weights(
 
     def _dispatch_loaded_tensor(param_name: str, param_tensor: torch.Tensor, *, expect_expert: bool) -> None:
         model_name = _compiled_key_map.get(param_name, param_name)
+
+        # QLoRA base tensors are source-only checkpoint state.  They are loaded
+        # by the deferred pre-quantized path and are not model parameters for
+        # this dispatch pass, so queue-family validation does not apply to them.
+        if param_name in _expected_skip_keys or model_name in _expected_skip_keys:
+            return
+        if _expected_skip_prefixes and _should_skip_qlora_expert_key(model_name, _expected_skip_prefixes):
+            return
+
         is_expert = _is_expert_parameter_name(model_name, parallel_plan)
         if expect_expert != is_expert:
             raise RuntimeError(
                 f"Grouped weight loading misrouted {'expert' if expect_expert else 'dense'} tensor "
                 f"{param_name} -> {model_name}"
             )
-
-        if param_name in _expected_skip_keys or model_name in _expected_skip_keys:
-            return
-        if _expected_skip_prefixes and _should_skip_qlora_expert_key(model_name, _expected_skip_prefixes):
-            return
         if model_name in buffer_dict:
             if model_name in loaded_persistent_buffer_names:
                 duplicate_persistent_buffer_names.add(model_name)

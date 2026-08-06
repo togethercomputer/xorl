@@ -516,6 +516,47 @@ def test_load_server_arguments_threads_fp8_training_into_train_config(tmp_path):
     assert train_config["fp8_training_allow_bf16_fallback"] is False
 
 
+def test_load_server_arguments_threads_glm52_block_fp8_qlora_mode(tmp_path):
+    config_path = tmp_path / "server_config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {
+                    "model_path": "zai-org/GLM-5.2-FP8",
+                    "moe_implementation": "triton",
+                    "ep_dispatch": "deepep",
+                    "merge_qkv": True,
+                },
+                "train": {
+                    "freeze_router": True,
+                    "output_dir": str(tmp_path / "outputs"),
+                },
+                "lora": {
+                    "enable_lora": True,
+                    "enable_qlora": True,
+                    "block_fp8_qlora_training": True,
+                    "quant_format": "block_fp8",
+                    "quant_group_size": 128,
+                    "moe_hybrid_shared_lora": True,
+                    "lora_export_format": "sglang_shared_outer",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    args = load_server_arguments(str(config_path))
+    config = args.to_config_dict()
+
+    assert args.block_fp8_qlora_training is True
+    assert config["lora"]["enable_lora"] is True
+    assert config["lora"]["enable_qlora"] is True
+    assert config["lora"]["block_fp8_qlora_training"] is True
+    assert config["lora"]["quant_format"] == "block_fp8"
+    assert config["lora"]["quant_group_size"] == 128
+    assert config["lora"]["moe_hybrid_shared_lora"] is True
+
+
 def test_load_server_arguments_threads_qarl_into_train_config(tmp_path):
     config_path = tmp_path / "server_config.yaml"
     config_path.write_text(

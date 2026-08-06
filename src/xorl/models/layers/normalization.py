@@ -278,12 +278,9 @@ def _get_sglang_jit_norm():
     global _SGLANG_JIT_NORM
     if _SGLANG_JIT_NORM is None:
         try:
-            sglang_jit_norm = importlib.import_module("sglang.jit_kernel.norm")
+            sglang_jit_norm = importlib.import_module("sglang.kernels.ops.layernorm.norm")
         except Exception as exc:
-            raise RuntimeError(
-                "rmsnorm_mode='sglang_jit' requires sglang.jit_kernel.norm on PYTHONPATH "
-                "(for example via SGLANG_REPO=/path/to/sglang/python)."
-            ) from exc
+            raise RuntimeError("rmsnorm_mode='sglang_jit' requires the installed SGLang JIT norm module.") from exc
         _SGLANG_JIT_NORM = sglang_jit_norm
     return _SGLANG_JIT_NORM
 
@@ -294,10 +291,7 @@ def _get_sglang_kernel_norm():
         try:
             _SGLANG_KERNEL_NORM = importlib.import_module("sgl_kernel")
         except Exception as exc:
-            raise RuntimeError(
-                "rmsnorm_mode='sglang_kernel' requires sgl_kernel on PYTHONPATH "
-                "(for example via an SGLang-capable xorl diagnostic venv)."
-            ) from exc
+            raise RuntimeError("rmsnorm_mode='sglang_kernel' requires an ABI-compatible installed sgl_kernel.") from exc
     return _SGLANG_KERNEL_NORM
 
 

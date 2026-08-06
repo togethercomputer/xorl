@@ -617,12 +617,12 @@ def test_sglang_moe_tp_sglang_mode_uses_sglang_weight_layout(monkeypatch):
         filter_expert,
         **kwargs,
     ):
-        del kwargs
         calls.append(
             {
                 "w1_shape": tuple(w1.shape),
                 "w2_shape": tuple(w2.shape),
                 "activation": activation,
+                "gemm1_limit": kwargs["gemm1_limit"],
                 "filter_expert": filter_expert,
             }
         )
@@ -653,8 +653,20 @@ def test_sglang_moe_tp_sglang_mode_uses_sglang_weight_layout(monkeypatch):
 
     torch.testing.assert_close(actual, expected)
     assert calls == [
-        {"w1_shape": (3, 6, 4), "w2_shape": (3, 4, 3), "activation": "silu", "filter_expert": False},
-        {"w1_shape": (3, 6, 4), "w2_shape": (3, 4, 3), "activation": "silu", "filter_expert": False},
+        {
+            "w1_shape": (3, 6, 4),
+            "w2_shape": (3, 4, 3),
+            "activation": "silu",
+            "gemm1_limit": None,
+            "filter_expert": False,
+        },
+        {
+            "w1_shape": (3, 6, 4),
+            "w2_shape": (3, 4, 3),
+            "activation": "silu",
+            "gemm1_limit": None,
+            "filter_expert": False,
+        },
     ]
 
 
@@ -717,6 +729,8 @@ def test_sglang_moe_tp_sglang_runner_mode_uses_runner_contract(monkeypatch):
                     "intermediate_size_per_partition": config.intermediate_size_per_partition,
                     "top_k": config.top_k,
                     "inplace": config.inplace,
+                    "gemm1_clamp_limit": config.gemm1_clamp_limit,
+                    "gate_up_interleaved": config.gate_up_interleaved,
                 }
             )
 
@@ -769,6 +783,8 @@ def test_sglang_moe_tp_sglang_runner_mode_uses_runner_contract(monkeypatch):
             "intermediate_size_per_partition": 3,
             "top_k": 2,
             "inplace": False,
+            "gemm1_clamp_limit": None,
+            "gate_up_interleaved": False,
         },
         {
             "backend": "triton",
@@ -777,6 +793,8 @@ def test_sglang_moe_tp_sglang_runner_mode_uses_runner_contract(monkeypatch):
             "intermediate_size_per_partition": 3,
             "top_k": 2,
             "inplace": False,
+            "gemm1_clamp_limit": None,
+            "gate_up_interleaved": False,
         },
     ]
 

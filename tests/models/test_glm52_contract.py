@@ -19,6 +19,7 @@ from xorl.models.transformers.glm5.index_share import (
     CanonicalLogicalIndices,
     IndexShareContextManager,
     IndexShareLifecycle,
+    IndexShareMode,
 )
 from xorl.models.transformers.glm5.indexer import Glm5DsaIndexer
 from xorl.models.transformers.glm5.layer_plan import Glm52LayerPlan
@@ -160,24 +161,26 @@ def test_index_share_context_lifecycle_reuse_exception_cleanup_and_concurrency_g
     manager = IndexShareContextManager(plan, (0, 4))
     payload = CanonicalLogicalIndices(torch.tensor([[[0, 1, -1]]], dtype=torch.int32))
 
-    first = manager.begin()
-    first.publish(layer_index=0, layer_plan=plan, indices=payload)
-    assert first.consume(layer_index=2, layer_plan=plan) is payload
+    first = manager.begin(mode=IndexShareMode.TRAINING_WITH_BACKWARD)
+    published = first.get_or_publish(producer_layer_index=0, layer_plan=plan, produce_payload=lambda: payload)
+    assert torch.equal(published.values, payload.values)
+    assert first.require(producer_layer_index=0, layer_plan=plan) is published
     with pytest.raises(RuntimeError, match="one live"):
-        manager.begin()
+        manager.begin(mode=IndexShareMode.FORWARD_ONLY)
+    manager.end(first)
     manager.end(first)
     assert first.lifecycle is IndexShareLifecycle.CLOSED
     assert manager.active is None
 
     with pytest.raises(RuntimeError, match="body failed"):
-        with manager.invocation() as second:
-            second.publish(layer_index=0, layer_plan=plan, indices=payload)
+        with manager.invocation(mode=IndexShareMode.FORWARD_ONLY) as second:
+            second.get_or_publish(producer_layer_index=0, layer_plan=plan, produce_payload=lambda: payload)
             raise RuntimeError("body failed")
     assert manager.active is None
 
-    with manager.invocation() as third:
+    with manager.invocation(mode=IndexShareMode.FORWARD_ONLY) as third:
         with pytest.raises(RuntimeError, match="has not published"):
-            third.consume(layer_index=1, layer_plan=plan)
+            third.require(producer_layer_index=0, layer_plan=plan)
 
 
 @pytest.mark.cpu
@@ -186,14 +189,18 @@ def test_index_share_context_identity_survives_fsdp_tensor_transform():
     manager = IndexShareContextManager(plan, (0, 4))
     payload = CanonicalLogicalIndices(torch.tensor([[[0, 1, -1]]], dtype=torch.int32))
 
-    with manager.invocation() as context:
+    with manager.invocation(mode=IndexShareMode.FORWARD_ONLY) as context:
         producer_context = _map_tensors(lambda tensor: tensor, {"context": context})["context"]
         assert producer_context is context
-        producer_context.publish(layer_index=0, layer_plan=plan, indices=payload)
+        producer_context.get_or_publish(producer_layer_index=0, layer_plan=plan, produce_payload=lambda: payload)
 
         consumer_context = _map_tensors(lambda tensor: tensor, {"context": context})["context"]
         assert consumer_context is context
-        assert consumer_context.consume(layer_index=1, layer_plan=plan) is payload
+        assert consumer_context.require(producer_layer_index=0, layer_plan=plan) is producer_context.get_or_publish(
+            producer_layer_index=0,
+            layer_plan=plan,
+            produce_payload=lambda: pytest.fail("retained producer payload was recomputed"),
+        )
 
 
 @pytest.mark.cpu
@@ -242,7 +249,10 @@ def test_index_share_survives_fsdp_cast_across_dense_producer_and_shared_consume
         for layer in model.layers
     ]
     try:
-        output = model(input_ids=torch.tensor([[1, 2, 3, 4]])).last_hidden_state
+        output = model(
+            input_ids=torch.tensor([[1, 2, 3, 4]]),
+            index_share_mode=IndexShareMode.FORWARD_ONLY,
+        ).last_hidden_state
     finally:
         for handle in handles:
             handle.remove()
@@ -452,8 +462,8 @@ def test_glm52_sparse_native_sampler_codecs_are_bitwise_at_production_shapes():
             "build documented in the PR body to run the GPU exact tests"
         ),
     )
-    from sglang.jit_kernel.fused_store_index_cache import fused_store_index_k_cache
-    from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
+    from sglang.kernels.ops.attention.dsa.triton_kernel import act_quant
+    from sglang.kernels.ops.attention.fused_store_index_cache import fused_store_index_k_cache
 
     torch.manual_seed(520052)
     query = torch.randn((4, 32, 128), device="cuda", dtype=torch.bfloat16)
@@ -750,7 +760,11 @@ def _bind_semantic_canonicalizers(model, boundaries, *, serving: bool, skip_laye
 
 def _semantic_logprobs(model, input_ids):
     positions = torch.arange(input_ids.shape[1]).expand_as(input_ids)
-    hidden = model.model(input_ids=input_ids, position_ids=positions).last_hidden_state
+    hidden = model.model(
+        input_ids=input_ids,
+        position_ids=positions,
+        index_share_mode=IndexShareMode.FORWARD_ONLY,
+    ).last_hidden_state
     return F.log_softmax(model.lm_head(hidden).float(), dim=-1)
 
 

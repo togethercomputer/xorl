@@ -55,6 +55,7 @@ from xorl.models.transformers.deepseek_v3.support import (
     freeze_deepseek_v3_router_parameters,
     validate_deepseek_v3_training_mode,
 )
+from xorl.models.transformers.glm5.index_share import IndexShareMode
 from xorl.models.transformers.glm5.support import validate_glm5_training_mode
 from xorl.optim import build_lr_scheduler, build_optimizer
 from xorl.qlora import (
@@ -711,6 +712,7 @@ class Trainer:
             sparse_mla_enabled=args.model.sparse_mla_enabled,
             sparse_mla_backend=args.model.sparse_mla_backend,
             flash_attention_deterministic=args.model.flash_attention_deterministic,
+            block_fp8_qlora_training=getattr(args.lora, "block_fp8_qlora_training", False),
             init_device=args.train.init_device,
         )
         self.model_config = self.model.config
@@ -745,6 +747,12 @@ class Trainer:
             enable_qlora=args.lora.enable_qlora,
             freeze_router=args.model.freeze_router,
             merge_qkv=args.model.merge_qkv,
+            block_fp8_qlora_training=getattr(args.lora, "block_fp8_qlora_training", False),
+            quant_format=getattr(args.lora, "quant_format", "nvfp4"),
+            quant_group_size=getattr(args.lora, "quant_group_size", 16),
+            moe_implementation=args.model.moe_implementation,
+            ep_dispatch=args.model.ep_dispatch,
+            moe_hybrid_shared_lora=getattr(args.lora, "moe_hybrid_shared_lora", False),
         )
         helper.print_device_mem_info("VRAM usage after building model")
 
@@ -882,19 +890,35 @@ class Trainer:
                 f"target={args.lora.quant_format} — will dequantize and re-quantize"
             )
 
-        inject_qlora_into_model(
-            self.model,
-            r=args.lora.lora_rank,
-            lora_alpha=args.lora.lora_alpha,
-            quant_format=args.lora.quant_format,
-            quant_group_size=args.lora.quant_group_size,
-            target_modules=args.lora.lora_target_modules,
-            checkpoint_quant_format=self.checkpoint_quant_format,
-            merge_qkv=args.model.merge_qkv,
-            exclude_modules=self.exclude_modules,
-            enable_aqn=args.lora.enable_aqn,
-            aqn_alpha=args.lora.aqn_alpha,
-        )
+        if getattr(args.lora, "block_fp8_qlora_training", False):
+            if args.lora.lora_target_modules is not None:
+                raise ValueError("GLM-5.2 block-FP8 QLoRA uses its complete deterministic target set")
+            if args.lora.exclude_modules is not None:
+                raise ValueError("GLM-5.2 block-FP8 QLoRA derives checkpoint exclusions and rejects user overrides")
+            if args.lora.enable_aqn:
+                raise ValueError("GLM-5.2 block-FP8 QLoRA does not admit Adaptive Quantization Noise")
+            from xorl.models.transformers.glm5.qlora import prepare_glm52_block_fp8_qlora  # noqa: PLC0415
+
+            self.glm52_adapter_inventory = prepare_glm52_block_fp8_qlora(
+                self.model,
+                self.model_config,
+                adapter_rank=args.lora.lora_rank,
+                adapter_alpha=args.lora.lora_alpha,
+            )
+        else:
+            inject_qlora_into_model(
+                self.model,
+                r=args.lora.lora_rank,
+                lora_alpha=args.lora.lora_alpha,
+                quant_format=args.lora.quant_format,
+                quant_group_size=args.lora.quant_group_size,
+                target_modules=args.lora.lora_target_modules,
+                checkpoint_quant_format=self.checkpoint_quant_format,
+                merge_qkv=args.model.merge_qkv,
+                exclude_modules=self.exclude_modules,
+                enable_aqn=args.lora.enable_aqn,
+                aqn_alpha=args.lora.aqn_alpha,
+            )
         if self.exclude_modules:
             self.model._qlora_exclude_modules = self.exclude_modules
         helper.print_device_mem_info("VRAM usage after QLoRA injection")
@@ -1777,12 +1801,25 @@ class Trainer:
             self._log_step_exception_diagnostics(phase_times, step_start, exc)
             raise
         finally:
+            self._release_index_share_contexts()
             self._current_step_phase_times = None
             self._current_step_memory_stats = None
 
     # ===================================================================
     # train_step helpers
     # ===================================================================
+
+    @staticmethod
+    def _index_share_forward_kwargs(model, mode: IndexShareMode) -> Dict[str, IndexShareMode]:
+        if callable(getattr(model, "release_index_share_context", None)):
+            return {"index_share_mode": mode}
+        return {}
+
+    def _release_index_share_contexts(self) -> None:
+        for model_part in self._all_model_parts():
+            release = getattr(model_part, "release_index_share_context", None)
+            if callable(release):
+                release()
 
     def _scan_nonfinite_grads(self) -> None:
         """Debug helper (XORL_DEBUG_NONFINITE_GRAD_SCAN=1): after backward, log
@@ -1877,6 +1914,18 @@ class Trainer:
         micro_batches: List[Dict[str, Any]],
         global_valid_tokens: torch.Tensor,
     ) -> float:
+        try:
+            return self._forward_backward_impl(micro_batches, global_valid_tokens)
+        finally:
+            # A successful backward releases per micro-batch below. This outer
+            # boundary owns loss/setup failures after a successful forward.
+            self._release_index_share_contexts()
+
+    def _forward_backward_impl(
+        self,
+        micro_batches: List[Dict[str, Any]],
+        global_valid_tokens: torch.Tensor,
+    ) -> float:
         """Standard gradient accumulation loop (non-PP)."""
         total_loss = 0.0
 
@@ -1926,7 +1975,15 @@ class Trainer:
                 def _do_model_forward(micro_batch=micro_batch):
                     self._per_component_timer.set_mode("fwd")
                     try:
-                        return self.model(**micro_batch, use_cache=False, output_hidden_states=False)
+                        return self.model(
+                            **micro_batch,
+                            use_cache=False,
+                            output_hidden_states=False,
+                            **self._index_share_forward_kwargs(
+                                self.model,
+                                IndexShareMode.TRAINING_WITH_BACKWARD,
+                            ),
+                        )
                     finally:
                         self._per_component_timer.set_mode("idle")
 
@@ -2005,6 +2062,7 @@ class Trainer:
                         if _env_flag("XORL_TRAINER_MEMORY_TRACE"):
                             _trainer_memory_trace("after ga_loss.backward")
                     finally:
+                        self._release_index_share_contexts()
                         self._per_component_timer.set_mode("idle")
 
                 self._time_step_phase("backward", _do_backward)

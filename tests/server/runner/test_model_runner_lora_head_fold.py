@@ -65,6 +65,8 @@ def test_runner_compiles_module_and_direct_output_properties_at_registration(tmp
         def __init__(self):
             super().__init__()
             self.trunk = LoraLinear(3, 3, r=2, lora_alpha=2)
+            self.kv_b_proj = LoraLinear(3, 3, r=2, lora_alpha=2)
+            self.kv_b_proj.adapter_gradient_producer_family = "direct_output_projection"
             self.lm_head = LoraLinear(3, 4, r=2, lora_alpha=2)
 
     model = _Model()
@@ -93,6 +95,8 @@ def test_runner_compiles_module_and_direct_output_properties_at_registration(tmp
     by_name = {item.fqn: item for item in plan.parameters}
     assert by_name["trunk.lora_A"].producer is ProducerFamily.MODULE_MANAGED
     assert by_name["trunk.lora_A"].topology is TopologyFamily.DENSE_REPLICATED
+    assert by_name["kv_b_proj.lora_A"].producer is ProducerFamily.DIRECT_OUTPUT_PROJECTION
+    assert by_name["kv_b_proj.lora_A"].topology is TopologyFamily.DIRECT_OUTPUT_PROJECTION
     assert by_name["lm_head.lora_B"].producer is ProducerFamily.DIRECT_OUTPUT_PROJECTION
     assert by_name["lm_head.lora_B"].topology is TopologyFamily.DIRECT_OUTPUT_PROJECTION
     assert dict(by_name["trunk.lora_A"].config_guard_fields)["merged_forward"] is False
@@ -457,6 +461,61 @@ def test_runner_rejects_uncertified_unquantized_expert_backends(tmp_path, monkey
         runner._compile_registered_adapter_gradient_ownership("policy")
 
 
+def test_runner_admits_certified_glm52_block_fp8_triton_deepep_expert_factors(tmp_path, monkeypatch):
+    class _Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.experts = BlockFP8QLoRAMoeExperts(
+                num_local_experts=2,
+                num_experts=2,
+                intermediate_size=8,
+                hidden_size=8,
+                r=2,
+                lora_alpha=2,
+                device=torch.device("cpu"),
+                moe_implementation="triton",
+                ep_dispatch="deepep",
+                hybrid_shared=True,
+            )
+
+    model = _Model()
+    manager = LoRAAdapterManager(
+        model,
+        torch.device("cpu"),
+        checkpoint_dir=str(tmp_path),
+        auto_save_on_eviction=False,
+    )
+    manager.register_adapter("policy", lr=0.1)
+    monkeypatch.setattr(
+        model_runner_module,
+        "get_parallel_state",
+        lambda: SimpleNamespace(
+            sp_grad_sync_group=None,
+            lm_head_tp_replica_group=None,
+            ep_group=None,
+            ep_size=1,
+            tp_size=1,
+        ),
+    )
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.model = model
+    runner._adapter_manager = manager
+
+    runner._compile_registered_adapter_gradient_ownership("policy")
+
+    plan = manager.get_adapter_state("policy").gradient_ownership_plan
+    assert plan is not None
+    assert len(plan.parameters) == 6
+    assert {item.producer for item in plan.parameters} == {ProducerFamily.FUSED_MANAGED}
+    for item in plan.parameters:
+        guard = dict(item.config_guard_fields)
+        assert guard["expert_module"] == "BlockFP8QLoRAMoeExperts"
+        assert guard["expert_quant_format"] == "block_fp8"
+        assert guard["expert_backend"] == "triton"
+        assert guard["expert_ep_dispatch"] == "deepep"
+        assert guard["expert_hybrid_shared"] is True
+
+
 @pytest.mark.parametrize("implementation", ("eager", "triton", "native", "quack"))
 def test_runner_rejects_uncertified_quantized_expert_factors(tmp_path, monkeypatch, implementation):
     class _Model(nn.Module):
@@ -490,7 +549,7 @@ def test_runner_rejects_uncertified_quantized_expert_factors(tmp_path, monkeypat
     runner.model = model
     runner._adapter_manager = manager
 
-    with pytest.raises(AdapterGradientOwnershipError, match="Quantized expert-factor LoRA is not certified"):
+    with pytest.raises(AdapterGradientOwnershipError, match="admitted only for the certified GLM-5.2"):
         runner._compile_registered_adapter_gradient_ownership("policy")
 
 

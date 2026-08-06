@@ -679,6 +679,7 @@ def test_grouped_load_weights_routes_hf_fused_experts_through_expert_queue(monke
     fake_group = object()
     fake_dense_group = object()
     raw_expert_key = "model.language_model.layers.0.mlp.experts.gate_up_proj.weight"
+    raw_deferred_scale = "model.layers.0.mlp.experts.0.down_proj.weight_scale_inv"
     raw_skipped_key = "mtp.layers.0.mlp.experts.0.gate_proj.weight"
     expert_key = "model.layers.0.mlp.experts.gate_up_proj.weight"
     expert_param = "model.layers.0.mlp.experts.gate_up_proj"
@@ -714,7 +715,12 @@ def test_grouped_load_weights_routes_hf_fused_experts_through_expert_queue(monke
             return [("keep.weight", None), (expert_param, None)]
 
         def named_modules(self):
-            return []
+            return [
+                (
+                    "model.layers.0.mlp.experts",
+                    SimpleNamespace(_qlora_expected_skip_keys={"down_proj"}),
+                )
+            ]
 
         def to_empty(self, device):
             self.device = device
@@ -746,7 +752,14 @@ def test_grouped_load_weights_routes_hf_fused_experts_through_expert_queue(monke
             prefetch_calls.append("expert")
             assert skip_key_fn(raw_skipped_key)
             assert skip_key_fn("keep.weight")
-            yield ({raw_expert_key: torch.tensor([3.0])}, [])
+            assert not skip_key_fn(raw_deferred_scale)
+            yield (
+                {
+                    raw_expert_key: torch.tensor([3.0]),
+                    raw_deferred_scale: torch.tensor([1.0]),
+                },
+                [],
+            )
 
     monkeypatch.setattr(module_utils, "dist", fake_dist)
     monkeypatch.setattr(module_utils, "tqdm", lambda iterable, **kwargs: iterable)
@@ -763,7 +776,7 @@ def test_grouped_load_weights_routes_hf_fused_experts_through_expert_queue(monke
     monkeypatch.setattr(
         module_utils,
         "_get_checkpoint_keys",
-        lambda weights_path: {"keep.weight", raw_expert_key, raw_skipped_key},
+        lambda weights_path: {"keep.weight", raw_expert_key, raw_deferred_scale, raw_skipped_key},
     )
     monkeypatch.setattr(module_utils, "_load_state_dict", lambda weights_path: ["shard-0"])
     monkeypatch.setattr(module_utils, "_prefetch_shards_filtered", fake_prefetch_filtered)
@@ -775,7 +788,7 @@ def test_grouped_load_weights_routes_hf_fused_experts_through_expert_queue(monke
 
     assert prefetch_calls == ["dense", "expert"]
     assert dense_loaded == ["keep.weight"]
-    assert expert_loaded == [expert_key]
+    assert expert_loaded == [expert_key, raw_deferred_scale]
     assert dispatched == ["keep.weight", expert_param]
 
 

@@ -578,6 +578,7 @@ def build_foundation_model(
     sparse_mla_backend: Optional[str] = None,
     flash_attention_deterministic: bool = False,
     server_training: bool = False,
+    block_fp8_qlora_training: bool = False,
     init_device: Literal["cpu", "cuda", "npu", "meta"] = "cuda",
     config_kwargs: Optional[Dict[str, Any]] = None,
 ) -> nn.Module:
@@ -597,7 +598,10 @@ def build_foundation_model(
             config = _load_config_with_rank0_priority(config_path, config_kwargs)
 
     glm52_model = _is_canonical_glm52(config)
-    config._glm52_exact_contract = bool(server_training and glm52_model)
+    if block_fp8_qlora_training and not glm52_model:
+        raise ValueError("block_fp8_qlora_training is supported only for the official GLM-5.2 model")
+    config._glm52_block_fp8_qlora = bool(block_fp8_qlora_training)
+    config._glm52_exact_contract = bool(server_training and glm52_model and not block_fp8_qlora_training)
     canonical_glm52 = config._glm52_exact_contract
     qwen35_model_type = getattr(config, "model_type", None) in {
         "xorl_qwen3_5",

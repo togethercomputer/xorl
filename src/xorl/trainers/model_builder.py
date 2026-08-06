@@ -54,6 +54,7 @@ class TrainingModelResult:
     is_prequantized: bool = False
     checkpoint_quant_format: Optional[str] = None
     exclude_modules: Set[str] = field(default_factory=set)
+    glm52_adapter_inventory: Any = None
 
 
 def resolve_training_model_dtype(
@@ -132,6 +133,7 @@ def build_training_model(
     moe_hybrid_shared_lora: bool = False,
     # --- QLoRA ---
     enable_qlora: bool = False,
+    block_fp8_qlora_training: bool = False,
     quant_format: str = "nvfp4",
     quant_group_size: int = 16,
     qlora_exclude_modules: Optional[List[str]] = None,
@@ -221,6 +223,8 @@ def build_training_model(
             "rope_class_b=True requires rope_native=True: the Class-B contract uses "
             "the CPU-built serving-layout cos/sin cache selected by rope_native"
         )
+    if block_fp8_qlora_training and (not enable_lora or not enable_qlora):
+        raise ValueError("block_fp8_qlora_training=True requires enable_lora=True and enable_qlora=True")
 
     # ------------------------------------------------------------------
     # 1. Build foundation model
@@ -252,6 +256,7 @@ def build_training_model(
         sparse_mla_backend=sparse_mla_backend,
         flash_attention_deterministic=flash_attention_deterministic,
         server_training=server_training,
+        block_fp8_qlora_training=block_fp8_qlora_training,
         init_device=init_device,
     )
 
@@ -276,6 +281,12 @@ def build_training_model(
         enable_qlora=enable_qlora,
         freeze_router=freeze_router,
         merge_qkv=merge_qkv,
+        block_fp8_qlora_training=block_fp8_qlora_training,
+        quant_format=quant_format,
+        quant_group_size=quant_group_size,
+        moe_implementation=moe_implementation,
+        ep_dispatch=ep_dispatch,
+        moe_hybrid_shared_lora=moe_hybrid_shared_lora,
     )
     helper.print_device_mem_info("VRAM usage after building model")
 
@@ -376,6 +387,7 @@ def build_training_model(
             quant_group_size=quant_group_size,
             merge_qkv=merge_qkv,
             qlora_exclude_modules=qlora_exclude_modules,
+            block_fp8_qlora_training=block_fp8_qlora_training,
         )
     elif enable_lora:
         _inject_lora(
@@ -534,6 +546,7 @@ def build_training_model(
         is_prequantized=is_prequantized,
         checkpoint_quant_format=checkpoint_quant_format,
         exclude_modules=exclude_modules,
+        glm52_adapter_inventory=getattr(model, "_glm52_adapter_inventory", None),
     )
 
 
@@ -553,6 +566,7 @@ def _inject_qlora(
     quant_group_size: int,
     merge_qkv: bool,
     qlora_exclude_modules: Optional[List[str]],
+    block_fp8_qlora_training: bool = False,
 ) -> tuple:
     """QLoRA injection with pre-quantized checkpoint detection.
 
@@ -607,17 +621,31 @@ def _inject_qlora(
                 f"not supported — use a checkpoint that matches the target format."
             )
 
-    inject_qlora_into_model(
-        model,
-        r=lora_rank,
-        lora_alpha=lora_alpha,
-        quant_format=quant_format,
-        quant_group_size=quant_group_size,
-        target_modules=lora_target_modules,
-        checkpoint_quant_format=checkpoint_quant_format,
-        merge_qkv=merge_qkv,
-        exclude_modules=exclude_modules,
-    )
+    if block_fp8_qlora_training:
+        if lora_target_modules is not None:
+            raise ValueError("GLM-5.2 block-FP8 QLoRA uses its complete deterministic target set")
+        if qlora_exclude_modules is not None:
+            raise ValueError("GLM-5.2 block-FP8 QLoRA derives checkpoint exclusions and rejects user overrides")
+        from xorl.models.transformers.glm5.qlora import prepare_glm52_block_fp8_qlora  # noqa: PLC0415
+
+        prepare_glm52_block_fp8_qlora(
+            model,
+            model.config,
+            adapter_rank=lora_rank,
+            adapter_alpha=lora_alpha,
+        )
+    else:
+        inject_qlora_into_model(
+            model,
+            r=lora_rank,
+            lora_alpha=lora_alpha,
+            quant_format=quant_format,
+            quant_group_size=quant_group_size,
+            target_modules=lora_target_modules,
+            checkpoint_quant_format=checkpoint_quant_format,
+            merge_qkv=merge_qkv,
+            exclude_modules=exclude_modules,
+        )
     if exclude_modules:
         model._qlora_exclude_modules = exclude_modules
     helper.print_device_mem_info("VRAM usage after QLoRA injection")

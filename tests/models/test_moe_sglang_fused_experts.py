@@ -16,8 +16,7 @@ Validates:
    (strided default, legacy cache env aliases cached, explicit mode wins,
    invalid rejects); strided mode hands zero-copy GKN transpose-views to the
    kernel and never populates the cache; strided forward+grads bit-identical
-   to transient (GPU); an upstream fused_moe restructure fails loud naming
-   the mode env and the transient fallback.
+   to transient (GPU); the adapter pins SGLang's split gate/up layout contract.
 6. Auto default (env unset): resolves per-regime — enabled at ep=1 (CUDA input,
    supported module, importable stack), disabled at EP>1; explicit 1/0 always
    wins; the resolution is logged once; (GPU) the auto path dispatches to the
@@ -25,7 +24,11 @@ Validates:
    explicit-flag path.
 """
 
+import inspect
 import logging
+import sys
+import types
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -154,6 +157,7 @@ def test_auto_requires_supported_expert_module(monkeypatch, auto_state):
         ("down_bias", torch.zeros(1)),
         ("gate_up_bias", torch.zeros(1)),
         ("hidden_act", "relu2"),
+        ("swiglu_limit", 1.0),
         ("fp8_training_enabled", True),
     ):
         blk = _block("triton")
@@ -264,6 +268,37 @@ def test_guards_reject_unsupported_experts(routed_inputs, monkeypatch):
         blk.experts.sglang_fused_experts_forward(x, None, None)
 
 
+def test_positive_swiglu_limit_fails_before_sglang_load_or_kernel(routed_inputs, monkeypatch):
+    """Every SGLang fused-kernel/runner entry must reject XoRL's
+    semantically different clamp before importing or invoking SGLang."""
+    blk = _block("triton")
+    blk.experts.swiglu_limit = 1.0
+    x, w, ids = routed_inputs
+    cumsum = torch.arange(1, NUM_EXPERTS + 1, dtype=torch.int64)
+    local_ids = ids.to(torch.int32)
+    parallel_state = SimpleNamespace(tp_size=1)
+    loaded = []
+
+    def forbidden_loader():
+        loaded.append(True)
+        raise AssertionError("positive swiglu_limit must fail before loading SGLang")
+
+    monkeypatch.setattr(type(blk.experts), "_load_sglang_fused_experts_impl", staticmethod(forbidden_loader))
+    monkeypatch.setattr(type(blk.experts), "_load_sglang_moe_runner_stack", staticmethod(forbidden_loader))
+
+    entrypoints = (
+        lambda: blk.experts.sglang_fused_experts_forward(x, w, ids),
+        lambda: blk.experts.sglang_fused_experts_ep_compute(x[:NUM_EXPERTS], cumsum, w[:NUM_EXPERTS, 0]),
+        lambda: blk.experts.sglang_ep_native_routed_partial(x, w, local_ids),
+        lambda: blk.experts._sglang_moe_tp_sim_sglang_forward(x, w, ids, parallel_state),
+        lambda: blk.experts._sglang_moe_tp_sim_sglang_runner_forward(x, w, ids, parallel_state),
+    )
+    for entrypoint in entrypoints:
+        with pytest.raises(NotImplementedError, match="positive swiglu_limit"):
+            entrypoint()
+    assert loaded == []
+
+
 def test_missing_sglang_raises_import_error_naming_flag(routed_inputs, monkeypatch):
     import importlib.util  # noqa: PLC0415
 
@@ -297,7 +332,7 @@ def test_trainable_dispatch_uses_autograd_function(routed_inputs, monkeypatch):
     monkeypatch.setattr(experts_mod._SglangFusedExpertsTrainFunction, "apply", staticmethod(fake_apply))
     monkeypatch.setattr(experts_mod, "_sglang_fused_experts_kernel_call", fake_kernel_call)
     monkeypatch.setattr(
-        type(blk.experts), "_load_sglang_fused_experts_impl", staticmethod(lambda: (lambda *a, **k: None))
+        type(blk.experts), "_load_sglang_fused_experts_impl", staticmethod(lambda: lambda *a, **k: None)
     )
 
     blk.experts.gate_up_proj.requires_grad_(True)
@@ -321,7 +356,7 @@ def test_trainable_guards(routed_inputs, monkeypatch):
     x, w, ids = routed_inputs
     monkeypatch.setenv(FLAG, "1")
     monkeypatch.setattr(
-        type(blk.experts), "_load_sglang_fused_experts_impl", staticmethod(lambda: (lambda *a, **k: None))
+        type(blk.experts), "_load_sglang_fused_experts_impl", staticmethod(lambda: lambda *a, **k: None)
     )
     blk.experts.gate_up_proj.requires_grad_(True)
 
@@ -591,6 +626,7 @@ def test_strided_mode_passes_zero_copy_views(routed_inputs, monkeypatch):
     def fake_impl(hidden, w13, w2, topk_weights, topk_ids, **kwargs):
         seen["w13"] = w13
         seen["w2"] = w2
+        seen["gemm1_limit"] = kwargs["gemm1_limit"]
         return hidden.clone()
 
     monkeypatch.setenv(FLAG, "1")
@@ -605,6 +641,7 @@ def test_strided_mode_passes_zero_copy_views(routed_inputs, monkeypatch):
     assert seen["w2"].data_ptr() == blk.experts.down_proj.data_ptr()
     assert torch.equal(seen["w13"], blk.experts.gate_up_proj.transpose(1, 2))
     assert torch.equal(seen["w2"], blk.experts.down_proj.transpose(1, 2))
+    assert seen["gemm1_limit"] is None
     assert getattr(blk.experts, "_sglang_fused_weight_cache", None) in (None, {})
 
     # strided mode ignores the legacy cache env (explicit mode wins)
@@ -626,18 +663,129 @@ def test_strided_vendored_impl_layout_guard():
     assert not serving_layout_or_gkn_view(gkn[:, ::2, :].transpose(1, 2))  # sliced: neither
 
 
-def test_strided_bind_failure_names_mode_and_fallback(monkeypatch):
-    """With strided the default, an upstream fused_moe restructure must fail loud:
-    the error names the mode env and the transient fallback, not a bare
-    AttributeError from inside a forward."""
+def test_strided_impl_delegates_with_split_gate_up_layout(monkeypatch):
     import xorl.ops.moe.sglang_fused_moe_strided as strided_mod  # noqa: PLC0415
 
-    monkeypatch.setattr(strided_mod, "_fm", lambda: object())  # module with no helpers
+    seen = {}
+
+    def fake_fused_experts(*args, **kwargs):
+        seen.update(kwargs)
+        return args[0]
+
+    monkeypatch.setattr(strided_mod, "_load_fused_experts_impl", lambda: fake_fused_experts)
     x = torch.zeros(2, 4, dtype=torch.bfloat16)
     w1 = torch.zeros(2, 6, 4, dtype=torch.bfloat16)
     w2 = torch.zeros(2, 4, 3, dtype=torch.bfloat16)
-    with pytest.raises(RuntimeError, match="XORL_MOE_SGLANG_FUSED_EXPERTS_WEIGHT_MODE=transient"):
-        strided_mod.fused_experts_impl_strided(x, w1, w2, torch.zeros(2, 1), torch.zeros(2, 1, dtype=torch.int64))
+    result = strided_mod.fused_experts_impl_strided(
+        x,
+        w1,
+        w2,
+        torch.zeros(2, 1),
+        torch.zeros(2, 1, dtype=torch.int64),
+        gate_up_interleaved=False,
+    )
+
+    assert result is x
+    assert seen["gate_up_interleaved"] is False
+
+    with pytest.raises(ValueError, match="gate_up_interleaved=False"):
+        strided_mod.fused_experts_impl_strided(
+            x,
+            w1,
+            w2,
+            torch.zeros(2, 1),
+            torch.zeros(2, 1, dtype=torch.int64),
+            gate_up_interleaved=True,
+        )
+
+
+def _install_fake_sglang_runtime(monkeypatch, *, existing, deterministic=True, fused_sum_all_reduce=False):
+    created = []
+    published = []
+
+    class FakeServerArgs:
+        def __init__(self, **kwargs):
+            created.append(kwargs)
+
+    def get_server_args():
+        if not existing:
+            raise ValueError("Global server args is not set yet!")
+        return object()
+
+    exec_config = SimpleNamespace(
+        deterministic=SimpleNamespace(enable_deterministic_inference=deterministic),
+        moe=SimpleNamespace(enable_fused_moe_sum_all_reduce=fused_sum_all_reduce),
+    )
+    runtime_context = types.ModuleType("sglang.srt.runtime_context")
+    runtime_context.get_exec = lambda: exec_config
+    runtime_context.get_server_args = get_server_args
+    runtime_context.publish = lambda server_args, *, role: published.append((server_args, role))
+    server_args = types.ModuleType("sglang.srt.server_args")
+    server_args.ServerArgs = FakeServerArgs
+    sglang = types.ModuleType("sglang")
+    srt = types.ModuleType("sglang.srt")
+    sglang.srt = srt
+    srt.runtime_context = runtime_context
+    srt.server_args = server_args
+    for name, module in (
+        ("sglang", sglang),
+        ("sglang.srt", srt),
+        ("sglang.srt.runtime_context", runtime_context),
+        ("sglang.srt.server_args", server_args),
+    ):
+        monkeypatch.setitem(sys.modules, name, module)
+    return created, published
+
+
+def test_ensure_sglang_runtime_publishes_xorl_deterministic_context(monkeypatch):
+    from xorl.models.layers.moe.experts import MoEExperts  # noqa: PLC0415
+
+    created, published = _install_fake_sglang_runtime(monkeypatch, existing=False)
+    MoEExperts._ensure_sglang_server_args()
+
+    assert created == [
+        {
+            "model_path": "dummy",
+            "enable_deterministic_inference": True,
+            "enable_fused_moe_sum_all_reduce": False,
+            "rl_on_policy_target": "xorl-batch-invariant",
+        }
+    ]
+    assert len(published) == 1
+    assert published[0][1] == "scheduler"
+
+
+def test_ensure_sglang_runtime_preserves_compatible_context(monkeypatch):
+    from xorl.models.layers.moe.experts import MoEExperts  # noqa: PLC0415
+
+    created, published = _install_fake_sglang_runtime(monkeypatch, existing=True)
+    MoEExperts._ensure_sglang_server_args()
+
+    assert created == []
+    assert published == []
+
+
+@pytest.mark.parametrize(
+    ("deterministic", "fused_sum_all_reduce"),
+    [(False, False), (True, True)],
+)
+def test_ensure_sglang_runtime_rejects_incompatible_context(monkeypatch, deterministic, fused_sum_all_reduce):
+    from xorl.models.layers.moe.experts import MoEExperts  # noqa: PLC0415
+
+    _install_fake_sglang_runtime(
+        monkeypatch,
+        existing=True,
+        deterministic=deterministic,
+        fused_sum_all_reduce=fused_sum_all_reduce,
+    )
+    with pytest.raises(RuntimeError, match="SGLang MoE parity requires"):
+        MoEExperts._ensure_sglang_server_args()
+
+
+def test_sglang_runtime_api_does_not_regress_to_legacy_globals():
+    source = inspect.getsource(experts_mod.MoEExperts._ensure_sglang_server_args)
+    assert "get_global_server_args" not in source
+    assert "set_global_server_args_for_scheduler" not in source
 
 
 @pytest.mark.gpu

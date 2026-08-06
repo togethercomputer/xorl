@@ -46,6 +46,7 @@ from xorl.models.transformers.glm5.index_share import (
     CanonicalLogicalIndices,
     IndexShareContext,
     IndexShareContextManager,
+    IndexShareMode,
 )
 from xorl.models.transformers.glm5.indexer import Glm5DsaIndexer
 from xorl.models.transformers.glm5.layer_plan import Glm52LayerPlan, Glm52LayerSpec, IndexerType, MLPType
@@ -250,8 +251,7 @@ class Glm5MlaAttention(nn.Module):
             sin,
             interleaved=getattr(self.config, "rope_interleave", True),
             class_b=bool(
-                getattr(self.config, "_rope_class_b", False)
-                or getattr(self.config, "_glm52_exact_contract", False)
+                getattr(self.config, "_rope_class_b", False) or getattr(self.config, "_glm52_exact_contract", False)
             ),
         )
         k_rot = k_rot.expand(*k_pass.shape[:-1], -1)
@@ -335,17 +335,18 @@ class Glm5Attention(Glm5MlaAttention):
         if self.layer_spec.indexer_type is IndexerType.FULL:
             if self.indexer is None:
                 raise RuntimeError(f"Full-indexer layer {self.layer_idx} has no indexer module")
-            indices = compute()
-            index_share_context.publish(
-                layer_index=self.layer_idx,
+            return index_share_context.get_or_publish(
+                producer_layer_index=self.layer_idx,
                 layer_plan=self.layer_plan,
-                indices=CanonicalLogicalIndices(indices),
-            )
-            return indices
+                produce_payload=lambda: CanonicalLogicalIndices(compute()),
+            ).values
         if self.indexer is not None:
             raise RuntimeError(f"Shared-index layer {self.layer_idx} allocated an indexer module")
-        return index_share_context.consume(
-            layer_index=self.layer_idx,
+        producer_layer_index = self.layer_spec.index_producer_layer
+        if producer_layer_index is None:
+            raise RuntimeError(f"Shared-index layer {self.layer_idx} has no planned producer")
+        return index_share_context.require(
+            producer_layer_index=producer_layer_index,
             layer_plan=self.layer_plan,
         ).values
 
@@ -357,14 +358,21 @@ class Glm5Attention(Glm5MlaAttention):
         dist.all_gather(pieces, tensor.contiguous(), group=group)
         return torch.cat(pieces, dim=1)
 
-    def _split_kv_b_weight(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def _split_kv_b_weight(self, *, compute_dtype: torch.dtype | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         from torch.distributed.tensor import DTensor, Replicate  # noqa: PLC0415
+
+        from xorl.qlora.modules.linear import QLoRALinear  # noqa: PLC0415
 
         if isinstance(self.kv_b_proj, NativeBlockFP8Linear):
             # Invoke the module's real forward boundary so an eFSDP wrapper
             # unshards the packed bytes/scales before reproducing SGLang's
             # block-FP8 -> BF16 MLA post-load transform.
             weight = self.kv_b_proj(return_dequantized_weight=True)
+        elif isinstance(self.kv_b_proj, QLoRALinear):
+            # Sparse MLA consumes kv_b through its absorb-form weight boundary
+            # instead of QLoRALinear.forward().  Dequantize the immutable base
+            # here, then add the differentiable adapter delta below.
+            weight = self.kv_b_proj._dequantize_weight()
         else:
             weight = self.kv_b_proj.weight
             if isinstance(weight, DTensor):
@@ -373,23 +381,19 @@ class Glm5Attention(Glm5MlaAttention):
         if hasattr(self.kv_b_proj, "get_delta_weight"):
             lora_A = self.kv_b_proj.lora_A
             lora_B = self.kv_b_proj.lora_B
-            if (
-                torch.is_grad_enabled()
-                and (lora_A.requires_grad or lora_B.requires_grad)
-                and dist.is_available()
-                and dist.is_initialized()
-                and dist.get_world_size() > 1
-            ):
-                raise RuntimeError(
-                    "Distributed GLM-5.2 kv_b LoRA training requires an explicit adapter-gradient "
-                    "ownership contract; evaluation and single-rank training remain supported"
-                )
             if isinstance(lora_A, DTensor):
                 lora_A = lora_A.redistribute(placements=(Replicate(),) * lora_A.device_mesh.ndim).to_local()
             if isinstance(lora_B, DTensor):
                 lora_B = lora_B.redistribute(placements=(Replicate(),) * lora_B.device_mesh.ndim).to_local()
             delta = (lora_B @ lora_A) * self.kv_b_proj.scaling
             weight = weight + delta.to(weight.dtype)
+
+        if compute_dtype is not None:
+            # Sparse MLA consumes kv_b through its absorb-form weight instead
+            # of the projection's normal forward boundary.  Match
+            # QLoRALinear.forward() by aligning the materialized FP8 base plus
+            # differentiable FP32 LoRA delta to the activation compute dtype.
+            weight = weight.to(compute_dtype)
 
         weight = weight.view(
             self.num_heads,
@@ -418,7 +422,7 @@ class Glm5Attention(Glm5MlaAttention):
         )
         kv_no_pe = self.kv_a_layernorm(kv_no_pe)
 
-        w_kc, w_vc = self._split_kv_b_weight()
+        w_kc, w_vc = self._split_kv_b_weight(compute_dtype=q_no_pe.dtype)
         q_no_pe_absorbed = torch.einsum("bshd,hdc->bshc", q_no_pe, w_kc)
 
         cos, sin = position_embeddings
@@ -430,8 +434,7 @@ class Glm5Attention(Glm5MlaAttention):
             sin,
             interleaved=getattr(self.config, "rope_interleave", True),
             class_b=bool(
-                getattr(self.config, "_rope_class_b", False)
-                or getattr(self.config, "_glm52_exact_contract", False)
+                getattr(self.config, "_rope_class_b", False) or getattr(self.config, "_glm52_exact_contract", False)
             ),
         )
         k_pe = k_pe.squeeze(2)
@@ -1233,8 +1236,6 @@ class Glm5DecoderLayer(nn.Module):
             and getattr(self, "gradient_checkpointing", False)
             and _checkpoint_method == "recompute_before_dispatch"
         )
-        if index_share_context is not None and _selective:
-            raise RuntimeError("GLM-5.2 IndexShare canonical path does not support activation recomputation")
 
         if _selective and isinstance(self.mlp, Glm5MoEBlock):
             (
@@ -1428,6 +1429,12 @@ class Glm5Model(Glm5PreTrainedModel):
             self._index_share_context_managers[stage] = manager
         return manager
 
+    def release_index_share_context(self) -> None:
+        """Idempotently release a retained backward-bearing invocation."""
+
+        for manager in self._index_share_context_managers.values():
+            manager.end_active()
+
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -1437,6 +1444,7 @@ class Glm5Model(Glm5PreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         output_router_logits: Optional[bool] = None,
+        index_share_mode: IndexShareMode | str | None = None,
         **kwargs,
     ) -> MoeModelOutput:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -1486,9 +1494,13 @@ class Glm5Model(Glm5PreTrainedModel):
         all_router_logits = () if output_router_logits else None
 
         index_share_manager = self._index_share_manager_for_local_layers()
-        if index_share_manager is not None and self.gradient_checkpointing and self.training:
-            raise RuntimeError("GLM-5.2 IndexShare canonical path does not support activation recomputation")
-        index_share_context = None if index_share_manager is None else index_share_manager.begin()
+        if index_share_manager is not None and index_share_mode is None:
+            raise RuntimeError(
+                "GLM-5.2 IndexShare execution requires explicit index_share_mode="
+                "'training_with_backward' or 'forward_only'"
+            )
+        index_share_context = None if index_share_manager is None else index_share_manager.begin(mode=index_share_mode)
+        forward_succeeded = False
         try:
             for layer_idx, decoder_layer in enumerate(self.layers):
                 if decoder_layer is None:
@@ -1530,19 +1542,21 @@ class Glm5Model(Glm5PreTrainedModel):
                     all_self_attns += (layer_outputs[1],)
                 if output_router_logits and layer_outputs[-1] is not None:
                     all_router_logits += (layer_outputs[-1],)
+
+            hidden_states = self.norm(hidden_states) if self.norm is not None else hidden_states
+            if output_hidden_states:
+                _ = output_hidden_states
+
+            result = MoeModelOutput(
+                last_hidden_state=hidden_states,
+                attentions=all_self_attns,
+                router_logits=all_router_logits,
+            )
+            forward_succeeded = True
+            return result
         finally:
             if index_share_manager is not None:
-                index_share_manager.end(index_share_context)
-
-        hidden_states = self.norm(hidden_states) if self.norm is not None else hidden_states
-        if output_hidden_states:
-            _ = output_hidden_states
-
-        return MoeModelOutput(
-            last_hidden_state=hidden_states,
-            attentions=all_self_attns,
-            router_logits=all_router_logits,
-        )
+                index_share_manager.finish_forward(index_share_context, succeeded=forward_succeeded)
 
 
 class Glm5ForCausalLM(Glm5PreTrainedModel):
@@ -1559,7 +1573,9 @@ class Glm5ForCausalLM(Glm5PreTrainedModel):
         self.num_experts = config.n_routed_experts
         self.num_experts_per_tok = config.num_experts_per_tok
         self.post_init()
-        if getattr(config, "quantization_config", None) is not None:
+        if getattr(config, "quantization_config", None) is not None and not getattr(
+            config, "_glm52_block_fp8_qlora", False
+        ):
             replace_glm52_native_fp8_modules(
                 self,
                 config.quantization_config,
@@ -1583,6 +1599,9 @@ class Glm5ForCausalLM(Glm5PreTrainedModel):
     def get_decoder(self):
         return self.model
 
+    def release_index_share_context(self) -> None:
+        self.model.release_index_share_context()
+
     def get_pp_module_config(self):
         return {
             "input_fqns": ["model.embed_tokens"],
@@ -1601,6 +1620,7 @@ class Glm5ForCausalLM(Glm5PreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         output_router_logits: Optional[bool] = None,
+        index_share_mode: IndexShareMode | str | None = None,
         **kwargs,
     ) -> MoeCausalLMOutput:
         if output_router_logits is None:
@@ -1613,6 +1633,7 @@ class Glm5ForCausalLM(Glm5PreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             output_router_logits=output_router_logits,
+            index_share_mode=index_share_mode,
             **kwargs,
         )
         return MoeCausalLMOutput(

@@ -1075,6 +1075,14 @@ class ServerArguments:
         default=False, metadata={"help": "Enable QLoRA (quantized LoRA) for memory-efficient training"}
     )
 
+    block_fp8_qlora_training: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable the complete official GLM-5.2 block-FP8 QLoRA target set. "
+            "Requires block_fp8, Triton experts, DeepEP, and hybrid-shared expert LoRA."
+        },
+    )
+
     quant_format: str = field(
         default="nvfp4", metadata={"help": "Quantization format for QLoRA: 'nvfp4', 'block_fp8', or 'nf4'"}
     )
@@ -1220,6 +1228,32 @@ class ServerArguments:
             raise ValueError("enable_fp8_training is a full-weight mode and cannot be combined with LoRA or QLoRA")
         if self.enable_qarl and (self.enable_lora or self.enable_qlora):
             raise ValueError("enable_qarl is a full-weight mode and cannot be combined with LoRA or QLoRA")
+        if self.block_fp8_qlora_training:
+            requirements = {
+                "enable_lora": (self.enable_lora, True),
+                "enable_qlora": (self.enable_qlora, True),
+                "quant_format": (self.quant_format, "block_fp8"),
+                "quant_group_size": (self.quant_group_size, 128),
+                "moe_hybrid_shared_lora": (self.moe_hybrid_shared_lora, True),
+                "moe_implementation": (self.moe_implementation, "triton"),
+                "ep_dispatch": (self.ep_dispatch, "deepep"),
+                "freeze_router": (self.freeze_router, True),
+                "merge_qkv": (self.merge_qkv, True),
+                "lora_export_format": (self.lora_export_format, "sglang_shared_outer"),
+            }
+            mismatches = [
+                f"{name}={actual!r} (requires {expected!r})"
+                for name, (actual, expected) in requirements.items()
+                if actual != expected
+            ]
+            if mismatches:
+                raise ValueError("GLM-5.2 block-FP8 QLoRA rejects unsupported configuration: " + ", ".join(mismatches))
+            if self.lora_target_modules is not None or self.lora_target_manifest is not None:
+                raise ValueError("GLM-5.2 block-FP8 QLoRA uses its complete deterministic target set")
+            if self.qlora_exclude_modules is not None:
+                raise ValueError("GLM-5.2 block-FP8 QLoRA derives checkpoint exclusions and rejects user overrides")
+            if self.merge_lora_interval:
+                raise ValueError("GLM-5.2 block-FP8 QLoRA publishes dynamic adapters and does not merge into the base")
         if self.enable_qarl:
             if self.qarl_calib_size < 0:
                 raise ValueError("qarl_calib_size must be non-negative")
@@ -1485,6 +1519,7 @@ class ServerArguments:
                 "moe_hybrid_shared_lora": self.moe_hybrid_shared_lora,
                 "lora_export_format": self.lora_export_format,
                 "enable_qlora": self.enable_qlora,
+                "block_fp8_qlora_training": self.block_fp8_qlora_training,
                 "quant_format": self.quant_format,
                 "quant_group_size": self.quant_group_size,
                 "exclude_modules": self.qlora_exclude_modules,
