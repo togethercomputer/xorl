@@ -42,6 +42,30 @@ from xorl.lora.utils import (
     load_lora_checkpoint_state_dict,
 )
 from xorl.optim import build_optimizer
+from xorl.server.runner.adapters.optimizer_reshard import (
+    active_rectangle_from_layout_descriptor as _active_rectangle_from_layout_descriptor,
+)
+from xorl.server.runner.adapters.optimizer_reshard import (
+    canonical_parameter_order as _canonical_parameter_order,
+)
+from xorl.server.runner.adapters.optimizer_reshard import (
+    clone_state_to_cpu as _clone_state_to_cpu,
+)
+from xorl.server.runner.adapters.optimizer_reshard import (
+    commit_optimizer_state as _commit_optimizer_state_transactionally,
+)
+from xorl.server.runner.adapters.optimizer_reshard import (
+    coordinate_restore_error as _optimizer_restore_rank_errors,
+)
+from xorl.server.runner.adapters.optimizer_reshard import (
+    reconstruct_optimizer_state,
+)
+from xorl.server.runner.adapters.optimizer_reshard import (
+    validate_live_optimizer_binding as _validate_live_optimizer_binding,
+)
+from xorl.server.runner.adapters.optimizer_reshard import (
+    validate_staged_optimizer_compatibility as _validate_staged_optimizer_compatibility,
+)
 from xorl.server.runner.adapters.sharded_state import (
     AdapterTensorLayout,
     canonical_parameter_name,
@@ -86,12 +110,6 @@ def _optimizer_shard_rank_world() -> Tuple[int, int]:
 
 def _optimizer_shard_filename(rank: int) -> str:
     return f"optimizer-rank{rank:05d}.safetensors"
-
-
-def _canonical_parameter_order(parameters: Dict[str, Any]) -> List[str]:
-    """Return stable optimizer order independent of insertion order."""
-
-    return sorted(parameters, key=lambda name: (canonical_parameter_name(name), name))
 
 
 def _encode_optimizer_state(value: Any, tensors: Dict[str, torch.Tensor], *, depth: int = 0) -> Any:
@@ -190,19 +208,6 @@ def _load_optimizer_state_safetensors(path: str, device: torch.device) -> Dict[s
     return optimizer_state
 
 
-def _clone_state_to_cpu(value: Any) -> Any:
-    """Recursively clone transaction state onto CPU to avoid GPU snapshot spikes."""
-    if isinstance(value, torch.Tensor):
-        return value.detach().to(device="cpu", copy=True)
-    if isinstance(value, dict):
-        return {key: _clone_state_to_cpu(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_clone_state_to_cpu(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(_clone_state_to_cpu(item) for item in value)
-    return deepcopy(value)
-
-
 def _adapter_param_structure_fingerprint(lora_params: Dict[str, nn.Parameter]) -> str:
     """Fingerprint the canonical non-empty optimizer (name, shape, dtype) sequence.
 
@@ -220,6 +225,57 @@ def _adapter_param_structure_fingerprint(lora_params: Dict[str, nn.Parameter]) -
         if lora_params[name].numel() > 0
     ]
     return hashlib.sha256(json.dumps(structure).encode("utf-8")).hexdigest()
+
+
+def _layout_descriptor_fingerprint(descriptors: List[Dict[str, Any]], *, world_size: int) -> str:
+    payload = {"world_size": int(world_size), "layouts": descriptors}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _descriptor_structure_fingerprint(
+    descriptors: List[Dict[str, Any]],
+    parameter_order: List[str],
+) -> str:
+    by_name = {canonical_parameter_name(descriptor["fqn"]): descriptor for descriptor in descriptors}
+    structure = []
+    for name in parameter_order:
+        descriptor = by_name[canonical_parameter_name(name)]
+        structure.append(
+            [
+                canonical_parameter_name(name),
+                [int(value) for value in descriptor["active_storage_shape"]],
+                f"torch.{descriptor['dtype']}",
+            ]
+        )
+    return hashlib.sha256(json.dumps(structure).encode("utf-8")).hexdigest()
+
+
+def _reshard_adapter_optimizer_state(
+    adapter_state: "AdapterState",
+    path: str,
+    manifest: Dict[str, Any],
+    *,
+    rank: int,
+    world: int,
+) -> Dict[str, Any]:
+    """Load source shards lazily and reconstruct this rank's logical rectangles."""
+
+    def load_source_rank(source_rank: int) -> Dict[str, Any]:
+        shard_path = resolve_path_within(
+            path,
+            _optimizer_shard_filename(source_rank),
+            must_exist=True,
+            reject_symlinks=True,
+        )
+        return _load_optimizer_state_safetensors(str(shard_path), torch.device("cpu"))
+
+    return reconstruct_optimizer_state(
+        adapter_state,
+        manifest,
+        rank=rank,
+        world=world,
+        load_source_rank=load_source_rank,
+    )
 
 
 def save_adapter_optimizer_shards(adapter_state: "AdapterState", path: str) -> Dict[str, Any]:
@@ -300,67 +356,152 @@ def load_adapter_optimizer_shards(
     legacy_path = os.path.join(path, _LEGACY_OPTIMIZER_FILENAME)
     rank, world = _optimizer_shard_rank_world()
     if os.path.exists(manifest_path):
-        with open(manifest_path) as f:
-            manifest = json.load(f)
-        if manifest.get("format_version") != 3:
-            raise RuntimeError(
-                f"Adapter optimizer checkpoint at {path} uses obsolete or unsupported layout format version "
-                f"{manifest.get('format_version')!r}; local-shard optimizer state cannot be migrated by position. "
-                "Load weights-only (load_optimizer=False) and re-save on the new topology."
+        optimizer_state: Optional[Dict[str, Any]] = None
+        topology_changed = False
+        saved_world = -1
+        live_order: List[str] = []
+        live_template: Optional[Dict[str, Any]] = None
+        local_error: Optional[BaseException] = None
+        try:
+            live_order, live_template = _validate_live_optimizer_binding(adapter_state)
+            with open(manifest_path) as f:
+                manifest = json.load(f)
+            if manifest.get("format_version") != 3:
+                raise RuntimeError(
+                    f"Adapter optimizer checkpoint at {path} uses obsolete or unsupported layout format version "
+                    f"{manifest.get('format_version')!r}; local-shard optimizer state cannot be migrated by position. "
+                    "Load weights-only (load_optimizer=False) and re-save on the new topology."
+                )
+            saved_world = int(manifest["world_size"])
+            descriptors_by_rank = manifest.get("per_rank_layout_descriptors")
+            layout_fingerprints = manifest.get("per_rank_layout_fingerprint")
+            structure_fingerprints = manifest.get("per_rank_param_structure_sha256")
+            orders_by_rank = manifest.get("per_rank_optimizer_parameter_order")
+            if not all(
+                type(values) is list and len(values) == saved_world
+                for values in (
+                    descriptors_by_rank,
+                    layout_fingerprints,
+                    structure_fingerprints,
+                    orders_by_rank,
+                )
+            ):
+                raise RuntimeError(
+                    f"Adapter optimizer checkpoint declares world_size={saved_world} but its topology manifest "
+                    "is incomplete"
+                )
+            for source_rank in range(saved_world):
+                descriptors = descriptors_by_rank[source_rank]
+                parameter_order = orders_by_rank[source_rank]
+                if type(descriptors) is not list or type(parameter_order) is not list:
+                    raise RuntimeError(f"Invalid optimizer topology metadata for saved rank {source_rank}")
+                descriptor_names_list = []
+                for descriptor in descriptors:
+                    if type(descriptor) is not dict or type(descriptor.get("fqn")) is not str:
+                        raise RuntimeError(f"Invalid adapter layout descriptor for saved rank {source_rank}")
+                    _active_rectangle_from_layout_descriptor(
+                        descriptor,
+                        context=f"saved rank {source_rank}, parameter {descriptor['fqn']}",
+                    )
+                    if math.prod(int(value) for value in descriptor["active_storage_shape"]) > 0:
+                        descriptor_names_list.append(canonical_parameter_name(descriptor["fqn"]))
+                if len(set(descriptor_names_list)) != len(descriptor_names_list):
+                    raise RuntimeError(f"Duplicate adapter layout descriptor on saved rank {source_rank}")
+                descriptor_names = set(descriptor_names_list)
+                canonical_order = [canonical_parameter_name(name) for name in parameter_order]
+                if (
+                    canonical_order != parameter_order
+                    or len(set(canonical_order)) != len(canonical_order)
+                    or set(canonical_order) != descriptor_names
+                ):
+                    raise RuntimeError(
+                        f"Adapter optimizer shard at {path} has a different optimizer parameter order "
+                        f"on saved rank {source_rank}"
+                    )
+                if layout_fingerprints[source_rank] != _layout_descriptor_fingerprint(
+                    descriptors, world_size=saved_world
+                ):
+                    raise RuntimeError(f"Layout fingerprint does not match descriptors for saved rank {source_rank}")
+                if structure_fingerprints[source_rank] != _descriptor_structure_fingerprint(
+                    descriptors,
+                    parameter_order,
+                ):
+                    raise RuntimeError(f"Parameter fingerprint does not match descriptors for saved rank {source_rank}")
+            expected_session_rank = manifest.get("session_rank")
+            live_session_rank = int(adapter_state.session_spec["lora_config"]["lora_rank"])
+            if expected_session_rank != live_session_rank:
+                raise RuntimeError(
+                    f"Adapter optimizer shard at {path} was saved for session_rank={expected_session_rank!r}, "
+                    f"but the live adapter uses session_rank={live_session_rank}; load weights-only "
+                    "(load_optimizer=False) instead."
+                )
+            topology_changed = saved_world != world
+            if not topology_changed:
+                expected_fingerprint = manifest["per_rank_param_structure_sha256"][rank]
+                live_fingerprint = _adapter_param_structure_fingerprint(adapter_state.local_params)
+                expected_layout_fingerprint = manifest.get("per_rank_layout_fingerprint", [None] * world)[rank]
+                per_rank_orders = manifest.get("per_rank_optimizer_parameter_order")
+                expected_order = (
+                    per_rank_orders[rank] if per_rank_orders is not None else manifest.get("optimizer_parameter_order")
+                )
+                topology_changed = expected_layout_fingerprint != adapter_state.layout_fingerprint
+                if not topology_changed and expected_fingerprint != live_fingerprint:
+                    raise RuntimeError(
+                        f"Adapter optimizer shard for rank {rank} at {path} was saved for a different local "
+                        "parameter structure"
+                    )
+                if not topology_changed and expected_order != live_order:
+                    raise RuntimeError(f"Adapter optimizer shard at {path} has a different optimizer parameter order")
+        except Exception as exc:
+            local_error = exc
+        _optimizer_restore_rank_errors(local_error, phase="manifest preflight")
+
+        if torch.distributed.is_available() and torch.distributed.is_initialized() and world > 1:
+            topology_votes: List[Optional[bool]] = [None] * world
+            torch.distributed.all_gather_object(topology_votes, topology_changed)
+            topology_changed = any(bool(vote) for vote in topology_votes)
+
+        local_error = None
+        try:
+            if topology_changed:
+                optimizer_state = _reshard_adapter_optimizer_state(
+                    adapter_state,
+                    path,
+                    manifest,
+                    rank=rank,
+                    world=world,
+                )
+            else:
+                shard_path = resolve_path_within(
+                    path,
+                    _optimizer_shard_filename(rank),
+                    must_exist=True,
+                    reject_symlinks=True,
+                )
+                optimizer_state = _load_optimizer_state_safetensors(str(shard_path), torch.device("cpu"))
+            if live_template is None:  # pragma: no cover - guarded by coordinated manifest preflight
+                raise RuntimeError("Live adapter optimizer validation did not produce a state template")
+            _validate_staged_optimizer_compatibility(
+                adapter_state,
+                optimizer_state,
+                live_order,
+                live_template,
             )
-        saved_world = int(manifest["world_size"])
-        if saved_world != world:
-            raise RuntimeError(
-                f"Adapter optimizer checkpoint at {path} was saved with world_size={saved_world} but is "
-                f"being loaded with world_size={world}. Per-rank Adam moments cannot be re-sharded; resume "
-                "on the saved topology or load weights-only (load_optimizer=False)."
+        except Exception as exc:
+            local_error = exc
+        _optimizer_restore_rank_errors(local_error, phase="preflight")
+        if optimizer_state is None:  # pragma: no cover - guarded by the coordinated preflight
+            raise RuntimeError("Adapter optimizer restore produced no staged state")
+        _commit_optimizer_state_transactionally(adapter_state, optimizer_state)
+        if topology_changed:
+            logger.info(
+                "Loaded topology-resharded adapter optimizer from world_size=%d into rank %d/%d",
+                saved_world,
+                rank,
+                world,
             )
-        expected_fingerprint = manifest["per_rank_param_structure_sha256"][rank]
-        live_fingerprint = _adapter_param_structure_fingerprint(adapter_state.local_params)
-        if expected_fingerprint != live_fingerprint:
-            raise RuntimeError(
-                f"Adapter optimizer shard for rank {rank} at {path} was saved for a different local "
-                "parameter structure. Refusing to load misassigned Adam moments; load weights-only "
-                "(load_optimizer=False) instead."
-            )
-        expected_layout_fingerprint = manifest.get("per_rank_layout_fingerprint", [None] * world)[rank]
-        if expected_layout_fingerprint != adapter_state.layout_fingerprint:
-            raise RuntimeError(
-                f"Adapter optimizer shard for rank {rank} at {path} was saved for a different topology/layout "
-                "fingerprint. Refusing to load rank-local optimizer state; load weights-only "
-                "(load_optimizer=False) instead."
-            )
-        expected_session_rank = manifest.get("session_rank")
-        live_session_rank = int(adapter_state.session_spec["lora_config"]["lora_rank"])
-        if expected_session_rank != live_session_rank:
-            raise RuntimeError(
-                f"Adapter optimizer shard at {path} was saved for session_rank={expected_session_rank!r}, "
-                f"but the live adapter uses session_rank={live_session_rank}; load weights-only "
-                "(load_optimizer=False) instead."
-            )
-        per_rank_orders = manifest.get("per_rank_optimizer_parameter_order")
-        expected_order = (
-            per_rank_orders[rank] if per_rank_orders is not None else manifest.get("optimizer_parameter_order")
-        )
-        live_order = [
-            canonical_parameter_name(name)
-            for name in _canonical_parameter_order(adapter_state.local_params)
-            if adapter_state.local_params[name].numel() > 0
-        ]
-        if expected_order != live_order:
-            raise RuntimeError(
-                f"Adapter optimizer shard at {path} has a different optimizer parameter order; "
-                "load weights-only (load_optimizer=False) instead."
-            )
-        shard_path = resolve_path_within(
-            path,
-            _optimizer_shard_filename(rank),
-            must_exist=True,
-            reject_symlinks=True,
-        )
-        optimizer_state = _load_optimizer_state_safetensors(str(shard_path), device)
-        adapter_state.optimizer.load_state_dict(optimizer_state)
-        logger.info(f"Loaded rank-{rank} adapter optimizer shard from {shard_path}")
+        else:
+            logger.info("Loaded rank-%d adapter optimizer shard from %s", rank, shard_path)
         return True
     if os.path.exists(legacy_path):
         raise RuntimeError(

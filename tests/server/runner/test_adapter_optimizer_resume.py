@@ -8,6 +8,7 @@ run silently assigned rank-0 moments to other ranks' expert parameters.
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -15,11 +16,23 @@ import torch
 from xorl.server.runner.adapters import manager as adapter_manager_module
 from xorl.server.runner.adapters.manager import (
     OPTIMIZER_SHARD_MANIFEST_FILENAME,
+    AdapterState,
     LoRAAdapterManager,
     _adapter_param_structure_fingerprint,
-    _clone_state_to_cpu,
+    _descriptor_structure_fingerprint,
+    _layout_descriptor_fingerprint,
     _optimizer_shard_filename,
+    _reshard_adapter_optimizer_state,
+    _save_optimizer_state_safetensors,
+    load_adapter_optimizer_shards,
 )
+from xorl.server.runner.adapters.optimizer_reshard import (
+    clone_state_to_cpu as _clone_state_to_cpu,
+)
+from xorl.server.runner.adapters.optimizer_reshard import (
+    same_optimizer_value as _same_optimizer_value,
+)
+from xorl.server.runner.adapters.sharded_state import AdapterTensorLayout
 
 from .test_adapter_manager import _build_manager, _session_spec
 
@@ -106,6 +119,51 @@ def test_transaction_snapshot_recursively_clones_tensor_state_to_cpu():
     assert snapshot["scalar"] == 3
 
 
+def test_live_optimizer_binding_rejects_noncanonical_parameter_object_before_state_read():
+    name = "layer.lora_A"
+    layout = _one_dimensional_layout(name, offset=0, size=4, logical_size=4)
+    state = _target_adapter_state(name, layout)
+    imposter = torch.nn.Parameter(torch.zeros_like(state.local_params[name]))
+    state.optimizer.param_groups[0]["params"][0] = imposter
+
+    with pytest.raises(RuntimeError, match="parameter objects are not in canonical"):
+        adapter_manager_module._validate_live_optimizer_binding(state)
+
+
+def test_collective_failure_after_optimizer_mutation_is_fatal_without_rollback(monkeypatch):
+    resident = {"state": {0: {"exp_avg": torch.tensor([1.0])}}, "param_groups": [{"params": [0]}]}
+    target = {"state": {0: {"exp_avg": torch.tensor([2.0])}}, "param_groups": [{"params": [0]}]}
+
+    class RecordingOptimizer:
+        def __init__(self):
+            self.value = _clone_state_to_cpu(resident)
+            self.loads = 0
+
+        def state_dict(self):
+            return _clone_state_to_cpu(self.value)
+
+        def load_state_dict(self, value):
+            self.loads += 1
+            self.value = _clone_state_to_cpu(value)
+
+    optimizer = RecordingOptimizer()
+    state = SimpleNamespace(optimizer=optimizer)
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_gather_object",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("communicator failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="must terminate"):
+        adapter_manager_module._commit_optimizer_state_transactionally(state, target)
+
+    assert optimizer.loads == 1, "must not attempt rollback coordination on a failed process group"
+    assert _same_optimizer_value(optimizer.value, target)
+
+
 def test_save_writes_sharded_optimizer_with_manifest(tmp_path: Path):
     manager = _build_manager(tmp_path)
     _register(manager, "resume-a")
@@ -135,7 +193,7 @@ def test_save_writes_sharded_optimizer_with_manifest(tmp_path: Path):
     ("manifest_update", "error_match"),
     [
         ({"session_rank": 2}, "saved for session_rank"),
-        ({"per_rank_layout_fingerprint": ["0" * 64]}, "different topology/layout fingerprint"),
+        ({"per_rank_layout_fingerprint": ["0" * 64]}, "Layout fingerprint does not match descriptors"),
         ({"per_rank_optimizer_parameter_order": [["wrong.fqn"]]}, "different optimizer parameter order"),
     ],
 )
@@ -342,6 +400,325 @@ def test_world_size_mismatch_refused(tmp_path: Path):
         target.load_adapter_state(model_id="resume-f", path=path, load_optimizer=True)
 
 
+def _one_dimensional_layout(name: str, *, offset: int, size: int, logical_size: int) -> AdapterTensorLayout:
+    return AdapterTensorLayout(
+        fqn=name,
+        dtype=torch.float32,
+        rank_dim=0,
+        substrate_shape=(logical_size,),
+        logical_shape=(logical_size,),
+        local_substrate_shape=(size,),
+        local_logical_offset=(offset,),
+        local_logical_shape=(size,),
+        active_local_slices=(slice(0, size),),
+        active_storage_shape=(size,),
+    )
+
+
+def _two_dimensional_layout(
+    name: str,
+    *,
+    offset: tuple[int, int],
+    shape: tuple[int, int],
+    logical_shape: tuple[int, int],
+    dtype: torch.dtype = torch.float32,
+) -> AdapterTensorLayout:
+    return AdapterTensorLayout(
+        fqn=name,
+        dtype=dtype,
+        rank_dim=0,
+        substrate_shape=logical_shape,
+        logical_shape=logical_shape,
+        local_substrate_shape=shape,
+        local_logical_offset=offset,
+        local_logical_shape=shape,
+        active_local_slices=tuple(slice(0, size) for size in shape),
+        active_storage_shape=shape,
+    )
+
+
+def _write_two_rank_optimizer_checkpoint(
+    path: Path,
+    *,
+    name: str,
+    layouts: list[AdapterTensorLayout],
+    moments: list[torch.Tensor],
+) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    for rank, moment in enumerate(moments):
+        state = {
+            "state": {
+                0: {
+                    "step": torch.tensor(8.0),
+                    "exp_avg": moment,
+                    "exp_avg_sq": moment.square(),
+                }
+            },
+            "param_groups": [
+                {
+                    "params": [0],
+                    "lr": 1e-2,
+                    "betas": (0.9, 0.95),
+                    "eps": 1e-8,
+                    "weight_decay": 0.01,
+                    "amsgrad": False,
+                    "maximize": False,
+                    "foreach": None,
+                    "capturable": False,
+                    "differentiable": False,
+                    "fused": None,
+                    "decoupled_weight_decay": True,
+                }
+            ],
+        }
+        _save_optimizer_state_safetensors(state, str(path / _optimizer_shard_filename(rank)))
+    manifest = {
+        "format_version": 3,
+        "world_size": 2,
+        "per_rank_layout_descriptors": [[layout.to_json_dict()] for layout in layouts],
+        "session_rank": 4,
+        "optimizer_parameter_order": [name],
+        "per_rank_optimizer_parameter_order": [[name], [name]],
+    }
+    manifest["per_rank_layout_fingerprint"] = [
+        _layout_descriptor_fingerprint(descriptors, world_size=2)
+        for descriptors in manifest["per_rank_layout_descriptors"]
+    ]
+    manifest["per_rank_param_structure_sha256"] = [
+        _descriptor_structure_fingerprint(descriptors, [name])
+        for descriptors in manifest["per_rank_layout_descriptors"]
+    ]
+    (path / OPTIMIZER_SHARD_MANIFEST_FILENAME).write_text(json.dumps(manifest), encoding="utf-8")
+
+
+def _target_adapter_state(name: str, layout: AdapterTensorLayout) -> AdapterState:
+    parameter = torch.nn.Parameter(torch.zeros(layout.active_storage_shape, dtype=layout.dtype))
+    optimizer = torch.optim.AdamW(
+        [parameter],
+        lr=1e-2,
+        betas=(0.9, 0.95),
+        eps=1e-8,
+        weight_decay=0.01,
+        fused=False,
+    )
+    return AdapterState(
+        model_id="reshard",
+        session_spec=_session_spec(rank=4, alpha=16, optimizer_type="adamw", lr=1e-2),
+        local_params={name: parameter},
+        tensor_layouts={name: layout},
+        layout_fingerprint="target",
+        optimizer=optimizer,
+    )
+
+
+def test_world_size_change_reshards_adam_rectangles_exactly(tmp_path: Path, monkeypatch):
+    name = "layer.lora_A"
+    source_layouts = [
+        _one_dimensional_layout(name, offset=0, size=2, logical_size=4),
+        _one_dimensional_layout(name, offset=2, size=2, logical_size=4),
+    ]
+    _write_two_rank_optimizer_checkpoint(
+        tmp_path,
+        name=name,
+        layouts=source_layouts,
+        moments=[torch.tensor([1.0, 2.0]), torch.tensor([3.0, 4.0])],
+    )
+    target = _target_adapter_state(name, _one_dimensional_layout(name, offset=0, size=4, logical_size=4))
+    monkeypatch.setattr(adapter_manager_module, "_optimizer_shard_rank_world", lambda: (0, 1))
+
+    assert load_adapter_optimizer_shards(target, str(tmp_path), torch.device("cpu"))
+
+    parameter = target.local_params[name]
+    assert torch.equal(target.optimizer.state[parameter]["exp_avg"], torch.tensor([1.0, 2.0, 3.0, 4.0]))
+    assert torch.equal(target.optimizer.state[parameter]["exp_avg_sq"], torch.tensor([1.0, 4.0, 9.0, 16.0]))
+    assert target.optimizer.state[parameter]["step"].item() == 8
+
+
+def test_world_size_change_refuses_divergent_replicated_moments(tmp_path: Path, monkeypatch):
+    name = "layer.lora_A"
+    replicated = _one_dimensional_layout(name, offset=0, size=4, logical_size=4)
+    _write_two_rank_optimizer_checkpoint(
+        tmp_path,
+        name=name,
+        layouts=[replicated, replicated],
+        moments=[torch.tensor([1.0, 2.0, 3.0, 4.0]), torch.tensor([1.0, 2.0, 3.0, 5.0])],
+    )
+    target = _target_adapter_state(name, replicated)
+    monkeypatch.setattr(adapter_manager_module, "_optimizer_shard_rank_world", lambda: (0, 1))
+
+    with pytest.raises(RuntimeError, match="Replicated optimizer field layer.lora_A.exp_avg differs"):
+        load_adapter_optimizer_shards(target, str(tmp_path), torch.device("cpu"))
+
+
+def test_topology_change_reshards_multidimensional_disjoint_rectangles(tmp_path: Path, monkeypatch):
+    name = "layer.lora_A"
+    source_layouts = [
+        _two_dimensional_layout(name, offset=(0, 0), shape=(2, 4), logical_shape=(4, 4)),
+        _two_dimensional_layout(name, offset=(2, 0), shape=(2, 4), logical_shape=(4, 4)),
+    ]
+    source = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    _write_two_rank_optimizer_checkpoint(
+        tmp_path,
+        name=name,
+        layouts=source_layouts,
+        moments=[source[:2].clone(), source[2:].clone()],
+    )
+    target_layout = _two_dimensional_layout(name, offset=(1, 1), shape=(2, 2), logical_shape=(4, 4))
+    target = _target_adapter_state(name, target_layout)
+    monkeypatch.setattr(adapter_manager_module, "_optimizer_shard_rank_world", lambda: (0, 1))
+
+    assert load_adapter_optimizer_shards(target, str(tmp_path), torch.device("cpu"))
+
+    parameter = target.local_params[name]
+    torch.testing.assert_close(target.optimizer.state[parameter]["exp_avg"], source[1:3, 1:3], rtol=0, atol=0)
+    torch.testing.assert_close(
+        target.optimizer.state[parameter]["exp_avg_sq"],
+        source[1:3, 1:3].square(),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_topology_change_slices_replicated_rectangle(tmp_path: Path, monkeypatch):
+    name = "layer.lora_A"
+    replicated = _two_dimensional_layout(name, offset=(0, 0), shape=(4, 4), logical_shape=(4, 4))
+    source = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    _write_two_rank_optimizer_checkpoint(
+        tmp_path,
+        name=name,
+        layouts=[replicated, replicated],
+        moments=[source.clone(), source.clone()],
+    )
+    target_layout = _two_dimensional_layout(name, offset=(2, 1), shape=(2, 2), logical_shape=(4, 4))
+    target = _target_adapter_state(name, target_layout)
+    monkeypatch.setattr(adapter_manager_module, "_optimizer_shard_rank_world", lambda: (0, 1))
+
+    assert load_adapter_optimizer_shards(target, str(tmp_path), torch.device("cpu"))
+
+    parameter = target.local_params[name]
+    torch.testing.assert_close(target.optimizer.state[parameter]["exp_avg"], source[2:4, 1:3], rtol=0, atol=0)
+
+
+def test_same_world_layout_change_uses_logical_reshard(tmp_path: Path, monkeypatch):
+    name = "layer.lora_A"
+    source_layouts = [
+        _one_dimensional_layout(name, offset=0, size=2, logical_size=4),
+        _one_dimensional_layout(name, offset=2, size=2, logical_size=4),
+    ]
+    _write_two_rank_optimizer_checkpoint(
+        tmp_path,
+        name=name,
+        layouts=source_layouts,
+        moments=[torch.tensor([1.0, 2.0]), torch.tensor([3.0, 4.0])],
+    )
+    target = _target_adapter_state(name, _one_dimensional_layout(name, offset=0, size=4, logical_size=4))
+    monkeypatch.setattr(adapter_manager_module, "_optimizer_shard_rank_world", lambda: (0, 2))
+
+    assert load_adapter_optimizer_shards(target, str(tmp_path), torch.device("cpu"))
+
+    parameter = target.local_params[name]
+    torch.testing.assert_close(
+        target.optimizer.state[parameter]["exp_avg"], torch.tensor([1.0, 2.0, 3.0, 4.0]), rtol=0, atol=0
+    )
+
+
+@pytest.mark.parametrize("defect", ["hole", "overlap", "dtype", "logical_shape", "step"])
+def test_topology_change_rejects_invalid_source_without_mutation(tmp_path: Path, monkeypatch, defect: str):
+    name = "layer.lora_A"
+    layouts = [
+        _one_dimensional_layout(name, offset=0, size=2, logical_size=4),
+        _one_dimensional_layout(name, offset=2, size=2, logical_size=4),
+    ]
+    moments = [torch.tensor([1.0, 2.0]), torch.tensor([3.0, 4.0])]
+    _write_two_rank_optimizer_checkpoint(tmp_path, name=name, layouts=layouts, moments=moments)
+    manifest_path = tmp_path / OPTIMIZER_SHARD_MANIFEST_FILENAME
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if defect == "hole":
+        manifest["per_rank_layout_descriptors"][1][0]["local_logical_offset"] = [3]
+    elif defect == "overlap":
+        manifest["per_rank_layout_descriptors"][1][0]["local_logical_offset"] = [1]
+    elif defect == "dtype":
+        manifest["per_rank_layout_descriptors"][1][0]["dtype"] = "float64"
+    elif defect == "logical_shape":
+        manifest["per_rank_layout_descriptors"][1][0]["logical_shape"] = [5]
+    else:
+        state_path = tmp_path / _optimizer_shard_filename(1)
+        state = adapter_manager_module._load_optimizer_state_safetensors(str(state_path), torch.device("cpu"))
+        state["state"][0]["step"] = torch.tensor(9.0)
+        _save_optimizer_state_safetensors(state, str(state_path))
+    manifest["per_rank_layout_fingerprint"] = [
+        _layout_descriptor_fingerprint(descriptors, world_size=2)
+        for descriptors in manifest["per_rank_layout_descriptors"]
+    ]
+    manifest["per_rank_param_structure_sha256"] = [
+        _descriptor_structure_fingerprint(descriptors, [name])
+        for descriptors in manifest["per_rank_layout_descriptors"]
+    ]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    target = _target_adapter_state(name, _one_dimensional_layout(name, offset=0, size=4, logical_size=4))
+    parameter = target.local_params[name]
+    parameter.grad = torch.tensor([0.5, 0.25, -0.25, -0.5])
+    target.optimizer.step()
+    before = _clone_state_to_cpu(target.optimizer.state_dict())
+    monkeypatch.setattr(adapter_manager_module, "_optimizer_shard_rank_world", lambda: (0, 1))
+
+    with pytest.raises(RuntimeError):
+        load_adapter_optimizer_shards(target, str(tmp_path), torch.device("cpu"))
+
+    after = target.optimizer.state_dict()
+    assert _same_optimizer_value(before, after)
+
+
+def test_topology_change_rejects_rank_without_active_optimizer_parameters(tmp_path: Path):
+    manifest = {
+        "world_size": 1,
+        "per_rank_layout_descriptors": [[]],
+        "per_rank_optimizer_parameter_order": [[]],
+    }
+    state = AdapterState(
+        model_id="empty",
+        session_spec=_session_spec(rank=4, alpha=16, optimizer_type="adamw", lr=1e-2),
+        local_params={},
+        tensor_layouts={},
+        layout_fingerprint="empty",
+        optimizer=None,  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(RuntimeError, match="coordinator ranks with no active local optimizer parameters"):
+        _reshard_adapter_optimizer_state(state, str(tmp_path), manifest, rank=0, world=1)
+
+
+@pytest.mark.parametrize("defect", ["group_metadata", "state_shape"])
+def test_staged_optimizer_contract_is_validated_before_resident_mutation(tmp_path: Path, defect: str):
+    source = _build_manager(tmp_path / "source")
+    _register(source, "staged-contract")
+    _apply_step(source, "staged-contract", seed=17)
+    path = source.save_adapter_state("staged-contract")["path"]
+    shard_path = os.path.join(path, _optimizer_shard_filename(0))
+    staged = adapter_manager_module._load_optimizer_state_safetensors(shard_path, torch.device("cpu"))
+    if defect == "group_metadata":
+        staged["param_groups"][0].pop("eps")
+    else:
+        first_state = next(iter(staged["state"].values()))
+        first_spatial_name = next(
+            name for name, value in first_state.items() if isinstance(value, torch.Tensor) and value.ndim > 0
+        )
+        first_state[first_spatial_name] = first_state[first_spatial_name].reshape(-1)[:-1]
+    _save_optimizer_state_safetensors(staged, shard_path)
+
+    target = _build_manager(tmp_path / "target")
+    _register(target, "staged-contract")
+    _apply_step(target, "staged-contract", seed=19)
+    resident = target.get_adapter_state("staged-contract")
+    before = _clone_state_to_cpu(resident.optimizer.state_dict())
+
+    with pytest.raises(RuntimeError):
+        load_adapter_optimizer_shards(resident, path, torch.device("cpu"))
+
+    assert _same_optimizer_value(before, resident.optimizer.state_dict())
+
+
 def test_param_structure_mismatch_refused(tmp_path: Path):
     source = _build_manager(tmp_path)
     _register(source, "resume-g")
@@ -355,5 +732,5 @@ def test_param_structure_mismatch_refused(tmp_path: Path):
         json.dump(manifest, f)
 
     target = _build_manager(tmp_path / "target")
-    with pytest.raises(RuntimeError, match="different local parameter structure"):
+    with pytest.raises(RuntimeError, match="Parameter fingerprint does not match descriptors"):
         target.load_adapter_state(model_id="resume-g", path=path, load_optimizer=True)
