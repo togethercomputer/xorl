@@ -14,8 +14,8 @@ serving-rank-r's contiguous expert slice):
 1. gather the full token batch over the EP group (backward: reduce-scatter sum);
 2. every rank computes ITS routed partial for ALL tokens through the trainable
    masked serving-kernel Function (T1: compact-valid-slots backward) plus ITS
-   shared-expert TP slice (trainable BI GEMMs, torch-native bf16 silu*mul,
-   sigmoid gate), added in bf16;
+   shared-expert TP slice (trainable BI GEMMs and torch-native bf16 silu*mul),
+   joined with the routed partial by serving's fused gate/sigmoid/mul/add;
 3. partials are exchanged RAW (all-to-all) — NEVER via an NCCL-summed
    collective (the sum order must stay ours) — and every rank chain-sums its
    own tokens' n partials locally in bf16, serving rank order (n-1) -> 0;
@@ -121,6 +121,61 @@ def gather_ids_for_ep_combine(ids: torch.Tensor, group, padded_rows: int | None 
     out = torch.empty((world_size * padded_rows, *ids.shape[1:]), dtype=ids.dtype, device=ids.device)
     dist.all_gather_into_tensor(out, ids, group=group)
     return out
+
+
+def _run_sglang_fused_gate_sigmoid_mul_add(
+    hidden_states: torch.Tensor,
+    gate_weight: torch.Tensor,
+    shared_output: torch.Tensor,
+    final_hidden_states: torch.Tensor,
+) -> None:
+    """Call the installed sampler's exact shared-gate forward kernel."""
+    from sglang.kernels.ops.elementwise.elementwise import fused_gate_sigmoid_mul_add  # noqa: PLC0415
+
+    fused_gate_sigmoid_mul_add(hidden_states, gate_weight, shared_output, final_hidden_states)
+
+
+class _SGLangFusedGateSigmoidMulAdd(torch.autograd.Function):
+    """Serving-exact shared-gate forward with an ordinary differentiable backward."""
+
+    @staticmethod
+    def forward(ctx, hidden_states, gate_weight, shared_output, routed_output):
+        ctx.save_for_backward(hidden_states, gate_weight, shared_output)
+        ctx.routed_dtype = routed_output.dtype
+        result = routed_output.contiguous().clone()
+        _run_sglang_fused_gate_sigmoid_mul_add(
+            hidden_states.contiguous(),
+            gate_weight.contiguous(),
+            shared_output.contiguous(),
+            result,
+        )
+        return result
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        hidden_states, gate_weight, shared_output = ctx.saved_tensors
+        hidden_fp32 = hidden_states.float()
+        weight_fp32 = gate_weight.float()
+        shared_fp32 = shared_output.float()
+        grad_fp32 = grad_output.float()
+
+        gate = torch.sigmoid((hidden_fp32 * weight_fp32).sum(dim=-1))
+        grad_gate_logits = (grad_fp32 * shared_fp32).sum(dim=-1) * gate * (1.0 - gate)
+        grad_hidden = (grad_gate_logits.unsqueeze(-1) * weight_fp32).to(hidden_states.dtype)
+        grad_weight = (grad_gate_logits.unsqueeze(-1) * hidden_fp32).sum(dim=0).to(gate_weight.dtype)
+        grad_shared = (grad_fp32 * gate.unsqueeze(-1)).to(shared_output.dtype)
+        grad_routed = grad_output.to(ctx.routed_dtype)
+        return grad_hidden, grad_weight, grad_shared, grad_routed
+
+
+def sglang_fused_gate_sigmoid_mul_add(
+    hidden_states: torch.Tensor,
+    gate_weight: torch.Tensor,
+    shared_output: torch.Tensor,
+    routed_output: torch.Tensor,
+) -> torch.Tensor:
+    """Apply the sampler's forward operation without giving up trainer gradients."""
+    return _SGLangFusedGateSigmoidMulAdd.apply(hidden_states, gate_weight, shared_output, routed_output)
 
 
 def exchange_and_chain_sum(partial: torch.Tensor, group, ep_size: int) -> torch.Tensor:

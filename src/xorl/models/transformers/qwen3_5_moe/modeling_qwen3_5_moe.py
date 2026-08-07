@@ -306,6 +306,7 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
             gather_ids_for_ep_combine,
             gather_tokens_for_ep_combine,
             max_rows_for_ep_combine,
+            sglang_fused_gate_sigmoid_mul_add,
         )
         from xorl.ops.batch_invariant_ops import _BatchInvariantTrunkLinearFn  # noqa: PLC0415
 
@@ -370,10 +371,13 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
         w_down = self.shared_expert.down_proj.weight  # [H, I]
         shard = inter // ep_size
         lo_s = ep_rank * shard
-        # serving applies the sigmoid shared-expert gate on each rank's partial;
-        # the scalar is identical across ranks.
-        gate_value = torch.sigmoid(_BatchInvariantTrunkLinearFn.apply(gathered, self.shared_expert_gate.weight, None))
-        self._capture_diagnostic_component("moe_native_shared_gate_value", gate_value)
+        # Retain the decomposed gate only when operand diagnostics request it.
+        # The local partial itself uses serving's fused reduction and rounding.
+        if callable(self.__dict__.get("_diagnostic_capture_component")):
+            gate_value = torch.sigmoid(
+                _BatchInvariantTrunkLinearFn.apply(gathered, self.shared_expert_gate.weight, None)
+            )
+            self._capture_diagnostic_component("moe_native_shared_gate_value", gate_value)
         w_slice = torch.cat((w_gu[lo_s : lo_s + shard], w_gu[inter + lo_s : inter + lo_s + shard]), dim=0)
         gate_up = _BatchInvariantTrunkLinearFn.apply(gathered, w_slice, None)
         self._capture_diagnostic_component("moe_native_shared_gate_up", gate_up)
@@ -382,7 +386,12 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
         self._capture_diagnostic_component("moe_native_shared_act", act)
         down = _BatchInvariantTrunkLinearFn.apply(act, w_down[:, lo_s : lo_s + shard].contiguous(), None)
         self._capture_diagnostic_component("moe_native_shared_down", down)
-        partial = routed + (gate_value * down).to(torch.bfloat16)
+        partial = sglang_fused_gate_sigmoid_mul_add(
+            gathered,
+            self.shared_expert_gate.weight.squeeze(0),
+            down,
+            routed,
+        )
         self._capture_diagnostic_component("moe_native_local_partial", partial)
 
         # 3./4. raw exchange + serving-order chain sum (autograd reverses the exchange)

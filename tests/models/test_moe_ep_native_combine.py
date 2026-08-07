@@ -8,6 +8,7 @@ from xorl.models.layers.moe.ep_native_combine import (
     gather_ids_for_ep_combine,
     gather_tokens_for_ep_combine,
     max_rows_for_ep_combine,
+    sglang_fused_gate_sigmoid_mul_add,
     validate_qwen35_native_ep_combine_size,
 )
 
@@ -140,6 +141,33 @@ def test_max_rows_for_ep_combine(monkeypatch):
     assert max_rows_for_ep_combine(6016, torch.device("cpu"), group=None) == 8192
 
 
+def test_serving_fused_gate_forward_preserves_trainer_gradients(monkeypatch):
+    import xorl.models.layers.moe.ep_native_combine as combine  # noqa: PLC0415
+
+    def fake_serving_kernel(hidden, weight, shared, final):
+        final.copy_(final + torch.sigmoid((hidden * weight).sum(dim=-1, keepdim=True)) * shared)
+
+    monkeypatch.setattr(combine, "_run_sglang_fused_gate_sigmoid_mul_add", fake_serving_kernel)
+    hidden = torch.randn(3, 5, requires_grad=True)
+    weight = torch.randn(5, requires_grad=True)
+    shared = torch.randn(3, 5, requires_grad=True)
+    routed = torch.randn(3, 5, requires_grad=True)
+    inputs = (hidden, weight, shared, routed)
+
+    actual = sglang_fused_gate_sigmoid_mul_add(*inputs)
+    actual.sum().backward()
+    actual_grads = tuple(value.grad.detach().clone() for value in inputs)
+
+    reference_inputs = tuple(value.detach().clone().requires_grad_() for value in inputs)
+    ref_hidden, ref_weight, ref_shared, ref_routed = reference_inputs
+    reference = ref_routed + torch.sigmoid((ref_hidden * ref_weight).sum(dim=-1, keepdim=True)) * ref_shared
+    reference.sum().backward()
+
+    torch.testing.assert_close(actual, reference)
+    for actual_grad, reference_input in zip(actual_grads, reference_inputs, strict=True):
+        torch.testing.assert_close(actual_grad, reference_input.grad)
+
+
 def test_native_combine_captures_actual_operands(monkeypatch):
     """The layer-selected diagnostic hook exposes every exact-combine boundary."""
     import xorl.models.layers.moe.ep_native_combine as combine  # noqa: PLC0415
@@ -168,6 +196,12 @@ def test_native_combine_captures_actual_operands(monkeypatch):
     monkeypatch.setattr(combine, "gather_tokens_for_ep_combine", lambda value, _group, _rows: value)
     monkeypatch.setattr(combine, "gather_ids_for_ep_combine", lambda value, _group, _rows: value)
     monkeypatch.setattr(combine, "exchange_and_chain_sum", lambda value, _group, _size: value)
+    monkeypatch.setattr(
+        combine,
+        "sglang_fused_gate_sigmoid_mul_add",
+        lambda hidden, weight, shared, routed: routed
+        + torch.sigmoid((hidden * weight).sum(dim=-1, keepdim=True)) * shared,
+    )
     monkeypatch.setattr(
         batch_invariant_ops._BatchInvariantTrunkLinearFn,
         "apply",
