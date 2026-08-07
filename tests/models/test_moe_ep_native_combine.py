@@ -138,3 +138,69 @@ def test_max_rows_for_ep_combine(monkeypatch):
 
     monkeypatch.setattr(combine.dist, "all_reduce", fake_max)
     assert max_rows_for_ep_combine(6016, torch.device("cpu"), group=None) == 8192
+
+
+def test_native_combine_captures_actual_operands(monkeypatch):
+    """The layer-selected diagnostic hook exposes every exact-combine boundary."""
+    import xorl.models.layers.moe.ep_native_combine as combine  # noqa: PLC0415
+    import xorl.distributed.parallel_state as parallel_state  # noqa: PLC0415
+    import xorl.ops.batch_invariant_ops as batch_invariant_ops  # noqa: PLC0415
+
+    class DummyParallelState:
+        ep_enabled = True
+        ep_size = 8
+        ep_rank = 2
+        ep_group = object()
+
+    class DummyExperts(torch.nn.Module):
+        num_experts = 8
+
+        def __init__(self):
+            super().__init__()
+            self.gate_up_proj = torch.nn.Parameter(torch.zeros(1, 2, 32, dtype=torch.bfloat16))
+
+        def forward(self, hidden, routing, *, sglang_ep_native_local_ids):
+            del routing, sglang_ep_native_local_ids
+            return torch.full_like(hidden, 0.25)
+
+    monkeypatch.setattr(parallel_state, "get_parallel_state", lambda: DummyParallelState())
+    monkeypatch.setattr(combine, "max_rows_for_ep_combine", lambda rows, _device, _group: rows)
+    monkeypatch.setattr(combine, "gather_tokens_for_ep_combine", lambda value, _group, _rows: value)
+    monkeypatch.setattr(combine, "gather_ids_for_ep_combine", lambda value, _group, _rows: value)
+    monkeypatch.setattr(combine, "exchange_and_chain_sum", lambda value, _group, _size: value)
+    monkeypatch.setattr(
+        batch_invariant_ops._BatchInvariantTrunkLinearFn,
+        "apply",
+        lambda value, weight, bias: torch.nn.functional.linear(value, weight, bias),
+    )
+
+    blk = _qwen_block()
+    blk.experts = DummyExperts()
+    captured = {}
+    blk._diagnostic_capture_component = lambda name, value: captured.setdefault(name, value.detach().clone())
+
+    hidden = torch.randn(1, 2, 32, dtype=torch.bfloat16)
+    routing = torch.randn(2, 2, dtype=torch.float32)
+    selected = torch.full((2, 2), 2, dtype=torch.int64)
+    output = blk._ep_combine_native(hidden, routing, selected)
+
+    assert set(captured) == {
+        "moe_native_gathered_input",
+        "moe_native_gathered_routing",
+        "moe_native_gathered_ids",
+        "moe_native_local_ids",
+        "moe_native_routed",
+        "moe_native_shared_gate_value",
+        "moe_native_shared_gate_up",
+        "moe_native_shared_act",
+        "moe_native_shared_down",
+        "moe_native_local_partial",
+        "moe_native_combined",
+    }
+    torch.testing.assert_close(captured["moe_native_gathered_input"], hidden.reshape(2, 32))
+    torch.testing.assert_close(captured["moe_native_gathered_routing"], routing)
+    torch.testing.assert_close(captured["moe_native_gathered_ids"], selected)
+    torch.testing.assert_close(captured["moe_native_local_ids"], torch.zeros_like(selected, dtype=torch.int32))
+    torch.testing.assert_close(captured["moe_native_routed"], torch.full((2, 32), 0.25, dtype=torch.bfloat16))
+    torch.testing.assert_close(captured["moe_native_combined"], captured["moe_native_local_partial"])
+    torch.testing.assert_close(output.reshape(2, 32), captured["moe_native_combined"])

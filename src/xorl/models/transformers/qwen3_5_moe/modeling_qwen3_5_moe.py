@@ -344,6 +344,9 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
         gathered = gather_tokens_for_ep_combine(flat, ep_group, padded_rows)
         gathered_routing = gather_tokens_for_ep_combine(routing_flat, ep_group, padded_rows)
         gathered_ids = gather_ids_for_ep_combine(selected_flat, ep_group, padded_rows)
+        self._capture_diagnostic_component("moe_native_gathered_input", gathered)
+        self._capture_diagnostic_component("moe_native_gathered_routing", gathered_routing)
+        self._capture_diagnostic_component("moe_native_gathered_ids", gathered_ids)
 
         # 2. this rank's partial: routed (masked serving kernel on the local
         #    slice) + shared-expert TP slice, added in bf16 (serving semantics)
@@ -353,6 +356,7 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
             gathered_ids - lo,
             gathered_ids.new_full((), -1),
         ).to(torch.int32)
+        self._capture_diagnostic_component("moe_native_local_ids", local_ids)
         # Enter through Module.__call__ so the experts FSDP unit materializes
         # its BF16 compute parameters before invoking the serving kernel.
         routed = self.experts(
@@ -360,6 +364,7 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
             gathered_routing,
             sglang_ep_native_local_ids=local_ids,
         ).to(torch.bfloat16)
+        self._capture_diagnostic_component("moe_native_routed", routed)
 
         w_gu = self.shared_expert.gate_up_proj.weight  # [2I, H], gate rows first
         w_down = self.shared_expert.down_proj.weight  # [H, I]
@@ -368,15 +373,21 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
         # serving applies the sigmoid shared-expert gate on each rank's partial;
         # the scalar is identical across ranks.
         gate_value = torch.sigmoid(_BatchInvariantTrunkLinearFn.apply(gathered, self.shared_expert_gate.weight, None))
+        self._capture_diagnostic_component("moe_native_shared_gate_value", gate_value)
         w_slice = torch.cat((w_gu[lo_s : lo_s + shard], w_gu[inter + lo_s : inter + lo_s + shard]), dim=0)
         gate_up = _BatchInvariantTrunkLinearFn.apply(gathered, w_slice, None)
+        self._capture_diagnostic_component("moe_native_shared_gate_up", gate_up)
         gate, up = gate_up.chunk(2, dim=-1)
         act = F.silu(gate) * up  # torch-native bf16 (serving's BI-ops lane; NOT the fused kernel)
+        self._capture_diagnostic_component("moe_native_shared_act", act)
         down = _BatchInvariantTrunkLinearFn.apply(act, w_down[:, lo_s : lo_s + shard].contiguous(), None)
+        self._capture_diagnostic_component("moe_native_shared_down", down)
         partial = routed + (gate_value * down).to(torch.bfloat16)
+        self._capture_diagnostic_component("moe_native_local_partial", partial)
 
         # 3./4. raw exchange + serving-order chain sum (autograd reverses the exchange)
         out = exchange_and_chain_sum(partial, ep_group, ep_size)
+        self._capture_diagnostic_component("moe_native_combined", out)
         return out[: flat.shape[0]].reshape(batch_size, sequence_length, hidden_dim)
 
     def forward_experts_only(self, hidden_states, routing_weights, selected_experts):

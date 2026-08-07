@@ -467,6 +467,51 @@ def test_hidden_component_hooks_capture_moe_internal_callback_components():
     assert "_diagnostic_capture_component" not in layer.mlp.__dict__
 
 
+def test_hidden_component_hooks_accept_native_moe_operand_components():
+    class DummyMlp(torch.nn.Module):
+        def forward(self, hidden_states):
+            capture = self._diagnostic_capture_component
+            capture("moe_native_gathered_input", hidden_states)
+            capture("moe_native_local_partial", hidden_states + 1.0)
+            capture("moe_native_combined", hidden_states + 2.0)
+            return hidden_states + 2.0
+
+    class DummyLayer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.mlp = DummyMlp()
+
+        def forward(self, hidden_states):
+            return (self.mlp(hidden_states),)
+
+    class DummyInner(torch.nn.Module):
+        def __init__(self, layer):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([layer])
+
+    class DummyOuter(torch.nn.Module):
+        def __init__(self, layer):
+            super().__init__()
+            self.model = DummyInner(layer)
+
+    layer = DummyLayer()
+    runner = object.__new__(ModelRunner)
+    runner.model = DummyOuter(layer)
+    captures, handles = runner._install_hidden_component_hooks([0])
+    hidden_states = torch.ones(1, 2, 3)
+    try:
+        layer(hidden_states)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    by_name = {capture["name"]: capture for capture in captures}
+    assert by_name["moe_native_gathered_input"]["order"] == 80
+    assert by_name["moe_native_local_partial"]["order"] == 89
+    assert by_name["moe_native_combined"]["order"] == 90
+    torch.testing.assert_close(by_name["moe_native_local_partial"]["tensor"], hidden_states + 1.0)
+
+
 def test_hidden_component_hooks_capture_shared_expert_split():
     class DummySharedExpert(torch.nn.Module):
         def forward(self, hidden_states):
