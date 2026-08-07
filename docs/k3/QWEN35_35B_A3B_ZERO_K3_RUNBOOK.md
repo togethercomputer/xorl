@@ -14,10 +14,10 @@ identity and geometry select the complete exact program:
 - native ordered EP combine by default only for the certified EP8 topology.
 
 Incompatible numerical overrides and any topology other than the admitted
-WORLD16/DP16 (replicate 2, shard 8)/EP8 program raise before execution. Native
-EP combine enters experts through `nn.Module.__call__`; this lets FSDP
-materialize the BF16 compute parameters before the serving-layout expert kernel
-runs.
+WORLD8/DP8 (replicate 1, shard 8)/EP8 or WORLD16/DP16 (replicate 2, shard
+8)/EP8 programs raise before execution. Native EP combine enters experts
+through `nn.Module.__call__`; this lets FSDP materialize the BF16 compute
+parameters before the serving-layout expert kernel runs.
 
 On serving, `--rl-on-policy-target xorl` is the only activation switch. The
 official geometry selects the qualified FA4 graph/radix program, exact GDN

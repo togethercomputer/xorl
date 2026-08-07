@@ -14,8 +14,10 @@ router gate (contracted separately by the exact model program) and lm_head/embed
 import pytest
 import torch
 
+from xorl.lora.modules.linear import LoraLinear
 from xorl.models.transformers.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig
 from xorl.models.transformers.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeForCausalLM
+from xorl.models.transformers.qwen3_5_shared import _apply_qwen35_gdn_exact
 from xorl.ops.batch_invariant_ops import (
     is_trunk_linear_contract_enabled,
     set_trunk_linear_contract,
@@ -57,6 +59,22 @@ def _hybrid_config(**overrides) -> Qwen3_5MoeConfig:
 def _build(dtype=torch.bfloat16) -> Qwen3_5MoeForCausalLM:
     torch.manual_seed(0)
     return Qwen3_5MoeForCausalLM(_hybrid_config()).to(dtype)
+
+
+def test_exact_qwen_hook_enables_merged_lora_before_trunk_wrap():
+    model = torch.nn.Module()
+    model.config = type("Config", (), {"model_type": "xorl_qwen3_5"})()
+    model.q_proj = LoraLinear(16, 16, r=2, lora_alpha=4, dtype=torch.bfloat16)
+
+    try:
+        assert model.q_proj.exact_merged_forward is False
+        wrapped = _apply_qwen35_gdn_exact(model)
+
+        assert model.q_proj.exact_merged_forward is True
+        assert wrapped == {"q_proj": 1}
+        assert model.q_proj._xorl_bi_trunk_wrapped is True
+    finally:
+        set_trunk_linear_contract(False)
 
 
 def test_qwen3_5_hybrid_trunk_wrap_selection():

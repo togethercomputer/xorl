@@ -337,10 +337,24 @@ def _qwen35_topology(**overrides):
     return SimpleNamespace(**fields)
 
 
-def test_exact_qwen35_moe_admits_ep8_topology():
+def test_exact_qwen35_moe_admits_world16_ep8_topology():
     config = _exact_qwen35_moe_config()
     config._qwen35_exact_contract = True
     _validate_exact_qwen35_topology(config, _qwen35_topology())
+
+
+def test_exact_qwen35_moe_admits_world8_ep8_topology():
+    config = _exact_qwen35_moe_config()
+    config._qwen35_exact_contract = True
+    _validate_exact_qwen35_topology(
+        config,
+        _qwen35_topology(
+            world_size=8,
+            dp_size=8,
+            dp_replicate_size=1,
+            dp_shard_size=8,
+        ),
+    )
 
 
 def test_exact_qwen35_dense_admits_single_gpu_topology():
@@ -376,7 +390,7 @@ def test_exact_qwen35_dense_admits_single_gpu_topology():
 def test_exact_qwen35_moe_rejects_noncertified_topology(override):
     config = _exact_qwen35_moe_config()
     config._qwen35_exact_contract = True
-    with pytest.raises(ValueError, match="certified only"):
+    with pytest.raises(ValueError, match="admitted only"):
         _validate_exact_qwen35_topology(config, _qwen35_topology(**override))
 
 

@@ -58,6 +58,7 @@ def _apply_qwen35_gdn_exact(model: torch.nn.Module) -> dict[str, int]:
             raise ValueError("Exact Qwen3.5-MoE server training requires expert parallelism")
         validate_qwen35_native_ep_combine_size(ps.ep_size)
 
+    from xorl.lora.modules.base import LoraModule  # noqa: PLC0415
     from xorl.ops.batch_invariant_ops import wrap_trunk_linears_batch_invariant  # noqa: PLC0415
     from xorl.ops.bi_families_v2 import _select_qwen35_families_v1  # noqa: PLC0415
 
@@ -66,6 +67,12 @@ def _apply_qwen35_gdn_exact(model: torch.nn.Module) -> dict[str, int]:
     # direct final-head replay admits a migration.
     _select_qwen35_families_v1()
     for module in model.modules():
+        # LoRA injection runs before this exact-model hook.  The exact contract
+        # is model-owned (not selected by the retired process-wide environment
+        # switch), so propagate it to every injected adapter before the trunk
+        # wrapper validates and composes with those modules.
+        if isinstance(module, LoraModule):
+            module.exact_merged_forward = True
         if hasattr(module, "_native_ep_combine"):
             module._native_ep_combine = is_moe
         if hasattr(module, "_exact_batch_invariant_router"):

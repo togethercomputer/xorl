@@ -370,12 +370,19 @@ def _validate_exact_qwen35_topology(config: PretrainedConfig, parallel_state: An
         parallel_state.ringattn_size,
         parallel_state.ulysses_size,
     )
-    certified = (16, 16, 2, 8, 1, 1, 8, 1, 1, 1) if _is_qwen35_moe(config) else (1, 1, 1, 1, 1, 1, 1, 1, 1, 1)
-    if topology != certified:
+    admitted = (
+        (
+            (8, 8, 1, 8, 1, 1, 8, 1, 1, 1),
+            (16, 16, 2, 8, 1, 1, 8, 1, 1, 1),
+        )
+        if _is_qwen35_moe(config)
+        else ((1, 1, 1, 1, 1, 1, 1, 1, 1, 1),)
+    )
+    if topology not in admitted:
         raise ValueError(
-            "The Qwen3.5-family exact server-training path is certified only for "
+            "The Qwen3.5-family exact server-training path is admitted only for "
             "WORLD/DP/DP-replicate/DP-shard/TP/PP/EP/CP/Ring/Ulysses="
-            f"{certified}; got {topology}"
+            f"{admitted}; got {topology}"
         )
 
 

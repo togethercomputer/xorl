@@ -24,11 +24,11 @@ bit-relevant boundary:
 - Qwen3.6 MoE uses the native EP8 ordered combine. The dense model does not
   inherit MoE-only graph or transport optimizations.
 
-The Qwen3.6 serving program uses FA4, DP attention, one local CUDA-graph bucket
-of 10, global admission 80 at DP8, radix reuse, and 64-aligned continuation
-chunks. The corresponding trainer program is WORLD16 with DP16 (two replicas,
-shard size 8) and EP8. Qwen3.5-0.8B is admitted only at the single-rank dense
-geometry.
+The Qwen3.6 serving program uses FA4, DP attention, a qualification-pinned local
+CUDA-graph bucket, DP8 admission, radix reuse, and 64-aligned continuation
+chunks. The corresponding trainer program admits WORLD8 with DP8 (one fully
+sharded replica) or WORLD16 with DP16 (two replicas, shard size 8); both use
+EP8. Qwen3.5-0.8B is admitted only at the single-rank dense geometry.
 
 ## Fail-closed envelope
 

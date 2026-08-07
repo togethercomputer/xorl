@@ -59,11 +59,13 @@ construction and rejects incompatible overrides. On serving, pass only
 `--rl-on-policy-target xorl`; the architecture resolver owns the corresponding
 graph, cache, precision, routing, and transport program.
 
-The Qwen3.6 trainer geometry is WORLD16 with DP16 (two DP replicas, shard size
-8) and EP8. The GLM-5.2 trainer geometry is WORLD16/PP1/TP1/DP1/EP16/CP16 with
-Ulysses16. The dense Qwen3.5-0.8B trainer is single-rank. These are admitted
-programs, not tuning suggestions. A different topology must earn a new direct
-train-infer parity result before admission.
+The Qwen3.6 trainer geometries are WORLD8 with DP8 (one fully sharded replica)
+and WORLD16 with DP16 (two DP replicas, shard size 8); both use EP8. The
+GLM-5.2 trainer geometry is WORLD16/PP1/TP1/DP1/EP16/CP16 with Ulysses16. The
+dense Qwen3.5-0.8B trainer is single-rank. These are admitted programs, not
+tuning suggestions. Each revision pair and selected geometry must pass a
+direct train-infer parity gate; any other topology must earn a new direct
+result before admission.
 
 Exact serving rejects sampling transforms the trainer does not replay,
 speculative decoding, unsupported session-state restoration, and other
