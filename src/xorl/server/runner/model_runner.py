@@ -1987,6 +1987,8 @@ class ModelRunner:
             "k_attn_input": 14,
             "v_attn_input": 15,
             "attn_output": 16,
+            "attention_gate": 16,
+            "attn_output_gated": 17,
             "o_proj_output": 17,
             "attention": 18,
             "post_attention_norm_input": 19,

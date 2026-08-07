@@ -182,6 +182,11 @@ class Qwen3_5MoeAttention(nn.Module):
         self.k_norm = Qwen3_5MoeRMSNorm(self.head_dim, eps=config.rms_norm_eps, exact_contract=exact_contract)
         self._attn_gate: torch.Tensor | None = None
 
+    def _capture_diagnostic_component(self, name: str, value: torch.Tensor) -> None:
+        capture = self.__dict__.get("_diagnostic_capture_component")
+        if callable(capture):
+            capture(name, value)
+
     def _project_qkv(
         self,
         hidden_states: torch.Tensor,
@@ -190,16 +195,25 @@ class Qwen3_5MoeAttention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states, gate = torch.chunk(
-            self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2), 2, dim=-1
-        )
+        self._capture_diagnostic_component("attention_input", hidden_states)
+        qkv = self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2)
+        self._capture_diagnostic_component("qkv", qkv)
+        query_states, gate = torch.chunk(qkv, 2, dim=-1)
         self._attn_gate = gate.reshape(*input_shape, -1)
 
+        self._capture_diagnostic_component("q_pre_qk_norm", query_states)
         query_states = self.q_norm(query_states.view(hidden_shape))
-        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape))
+        self._capture_diagnostic_component("q_post_qk_norm", query_states)
+        key_states = self.k_proj(hidden_states).view(hidden_shape)
+        self._capture_diagnostic_component("k_pre_qk_norm", key_states)
+        key_states = self.k_norm(key_states)
+        self._capture_diagnostic_component("k_post_qk_norm", key_states)
         value_states = self.v_proj(hidden_states).view(hidden_shape)
+        self._capture_diagnostic_component("v", value_states)
 
         cos, sin = position_embeddings
+        self._capture_diagnostic_component("rope_cos", cos)
+        self._capture_diagnostic_component("rope_sin", sin)
         query_states, key_states = qwen3_5_apply_rotary_pos_emb(
             query_states,
             key_states,
@@ -210,6 +224,8 @@ class Qwen3_5MoeAttention(nn.Module):
         if getattr(self.config, "_attention_cast_bf16", False):
             query_states = query_states.to(torch.bfloat16)
             key_states = key_states.to(torch.bfloat16)
+        self._capture_diagnostic_component("q", query_states)
+        self._capture_diagnostic_component("k", key_states)
         return query_states, key_states, value_states
 
     def _project_output(self, attn_output: torch.Tensor) -> torch.Tensor:
@@ -217,9 +233,14 @@ class Qwen3_5MoeAttention(nn.Module):
         self._attn_gate = None
         if gate is None:
             raise RuntimeError("Qwen3.5 MoE attention gate was not initialized before output projection.")
+        self._capture_diagnostic_component("attention_gate", gate)
+        self._capture_diagnostic_component("attn_output", attn_output)
         attn_output = attn_output.reshape(*attn_output.shape[:-2], -1).contiguous()
         attn_output = attn_output * torch.sigmoid(gate)
-        return self.o_proj(attn_output)
+        self._capture_diagnostic_component("attn_output_gated", attn_output)
+        output = self.o_proj(attn_output)
+        self._capture_diagnostic_component("o_proj_output", output)
+        return output
 
     def _get_attention_fn(self) -> Callable:
         return ATTENTION_FUNCTIONS.get(self.config._attn_implementation, eager_attention_forward)
