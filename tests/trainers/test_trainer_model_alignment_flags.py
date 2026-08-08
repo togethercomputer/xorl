@@ -71,7 +71,12 @@ def _trainer_args():
             qarl_quant_sequence_length=None,
             qarl_calib_data=None,
         ),
-        lora=SimpleNamespace(enable_lora=False, enable_qlora=False),
+        lora=SimpleNamespace(
+            enable_lora=False,
+            enable_qlora=False,
+            lora_rank=16,
+            lora_alpha=16,
+        ),
     )
 
 
@@ -100,3 +105,5 @@ def test_local_trainer_forwards_model_numeric_alignment_flags(monkeypatch):
     assert captured["rope_class_b"] is True
     assert captured["attention_cast_bf16"] is True
     assert captured["moe_routing_weights_before_down"] is True
+    assert captured["lora_rank"] == 16
+    assert captured["lora_alpha"] == 16

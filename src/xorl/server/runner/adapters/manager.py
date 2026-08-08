@@ -700,6 +700,12 @@ class LoRAAdapterManager:
         ] = {}
         self._model_param_ids: Dict[str, int] = {}
         self._adapter_registration_ordinals: Dict[str, int] = {}
+        exact_lm_head_a_ids = {
+            id(module.lora_A)
+            for module in self.model.modules()
+            if getattr(module, "_glm52_exact_tp16_lm_head", False) and getattr(module, "lora_A", None) is not None
+        }
+        self._exact_lm_head_replicated_param_names: set[str] = set()
 
         # Cache the list of LoRA parameter names for efficient lookups
         self._lora_param_names: List[str] = []
@@ -709,6 +715,8 @@ class LoRAAdapterManager:
                 self._lora_param_names.append(name)
                 param_shape = tuple(param.shape if _HAS_DTENSOR and isinstance(param, DTensor) else param.data.shape)
                 self._model_param_ids[name] = id(param)
+                if id(param) in exact_lm_head_a_ids:
+                    self._exact_lm_head_replicated_param_names.add(name)
                 self._lora_param_metadata[name] = {
                     "shape": param_shape,
                     "dtype": param.dtype if _HAS_DTENSOR and isinstance(param, DTensor) else param.data.dtype,
@@ -888,6 +896,7 @@ class LoRAAdapterManager:
             local_group_memberships = {}
             sp_group = parallel_state.sp_grad_sync_group
             output_group = getattr(parallel_state, "lm_head_tp_replica_group", None)
+            output_tp_group = getattr(parallel_state, "lm_head_tp_group", None)
             ep_group = (
                 parallel_state.ep_group
                 if bool(getattr(parallel_state, "ep_enabled", getattr(parallel_state, "ep_size", 1) > 1))
@@ -897,6 +906,8 @@ class LoRAAdapterManager:
                 local_group_memberships["sequence_parallel"] = _public_group_members(sp_group)
             if output_group is not None:
                 local_group_memberships["output_projection_replica"] = _public_group_members(output_group)
+            if output_tp_group is not None:
+                local_group_memberships["output_projection_tp"] = _public_group_members(output_tp_group)
             if ep_group is not None:
                 local_group_memberships["expert_parallel_replica"] = _public_group_members(ep_group)
         layouts, fingerprint, group_memberships = discover_adapter_layouts(
@@ -961,6 +972,46 @@ class LoRAAdapterManager:
                     f"LoRA parameter placement changed after layout discovery for {name}: "
                     f"local shape {tuple(local.shape)} != {layout.local_substrate_shape}"
                 )
+
+    def _validate_exact_lm_head_tp_coherence(self, state: AdapterState, *, include_optimizer: bool) -> None:
+        """Byte-assert replicated exact-head A and its optimizer state over TP16."""
+
+        if not self._exact_lm_head_replicated_param_names:
+            return
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            raise RuntimeError("Exact GLM-5.2 adapter coherence requires initialized torch.distributed")
+        from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
+
+        group = get_parallel_state().lm_head_tp_group
+        if group is None or torch.distributed.get_world_size(group) != 16:
+            raise RuntimeError("Exact GLM-5.2 adapter coherence requires the WORLD16 lm-head TP group")
+
+        def _assert_equal(label: str, value: torch.Tensor) -> None:
+            # AdamW stores ``step`` as a scalar tensor.  Flatten before the
+            # dtype reinterpretation so scalar and shaped optimizer states
+            # use the same byte-exact coherence path.
+            payload = value.detach().cpu().contiguous().reshape(-1).view(torch.uint8).numpy().tobytes()
+            digest = torch.tensor(
+                list(hashlib.sha256(payload).digest()),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            minimum = digest.clone()
+            maximum = digest.clone()
+            torch.distributed.all_reduce(minimum, op=torch.distributed.ReduceOp.MIN, group=group)
+            torch.distributed.all_reduce(maximum, op=torch.distributed.ReduceOp.MAX, group=group)
+            if not torch.equal(minimum, maximum):
+                raise RuntimeError(f"Exact GLM-5.2 replicated adapter state diverged across TP16: {label}")
+
+        for name in sorted(self._exact_lm_head_replicated_param_names):
+            parameter = state.local_params[name]
+            _assert_equal(name, parameter)
+            if not include_optimizer:
+                continue
+            optimizer_state = state.optimizer.state.get(parameter, {})
+            for state_name, value in sorted(optimizer_state.items()):
+                if isinstance(value, torch.Tensor):
+                    _assert_equal(f"{name}.optimizer.{state_name}", value)
 
     @staticmethod
     def _replica_validation_enabled() -> bool:
@@ -1685,6 +1736,11 @@ class LoRAAdapterManager:
             global_forward_backward_step=0,
             lr=effective_lr,
         )
+        try:
+            self._validate_exact_lm_head_tp_coherence(self.adapters[model_id], include_optimizer=False)
+        except Exception:
+            del self.adapters[model_id]
+            raise
 
         logger.info(
             f"Registered adapter for model_id={model_id} "
@@ -2284,6 +2340,7 @@ class LoRAAdapterManager:
             state.optimizer.step()
             if self.device.type == "cuda":
                 torch.cuda.current_stream(self.device).synchronize()
+            self._validate_exact_lm_head_tp_coherence(state, include_optimizer=True)
             self._validate_replica_coherence(state, gradients=False)
             self._validate_optimizer_replica_coherence(state)
         except Exception as error:
@@ -2875,6 +2932,7 @@ class LoRAAdapterManager:
             state.publication_eligible = True
             self._clear_all_adapter_gradients(state)
             self._reset_gradient_scratch(state)
+            self._validate_exact_lm_head_tp_coherence(state, include_optimizer=load_optimizer)
         except Exception:
             if registered_here:
                 try:

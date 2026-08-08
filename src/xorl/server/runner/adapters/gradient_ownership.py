@@ -72,6 +72,7 @@ class ReductionAuthority(str, Enum):
     ADAPTER_CAPTURE = "adapter_capture"
     GENERIC_SP_SYNC = "generic_sp_sync"
     OUTPUT_PROJECTION_SYNC = "output_projection_sync"
+    EXACT_LM_HEAD_VJP = "exact_lm_head_vjp"
     ADAPTER_FINALIZER = "adapter_finalizer"
 
 

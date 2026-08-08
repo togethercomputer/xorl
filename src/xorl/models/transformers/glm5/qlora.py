@@ -6,11 +6,30 @@ from collections import Counter
 from dataclasses import dataclass
 
 import torch
+import torch.distributed as dist
 from torch import nn
 
 from xorl.distributed.parallel_state import get_parallel_state
 from xorl.lora.modules.linear import LoraLinear
 from xorl.models.layers.moe.experts import MoEExperts
+from xorl.models.transformers.glm5.exact_absorbed_kv_b_qlora import (
+    Glm52ExactTP1AbsorbedKvBBlockFP8QLoRA,
+)
+from xorl.models.transformers.glm5.exact_dense_mlp import Glm52ExactTP1DenseMLP
+from xorl.models.transformers.glm5.exact_lm_head_qlora import (
+    GLM52_LM_HEAD_GROUP_RANKS,
+    GLM52_LM_HEAD_TP_SIZE,
+    Glm52ExactTP16LmHeadLoraLinear,
+    Glm52ExactTP16LmHeadSelectedLogprob,
+    glm52_lm_head_shard,
+)
+from xorl.models.transformers.glm5.exact_qlora import Glm52ExactTP1BlockFP8QLoRALinear
+from xorl.models.transformers.glm5.exact_routed_experts_qlora import (
+    Glm52ExactEP16BlockFP8QLoRARoutedExperts,
+)
+from xorl.models.transformers.glm5.exact_shared_expert_qlora import (
+    Glm52ExactTP16SharedExpertBlockFP8QLoRA,
+)
 from xorl.models.transformers.glm5.native_fp8 import (
     replace_glm52_native_fp8_modules,
     validate_glm52_native_fp8_config,
@@ -131,8 +150,41 @@ def _validate_official_config(config) -> dict:
         raise ValueError("GLM-5.2 block-FP8 QLoRA is a training lane and cannot use the scoring-only exact contract")
     if getattr(config, "_moe_implementation", None) != "triton":
         raise ValueError("GLM-5.2 block-FP8 QLoRA requires moe_implementation='triton'")
-    if getattr(config, "_ep_dispatch", None) != "deepep":
-        raise ValueError("GLM-5.2 block-FP8 QLoRA requires ep_dispatch='deepep'")
+    exact_dense_component = bool(getattr(config, "_glm52_exact_active_lora_dense_component", False))
+    exact_attention_component = bool(getattr(config, "_glm52_exact_active_lora_attention_component", False))
+    exact_shared_component = bool(getattr(config, "_glm52_exact_active_lora_shared_expert_component", False))
+    exact_routed_component = bool(getattr(config, "_glm52_exact_active_lora_routed_expert_component", False))
+    exact_lm_head_component = bool(getattr(config, "_glm52_exact_active_lora_lm_head_component", False))
+    if exact_attention_component and not exact_dense_component:
+        raise ValueError("GLM-5.2 exact active-LoRA attention component requires the exact active-LoRA dense component")
+    if exact_shared_component and not exact_attention_component:
+        raise ValueError(
+            "GLM-5.2 exact active-LoRA shared-expert component requires the exact active-LoRA attention component"
+        )
+    if exact_routed_component and not exact_shared_component:
+        raise ValueError(
+            "GLM-5.2 exact active-LoRA routed-expert component requires the exact active-LoRA shared-expert component"
+        )
+    if exact_lm_head_component and not exact_routed_component:
+        raise ValueError(
+            "GLM-5.2 exact active-LoRA lm-head component requires the exact active-LoRA routed-expert component"
+        )
+    exact_component_enabled = any(
+        (
+            exact_dense_component,
+            exact_attention_component,
+            exact_shared_component,
+            exact_routed_component,
+            exact_lm_head_component,
+        )
+    )
+    required_ep_dispatch = "alltoall" if exact_component_enabled else "deepep"
+    if getattr(config, "_ep_dispatch", None) != required_ep_dispatch:
+        raise ValueError(f"GLM-5.2 block-FP8 QLoRA requires ep_dispatch={required_ep_dispatch!r}")
+    if exact_dense_component and getattr(config, "hidden_act", None) != "silu":
+        raise ValueError("GLM-5.2 exact active-LoRA dense component requires hidden_act='silu'")
+    if exact_attention_component and not getattr(config, "_sparse_mla_enabled", False):
+        raise ValueError("GLM-5.2 exact active-LoRA attention component requires sparse_mla_enabled=true")
 
     quantization_config = validate_glm52_native_fp8_config(config.quantization_config)
     excluded = quantization_config["modules_to_not_convert"]
@@ -272,6 +324,187 @@ def _replace_dense_target(
     _set_submodule(model, target.name, replacement)
 
 
+def _replace_exact_attention_target(
+    model: nn.Module,
+    target: Glm52AdapterTarget,
+    *,
+    config,
+    adapter_rank: int,
+    adapter_alpha: int,
+) -> None:
+    original = model.get_submodule(target.name)
+    if not isinstance(original, nn.Linear):
+        raise TypeError(f"GLM-5.2 exact attention source {target.name} must be an unadapted nn.Linear")
+    if target.name.endswith(".kv_b_proj"):
+        replacement = Glm52ExactTP1AbsorbedKvBBlockFP8QLoRA(
+            num_heads=config.num_attention_heads,
+            qk_nope_head_dim=config.qk_nope_head_dim,
+            v_head_dim=config.v_head_dim,
+            kv_lora_rank=config.kv_lora_rank,
+            r=adapter_rank,
+            lora_alpha=adapter_alpha,
+            bias=original.bias is not None,
+            device=original.weight.device,
+            tp_size=1,
+        )
+    else:
+        replacement = Glm52ExactTP1BlockFP8QLoRALinear(
+            in_features=target.in_features,
+            out_features=target.out_features,
+            r=adapter_rank,
+            lora_alpha=adapter_alpha,
+            bias=original.bias is not None,
+            device=original.weight.device,
+            enable_aqn=False,
+        )
+    replacement._is_prequantized = True
+    replacement._source_quant_format = "block_fp8"
+    replacement._source_fqn = target.name
+    replacement._merge_sources = None
+    replacement._qlora_expected_skip_keys = {"weight", "weight_scale_inv"}
+    _set_submodule(model, target.name, replacement)
+
+
+def _replace_exact_dense_mlp_root(
+    model: nn.Module,
+    *,
+    layer_idx: int,
+    config,
+    adapter_rank: int,
+    adapter_alpha: int,
+) -> None:
+    mlp_fqn = f"model.layers.{layer_idx}.mlp"
+    original = model.get_submodule(mlp_fqn)
+    for projection in _MLP_TARGETS:
+        module = getattr(original, projection, None)
+        if not isinstance(module, nn.Linear):
+            raise TypeError(f"GLM-5.2 exact dense MLP source {mlp_fqn}.{projection} must be an unadapted nn.Linear")
+    replacement = Glm52ExactTP1DenseMLP(
+        config.hidden_size,
+        config.intermediate_size,
+        r=adapter_rank,
+        lora_alpha=adapter_alpha,
+        bias=False,
+        device=original.gate_proj.weight.device,
+        enable_aqn=False,
+        tp_size=1,
+    )
+    replacement.bind_checkpoint_sources(mlp_fqn)
+    _set_submodule(model, mlp_fqn, replacement)
+
+
+def _replace_exact_shared_expert_root(
+    model: nn.Module,
+    *,
+    layer_idx: int,
+    config,
+    adapter_rank: int,
+    adapter_alpha: int,
+) -> None:
+    shared_fqn = f"model.layers.{layer_idx}.mlp.shared_experts"
+    original = model.get_submodule(shared_fqn)
+    for projection in _MLP_TARGETS:
+        module = getattr(original, projection, None)
+        if not isinstance(module, nn.Linear):
+            raise TypeError(
+                f"GLM-5.2 exact shared-expert source {shared_fqn}.{projection} must be an unadapted nn.Linear"
+            )
+    replacement = Glm52ExactTP16SharedExpertBlockFP8QLoRA(
+        config.hidden_size,
+        config.moe_intermediate_size * config.n_shared_experts,
+        r=adapter_rank,
+        lora_alpha=adapter_alpha,
+        bias=False,
+        device=original.gate_proj.weight.device,
+        enable_aqn=False,
+        tp_size=16,
+    )
+    replacement.bind_checkpoint_sources(shared_fqn)
+    _set_submodule(model, shared_fqn, replacement)
+
+
+def _replace_exact_routed_target(
+    model: nn.Module,
+    target: Glm52AdapterTarget,
+    *,
+    config,
+    adapter_rank: int,
+    adapter_alpha: int,
+    ep_rank: int,
+) -> None:
+    original = model.get_submodule(target.name)
+    if not isinstance(original, MoEExperts):
+        raise TypeError(f"GLM-5.2 exact routed source {target.name} must be an unadapted MoEExperts bank")
+    replacement = Glm52ExactEP16BlockFP8QLoRARoutedExperts(
+        config.hidden_size,
+        config.moe_intermediate_size,
+        ep_rank=ep_rank,
+        r=adapter_rank,
+        lora_alpha=adapter_alpha,
+        num_experts=config.n_routed_experts,
+        ep_size=16,
+        num_local_experts=config.n_routed_experts // 16,
+        moe_tp_size=1,
+        ep_dispatch=config._ep_dispatch,
+        hidden_act=config.hidden_act,
+        device=original.gate_up_proj.device,
+    )
+    replacement._source_fqn = target.name
+    replacement._source_quant_format = "block_fp8"
+    _set_submodule(model, target.name, replacement)
+
+
+def _validate_exact_lm_head_topology() -> tuple[int, dist.ProcessGroup]:
+    parallel_state = get_parallel_state()
+    if getattr(parallel_state, "tp_size", 1) != 1 or getattr(parallel_state, "pp_size", 1) != 1:
+        raise RuntimeError("GLM-5.2 exact active-LoRA lm head requires body TP1 and PP1")
+    if getattr(parallel_state, "lm_head_tp_size", 1) != GLM52_LM_HEAD_TP_SIZE:
+        raise RuntimeError("GLM-5.2 exact active-LoRA lm head requires initialized lm-head TP16")
+    group = getattr(parallel_state, "lm_head_tp_group", None)
+    if group is None or getattr(parallel_state, "lm_head_mesh", None) is None or not dist.is_initialized():
+        raise RuntimeError("GLM-5.2 exact active-LoRA lm head requires initialized lm-head TP16")
+    if dist.get_world_size(group) != GLM52_LM_HEAD_TP_SIZE:
+        raise RuntimeError("GLM-5.2 exact active-LoRA lm head requires initialized lm-head TP16")
+    group_ranks = tuple(dist.get_process_group_ranks(group))
+    if group_ranks != GLM52_LM_HEAD_GROUP_RANKS or dist.get_world_size() != GLM52_LM_HEAD_TP_SIZE:
+        raise RuntimeError("GLM-5.2 exact active-LoRA lm head requires WORLD16 with lm-head group ranks 0..15")
+    if str(dist.get_backend(group)).lower() != "nccl":
+        raise RuntimeError("GLM-5.2 exact active-LoRA lm head requires an NCCL lm-head TP16 group")
+    tp_rank = int(dist.get_rank(group))
+    if not 0 <= tp_rank < GLM52_LM_HEAD_TP_SIZE or dist.get_rank() != group_ranks[tp_rank]:
+        raise RuntimeError("GLM-5.2 exact active-LoRA lm-head group rank is inconsistent")
+    return tp_rank, group
+
+
+def _replace_exact_lm_head_target(
+    model: nn.Module,
+    target: Glm52AdapterTarget,
+    *,
+    adapter_rank: int,
+    adapter_alpha: int,
+    tp_rank: int,
+    tp_group: dist.ProcessGroup,
+) -> None:
+    original = model.get_submodule(target.name)
+    replacement = Glm52ExactTP16LmHeadLoraLinear.from_module(
+        original,
+        r=adapter_rank,
+        lora_alpha=adapter_alpha,
+    )
+    shard = glm52_lm_head_shard(tp_rank)
+    replacement._glm52_exact_selected_logprob = Glm52ExactTP16LmHeadSelectedLogprob(
+        tp_rank=tp_rank,
+        vocab_start=shard.vocab_start,
+        vocab_end=shard.vocab_end,
+        padded_vocab_start=shard.padded_vocab_start,
+        padded_vocab_end=shard.padded_vocab_end,
+        tp_group=tp_group,
+    )
+    replacement._glm52_exact_replicated_parameter_names = ("lora_A",)
+    replacement._source_fqn = target.name
+    _set_submodule(model, target.name, replacement)
+
+
 def _replace_routed_target(
     model: nn.Module, target: Glm52AdapterTarget, *, adapter_rank: int, adapter_alpha: int
 ) -> None:
@@ -327,20 +560,98 @@ def _validate_constructed_model(model: nn.Module, inventory: Glm52AdapterInvento
     expected_quantized = {target.name for target in inventory.targets if target.kind == "block_fp8_linear"}
     expected_heads = {target.name for target in inventory.targets if target.kind == "bf16_linear"}
     expected_banks = {target.name for target in inventory.targets if target.kind == "block_fp8_routed_bank"}
-    actual_quantized = {name for name, module in model.named_modules() if isinstance(module, BlockFP8QLoRALinear)}
+    actual_absorbed_kv_b = {
+        name for name, module in model.named_modules() if isinstance(module, Glm52ExactTP1AbsorbedKvBBlockFP8QLoRA)
+    }
+    actual_quantized = {
+        name
+        for name, module in model.named_modules()
+        if isinstance(module, (BlockFP8QLoRALinear, Glm52ExactTP1AbsorbedKvBBlockFP8QLoRA))
+    }
     actual_heads = {
         name
         for name, module in model.named_modules()
         if isinstance(module, LoraLinear) and not isinstance(module, BlockFP8QLoRALinear)
     }
     actual_banks = {name for name, module in model.named_modules() if isinstance(module, BlockFP8QLoRAMoeExperts)}
-    if (actual_quantized, actual_heads, actual_banks) != (expected_quantized, expected_heads, expected_banks):
+    exact_dense_roots = {name for name, module in model.named_modules() if isinstance(module, Glm52ExactTP1DenseMLP)}
+    exact_shared_roots = {
+        name for name, module in model.named_modules() if isinstance(module, Glm52ExactTP16SharedExpertBlockFP8QLoRA)
+    }
+    exact_routed_roots = {
+        name for name, module in model.named_modules() if isinstance(module, Glm52ExactEP16BlockFP8QLoRARoutedExperts)
+    }
+    expected_exact_dense_roots = (
+        {f"model.layers.{layer_idx}.mlp" for layer_idx in range(3)}
+        if getattr(model.config, "_glm52_exact_active_lora_dense_component", False)
+        else set()
+    )
+    expected_absorbed_kv_b = (
+        {f"model.layers.{layer_idx}.self_attn.kv_b_proj" for layer_idx in range(78)}
+        if getattr(model.config, "_glm52_exact_active_lora_attention_component", False)
+        else set()
+    )
+    expected_exact_shared_roots = (
+        {f"model.layers.{layer_idx}.mlp.shared_experts" for layer_idx in range(3, 78)}
+        if getattr(model.config, "_glm52_exact_active_lora_shared_expert_component", False)
+        else set()
+    )
+    expected_exact_routed_roots = (
+        {f"model.layers.{layer_idx}.mlp.experts" for layer_idx in range(3, 78)}
+        if getattr(model.config, "_glm52_exact_active_lora_routed_expert_component", False)
+        else set()
+    )
+    exact_lm_head_expected = bool(getattr(model.config, "_glm52_exact_active_lora_lm_head_component", False))
+    exact_lm_heads = {
+        name
+        for name, module in model.named_modules()
+        if isinstance(module, LoraLinear) and getattr(module, "_glm52_exact_tp16_lm_head", False)
+    }
+    expected_exact_lm_heads = {"lm_head"} if exact_lm_head_expected else set()
+    fused_logical_targets = {
+        f"{root}.{projection}" for root in expected_exact_dense_roots for projection in ("gate_proj", "up_proj")
+    }
+    exact_shared_logical_targets = {
+        f"{root}.{projection}" for root in expected_exact_shared_roots for projection in _MLP_TARGETS
+    }
+    expected_physical_quantized = expected_quantized - fused_logical_targets - exact_shared_logical_targets
+    expected_physical_banks = expected_banks - expected_exact_routed_roots
+    if (
+        actual_quantized,
+        actual_heads,
+        actual_banks,
+        exact_dense_roots,
+        actual_absorbed_kv_b,
+        exact_shared_roots,
+        exact_routed_roots,
+        exact_lm_heads,
+    ) != (
+        expected_physical_quantized,
+        expected_heads,
+        expected_physical_banks,
+        expected_exact_dense_roots,
+        expected_absorbed_kv_b,
+        expected_exact_shared_roots,
+        expected_exact_routed_roots,
+        expected_exact_lm_heads,
+    ):
         raise RuntimeError(
             "GLM-5.2 QLoRA constructed target set mismatch: "
-            f"quantized_missing={sorted(expected_quantized - actual_quantized)} "
-            f"quantized_extra={sorted(actual_quantized - expected_quantized)} "
+            f"quantized_missing={sorted(expected_physical_quantized - actual_quantized)} "
+            f"quantized_extra={sorted(actual_quantized - expected_physical_quantized)} "
             f"head_missing={sorted(expected_heads - actual_heads)} head_extra={sorted(actual_heads - expected_heads)} "
-            f"bank_missing={sorted(expected_banks - actual_banks)} bank_extra={sorted(actual_banks - expected_banks)}"
+            f"bank_missing={sorted(expected_physical_banks - actual_banks)} "
+            f"bank_extra={sorted(actual_banks - expected_physical_banks)} "
+            f"exact_dense_missing={sorted(expected_exact_dense_roots - exact_dense_roots)} "
+            f"exact_dense_extra={sorted(exact_dense_roots - expected_exact_dense_roots)} "
+            f"absorbed_kv_b_missing={sorted(expected_absorbed_kv_b - actual_absorbed_kv_b)} "
+            f"absorbed_kv_b_extra={sorted(actual_absorbed_kv_b - expected_absorbed_kv_b)} "
+            f"exact_shared_missing={sorted(expected_exact_shared_roots - exact_shared_roots)} "
+            f"exact_shared_extra={sorted(exact_shared_roots - expected_exact_shared_roots)} "
+            f"exact_routed_missing={sorted(expected_exact_routed_roots - exact_routed_roots)} "
+            f"exact_routed_extra={sorted(exact_routed_roots - expected_exact_routed_roots)} "
+            f"exact_lm_head_missing={sorted(expected_exact_lm_heads - exact_lm_heads)} "
+            f"exact_lm_head_extra={sorted(exact_lm_heads - expected_exact_lm_heads)}"
         )
 
     expected_native_indexers = {
@@ -350,7 +661,11 @@ def _validate_constructed_model(model: nn.Module, inventory: Glm52AdapterInvento
         for projection in ("wq_b", "wk")
     }
     actual_native_indexers = {
-        name for name, module in model.named_modules() if isinstance(module, NativeBlockFP8Linear)
+        name
+        for name, module in model.named_modules()
+        if isinstance(module, NativeBlockFP8Linear)
+        and not isinstance(module, (Glm52ExactTP1DenseMLP, Glm52ExactTP1AbsorbedKvBBlockFP8QLoRA))
+        and not any(name.startswith(f"{root}.") for root in expected_exact_shared_roots)
     }
     if actual_native_indexers != expected_native_indexers:
         raise RuntimeError(
@@ -378,6 +693,9 @@ def _validate_constructed_model(model: nn.Module, inventory: Glm52AdapterInvento
             "GLM-5.2 QLoRA trainable factor set mismatch: "
             f"missing={sorted(inventory.factor_names - trainable)} extra={sorted(trainable - inventory.factor_names)}"
         )
+    trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
+    if len({id(parameter) for parameter in trainable_parameters}) != len(trainable_parameters):
+        raise RuntimeError("GLM-5.2 QLoRA trainable factor set contains aliased Parameter identities")
 
     if len(expected_quantized) != GLM52_QLORA_QUANTIZED_LINEAR_COUNT:
         raise RuntimeError(f"GLM-5.2 QLoRA requires 624 quantized dense targets, got {len(expected_quantized)}")
@@ -405,6 +723,25 @@ def prepare_glm52_block_fp8_qlora(
     if adapter_rank <= 0 or adapter_alpha <= 0:
         raise ValueError("GLM-5.2 QLoRA adapter_rank and adapter_alpha must be positive")
     quantization_config = _validate_official_config(config)
+    exact_dense_component = bool(getattr(config, "_glm52_exact_active_lora_dense_component", False))
+    exact_attention_component = bool(getattr(config, "_glm52_exact_active_lora_attention_component", False))
+    exact_shared_component = bool(getattr(config, "_glm52_exact_active_lora_shared_expert_component", False))
+    exact_routed_component = bool(getattr(config, "_glm52_exact_active_lora_routed_expert_component", False))
+    exact_lm_head_component = bool(getattr(config, "_glm52_exact_active_lora_lm_head_component", False))
+    exact_component_enabled = any(
+        (
+            exact_dense_component,
+            exact_attention_component,
+            exact_shared_component,
+            exact_routed_component,
+            exact_lm_head_component,
+        )
+    )
+    if exact_component_enabled and (adapter_rank, adapter_alpha) != (1, 1):
+        raise ValueError(
+            "GLM-5.2 exact active-LoRA component requires adapter_rank=1 and adapter_alpha=1; "
+            f"got rank={adapter_rank}, alpha={adapter_alpha}"
+        )
     targets = _expected_targets(model, config)
     excluded = quantization_config["modules_to_not_convert"]
     accidentally_excluded = sorted(
@@ -413,24 +750,92 @@ def prepare_glm52_block_fp8_qlora(
     if accidentally_excluded:
         raise ValueError(f"GLM-5.2 QLoRA quantized targets are excluded by checkpoint config: {accidentally_excluded}")
 
+    exact_routed_ep_rank: int | None = None
+    if exact_routed_component:
+        parallel_state = get_parallel_state()
+        if not parallel_state.ep_enabled or parallel_state.ep_size != 16:
+            raise RuntimeError("GLM-5.2 exact active-LoRA routed experts require initialized EP16")
+        exact_routed_ep_rank = int(parallel_state.ep_rank)
+        if not 0 <= exact_routed_ep_rank < 16:
+            raise RuntimeError(f"GLM-5.2 exact active-LoRA routed expert rank is invalid: {exact_routed_ep_rank}")
+
+    exact_lm_head_placement: tuple[int, dist.ProcessGroup] | None = None
+    if exact_lm_head_component:
+        exact_lm_head_placement = _validate_exact_lm_head_topology()
+
     for parameter in model.parameters():
         parameter.requires_grad = False
 
+    if exact_dense_component:
+        for layer_idx in range(3):
+            _replace_exact_dense_mlp_root(
+                model,
+                layer_idx=layer_idx,
+                config=config,
+                adapter_rank=adapter_rank,
+                adapter_alpha=adapter_alpha,
+            )
+
+    if exact_shared_component:
+        for layer_idx in range(3, 78):
+            _replace_exact_shared_expert_root(
+                model,
+                layer_idx=layer_idx,
+                config=config,
+                adapter_rank=adapter_rank,
+                adapter_alpha=adapter_alpha,
+            )
+
     for target in targets:
         if target.kind == "block_fp8_linear":
+            if exact_attention_component and target.role.startswith("attention."):
+                _replace_exact_attention_target(
+                    model,
+                    target,
+                    config=config,
+                    adapter_rank=adapter_rank,
+                    adapter_alpha=adapter_alpha,
+                )
+                continue
+            if exact_dense_component and target.role.startswith("dense_mlp."):
+                continue
+            if exact_shared_component and target.role.startswith("shared_expert."):
+                continue
             _replace_dense_target(model, target, adapter_rank=adapter_rank, adapter_alpha=adapter_alpha)
         elif target.kind == "block_fp8_routed_bank":
-            _replace_routed_target(model, target, adapter_rank=adapter_rank, adapter_alpha=adapter_alpha)
+            if exact_routed_component:
+                assert exact_routed_ep_rank is not None
+                _replace_exact_routed_target(
+                    model,
+                    target,
+                    config=config,
+                    adapter_rank=adapter_rank,
+                    adapter_alpha=adapter_alpha,
+                    ep_rank=exact_routed_ep_rank,
+                )
+            else:
+                _replace_routed_target(model, target, adapter_rank=adapter_rank, adapter_alpha=adapter_alpha)
         elif target.kind == "bf16_linear":
-            _set_submodule(
-                model,
-                target.name,
-                LoraLinear.from_module(
-                    model.get_submodule(target.name),
-                    r=adapter_rank,
-                    lora_alpha=adapter_alpha,
-                ),
-            )
+            if exact_lm_head_component:
+                assert exact_lm_head_placement is not None
+                _replace_exact_lm_head_target(
+                    model,
+                    target,
+                    adapter_rank=adapter_rank,
+                    adapter_alpha=adapter_alpha,
+                    tp_rank=exact_lm_head_placement[0],
+                    tp_group=exact_lm_head_placement[1],
+                )
+            else:
+                _set_submodule(
+                    model,
+                    target.name,
+                    LoraLinear.from_module(
+                        model.get_submodule(target.name),
+                        r=adapter_rank,
+                        lora_alpha=adapter_alpha,
+                    ),
+                )
         else:
             raise AssertionError(f"Unknown GLM-5.2 QLoRA target kind: {target.kind}")
 

@@ -1228,7 +1228,14 @@ class ServerArguments:
             raise ValueError("enable_fp8_training is a full-weight mode and cannot be combined with LoRA or QLoRA")
         if self.enable_qarl and (self.enable_lora or self.enable_qlora):
             raise ValueError("enable_qarl is a full-weight mode and cannot be combined with LoRA or QLoRA")
+        if self.max_lora_rank is None:
+            self.max_lora_rank = self.lora_rank
+        if self.max_lora_rank < self.lora_rank:
+            raise ValueError(
+                f"max_lora_rank ({self.max_lora_rank}) must be >= lora_rank ({self.lora_rank}) for the default session"
+            )
         if self.block_fp8_qlora_training:
+            exact_active_lora = (self.lora_rank, self.lora_alpha) == (1, 1)
             requirements = {
                 "enable_lora": (self.enable_lora, True),
                 "enable_qlora": (self.enable_qlora, True),
@@ -1236,11 +1243,28 @@ class ServerArguments:
                 "quant_group_size": (self.quant_group_size, 128),
                 "moe_hybrid_shared_lora": (self.moe_hybrid_shared_lora, True),
                 "moe_implementation": (self.moe_implementation, "triton"),
-                "ep_dispatch": (self.ep_dispatch, "deepep"),
+                "ep_dispatch": (self.ep_dispatch, "alltoall" if exact_active_lora else "deepep"),
                 "freeze_router": (self.freeze_router, True),
                 "merge_qkv": (self.merge_qkv, True),
                 "lora_export_format": (self.lora_export_format, "sglang_shared_outer"),
             }
+            if exact_active_lora:
+                requirements.update(
+                    {
+                        "max_lora_rank": (self.max_lora_rank, 1),
+                        "tensor_parallel_size": (self.tensor_parallel_size, 1),
+                        "pipeline_parallel_size": (self.pipeline_parallel_size, 1),
+                        "expert_parallel_size": (self.expert_parallel_size, 16),
+                        "ulysses_parallel_size": (self.ulysses_parallel_size, 16),
+                        "ringattn_parallel_size": (self.ringattn_parallel_size, 1),
+                        "lm_head_tensor_parallel_size": (self.lm_head_tensor_parallel_size, 16),
+                        "data_parallel_replicate_size": (self.data_parallel_replicate_size, 1),
+                        "data_parallel_shard_size": (self.data_parallel_shard_size, 1),
+                        "data_parallel_mode": (self.data_parallel_mode, "fsdp2"),
+                        "cp_fsdp_mode": (self.cp_fsdp_mode, "all"),
+                        "fsdp_sharded_lm_head_loss": (self.fsdp_sharded_lm_head_loss, True),
+                    }
+                )
             mismatches = [
                 f"{name}={actual!r} (requires {expected!r})"
                 for name, (actual, expected) in requirements.items()
@@ -1327,13 +1351,6 @@ class ServerArguments:
             raise ValueError("merge_lora_interval is not supported with multi-adapter LoRA server training")
         if self.adapter_gradient_ownership_bucket_bytes <= 0:
             raise ValueError("adapter_gradient_ownership_bucket_bytes must be positive")
-        if self.max_lora_rank is None:
-            self.max_lora_rank = self.lora_rank
-        if self.max_lora_rank < self.lora_rank:
-            raise ValueError(
-                f"max_lora_rank ({self.max_lora_rank}) must be >= lora_rank ({self.lora_rank}) for the default session"
-            )
-
         if self.load_weights_mode not in {"grouped", "all_ranks", "skip"}:
             raise ValueError(
                 f"Unsupported load_weights_mode={self.load_weights_mode!r}. Expected one of: grouped, all_ranks, skip."

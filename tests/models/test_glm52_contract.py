@@ -21,7 +21,13 @@ from xorl.models.transformers.glm5.index_share import (
     IndexShareLifecycle,
     IndexShareMode,
 )
-from xorl.models.transformers.glm5.indexer import Glm5DsaIndexer
+from xorl.models.transformers.glm5.indexer import (
+    Glm5DsaIndexer,
+    _fused_bf16_indexer_projection,
+    _fused_sampler_index_k_prepare,
+    _mix_sampler_index_k_preparation,
+    _scale_fused_bf16_indexer_head_gates,
+)
 from xorl.models.transformers.glm5.layer_plan import Glm52LayerPlan
 from xorl.models.transformers.glm5.modeling_glm5 import (
     _GLM52_CANONICAL_TRAINER_TOPOLOGIES,
@@ -419,6 +425,209 @@ def test_sparse_selector_applies_hadamard_before_fp8_quantization(monkeypatch):
 
     assert torch.equal(observed["query"].view(torch.uint8), expected_query.view(torch.uint8))
     assert torch.equal(observed["key"].view(torch.uint8), expected_key.view(torch.uint8))
+
+
+@pytest.mark.cpu
+def test_sparse_selector_fused_contract_skips_hadamard_before_fp8_quantization(monkeypatch):
+    torch.manual_seed(2)
+    query = torch.randn((1, 1, 2, 128), dtype=torch.bfloat16)
+    key = torch.randn((1, 128, 128), dtype=torch.bfloat16)
+    weights = torch.randn((1, 1, 2), dtype=torch.bfloat16)
+    allowed = torch.ones((1, 1, 128), dtype=torch.bool)
+    observed = {}
+    quantize_query = sparse_selector_module.quantize_sparse_query
+    quantize_key = sparse_selector_module.quantize_sparse_key_cache
+
+    def record_query(tensor, **kwargs):
+        observed["query"] = tensor.clone()
+        return quantize_query(tensor, **kwargs)
+
+    def record_key(tensor, **kwargs):
+        observed["key"] = tensor.clone()
+        return quantize_key(tensor, **kwargs)
+
+    monkeypatch.setattr(sparse_selector_module, "quantize_sparse_query", record_query)
+    monkeypatch.setattr(sparse_selector_module, "quantize_sparse_key_cache", record_key)
+
+    select_glm52_logical_indices(
+        query,
+        key,
+        weights,
+        allowed,
+        topk=16,
+        apply_hadamard=False,
+        _native_kernel_for_testing=_fake_fp8_mqa_logits,
+        _selector_for_testing=_reference_select,
+    )
+
+    assert torch.equal(observed["query"].view(torch.uint8), query.view(torch.uint8))
+    assert torch.equal(observed["key"].view(torch.uint8), key.view(torch.uint8))
+
+
+@pytest.mark.cpu
+def test_fused_bf16_indexer_projection_matches_sampler_row_order(monkeypatch):
+    torch.manual_seed(3)
+    hidden = torch.randn((1, 5, 16), dtype=torch.bfloat16)
+    wk = torch.randn((128, 16), dtype=torch.bfloat16)
+    weights_proj = torch.randn((2, 16), dtype=torch.bfloat16)
+    fused_weight = torch.cat((wk, weights_proj), dim=0).contiguous()
+    expected = F.linear(hidden, fused_weight)
+    calls = []
+    linear = F.linear
+
+    def recording_linear(input, weight, bias=None):
+        calls.append((tuple(input.shape), weight.detach().clone()))
+        return linear(input, weight, bias)
+
+    monkeypatch.setattr(indexer_module.F, "linear", recording_linear)
+    index_k, raw_gate = _fused_bf16_indexer_projection(
+        hidden,
+        wk,
+        weights_proj,
+        index_head_dim=128,
+        index_n_heads=2,
+    )
+
+    assert len(calls) == 1
+    assert calls[0][0] == (5, 16)
+    assert torch.equal(calls[0][1].view(torch.uint8), fused_weight.view(torch.uint8))
+    assert torch.equal(index_k.view(torch.uint8), expected[..., :128].view(torch.uint8))
+    assert torch.equal(raw_gate.view(torch.uint8), expected[..., 128:].view(torch.uint8))
+
+
+@pytest.mark.cpu
+def test_fused_bf16_indexer_head_gate_scaling_promotes_before_head_scale():
+    raw_gate = torch.tensor([-6.4375, 11.0, -7.65625, -8.125], dtype=torch.bfloat16)
+
+    scaled = _scale_fused_bf16_indexer_head_gates(raw_gate, index_n_heads=32)
+    expected = raw_gate.float() * 32**-0.5
+    bf16_intermediate = (raw_gate * 32**-0.5).float()
+
+    assert scaled.dtype is torch.float32
+    assert torch.equal(scaled, expected)
+    assert not torch.equal(scaled, bf16_intermediate)
+
+    query_scale = torch.tensor([0.03125, 0.0625, 0.0625, 0.03125], dtype=torch.float32)
+    native_score_weights = scaled * query_scale * 128**-0.5
+    sampler_formula = raw_gate.float() * 32**-0.5 * query_scale * 128**-0.5
+    assert torch.equal(native_score_weights, sampler_formula)
+
+
+@pytest.mark.cpu
+def test_fused_sampler_index_k_prepare_preserves_projection_stride_and_builds_literal_rope_cache():
+    backing = torch.arange(3 * 160, dtype=torch.int32).reshape(1, 3, 160).to(torch.bfloat16)
+    raw_key = backing[..., :128]
+    norm_weight = torch.ones((128,), dtype=torch.float32)
+    norm_bias = torch.zeros((128,), dtype=torch.float32)
+    cos_half = torch.arange(3 * 32, dtype=torch.float32).reshape(1, 3, 32)
+    sin_half = cos_half.neg()
+    cos = torch.cat((cos_half, cos_half), dim=-1)
+    sin = torch.cat((sin_half, sin_half), dim=-1)
+    calls = []
+
+    def recording_kernel(key, weight, bias, eps, cos_sin_cache, positions):
+        calls.append(
+            {
+                "key_stride": key.stride(),
+                "weight": weight.clone(),
+                "bias": bias.clone(),
+                "eps": eps,
+                "cos_sin_cache": cos_sin_cache.clone(),
+                "positions": positions.clone(),
+            }
+        )
+        return key.contiguous()
+
+    prepared = _fused_sampler_index_k_prepare(
+        raw_key,
+        norm_weight,
+        norm_bias,
+        1e-6,
+        (cos, sin),
+        interleaved=True,
+        _native_kernel_for_testing=recording_kernel,
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["key_stride"] == (160, 1)
+    assert torch.equal(calls[0]["weight"], norm_weight)
+    assert torch.equal(calls[0]["bias"], norm_bias)
+    assert calls[0]["eps"] == 1e-6
+    assert torch.equal(calls[0]["cos_sin_cache"], torch.cat((cos_half.reshape(3, 32), sin_half.reshape(3, 32)), -1))
+    assert torch.equal(calls[0]["positions"], torch.arange(3, dtype=torch.int64))
+    assert torch.equal(prepared, raw_key)
+
+
+@pytest.mark.cpu
+def test_sampler_index_k_preparation_uses_split_prompt_and_fused_decode_suffix():
+    split = torch.full((1, 8, 128), 7, dtype=torch.bfloat16)
+    backing = torch.arange(8 * 160, dtype=torch.int32).reshape(1, 8, 160).to(torch.bfloat16)
+    raw = backing[..., :128]
+    weight = torch.ones((128,), dtype=torch.float32)
+    bias = torch.zeros((128,), dtype=torch.float32)
+    cos = torch.ones((1, 8, 64), dtype=torch.float32)
+    sin = torch.zeros_like(cos)
+    calls = []
+
+    def mark_fused_suffix(key, _weight, _bias, _eps, _cache, _positions):
+        calls.append((tuple(key.shape), key.stride()))
+        return torch.full_like(key, 11)
+
+    mixed = _mix_sampler_index_k_preparation(
+        split,
+        raw,
+        weight,
+        bias,
+        1e-6,
+        (cos, sin),
+        torch.tensor([6], dtype=torch.int64),
+        query_offset=2,
+        interleaved=True,
+        _native_kernel_for_testing=mark_fused_suffix,
+    )
+
+    assert calls == [((4, 128), (160, 1))]
+    assert torch.equal(mixed[:, :4], split[:, :4])
+    assert torch.equal(mixed[:, 4:], torch.full_like(mixed[:, 4:], 11))
+
+
+@pytest.mark.cpu
+def test_sampler_index_k_preparation_maps_4096_boundary_across_cp16():
+    local_length = 260
+    split = torch.zeros((1, local_length, 128), dtype=torch.bfloat16)
+    raw = torch.zeros_like(split)
+    weight = torch.ones((128,), dtype=torch.float32)
+    bias = torch.zeros((128,), dtype=torch.float32)
+    cos = torch.ones((1, local_length, 64), dtype=torch.float32)
+    sin = torch.zeros_like(cos)
+
+    for cp_rank in range(16):
+        calls = []
+
+        def record_suffix(key, _weight, _bias, _eps, _cache, _positions):
+            calls.append(key.shape[0])
+            return torch.ones_like(key)
+
+        mixed = _mix_sampler_index_k_preparation(
+            split,
+            raw,
+            weight,
+            bias,
+            1e-6,
+            (cos, sin),
+            torch.tensor([4096], dtype=torch.int64),
+            query_offset=cp_rank * local_length,
+            interleaved=True,
+            _native_kernel_for_testing=record_suffix,
+        )
+
+        if cp_rank < 15:
+            assert calls == []
+            assert torch.equal(mixed, split)
+        else:
+            assert calls == [64]
+            assert torch.equal(mixed[:, :196], split[:, :196])
+            assert torch.equal(mixed[:, 196:], torch.ones_like(mixed[:, 196:]))
 
 
 @pytest.mark.cpu

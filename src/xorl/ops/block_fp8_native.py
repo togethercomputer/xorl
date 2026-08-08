@@ -17,6 +17,46 @@ NATIVE_BLOCK_FP8_CONTRACT_VERSION = "xorl_native_block_fp8_sglang_v1"
 _FP8_DTYPE = torch.float8_e4m3fn
 
 
+def _sglang_native_block_fp8_linear_value(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale_inv: torch.Tensor,
+    *,
+    block_size: tuple[int, int] = (128, 128),
+) -> torch.Tensor:
+    """Run the shared exact-value SGLang W8A8 dispatch.
+
+    Gradient policy belongs to the caller: :class:`NativeBlockFP8Linear`
+    remains scoring-only, while the exact QLoRA wrapper supplies its validated
+    surrogate through a custom autograd boundary.
+    """
+
+    if input.device.type != "cuda":
+        raise RuntimeError("Native block-FP8 forward requires CUDA and the pinned SGLang Triton kernel")
+    if input.dtype is not torch.bfloat16:
+        raise TypeError(f"Native block-FP8 forward requires BF16 activations, got {input.dtype}")
+    if weight.dtype is not _FP8_DTYPE:
+        raise TypeError(f"Native block-FP8 weight must remain float8_e4m3fn, got {weight.dtype}")
+    if weight_scale_inv.dtype is not torch.float32:
+        raise TypeError(f"Native block-FP8 scales must remain FP32, got {weight_scale_inv.dtype}")
+    if input.device != weight.device or input.device != weight_scale_inv.device:
+        raise RuntimeError("Native block-FP8 weight, scales, and input must be on the same CUDA device")
+
+    try:
+        from sglang.srt.layers.quantization.fp8_utils import (  # noqa: PLC0415
+            triton_w8a8_block_fp8_linear,
+        )
+    except Exception as exc:
+        raise RuntimeError("Pinned public SGLang block-FP8 kernel is required for native FP8") from exc
+
+    return triton_w8a8_block_fp8_linear(
+        input,
+        weight,
+        list(block_size),
+        weight_scale_inv,
+    )
+
+
 def pack_fp8_as_float32(weight: torch.Tensor) -> torch.Tensor:
     """Return a contiguous float32 view containing the exact float8 bytes."""
 
@@ -285,33 +325,16 @@ class NativeBlockFP8Linear(nn.Module):
             raise ValueError(
                 f"Native block-FP8 input width {input.shape[-1]} does not match selected range {in_start}:{in_end}"
             )
-        if input.device.type != "cuda":
-            raise RuntimeError("Native block-FP8 forward requires CUDA and the pinned SGLang Triton kernel")
-        if input.dtype is not torch.bfloat16:
-            raise TypeError(f"Native block-FP8 forward requires BF16 activations, got {input.dtype}")
-        if self.weight_scale_inv.dtype is not torch.float32:
-            raise TypeError(f"Native block-FP8 scales must remain FP32, got {self.weight_scale_inv.dtype}")
-
         weight = self.fp8_weight()[out_start:out_end, in_start:in_end].contiguous()
         scale = self.weight_scale_inv[
             out_start // 128 : (out_end + 127) // 128,
             in_start // 128 : (in_end + 127) // 128,
         ].contiguous()
-        if weight.device != input.device or self.weight_scale_inv.device != input.device:
-            raise RuntimeError("Native block-FP8 weight, scales, and input must be on the same CUDA device")
-
-        try:
-            from sglang.srt.layers.quantization.fp8_utils import (  # noqa: PLC0415
-                triton_w8a8_block_fp8_linear,
-            )
-        except Exception as exc:
-            raise RuntimeError("Pinned public SGLang block-FP8 kernel is required for native FP8") from exc
-
-        output = triton_w8a8_block_fp8_linear(
+        output = _sglang_native_block_fp8_linear_value(
             input,
             weight,
-            list(self.block_size),
             scale,
+            block_size=self.block_size,
         )
         return output
 

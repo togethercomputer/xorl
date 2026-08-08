@@ -153,6 +153,8 @@ def test_build_training_model_threads_glm52_block_fp8_qlora_mode(monkeypatch):
 
     def fake_build_foundation_model(**kwargs):
         captured["foundation_flag"] = kwargs["block_fp8_qlora_training"]
+        captured["foundation_rank"] = kwargs["lora_rank"]
+        captured["foundation_alpha"] = kwargs["lora_alpha"]
         return TinyDenseOnlyModel()
 
     def fake_inject_qlora(model, **kwargs):
@@ -186,6 +188,8 @@ def test_build_training_model_threads_glm52_block_fp8_qlora_mode(monkeypatch):
 
     assert captured == {
         "foundation_flag": True,
+        "foundation_rank": 32,
+        "foundation_alpha": 16,
         "inject_flag": True,
         "quant_format": "block_fp8",
         "quant_group_size": 128,

@@ -106,6 +106,10 @@ class _DummyLoRAModel(nn.Module):
         self.model.layers[0].self_attn.o_proj = _DummyLoRALayer(max_rank=max_rank)
 
 
+class _ExactActiveLoRAComponent(nn.Module):
+    _glm52_exact_active_lora_component = True
+
+
 def _build_checkpoint_manager() -> CheckpointManager:
     manager = object.__new__(CheckpointManager)
     manager.rank = 0
@@ -187,6 +191,34 @@ def test_save_adapter_state_raises_before_barrier_when_rank0_write_fails(monkeyp
 
     with pytest.raises(RuntimeError, match="Adapter state save failed: disk full"):
         manager.save_adapter_state("policy-a", path=str(tmp_path / "adapter-save"), save_optimizer=True)
+
+
+def test_exact_active_lora_rejects_full_snapshot_paths_before_downstream_work(monkeypatch, tmp_path):
+    manager = object.__new__(CheckpointManager)
+    manager.model = nn.Sequential(_ExactActiveLoRAComponent())
+
+    monkeypatch.setattr(
+        _MODULE,
+        "get_parallel_state",
+        lambda: (_ for _ in ()).throw(AssertionError("parallel-state resolution must not run")),
+    )
+    monkeypatch.setattr(
+        _MODULE,
+        "ckpt_to_state_dict",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("checkpoint conversion must not run")),
+    )
+
+    with pytest.raises(RuntimeError, match="factor-only adapter publication"):
+        manager.save_full_weights(str(tmp_path / "full"))
+    with pytest.raises(RuntimeError, match="factor-only adapter publication"):
+        manager.save_weights_for_sampler(str(tmp_path / "checkpoint"), str(tmp_path / "sampler"))
+
+
+def test_factor_only_snapshot_guard_leaves_ordinary_models_unrestricted():
+    manager = object.__new__(CheckpointManager)
+    manager.model = nn.Linear(2, 2)
+
+    manager._require_factor_only_exact_active_lora("ordinary save")
 
 
 def test_save_adapter_state_requests_dtype_preserving_lora_checkpoint(monkeypatch, tmp_path):

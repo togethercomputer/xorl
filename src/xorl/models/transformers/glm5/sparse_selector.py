@@ -244,6 +244,7 @@ def select_glm52_logical_indices(
     *,
     topk: int,
     block_size: int = 128,
+    apply_hadamard: bool = True,
     _native_kernel_for_testing: NativeScoreKernel | None = None,
     _selector_for_testing: NativeScoreKernel | None = None,
     _query_quantizer_for_testing: NativeQuantKernel | None = None,
@@ -253,7 +254,8 @@ def select_glm52_logical_indices(
 
     Ties are resolved by the smaller canonical logical key index. The returned
     valid indices are sorted in ascending logical order, followed by ``-1``
-    sentinels when fewer than ``topk`` keys are legal.
+    sentinels when fewer than ``topk`` keys are legal. The fused GLM-5.2
+    indexer sets ``apply_hadamard=False`` because serving omits that transport.
     """
     if index_query.ndim != 4 or index_key.ndim != 3 or head_weights.ndim != 3:
         raise ValueError("Expected query [B,Q,H,D], key [B,K,D], and head_weights [B,Q,H]")
@@ -286,8 +288,9 @@ def select_glm52_logical_indices(
         raise RuntimeError("GLM-5.2 sparse selector native scoring admits only contiguous request-local key prefixes")
 
     with torch.no_grad():
-        index_query = rotate_sparse_selector_activation(index_query)
-        index_key = rotate_sparse_selector_activation(index_key)
+        if apply_hadamard:
+            index_query = rotate_sparse_selector_activation(index_query)
+            index_key = rotate_sparse_selector_activation(index_key)
         q_fp8, q_scales = quantize_sparse_query(
             index_query,
             block_size=block_size,

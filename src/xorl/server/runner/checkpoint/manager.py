@@ -32,6 +32,7 @@ from xorl.distributed.parallel_state import get_parallel_state
 from xorl.lora.target_manifest import load_lora_target_manifest
 from xorl.lora.utils import get_lora_state_dict, save_lora_checkpoint
 from xorl.models import save_model_weights
+from xorl.models.exact_contract import contains_glm52_exact_active_lora_component
 from xorl.server.runner.adapters.manager import save_adapter_optimizer_shards
 from xorl.server.session_spec import write_session_spec
 from xorl.utils import helper
@@ -129,17 +130,26 @@ class CheckpointManager:
                 return True
         return False
 
+    def _assert_no_model_meta_tensors(self, *, stage: str) -> None:
+        meta_parameters = [name for name, parameter in self.model.named_parameters() if self._tensor_is_meta(parameter)]
+        meta_buffers = [name for name, buffer in self.model.named_buffers() if self._tensor_is_meta(buffer)]
+        if meta_parameters or meta_buffers:
+            raise RuntimeError(
+                f"DCP zero-meta gate failed at {stage}: meta_parameters={meta_parameters}, meta_buffers={meta_buffers}"
+            )
+        logger.info("DCP zero-meta gate passed at %s: meta_parameters=0, meta_buffers=0", stage)
+
     def _materialize_meta_tensors_for_dcp_load(self) -> bool:
         if self.train_config.get("load_weights_mode") != "skip":
             return False
-        if not self._model_has_meta_tensors():
-            return False
-
-        device_type = get_device_type()
-        target_device = "cpu" if device_type == "cpu" else f"{device_type}:{self.local_rank}"
-        logger.info("Materializing meta parameters before DCP load via to_empty(device=%s)", target_device)
-        self.model.to_empty(device=target_device)
-        return True
+        materialized = self._model_has_meta_tensors()
+        if materialized:
+            device_type = get_device_type()
+            target_device = "cpu" if device_type == "cpu" else f"{device_type}:{self.local_rank}"
+            logger.info("Materializing meta parameters before DCP load via to_empty(device=%s)", target_device)
+            self.model.to_empty(device=target_device)
+        self._assert_no_model_meta_tensors(stage="post_to_empty")
+        return materialized
 
     def _checkpoint_has_optimizer(self, checkpoint_path: str) -> bool:
         if not os.path.exists(os.path.join(checkpoint_path, ".metadata")):
@@ -273,6 +283,14 @@ class CheckpointManager:
         model_id = self._adapter_manager.current_adapter_id
         if model_id is not None:
             self._require_collective_adapter_publication(model_id, strict=False)
+
+    def _require_factor_only_exact_active_lora(self, operation: str) -> None:
+        if contains_glm52_exact_active_lora_component(self.model):
+            raise RuntimeError(
+                "GLM-5.2 exact active-LoRA composites require factor-only adapter publication; "
+                f"{operation} cannot materialize a merged/full-weight snapshot. Export the complete 1,700-factor "
+                "adapter and start a fresh sampler adapter lifecycle."
+            )
 
     @staticmethod
     def _infer_lora_rank_dim(name: str, tensor: torch.Tensor) -> Optional[int]:
@@ -664,6 +682,7 @@ class CheckpointManager:
         Returns:
             Dictionary with save status, path, and number of shards
         """
+        self._require_factor_only_exact_active_lora("save_full_weights")
         ps = get_parallel_state()
 
         # Use distributed writing only if we have multiple nodes and EP is enabled
@@ -1194,6 +1213,7 @@ class CheckpointManager:
         state = self._build_dcp_load_state(checkpoint_path, load_optimizer=load_optimizer)
 
         self.Checkpointer.load(checkpoint_path, state)
+        self._assert_no_model_meta_tensors(stage="post_dcp_restore")
 
         # Restore state
         self.global_step = state["extra_state"].get("global_step", 0)
@@ -1232,6 +1252,7 @@ class CheckpointManager:
         Returns:
             Dictionary with save status
         """
+        self._require_factor_only_exact_active_lora("legacy save_weights_for_sampler")
         start_time = time.time()
 
         # Convert distributed checkpoint to state dict

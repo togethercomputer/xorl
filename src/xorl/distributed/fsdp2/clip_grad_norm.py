@@ -87,6 +87,11 @@ def ep_fsdp2_clip_grad_norm(
     # reduction; their replicated norm statistics are averaged below so the
     # logical factor is counted once.
     ep_replicated_ids = {id(p) for p in model._ep_param_groups.get("ep_replicated", [])}
+    exact_lm_head_replicated_ids = {
+        id(module.lora_A)
+        for module in model.modules()
+        if getattr(module, "_glm52_exact_tp16_lm_head", False) and getattr(module, "lora_A", None) is not None
+    }
     ep_fsdp_params: List[torch.nn.Parameter] = []
     ep_local_params: List[torch.nn.Parameter] = []  # _skip_fsdp params (not sharded, not reduced)
     ep_replicated_fsdp_params: List[torch.nn.Parameter] = []
@@ -104,8 +109,15 @@ def ep_fsdp2_clip_grad_norm(
             ep_fsdp_params.append(p)
         else:
             ep_local_params.append(p)
+    exact_lm_head_replicated_params: List[torch.nn.Parameter] = [
+        p
+        for p in model._ep_param_groups.get("non_ep", [])
+        if p.grad is not None and id(p) in exact_lm_head_replicated_ids
+    ]
     non_ep_params: List[torch.nn.Parameter] = [
-        p for p in model._ep_param_groups.get("non_ep", []) if p.grad is not None
+        p
+        for p in model._ep_param_groups.get("non_ep", [])
+        if p.grad is not None and id(p) not in exact_lm_head_replicated_ids
     ]
 
     # Note: torchtitan eFSDP design disables FSDP's automatic gradient division for ALL
@@ -124,6 +136,15 @@ def ep_fsdp2_clip_grad_norm(
         params=non_ep_params,
         norm_type=norm_type,
         reduce_groups=non_ep_reduce_groups,
+    )
+    # The exact TP16 lm-head A master is deliberately a plain replicated
+    # Parameter. Its custom VJP already all-reduces dA over the full TP16
+    # group, so reducing its norm over the main FSDP group would count the one
+    # logical factor sixteen times. Count the identical local copy once.
+    exact_lm_head_replicated_total = _fsdp2_reduce_group(
+        params=exact_lm_head_replicated_params,
+        norm_type=norm_type,
+        reduce_groups=[],
     )
 
     # Compute and reduce FSDP-sharded EP norms across ep_fsdp, then ep
@@ -174,17 +195,27 @@ def ep_fsdp2_clip_grad_norm(
             torch.maximum(non_ep_total, ep_fsdp_total),
             torch.maximum(
                 torch.maximum(ep_local_total, ep_replicated_fsdp_total),
-                ep_replicated_local_total,
+                torch.maximum(ep_replicated_local_total, exact_lm_head_replicated_total),
             ),
         )
     else:
         total_norm = (
-            non_ep_total + ep_fsdp_total + ep_local_total + ep_replicated_fsdp_total + ep_replicated_local_total
+            non_ep_total
+            + exact_lm_head_replicated_total
+            + ep_fsdp_total
+            + ep_local_total
+            + ep_replicated_fsdp_total
+            + ep_replicated_local_total
         ) ** (1.0 / float(norm_type))
 
     # Apply the same clip coefficient to all groups
     all_params = (
-        ep_fsdp_params + ep_local_params + ep_replicated_fsdp_params + ep_replicated_local_params + non_ep_params
+        ep_fsdp_params
+        + ep_local_params
+        + ep_replicated_fsdp_params
+        + ep_replicated_local_params
+        + exact_lm_head_replicated_params
+        + non_ep_params
     )
     if error_if_nonfinite:
         finite_checks = [

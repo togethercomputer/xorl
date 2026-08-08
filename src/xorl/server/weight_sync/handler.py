@@ -46,6 +46,7 @@ from xorl.lora.fold import lora_merged_forward_enabled
 from xorl.lora.modules.base import LoraModule
 from xorl.lora.modules.delta_linear import LoraDeltaLinear
 from xorl.lora.modules.linear import LoraLinear
+from xorl.models.exact_contract import contains_glm52_exact_active_lora_component
 from xorl.models.layers.moe.experts import MoEExperts
 from xorl.models.layers.moe.lora import MoEExpertsLoRA
 from xorl.models.transformers.nemotron_h.checkpoint_handler import (
@@ -466,6 +467,14 @@ class WeightSyncHandler:
         if adapter_manager is None:
             return None
 
+        model = getattr(self.trainer, "model", None)
+        if contains_glm52_exact_active_lora_component(model):
+            raise RuntimeError(
+                "GLM-5.2 exact active-LoRA composites require a complete factor-only adapter synchronization "
+                "protocol, which this handler does not implement; legacy merged full-weight synchronization is "
+                "not admitted. Export all 1,700 factors and start a fresh sampler adapter lifecycle."
+            )
+
         resolved_model_id = model_id or getattr(adapter_manager, "current_adapter_id", None) or "default"
         if not adapter_manager.has_adapter(resolved_model_id):
             register_adapter = getattr(self.trainer, "register_lora_adapter", None)
@@ -705,6 +714,14 @@ class WeightSyncHandler:
         in :func:`backends.create_backend`.
         """
         logger.info(f"Rank {self.rank}: [WeightSync] Starting sync_inference_weights")
+
+        model = getattr(self.trainer, "model", None)
+        if contains_glm52_exact_active_lora_component(model):
+            raise RuntimeError(
+                "GLM-5.2 exact active-LoRA composites require factor-only adapter publication; "
+                "legacy merged/full-weight synchronization, including prepacked sparse-delta sync, is not admitted. "
+                "Export all 1,700 factors and start a fresh sampler adapter lifecycle."
+            )
 
         p: SyncWeightsData = command_dict.get("payload", SyncWeightsData())
 
@@ -2039,6 +2056,11 @@ class WeightSyncHandler:
         """
         if collect_results is None:
             collect_results = self.rank == 0
+        if contains_glm52_exact_active_lora_component(fsdp_mod):
+            raise RuntimeError(
+                "GLM-5.2 exact active-LoRA composites cannot enter QLoRA merged-weight collectives; "
+                "export the complete 1,700-factor adapter and start a fresh sampler adapter lifecycle"
+            )
         # Discover QLoRA modules (only those directly owned by this FSDP module,
         # not by child FSDP modules — child modules will be processed separately)
 
@@ -2219,7 +2241,7 @@ class WeightSyncHandler:
                             # forward trains with (fp32 accumulate, cast once).
                             if isinstance(param.data, DTensor):
                                 raise NotImplementedError(
-                                "Canonical merged-LoRA weight sync requires plain (non-DTensor) "
+                                    "Canonical merged-LoRA weight sync requires plain (non-DTensor) "
                                     "expert params (ep_fsdp_size must be 1)"
                                 )
                             local = mod.canonical_merged_proj_weight(proj_name).to(torch.bfloat16)
@@ -4101,6 +4123,12 @@ class WeightSyncHandler:
         Supports both LoraLinear (dense LoRA) and MoEExpertsLoRA (MoE LoRA).
         """
         buffer = []
+
+        if contains_glm52_exact_active_lora_component(fsdp_mod):
+            raise RuntimeError(
+                "GLM-5.2 exact active-LoRA composite internals cannot be extracted by legacy merged-weight sync; "
+                "export the complete 1,700-factor adapter and start a fresh sampler adapter lifecycle"
+            )
 
         # Identify child FSDP module prefixes — their params will be processed
         # when that child module is unsharded separately. Parent unshard may

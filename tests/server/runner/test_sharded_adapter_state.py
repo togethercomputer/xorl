@@ -8,6 +8,8 @@ import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed._tensor import DeviceMesh, DTensor, Shard
 
+from xorl.server.runner.adapters import gradient_ownership as gradient_ownership_module
+from xorl.server.runner.adapters import sharded_state as sharded_state_module
 from xorl.server.runner.adapters.manager import LoRAAdapterManager
 from xorl.server.runner.adapters.sharded_state import (
     AdapterTensorLayout,
@@ -131,6 +133,73 @@ def test_layout_pack_unpack_zeroes_inactive_rank_and_supports_empty_intersection
     assert empty.active_storage_shape == (0, 4)
     assert empty.pack_from_local(torch.ones(2, 4)).shape == (0, 4)
     assert torch.count_nonzero(empty.unpack_to_local(torch.empty(0, 4))) == 0
+
+
+def test_layout_discovery_keeps_identical_empty_fsdp_shards_out_of_replica_classes(monkeypatch):
+    nonempty = _layout(name="lora_A", local_shape=(1, 4), offset=(0, 0), substrate=(1, 4), logical=(1, 4))
+    empty = _layout(name="lora_A", local_shape=(0, 4), offset=(1, 0), substrate=(1, 4), logical=(1, 4))
+    gathered = [
+        {"layouts": [sharded_state_module._descriptor_from_layout(nonempty)], "group_memberships": {}},
+        {"layouts": [sharded_state_module._descriptor_from_layout(empty)], "group_memberships": {}},
+        {"layouts": [sharded_state_module._descriptor_from_layout(empty)], "group_memberships": {}},
+    ]
+
+    model = nn.Module()
+    model.register_parameter("lora_A", nn.Parameter(torch.empty(0, 4)))
+    monkeypatch.setattr(sharded_state_module, "_base_layout_for_parameter", lambda *_args, **_kwargs: empty)
+    monkeypatch.setattr(sharded_state_module.dist, "is_available", lambda: True)
+    monkeypatch.setattr(sharded_state_module.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(sharded_state_module.dist, "get_world_size", lambda group=None: 3)
+    monkeypatch.setattr(sharded_state_module.dist, "get_rank", lambda group=None: 1)
+
+    def _all_gather_object(output, local_payload, group=None):
+        assert local_payload == gathered[1]
+        output[:] = gathered
+
+    monkeypatch.setattr(sharded_state_module.dist, "all_gather_object", _all_gather_object)
+
+    layouts, fingerprint, _ = discover_adapter_layouts(
+        model,
+        {"lora_A": {"rank_dim": 0}},
+        active_rank=1,
+    )
+
+    assert layouts["lora_A"].active_storage_shape == (0, 4)
+    assert layouts["lora_A"].replica_count == 1
+    assert layouts["lora_A"].replica_ranks == (1,)
+    assert fingerprint
+
+    model.lora_A.to_local = lambda: model.lora_A
+    model.lora_A.placements = ("Shard(0)",)
+    plan = gradient_ownership_module.compile_adapter_gradient_ownership(
+        layouts=layouts,
+        model_parameters={"lora_A": model.lora_A},
+        optimizer_parameters={"lora_A": nn.Parameter(torch.empty(0, 4))},
+        declarations={
+            "lora_A": gradient_ownership_module.ParameterOwnershipDeclaration(
+                topology=gradient_ownership_module.TopologyFamily.DENSE_REPLICATED,
+                producer=gradient_ownership_module.ProducerFamily.MODULE_MANAGED,
+                representation=gradient_ownership_module.GradientRepresentation.FSDP_COMPLETED_LOCAL_SHARD,
+                completed_domains=(
+                    gradient_ownership_module.ReductionDomainPlan(
+                        gradient_ownership_module.ReductionAxis.FSDP_SHARD,
+                        gradient_ownership_module.ReductionAuthority.FSDP,
+                        gradient_ownership_module.ReductionOperation.SUM,
+                        "fsdp_shard",
+                    ),
+                ),
+                pending_domains=(),
+                presence=gradient_ownership_module.GradientPresencePolicy.REQUIRED_IF_ACTIVE,
+                config_guard_fingerprint="empty-fsdp-shard",
+                managed_fsdp_shard=True,
+            )
+        },
+        model_generation="model-generation",
+        adapter_generation="adapter-generation",
+        rank=1,
+    )
+    assert plan.parameters[0].norm_replica_divisor == 1
+    assert not plan.parameters[0].requires_local_gradient
 
 
 def test_deterministic_initialization_is_coordinate_and_replica_stable():

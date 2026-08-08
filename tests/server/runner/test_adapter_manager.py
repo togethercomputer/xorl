@@ -727,6 +727,28 @@ def test_authoritative_dense_step_adds_only_the_logical_norm_collective(tmp_path
         manager.begin_gradient_capture("policy-collectives", scale_state=GradientScaleState.RAW_NUMERATOR)
 
 
+def test_exact_lm_head_optimizer_coherence_accepts_scalar_tensor_state(tmp_path, monkeypatch):
+    manager = _build_manager(tmp_path)
+    parameter = nn.Parameter(torch.ones(1))
+    manager._exact_lm_head_replicated_param_names = {"lm_head.lora_A"}
+    state = SimpleNamespace(
+        local_params={"lm_head.lora_A": parameter},
+        optimizer=SimpleNamespace(state={parameter: {"step": torch.tensor(1.0), "exp_avg": torch.ones(1)}}),
+    )
+    group = object()
+
+    monkeypatch.setattr(adapter_manager_module.torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(adapter_manager_module.torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(adapter_manager_module.torch.distributed, "get_world_size", lambda group=None: 16)
+    monkeypatch.setattr(adapter_manager_module.torch.distributed, "all_reduce", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        "xorl.distributed.parallel_state.get_parallel_state",
+        lambda: SimpleNamespace(lm_head_tp_group=group),
+    )
+
+    manager._validate_exact_lm_head_tp_coherence(state, include_optimizer=True)
+
+
 def test_authoritative_semantic_rejection_is_recoverable_before_mutation(tmp_path):
     manager = _build_manager(tmp_path)
     manager.register_adapter("policy-semantic", lr=0.1, initialize_fresh=True)

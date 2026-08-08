@@ -48,6 +48,7 @@ from xorl.distillation import (
     TeacherHeadManager,
 )
 from xorl.distributed.ep_gradients import synchronize_ep_replicated_gradients
+from xorl.distributed.gradient_reduction import GradientReductionDomain
 from xorl.distributed.offloading import build_activation_offloading_context
 from xorl.distributed.parallel_state import get_parallel_state, init_parallel_state
 from xorl.distributed.pipeline_parallel import (
@@ -689,6 +690,7 @@ class ModelRunner:
         memberships: dict[str, tuple[int, ...]] = {}
         sp_group = parallel_state.sp_grad_sync_group
         output_group = getattr(parallel_state, "lm_head_tp_replica_group", None)
+        output_tp_group = getattr(parallel_state, "lm_head_tp_group", None)
         ep_group = (
             parallel_state.ep_group
             if bool(getattr(parallel_state, "ep_enabled", getattr(parallel_state, "ep_size", 1) > 1))
@@ -698,6 +700,8 @@ class ModelRunner:
             memberships["sequence_parallel"] = _public_group_members(sp_group)
         if output_group is not None:
             memberships["output_projection_replica"] = _public_group_members(output_group)
+        if output_tp_group is not None:
+            memberships["output_projection_tp"] = _public_group_members(output_tp_group)
         if ep_group is not None:
             memberships["expert_parallel_replica"] = _public_group_members(ep_group)
         return memberships
@@ -726,6 +730,7 @@ class ModelRunner:
         producer_by_parameter_id: dict[int, ProducerFamily] = {}
         merged_forward_by_parameter_id: dict[int, bool] = {}
         expert_guard_by_parameter_id: dict[int, dict[str, Any]] = {}
+        exact_lm_head_guard_by_parameter_id: dict[int, dict[str, Any]] = {}
 
         def _walk_module_tree(module: nn.Module, *, inherited_fsdp: bool = False, direct: bool = False) -> None:
             managed_fsdp = inherited_fsdp or isinstance(module, FSDPModule)
@@ -748,10 +753,37 @@ class ModelRunner:
                 if has_expert_adapter_factors:
                     quant_format = getattr(module, "quant_format", None)
                     if quant_format is not None:
+                        from xorl.models.transformers.glm5.exact_routed_experts_qlora import (  # noqa: PLC0415
+                            GLM52_EXACT_EP16_ROUTED_QLORA_CONTRACT_VERSION,
+                            Glm52ExactEP16BlockFP8QLoRARoutedExperts,
+                        )
                         from xorl.qlora.modules.moe_experts import BlockFP8QLoRAMoeExperts  # noqa: PLC0415
 
                         ep_dispatch = getattr(module, "ep_dispatch", None)
                         hybrid_shared = getattr(module, "hybrid_shared", None)
+                        exact_routed_type_is_certified = isinstance(
+                            module, Glm52ExactEP16BlockFP8QLoRARoutedExperts
+                        ) and (
+                            type(module) is Glm52ExactEP16BlockFP8QLoRARoutedExperts or isinstance(module, FSDPModule)
+                        )
+                        certified_glm52_exact_routed = (
+                            exact_routed_type_is_certified
+                            and getattr(module, "contract_version", None)
+                            == GLM52_EXACT_EP16_ROUTED_QLORA_CONTRACT_VERSION
+                            and quant_format == "block_fp8"
+                            and expert_backend == "triton"
+                            and ep_dispatch == "alltoall"
+                            and hybrid_shared is True
+                            and getattr(module, "ep_size", None) == 16
+                            and getattr(module, "num_experts", None) == 256
+                            and getattr(module, "num_local_experts", None) == 16
+                            and getattr(module, "moe_tp_size", None) == 1
+                            and getattr(module, "_glm52_exact_active_lora_component", False) is True
+                            and getattr(module, "r", None) == 1
+                            and getattr(module, "active_r", None) == 1
+                            and getattr(module, "lora_alpha", None) == 1
+                            and getattr(module, "active_lora_alpha", None) == 1
+                        )
                         certified_glm52_block_fp8 = (
                             type(module) is BlockFP8QLoRAMoeExperts
                             and quant_format == "block_fp8"
@@ -759,21 +791,34 @@ class ModelRunner:
                             and ep_dispatch == "deepep"
                             and hybrid_shared is True
                         )
-                        if not certified_glm52_block_fp8:
+                        if not (certified_glm52_block_fp8 or certified_glm52_exact_routed):
                             raise AdapterGradientOwnershipError(
                                 "Quantized expert-factor LoRA is admitted only for the certified GLM-5.2 "
-                                "BlockFP8QLoRAMoeExperts lane with block_fp8 + triton + DeepEP + hybrid-shared; "
+                                "BlockFP8QLoRAMoeExperts DeepEP lane or the exact EP16 alltoall routed lane; "
                                 f"got type={type(module).__qualname__}, quant_format={quant_format!r}, "
                                 f"expert_backend={expert_backend!r}, ep_dispatch={ep_dispatch!r}, "
                                 f"hybrid_shared={hybrid_shared!r}"
                             )
                         expert_guard = {
-                            "expert_module": "BlockFP8QLoRAMoeExperts",
+                            "expert_module": (
+                                Glm52ExactEP16BlockFP8QLoRARoutedExperts.__qualname__
+                                if certified_glm52_exact_routed
+                                else type(module).__qualname__
+                            ),
                             "expert_quant_format": quant_format,
                             "expert_backend": expert_backend,
                             "expert_ep_dispatch": ep_dispatch,
                             "expert_hybrid_shared": hybrid_shared,
                         }
+                        if certified_glm52_exact_routed:
+                            expert_guard.update(
+                                {
+                                    "expert_exact_contract": module.contract_version,
+                                    "expert_ep_size": module.ep_size,
+                                    "expert_moe_tp_size": module.moe_tp_size,
+                                    "expert_fsdp_unit": isinstance(module, FSDPModule),
+                                }
+                            )
                     elif expert_backend not in {"eager", "triton"}:
                         raise AdapterGradientOwnershipError(
                             "Authoritative adapter-gradient ownership admits only the analytically "
@@ -792,6 +837,19 @@ class ModelRunner:
                         producer_by_parameter_id[id(parameter)] = producer
                     if expert_guard is not None:
                         expert_guard_by_parameter_id[id(parameter)] = dict(expert_guard)
+                    if getattr(module, "_glm52_exact_tp16_lm_head", False):
+                        exact_op = getattr(module, "_glm52_exact_selected_logprob", None)
+                        contract_version = getattr(exact_op, "contract_version", None)
+                        if not isinstance(contract_version, str) or not contract_version:
+                            raise AdapterGradientOwnershipError(
+                                "Exact GLM-5.2 lm-head factors require a selected-logprob contract version"
+                            )
+                        exact_lm_head_guard_by_parameter_id[id(parameter)] = {
+                            "exact_lm_head_contract": contract_version,
+                            "exact_lm_head_factor": local_name,
+                            "exact_lm_head_tp_size": 16,
+                            "exact_lm_head_vjp_tp_completed": True,
+                        }
                     if direct:
                         direct_parameter_ids.add(id(parameter))
                     if managed_fsdp and hasattr(parameter, "to_local") and hasattr(parameter, "placements"):
@@ -800,6 +858,74 @@ class ModelRunner:
                 _walk_module_tree(child, inherited_fsdp=managed_fsdp, direct=direct)
 
         _walk_module_tree(self.model)
+
+        exact_routed_shared_factors = {"gate_proj_lora_A", "up_proj_lora_A", "down_proj_lora_B"}
+        exact_routed_owner_factors = {"gate_proj_lora_B", "up_proj_lora_B", "down_proj_lora_A"}
+        exact_routed_factor_groups: dict[str, set[str]] = {}
+        for name, layout in state.tensor_layouts.items():
+            parameter = named_parameters[name]
+            expert_guard = expert_guard_by_parameter_id.get(id(parameter), {})
+            if "expert_exact_contract" not in expert_guard:
+                continue
+
+            owner_path, separator, local_name = name.rpartition(".")
+            if not separator or local_name not in exact_routed_shared_factors | exact_routed_owner_factors:
+                raise AdapterGradientOwnershipError(
+                    f"Exact GLM-5.2 routed ownership found an unexpected factor {name!r}"
+                )
+            exact_routed_factor_groups.setdefault(owner_path, set()).add(local_name)
+
+            if expert_guard.get("expert_fsdp_unit") is not True:
+                raise AdapterGradientOwnershipError(
+                    f"Exact GLM-5.2 routed factor {name!r} is not managed by its expert FSDP unit"
+                )
+            if id(parameter) not in managed_fsdp_parameter_ids:
+                raise AdapterGradientOwnershipError(
+                    f"Exact GLM-5.2 routed factor {name!r} lacks managed FSDP ownership"
+                )
+            if not (hasattr(parameter, "to_local") and hasattr(parameter, "placements")):
+                raise AdapterGradientOwnershipError(f"Exact GLM-5.2 routed factor {name!r} is not an FSDP DTensor")
+            if not layout.logical_shape or not layout.local_logical_shape:
+                raise AdapterGradientOwnershipError(
+                    f"Exact GLM-5.2 routed factor {name!r} has an empty ownership shape"
+                )
+
+            if local_name in exact_routed_shared_factors:
+                valid = (
+                    layout.logical_shape[0] == 1
+                    and layout.local_logical_shape[0] == 1
+                    and layout.replica_count == 16
+                    and layout.is_ep_owned
+                    and layout.gradient_reduction is GradientReductionDomain.EP_SUM
+                    and layout.needs_ep_gradient_sync
+                )
+                expected = "logical/local leading 1, sixteen EP replicas, and one EP_SUM disposition"
+            else:
+                valid = (
+                    layout.logical_shape[0] == 256
+                    and layout.local_logical_shape[0] == 16
+                    and layout.replica_count == 1
+                    and layout.is_ep_owned
+                    and layout.gradient_reduction is GradientReductionDomain.NONE
+                    and not layout.needs_ep_gradient_sync
+                )
+                expected = "logical leading 256, owner-local leading 16, one owner, and no EP sum"
+            if not valid:
+                raise AdapterGradientOwnershipError(
+                    f"Exact GLM-5.2 routed factor {name!r} has an invalid ownership layout; expected {expected}; "
+                    f"got logical={layout.logical_shape}, local={layout.local_logical_shape}, "
+                    f"replicas={layout.replica_count}, ep_owned={layout.is_ep_owned}, "
+                    f"gradient_reduction={layout.gradient_reduction.value!r}"
+                )
+
+        exact_routed_factor_names = exact_routed_shared_factors | exact_routed_owner_factors
+        for owner_path, factor_names in exact_routed_factor_groups.items():
+            if factor_names != exact_routed_factor_names:
+                raise AdapterGradientOwnershipError(
+                    f"Exact GLM-5.2 routed FSDP unit {owner_path!r} does not expose exactly six factors; "
+                    f"missing={sorted(exact_routed_factor_names - factor_names)}, "
+                    f"extra={sorted(factor_names - exact_routed_factor_names)}"
+                )
 
         sp_group = parallel_state.sp_grad_sync_group
         local_group_memberships = self._local_adapter_gradient_group_memberships(parallel_state)
@@ -862,6 +988,16 @@ class ModelRunner:
                         "fsdp_shard",
                     )
                 )
+            exact_lm_head_guard = exact_lm_head_guard_by_parameter_id.get(id(parameter))
+            if exact_lm_head_guard is not None and exact_lm_head_guard["exact_lm_head_factor"] == "lora_A":
+                completed.append(
+                    ReductionDomainPlan(
+                        ReductionAxis.OUTPUT_PROJECTION_REPLICA,
+                        ReductionAuthority.EXACT_LM_HEAD_VJP,
+                        ReductionOperation.SUM,
+                        "output_projection_tp",
+                    )
+                )
             if sp_group is not None:
                 pending.append(
                     ReductionDomainPlan(
@@ -889,6 +1025,20 @@ class ModelRunner:
                         "expert_parallel_replica",
                     )
                 )
+            exact_routed_guard = expert_guard_by_parameter_id.get(id(parameter), {})
+            if "expert_exact_contract" in exact_routed_guard:
+                local_name = name.rpartition(".")[2]
+                ep_pending = [domain for domain in pending if domain.axis is ReductionAxis.EXPERT_PARALLEL_REPLICA]
+                if local_name in exact_routed_shared_factors:
+                    if topology is not TopologyFamily.EP_REPLICATED_SHARED or len(ep_pending) != 1:
+                        raise AdapterGradientOwnershipError(
+                            f"Exact GLM-5.2 shared routed factor {name!r} requires EP_REPLICATED_SHARED "
+                            "with exactly one pending EP sum"
+                        )
+                elif topology is not TopologyFamily.OWNER_SHARDED or ep_pending:
+                    raise AdapterGradientOwnershipError(
+                        f"Exact GLM-5.2 owner routed factor {name!r} requires OWNER_SHARDED with no EP sum"
+                    )
             guard_payload = {
                 "producer": producer.value,
                 "topology": topology.value,
@@ -902,6 +1052,7 @@ class ModelRunner:
                 "lora_alpha": int(state.session_spec["lora_config"]["lora_alpha"]),
             }
             guard_payload.update(expert_guard_by_parameter_id.get(id(parameter), {}))
+            guard_payload.update(exact_lm_head_guard_by_parameter_id.get(id(parameter), {}))
             guard_payloads[name] = guard_payload
             declarations[name] = ParameterOwnershipDeclaration(
                 topology=topology,
@@ -1272,6 +1423,12 @@ class ModelRunner:
         )
 
         self.model = result.model
+        if getattr(get_parallel_state(), "lm_head_tp_size", 1) > 1:
+            sync_lm_head_tp_parameters(
+                self.model,
+                get_parallel_state().lm_head_tp_replica_group,
+                get_parallel_state().lm_head_tp_group,
+            )
         self.model_config_obj = result.model_config
         numerical_program = self.model_config_obj._resolved_numerical_program
         self.model_config.update(
@@ -1630,6 +1787,13 @@ class ModelRunner:
         """Get lm_head weight, merging LoRA delta on-the-fly if needed."""
         lm_head = self.model.lm_head
         if isinstance(lm_head, LoraLinear):
+            if getattr(lm_head, "_glm52_exact_tp16_lm_head", False):
+                # The exact selected-logprob op consumes the physical local
+                # base shard plus live A/B factors. Materializing B@A here
+                # would both duplicate TP16 state and change the value program.
+                if lora_merged_forward_enabled(lm_head):
+                    raise RuntimeError("The exact GLM-5.2 lm head rejects merged-forward mode")
+                return lm_head.weight
             if lora_merged_forward_enabled(lm_head):
                 # The loss path consumes the LM-head weight directly instead
                 # of calling ``LoraLinear.forward``.  Use the same canonical
@@ -1658,6 +1822,14 @@ class ModelRunner:
         except ImportError:  # pragma: no cover - optional in lightweight import contexts.
             return None
         return lm_head if isinstance(lm_head, FP8Linear) else None
+
+    @staticmethod
+    def _get_loss_lm_head_module(lm_head):
+        """Return a module that owns the loss projection, when one is required."""
+
+        if lm_head is not None and getattr(lm_head, "_glm52_exact_tp16_lm_head", False):
+            return lm_head
+        return ModelRunner._get_fp8_lm_head_module(lm_head)
 
     def _collect_per_token_outputs(self, per_token_tensors, micro_batch, accumulators):
         """Gather per-token outputs across the unified SP group and append to accumulators."""
@@ -5394,7 +5566,7 @@ class ModelRunner:
         }
 
         effective_weight = self._get_effective_lm_head_weight()
-        fp8_lm_head = self._get_fp8_lm_head_module(getattr(self.model, "lm_head", None))
+        loss_lm_head = self._get_loss_lm_head_module(getattr(self.model, "lm_head", None))
         token_sum_reducer = TokenPartial(scale=torch.tensor(1.0, device=hidden_states.device))
         loss_tp_group = self._get_loss_tp_group()
         result = causallm_loss_function(
@@ -5406,7 +5578,7 @@ class ModelRunner:
             lm_head_fp32=self.lm_head_fp32,
             loss_reducer=token_sum_reducer,
             tp_group=loss_tp_group,
-            lm_head=fp8_lm_head,
+            lm_head=loss_lm_head,
             logprob_temperature=logprob_temperature,
         )
 
@@ -5426,7 +5598,7 @@ class ModelRunner:
                 weight=effective_weight,
                 labels=labels,
                 topk=diagnostic_topk,
-                lm_head=fp8_lm_head,
+                lm_head=loss_lm_head,
                 lm_head_fp32=self.lm_head_fp32,
                 per_token_logprobs=result.per_token_logprobs if return_per_token else None,
                 include_weight_reference=diagnostic_reference_logits,
@@ -5464,6 +5636,21 @@ class ModelRunner:
 
         exclude_keys = self._LOSS_EXCLUDE_KEYS.get(loss_fn, set())
         model_inputs = {k: v for k, v in micro_batch.items() if k not in exclude_keys}
+        sampler_prefill_lengths = params.get("sampler_prefill_lengths")
+        if sampler_prefill_lengths is not None:
+            if isinstance(sampler_prefill_lengths, int):
+                sampler_prefill_lengths = [sampler_prefill_lengths]
+            if not isinstance(sampler_prefill_lengths, (list, tuple)) or not sampler_prefill_lengths:
+                raise ValueError("sampler_prefill_lengths must be a nonempty integer list")
+            if any(
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in sampler_prefill_lengths
+            ):
+                raise ValueError("sampler_prefill_lengths must contain positive integers")
+            model_inputs["sampler_prefill_lengths"] = torch.tensor(
+                sampler_prefill_lengths,
+                dtype=torch.long,
+                device=model_inputs["input_ids"].device,
+            )
 
         # Shared-prefix: the dispatcher already repacked input_ids / loss fields and
         # attached a SharedPrefixContext. Move its index tensors to the model device
@@ -5648,7 +5835,7 @@ class ModelRunner:
             )
             logger.info("Full hidden-component diagnostic tensors saved to %s", saved_path)
         effective_weight = self._get_effective_lm_head_weight()
-        fp8_lm_head = self._get_fp8_lm_head_module(getattr(self.model, "lm_head", None))
+        loss_lm_head = self._get_loss_lm_head_module(getattr(self.model, "lm_head", None))
         loss_lm_head_fp32 = self.lm_head_fp32
         if "lm_head_fp32" in params:
             raw_lm_head_fp32 = params["lm_head_fp32"]
@@ -5682,7 +5869,7 @@ class ModelRunner:
                 lm_head_fp32=loss_lm_head_fp32,
                 loss_reducer=token_sum_reducer,
                 tp_group=loss_tp_group,
-                lm_head=fp8_lm_head,
+                lm_head=loss_lm_head,
                 logprob_temperature=logprob_temperature,
             )
             local_loss_sum = _result.loss
@@ -5702,7 +5889,7 @@ class ModelRunner:
                     weight=effective_weight,
                     labels=labels,
                     topk=diagnostic_topk,
-                    lm_head=fp8_lm_head,
+                    lm_head=loss_lm_head,
                     lm_head_fp32=loss_lm_head_fp32,
                     per_token_logprobs=_result.per_token_logprobs,
                     include_weight_reference=diagnostic_reference_logits,
@@ -5734,7 +5921,7 @@ class ModelRunner:
                 loss_reducer=token_sum_reducer,
                 metric_reducer=token_sum_reducer,
                 tp_group=loss_tp_group,
-                lm_head=fp8_lm_head,
+                lm_head=loss_lm_head,
                 logprob_temperature=logprob_temperature,
             )
             local_loss_sum = _result.loss
@@ -5759,7 +5946,7 @@ class ModelRunner:
                     weight=effective_weight,
                     labels=target_tokens,
                     topk=diagnostic_topk,
-                    lm_head=fp8_lm_head,
+                    lm_head=loss_lm_head,
                     lm_head_fp32=loss_lm_head_fp32,
                     per_token_logprobs=_result.per_token_logprobs,
                     include_weight_reference=diagnostic_reference_logits,
@@ -5787,8 +5974,6 @@ class ModelRunner:
             if kl_type in {"low_var_kl", "low_variance_kl"}:
                 kl_type = "k3"
 
-            parallel_state = get_parallel_state()
-            tp_group = parallel_state.tp_group if parallel_state.tp_enabled else None
             _result = drgrpo_loss_function(
                 hidden_states=hidden_states,
                 weight=effective_weight,
@@ -5803,11 +5988,11 @@ class ModelRunner:
                 kl_type=kl_type,
                 ce_mode=self.ce_mode,
                 num_chunks=params.get("num_chunks", 8),
-                tp_group=tp_group,
+                tp_group=loss_tp_group,
                 lm_head_fp32=loss_lm_head_fp32,
                 loss_reducer=token_sum_reducer,
                 metric_reducer=token_sum_reducer,
-                lm_head=fp8_lm_head,
+                lm_head=loss_lm_head,
                 logprob_temperature=logprob_temperature,
             )
             local_loss_sum = _result.loss
@@ -5858,7 +6043,7 @@ class ModelRunner:
                 loss_reducer=token_sum_reducer,
                 metric_reducer=token_sum_reducer,
                 tp_group=loss_tp_group,
-                lm_head=fp8_lm_head,
+                lm_head=loss_lm_head,
                 logprob_temperature=logprob_temperature,
             )
             local_loss_sum = _result.loss
@@ -6721,7 +6906,7 @@ class ModelRunner:
                         ce_mode=self.ce_mode,
                         lm_head_fp32=self.lm_head_fp32,
                         loss_reducer=TokenPartial(scale=torch.tensor(1.0, device=hidden_per_mb[batch_idx].device)),
-                        lm_head=self._get_fp8_lm_head_module(lm_head),
+                        lm_head=self._get_loss_lm_head_module(lm_head),
                     )
                     payloads.append(
                         [
@@ -6986,7 +7171,7 @@ class ModelRunner:
                     hidden_states = outputs.last_hidden_state
 
                     effective_weight = self._get_effective_lm_head_weight()
-                    fp8_lm_head = self._get_fp8_lm_head_module(getattr(self.model, "lm_head", None))
+                    loss_lm_head = self._get_loss_lm_head_module(getattr(self.model, "lm_head", None))
 
                     labels = mb.get("target_tokens", mb.get("labels"))
 
@@ -6999,7 +7184,7 @@ class ModelRunner:
                         ce_mode=self.ce_mode,
                         lm_head_fp32=self.lm_head_fp32,
                         tp_group=self._get_loss_tp_group(),
-                        lm_head=fp8_lm_head,
+                        lm_head=loss_lm_head,
                         logprob_temperature=ref_logprob_temperature,
                     )
                     ref_logprobs = _ref_result.per_token_logprobs
@@ -7521,7 +7706,11 @@ class ModelRunner:
         self.global_step = self._checkpoint_mgr.global_step
         self.global_forward_backward_step = self._checkpoint_mgr.global_forward_backward_step
         if getattr(get_parallel_state(), "lm_head_tp_size", 1) > 1:
-            sync_lm_head_tp_parameters(self.model, get_parallel_state().lm_head_tp_replica_group)
+            sync_lm_head_tp_parameters(
+                self.model,
+                get_parallel_state().lm_head_tp_replica_group,
+                get_parallel_state().lm_head_tp_group,
+            )
 
     def save_adapter_state(self, model_id, path=None, save_optimizer=True):
         self._sync_checkpoint_state()

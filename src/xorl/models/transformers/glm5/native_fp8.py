@@ -156,7 +156,10 @@ class Glm52NativeBlockFP8Experts(nn.Module):
                     if parameter.is_meta
                     else parameter.to(device=probe.device, dtype=torch.float32)
                 )
-                replacements[name] = nn.Parameter(value, requires_grad=False)
+                replacement = nn.Parameter(value, requires_grad=False)
+                if hasattr(parameter, "spec_info"):
+                    replacement.spec_info = parameter.spec_info
+                replacements[name] = replacement
         except Exception:
             self._parameters.update(protected)
             raise

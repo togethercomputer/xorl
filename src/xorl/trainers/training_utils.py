@@ -97,7 +97,11 @@ def _group_root_rank(group) -> int:
     return int(dist.get_process_group_ranks(group)[0])
 
 
-def sync_lm_head_tp_parameters(model: torch.nn.Module, lm_head_tp_replica_group) -> None:
+def sync_lm_head_tp_parameters(
+    model: torch.nn.Module,
+    lm_head_tp_replica_group,
+    lm_head_tp_group=None,
+) -> None:
     """Broadcast lm-head-TP parameter shards over the replica dim after load.
 
     The lm-head-only TP mesh shards vocab rows over ``lm_head_tp`` and replicates
@@ -106,12 +110,24 @@ def sync_lm_head_tp_parameters(model: torch.nn.Module, lm_head_tp_replica_group)
     identical. This post-load sync makes that invariant explicit for DCP loads
     and model-only replay loads.
     """
-    if lm_head_tp_replica_group is None:
-        return
-    if dist.get_world_size(lm_head_tp_replica_group) <= 1:
-        return
-    src = _group_root_rank(lm_head_tp_replica_group)
     with torch.no_grad():
+        # Exact GLM-5.2 A is the one parameter intentionally ignored by the
+        # vocab-sharding FSDP unit. Its custom VJP TP-sums dA, so the masters
+        # remain identical after they begin from identical bytes. Establish
+        # that invariant explicitly after initialization and every restore.
+        if lm_head_tp_group is not None and dist.get_world_size(lm_head_tp_group) > 1:
+            exact_src = _group_root_rank(lm_head_tp_group)
+            for module in model.modules():
+                if not getattr(module, "_glm52_exact_tp16_lm_head", False):
+                    continue
+                parameter = getattr(module, "lora_A", None)
+                if parameter is None or (DTensor is not None and isinstance(parameter, DTensor)):
+                    raise RuntimeError("The exact GLM-5.2 lm-head lora_A must remain a plain replicated Parameter")
+                dist.broadcast(parameter.data, src=exact_src, group=lm_head_tp_group)
+
+        if lm_head_tp_replica_group is None or dist.get_world_size(lm_head_tp_replica_group) <= 1:
+            return
+        src = _group_root_rank(lm_head_tp_replica_group)
         for module in model.modules():
             if not getattr(module, "_xorl_fsdp_sharded_lm_head_loss", False):
                 continue

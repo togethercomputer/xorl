@@ -17,6 +17,7 @@ from transformers import (
 from ..distributed.parallel_state import get_parallel_state
 from ..ops.moe.triton import resolve_routing_weights_before_down, set_routing_weights_before_down
 from ..utils import logging
+from .exact_contract import glm52_exact_active_lora_enabled, glm52_exact_forward_enabled, set_glm52_exact_active_lora
 from .layers.attention import get_attention_fn
 from .layers.normalization import set_rmsnorm_mode
 from .layers.rope import set_rope_class_b, set_rope_native
@@ -221,7 +222,7 @@ def _is_canonical_glm52(config: PretrainedConfig) -> bool:
 
 
 def _is_exact_glm52(config: PretrainedConfig) -> bool:
-    return bool(getattr(config, "_glm52_exact_contract", False))
+    return glm52_exact_forward_enabled(config)
 
 
 def _validate_canonical_glm52_model_scope(config: PretrainedConfig) -> None:
@@ -586,6 +587,8 @@ def build_foundation_model(
     flash_attention_deterministic: bool = False,
     server_training: bool = False,
     block_fp8_qlora_training: bool = False,
+    lora_rank: Optional[int] = None,
+    lora_alpha: Optional[int] = None,
     init_device: Literal["cpu", "cuda", "npu", "meta"] = "cuda",
     config_kwargs: Optional[Dict[str, Any]] = None,
 ) -> nn.Module:
@@ -607,9 +610,13 @@ def build_foundation_model(
     glm52_model = _is_canonical_glm52(config)
     if block_fp8_qlora_training and not glm52_model:
         raise ValueError("block_fp8_qlora_training is supported only for the official GLM-5.2 model")
+    exact_active_lora = bool(
+        server_training and glm52_model and block_fp8_qlora_training and (lora_rank, lora_alpha) == (1, 1)
+    )
     config._glm52_block_fp8_qlora = bool(block_fp8_qlora_training)
     config._glm52_exact_contract = bool(server_training and glm52_model and not block_fp8_qlora_training)
-    canonical_glm52 = config._glm52_exact_contract
+    set_glm52_exact_active_lora(config, enabled=exact_active_lora)
+    canonical_glm52 = _is_exact_glm52(config)
     qwen35_model_type = getattr(config, "model_type", None) in {
         "xorl_qwen3_5",
         "xorl_qwen3_5_moe",
@@ -734,7 +741,25 @@ def build_foundation_model(
     ps = get_parallel_state()
     _validate_exact_qwen35_topology(config, ps)
     if isinstance(config, Glm5Config) and config.num_hidden_layers == 78:
-        if canonical_glm52 and server_training:
+        if glm52_exact_active_lora_enabled(config):
+            topology = (
+                ps.world_size,
+                ps.pp_size,
+                ps.tp_size,
+                ps.dp_size,
+                ps.ep_size,
+                ps.cp_size,
+            )
+            certified = (16, 1, 1, 1, 16, 16)
+            lm_head_tp_size = getattr(ps, "lm_head_tp_size", 1)
+            if topology != certified or ps.ringattn_size != 1 or ps.ulysses_size != 16 or lm_head_tp_size != 16:
+                raise ValueError(
+                    "The GLM-5.2 exact active-LoRA path is certified only for "
+                    f"WORLD/PP/TP/DP/EP/CP={certified} with Ring1/Ulysses16/lm-head-TP16; got {topology} "
+                    f"with Ring{ps.ringattn_size}/Ulysses{ps.ulysses_size}/lm-head-TP{lm_head_tp_size}"
+                )
+            config._glm52_pipeline_layer_ranges = ((0, 78),)
+        elif canonical_glm52 and server_training:
             topology = (
                 ps.world_size,
                 ps.pp_size,

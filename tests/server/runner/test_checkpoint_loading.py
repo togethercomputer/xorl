@@ -2,6 +2,7 @@ import pytest
 import torch
 from torch import nn
 
+from xorl.server.runner.checkpoint import manager as checkpoint_manager_module
 from xorl.server.runner.checkpoint.manager import CheckpointManager
 from xorl.server.runner.model_runner import ModelRunner
 
@@ -13,11 +14,13 @@ class _MetaModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.weight = nn.Parameter(torch.empty(2, device="meta"))
+        self.register_buffer("cache", torch.empty(2, device="meta"))
         self.to_empty_device = None
 
     def to_empty(self, *, device, recurse=True):  # noqa: ARG002
         self.to_empty_device = device
         self.weight = nn.Parameter(torch.empty(2, device="cpu"))
+        self.cache = torch.empty(2, device="cpu")
         return self
 
 
@@ -41,6 +44,7 @@ class _DummyCheckpointer:
 def test_checkpoint_manager_materializes_skip_mode_and_omits_missing_optimizer(monkeypatch):
     model = _MetaModel()
     checkpointer = _DummyCheckpointer()
+    info_messages = []
     manager = CheckpointManager(
         model=model,
         optimizer=object(),
@@ -50,6 +54,11 @@ def test_checkpoint_manager_materializes_skip_mode_and_omits_missing_optimizer(m
         train_config={"load_weights_mode": "skip"},
         rank=0,
         local_rank=0,
+    )
+    monkeypatch.setattr(
+        checkpoint_manager_module.logger,
+        "info",
+        lambda message, *args: info_messages.append(message % args if args else message),
     )
     monkeypatch.setattr("xorl.server.runner.checkpoint.manager.get_device_type", lambda: "cpu")
     monkeypatch.setattr(manager, "_checkpoint_has_optimizer", lambda _path: False)
@@ -62,6 +71,67 @@ def test_checkpoint_manager_materializes_skip_mode_and_omits_missing_optimizer(m
     assert result["load_optimizer"] is False
     assert manager.global_step == 7
     assert manager.global_forward_backward_step == 11
+    assert "DCP zero-meta gate passed at post_to_empty: meta_parameters=0, meta_buffers=0" in info_messages
+    assert "DCP zero-meta gate passed at post_dcp_restore: meta_parameters=0, meta_buffers=0" in info_messages
+
+
+def test_checkpoint_manager_fails_if_to_empty_leaves_meta_tensor(monkeypatch):
+    class BrokenMaterializationModel(_MetaModel):
+        def to_empty(self, *, device, recurse=True):  # noqa: ARG002
+            self.to_empty_device = device
+            return self
+
+    model = BrokenMaterializationModel()
+    checkpointer = _DummyCheckpointer()
+    manager = CheckpointManager(
+        model=model,
+        optimizer=None,
+        checkpointer=checkpointer,
+        lora_config={},
+        model_config={},
+        train_config={"load_weights_mode": "skip"},
+        rank=0,
+        local_rank=0,
+    )
+    monkeypatch.setattr("xorl.server.runner.checkpoint.manager.get_device_type", lambda: "cpu")
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"DCP zero-meta gate failed at post_to_empty: .*weight.*cache",
+    ):
+        manager.load_state("/tmp/model-only-dcp", load_optimizer=False)
+
+    assert checkpointer.path is None
+
+
+def test_checkpoint_manager_fails_if_dcp_restore_leaves_meta_tensor(monkeypatch):
+    class MetaAfterRestoreCheckpointer(_DummyCheckpointer):
+        def load(self, path, state):
+            super().load(path, state)
+            state["model"].weight = nn.Parameter(torch.empty(2, device="meta"))
+            state["model"].cache = torch.empty(2, device="meta")
+
+    model = _MetaModel()
+    checkpointer = MetaAfterRestoreCheckpointer()
+    manager = CheckpointManager(
+        model=model,
+        optimizer=None,
+        checkpointer=checkpointer,
+        lora_config={},
+        model_config={},
+        train_config={"load_weights_mode": "skip"},
+        rank=0,
+        local_rank=0,
+    )
+    monkeypatch.setattr("xorl.server.runner.checkpoint.manager.get_device_type", lambda: "cpu")
+
+    with pytest.raises(
+        RuntimeError,
+        match=r"DCP zero-meta gate failed at post_dcp_restore: .*weight.*cache",
+    ):
+        manager.load_state("/tmp/model-only-dcp", load_optimizer=False)
+
+    assert checkpointer.path == "/tmp/model-only-dcp"
 
 
 def test_model_runner_loads_initial_checkpoint_and_syncs_state():

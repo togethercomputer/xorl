@@ -168,6 +168,39 @@ def test_compute_micro_batch_loss_drgrpo_keeps_logprobs_for_per_sample_k3():
     assert metrics["valid_tokens"] == 2
 
 
+def test_compute_micro_batch_loss_forwards_sampler_prefill_lengths_to_model():
+    class _BoundaryModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = torch.nn.Embedding(16, 4)
+            self.lm_head = torch.nn.Linear(4, 8, bias=False)
+            self.forward_kwargs = None
+
+        def forward(self, input_ids, **kwargs):
+            self.forward_kwargs = kwargs
+            return SimpleNamespace(last_hidden_state=self.embed(input_ids))
+
+    runner = object.__new__(ModelRunner)
+    runner.model = _BoundaryModel()
+    runner.ce_mode = "eager"
+    runner.lm_head_fp32 = False
+    input_ids = torch.tensor([[1, 2]])
+
+    runner._compute_micro_batch_loss(
+        {
+            "input_ids": input_ids,
+            "labels": torch.tensor([[2, 3]]),
+        },
+        "causallm_loss",
+        {"sampler_prefill_lengths": [4096]},
+    )
+
+    boundary = runner.model.forward_kwargs["sampler_prefill_lengths"]
+    assert boundary.dtype is torch.int64
+    assert boundary.device == input_ids.device
+    assert boundary.tolist() == [4096]
+
+
 def test_forward_backward_dispatches_drgrpo_through_standard_loop(monkeypatch):
     monkeypatch.setattr("xorl.server.runner.model_runner.synchronize", lambda: None)
 
@@ -203,6 +236,7 @@ def test_forward_backward_dispatches_drgrpo_through_standard_loop(monkeypatch):
     params = {"beta": 0.0, "ratio_type": "sequence"}
 
     result = runner.forward_backward(micro_batches, loss_fn="drgrpo", loss_fn_params=params, model_id="policy-a")
+    runner.commit_forward_backward_completion("policy-a")
 
     assert captured["micro_batches"] is micro_batches
     assert captured["loss_fn"] == "drgrpo"

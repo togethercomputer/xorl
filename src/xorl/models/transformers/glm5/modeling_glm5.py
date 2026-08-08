@@ -24,6 +24,7 @@ from xorl.distributed.parallel_state import get_parallel_state
 from xorl.distributed.sequence_parallel.data import gather_outputs
 from xorl.distributed.sequence_parallel.strategy import get_cp_strategy
 from xorl.models.base import XorlPreTrainedModel
+from xorl.models.exact_contract import glm52_exact_forward_enabled
 from xorl.models.layers import (
     ACT2FN,
     RMS_NORM_FAMILY_NO_RESIDUAL,
@@ -42,6 +43,15 @@ from xorl.models.outputs import MoeCausalLMOutput, MoeModelOutput
 from xorl.models.transformers.glm5 import parallelize
 from xorl.models.transformers.glm5.checkpoint_handler import Glm5CheckpointHandler
 from xorl.models.transformers.glm5.configuration_glm5 import Glm5Config
+from xorl.models.transformers.glm5.exact_absorbed_kv_b_qlora import (
+    Glm52ExactTP1AbsorbedKvBBlockFP8QLoRA,
+)
+from xorl.models.transformers.glm5.exact_routed_experts_qlora import (
+    Glm52ExactEP16BlockFP8QLoRARoutedExperts,
+)
+from xorl.models.transformers.glm5.exact_shared_expert_qlora import (
+    Glm52ExactTP16SharedExpertBlockFP8QLoRA,
+)
 from xorl.models.transformers.glm5.index_share import (
     CanonicalLogicalIndices,
     IndexShareContext,
@@ -250,9 +260,7 @@ class Glm5MlaAttention(nn.Module):
             cos,
             sin,
             interleaved=getattr(self.config, "rope_interleave", True),
-            class_b=bool(
-                getattr(self.config, "_rope_class_b", False) or getattr(self.config, "_glm52_exact_contract", False)
-            ),
+            class_b=bool(getattr(self.config, "_rope_class_b", False) or glm52_exact_forward_enabled(self.config)),
         )
         k_rot = k_rot.expand(*k_pass.shape[:-1], -1)
 
@@ -363,6 +371,11 @@ class Glm5Attention(Glm5MlaAttention):
 
         from xorl.qlora.modules.linear import QLoRALinear  # noqa: PLC0415
 
+        if isinstance(self.kv_b_proj, Glm52ExactTP1AbsorbedKvBBlockFP8QLoRA):
+            raise RuntimeError(
+                "GLM-5.2 exact absorbed kv_b owns its dequantization and both base BMMs; "
+                "the legacy materialized-weight path is not admitted"
+            )
         if isinstance(self.kv_b_proj, NativeBlockFP8Linear):
             # Invoke the module's real forward boundary so an eFSDP wrapper
             # unshards the packed bytes/scales before reproducing SGLang's
@@ -408,7 +421,7 @@ class Glm5Attention(Glm5MlaAttention):
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         batch_size, seq_length, _ = hidden_states.shape
         q_compressed = self.q_a_layernorm(self.q_a_proj(hidden_states))
         q = self.q_b_proj(q_compressed).view(batch_size, seq_length, self.num_heads, self.qk_head_dim)
@@ -422,8 +435,12 @@ class Glm5Attention(Glm5MlaAttention):
         )
         kv_no_pe = self.kv_a_layernorm(kv_no_pe)
 
-        w_kc, w_vc = self._split_kv_b_weight(compute_dtype=q_no_pe.dtype)
-        q_no_pe_absorbed = torch.einsum("bshd,hdc->bshc", q_no_pe, w_kc)
+        if isinstance(self.kv_b_proj, Glm52ExactTP1AbsorbedKvBBlockFP8QLoRA):
+            q_no_pe_absorbed = self.kv_b_proj(q_no_pe, branch="q")
+            w_vc = None
+        else:
+            w_kc, w_vc = self._split_kv_b_weight(compute_dtype=q_no_pe.dtype)
+            q_no_pe_absorbed = torch.einsum("bshd,hdc->bshc", q_no_pe, w_kc)
 
         cos, sin = position_embeddings
         k_pe = k_pe.view(batch_size, seq_length, 1, self.qk_rope_head_dim)
@@ -433,15 +450,26 @@ class Glm5Attention(Glm5MlaAttention):
             cos,
             sin,
             interleaved=getattr(self.config, "rope_interleave", True),
-            class_b=bool(
-                getattr(self.config, "_rope_class_b", False) or getattr(self.config, "_glm52_exact_contract", False)
-            ),
+            class_b=bool(getattr(self.config, "_rope_class_b", False) or glm52_exact_forward_enabled(self.config)),
         )
         k_pe = k_pe.squeeze(2)
 
         q_absorbed = torch.cat([q_no_pe_absorbed, q_pe], dim=-1)
         kv_compressed = torch.cat([kv_no_pe, k_pe], dim=-1)
         return q_absorbed, kv_compressed, q_compressed, w_vc
+
+    def _project_absorbed_value(
+        self,
+        attn_compressed: torch.Tensor,
+        w_vc: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if isinstance(self.kv_b_proj, Glm52ExactTP1AbsorbedKvBBlockFP8QLoRA):
+            if w_vc is not None:
+                raise RuntimeError("GLM-5.2 exact absorbed kv_b must not receive a legacy materialized V weight")
+            return self.kv_b_proj(attn_compressed, branch="v")
+        if w_vc is None:
+            raise RuntimeError("GLM-5.2 generic absorbed MLA requires its materialized V weight")
+        return torch.einsum("bshk,hdk->bshd", attn_compressed, w_vc)
 
     def _gather_full_dsa_inputs(
         self,
@@ -556,6 +584,7 @@ class Glm5Attention(Glm5MlaAttention):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None,
         index_share_context: IndexShareContext | None = None,
+        sampler_prefill_lengths: torch.Tensor | None = None,
         **_kwargs,
     ) -> tuple[torch.Tensor, None]:
         ps = get_parallel_state()
@@ -563,7 +592,13 @@ class Glm5Attention(Glm5MlaAttention):
 
         if not ps.cp_enabled:
             topk_indices = self._compute_or_consume_indices(
-                lambda: self.indexer(hidden_states, q_compressed, position_embeddings, attention_mask),
+                lambda: self.indexer(
+                    hidden_states,
+                    q_compressed,
+                    position_embeddings,
+                    attention_mask,
+                    sampler_prefill_lengths=sampler_prefill_lengths,
+                ),
                 index_share_context,
             )
             attn_compressed = sparse_mla_dispatch(
@@ -574,7 +609,7 @@ class Glm5Attention(Glm5MlaAttention):
                 kv_lora_rank=self.kv_lora_rank,
                 backend=getattr(self.config, "_sparse_mla_backend", "auto"),
             )
-            attn_out = torch.einsum("bshk,hdk->bshd", attn_compressed, w_vc)
+            attn_out = self._project_absorbed_value(attn_compressed, w_vc)
             projected = self._project_output(attn_out)
             return projected, None
 
@@ -590,6 +625,8 @@ class Glm5Attention(Glm5MlaAttention):
                     hidden_states,
                     q_compressed,
                     position_embeddings,
+                    sampler_prefill_lengths=sampler_prefill_lengths,
+                    query_offset=query_offset,
                 )
                 full_index_k = self._gather_ulysses_sequence_no_grad(local_index_k, group)
                 full_seq_len = full_index_k.shape[1]
@@ -614,7 +651,7 @@ class Glm5Attention(Glm5MlaAttention):
             backend=getattr(self.config, "_sparse_mla_backend", "auto"),
             query_offset=query_offset,
         )
-        attn_out = torch.einsum("bshk,hdk->bshd", attn_compressed, w_vc)
+        attn_out = self._project_absorbed_value(attn_compressed, w_vc)
 
         projected = self._project_output(attn_out)
         return projected, None
@@ -741,9 +778,7 @@ class Glm5MoEBlock(MoEBlock):
             config,
             intermediate_size=config.moe_intermediate_size * config.n_shared_experts,
         )
-        self.canonical_contract_version = (
-            CANONICAL_MOE_REDUCE_VERSION if getattr(config, "_glm52_exact_contract", False) else None
-        )
+        self.canonical_contract_version = CANONICAL_MOE_REDUCE_VERSION if glm52_exact_forward_enabled(config) else None
         # No user-facing transport knob: the exact GLM path resolves the best
         # certified transport for the geometry internally (see
         # resolve_canonical_moe_transport) and rejects unsupported geometry.
@@ -905,6 +940,66 @@ class Glm5MoEBlock(MoEBlock):
         sync_pending_combine()
         return expert_output + shared_output
 
+    def _canonical_routed_local_partial(
+        self,
+        gathered: torch.Tensor,
+        gathered_routing: torch.Tensor,
+        gathered_ids: torch.Tensor,
+        local_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        if not isinstance(self.experts, Glm52NativeBlockFP8Experts):
+            raise RuntimeError("GLM-5.2 canonical path requires native block-FP8 experts")
+        kwargs = {
+            "sglang_ep_native_local_ids": local_ids,
+            "routed_scaling_factor": self.routed_scaling_factor,
+        }
+        if isinstance(self.experts, Glm52ExactEP16BlockFP8QLoRARoutedExperts):
+            kwargs["selected_experts"] = gathered_ids
+        return self.experts(gathered, gathered_routing, **kwargs).to(torch.bfloat16)
+
+    def _canonical_shared_local_partial(
+        self,
+        gathered: torch.Tensor,
+        *,
+        contributor_ordinal: int,
+        contributor_count: int,
+    ) -> torch.Tensor:
+        if isinstance(self.shared_experts, Glm52ExactTP16SharedExpertBlockFP8QLoRA):
+            return self.shared_experts(gathered, contributor_ordinal=contributor_ordinal)
+
+        intermediate_size = self.shared_experts.intermediate_size
+        if intermediate_size % contributor_count:
+            raise RuntimeError("GLM-5.2 shared-expert width must divide evenly across EP contributors")
+        shard = intermediate_size // contributor_count
+        shard_start = contributor_ordinal * shard
+        shard_end = shard_start + shard
+        if isinstance(self.shared_experts.gate_proj, NativeBlockFP8Linear):
+            if not isinstance(self.shared_experts.up_proj, NativeBlockFP8Linear) or not isinstance(
+                self.shared_experts.down_proj, NativeBlockFP8Linear
+            ):
+                raise RuntimeError("GLM-5.2 native FP8 shared experts require all three projections")
+            gate = self.shared_experts.gate_proj(
+                gathered,
+                output_range=(shard_start, shard_end),
+            )
+            up = self.shared_experts.up_proj(
+                gathered,
+                output_range=(shard_start, shard_end),
+            )
+        else:
+            gate = F.linear(gathered, self.shared_experts.gate_proj.weight[shard_start:shard_end])
+            up = F.linear(gathered, self.shared_experts.up_proj.weight[shard_start:shard_end])
+        activated = F.silu(gate) * up
+        if isinstance(self.shared_experts.down_proj, NativeBlockFP8Linear):
+            return self.shared_experts.down_proj(
+                activated,
+                input_range=(shard_start, shard_end),
+            ).to(torch.bfloat16)
+        return F.linear(
+            activated,
+            self.shared_experts.down_proj.weight[:, shard_start:shard_end],
+        ).to(torch.bfloat16)
+
     def _canonical_ep_forward(
         self,
         hidden_states: torch.Tensor,
@@ -967,7 +1062,10 @@ class Glm5MoEBlock(MoEBlock):
         gathered_valid = gather_ids_for_ep_combine(local_valid, group, padded_rows).squeeze(-1) >= 0
 
         ep_rank = dist.get_rank(group)
-        local_experts = int(self.experts.gate_up_proj.shape[0])
+        if isinstance(self.experts, Glm52ExactEP16BlockFP8QLoRARoutedExperts):
+            local_experts = self.experts.num_local_experts
+        else:
+            local_experts = int(self.experts.gate_up_proj.shape[0])
         if local_experts * ps.ep_size != self.experts.num_experts:
             raise RuntimeError("GLM-5.2 canonical MoE requires equal contiguous expert slices")
         expert_start = ep_rank * local_experts
@@ -976,48 +1074,12 @@ class Glm5MoEBlock(MoEBlock):
             gathered_ids - expert_start,
             gathered_ids.new_full((), -1),
         ).to(torch.int32)
-        if not isinstance(self.experts, Glm52NativeBlockFP8Experts):
-            raise RuntimeError("GLM-5.2 canonical canonical path requires native block-FP8 experts")
-        routed = self.experts(
+        routed = self._canonical_routed_local_partial(gathered, gathered_routing, gathered_ids, local_ids)
+        shared = self._canonical_shared_local_partial(
             gathered,
-            gathered_routing,
-            sglang_ep_native_local_ids=local_ids,
-            routed_scaling_factor=self.routed_scaling_factor,
-        ).to(torch.bfloat16)
-
-        intermediate_size = self.shared_experts.intermediate_size
-        if intermediate_size % ps.ep_size:
-            raise RuntimeError("GLM-5.2 shared-expert width must divide evenly across EP contributors")
-        shard = intermediate_size // ps.ep_size
-        shard_start = ep_rank * shard
-        shard_end = shard_start + shard
-        if isinstance(self.shared_experts.gate_proj, NativeBlockFP8Linear):
-            if not isinstance(self.shared_experts.up_proj, NativeBlockFP8Linear) or not isinstance(
-                self.shared_experts.down_proj, NativeBlockFP8Linear
-            ):
-                raise RuntimeError("GLM-5.2 native FP8 shared experts require all three projections")
-            gate = self.shared_experts.gate_proj(
-                gathered,
-                output_range=(shard_start, shard_end),
-            )
-            up = self.shared_experts.up_proj(
-                gathered,
-                output_range=(shard_start, shard_end),
-            )
-        else:
-            gate = F.linear(gathered, self.shared_experts.gate_proj.weight[shard_start:shard_end])
-            up = F.linear(gathered, self.shared_experts.up_proj.weight[shard_start:shard_end])
-        activated = F.silu(gate) * up
-        if isinstance(self.shared_experts.down_proj, NativeBlockFP8Linear):
-            shared = self.shared_experts.down_proj(
-                activated,
-                input_range=(shard_start, shard_end),
-            ).to(torch.bfloat16)
-        else:
-            shared = F.linear(
-                activated,
-                self.shared_experts.down_proj.weight[:, shard_start:shard_end],
-            ).to(torch.bfloat16)
+            contributor_ordinal=ep_rank,
+            contributor_count=ps.ep_size,
+        )
         local_partial = (routed + shared).to(torch.bfloat16)
 
         capacity = int(getattr(self.config, "_glm52_canonical_moe_capacity", local_partial.shape[0]))
@@ -1310,11 +1372,27 @@ class Glm5PreTrainedModel(XorlPreTrainedModel):
     supports_tensor_parallelism = True
 
     def get_ignore_modules_in_mixed_precision(self):
-        # Dense native-FP8 modules are separately fully_shard-wrapped without
-        # an MP policy. Native experts use the dedicated expert FSDP branch and
-        # must not appear here (which would double-wrap them).
+        # Dense native-FP8 and exact active-QLoRA modules are separately
+        # fully_shard-wrapped without an MP policy. The exact QLoRA wrapper
+        # owns FP32 master factors and performs its one BF16 rounding inside
+        # the value path. Native experts use the dedicated expert FSDP branch
+        # and must not appear here (which would double-wrap them).
         if getattr(self.config, "quantization_config", None) is not None:
-            return (NativeBlockFP8Linear,)
+            # Keep the base model independent of adapter implementation at
+            # import time; exact_qlora may grow model-specific construction
+            # helpers without creating a modeling import cycle.
+            from xorl.models.transformers.glm5.exact_qlora import (  # noqa: PLC0415
+                Glm52ExactTP1BlockFP8QLoRALinear,
+            )
+            from xorl.models.transformers.glm5.exact_shared_expert_qlora import (  # noqa: PLC0415
+                Glm52ExactTP16SharedExpertBlockFP8QLoRA,
+            )
+
+            return (
+                NativeBlockFP8Linear,
+                Glm52ExactTP1BlockFP8QLoRALinear,
+                Glm52ExactTP16SharedExpertBlockFP8QLoRA,
+            )
         return None
 
     def _init_weights(self, module):

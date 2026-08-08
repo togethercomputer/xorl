@@ -5,6 +5,8 @@ import torch
 from torch import nn
 
 from xorl.models.transformers.glm5.configuration_glm5 import Glm5Config
+from xorl.models.transformers.glm5.exact_qlora import Glm52ExactTP1BlockFP8QLoRALinear
+from xorl.models.transformers.glm5.exact_shared_expert_qlora import Glm52ExactTP16SharedExpertBlockFP8QLoRA
 from xorl.models.transformers.glm5.modeling_glm5 import Glm5Attention, Glm5ForCausalLM
 from xorl.models.transformers.glm5.native_fp8 import (
     Glm52NativeBlockFP8Experts,
@@ -164,7 +166,11 @@ def test_model_replaces_only_quantized_dense_shared_and_expert_modules():
     assert isinstance(modules["model.layers.1.mlp.experts"], Glm52NativeBlockFP8Experts)
     assert isinstance(modules["model.layers.0.self_attn.indexer.weights_proj"], nn.Linear)
     assert isinstance(model.lm_head, nn.Linear)
-    assert model.get_ignore_modules_in_mixed_precision() == (NativeBlockFP8Linear,)
+    assert model.get_ignore_modules_in_mixed_precision() == (
+        NativeBlockFP8Linear,
+        Glm52ExactTP1BlockFP8QLoRALinear,
+        Glm52ExactTP16SharedExpertBlockFP8QLoRA,
+    )
 
 
 def test_sparse_mla_native_kv_weight_uses_module_forward_and_preserves_layout():

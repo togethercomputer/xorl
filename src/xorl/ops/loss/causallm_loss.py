@@ -507,11 +507,36 @@ def causallm_loss_function(
     logprob_temperature = float(logprob_temperature)
     if logprob_temperature <= 0.0:
         raise ValueError(f"logprob_temperature must be > 0, got {logprob_temperature}")
+    exact_lm_head = bool(lm_head is not None and getattr(lm_head, "_glm52_exact_tp16_lm_head", False))
     if ce_mode == "bi_fused":
-        if tp_group is not None:
+        if tp_group is not None and not exact_lm_head:
             raise NotImplementedError("ce_mode='bi_fused' does not support tensor parallelism yet")
-        if lm_head is not None and not lm_head_fp32:
+        if lm_head is not None and not lm_head_fp32 and not exact_lm_head:
             raise NotImplementedError("ce_mode='bi_fused' does not support FP8 lm_head modules")
+    if exact_lm_head:
+        if z_loss_coef > 0.0:
+            raise NotImplementedError("The exact GLM-5.2 active-LoRA lm head does not support Z-loss")
+        per_token_ce = compute_per_token_ce(
+            hidden_states_flat,
+            weight,
+            labels_flat,
+            ignore_index,
+            ce_mode,
+            num_chunks,
+            tp_group=tp_group,
+            use_compile=use_compile,
+            lm_head_fp32=lm_head_fp32,
+            lm_head=lm_head,
+            logprob_temperature=logprob_temperature,
+        )
+        loss = loss_reducer(per_token_ce, mask_flat)
+        if return_per_token:
+            return LossOutput(
+                loss=loss,
+                per_token_logprobs=-per_token_ce.detach().view(original_shape),
+                per_token_loss=per_token_ce.view(original_shape),
+            )
+        return LossOutput(loss=loss)
     if logprob_temperature != 1.0:
         if z_loss_coef > 0.0:
             raise NotImplementedError("logprob_temperature is not supported with softmax_auxiliary_loss")

@@ -27,6 +27,7 @@ from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME, WEIGH
 from transformers.utils.hub import cached_file, get_checkpoint_shard_files
 
 from xorl.distributed.parallel_state import get_parallel_state
+from xorl.lora.fold import lora_merged_forward_enabled
 from xorl.lora.modules.linear import LoraLinear
 from xorl.models.checkpoint_handlers.buffers import (  # noqa: F401
     FUSED_EXPERT_PATTERN,
@@ -2801,6 +2802,10 @@ def save_model_assets(output_dir: Union[str, "os.PathLike"], model_assets: Seque
 
 def get_lm_head_weight(lm_head: nn.Module, *, fsdp_sharded_loss: bool = False) -> torch.Tensor:
     """Get lm_head weight, merging LoRA delta if applicable."""
+    if getattr(lm_head, "_glm52_exact_tp16_lm_head", False):
+        if lora_merged_forward_enabled(lm_head):
+            raise RuntimeError("The exact GLM-5.2 lm head rejects merged-forward mode")
+        return lm_head.weight
     if fsdp_sharded_loss and isinstance(lm_head, LoraLinear):
         raise NotImplementedError("fsdp_sharded_lm_head_loss is not supported with LoRA lm_head adapters.")
     if isinstance(lm_head, LoraLinear):
@@ -2833,7 +2838,8 @@ def compute_loss(
     """
     fn_name = loss_fn_name or "causallm_loss"
     loss_fn = get_loss_function(fn_name)
-    fsdp_sharded_loss = bool(getattr(lm_head, "_xorl_fsdp_sharded_lm_head_loss", False))
+    exact_lm_head = bool(getattr(lm_head, "_glm52_exact_tp16_lm_head", False))
+    fsdp_sharded_loss = bool(getattr(lm_head, "_xorl_fsdp_sharded_lm_head_loss", False)) and not exact_lm_head
     if fsdp_sharded_loss and fn_name not in {"causallm_loss", "cross_entropy"}:
         raise NotImplementedError(f"fsdp_sharded_lm_head_loss is not supported for loss function {fn_name!r}.")
     weight = get_lm_head_weight(lm_head, fsdp_sharded_loss=fsdp_sharded_loss)
@@ -2920,7 +2926,12 @@ def compute_loss(
         FP8Linear = None
     if FP8Linear is not None and isinstance(lm_head, FP8Linear) and fn_name in {"causallm_loss", "cross_entropy"}:
         loss_kwargs["lm_head"] = lm_head
-    if ps.tp_enabled:
+    if exact_lm_head:
+        if not getattr(lm_head, "_xorl_fsdp_sharded_lm_head_loss", False):
+            raise RuntimeError("The exact GLM-5.2 lm head was not prepared for sharded TP16 loss")
+        loss_kwargs["lm_head"] = lm_head
+        loss_kwargs["tp_group"] = ps.lm_head_tp_group
+    elif ps.tp_enabled:
         loss_kwargs["tp_group"] = ps.tp_group
     if loss_fn_inputs:
         loss_kwargs.update(loss_fn_inputs)

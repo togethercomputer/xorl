@@ -7,6 +7,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from xorl.models.exact_contract import glm52_exact_forward_enabled
+
 from .experts import MoEExperts, moe_sglang_fused_experts_enabled
 from .router import TopKRouter, balanced_synthetic_routing
 from .routing_replay import RoutingReplay, get_replay_stage
@@ -39,7 +41,7 @@ def _moe_bi_router_enabled(config=None) -> bool:
     fp32 router-GEMM reduction-order tail can flip top-k expert selection on
     razor-edge tokens. This pins the router logits identically cross-engine.
     """
-    return bool(config is not None and getattr(config, "_glm52_exact_contract", False))
+    return glm52_exact_forward_enabled(config)
 
 
 class _BIRouterGemm(torch.autograd.Function):

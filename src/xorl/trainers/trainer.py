@@ -713,6 +713,8 @@ class Trainer:
             sparse_mla_backend=args.model.sparse_mla_backend,
             flash_attention_deterministic=args.model.flash_attention_deterministic,
             block_fp8_qlora_training=getattr(args.lora, "block_fp8_qlora_training", False),
+            lora_rank=args.lora.lora_rank,
+            lora_alpha=args.lora.lora_alpha,
             init_device=args.train.init_device,
         )
         self.model_config = self.model.config
@@ -1031,6 +1033,13 @@ class Trainer:
             if frozen > 0:
                 logger.info_rank0(f"Froze {frozen} MoE router (gate) parameters")
 
+        if getattr(self.ps, "lm_head_tp_size", 1) > 1:
+            sync_lm_head_tp_parameters(
+                self.model,
+                self.ps.lm_head_tp_replica_group,
+                self.ps.lm_head_tp_group,
+            )
+
     def _all_model_parts(self) -> List[torch.nn.Module]:
         """All local model chunks: PP virtual stages own several, else just self.model."""
         return list(self.model_parts) if self.pp_enabled else [self.model]
@@ -1178,7 +1187,11 @@ class Trainer:
                 pass
         self.Checkpointer.load(args.train.load_checkpoint_path, state)
         if getattr(self.ps, "lm_head_tp_size", 1) > 1:
-            sync_lm_head_tp_parameters(self.model, self.ps.lm_head_tp_replica_group)
+            sync_lm_head_tp_parameters(
+                self.model,
+                self.ps.lm_head_tp_replica_group,
+                self.ps.lm_head_tp_group,
+            )
 
         extra = state.get("extra_state", {})
         self.state.global_step = extra.get("global_step", 0)

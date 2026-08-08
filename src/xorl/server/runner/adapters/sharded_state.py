@@ -373,9 +373,26 @@ def _descriptor_from_layout(layout: AdapterTensorLayout) -> dict[str, Any]:
         "logical_shape": list(layout.logical_shape),
         "local_logical_offset": list(layout.local_logical_offset),
         "local_logical_shape": list(layout.local_logical_shape),
+        "active_storage_shape": list(layout.active_storage_shape),
         "dtype": _dtype_name(layout.dtype),
         "gradient_reduction": layout.gradient_reduction.value,
     }
+
+
+def _replica_key_from_descriptor(descriptor: Mapping[str, Any], *, rank: int) -> tuple[Any, ...]:
+    key = (
+        descriptor["fqn"],
+        tuple(descriptor["logical_shape"]),
+        tuple(descriptor["local_logical_offset"]),
+        tuple(descriptor["local_logical_shape"]),
+        descriptor["dtype"],
+    )
+    if any(int(size) == 0 for size in descriptor["active_storage_shape"]):
+        # Uneven FSDP sharding can give several ranks the same empty rectangle.
+        # Empty shards contain no replicated logical value and therefore need
+        # no replica reduction; keep each one as a singleton ownership class.
+        return (*key, ("empty_rank", int(rank)))
+    return key
 
 
 def discover_adapter_layouts(
@@ -415,6 +432,7 @@ def discover_adapter_layouts(
     group = process_group
     distributed = dist.is_available() and dist.is_initialized()
     world = dist.get_world_size(group=group) if distributed else 1
+    local_rank = dist.get_rank(group=group) if distributed else 0
     local_descriptors = [_descriptor_from_layout(layouts[name]) for name in sorted(layouts)]
     local_payload = {
         "layouts": local_descriptors,
@@ -452,20 +470,20 @@ def discover_adapter_layouts(
                 raise RuntimeError(f"Incompatible logical LoRA layout for {key!r} on rank {rank}")
 
     replica_members: dict[tuple[Any, ...], list[int]] = defaultdict(list)
-    for rank, payload in enumerate(gathered):
+    for peer_rank, payload in enumerate(gathered):
         descriptors = payload["layouts"]
         for descriptor in descriptors:
-            key = (
-                descriptor["fqn"],
-                tuple(descriptor["logical_shape"]),
-                tuple(descriptor["local_logical_offset"]),
-                tuple(descriptor["local_logical_shape"]),
-                descriptor["dtype"],
-            )
-            replica_members[key].append(rank)
+            key = _replica_key_from_descriptor(descriptor, rank=peer_rank)
+            replica_members[key].append(peer_rank)
     for name, layout in list(layouts.items()):
-        members = tuple(replica_members[layout.replica_key])
-        layouts[name] = replace(layout, replica_count=len(members), replica_ranks=members)
+        replica_key = _replica_key_from_descriptor(_descriptor_from_layout(layout), rank=local_rank)
+        members = tuple(replica_members[replica_key])
+        layouts[name] = replace(
+            layout,
+            replica_count=len(members),
+            replica_ranks=members,
+            replica_key=replica_key,
+        )
 
     group_memberships: dict[str, tuple[tuple[int, ...], ...]] = {}
     group_keys = sorted({key for payload in gathered for key in payload["group_memberships"]})

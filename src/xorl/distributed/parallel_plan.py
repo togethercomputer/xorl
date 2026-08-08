@@ -17,6 +17,22 @@ logger = logging.get_logger(__name__)
 def _gradient_reduction_domain(model: nn.Module, fqn: str) -> GradientReductionDomain:
     """Read explicit gradient-reduction metadata from the owning module."""
 
+    parameter_domain = getattr(get_module_from_path(model, fqn), "_ep_gradient_reduction_domain", None)
+    if parameter_domain is not None:
+        try:
+            return validate_gradient_reduction_domain(parameter_domain)
+        except ValueError as exc:
+            raise ValueError(f"Invalid gradient reduction metadata for {fqn}: {exc}") from exc
+
+    owner_path, _, local_name = fqn.rpartition(".")
+    owner = get_module_from_path(model, owner_path) if owner_path else model
+    per_parameter = getattr(owner, "_ep_gradient_reduction_by_parameter", None)
+    if per_parameter is not None and local_name in per_parameter:
+        try:
+            return validate_gradient_reduction_domain(per_parameter[local_name])
+        except ValueError as exc:
+            raise ValueError(f"Invalid gradient reduction metadata for {fqn}: {exc}") from exc
+
     parts = fqn.split(".")[:-1]
     while parts:
         module = get_module_from_path(model, ".".join(parts))
@@ -89,7 +105,58 @@ class ParallelPlan:
                 for fqn_pattern, shard in self.ep_plan.items():
                     if check_fqn_match(fqn_pattern, fqn):
                         gradient_reduction = _gradient_reduction_domain(model, fqn)
-                        # Shared LoRA weights have size=1 on shard dim - replicate instead of shard
+                        owner_path, _, local_name = fqn.rpartition(".")
+                        owner = get_module_from_path(model, owner_path) if owner_path else model
+                        declared_local = local_name in set(
+                            getattr(owner, "_ep_already_local_parameter_names", ()) or ()
+                        )
+                        force_shard = local_name in set(
+                            getattr(owner, "_ep_force_shard_parameter_names", ()) or ()
+                        ) or bool(getattr(param, "_xorl_ep_force_shard", False))
+                        if declared_local and force_shard:
+                            raise ValueError(f"EP disposition for {fqn} cannot be both already-local and force-shard")
+
+                        expected_local_size = getattr(owner, "num_local_experts", None)
+                        expected_global_size = getattr(owner, "num_experts", None)
+                        if declared_local:
+                            if expected_local_size is None or param.size(shard.dim) != int(expected_local_size):
+                                raise ValueError(
+                                    f"EP already-local parameter {fqn} has dim {shard.dim} size "
+                                    f"{param.size(shard.dim)}; expected {expected_local_size}"
+                                )
+                            param.spec_info = SpecInfo(
+                                ep_fsdp_mesh=ep_fsdp_mesh,
+                                placement=shard,
+                                fqn=fqn,
+                                gradient_reduction=gradient_reduction,
+                            )
+                            fqn2spec_info[fqn] = param.spec_info
+                            logger.debug_rank0(f"EP preserved declared local parameter: {fqn} {list(param.shape)}")
+                            break
+
+                        if force_shard:
+                            if expected_local_size is not None and param.size(shard.dim) == int(expected_local_size):
+                                param.spec_info = SpecInfo(
+                                    ep_fsdp_mesh=ep_fsdp_mesh,
+                                    placement=shard,
+                                    fqn=fqn,
+                                    gradient_reduction=gradient_reduction,
+                                )
+                                fqn2spec_info[fqn] = param.spec_info
+                                logger.debug_rank0(
+                                    f"EP annotated force-shard parameter already local: {fqn} {list(param.shape)}"
+                                )
+                                break
+                            if expected_global_size is None or param.size(shard.dim) != int(expected_global_size):
+                                raise ValueError(
+                                    f"EP force-shard parameter {fqn} has dim {shard.dim} size "
+                                    f"{param.size(shard.dim)}; expected {expected_global_size} or {expected_local_size}"
+                                )
+
+                        # An undeclared singleton expert axis is a shared LoRA
+                        # factor. Explicit owner dispositions are validated
+                        # above so malformed local or force-sharded tensors
+                        # cannot silently fall through to replication.
                         if param.size(shard.dim) == 1:
                             param.spec_info = SpecInfo(
                                 ep_fsdp_mesh=ep_fsdp_mesh,
@@ -97,12 +164,7 @@ class ParallelPlan:
                                 fqn=fqn,
                                 gradient_reduction=gradient_reduction,
                             )
-                            fqn2spec_info[fqn] = SpecInfo(
-                                ep_fsdp_mesh=ep_fsdp_mesh,
-                                placement=Replicate(),
-                                fqn=fqn,
-                                gradient_reduction=gradient_reduction,
-                            )
+                            fqn2spec_info[fqn] = param.spec_info
                             logger.debug_rank0(f"EP replicated (shared): {fqn} {list(param.shape)}")
                             break
 
@@ -121,19 +183,29 @@ class ParallelPlan:
                                 torch.empty(new_shape, device="meta", dtype=param.dtype),
                                 requires_grad=param.requires_grad,
                             )
-                            local_chunk.spec_info = SpecInfo(ep_fsdp_mesh=ep_fsdp_mesh, placement=shard, fqn=fqn)
+                            local_chunk.spec_info = SpecInfo(
+                                ep_fsdp_mesh=ep_fsdp_mesh,
+                                placement=shard,
+                                fqn=fqn,
+                                gradient_reduction=gradient_reduction,
+                            )
                             set_module_from_path(model, fqn, local_chunk)
-                            fqn2spec_info[fqn] = SpecInfo(ep_fsdp_mesh=ep_fsdp_mesh, placement=shard, fqn=fqn)
+                            fqn2spec_info[fqn] = local_chunk.spec_info
                             logger.debug_rank0(
                                 f"EP meta-sliced: {fqn} {list(param.shape)} -> {list(local_chunk.shape)} "
                                 f"(dim={shard.dim}, ep_size={ep_size})"
                             )
                             break
 
-                        if already_local:
+                        if already_local and not force_shard:
                             # Params already EP-local — just annotate with spec_info
-                            param.spec_info = SpecInfo(ep_fsdp_mesh=ep_fsdp_mesh, placement=shard, fqn=fqn)
-                            fqn2spec_info[fqn] = SpecInfo(ep_fsdp_mesh=ep_fsdp_mesh, placement=shard, fqn=fqn)
+                            param.spec_info = SpecInfo(
+                                ep_fsdp_mesh=ep_fsdp_mesh,
+                                placement=shard,
+                                fqn=fqn,
+                                gradient_reduction=gradient_reduction,
+                            )
+                            fqn2spec_info[fqn] = param.spec_info
                             logger.debug_rank0(
                                 f"EP annotated (already local): {fqn} {list(param.shape)} "
                                 f"(dim={shard.dim}, ep_size={ep_size})"
@@ -151,9 +223,14 @@ class ParallelPlan:
                         )
                         dtensor = dtensor.redistribute(device_mesh=ep_mesh, placements=ep_placement)
                         local_chunk = torch.nn.Parameter(dtensor.to_local(), requires_grad=param.requires_grad)
-                        local_chunk.spec_info = SpecInfo(ep_fsdp_mesh=ep_fsdp_mesh, placement=shard, fqn=fqn)
+                        local_chunk.spec_info = SpecInfo(
+                            ep_fsdp_mesh=ep_fsdp_mesh,
+                            placement=shard,
+                            fqn=fqn,
+                            gradient_reduction=gradient_reduction,
+                        )
                         set_module_from_path(model, fqn, local_chunk)
-                        fqn2spec_info[fqn] = SpecInfo(ep_fsdp_mesh=ep_fsdp_mesh, placement=shard, fqn=fqn)
+                        fqn2spec_info[fqn] = local_chunk.spec_info
                         logger.debug_rank0(
                             f"EP sharded: {fqn} {list(original_shape)} -> {list(local_chunk.shape)} "
                             f"(dim={shard.dim}, ep_size={ep_size})"

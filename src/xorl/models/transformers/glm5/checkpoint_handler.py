@@ -10,7 +10,110 @@ import torch
 
 from ...checkpoint_handlers.base import CheckpointHandler
 from ...checkpoint_handlers.buffers import ExpertWeightBuffer, parse_expert_full_key, parse_expert_key
-from .native_fp8 import NativeBlockFP8ExpertPairBuffer, NativeBlockFP8PairBuffer, native_fp8_dense_source_map
+from .exact_dense_mlp import Glm52ExactTP1DenseMLP
+from .native_fp8 import (
+    NativeBlockFP8ExpertPairBuffer,
+    NativeBlockFP8PairBuffer,
+    native_fp8_dense_source_map,
+    pack_fp8_as_float32,
+)
+
+
+class Glm52ExactDenseGateUpPairBuffer:
+    """Fuse strict official gate/up FP8 pairs into exact dense-MLP state."""
+
+    _WEIGHT_SUFFIX = ".weight"
+    _SCALE_SUFFIX = ".weight_scale_inv"
+
+    def __init__(self, model: torch.nn.Module):
+        self._targets: dict[str, Glm52ExactTP1DenseMLP] = {}
+        self._sources: dict[str, tuple[str, str]] = {}
+        for target, module in model.named_modules():
+            if not isinstance(module, Glm52ExactTP1DenseMLP):
+                continue
+            gate_source = module._exact_gate_source_fqn
+            up_source = module._exact_up_source_fqn
+            if not gate_source or not up_source:
+                raise ValueError(f"Exact dense MLP target {target!r} has no bound gate/up checkpoint sources")
+            if gate_source == up_source or gate_source in self._sources or up_source in self._sources:
+                raise ValueError(
+                    "GLM-5.2 exact dense gate/up checkpoint source mapping must be unique: "
+                    f"gate={gate_source!r}, up={up_source!r}"
+                )
+            self._targets[target] = module
+            self._sources[gate_source] = (target, "gate")
+            self._sources[up_source] = (target, "up")
+        self._pending: dict[str, dict[str, dict[str, torch.Tensor]]] = {}
+        self._completed: set[str] = set()
+
+    def has_targets(self) -> bool:
+        return bool(self._targets)
+
+    def try_consume(self, key: str, tensor: torch.Tensor) -> list[tuple[str, torch.Tensor]] | None:
+        if key.endswith(self._SCALE_SUFFIX):
+            source = key[: -len(self._SCALE_SUFFIX)]
+            member = "scale"
+        elif key.endswith(self._WEIGHT_SUFFIX):
+            source = key[: -len(self._WEIGHT_SUFFIX)]
+            member = "weight"
+        else:
+            return None
+        source_info = self._sources.get(source)
+        if source_info is None:
+            return None
+        target, role = source_info
+        if target in self._completed:
+            raise ValueError(f"Duplicate exact dense gate/up tensor after completed pair set: {key}")
+        role_parts = self._pending.setdefault(target, {}).setdefault(role, {})
+        if member in role_parts:
+            raise ValueError(f"Duplicate exact dense gate/up pair member: {key}")
+        role_parts[member] = tensor
+        pending = self._pending[target]
+        if set(pending) != {"gate", "up"} or any(set(pending[part]) != {"weight", "scale"} for part in pending):
+            return []
+
+        module = self._targets[target]
+        projection_shape = (module.intermediate_size, module.in_features)
+        scale_shape = (module.intermediate_size // 128, (module.in_features + 127) // 128)
+        for part in ("gate", "up"):
+            weight = pending[part]["weight"]
+            scale = pending[part]["scale"]
+            if weight.dtype is not torch.float8_e4m3fn or tuple(weight.shape) != projection_shape:
+                raise TypeError(
+                    f"{getattr(module, f'_exact_{part}_source_fqn')}.weight must be "
+                    f"float8_e4m3fn {projection_shape}, got {weight.dtype} {tuple(weight.shape)}"
+                )
+            if scale.dtype is not torch.float32 or tuple(scale.shape) != scale_shape:
+                raise TypeError(
+                    f"{getattr(module, f'_exact_{part}_source_fqn')}.weight_scale_inv must be "
+                    f"FP32 {scale_shape}, got {scale.dtype} {tuple(scale.shape)}"
+                )
+            if weight.device != scale.device:
+                raise RuntimeError(f"{part} weight and scale must share one checkpoint device")
+            if not bool(torch.all(torch.isfinite(scale))):
+                raise ValueError(f"{part} weight_scale_inv contains non-finite values")
+        gate = pending["gate"]
+        up = pending["up"]
+        if gate["weight"].device != up["weight"].device:
+            raise RuntimeError("gate and up checkpoint pairs must share one device")
+
+        fused_weight = torch.cat((gate["weight"], up["weight"]), dim=0).contiguous()
+        fused_scale = torch.cat((gate["scale"], up["scale"]), dim=0).contiguous()
+        del self._pending[target]
+        self._completed.add(target)
+        module._exact_gate_up_base_loaded = True
+        return [
+            (f"{target}.packed_weight_f32", pack_fp8_as_float32(fused_weight)),
+            (f"{target}.weight_scale_inv", fused_scale),
+        ]
+
+    def validate_complete(self) -> None:
+        missing = sorted(set(self._targets) - self._completed)
+        pending = {
+            target: {role: sorted(parts) for role, parts in roles.items()} for target, roles in self._pending.items()
+        }
+        if missing or pending:
+            raise ValueError(f"Incomplete exact dense gate/up FP8 pairs: missing={missing} pending={pending}")
 
 
 class Glm5CheckpointHandler(CheckpointHandler):
@@ -47,10 +150,14 @@ class Glm5CheckpointHandler(CheckpointHandler):
         self._dequant_device = None if device is None or device.type == "meta" else device
         self._output_dtype = dtype
         self._load_family = load_family
+        self._exact_dense_gate_up_buffer: Optional[Glm52ExactDenseGateUpPairBuffer] = None
         self._native_weight_buffer: Optional[NativeBlockFP8PairBuffer] = None
         self._native_expert_buffer: Optional[NativeBlockFP8ExpertPairBuffer] = None
         if model is not None:
             if load_family in {None, "dense"}:
+                exact_dense = Glm52ExactDenseGateUpPairBuffer(model)
+                if exact_dense.has_targets():
+                    self._exact_dense_gate_up_buffer = exact_dense
                 dense_map = native_fp8_dense_source_map(model)
                 if dense_map:
                     self._native_weight_buffer = NativeBlockFP8PairBuffer(model, dense_map)
@@ -342,6 +449,11 @@ class Glm5CheckpointHandler(CheckpointHandler):
         if key.endswith(".input_scale"):
             return []
 
+        if self._exact_dense_gate_up_buffer is not None:
+            exact_dense_result = self._exact_dense_gate_up_buffer.try_consume(key, tensor)
+            if exact_dense_result is not None:
+                return exact_dense_result
+
         if self._native_weight_buffer is not None:
             native_result = self._native_weight_buffer.try_consume(key, tensor)
             if native_result is not None:
@@ -398,6 +510,8 @@ class Glm5CheckpointHandler(CheckpointHandler):
         return self._maybe_finalize_per_expert_merge(layer_idx, proj)
 
     def on_load_complete(self) -> List[Tuple[str, torch.Tensor]]:
+        if self._exact_dense_gate_up_buffer is not None:
+            self._exact_dense_gate_up_buffer.validate_complete()
         if self._native_weight_buffer is not None:
             self._native_weight_buffer.validate_complete()
         if self._native_expert_buffer is not None:

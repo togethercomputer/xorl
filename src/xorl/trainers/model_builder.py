@@ -17,6 +17,7 @@ from xorl.lora import freeze_base_parameters
 from xorl.lora.utils import inject_lora_into_model, inject_lora_into_model_with_moe
 from xorl.models import build_foundation_model
 from xorl.models.checkpoint_handlers.buffers import get_prequantized_exclude_modules
+from xorl.models.exact_contract import glm52_exact_active_lora_enabled, glm52_exact_forward_enabled
 from xorl.models.transformers.deepseek_v3.support import (
     freeze_deepseek_v3_router_parameters,
     validate_deepseek_v3_training_mode,
@@ -257,6 +258,8 @@ def build_training_model(
         flash_attention_deterministic=flash_attention_deterministic,
         server_training=server_training,
         block_fp8_qlora_training=block_fp8_qlora_training,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
         init_device=init_device,
     )
 
@@ -415,7 +418,7 @@ def build_training_model(
     from xorl.ops.bi_families_v2 import _select_nonexact_families  # noqa: PLC0415
 
     _select_nonexact_families()
-    if getattr(model.config, "_glm52_exact_contract", False):
+    if glm52_exact_forward_enabled(model.config):
         from xorl.ops.bi_families_v2 import _select_glm52_families_v2  # noqa: PLC0415
 
         _select_glm52_families_v2()
@@ -699,6 +702,20 @@ def _deferred_qlora_quantize(
     2. NF4 linear: bf16 weight already loaded by FSDP → quantize in-place
     3. NF4 MoE: load bf16 experts from checkpoint → quantize
     """
+
+    if load_weights_mode == "skip":
+        if not glm52_exact_active_lora_enabled(getattr(model, "config", None)):
+            raise ValueError(
+                "load_weights_mode='skip' only bypasses deferred QLoRA loading for the complete "
+                "GLM-5.2 exact active-LoRA model; its base weights must be restored from DCP"
+            )
+        removed = _deregister_qlora_weights_from_fsdp(model, param_names=("packed_weight_f32",))
+        torch.cuda.empty_cache()
+        logger.info(
+            "Deferred HF QLoRA loading skipped for DCP restore; "
+            f"deregistered {removed} packed_weight_f32 params from FSDP2"
+        )
+        return
 
     # 1. Pre-quantized linear/MoE loading (nvfp4/block_fp8)
     needs_prequant_linear = any(

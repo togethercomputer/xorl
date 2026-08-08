@@ -1,5 +1,8 @@
 """GLM-5 support helpers shared by model construction and layers."""
 
+from xorl.models.exact_contract import glm52_exact_active_lora_enabled
+
+
 GLM5_DSA_RING_ATTENTION_UNSUPPORTED_MESSAGE = (
     "GLM-5 DSA attention supports Ulysses sequence parallelism but not ring attention yet. "
     "Set ringattn_parallel_size=1 for GLM-5 DSA runs, or set config._dsa_mask_disabled=True "
@@ -58,12 +61,13 @@ def validate_glm5_training_mode(
     if not is_glm5_config(config):
         return
     if block_fp8_qlora_training:
+        exact_active_lora = glm52_exact_active_lora_enabled(config)
         requirements = {
             "enable_qlora": (enable_qlora, True),
             "quant_format": (quant_format, "block_fp8"),
             "quant_group_size": (quant_group_size, 128),
             "moe_implementation": (moe_implementation, "triton"),
-            "ep_dispatch": (ep_dispatch, "deepep"),
+            "ep_dispatch": (ep_dispatch, "alltoall" if exact_active_lora else "deepep"),
             "moe_hybrid_shared_lora": (moe_hybrid_shared_lora, True),
         }
         mismatches = [

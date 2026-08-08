@@ -171,6 +171,20 @@ def _merged_model_state_dict(model) -> Dict[str, Any]:
     return merged
 
 
+def _glm52_exact_base_dcp_projection(model):
+    """Return the narrow exact-GLM base-DCP adapter when the model needs it."""
+
+    from xorl.models.exact_contract import contains_glm52_exact_active_lora_component  # noqa: PLC0415
+
+    if not any(contains_glm52_exact_active_lora_component(part) for part in _as_model_parts(model)):
+        return None
+
+    from xorl.models.transformers.glm5.exact_dcp import Glm52ExactBaseDcpLoadProjection  # noqa: PLC0415
+
+    projection = Glm52ExactBaseDcpLoadProjection(model)
+    return projection if projection.enabled else None
+
+
 def _get_model_param_keys(model) -> List[str]:
     """Get sorted list of parameter keys from a model (or PP virtual-stage parts)."""
     return sorted(
@@ -293,9 +307,18 @@ def _validate_checkpoint_compatibility(
         ckpt_metadata = json.load(f)
 
     ckpt_keys = set(ckpt_metadata.get("parameter_keys", []))
+    ckpt_lora_only = ckpt_metadata.get("save_lora_only", False)
     model_param_keys, model_persistent_buffer_keys, pipeline_key_union = _get_checkpoint_model_keys(
         model, process_group=process_group
     )
+    base_dcp_projection = None
+    if ckpt_metadata.get("has_lora") is False and not ckpt_lora_only:
+        base_dcp_projection = _glm52_exact_base_dcp_projection(model)
+        if base_dcp_projection is not None:
+            model_param_keys, model_persistent_buffer_keys = base_dcp_projection.project_key_contract(
+                model_param_keys,
+                model_persistent_buffer_keys,
+            )
     model_keys = set(model_param_keys)
     ckpt_buffer_keys_raw = ckpt_metadata.get("buffer_keys")
     buffers_validated = isinstance(ckpt_buffer_keys_raw, list)
@@ -309,9 +332,6 @@ def _validate_checkpoint_compatibility(
     missing_buffers_in_ckpt = model_buffer_keys - ckpt_buffer_keys
     unexpected_buffers_in_ckpt = ckpt_buffer_keys - model_buffer_keys
 
-    # Check if checkpoint was saved with save_lora_only
-    ckpt_lora_only = ckpt_metadata.get("save_lora_only", False)
-
     # Check if mismatch is LoRA-related
     missing_lora_keys = [k for k in missing_in_ckpt if "lora" in k.lower()]
     missing_non_lora_keys = [k for k in missing_in_ckpt if "lora" not in k.lower()]
@@ -321,6 +341,7 @@ def _validate_checkpoint_compatibility(
         "checkpoint_has_lora": ckpt_metadata.get("has_lora", False),
         "checkpoint_lora_only": ckpt_lora_only,
         "model_has_lora": any("lora" in k.lower() for k in model_keys),
+        "glm52_exact_base_dcp_projection": base_dcp_projection is not None,
         "pipeline_parallel_key_union": pipeline_key_union,
         "model_parameter_count": len(model_keys),
         "model_buffer_count": len(model_buffer_keys),
@@ -404,10 +425,20 @@ class ModelState(Stateful):
                                Used when merge_lora_interval == 0 (base weights unchanged).
     """
 
-    def __init__(self, model, exclude_keys: Optional[Set[str]] = None, save_lora_only: bool = False):
+    def __init__(
+        self,
+        model,
+        exclude_keys: Optional[Set[str]] = None,
+        save_lora_only: bool = False,
+        project_glm52_exact_base_dcp: bool = False,
+    ):
         self.model = model
         self.exclude_keys = exclude_keys or set()
         self.save_lora_only = save_lora_only
+        self.base_dcp_projection = _glm52_exact_base_dcp_projection(model) if project_glm52_exact_base_dcp else None
+        if project_glm52_exact_base_dcp and self.base_dcp_projection is None:
+            raise RuntimeError("Exact GLM base-DCP projection was requested for a model without projected state")
+        self._base_dcp_model_state = None
 
         # Determine whether this is EP+FSDP2 case
         # If so, we need to restore EP-dim before saving to DCP
@@ -437,6 +468,10 @@ class ModelState(Stateful):
         if self.save_lora_only:
             model_state_dict = {k: v for k, v in model_state_dict.items() if "lora_" in k}
             logger.info_rank0(f"LoRA-only save: keeping {len(model_state_dict)} LoRA parameters")
+
+        if self.base_dcp_projection is not None:
+            self._base_dcp_model_state = model_state_dict
+            model_state_dict = self.base_dcp_projection.project_state(model_state_dict)
 
         return model_state_dict
 
@@ -497,6 +532,14 @@ class ModelState(Stateful):
         """
 
         model_state_dict = state_dict
+        if self.base_dcp_projection is not None:
+            if self._base_dcp_model_state is None:
+                raise RuntimeError("Exact GLM base-DCP state was loaded before its target state was projected")
+            model_state_dict = self.base_dcp_projection.restore_state(
+                projected_state=state_dict,
+                model_state=self._base_dcp_model_state,
+            )
+            self._base_dcp_model_state = None
         if self.should_ep_aware:
             model_state_dict = self.get_state_dict_without_ep_dim(model_state_dict)
 
@@ -953,7 +996,13 @@ class DistributedCheckpointer(CheckpointerBase):
             exclude_keys = {k for k in all_model_keys if "lora_" not in k}
             logger.info_rank0(f"LoRA-only checkpoint: excluding {len(exclude_keys)} non-LoRA keys from load")
 
-        load_state = {"model": ModelState(state["model"], exclude_keys=exclude_keys)}
+        load_state = {
+            "model": ModelState(
+                state["model"],
+                exclude_keys=exclude_keys,
+                project_glm52_exact_base_dcp=validation_result.get("glm52_exact_base_dcp_projection", False),
+            )
+        }
         has_optimizer_state = False
         optimizer_load_keys: Optional[Set[str]] = None
         if "optimizer" in state and state["optimizer"] is not None:

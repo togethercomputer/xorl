@@ -557,6 +557,61 @@ def test_load_server_arguments_threads_glm52_block_fp8_qlora_mode(tmp_path):
     assert config["lora"]["moe_hybrid_shared_lora"] is True
 
 
+def _exact_glm52_rank1_server_config(tmp_path):
+    return {
+        "model": {
+            "model_path": "zai-org/GLM-5.2-FP8",
+            "moe_implementation": "triton",
+            "ep_dispatch": "alltoall",
+            "merge_qkv": True,
+        },
+        "train": {
+            "freeze_router": True,
+            "output_dir": str(tmp_path / "outputs"),
+            "expert_parallel_size": 16,
+            "ulysses_parallel_size": 16,
+            "lm_head_tensor_parallel_size": 16,
+            "fsdp_sharded_lm_head_loss": True,
+        },
+        "lora": {
+            "enable_lora": True,
+            "enable_qlora": True,
+            "block_fp8_qlora_training": True,
+            "lora_rank": 1,
+            "max_lora_rank": 1,
+            "lora_alpha": 1,
+            "quant_format": "block_fp8",
+            "quant_group_size": 128,
+            "moe_hybrid_shared_lora": True,
+            "lora_export_format": "sglang_shared_outer",
+        },
+    }
+
+
+def test_load_server_arguments_admits_exact_glm52_rank1_world16_tuple(tmp_path):
+    config_path = tmp_path / "server_config.yaml"
+    config_path.write_text(yaml.safe_dump(_exact_glm52_rank1_server_config(tmp_path)), encoding="utf-8")
+
+    args = load_server_arguments(str(config_path))
+
+    assert (args.lora_rank, args.max_lora_rank, args.lora_alpha) == (1, 1, 1)
+    assert args.ep_dispatch == "alltoall"
+    assert (args.expert_parallel_size, args.ulysses_parallel_size) == (16, 16)
+    assert args.lm_head_tensor_parallel_size == 16
+    assert args.fsdp_sharded_lm_head_loss is True
+    assert args.get_total_gpus() == 16
+
+
+def test_load_server_arguments_rejects_rank1_exact_lane_with_non_tp16_lm_head(tmp_path):
+    payload = _exact_glm52_rank1_server_config(tmp_path)
+    payload["train"]["lm_head_tensor_parallel_size"] = 1
+    config_path = tmp_path / "server_config.yaml"
+    config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="lm_head_tensor_parallel_size=1"):
+        load_server_arguments(str(config_path))
+
+
 def test_load_server_arguments_threads_qarl_into_train_config(tmp_path):
     config_path = tmp_path / "server_config.yaml"
     config_path.write_text(

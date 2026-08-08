@@ -14,6 +14,8 @@ from functools import wraps
 import torch
 import torch.nn as nn
 
+from xorl.models.exact_contract import glm52_exact_forward_enabled
+
 
 try:
     from flash_attn.layers.rotary import apply_rotary_emb as _flash_apply_rotary_emb
@@ -460,7 +462,7 @@ class RotaryEmbedding(nn.Module):
         self._set_inv_freq_fp32(self._cpu_fp32_inv_freq())
         self._sglang_default_cache = None
         self._use_sglang_default_cache = bool(getattr(config, "_rope_native", False) and self.rope_type == "default")
-        self._class_b = bool(getattr(config, "_rope_class_b", False) or getattr(config, "_glm52_exact_contract", False))
+        self._class_b = bool(getattr(config, "_rope_class_b", False) or glm52_exact_forward_enabled(config))
 
     def _cpu_fp32_inv_freq(self) -> torch.Tensor:
         """Frequency table computed on CPU in fp32 — the provenance serving's cos/sin cache is built with."""
@@ -511,7 +513,7 @@ class RotaryEmbedding(nn.Module):
         # trainer/sampler logprob mismatch.
         base, dim = self._default_rope_base_and_dim()
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-        if getattr(self.config, "_glm52_exact_contract", False):
+        if glm52_exact_forward_enabled(self.config):
             inv_freq = inv_freq.to(device=device)
             positions = torch.arange(seq_len, dtype=torch.float32, device=device)
             freqs = torch.einsum("i,j->ij", positions, inv_freq)

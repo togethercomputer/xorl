@@ -11,12 +11,21 @@ import torch.nn.functional as F
 from xorl.lora.fold import canonical_lora_fold_linear
 from xorl.lora.modules.linear import LoraLinear
 from xorl.models.layers.moe.lora import MoEExpertsLoRA, MoELoRAConfig
+from xorl.models.transformers.glm5.exact_lm_head_qlora import (
+    Glm52ExactTP16LmHeadLoraLinear,
+    Glm52ExactTP16LmHeadSelectedLogprob,
+    glm52_lm_head_shard,
+)
 from xorl.qlora.modules.moe_experts import BlockFP8QLoRAMoeExperts
 from xorl.server.runner import model_runner as model_runner_module
 from xorl.server.runner.adapters.gradient_ownership import (
     AdapterGradientOwnershipError,
+    GradientRepresentation,
     GradientScaleState,
     ProducerFamily,
+    ReductionAuthority,
+    ReductionAxis,
+    ReductionOperation,
     TopologyFamily,
 )
 from xorl.server.runner.adapters.manager import LoRAAdapterManager
@@ -101,6 +110,110 @@ def test_runner_compiles_module_and_direct_output_properties_at_registration(tmp
     assert by_name["lm_head.lora_B"].topology is TopologyFamily.DIRECT_OUTPUT_PROJECTION
     assert dict(by_name["trunk.lora_A"].config_guard_fields)["merged_forward"] is False
     assert dict(by_name["lm_head.lora_B"].config_guard_fields)["merged_forward"] is True
+
+
+def test_runner_compiles_exact_lm_head_vjp_and_shard_capture_without_double_ownership(tmp_path, monkeypatch):
+    shard = glm52_lm_head_shard(0)
+    head = Glm52ExactTP16LmHeadLoraLinear(3, 4, r=1, lora_alpha=1)
+    head._glm52_exact_selected_logprob = Glm52ExactTP16LmHeadSelectedLogprob(
+        tp_rank=shard.tp_rank,
+        vocab_start=shard.vocab_start,
+        vocab_end=shard.vocab_end,
+        padded_vocab_start=shard.padded_vocab_start,
+        padded_vocab_end=shard.padded_vocab_end,
+    )
+
+    # Model the post-FSDP public shape: exact A is deliberately replicated,
+    # while B remains a row-sharded DTensor consumed directly by the loss op.
+    def _local_lora_b():
+        return head.lora_B
+
+    head.lora_B.to_local = _local_lora_b
+    head.lora_B.placements = ("Shard(0)",)
+
+    class _Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lm_head = head
+
+    model = _Model()
+    manager = LoRAAdapterManager(
+        model,
+        torch.device("cpu"),
+        checkpoint_dir=str(tmp_path),
+        auto_save_on_eviction=False,
+    )
+    monkeypatch.setattr(manager, "_validate_exact_lm_head_tp_coherence", lambda *_args, **_kwargs: None)
+    manager.register_adapter("policy", lr=0.1)
+    state = manager.get_adapter_state("policy")
+    state.tensor_layouts = {
+        name: replace(
+            layout,
+            replica_count=16 if name == "lm_head.lora_A" else 1,
+            replica_ranks=tuple(range(16)) if name == "lm_head.lora_A" else (0,),
+        )
+        for name, layout in state.tensor_layouts.items()
+    }
+
+    monkeypatch.setattr("torch.distributed.fsdp.FSDPModule", Glm52ExactTP16LmHeadLoraLinear)
+    monkeypatch.setattr(
+        model_runner_module,
+        "get_parallel_state",
+        lambda: SimpleNamespace(
+            sp_grad_sync_group=None,
+            lm_head_tp_replica_group=None,
+            lm_head_tp_group=None,
+            ep_group=None,
+            ep_size=1,
+            tp_size=1,
+        ),
+    )
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.model = model
+    runner._adapter_manager = manager
+    tp16 = tuple(range(16))
+
+    runner._compile_registered_adapter_gradient_ownership(
+        "policy",
+        group_memberships={"output_projection_tp": (tp16,)},
+    )
+
+    plan = state.gradient_ownership_plan
+    assert plan is not None
+    by_name = {item.fqn: item for item in plan.parameters}
+    lora_a = by_name["lm_head.lora_A"]
+    lora_b = by_name["lm_head.lora_B"]
+
+    assert lora_a.completed_domains == (
+        model_runner_module.ReductionDomainPlan(
+            ReductionAxis.OUTPUT_PROJECTION_REPLICA,
+            ReductionAuthority.EXACT_LM_HEAD_VJP,
+            ReductionOperation.SUM,
+            "output_projection_tp",
+        ),
+    )
+    assert lora_a.capture_domains == ()
+    assert lora_a.norm_replica_divisor == 16
+    assert dict(lora_a.config_guard_fields)["exact_lm_head_tp_size"] == 16
+
+    assert lora_b.producer is ProducerFamily.DIRECT_OUTPUT_PROJECTION
+    assert lora_b.representation is GradientRepresentation.DIRECT_DTENSOR_CONTRIBUTION
+    assert lora_b.capture_domains == (
+        model_runner_module.ReductionDomainPlan(
+            ReductionAxis.FSDP_SHARD,
+            ReductionAuthority.ADAPTER_CAPTURE,
+            ReductionOperation.SUM,
+            "direct_dtensor_placement",
+        ),
+    )
+    assert lora_b.completed_domains == ()
+    assert lora_b.managed_fsdp_shard is True
+    assert lora_b.norm_replica_divisor == 1
+
+    masks = {(mask.axis, mask.authority): mask.fqns for mask in plan.authority_masks}
+    assert masks[(ReductionAxis.OUTPUT_PROJECTION_REPLICA, ReductionAuthority.EXACT_LM_HEAD_VJP)] == ("lm_head.lora_A",)
+    assert masks[(ReductionAxis.FSDP_SHARD, ReductionAuthority.ADAPTER_CAPTURE)] == ("lm_head.lora_B",)
+    assert (ReductionAxis.FSDP_SHARD, ReductionAuthority.FSDP) not in masks
 
 
 @pytest.mark.parametrize(

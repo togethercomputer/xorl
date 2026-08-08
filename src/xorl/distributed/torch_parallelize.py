@@ -42,6 +42,42 @@ if is_torch_version_greater_than("2.4"):
 logger = logging.get_logger(__name__)
 
 
+def _topmost_modules_matching(root: "nn.Module", classes: tuple[type, ...]) -> list["nn.Module"]:
+    """Select matching descendants without descending into a selected unit.
+
+    Mixed-precision-excluded modules are independent FSDP units. Wrapping a
+    matching descendant after its matching parent would create nested units
+    over one logical ownership boundary, so traversal stops at the first
+    match on each branch.
+    """
+
+    selected: list[nn.Module] = []
+
+    def visit(module: nn.Module) -> None:
+        for child in module.children():
+            if isinstance(child, classes):
+                selected.append(child)
+            else:
+                visit(child)
+
+    visit(root)
+    return selected
+
+
+def _exact_lm_head_replicated_params(lm_head: "nn.Module | None") -> set[nn.Parameter]:
+    """Return exact-head factors that must remain replicated over vocab TP."""
+
+    if lm_head is None or not getattr(lm_head, "_glm52_exact_tp16_lm_head", False):
+        return set()
+    names = tuple(getattr(lm_head, "_glm52_exact_replicated_parameter_names", ()))
+    if names != ("lora_A",):
+        raise RuntimeError("The exact GLM-5.2 lm head must declare only lora_A as TP16-replicated")
+    parameter = getattr(lm_head, "lora_A", None)
+    if not isinstance(parameter, nn.Parameter) or parameter.dtype is not torch.float32:
+        raise RuntimeError("The exact GLM-5.2 lm-head lora_A must be an FP32 Parameter")
+    return {parameter}
+
+
 def _compile_module(mod: "nn.Module", *, dynamic_shapes: bool) -> "nn.Module":
     if dynamic_shapes:
         return torch.compile(mod, dynamic=True)
@@ -460,14 +496,13 @@ def parallelize_model_fsdp2(
             fsdp_wrapped_experts.append(experts_mod)
         # shard module that needs to ignore mixed precision control
         if mp_ignored_classes:
-            for sub_mod in layer_mod.modules():
-                if isinstance(sub_mod, mp_ignored_classes) and sub_mod is not layer_mod:
-                    # this will also create a AllGather communication group
-                    # when modules here are small (like gating), this would slightly impacts the performance
-                    # a better method might be adding them to ignored_params of fully_shard
-                    # but then they will need to be initialized separately
-                    fully_shard(sub_mod, **fsdp_kwargs_without_mp)
-                    layer_mod._fsdp_modules.append(sub_mod)
+            for sub_mod in _topmost_modules_matching(layer_mod, mp_ignored_classes):
+                # this will also create a AllGather communication group
+                # when modules here are small (like gating), this would slightly impacts the performance
+                # a better method might be adding them to ignored_params of fully_shard
+                # but then they will need to be initialized separately
+                fully_shard(sub_mod, **fsdp_kwargs_without_mp)
+                layer_mod._fsdp_modules.append(sub_mod)
 
         # shard everything else in the decoder layer
         # If experts_mod has _skip_fsdp, exclude its params from the parent FSDP unit
@@ -506,6 +541,11 @@ def parallelize_model_fsdp2(
         norm_mod = getattr(base_model, "norm_f", None)
     lm_head_mod = getattr(model, "lm_head", None)
     lm_head_tp = getattr(parallel_state, "lm_head_tp_size", 1) > 1
+    exact_lm_head = bool(lm_head_mod is not None and getattr(lm_head_mod, "_glm52_exact_tp16_lm_head", False))
+    if exact_lm_head and not fsdp_sharded_lm_head_loss:
+        raise RuntimeError("The exact GLM-5.2 lm head requires fsdp_sharded_lm_head_loss=true")
+    if exact_lm_head and getattr(parallel_state, "lm_head_tp_size", 1) != 16:
+        raise RuntimeError("The exact GLM-5.2 lm head requires lm_head_tensor_parallel_size=16")
     if fsdp_sharded_lm_head_loss:
         if pp_enabled:
             raise NotImplementedError("fsdp_sharded_lm_head_loss is not supported with pipeline parallelism.")
@@ -550,6 +590,9 @@ def parallelize_model_fsdp2(
             # NOT the model's FSDP mesh. The body keeps the normal fsdp_mesh.
             lm_head_fsdp_kwargs = dict(fsdp_kwargs)
             lm_head_fsdp_kwargs["mesh"] = parallel_state.lm_head_mesh
+            exact_replicated_params = _exact_lm_head_replicated_params(lm_head_mod)
+            if exact_replicated_params:
+                lm_head_fsdp_kwargs["ignored_params"] = exact_replicated_params
             fully_shard(lm_head_mod, **lm_head_fsdp_kwargs)
             # Sum (not average) the lm_head grad over its replica dim (DP x cp_replica):
             # the loss is normalized by global valid tokens, and cp_replica grads are
@@ -577,6 +620,7 @@ def parallelize_model_fsdp2(
     for _, _, experts_mod in layer_pairs:
         if experts_mod is not None and getattr(experts_mod, "_skip_fsdp", False):
             root_ignored_params.update(experts_mod.parameters())
+    root_ignored_params.update(_exact_lm_head_replicated_params(lm_head_mod))
     if root_ignored_params:
         root_fsdp_kwargs = dict(fsdp_kwargs)
         root_fsdp_kwargs["ignored_params"] = root_ignored_params
