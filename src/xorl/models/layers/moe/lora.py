@@ -16,12 +16,21 @@ LoRA weight parameter names are preserved exactly for checkpoint compatibility::
 """
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Optional
 
 import torch
 import torch.nn as nn
 
+from xorl.distributed.gradient_reduction import GradientReductionDomain
+
+from ....lora.expert_adapter_contract import (
+    ExpertAdapterFactorOwnership,
+    ExpertAdapterGradientContract,
+    gated_expert_factor_ownership,
+    gated_expert_factor_shapes,
+    validate_gated_silu_expert_adapter_semantics,
+)
 from ....lora.fold import (
     FoldedLoraWeightGateUpGKN,
     FoldedLoraWeightGKN,
@@ -39,6 +48,7 @@ from .backend import (
     EP_EXPERT_COMPUTE_LORA,
     MOE_EXPERT_BACKENDS_LORA,
     ep_lora_gradient_reduction_domain,
+    expert_adapter_backend_contract,
     zero_token_lora_output,
 )
 from .common import split_gate_up_proj
@@ -60,6 +70,14 @@ class MoELoRAConfig:
     def __post_init__(self):
         if self.target_modules is None:
             self.target_modules = ["gate_proj", "up_proj", "down_proj"]
+        selected = tuple(self.target_modules)
+        supported = {"gate_proj", "up_proj", "down_proj"}
+        unsupported = set(selected) - supported
+        if not selected or len(set(selected)) != len(selected) or unsupported:
+            raise ValueError(
+                f"MoE LoRA target_modules must be a non-empty subset of {sorted(supported)}; got {list(selected)!r}"
+            )
+        self.target_modules = list(selected)
 
 
 class MoEExpertsLoRA(LoraModule, nn.Module):
@@ -86,6 +104,39 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
             return "fused_managed"
         return "module_managed"
 
+    @property
+    def expert_adapter_gradient_contract(self) -> ExpertAdapterGradientContract:
+        """Declare the configured backend and factor ownership to the compiler."""
+
+        try:
+            validate_gated_silu_expert_adapter_semantics(self)
+        except NotImplementedError as error:
+            raise ValueError(str(error)) from error
+        roles = tuple(self.lora_config.target_modules)
+        backend = replace(
+            expert_adapter_backend_contract(self.moe_implementation),
+            producer_family=self.adapter_gradient_producer_family(),
+        )
+        return ExpertAdapterGradientContract(
+            backend=backend,
+            factor_layout="gkn_gate_up_down",
+            projection_roles=roles,
+            factor_ownership=gated_expert_factor_ownership(
+                roles,
+                hybrid_shared=self.lora_config.hybrid_shared,
+            ),
+            factor_shapes=gated_expert_factor_shapes(
+                roles,
+                num_experts=self.num_experts,
+                hidden_size=self.hidden_dim,
+                intermediate_size=self.intermediate_size,
+                rank=self.r,
+                hybrid_shared=self.lora_config.hybrid_shared,
+            ),
+            supports_efsdp_replication=True,
+            guard_fields=(("expert_hybrid_shared", self.lora_config.hybrid_shared),),
+        )
+
     def __init__(
         self,
         num_experts: int,
@@ -102,16 +153,30 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         self.hidden_dim = hidden_dim
         self.intermediate_size = intermediate_size
         self.hidden_act = hidden_act
+        self.gated = True
         self.moe_implementation = moe_implementation
         self.lora_config = lora_config or MoELoRAConfig()
         self.r = self.lora_config.r
         self.lora_alpha = self.lora_config.lora_alpha
         self.swiglu_limit = float(swiglu_limit)
+        self.gate_up_bias = None
+        self.down_bias = None
         self.active_r = self.r
         self.active_lora_alpha = self.lora_alpha
         self.use_rslora = self.lora_config.use_rslora
-        self.swiglu_limit = float(swiglu_limit)
         self._ep_gradient_reduction_domain = ep_lora_gradient_reduction_domain(moe_implementation)
+        factor_ownership = gated_expert_factor_ownership(
+            self.lora_config.target_modules,
+            hybrid_shared=self.lora_config.hybrid_shared,
+        )
+        self._ep_gradient_reduction_by_parameter = {
+            name: (
+                self._ep_gradient_reduction_domain
+                if ownership is ExpertAdapterFactorOwnership.EP_REPLICATED
+                else GradientReductionDomain.NONE
+            )
+            for name, ownership in factor_ownership
+        }
 
         # Base weights (frozen) in (G, K, N) format
         self.gate_up_proj = nn.Parameter(
@@ -138,6 +203,27 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         # - gate/up: lora_A shared [1, hidden, r], lora_B per-expert [E, r, inter]
         # - down: lora_A per-expert [E, inter, r], lora_B shared [1, r, hidden]
         shared_exp = 1 if hybrid else num_exp
+
+        # ParallelPlan shards parameters, not buffers. Unselected projection
+        # factors are structural zeros consumed by the same fused backend API,
+        # so their owner-specific expert dimension must already be EP-local.
+        # A post-EP construction explicitly supplies a smaller num_local_experts;
+        # a pre-EP construction derives the future local size from parallel state.
+        self._zero_factor_experts = num_exp
+        if num_local_experts is None or num_local_experts == num_experts:
+            try:
+                from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
+
+                parallel_state = get_parallel_state()
+                ep_size = int(parallel_state.ep_size) if parallel_state.ep_enabled else 1
+                if ep_size > 1:
+                    if num_exp % ep_size:
+                        raise ValueError(f"Expert count {num_exp} is not divisible by expert parallel size {ep_size}")
+                    self._zero_factor_experts = num_exp // ep_size
+            except RuntimeError:
+                # Construction outside an initialized distributed runtime is
+                # local; a later EP plan is responsible for parameters.
+                pass
 
         self._create_lora_params("gate_proj", shared_exp, num_exp, r, hidden_dim, intermediate_size)
         self._create_lora_params("up_proj", shared_exp, num_exp, r, hidden_dim, intermediate_size)
@@ -181,8 +267,18 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
             setattr(self, f"{name}_lora_A", nn.Parameter(torch.empty(A_experts, in_features, r)))
             setattr(self, f"{name}_lora_B", nn.Parameter(torch.empty(B_experts, r, out_features)))
         else:
-            self.register_buffer(f"{name}_lora_A", torch.zeros(A_experts, in_features, r))
-            self.register_buffer(f"{name}_lora_B", torch.zeros(B_experts, r, out_features))
+            local_A_experts = 1 if A_experts == 1 else self._zero_factor_experts
+            local_B_experts = 1 if B_experts == 1 else self._zero_factor_experts
+            self.register_buffer(
+                f"{name}_lora_A",
+                torch.zeros(local_A_experts, in_features, r),
+                persistent=False,
+            )
+            self.register_buffer(
+                f"{name}_lora_B",
+                torch.zeros(local_B_experts, r, out_features),
+                persistent=False,
+            )
 
     def reset_lora_parameters(self):
         """Initialize LoRA weights: kaiming_uniform for A, zeros for B."""
@@ -819,6 +915,7 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
     @classmethod
     def from_module(cls, module: nn.Module, r: int, lora_alpha: int, **kwargs):
         """Create from an existing MoEExperts module, copying base weights."""
+        validate_gated_silu_expert_adapter_semantics(module)
         target_modules = kwargs.get("target_modules", ["gate_proj", "up_proj", "down_proj"])
         use_rslora = kwargs.get("use_rslora", False)
         hybrid_shared = kwargs.get("hybrid_shared", False)
@@ -878,6 +975,7 @@ def inject_lora_into_experts(
     hybrid_shared: bool = False,
 ) -> None:
     """Replace ``block.experts`` with a :class:`MoEExpertsLoRA` instance."""
+    validate_gated_silu_expert_adapter_semantics(block.experts)
     if target_modules is None:
         target_modules = ["gate_proj", "up_proj", "down_proj"]
 

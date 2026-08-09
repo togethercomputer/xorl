@@ -1,5 +1,7 @@
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -139,32 +141,91 @@ def test_removed_field_inventory_allows_unrelated_unknown_fields():
     assert reject_removed_configuration_fields(payload, context="test config") is payload
 
 
-@pytest.mark.parametrize(
-    "relative_path",
-    (
-        "examples/server/configs/lora/qwen3_5_35b_a3b_lora.yaml",
-        "examples/server/configs/lora/qwen3_coder_30b_a3b_lora.yaml",
-    ),
+_SHIPPED_MOE_LORA_CONFIGS = (
+    "examples/server/configs/lora/qwen3_5_35b_a3b_lora.yaml",
+    "examples/server/configs/lora/qwen3_coder_30b_a3b_lora.yaml",
 )
-def test_shipped_moe_lora_examples_select_certified_triton(relative_path):
-    config = yaml.safe_load((Path(__file__).resolve().parents[2] / relative_path).read_text(encoding="utf-8"))
-    assert config["moe_implementation"] == "triton"
+_SHIPPED_QWEN_MOE_QLORA_CONFIGS = (
+    "examples/server/configs/qlora/qwen3_235b_a22b_qlora_nf4.yaml",
+    "examples/server/configs/qlora/qwen3_235b_a22b_qlora_nvfp4.yaml",
+    "examples/server/configs/qlora/qwen3_30b_a3b_qlora_nf4.yaml",
+    "examples/server/configs/qlora/qwen3_30b_a3b_qlora_nvfp4.yaml",
+    "examples/server/configs/qlora/qwen3_coder_30b_a3b_qlora.yaml",
+)
+
+
+@pytest.fixture(scope="module")
+def clean_shipped_adapter_arguments():
+    """Parse shipped configs in a clean process, outside this module's launcher stubs."""
+
+    root = Path(__file__).resolve().parents[2]
+    relative_paths = _SHIPPED_MOE_LORA_CONFIGS + _SHIPPED_QWEN_MOE_QLORA_CONFIGS
+    script = """
+import json
+import sys
+from xorl.server.launcher import load_server_arguments
+
+result = {}
+for path in sys.argv[1:]:
+    args = load_server_arguments(path)
+    result[path] = {
+        "moe_implementation": args.moe_implementation,
+        "moe_hybrid_shared_lora": args.moe_hybrid_shared_lora,
+        "lora_target_modules": args.lora_target_modules,
+    }
+print("XORL_SHIPPED_CONFIG_ARGS=" + json.dumps(result, sort_keys=True))
+"""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join((str(root / "src"), str(root), env.get("PYTHONPATH", "")))
+    completed = subprocess.run(
+        [sys.executable, "-c", script, *(str(root / path) for path in relative_paths)],
+        cwd=root,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    marker = "XORL_SHIPPED_CONFIG_ARGS="
+    payload = next(line.removeprefix(marker) for line in completed.stdout.splitlines() if line.startswith(marker))
+    parsed = json.loads(payload)
+    return {path: parsed[str(root / path)] for path in relative_paths}
 
 
 @pytest.mark.parametrize(
     "relative_path",
-    (
-        "examples/server/configs/qlora/qwen3_235b_a22b_qlora_nf4.yaml",
-        "examples/server/configs/qlora/qwen3_235b_a22b_qlora_nvfp4.yaml",
-        "examples/server/configs/qlora/qwen3_30b_a3b_qlora_nf4.yaml",
-        "examples/server/configs/qlora/qwen3_30b_a3b_qlora_nvfp4.yaml",
-        "examples/server/configs/qlora/qwen3_coder_30b_a3b_qlora.yaml",
-    ),
+    _SHIPPED_MOE_LORA_CONFIGS,
 )
-def test_shipped_qwen_quantized_moe_examples_are_attention_only(relative_path):
-    config = yaml.safe_load((Path(__file__).resolve().parents[2] / relative_path).read_text(encoding="utf-8"))
-    assert config["moe_implementation"] == "triton"
-    assert config["lora_target_modules"] == ["q_proj", "k_proj", "v_proj", "o_proj"]
+def test_shipped_moe_lora_examples_restore_certified_quack(relative_path, clean_shipped_adapter_arguments):
+    config_path = Path(__file__).resolve().parents[2] / relative_path
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    parsed = clean_shipped_adapter_arguments[relative_path]
+    assert config["moe_implementation"] == parsed["moe_implementation"] == "quack"
+    assert config.get("moe_hybrid_shared_lora", False) is parsed["moe_hybrid_shared_lora"] is False
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    _SHIPPED_QWEN_MOE_QLORA_CONFIGS,
+)
+def test_shipped_qwen_quantized_moe_examples_restore_quack_expert_targets(
+    relative_path, clean_shipped_adapter_arguments
+):
+    config_path = Path(__file__).resolve().parents[2] / relative_path
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    parsed = clean_shipped_adapter_arguments[relative_path]
+    expected_targets = [
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    ]
+    assert config["moe_implementation"] == parsed["moe_implementation"] == "quack"
+    assert config["lora_target_modules"] == parsed["lora_target_modules"] == expected_targets
+    assert config["moe_hybrid_shared_lora"] is parsed["moe_hybrid_shared_lora"] is True
 
 
 def test_canonical_moe_and_rope_auto_defaults_serialize(tmp_path):

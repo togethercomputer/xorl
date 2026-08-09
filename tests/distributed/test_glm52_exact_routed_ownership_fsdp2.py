@@ -158,6 +158,7 @@ def _run_world16_exact_routed_ownership() -> None:
                 checkpoint_dir=checkpoint_dir,
                 auto_save_on_eviction=False,
                 optimizer_fused=False,
+                lora_config={"moe_hybrid_shared_lora": True},
             )
             group_memberships = manager.register_adapter(
                 "policy",
@@ -183,9 +184,9 @@ def _run_world16_exact_routed_ownership() -> None:
                 local_name = full_name.rpartition(".")[2]
                 layout = state.tensor_layouts[full_name]
                 guard = dict(item.config_guard_fields)
-                assert guard["expert_module"] == "Glm52ExactEP16BlockFP8QLoRARoutedExperts"
                 assert guard["expert_exact_contract"] == GLM52_EXACT_EP16_ROUTED_QLORA_CONTRACT_VERSION
-                assert guard["expert_fsdp_unit"] is True
+                assert guard["expert_requires_managed_fsdp"] is True
+                assert guard["expert_factor_layout"] == "gkn_gate_up_down"
                 assert item.producer is ProducerFamily.MODULE_MANAGED
                 assert item.managed_fsdp_shard is True
                 if local_name in _SHARED_FACTORS:

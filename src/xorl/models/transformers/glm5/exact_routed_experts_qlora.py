@@ -17,13 +17,19 @@ form, while production consumes the post-EP sixteen-expert form directly.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
 from xorl.distributed.gradient_reduction import GradientReductionDomain
+from xorl.lora.expert_adapter_contract import (
+    ExpertAdapterGradientContract,
+    gated_expert_factor_ownership,
+    gated_expert_factor_shapes,
+)
+from xorl.models.layers.moe.backend import expert_adapter_backend_contract
 from xorl.models.layers.moe.experts import MoEExperts
 from xorl.models.transformers.glm5.native_fp8 import Glm52NativeBlockFP8Experts
 from xorl.ops.block_fp8_native import pack_fp8_as_float32
@@ -168,6 +174,52 @@ class Glm52ExactEP16BlockFP8QLoRARoutedExperts(Glm52NativeBlockFP8Experts):
         "down_proj_lora_A",
         "down_proj_lora_B",
     )
+
+    @property
+    def expert_adapter_gradient_contract(self) -> ExpertAdapterGradientContract:
+        """Declare generic ownership plus the exact lane's immutable geometry."""
+
+        if (
+            self.contract_version != GLM52_EXACT_EP16_ROUTED_QLORA_CONTRACT_VERSION
+            or self.ep_size != GLM52_ROUTED_EP_SIZE
+            or self.num_experts != GLM52_ROUTED_GLOBAL_EXPERTS
+            or self.num_local_experts != GLM52_ROUTED_LOCAL_EXPERTS
+            or self.moe_tp_size != 1
+            or self.r != 1
+            or self.active_r != 1
+            or self.lora_alpha != 1
+            or self.active_lora_alpha != 1
+            or self.ep_dispatch != "alltoall"
+            or self.hybrid_shared is not True
+        ):
+            raise ValueError("exact EP16 alltoall routed lane geometry no longer matches its declared contract")
+        roles = ("gate_proj", "up_proj", "down_proj")
+        return ExpertAdapterGradientContract(
+            backend=replace(
+                expert_adapter_backend_contract(self.moe_implementation),
+                producer_family="module_managed",
+            ),
+            factor_layout="gkn_gate_up_down",
+            projection_roles=roles,
+            factor_ownership=gated_expert_factor_ownership(roles, hybrid_shared=True),
+            factor_shapes=gated_expert_factor_shapes(
+                roles,
+                num_experts=self.num_experts,
+                hidden_size=self.hidden_size,
+                intermediate_size=self.intermediate_size,
+                rank=self.r,
+                hybrid_shared=True,
+            ),
+            supported_quantized_base_formats=("block_fp8",),
+            quantized_base_format=self.quant_format,
+            supports_efsdp_replication=True,
+            requires_managed_fsdp=True,
+            guard_fields=(
+                ("expert_exact_contract", self.contract_version),
+                ("expert_ep_size", self.ep_size),
+                ("expert_moe_tp_size", self.moe_tp_size),
+            ),
+        )
 
     def __init__(
         self,

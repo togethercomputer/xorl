@@ -11,6 +11,7 @@ either implementation path.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import os
 import shutil
 import tempfile
@@ -21,7 +22,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch.distributed.fsdp import fully_shard
+from torch.distributed.fsdp import MixedPrecisionPolicy, fully_shard
 from torch.distributed.tensor import DTensor, Shard
 from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
 
@@ -29,6 +30,12 @@ from xorl.distributed.parallel_plan import ParallelPlan
 from xorl.distributed.parallel_state import get_parallel_state, init_parallel_state
 from xorl.lora.modules.linear import LoraLinear
 from xorl.models.layers.moe.lora import MoEExpertsLoRA, MoELoRAConfig
+from xorl.qlora.modules.moe_experts import (
+    BlockFP8QLoRAMoeExperts,
+    NF4QLoRAMoeExperts,
+    NvFP4QLoRAMoeExperts,
+    QLoRAMoeExperts,
+)
 from xorl.server.protocol.operations import OptimStepData
 from xorl.server.protocol.orchestrator_runner import RunnerDispatchCommand
 from xorl.server.runner.adapters.gradient_ownership import (
@@ -45,11 +52,11 @@ from xorl.trainers.training_utils import sync_sp_gradients
 pytestmark = [pytest.mark.server, pytest.mark.gpu]
 
 
-def _session_spec() -> dict:
+def _session_spec(*, rank: int = 2) -> dict:
     return {
         "base_model": "analytical-adapter-fixture",
         "is_lora": True,
-        "lora_config": {"lora_rank": 2, "lora_alpha": 2, "seed": 11},
+        "lora_config": {"lora_rank": rank, "lora_alpha": rank, "seed": 11},
         "optimizer_config": {
             "type": "adamw",
             "learning_rate": 1e-2,
@@ -539,11 +546,27 @@ def _expert_reference_gradients(
     expert_batches: list[torch.Tensor],
     *,
     owner_range: range | None,
+    scaling: float = 1.0,
 ) -> dict[str, torch.Tensor]:
     factor_names = tuple(name for name in values if "lora_" in name)
     factors = {name: values[name].detach().clone().requires_grad_(True) for name in factor_names}
-    gate_base, up_base = values["experts.gate_up_proj"].split(6, dim=-1)
+    gate_up_base = values["experts.gate_up_proj"]
+    gate_base, up_base = gate_up_base.split(gate_up_base.shape[-1] // 2, dim=-1)
     down_base = values["experts.down_proj"]
+    first_name, first_factor = next(iter(factors.items()))
+    rank = first_factor.shape[-1] if first_name.endswith("_A") else first_factor.shape[-2]
+
+    def _factor(name: str, shape: tuple[int, ...]) -> torch.Tensor:
+        factor = factors.get(name)
+        return factor if factor is not None else gate_base.new_zeros(shape)
+
+    expert_count, hidden_size, intermediate_size = gate_base.shape
+    gate_a_all = _factor("experts.gate_proj_lora_A", (1, hidden_size, rank))
+    gate_b_all = _factor("experts.gate_proj_lora_B", (expert_count, rank, intermediate_size))
+    up_a_all = _factor("experts.up_proj_lora_A", (1, hidden_size, rank))
+    up_b_all = _factor("experts.up_proj_lora_B", (expert_count, rank, intermediate_size))
+    down_a_all = _factor("experts.down_proj_lora_A", (expert_count, intermediate_size, rank))
+    down_b_all = _factor("experts.down_proj_lora_B", (1, rank, hidden_size))
     # Keep the mathematical reference structurally connected to every factor.
     # An EP owner can receive no routed tokens for an entire step; its exact
     # reference gradient is a present zero tensor, not an absent gradient.
@@ -553,16 +576,26 @@ def _expert_reference_gradients(
             expert = int(expert_tensor.item())
             if owner_range is not None and expert not in owner_range:
                 continue
-            gate_a = factors["experts.gate_proj_lora_A"][0]
-            gate_b = factors["experts.gate_proj_lora_B"][expert]
-            up_a = factors["experts.up_proj_lora_A"][0]
-            up_b = factors["experts.up_proj_lora_B"][expert]
-            down_a = factors["experts.down_proj_lora_A"][expert]
-            down_b = factors["experts.down_proj_lora_B"][0]
-            gate = token @ gate_base[expert] + (token @ gate_a) @ gate_b
-            up = token @ up_base[expert] + (token @ up_a) @ up_b
+            gate_a = gate_a_all[0 if gate_a_all.shape[0] == 1 else expert]
+            gate_b = gate_b_all[expert]
+            up_a = up_a_all[0 if up_a_all.shape[0] == 1 else expert]
+            up_b = up_b_all[expert]
+            down_a = down_a_all[expert]
+            down_b = down_b_all[0 if down_b_all.shape[0] == 1 else expert]
+            compute_dtype = token.dtype
+            gate = (
+                token @ gate_base[expert].to(compute_dtype)
+                + ((token @ gate_a.to(compute_dtype)) @ gate_b.to(compute_dtype)) * scaling
+            )
+            up = (
+                token @ up_base[expert].to(compute_dtype)
+                + ((token @ up_a.to(compute_dtype)) @ up_b.to(compute_dtype)) * scaling
+            )
             activated = torch.nn.functional.silu(gate) * up
-            output = activated @ down_base[expert] + (activated @ down_a) @ down_b
+            output = (
+                activated @ down_base[expert].to(compute_dtype)
+                + ((activated @ down_a.to(compute_dtype)) @ down_b.to(compute_dtype)) * scaling
+            )
             objective = objective + output.square().sum()
     gradients = torch.autograd.grad(objective, tuple(factors.values()))
     return dict(zip(factor_names, gradients, strict=True))
@@ -588,6 +621,9 @@ def _assert_adam_matches_reference(
     state,
     reference_parameters: dict[str, nn.Parameter],
     reference_optimizer: torch.optim.Optimizer,
+    *,
+    rtol: float = 5e-4,
+    atol: float = 1e-4,
 ) -> None:
     for name, parameter in state.local_params.items():
         layout = state.tensor_layouts[name]
@@ -595,8 +631,8 @@ def _assert_adam_matches_reference(
         torch.testing.assert_close(
             parameter.float(),
             _logical_slice(reference_parameter.detach(), layout).float(),
-            rtol=5e-4,
-            atol=1e-4,
+            rtol=rtol,
+            atol=atol,
         )
         actual_optimizer_state = state.optimizer.state[parameter]
         reference_optimizer_state = reference_optimizer.state[reference_parameter]
@@ -604,30 +640,40 @@ def _assert_adam_matches_reference(
             torch.testing.assert_close(
                 actual_optimizer_state[field].float(),
                 _logical_slice(reference_optimizer_state[field], layout).float(),
-                rtol=5e-4,
-                atol=1e-4,
+                rtol=rtol,
+                atol=atol,
             )
         assert float(actual_optimizer_state["step"].item()) == float(reference_optimizer_state["step"].item())
 
 
 def _run_experts() -> None:
     rank, world, device = _init_nccl()
-    assert world == 4
+    assert world in {2, 4}
+
     try:
         init_parallel_state(dp_size=world, ep_size=2, dp_mode="none", device_type="cuda")
         ps = get_parallel_state()
         backend = os.environ.get("XORL_ADAPTER_EXPERT_BACKEND", "eager")
+        ep_dispatch = os.environ.get("XORL_ADAPTER_EXPERT_DISPATCH", "alltoall")
+        target_modules = os.environ.get("XORL_ADAPTER_EXPERT_TARGETS", "gate_proj,up_proj,down_proj").split(",")
+        hybrid_shared = os.environ.get("XORL_ADAPTER_EXPERT_HYBRID_SHARED", "1") == "1"
 
         class _ExpertModel(nn.Module):
             def __init__(self) -> None:
                 super().__init__()
                 self.experts = MoEExpertsLoRA(
                     num_experts=4,
-                    hidden_dim=4,
-                    intermediate_size=6,
+                    hidden_dim=128,
+                    intermediate_size=128,
                     moe_implementation=backend,
-                    lora_config=MoELoRAConfig(r=2, lora_alpha=2, hybrid_shared=True),
+                    lora_config=MoELoRAConfig(
+                        r=8,
+                        lora_alpha=8,
+                        hybrid_shared=hybrid_shared,
+                        target_modules=target_modules,
+                    ),
                 ).to(device)
+                self.experts.ep_dispatch = ep_dispatch
                 self._parallel_plan = ParallelPlan(
                     {
                         f"experts.{name}": Shard(0)
@@ -654,11 +700,16 @@ def _run_experts() -> None:
             model.experts,
             mesh=ps.ep_fsdp_device_mesh["ep_fsdp"],
             shard_placement_fn=lambda _parameter: Shard(1),
+            mp_policy=MixedPrecisionPolicy(
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.float32,
+            ),
         )
         model.experts.set_gradient_divide_factor(1.0)
 
-        manager = _manager(model, _root("experts", rank))
-        manager.register_adapter("policy", session_spec=_session_spec(), initialize_fresh=False)
+        manager = _manager(model, _root(f"experts-{backend}-{ep_dispatch}", rank))
+        manager.lora_config["moe_hybrid_shared_lora"] = hybrid_shared
+        manager.register_adapter("policy", session_spec=_session_spec(rank=8), initialize_fresh=False)
         runner = _runner(model, manager)
         dispatcher = _dispatcher(runner)
         runner._compile_registered_adapter_gradient_ownership("policy")
@@ -675,8 +726,10 @@ def _run_experts() -> None:
             weight_decay=0.0,
         )
 
-        hidden_base = torch.arange(16, device=device, dtype=torch.float32).reshape(4, 4) / 25.0 + rank * 0.03
-        routing = torch.ones((4, 1), device=device, dtype=torch.float32)
+        hidden_base = (
+            torch.arange(4 * 128, device=device, dtype=torch.float32).reshape(4, 128) / 2048.0 + rank * 0.01
+        ).to(torch.bfloat16)
+        routing = torch.ones((4, 1), device=device, dtype=torch.bfloat16)
         owner_start = int(ps.ep_rank) * 2
         for step_index, routed_expert in enumerate((0, 2), start=1):
             manager.prepare_forward("policy")
@@ -724,11 +777,12 @@ def _run_experts() -> None:
             assert raw_boundary.keys() == state.tensor_layouts.keys()
             for name, raw in raw_boundary.items():
                 packed = state.tensor_layouts[name].pack_from_local(raw).float()
+                expected_packed = _logical_slice(owner_reference[name], state.tensor_layouts[name]).float()
                 torch.testing.assert_close(
                     packed,
-                    _logical_slice(owner_reference[name], state.tensor_layouts[name]).float(),
-                    rtol=2e-3,
-                    atol=2e-4,
+                    expected_packed,
+                    rtol=1.5e-2,
+                    atol=2e-3,
                 )
 
             normalized = {name: gradient / 2.0 for name, gradient in logical_gradients.items()}
@@ -745,7 +799,262 @@ def _run_experts() -> None:
                 gradient_clip=0.05,
             )
             if rank == 0:
-                assert actual_norm == pytest.approx(expected_norm, rel=2e-3, abs=2e-4)
+                assert actual_norm == pytest.approx(expected_norm, rel=1.5e-2, abs=2e-3)
+            _assert_adam_matches_reference(
+                state,
+                reference_parameters,
+                reference_optimizer,
+                rtol=1.5e-2,
+                atol=2e-3,
+            )
+            assert state.publication_eligible
+            assert state.global_step == step_index
+
+        expected_topologies = {TopologyFamily.OWNER_SHARDED}
+        if hybrid_shared:
+            expected_topologies.add(TopologyFamily.EP_REPLICATED_SHARED)
+        assert {item.topology for item in state.gradient_ownership_plan.parameters} == expected_topologies
+        assert state.last_transport_stats.collective_count == (1 if hybrid_shared else 0)
+        if rank == 0:
+            target_suffix = (
+                "" if target_modules == ["gate_proj", "up_proj", "down_proj"] else ":" + ",".join(target_modules)
+            )
+            layout_suffix = "" if hybrid_shared else ":all_owner"
+            print(
+                f"EXPERT_SHARED_OWNER_TWO_STEP_ZERO_TOKEN_REAL_AUTOGRAD_PUBLIC_OPTIM_CERTIFIED:"
+                f"{backend}:{ep_dispatch}{target_suffix}{layout_suffix}",
+                flush=True,
+            )
+    finally:
+        dist.destroy_process_group()
+
+
+def _quantized_expert_class(quant_format: str) -> type[QLoRAMoeExperts]:
+    try:
+        return {
+            "block_fp8": BlockFP8QLoRAMoeExperts,
+            "nf4": NF4QLoRAMoeExperts,
+            "nvfp4": NvFP4QLoRAMoeExperts,
+        }[quant_format]
+    except KeyError as error:
+        raise AssertionError(f"Unsupported quantized expert fixture format {quant_format!r}") from error
+
+
+def _set_quantized_expert_values(module: QLoRAMoeExperts, *, rank: int) -> dict[str, torch.Tensor]:
+    """Install deterministic local quantized bases and global LoRA factors."""
+
+    values: dict[str, torch.Tensor] = {}
+    with torch.no_grad():
+        for ordinal, (name, parameter) in enumerate(module.named_parameters()):
+            sequence = torch.linspace(
+                -0.08 + ordinal * 0.005,
+                0.11 + ordinal * 0.005,
+                parameter.numel(),
+                device=parameter.device,
+                dtype=parameter.dtype,
+            ).reshape_as(parameter)
+            parameter.copy_(sequence)
+            values[f"experts.{name}"] = parameter.detach().clone()
+
+        for ordinal, (projection, in_features, out_features) in enumerate(
+            (
+                ("gate", module.hidden_size, module.intermediate_size),
+                ("up", module.hidden_size, module.intermediate_size),
+                ("down", module.intermediate_size, module.hidden_size),
+            )
+        ):
+            base = torch.linspace(
+                -0.09 + rank * 0.004 + ordinal * 0.007,
+                0.13 + rank * 0.004 + ordinal * 0.007,
+                in_features * out_features,
+                device=next(module.parameters()).device,
+                dtype=torch.float32,
+            ).reshape(1, in_features, out_features)
+            module._quantize_proj(projection, base)
+    module._weights_loaded = True
+    return values
+
+
+def _gather_quantized_expert_bases(module: QLoRAMoeExperts, world: int) -> dict[str, torch.Tensor]:
+    values: dict[str, torch.Tensor] = {}
+    for name, local in (
+        ("experts.gate_proj", module.gate_proj),
+        ("experts.up_proj", module.up_proj),
+        ("experts.down_proj", module.down_proj),
+    ):
+        gathered = [torch.empty_like(local) for _ in range(world)]
+        dist.all_gather(gathered, local)
+        values[name] = torch.cat(gathered, dim=0)
+    return values
+
+
+def _quantized_expert_reference_gradients(
+    values: dict[str, torch.Tensor],
+    hidden_batches: list[torch.Tensor],
+    expert_batches: list[torch.Tensor],
+    *,
+    owner_range: range | None,
+    scaling: float,
+) -> dict[str, torch.Tensor]:
+    reference_values = dict(values)
+    reference_values["experts.gate_up_proj"] = torch.cat(
+        (reference_values.pop("experts.gate_proj"), reference_values.pop("experts.up_proj")),
+        dim=-1,
+    )
+    return _expert_reference_gradients(
+        reference_values,
+        hidden_batches,
+        expert_batches,
+        owner_range=owner_range,
+        scaling=scaling,
+    )
+
+
+def _run_quantized_experts() -> None:
+    rank, world, device = _init_nccl()
+    assert world == 2
+    try:
+        # QLoRA expert factors are intentionally excluded from FSDP.  EP spans
+        # the world here so there is no unsupported eFSDP replica dimension.
+        init_parallel_state(dp_size=world, ep_size=world, dp_mode="none", device_type="cuda")
+        ps = get_parallel_state()
+        assert ps.dp_shard_in_ep_size == 1
+        backend = os.environ["XORL_ADAPTER_EXPERT_BACKEND"]
+        quant_format = os.environ["XORL_ADAPTER_EXPERT_QUANT_FORMAT"]
+        ep_dispatch = os.environ.get("XORL_ADAPTER_EXPERT_DISPATCH", "alltoall")
+        target_modules = os.environ.get("XORL_ADAPTER_EXPERT_TARGETS", "gate_proj,up_proj,down_proj").split(",")
+        qlora_class = _quantized_expert_class(quant_format)
+        lora_rank = 8
+
+        class _QuantizedExpertModel(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.experts = qlora_class(
+                    num_local_experts=1,
+                    num_experts=world,
+                    intermediate_size=128,
+                    hidden_size=128,
+                    r=lora_rank,
+                    lora_alpha=lora_rank,
+                    expert_offset=rank,
+                    device=device,
+                    moe_implementation=backend,
+                    hybrid_shared=True,
+                    target_modules=target_modules,
+                    ep_dispatch=ep_dispatch,
+                    deepep_buffer_size_gb=0.1,
+                )
+                self._parallel_plan = ParallelPlan(
+                    {f"experts.{name}": Shard(0) for name, _parameter in self.experts.named_parameters()}
+                )
+
+            def get_parallel_plan(self):
+                return self._parallel_plan
+
+        model = _QuantizedExpertModel()
+        global_values = _set_quantized_expert_values(model.experts, rank=rank)
+        global_values.update(_gather_quantized_expert_bases(model.experts, world))
+        model._fqn2spec_info = model.get_parallel_plan().apply(model, ps.ep_fsdp_device_mesh)
+
+        manager = _manager(
+            model,
+            _root(f"quantized-experts-{backend}-{quant_format}-{ep_dispatch}", rank),
+        )
+        manager.lora_config["moe_hybrid_shared_lora"] = True
+        manager.register_adapter(
+            "policy",
+            session_spec=_session_spec(rank=lora_rank),
+            initialize_fresh=False,
+        )
+        runner = _runner(model, manager)
+        dispatcher = _dispatcher(runner)
+        runner._compile_registered_adapter_gradient_ownership("policy")
+        manager.prepare_forward("policy")
+        state = manager.get_adapter_state("policy")
+        reference_parameters = {
+            name: nn.Parameter(value.detach().clone()) for name, value in global_values.items() if "lora_" in name
+        }
+        reference_optimizer = torch.optim.AdamW(
+            reference_parameters.values(),
+            lr=1e-2,
+            betas=(0.9, 0.95),
+            eps=1e-8,
+            weight_decay=0.0,
+        )
+
+        hidden_base = (
+            torch.arange(4 * 128, device=device, dtype=torch.float32).reshape(4, 128) / 2048.0 + rank * 0.01
+        ).to(torch.bfloat16)
+        routing = torch.ones((4, 1), device=device, dtype=torch.bfloat16)
+        for step_index, routed_expert in enumerate((0, world - 1), start=1):
+            manager.prepare_forward("policy")
+            hidden = hidden_base + (step_index - 1) * 0.015625
+            selected = torch.full((4, 1), routed_expert, device=device, dtype=torch.int64)
+            hidden_batches = [torch.empty_like(hidden) for _ in range(world)]
+            expert_batches = [torch.empty_like(selected) for _ in range(world)]
+            dist.all_gather(hidden_batches, hidden)
+            dist.all_gather(expert_batches, selected)
+            reference_values = {
+                **global_values,
+                **{name: parameter.detach() for name, parameter in reference_parameters.items()},
+            }
+            owner_reference = _quantized_expert_reference_gradients(
+                reference_values,
+                hidden_batches,
+                expert_batches,
+                owner_range=range(rank, rank + 1),
+                scaling=model.experts.scaling,
+            )
+            logical_gradients = _quantized_expert_reference_gradients(
+                reference_values,
+                hidden_batches,
+                expert_batches,
+                owner_range=None,
+                scaling=model.experts.scaling,
+            )
+            raw_boundary: dict[str, torch.Tensor] = {}
+
+            def _capture(_micro_batches, **_kwargs):
+                assert manager.begin_gradient_capture("policy", scale_state=GradientScaleState.RAW_NUMERATOR)
+                model.experts(hidden, routing, selected).float().square().sum().backward()
+                for name, parameter in model.named_parameters():
+                    if name in state.tensor_layouts:
+                        assert parameter.grad is not None, f"missing structural gradient for {name}"
+                        raw_boundary[name] = _local_tensor(parameter.grad).detach().clone()
+                if routed_expert != rank:
+                    assert all(torch.count_nonzero(gradient) == 0 for gradient in raw_boundary.values())
+                manager.stage_gradient_numerators("policy", denominator=2.0, backward_completed=True)
+                return {"loss": 0.0}
+
+            runner._forward_backward_impl = _capture
+            runner.forward_backward([], model_id="policy")
+            runner.commit_forward_backward_completion("policy")
+
+            assert raw_boundary.keys() == state.tensor_layouts.keys()
+            for name, raw in raw_boundary.items():
+                packed = state.tensor_layouts[name].pack_from_local(raw).float()
+                torch.testing.assert_close(
+                    packed,
+                    _logical_slice(owner_reference[name], state.tensor_layouts[name]).float(),
+                    rtol=1.5e-2,
+                    atol=2e-3,
+                )
+
+            normalized = {name: gradient / 2.0 for name, gradient in logical_gradients.items()}
+            expected_norm = _reference_adam_step(
+                reference_optimizer,
+                reference_parameters,
+                normalized,
+                gradient_clip=0.05,
+            )
+            actual_norm = _public_optimizer_step(
+                dispatcher,
+                request_id=f"{backend}-{quant_format}-expert-optim-step-{step_index}",
+                lr=1e-2,
+                gradient_clip=0.05,
+            )
+            if rank == 0:
+                assert actual_norm == pytest.approx(expected_norm, rel=1.5e-2, abs=2e-3)
             _assert_adam_matches_reference(state, reference_parameters, reference_optimizer)
             assert state.publication_eligible
             assert state.global_step == step_index
@@ -756,8 +1065,12 @@ def _run_experts() -> None:
         }
         assert state.last_transport_stats.collective_count == 1
         if rank == 0:
+            target_suffix = (
+                "" if target_modules == ["gate_proj", "up_proj", "down_proj"] else ":" + ",".join(target_modules)
+            )
             print(
-                f"EXPERT_SHARED_OWNER_TWO_STEP_ZERO_TOKEN_REAL_AUTOGRAD_PUBLIC_OPTIM_CERTIFIED:{backend}",
+                f"QUANTIZED_EXPERT_TWO_STEP_ZERO_TOKEN_REAL_AUTOGRAD_PUBLIC_OPTIM_CERTIFIED:"
+                f"{backend}:{quant_format}:{ep_dispatch}{target_suffix}",
                 flush=True,
             )
     finally:
@@ -809,21 +1122,214 @@ def test_sequence_parallel_real_autograd_matches_analytical_optimizer_step() -> 
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="Requires four GPUs")
-@pytest.mark.parametrize("backend", ("eager", "triton"))
+@pytest.mark.parametrize("backend", ("eager", "triton", "native", "quack"))
 def test_expert_shared_and_owner_real_fsdp_autograd_match_analytical_optimizer_step(backend: str) -> None:
     from tests.distributed.distributed_utils import run_distributed_script
 
     result = run_distributed_script(
         __file__,
         num_gpus=4,
-        timeout=180,
+        timeout=300,
         extra_env={
             "XORL_ADAPTER_AUTOGRAD_CASE": "experts",
             "XORL_ADAPTER_EXPERT_BACKEND": backend,
         },
     )
     result.assert_success(f"{backend} expert shared/owner real-autograd ownership certification")
-    assert f"EXPERT_SHARED_OWNER_TWO_STEP_ZERO_TOKEN_REAL_AUTOGRAD_PUBLIC_OPTIM_CERTIFIED:{backend}" in result.stdout
+    assert (
+        f"EXPERT_SHARED_OWNER_TWO_STEP_ZERO_TOKEN_REAL_AUTOGRAD_PUBLIC_OPTIM_CERTIFIED:{backend}:alltoall"
+        in result.stdout
+    )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two GPUs")
+@pytest.mark.parametrize("backend", ("eager", "triton", "native", "quack"))
+def test_expert_backend_real_autograd_matches_analytical_optimizer_step(backend: str) -> None:
+    """Qualify backend math at EP2; the four-rank gate separately adds eFSDP2."""
+
+    from tests.distributed.distributed_utils import run_distributed_script
+
+    result = run_distributed_script(
+        __file__,
+        num_gpus=2,
+        timeout=300,
+        extra_env={
+            "XORL_ADAPTER_AUTOGRAD_CASE": "experts",
+            "XORL_ADAPTER_EXPERT_BACKEND": backend,
+        },
+    )
+    result.assert_success(f"{backend} expert EP2 real-autograd ownership certification")
+    assert (
+        f"EXPERT_SHARED_OWNER_TWO_STEP_ZERO_TOKEN_REAL_AUTOGRAD_PUBLIC_OPTIM_CERTIFIED:{backend}:alltoall"
+        in result.stdout
+    )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two GPUs")
+@pytest.mark.skipif(importlib.util.find_spec("deep_ep") is None, reason="DeepEP is not installed")
+@pytest.mark.parametrize("hybrid_shared", (True, False))
+def test_unquantized_quack_deepep_real_autograd_matches_analytical_optimizer_step(hybrid_shared: bool) -> None:
+    """Qualify the shipped Quack+DeepEP expert-LoRA composition."""
+
+    from tests.distributed.distributed_utils import run_distributed_script
+
+    result = run_distributed_script(
+        __file__,
+        num_gpus=2,
+        timeout=300,
+        extra_env={
+            "XORL_ADAPTER_AUTOGRAD_CASE": "experts",
+            "XORL_ADAPTER_EXPERT_BACKEND": "quack",
+            "XORL_ADAPTER_EXPERT_DISPATCH": "deepep",
+            "XORL_ADAPTER_EXPERT_HYBRID_SHARED": "1" if hybrid_shared else "0",
+        },
+    )
+    result.assert_success("quack DeepEP expert EP2 real-autograd ownership certification")
+    suffix = "" if hybrid_shared else ":all_owner"
+    assert (
+        "EXPERT_SHARED_OWNER_TWO_STEP_ZERO_TOKEN_REAL_AUTOGRAD_PUBLIC_OPTIM_CERTIFIED:quack:deepep" + suffix
+        in result.stdout
+    )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="Requires four GPUs")
+def test_unquantized_quack_all_owner_real_fsdp_autograd_matches_analytical_optimizer_step() -> None:
+    """Qualify the restored all-owner Quack layout with an eFSDP dimension."""
+
+    from tests.distributed.distributed_utils import run_distributed_script
+
+    result = run_distributed_script(
+        __file__,
+        num_gpus=4,
+        timeout=300,
+        extra_env={
+            "XORL_ADAPTER_AUTOGRAD_CASE": "experts",
+            "XORL_ADAPTER_EXPERT_BACKEND": "quack",
+            "XORL_ADAPTER_EXPERT_HYBRID_SHARED": "0",
+        },
+    )
+    result.assert_success("quack all-owner expert eFSDP2 real-autograd ownership certification")
+    assert (
+        "EXPERT_SHARED_OWNER_TWO_STEP_ZERO_TOKEN_REAL_AUTOGRAD_PUBLIC_OPTIM_CERTIFIED:"
+        "quack:alltoall:all_owner" in result.stdout
+    )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two GPUs")
+def test_unquantized_expert_projection_subset_matches_analytical_optimizer_step() -> None:
+    from tests.distributed.distributed_utils import run_distributed_script
+
+    result = run_distributed_script(
+        __file__,
+        num_gpus=2,
+        timeout=300,
+        extra_env={
+            "XORL_ADAPTER_AUTOGRAD_CASE": "experts",
+            "XORL_ADAPTER_EXPERT_BACKEND": "quack",
+            "XORL_ADAPTER_EXPERT_TARGETS": "down_proj",
+        },
+    )
+    result.assert_success("quack exact expert projection-subset certification")
+    assert (
+        "EXPERT_SHARED_OWNER_TWO_STEP_ZERO_TOKEN_REAL_AUTOGRAD_PUBLIC_OPTIM_CERTIFIED:"
+        "quack:alltoall:down_proj" in result.stdout
+    )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two GPUs")
+@pytest.mark.parametrize("backend", ("eager", "triton", "native", "quack"))
+def test_unquantized_all_owner_layout_matches_analytical_optimizer_step(backend: str) -> None:
+    """Qualify the default non-hybrid layout, including restored Quack recipes."""
+
+    from tests.distributed.distributed_utils import run_distributed_script
+
+    result = run_distributed_script(
+        __file__,
+        num_gpus=2,
+        timeout=300,
+        extra_env={
+            "XORL_ADAPTER_AUTOGRAD_CASE": "experts",
+            "XORL_ADAPTER_EXPERT_BACKEND": backend,
+            "XORL_ADAPTER_EXPERT_HYBRID_SHARED": "0",
+        },
+    )
+    result.assert_success(f"{backend} all-owner expert EP2 real-autograd ownership certification")
+    assert (
+        "EXPERT_SHARED_OWNER_TWO_STEP_ZERO_TOKEN_REAL_AUTOGRAD_PUBLIC_OPTIM_CERTIFIED:"
+        f"{backend}:alltoall:all_owner" in result.stdout
+    )
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two GPUs")
+@pytest.mark.parametrize("backend", ("triton", "quack", "native"))
+@pytest.mark.parametrize("quant_format", ("nf4", "nvfp4", "block_fp8"))
+def test_quantized_expert_shared_and_owner_real_autograd_matches_analytical_optimizer_step(
+    backend: str,
+    quant_format: str,
+) -> None:
+    from tests.distributed.distributed_utils import run_distributed_script
+
+    result = run_distributed_script(
+        __file__,
+        num_gpus=2,
+        timeout=240,
+        extra_env={
+            "XORL_ADAPTER_AUTOGRAD_CASE": "quantized_experts",
+            "XORL_ADAPTER_EXPERT_BACKEND": backend,
+            "XORL_ADAPTER_EXPERT_QUANT_FORMAT": quant_format,
+        },
+    )
+    result.assert_success(
+        f"{backend} {quant_format} quantized expert shared/owner real-autograd ownership certification"
+    )
+    assert (
+        f"QUANTIZED_EXPERT_TWO_STEP_ZERO_TOKEN_REAL_AUTOGRAD_PUBLIC_OPTIM_CERTIFIED:{backend}:{quant_format}:alltoall"
+    ) in result.stdout
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two GPUs")
+@pytest.mark.skipif(importlib.util.find_spec("deep_ep") is None, reason="DeepEP is not installed")
+def test_quantized_expert_deepep_real_autograd_matches_analytical_optimizer_step() -> None:
+    from tests.distributed.distributed_utils import run_distributed_script
+
+    result = run_distributed_script(
+        __file__,
+        num_gpus=2,
+        timeout=240,
+        extra_env={
+            "XORL_ADAPTER_AUTOGRAD_CASE": "quantized_experts",
+            "XORL_ADAPTER_EXPERT_BACKEND": "quack",
+            "XORL_ADAPTER_EXPERT_QUANT_FORMAT": "nf4",
+            "XORL_ADAPTER_EXPERT_DISPATCH": "deepep",
+        },
+    )
+    result.assert_success("quack NF4 DeepEP quantized expert ownership certification")
+    assert (
+        "QUANTIZED_EXPERT_TWO_STEP_ZERO_TOKEN_REAL_AUTOGRAD_PUBLIC_OPTIM_CERTIFIED:quack:nf4:deepep"
+    ) in result.stdout
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two GPUs")
+def test_quantized_expert_projection_subset_matches_analytical_optimizer_step() -> None:
+    """The backend's structural zero factors must use EP-local owner dimensions."""
+
+    from tests.distributed.distributed_utils import run_distributed_script
+
+    result = run_distributed_script(
+        __file__,
+        num_gpus=2,
+        timeout=240,
+        extra_env={
+            "XORL_ADAPTER_AUTOGRAD_CASE": "quantized_experts",
+            "XORL_ADAPTER_EXPERT_BACKEND": "quack",
+            "XORL_ADAPTER_EXPERT_QUANT_FORMAT": "nf4",
+            "XORL_ADAPTER_EXPERT_TARGETS": "down_proj",
+        },
+    )
+    result.assert_success("quack NF4 exact expert projection-subset certification")
+    assert (
+        "QUANTIZED_EXPERT_TWO_STEP_ZERO_TOKEN_REAL_AUTOGRAD_PUBLIC_OPTIM_CERTIFIED:quack:nf4:alltoall:down_proj"
+    ) in result.stdout
 
 
 if os.environ.get("XORL_ADAPTER_AUTOGRAD_CASE") == "dense":
@@ -834,3 +1340,5 @@ elif os.environ.get("XORL_ADAPTER_AUTOGRAD_CASE") == "direct":
     _run_direct_output()
 elif os.environ.get("XORL_ADAPTER_AUTOGRAD_CASE") == "experts":
     _run_experts()
+elif os.environ.get("XORL_ADAPTER_AUTOGRAD_CASE") == "quantized_experts":
+    _run_quantized_experts()

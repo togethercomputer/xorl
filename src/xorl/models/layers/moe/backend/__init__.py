@@ -10,6 +10,10 @@ from typing import Callable, Dict
 import torch
 
 from xorl.distributed.gradient_reduction import GradientReductionDomain
+from xorl.lora.expert_adapter_contract import (
+    ExpertAdapterBackendContract,
+    ZeroTokenGradientBehavior,
+)
 
 
 MOE_EXPERT_BACKENDS: Dict[str, Callable] = {}
@@ -352,7 +356,11 @@ except ImportError:
     pass
 
 # DeepEP dispatch (optional — requires deep_ep package)
+DEEPEP_AVAILABLE = False
 try:
+    from xorl.distributed.moe.deepep import (
+        DEEPEP_AVAILABLE,
+    )
     from xorl.distributed.moe.deepep import (
         token_pre_dispatch as deepep_pre_dispatch,
     )
@@ -360,8 +368,9 @@ try:
         tokens_post_combine as deepep_post_combine,
     )
 
-    EP_DISPATCH["deepep"] = deepep_pre_dispatch
-    EP_COMBINE["deepep"] = deepep_post_combine
+    if DEEPEP_AVAILABLE:
+        EP_DISPATCH["deepep"] = deepep_pre_dispatch
+        EP_COMBINE["deepep"] = deepep_post_combine
 except ImportError:
     pass
 
@@ -461,6 +470,29 @@ def ep_lora_gradient_reduction_domain(moe_implementation: str) -> GradientReduct
         ) from exc
 
 
+def expert_adapter_backend_contract(moe_implementation: str) -> ExpertAdapterBackendContract:
+    """Return the live LoRA execution capabilities of one registered backend.
+
+    This is deliberately derived from the actual local/EP registries.  Merely
+    naming a known backend is insufficient: if its optional implementation did
+    not import, ownership compilation fails before training starts.
+    """
+
+    reduction = ep_lora_gradient_reduction_domain(moe_implementation)
+    supports_local = moe_implementation == "eager" or moe_implementation in MOE_EXPERT_BACKENDS_LORA
+    supports_ep = moe_implementation in EP_EXPERT_COMPUTE_LORA
+    dispatch_methods = tuple(sorted(set(EP_DISPATCH) & set(EP_COMBINE))) if supports_ep else ()
+    return ExpertAdapterBackendContract(
+        name=moe_implementation,
+        producer_family="module_managed" if moe_implementation == "eager" else "fused_managed",
+        supports_local=supports_local,
+        supports_ep=supports_ep,
+        supported_dispatch_methods=dispatch_methods,
+        gradient_reduction_domain=reduction,
+        zero_token_gradient_behavior=ZeroTokenGradientBehavior.STRUCTURAL_ZERO,
+    )
+
+
 __all__ = [
     "MOE_EXPERT_BACKENDS",
     "EP_EXPERT_COMPUTE",
@@ -473,4 +505,6 @@ __all__ = [
     "EP_SHARED_GRADIENT_REDUCTION",
     "GradientReductionDomain",
     "ep_lora_gradient_reduction_domain",
+    "expert_adapter_backend_contract",
+    "DEEPEP_AVAILABLE",
 ]

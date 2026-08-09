@@ -267,6 +267,7 @@ def inject_qlora_into_model(
             num_local_experts=num_local_experts,
             expert_offset=expert_offset,
             hybrid_shared=True,
+            target_modules=[target for target in target_modules if target in _moe_proj_names],
         )
 
         experts_fqn = name + ".experts" if not name.endswith(".experts") else name

@@ -149,6 +149,7 @@ def _exact_routed_runner(tmp_path, monkeypatch):
         torch.device("cpu"),
         checkpoint_dir=str(tmp_path),
         auto_save_on_eviction=False,
+        lora_config={"moe_hybrid_shared_lora": True},
     )
     manager.register_adapter("policy", lr=0.1)
     parallel_state = SimpleNamespace(
@@ -167,7 +168,7 @@ def _exact_routed_runner(tmp_path, monkeypatch):
 def test_exact_routed_ownership_guard_rejects_unwrapped_unparallelized_experts(tmp_path, monkeypatch) -> None:
     runner, _manager, _model = _exact_routed_runner(tmp_path, monkeypatch)
 
-    with pytest.raises(AdapterGradientOwnershipError, match="not managed by its expert FSDP unit"):
+    with pytest.raises(AdapterGradientOwnershipError, match="requires managed FSDP ownership"):
         runner._compile_registered_adapter_gradient_ownership("policy")
 
 

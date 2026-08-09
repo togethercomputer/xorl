@@ -59,6 +59,11 @@ from xorl.distributed.pipeline_parallel import (
 )
 from xorl.distributed.sequence_parallel.data import gather_outputs
 from xorl.lora import LoraLinear
+from xorl.lora.expert_adapter_contract import (
+    ExpertAdapterFactorOwnership,
+    ExpertAdapterGradientContract,
+    ZeroTokenGradientBehavior,
+)
 from xorl.lora.fold import lora_merged_forward_enabled
 from xorl.models import resolve_cross_entropy_mode
 from xorl.models.layers.moe.routing_replay import set_replay_stage
@@ -730,7 +735,11 @@ class ModelRunner:
         producer_by_parameter_id: dict[int, ProducerFamily] = {}
         merged_forward_by_parameter_id: dict[int, bool] = {}
         expert_guard_by_parameter_id: dict[int, dict[str, Any]] = {}
+        expert_contract_by_parameter_id: dict[int, ExpertAdapterGradientContract] = {}
         exact_lm_head_guard_by_parameter_id: dict[int, dict[str, Any]] = {}
+        configured_hybrid_shared = bool(
+            getattr(self._adapter_manager, "lora_config", {}).get("moe_hybrid_shared_lora", False)
+        )
 
         def _walk_module_tree(module: nn.Module, *, inherited_fsdp: bool = False, direct: bool = False) -> None:
             managed_fsdp = inherited_fsdp or isinstance(module, FSDPModule)
@@ -739,6 +748,7 @@ class ModelRunner:
             selected = selector() if callable(selector) else selector
             producer = None
             expert_guard: dict[str, Any] | None = None
+            expert_contract: ExpertAdapterGradientContract | None = None
             has_expert_adapter_factors = any(
                 "_proj_lora_A" in local_name or "_proj_lora_B" in local_name
                 for local_name, _parameter in module.named_parameters(recurse=False)
@@ -749,87 +759,79 @@ class ModelRunner:
                 except ValueError as error:
                     raise RuntimeError(f"Unsupported adapter-gradient producer property {selected!r}") from error
                 direct = direct or producer is ProducerFamily.DIRECT_OUTPUT_PROJECTION
-                expert_backend = getattr(module, "moe_implementation", None)
                 if has_expert_adapter_factors:
-                    quant_format = getattr(module, "quant_format", None)
-                    if quant_format is not None:
-                        from xorl.models.transformers.glm5.exact_routed_experts_qlora import (  # noqa: PLC0415
-                            GLM52_EXACT_EP16_ROUTED_QLORA_CONTRACT_VERSION,
-                            Glm52ExactEP16BlockFP8QLoRARoutedExperts,
-                        )
-                        from xorl.qlora.modules.moe_experts import BlockFP8QLoRAMoeExperts  # noqa: PLC0415
-
-                        ep_dispatch = getattr(module, "ep_dispatch", None)
-                        hybrid_shared = getattr(module, "hybrid_shared", None)
-                        exact_routed_type_is_certified = isinstance(
-                            module, Glm52ExactEP16BlockFP8QLoRARoutedExperts
-                        ) and (
-                            type(module) is Glm52ExactEP16BlockFP8QLoRARoutedExperts or isinstance(module, FSDPModule)
-                        )
-                        certified_glm52_exact_routed = (
-                            exact_routed_type_is_certified
-                            and getattr(module, "contract_version", None)
-                            == GLM52_EXACT_EP16_ROUTED_QLORA_CONTRACT_VERSION
-                            and quant_format == "block_fp8"
-                            and expert_backend == "triton"
-                            and ep_dispatch == "alltoall"
-                            and hybrid_shared is True
-                            and getattr(module, "ep_size", None) == 16
-                            and getattr(module, "num_experts", None) == 256
-                            and getattr(module, "num_local_experts", None) == 16
-                            and getattr(module, "moe_tp_size", None) == 1
-                            and getattr(module, "_glm52_exact_active_lora_component", False) is True
-                            and getattr(module, "r", None) == 1
-                            and getattr(module, "active_r", None) == 1
-                            and getattr(module, "lora_alpha", None) == 1
-                            and getattr(module, "active_lora_alpha", None) == 1
-                        )
-                        certified_glm52_block_fp8 = (
-                            type(module) is BlockFP8QLoRAMoeExperts
-                            and quant_format == "block_fp8"
-                            and expert_backend == "triton"
-                            and ep_dispatch == "deepep"
-                            and hybrid_shared is True
-                        )
-                        if not (certified_glm52_block_fp8 or certified_glm52_exact_routed):
-                            raise AdapterGradientOwnershipError(
-                                "LoRA factors on quantized routed experts are admitted only for the certified GLM-5.2 "
-                                "BlockFP8QLoRAMoeExperts DeepEP lane or the exact EP16 alltoall routed lane; "
-                                f"got type={type(module).__qualname__}, quant_format={quant_format!r}, "
-                                f"expert_backend={expert_backend!r}, ep_dispatch={ep_dispatch!r}, "
-                                f"hybrid_shared={hybrid_shared!r}"
-                            )
-                        expert_guard = {
-                            "expert_module": (
-                                Glm52ExactEP16BlockFP8QLoRARoutedExperts.__qualname__
-                                if certified_glm52_exact_routed
-                                else type(module).__qualname__
-                            ),
-                            "expert_quant_format": quant_format,
-                            "expert_backend": expert_backend,
-                            "expert_ep_dispatch": ep_dispatch,
-                            "expert_hybrid_shared": hybrid_shared,
-                        }
-                        if certified_glm52_exact_routed:
-                            expert_guard.update(
-                                {
-                                    "expert_exact_contract": module.contract_version,
-                                    "expert_ep_size": module.ep_size,
-                                    "expert_moe_tp_size": module.moe_tp_size,
-                                    "expert_fsdp_unit": isinstance(module, FSDPModule),
-                                }
-                            )
-                    elif expert_backend not in {"eager", "triton"}:
+                    try:
+                        contract_selector = getattr(module, "expert_adapter_gradient_contract", None)
+                        if contract_selector is None:
+                            raise ValueError("module does not declare an execution contract")
+                        expert_contract = contract_selector() if callable(contract_selector) else contract_selector
+                    except (TypeError, ValueError) as error:
                         raise AdapterGradientOwnershipError(
-                            "Authoritative adapter-gradient ownership admits only the analytically "
-                            f"certified eager/triton expert backends, got {expert_backend!r}"
+                            f"Expert adapter module {type(module).__qualname__} declared an invalid execution contract: "
+                            f"{error}"
+                        ) from error
+                    if not isinstance(expert_contract, ExpertAdapterGradientContract):
+                        raise AdapterGradientOwnershipError(
+                            f"Expert adapter module {type(module).__qualname__} returned an invalid contract object"
                         )
-                    else:
-                        expert_guard = {
-                            "expert_module": type(module).__qualname__,
-                            "expert_quant_format": "none",
-                            "expert_backend": expert_backend,
-                        }
+                    try:
+                        expert_contract = expert_contract.for_active_rank(
+                            int(state.session_spec["lora_config"]["lora_rank"])
+                        )
+                    except (KeyError, TypeError, ValueError) as error:
+                        raise AdapterGradientOwnershipError(
+                            f"Expert adapter module {type(module).__qualname__} could not specialize its factor "
+                            f"contract to the registered session rank: {error}"
+                        ) from error
+                    if expert_contract.backend.producer_family != producer.value:
+                        raise AdapterGradientOwnershipError(
+                            "Expert adapter producer does not match its execution contract: "
+                            f"module={producer.value!r}, contract={expert_contract.backend.producer_family!r}"
+                        )
+                    contract_hybrid_shared = any(
+                        ownership is ExpertAdapterFactorOwnership.EP_REPLICATED
+                        for _name, ownership in expert_contract.factor_ownership
+                    )
+                    if contract_hybrid_shared != configured_hybrid_shared:
+                        raise AdapterGradientOwnershipError(
+                            "Expert adapter factor sharing does not match server checkpoint metadata; "
+                            f"compiled_hybrid_shared={contract_hybrid_shared}, "
+                            f"configured_moe_hybrid_shared_lora={configured_hybrid_shared}"
+                        )
+
+                    ep_size = int(getattr(parallel_state, "ep_size", 1))
+                    ep_enabled = bool(getattr(parallel_state, "ep_enabled", ep_size > 1))
+                    if ep_enabled:
+                        if not expert_contract.backend.supports_ep:
+                            raise AdapterGradientOwnershipError(
+                                f"Expert backend {expert_contract.backend.name!r} does not provide LoRA EP execution"
+                            )
+                        ep_dispatch = getattr(module, "ep_dispatch", None)
+                        if ep_dispatch not in expert_contract.backend.supported_dispatch_methods:
+                            raise AdapterGradientOwnershipError(
+                                f"Expert dispatch {ep_dispatch!r} is not supported by backend "
+                                f"{expert_contract.backend.name!r}; supported="
+                                f"{expert_contract.backend.supported_dispatch_methods}"
+                            )
+                        ep_fsdp_size = int(getattr(parallel_state, "dp_shard_in_ep_size", 1))
+                        if ep_fsdp_size > 1 and not expert_contract.supports_efsdp_replication:
+                            raise AdapterGradientOwnershipError(
+                                f"Expert adapter backend {expert_contract.backend.name!r} does not support "
+                                f"eFSDP replication; got ep_fsdp_size={ep_fsdp_size}"
+                            )
+                    elif not expert_contract.backend.supports_local:
+                        raise AdapterGradientOwnershipError(
+                            f"Expert backend {expert_contract.backend.name!r} does not provide local LoRA execution"
+                        )
+                    if (
+                        expert_contract.backend.zero_token_gradient_behavior
+                        is not ZeroTokenGradientBehavior.STRUCTURAL_ZERO
+                    ):
+                        raise AdapterGradientOwnershipError(
+                            "Expert adapter execution must materialize structural zero gradients for zero-token owners"
+                        )
+                    expert_guard = expert_contract.config_guard_fields()
+                    expert_guard["expert_ep_dispatch"] = getattr(module, "ep_dispatch", None)
             for local_name, parameter in module.named_parameters(recurse=False):
                 if "lora_A" in local_name or "lora_B" in local_name:
                     merged_forward_by_parameter_id[id(parameter)] = bool(lora_merged_forward_enabled(module))
@@ -837,6 +839,8 @@ class ModelRunner:
                         producer_by_parameter_id[id(parameter)] = producer
                     if expert_guard is not None:
                         expert_guard_by_parameter_id[id(parameter)] = dict(expert_guard)
+                    if expert_contract is not None:
+                        expert_contract_by_parameter_id[id(parameter)] = expert_contract
                     if getattr(module, "_glm52_exact_tp16_lm_head", False):
                         exact_op = getattr(module, "_glm52_exact_selected_logprob", None)
                         contract_version = getattr(exact_op, "contract_version", None)
@@ -859,72 +863,76 @@ class ModelRunner:
 
         _walk_module_tree(self.model)
 
-        exact_routed_shared_factors = {"gate_proj_lora_A", "up_proj_lora_A", "down_proj_lora_B"}
-        exact_routed_owner_factors = {"gate_proj_lora_B", "up_proj_lora_B", "down_proj_lora_A"}
-        exact_routed_factor_groups: dict[str, set[str]] = {}
+        expert_factor_groups: dict[str, set[str]] = {}
+        expert_contracts_by_owner: dict[str, ExpertAdapterGradientContract] = {}
+        ep_size = int(getattr(parallel_state, "ep_size", 1))
+        ep_enabled = bool(getattr(parallel_state, "ep_enabled", ep_size > 1))
         for name, layout in state.tensor_layouts.items():
             parameter = named_parameters[name]
-            expert_guard = expert_guard_by_parameter_id.get(id(parameter), {})
-            if "expert_exact_contract" not in expert_guard:
+            expert_contract = expert_contract_by_parameter_id.get(id(parameter))
+            if expert_contract is None:
                 continue
 
             owner_path, separator, local_name = name.rpartition(".")
-            if not separator or local_name not in exact_routed_shared_factors | exact_routed_owner_factors:
+            if not separator:
+                raise AdapterGradientOwnershipError(f"Expert adapter ownership found an unscoped factor {name!r}")
+            try:
+                factor_ownership = expert_contract.ownership_for(local_name)
+            except ValueError as error:
                 raise AdapterGradientOwnershipError(
-                    f"Exact GLM-5.2 routed ownership found an unexpected factor {name!r}"
+                    f"Expert adapter factor {name!r} is outside its declared contract"
+                ) from error
+            expected_shape = dict(expert_contract.factor_shapes)[local_name]
+            if tuple(layout.logical_shape) != expected_shape:
+                raise AdapterGradientOwnershipError(
+                    f"Expert adapter factor {name!r} does not match its declared logical shape; "
+                    f"expected={expected_shape}, actual={layout.logical_shape}"
                 )
-            exact_routed_factor_groups.setdefault(owner_path, set()).add(local_name)
+            existing_contract = expert_contracts_by_owner.setdefault(owner_path, expert_contract)
+            if existing_contract != expert_contract:
+                raise AdapterGradientOwnershipError(
+                    f"Expert adapter module {owner_path!r} declared inconsistent factor contracts"
+                )
+            expert_factor_groups.setdefault(owner_path, set()).add(local_name)
 
-            if expert_guard.get("expert_fsdp_unit") is not True:
+            if expert_contract.requires_managed_fsdp:
+                if id(parameter) not in managed_fsdp_parameter_ids:
+                    raise AdapterGradientOwnershipError(
+                        f"Expert adapter factor {name!r} requires managed FSDP ownership"
+                    )
+                if not (hasattr(parameter, "to_local") and hasattr(parameter, "placements")):
+                    raise AdapterGradientOwnershipError(f"Expert adapter factor {name!r} requires an FSDP DTensor")
+
+            if not ep_enabled:
+                if layout.gradient_reduction is not GradientReductionDomain.NONE:
+                    raise AdapterGradientOwnershipError(
+                        f"Local expert adapter factor {name!r} unexpectedly declares "
+                        f"gradient reduction {layout.gradient_reduction.value!r}"
+                    )
+                continue
+            if not layout.is_ep_owned:
+                raise AdapterGradientOwnershipError(f"Expert adapter factor {name!r} lacks an explicit EP placement")
+            if factor_ownership is ExpertAdapterFactorOwnership.EP_REPLICATED:
+                if layout.gradient_reduction is not expert_contract.backend.gradient_reduction_domain or (
+                    ep_size > 1 and not layout.needs_ep_gradient_sync
+                ):
+                    raise AdapterGradientOwnershipError(
+                        f"EP-replicated expert factor {name!r} lacks its declared "
+                        f"{expert_contract.backend.gradient_reduction_domain.value} reduction"
+                    )
+            elif layout.gradient_reduction is not GradientReductionDomain.NONE or layout.needs_ep_gradient_sync:
                 raise AdapterGradientOwnershipError(
-                    f"Exact GLM-5.2 routed factor {name!r} is not managed by its expert FSDP unit"
-                )
-            if id(parameter) not in managed_fsdp_parameter_ids:
-                raise AdapterGradientOwnershipError(
-                    f"Exact GLM-5.2 routed factor {name!r} lacks managed FSDP ownership"
-                )
-            if not (hasattr(parameter, "to_local") and hasattr(parameter, "placements")):
-                raise AdapterGradientOwnershipError(f"Exact GLM-5.2 routed factor {name!r} is not an FSDP DTensor")
-            if not layout.logical_shape or not layout.local_logical_shape:
-                raise AdapterGradientOwnershipError(
-                    f"Exact GLM-5.2 routed factor {name!r} has an empty ownership shape"
+                    f"Owner-sharded expert factor {name!r} declares an unexpected replicated reduction"
                 )
 
-            if local_name in exact_routed_shared_factors:
-                valid = (
-                    layout.logical_shape[0] == 1
-                    and layout.local_logical_shape[0] == 1
-                    and layout.replica_count == 16
-                    and layout.is_ep_owned
-                    and layout.gradient_reduction is GradientReductionDomain.EP_SUM
-                    and layout.needs_ep_gradient_sync
-                )
-                expected = "logical/local leading 1, sixteen EP replicas, and one EP_SUM disposition"
-            else:
-                valid = (
-                    layout.logical_shape[0] == 256
-                    and layout.local_logical_shape[0] == 16
-                    and layout.replica_count == 1
-                    and layout.is_ep_owned
-                    and layout.gradient_reduction is GradientReductionDomain.NONE
-                    and not layout.needs_ep_gradient_sync
-                )
-                expected = "logical leading 256, owner-local leading 16, one owner, and no EP sum"
-            if not valid:
+        for owner_path, contract in expert_contracts_by_owner.items():
+            expected_factors = {name for name, _ownership in contract.factor_ownership}
+            actual_factors = expert_factor_groups.get(owner_path, set())
+            if actual_factors != expected_factors:
                 raise AdapterGradientOwnershipError(
-                    f"Exact GLM-5.2 routed factor {name!r} has an invalid ownership layout; expected {expected}; "
-                    f"got logical={layout.logical_shape}, local={layout.local_logical_shape}, "
-                    f"replicas={layout.replica_count}, ep_owned={layout.is_ep_owned}, "
-                    f"gradient_reduction={layout.gradient_reduction.value!r}"
-                )
-
-        exact_routed_factor_names = exact_routed_shared_factors | exact_routed_owner_factors
-        for owner_path, factor_names in exact_routed_factor_groups.items():
-            if factor_names != exact_routed_factor_names:
-                raise AdapterGradientOwnershipError(
-                    f"Exact GLM-5.2 routed FSDP unit {owner_path!r} does not expose exactly six factors; "
-                    f"missing={sorted(exact_routed_factor_names - factor_names)}, "
-                    f"extra={sorted(factor_names - exact_routed_factor_names)}"
+                    f"Expert adapter module {owner_path!r} does not expose its exact declared factor universe; "
+                    f"missing={sorted(expected_factors - actual_factors)}, "
+                    f"extra={sorted(actual_factors - expected_factors)}"
                 )
 
         sp_group = parallel_state.sp_grad_sync_group
@@ -1025,19 +1033,20 @@ class ModelRunner:
                         "expert_parallel_replica",
                     )
                 )
-            exact_routed_guard = expert_guard_by_parameter_id.get(id(parameter), {})
-            if "expert_exact_contract" in exact_routed_guard:
+            expert_contract = expert_contract_by_parameter_id.get(id(parameter))
+            if expert_contract is not None and ep_enabled:
                 local_name = name.rpartition(".")[2]
+                factor_ownership = expert_contract.ownership_for(local_name)
                 ep_pending = [domain for domain in pending if domain.axis is ReductionAxis.EXPERT_PARALLEL_REPLICA]
-                if local_name in exact_routed_shared_factors:
+                if factor_ownership is ExpertAdapterFactorOwnership.EP_REPLICATED:
                     if topology is not TopologyFamily.EP_REPLICATED_SHARED or len(ep_pending) != 1:
                         raise AdapterGradientOwnershipError(
-                            f"Exact GLM-5.2 shared routed factor {name!r} requires EP_REPLICATED_SHARED "
+                            f"EP-replicated expert factor {name!r} requires EP_REPLICATED_SHARED "
                             "with exactly one pending EP sum"
                         )
                 elif topology is not TopologyFamily.OWNER_SHARDED or ep_pending:
                     raise AdapterGradientOwnershipError(
-                        f"Exact GLM-5.2 owner routed factor {name!r} requires OWNER_SHARDED with no EP sum"
+                        f"Owner-sharded expert factor {name!r} requires OWNER_SHARDED with no EP sum"
                     )
             guard_payload = {
                 "producer": producer.value,
