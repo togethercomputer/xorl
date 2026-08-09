@@ -283,21 +283,21 @@ def fast_zero_centered_families_v2_rms_norm(
     *,
     residual: Optional[torch.Tensor] = None,
 ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
-    """Run the explicit Qwen families-v2 candidate without fallback.
+    """Run the exact Qwen families-v2 RMSNorm program without fallback.
 
-    The candidate is deliberately fail-loud: it is defined only for the BF16
+    The program is deliberately fail-loud: it is defined only for the BF16
     CUDA contract used by exact Qwen3.5/3.6.  Production v1 callers never reach
     this function.
     """
 
     if not hidden_states.is_cuda or hidden_states.dtype != torch.bfloat16:
         raise RuntimeError(
-            "The Qwen families-v2 RMSNorm candidate requires CUDA BF16 input; "
+            "The Qwen families-v2 RMSNorm program requires CUDA BF16 input; "
             f"got device={hidden_states.device}, dtype={hidden_states.dtype}."
         )
     if hidden_states.shape[-1] != weight.numel():
         raise RuntimeError(
-            "The Qwen families-v2 RMSNorm candidate requires one weight per hidden feature; "
+            "The Qwen families-v2 RMSNorm program requires one weight per hidden feature; "
             f"got hidden={hidden_states.shape[-1]}, weight={weight.numel()}."
         )
 
@@ -312,7 +312,7 @@ def fast_zero_centered_families_v2_rms_norm(
 
     if residual.shape != hidden_states.shape or residual.dtype != torch.bfloat16 or not residual.is_cuda:
         raise RuntimeError(
-            "The Qwen families-v2 residual RMSNorm candidate requires a CUDA BF16 residual "
+            "The Qwen families-v2 residual RMSNorm program requires a CUDA BF16 residual "
             f"matching the input shape; got shape={tuple(residual.shape)}, dtype={residual.dtype}, "
             f"device={residual.device}."
         )

@@ -42,11 +42,11 @@ def _apply_qwen35_gdn_exact(model: torch.nn.Module) -> dict[str, int]:
         return dict(model._qwen35_gdn_exact_wrapped)
 
     config = model.config
-    rmsnorm_family = getattr(config, "_qwen35_rmsnorm_family", "v1")
+    rmsnorm_family = getattr(config, "_qwen35_rmsnorm_family", "v2")
     if rmsnorm_family not in ("v1", "v2"):
         raise ValueError(f"Unsupported exact Qwen RMSNorm family: {rmsnorm_family!r}")
     if rmsnorm_family == "v2" and getattr(config, "_rmsnorm_mode", None) != "sglang_fused":
-        raise RuntimeError("The exact Qwen families-v2 RMSNorm candidate requires rmsnorm_mode='sglang_fused'.")
+        raise RuntimeError("The exact Qwen families-v2 RMSNorm program requires rmsnorm_mode='sglang_fused'.")
     is_moe = getattr(config, "model_type", None) in {
         "xorl_qwen3_5_moe",
         "qwen3_5_moe",
@@ -67,8 +67,8 @@ def _apply_qwen35_gdn_exact(model: torch.nn.Module) -> dict[str, int]:
     from xorl.ops.batch_invariant_ops import wrap_trunk_linears_batch_invariant  # noqa: PLC0415
     from xorl.ops.bi_families_v2 import _select_qwen35_families_v1  # noqa: PLC0415
 
-    # This candidate changes RMSNorm only. Keep the qualified v1 LM-head/LSE
-    # program pinned so the GPU discriminator has one numerical variable.
+    # RMSNorm uses the qualified v2 tree. The LM-head/LSE remains on its
+    # separately qualified v1 program; that selector does not control norms.
     _select_qwen35_families_v1()
     norm_modules = []
     for module in model.modules():
@@ -123,30 +123,26 @@ def qwen3_5_apply_rotary_pos_emb(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     if class_b:
         if not q.is_cuda or not k.is_cuda:
-            raise RuntimeError("Qwen3.5-family Class-B RoPE candidate requires CUDA q/k tensors")
+            raise RuntimeError("Qwen3.5-family Class-B RoPE requires CUDA q/k tensors")
         if q.dtype is not torch.bfloat16 or k.dtype is not torch.bfloat16:
-            raise RuntimeError(
-                "Qwen3.5-family Class-B RoPE candidate requires BF16 q/k tensors; "
-                f"got q={q.dtype}, k={k.dtype}"
-            )
+            raise RuntimeError(f"Qwen3.5-family Class-B RoPE requires BF16 q/k tensors; got q={q.dtype}, k={k.dtype}")
         if q.ndim != 4 or k.ndim != 4 or cos.ndim != 3 or sin.ndim != 3:
             raise RuntimeError(
-                "Qwen3.5-family Class-B RoPE candidate requires q/k [B,S,H,D] and cos/sin [B,S,D]; "
+                "Qwen3.5-family Class-B RoPE requires q/k [B,S,H,D] and cos/sin [B,S,D]; "
                 f"got q={tuple(q.shape)}, k={tuple(k.shape)}, cos={tuple(cos.shape)}, sin={tuple(sin.shape)}"
             )
         if q.shape[:2] != k.shape[:2] or q.shape[:2] != cos.shape[:2] or cos.shape != sin.shape:
             raise RuntimeError(
-                "Qwen3.5-family Class-B RoPE candidate received incompatible token/table shapes: "
+                "Qwen3.5-family Class-B RoPE received incompatible token/table shapes: "
                 f"q={tuple(q.shape)}, k={tuple(k.shape)}, cos={tuple(cos.shape)}, sin={tuple(sin.shape)}"
             )
         if cos.dtype is not torch.float32 or sin.dtype is not torch.float32:
             raise RuntimeError(
-                "Qwen3.5-family Class-B RoPE candidate requires fp32 cos/sin; "
-                f"got cos={cos.dtype}, sin={sin.dtype}"
+                f"Qwen3.5-family Class-B RoPE requires fp32 cos/sin; got cos={cos.dtype}, sin={sin.dtype}"
             )
         if cos.shape[-1] % 2 or cos.shape[-1] > min(q.shape[-1], k.shape[-1]):
             raise RuntimeError(
-                "Qwen3.5-family Class-B RoPE candidate requires an even rotary dimension no larger than q/k; "
+                "Qwen3.5-family Class-B RoPE requires an even rotary dimension no larger than q/k; "
                 f"got rotary={cos.shape[-1]}, q={q.shape[-1]}, k={k.shape[-1]}"
             )
         return stock_fused_apply_rotary_pos_emb(q, k, cos, sin, interleaved=interleaved)

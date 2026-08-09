@@ -131,7 +131,7 @@ class Qwen3_5MoeRMSNorm(nn.Module):
         if self.exact_contract and self.rmsnorm_family == "v2":
             if self.mode != "sglang_fused":
                 raise RuntimeError(
-                    f"The Qwen families-v2 RMSNorm candidate requires rmsnorm_mode='sglang_fused'; got {self.mode!r}."
+                    f"The Qwen families-v2 RMSNorm program requires rmsnorm_mode='sglang_fused'; got {self.mode!r}."
                 )
             if residual is None:
                 out = fast_zero_centered_families_v2_rms_norm(x, self.weight, self.eps)

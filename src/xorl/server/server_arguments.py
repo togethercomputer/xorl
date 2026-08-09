@@ -163,10 +163,7 @@ class ServerArguments:
     )
     qwen35_rmsnorm_family: Optional[Literal["v1", "v2"]] = field(
         default=None,
-        metadata={
-            "help": "Exact Qwen3.5/3.6 RMSNorm arithmetic candidate. Omitted keeps the qualified v1 "
-            "program; 'v2' opts only Qwen zero-centered q/k, residual, and final norms into families-v2."
-        },
+        metadata={"help": "Exact Qwen3.5/3.6 RMSNorm arithmetic. Exact Qwen models require the qualified v2 tree."},
     )
 
     activation_native: bool = field(
@@ -180,8 +177,8 @@ class ServerArguments:
     rope_class_b: Optional[bool] = field(
         default=None,
         metadata={
-            "help": "Use compiled Class-B RoPE fp32-chain numerics. Auto-enables for canonical GLM-5.2 when omitted; "
-            "for exact Qwen3.5-family training this is an explicit, unqualified A/B candidate and defaults to Class A."
+            "help": "Use compiled Class-B RoPE fp32-chain numerics. Auto-enables for canonical GLM-5.2 and "
+            "exact Qwen3.5-family training when omitted."
         },
     )
 

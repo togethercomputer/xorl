@@ -247,10 +247,10 @@ def test_exact_qwen35_resolves_the_certified_numerical_program(config_factory):
         router_fp32=True,
         lm_head_fp32=True,
         rmsnorm_mode="sglang_fused",
-        qwen35_rmsnorm_family="v1",
+        qwen35_rmsnorm_family="v2",
         activation_native=True,
         rope_native=True,
-        rope_class_b=False,
+        rope_class_b=True,
         attention_cast_bf16=True,
         sparse_mla_enabled=False,
         sparse_mla_backend="auto",
@@ -259,14 +259,14 @@ def test_exact_qwen35_resolves_the_certified_numerical_program(config_factory):
 
 
 @pytest.mark.parametrize("config_factory", [_exact_qwen35_dense_config, _exact_qwen35_moe_config])
-def test_exact_qwen35_class_b_is_explicit_opt_in_only(config_factory):
+def test_exact_qwen35_resolves_class_b_and_rejects_opt_out(config_factory):
     config = config_factory()
     config._qwen35_exact_contract = True
 
     default_modes = _resolve_rope_modes(config, rope_native=None, rope_class_b=None)
-    candidate_modes = _resolve_rope_modes(config, rope_native=None, rope_class_b=True)
-    assert default_modes == (True, False)
-    assert candidate_modes == (True, True)
+    assert default_modes == (True, True)
+    with pytest.raises(ValueError, match="requires native Class-B RoPE"):
+        _resolve_rope_modes(config, rope_native=None, rope_class_b=False)
 
     program = resolve_model_numerical_program(
         config,
@@ -287,7 +287,7 @@ def test_exact_qwen35_class_b_is_explicit_opt_in_only(config_factory):
 
 
 @pytest.mark.parametrize("config_factory", [_exact_qwen35_dense_config, _exact_qwen35_moe_config])
-def test_exact_qwen35_rmsnorm_v2_is_an_explicit_architecture_scoped_candidate(config_factory):
+def test_exact_qwen35_rmsnorm_v2_is_the_architecture_scoped_default(config_factory):
     config = config_factory()
     config._qwen35_exact_contract = True
     kwargs = {
@@ -296,7 +296,7 @@ def test_exact_qwen35_rmsnorm_v2_is_an_explicit_architecture_scoped_candidate(co
         "router_fp32": None,
         "lm_head_fp32": None,
         "rmsnorm_mode": None,
-        "qwen35_rmsnorm_family": "v2",
+        "qwen35_rmsnorm_family": None,
         "activation_native": False,
         "rope_native": None,
         "rope_class_b": None,
@@ -338,6 +338,7 @@ def test_non_qwen_rejects_qwen35_rmsnorm_v2():
         ("lm_head_fp32", False),
         ("rmsnorm_mode", "native"),
         ("rope_native", False),
+        ("qwen35_rmsnorm_family", "v1"),
     ],
 )
 def test_exact_qwen35_rejects_incompatible_numerical_override(override, value):

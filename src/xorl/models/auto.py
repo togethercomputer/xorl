@@ -419,12 +419,13 @@ def _resolve_rope_modes(
         return True, True
 
     if _is_exact_qwen35(config):
-        if rope_native is False:
-            raise ValueError("Exact Qwen3.5-family server training requires rope_native=true")
-        # Class A remains the qualified default.  Class B is an explicit
-        # candidate used only for paired trainer/sampler qualification; unlike
-        # an omitted value, ``True`` must survive numerical-program resolution.
-        return True, bool(rope_class_b)
+        if rope_native is False or rope_class_b is False:
+            raise ValueError(
+                "Exact Qwen3.5-family server training requires native Class-B RoPE; "
+                "explicit rope_native=false or rope_class_b=false is incompatible "
+                "with the model's numerical contract"
+            )
+        return True, True
 
     effective_rope_native = bool(rope_native)
     effective_rope_class_b = bool(rope_class_b)
@@ -478,6 +479,8 @@ def resolve_model_numerical_program(
             for name, (requested, required) in requirements.items()
             if requested is not None and requested != required
         ]
+        if qwen35_rmsnorm_family not in (None, "v2"):
+            incompatible.append(f"qwen35_rmsnorm_family={qwen35_rmsnorm_family!r} (requires 'v2')")
         if incompatible:
             raise ValueError(
                 "Exact Qwen3.5-family server training rejects incompatible numerical overrides: "
@@ -488,7 +491,7 @@ def resolve_model_numerical_program(
             router_fp32=True,
             lm_head_fp32=True,
             rmsnorm_mode="sglang_fused",
-            qwen35_rmsnorm_family=qwen35_rmsnorm_family or "v1",
+            qwen35_rmsnorm_family="v2",
             activation_native=True,
             rope_native=True,
             rope_class_b=effective_rope_class_b,
@@ -686,9 +689,9 @@ def build_foundation_model(
     if canonical_glm52:
         logger.info_rank0(f"Canonical GLM-5.2 numerical program: {numerical_program}")
     elif config._qwen35_exact_contract:
-        rope_program = "candidate Class B" if numerical_program.rope_class_b else "qualified Class A"
         logger.info_rank0(
-            f"Exact Qwen3.5-family server-training numerical program ({rope_program} RoPE): {numerical_program}"
+            "Exact Qwen3.5-family server-training numerical program "
+            f"(Class-B RoPE, RMSNorm {numerical_program.qwen35_rmsnorm_family}): {numerical_program}"
         )
 
     if moe_implementation is not None:
