@@ -31,14 +31,11 @@ silently claim to cover them.
 SGLang and `sgl_kernel` must be importable in the training environment. The
 default path is unchanged when the variable is unset or `0`.
 
-## Evidence and gates
+## Gates
 
-The checked-in [measurement receipt](evidence/moe-expert-kernel-q30.json)
-records the frozen Qwen3-30B-A3B layer replay used to select the mechanism:
-the direct serving kernel reproduced all 286,720 output elements exactly and
-ran in 0.451 ms versus 0.473 ms for the prior grouped-GEMM forward on the
-140-row replay. This is a forward-only replay, not an end-to-end throughput
-claim.
+Development layer replays established the mechanism, but campaign receipts and
+benchmark artifacts are intentionally not part of the public source tree. The
+public repository keeps the implementation and its conventional equality tests.
 
 Run the dependency-light contract suite with:
 

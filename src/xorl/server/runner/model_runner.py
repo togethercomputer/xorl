@@ -793,7 +793,7 @@ class ModelRunner:
                         )
                         if not (certified_glm52_block_fp8 or certified_glm52_exact_routed):
                             raise AdapterGradientOwnershipError(
-                                "Quantized expert-factor LoRA is admitted only for the certified GLM-5.2 "
+                                "LoRA factors on quantized routed experts are admitted only for the certified GLM-5.2 "
                                 "BlockFP8QLoRAMoeExperts DeepEP lane or the exact EP16 alltoall routed lane; "
                                 f"got type={type(module).__qualname__}, quant_format={quant_format!r}, "
                                 f"expert_backend={expert_backend!r}, ep_dispatch={ep_dispatch!r}, "

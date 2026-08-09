@@ -17,9 +17,10 @@ bit-relevant boundary:
   paired exact kernels. Decode reconstructs the current partial chunk from the
   last 64-token fp32 boundary state, matching teacher-forced prefill.
 - RoPE inverse frequencies, positions, and cosine/sine tables are constructed
-  on CPU in fp32 before bit-exact device transfer. Qwen uses the Class-A rotary
-  application program.
-- Trunk projections, norm families, router selection, and the float32 LM-head
+  on CPU in fp32 before bit-exact device transfer. Qwen uses the Class-B rotary
+  application program: one fp32 product-and-sum chain followed by one bf16
+  output round.
+- Trunk projections, RMSNorm-v2, router selection, and the float32 LM-head
   scoring path use their batch-invariant implementations.
 - Qwen3.6 MoE uses the native EP8 ordered combine. The dense model does not
   inherit MoE-only graph or transport optimizations.

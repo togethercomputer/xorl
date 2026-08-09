@@ -13,7 +13,6 @@ retained only as an internal launch-failure fallback; it is not a user-selectabl
 mode.
 """
 
-
 # The bit-relevant axis: pinned per dtype, NEVER shape-keyed.
 PINNED_BLOCK_K = {
     "torch.bfloat16": 64,

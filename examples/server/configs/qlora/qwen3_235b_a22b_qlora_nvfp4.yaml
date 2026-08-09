@@ -47,7 +47,8 @@ quant_group_size: 16
 enable_lora: true
 lora_rank: 32
 lora_alpha: 32
-# Quantized expert-factor LoRA is deferred; this release adapts attention only.
+# This shipped Qwen3 recipe remains attention-only. LoRA factors on quantized
+# routed experts are currently admitted only for certified GLM-5.2 lanes.
 lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
 
 # Skip initial checkpoint

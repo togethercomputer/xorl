@@ -25,16 +25,10 @@ def test_class_b_rejects_bf16_table_before_kernel_dispatch():
     ("q_heads", "k_heads", "head_dim", "rotary_dim"),
     [(2, 1, 8, 8), (3, 2, 12, 8), (1, 1, 16, 8)],
 )
-def test_class_b_shape_matrix_and_partial_rotary_backward(
-    q_heads, k_heads, head_dim, rotary_dim
-):
+def test_class_b_shape_matrix_and_partial_rotary_backward(q_heads, k_heads, head_dim, rotary_dim):
     torch.manual_seed(17)
-    q = torch.randn(
-        (1, 3, q_heads, head_dim), dtype=torch.bfloat16, requires_grad=True
-    )
-    k = torch.randn(
-        (1, 3, k_heads, head_dim), dtype=torch.bfloat16, requires_grad=True
-    )
+    q = torch.randn((1, 3, q_heads, head_dim), dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn((1, 3, k_heads, head_dim), dtype=torch.bfloat16, requires_grad=True)
     half = rotary_dim // 2
     angles = torch.randn((1, 3, half), dtype=torch.float32)
     cos_half, sin_half = angles.cos(), angles.sin()
@@ -50,9 +44,7 @@ def test_class_b_shape_matrix_and_partial_rotary_backward(
 
     q_grad = torch.randn_like(q_out)
     k_grad = torch.randn_like(k_out)
-    dq, dk = torch.autograd.grad(
-        (q_out, k_out), (q, k), grad_outputs=(q_grad, k_grad)
-    )
+    dq, dk = torch.autograd.grad((q_out, k_out), (q, k), grad_outputs=(q_grad, k_grad))
     assert dq.shape == q.shape and dk.shape == k.shape
     assert torch.isfinite(dq.float()).all()
     assert torch.isfinite(dk.float()).all()

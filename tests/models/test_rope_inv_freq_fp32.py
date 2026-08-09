@@ -160,9 +160,7 @@ def test_qwen_class_b_candidate_default_cache_growth_preserves_cpu_fp32_recipe()
     assert cos0.dtype is sin0.dtype is torch.float32
     assert cos1.dtype is sin1.dtype is torch.float32
     assert torch.equal(rotary._sglang_default_cache[: prefix.shape[0]], prefix)
-    expected = rotary._build_sglang_default_cache(
-        rotary._sglang_default_cache.shape[0], torch.device("cpu")
-    )
+    expected = rotary._build_sglang_default_cache(rotary._sglang_default_cache.shape[0], torch.device("cpu"))
     assert torch.equal(rotary._sglang_default_cache, expected)
 
 

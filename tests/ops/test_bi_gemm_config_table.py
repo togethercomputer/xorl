@@ -44,9 +44,7 @@ def test_ambient_legacy_envs_cannot_change_the_production_program(monkeypatch):
     assert batch_invariant_ops._ENABLE_MM_DEEPGEMM is True
     assert not hasattr(batch_invariant_ops, "_ENABLE_MM_FALLBACK_VARIANT")
     assert not hasattr(batch_invariant_ops, "_ENABLE_MM_COMPARISON_TEST")
-    assert lookup_mm_config(torch.bfloat16, 1, 3840, 3840) != dict(
-        BASELINE_CONFIG["torch.bfloat16"], BLOCK_SIZE_K=64
-    )
+    assert lookup_mm_config(torch.bfloat16, 1, 3840, 3840) != dict(BASELINE_CONFIG["torch.bfloat16"], BLOCK_SIZE_K=64)
 
 
 def _launch(a, b, cfg, out_dtype=None):

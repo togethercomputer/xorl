@@ -45,10 +45,38 @@ def _record():
         ],
         "class_b_confirmation": _run("b64", "B", 64, 10),
         "timing": [
-            {"rope_class": "A", "pair_order": "AB", "session_id": "s", "workload_id": "w", "warm": True, "elapsed_s": 2.0},
-            {"rope_class": "B", "pair_order": "AB", "session_id": "s", "workload_id": "w", "warm": True, "elapsed_s": 1.0},
-            {"rope_class": "B", "pair_order": "BA", "session_id": "s", "workload_id": "w", "warm": True, "elapsed_s": 1.2},
-            {"rope_class": "A", "pair_order": "BA", "session_id": "s", "workload_id": "w", "warm": True, "elapsed_s": 2.2},
+            {
+                "rope_class": "A",
+                "pair_order": "AB",
+                "session_id": "s",
+                "workload_id": "w",
+                "warm": True,
+                "elapsed_s": 2.0,
+            },
+            {
+                "rope_class": "B",
+                "pair_order": "AB",
+                "session_id": "s",
+                "workload_id": "w",
+                "warm": True,
+                "elapsed_s": 1.0,
+            },
+            {
+                "rope_class": "B",
+                "pair_order": "BA",
+                "session_id": "s",
+                "workload_id": "w",
+                "warm": True,
+                "elapsed_s": 1.2,
+            },
+            {
+                "rope_class": "A",
+                "pair_order": "BA",
+                "session_id": "s",
+                "workload_id": "w",
+                "warm": True,
+                "elapsed_s": 2.2,
+            },
         ],
     }
 

@@ -82,11 +82,7 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
 
         from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
 
-        if (
-            lora_merged_forward_enabled(self)
-            or get_parallel_state().ep_enabled
-            or self.moe_implementation != "eager"
-        ):
+        if lora_merged_forward_enabled(self) or get_parallel_state().ep_enabled or self.moe_implementation != "eager":
             return "fused_managed"
         return "module_managed"
 

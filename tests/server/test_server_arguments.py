@@ -161,7 +161,7 @@ def test_shipped_moe_lora_examples_select_certified_triton(relative_path):
         "examples/server/configs/qlora/qwen3_coder_30b_a3b_qlora.yaml",
     ),
 )
-def test_shipped_quantized_moe_examples_defer_expert_factors(relative_path):
+def test_shipped_qwen_quantized_moe_examples_are_attention_only(relative_path):
     config = yaml.safe_load((Path(__file__).resolve().parents[2] / relative_path).read_text(encoding="utf-8"))
     assert config["moe_implementation"] == "triton"
     assert config["lora_target_modules"] == ["q_proj", "k_proj", "v_proj", "o_proj"]

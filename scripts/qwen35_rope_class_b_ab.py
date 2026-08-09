@@ -84,8 +84,7 @@ def audit(record: dict[str, Any]) -> dict[str, Any]:
         "Class B 64-decision IDs do not preserve the accepted four-decision prefix",
     )
     _require(
-        confirmation["sampler_logprob_f32_hex"][:4]
-        == by_class["B"][0]["sampler_logprob_f32_hex"],
+        confirmation["sampler_logprob_f32_hex"][:4] == by_class["B"][0]["sampler_logprob_f32_hex"],
         "Class B 64-decision bytes do not preserve the accepted four-decision prefix",
     )
 

@@ -62,6 +62,7 @@ def _pin_compile_budget() -> None:
 
 _pin_compile_budget()
 
+
 def _rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, is_neox: bool) -> torch.Tensor:
     """SGLang's ``apply_rotary_emb``, vendored.
 
