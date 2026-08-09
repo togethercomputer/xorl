@@ -420,9 +420,10 @@ def _resolve_rope_modes(
     if _is_exact_qwen35(config):
         if rope_native is False:
             raise ValueError("Exact Qwen3.5-family server training requires rope_native=true")
-        if rope_class_b is True:
-            raise ValueError("Exact Qwen3.5-family server training uses native Class-A RoPE, not Class-B RoPE")
-        return True, False
+        # Class A remains the qualified default.  Class B is an explicit
+        # candidate used only for paired trainer/sampler qualification; unlike
+        # an omitted value, ``True`` must survive numerical-program resolution.
+        return True, bool(rope_class_b)
 
     effective_rope_native = bool(rope_native)
     effective_rope_class_b = bool(rope_class_b)
@@ -485,7 +486,7 @@ def resolve_model_numerical_program(
             rmsnorm_mode="sglang_fused",
             activation_native=True,
             rope_native=True,
-            rope_class_b=False,
+            rope_class_b=effective_rope_class_b,
             attention_cast_bf16=True,
             sparse_mla_enabled=False,
             sparse_mla_backend="auto",
@@ -669,7 +670,10 @@ def build_foundation_model(
     if canonical_glm52:
         logger.info_rank0(f"Canonical GLM-5.2 numerical program: {numerical_program}")
     elif config._qwen35_exact_contract:
-        logger.info_rank0(f"Exact Qwen3.5-family server-training numerical program: {numerical_program}")
+        rope_program = "candidate Class B" if numerical_program.rope_class_b else "qualified Class A"
+        logger.info_rank0(
+            f"Exact Qwen3.5-family server-training numerical program ({rope_program} RoPE): {numerical_program}"
+        )
 
     if moe_implementation is not None:
         if moe_implementation not in ["eager", "triton", "native", "quack"]:

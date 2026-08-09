@@ -143,6 +143,29 @@ def test_native_default_cache_is_lazy_and_follows_execution_device():
     assert torch.equal(sin[..., : HEAD_DIM // 2].reshape_as(cached_sin), cached_sin)
 
 
+def test_qwen_class_b_candidate_default_cache_growth_preserves_cpu_fp32_recipe():
+    config = _config("default")
+    config.max_position_embeddings = 8
+    config._rope_native = True
+    config._rope_class_b = True
+    config._glm52_exact_contract = False
+    config._qwen35_exact_contract = True
+    rotary = RotaryEmbedding(config)
+    x = torch.zeros((1, 1, HEAD_DIM), dtype=torch.bfloat16)
+
+    cos0, sin0 = rotary(x, torch.tensor([[0, 7]], dtype=torch.long))
+    prefix = rotary._sglang_default_cache.clone()
+    cos1, sin1 = rotary(x, torch.tensor([[8, 12]], dtype=torch.long))
+
+    assert cos0.dtype is sin0.dtype is torch.float32
+    assert cos1.dtype is sin1.dtype is torch.float32
+    assert torch.equal(rotary._sglang_default_cache[: prefix.shape[0]], prefix)
+    expected = rotary._build_sglang_default_cache(
+        rotary._sglang_default_cache.shape[0], torch.device("cpu")
+    )
+    assert torch.equal(rotary._sglang_default_cache, expected)
+
+
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_exact_architectures_build_default_rope_tables_on_their_serving_devices():

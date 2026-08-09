@@ -581,7 +581,8 @@ class ModelArguments:
     rope_class_b: Optional[bool] = field(
         default=None,
         metadata={
-            "help": "Use compiled Class-B RoPE fp32-chain numerics. Auto-enables for canonical GLM-5.2 when omitted."
+            "help": "Use compiled Class-B RoPE fp32-chain numerics. Auto-enables for canonical GLM-5.2 when omitted; "
+            "for exact Qwen3.5-family training this is an explicit, unqualified A/B candidate and defaults to Class A."
         },
     )
     attention_cast_bf16: bool = field(

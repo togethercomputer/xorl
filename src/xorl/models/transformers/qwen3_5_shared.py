@@ -105,7 +105,34 @@ def qwen3_5_apply_rotary_pos_emb(
     interleaved: bool = False,
     class_b: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if class_b and q.is_cuda:
+    if class_b:
+        if not q.is_cuda or not k.is_cuda:
+            raise RuntimeError("Qwen3.5-family Class-B RoPE candidate requires CUDA q/k tensors")
+        if q.dtype is not torch.bfloat16 or k.dtype is not torch.bfloat16:
+            raise RuntimeError(
+                "Qwen3.5-family Class-B RoPE candidate requires BF16 q/k tensors; "
+                f"got q={q.dtype}, k={k.dtype}"
+            )
+        if q.ndim != 4 or k.ndim != 4 or cos.ndim != 3 or sin.ndim != 3:
+            raise RuntimeError(
+                "Qwen3.5-family Class-B RoPE candidate requires q/k [B,S,H,D] and cos/sin [B,S,D]; "
+                f"got q={tuple(q.shape)}, k={tuple(k.shape)}, cos={tuple(cos.shape)}, sin={tuple(sin.shape)}"
+            )
+        if q.shape[:2] != k.shape[:2] or q.shape[:2] != cos.shape[:2] or cos.shape != sin.shape:
+            raise RuntimeError(
+                "Qwen3.5-family Class-B RoPE candidate received incompatible token/table shapes: "
+                f"q={tuple(q.shape)}, k={tuple(k.shape)}, cos={tuple(cos.shape)}, sin={tuple(sin.shape)}"
+            )
+        if cos.dtype is not torch.float32 or sin.dtype is not torch.float32:
+            raise RuntimeError(
+                "Qwen3.5-family Class-B RoPE candidate requires fp32 cos/sin; "
+                f"got cos={cos.dtype}, sin={sin.dtype}"
+            )
+        if cos.shape[-1] % 2 or cos.shape[-1] > min(q.shape[-1], k.shape[-1]):
+            raise RuntimeError(
+                "Qwen3.5-family Class-B RoPE candidate requires an even rotary dimension no larger than q/k; "
+                f"got rotary={cos.shape[-1]}, q={q.shape[-1]}, k={k.shape[-1]}"
+            )
         return stock_fused_apply_rotary_pos_emb(q, k, cos, sin, interleaved=interleaved)
 
     # `interleaved` describes the q/k feature-layout convention only.

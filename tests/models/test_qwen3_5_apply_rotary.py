@@ -115,16 +115,45 @@ def test_class_b_dispatches_before_eager_qwen_math(monkeypatch):
 
     class _CudaInput:
         is_cuda = True
+        dtype = torch.bfloat16
+        ndim = 4
+        shape = (1, 2, 1, 4)
 
     def _stock(q, k, cos, sin, *, interleaved):
         calls.append((q, k, cos, sin, interleaved))
         return sentinel
 
     monkeypatch.setattr(qwen3_5_shared, "stock_fused_apply_rotary_pos_emb", _stock)
-    q, k, cos, sin = (_CudaInput() for _ in range(4))
+    q, k = (_CudaInput() for _ in range(2))
+    cos = torch.zeros((1, 2, 4), dtype=torch.float32)
+    sin = torch.zeros_like(cos)
 
     assert qwen3_5_shared.qwen3_5_apply_rotary_pos_emb(q, k, cos, sin, class_b=True) is sentinel
     assert calls == [(q, k, cos, sin, False)]
+
+
+@pytest.mark.parametrize(
+    ("q", "k", "cos", "sin", "message"),
+    [
+        (
+            torch.zeros((1, 2, 1, 4), dtype=torch.bfloat16),
+            torch.zeros((1, 2, 1, 4), dtype=torch.bfloat16),
+            torch.zeros((1, 2, 4), dtype=torch.float32),
+            torch.zeros((1, 2, 4), dtype=torch.float32),
+            "requires CUDA",
+        ),
+        (
+            torch.zeros((1, 2, 1, 4), dtype=torch.float32),
+            torch.zeros((1, 2, 1, 4), dtype=torch.float32),
+            torch.zeros((1, 2, 4), dtype=torch.float32),
+            torch.zeros((1, 2, 4), dtype=torch.float32),
+            "requires CUDA",
+        ),
+    ],
+)
+def test_class_b_fails_loudly_outside_cuda_contract(q, k, cos, sin, message):
+    with pytest.raises(RuntimeError, match=message):
+        qwen3_5_apply_rotary_pos_emb(q, k, cos, sin, class_b=True)
 
 
 @pytest.mark.parametrize("modeling_module", [modeling_qwen3_5, modeling_qwen3_5_moe])

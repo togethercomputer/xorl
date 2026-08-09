@@ -255,6 +255,34 @@ def test_exact_qwen35_resolves_the_certified_numerical_program(config_factory):
     assert resolve_cross_entropy_mode(config, None) == "bi_fused"
 
 
+@pytest.mark.parametrize("config_factory", [_exact_qwen35_dense_config, _exact_qwen35_moe_config])
+def test_exact_qwen35_class_b_is_explicit_opt_in_only(config_factory):
+    config = config_factory()
+    config._qwen35_exact_contract = True
+
+    default_modes = _resolve_rope_modes(config, rope_native=None, rope_class_b=None)
+    candidate_modes = _resolve_rope_modes(config, rope_native=None, rope_class_b=True)
+    assert default_modes == (True, False)
+    assert candidate_modes == (True, True)
+
+    program = resolve_model_numerical_program(
+        config,
+        attn_implementation=None,
+        non_glm_attn_default="flash_attention_3",
+        router_fp32=None,
+        lm_head_fp32=None,
+        rmsnorm_mode=None,
+        activation_native=False,
+        rope_native=None,
+        rope_class_b=True,
+        attention_cast_bf16=False,
+        sparse_mla_enabled=None,
+        sparse_mla_backend=None,
+    )
+    assert program.rope_native is True
+    assert program.rope_class_b is True
+
+
 @pytest.mark.parametrize(
     ("override", "value"),
     [
@@ -263,7 +291,6 @@ def test_exact_qwen35_resolves_the_certified_numerical_program(config_factory):
         ("lm_head_fp32", False),
         ("rmsnorm_mode", "native"),
         ("rope_native", False),
-        ("rope_class_b", True),
     ],
 )
 def test_exact_qwen35_rejects_incompatible_numerical_override(override, value):
