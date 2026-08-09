@@ -6,8 +6,6 @@ prefill row counts to the slower realization. These gates pin the direction and
 re-pin bit-neutrality, so the switch stays free to move on measurement.
 """
 
-from pathlib import Path
-
 import pytest
 import torch
 
@@ -16,21 +14,6 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requir
 
 SHIPPED_H = (2048, 3840, 4096)
 DEEP_H = 16384
-
-
-def test_benchmark_uses_installed_module_and_fixed_report_path():
-    script = (
-        Path(__file__).resolve().parents[2]
-        / "experiments"
-        / "k3_tests"
-        / "families_v2"
-        / "bench_norm_structure_switch.py"
-    ).read_text(encoding="utf-8")
-
-    assert "spec_from_file_location" not in script
-    assert 'add_argument("--v2"' not in script
-    assert 'add_argument("--out"' not in script
-    assert 'REPORT_PATH = Path(__file__).resolve().with_name("results")' in script
 
 
 def _payload(rows, h):

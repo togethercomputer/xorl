@@ -1,49 +1,50 @@
-# MoE serving-kernel forward contract
+# MoE expert forward contract
 
-## Problem
+## The expert block is one numerical program
 
-An MoE expert block is a program, not one matrix multiplication. Kernel launch
-shape, SiLU multiplication, routing-weight placement, and the top-k reduction
-tree all affect the final bf16 bits. Running XoRL's grouped-GEMM forward in the
-trainer while SGLang runs `fused_experts_impl` in the sampler therefore leaves
-a trainer-sampler log-probability mismatch even when inputs, routes, and weights
-are identical.
+An MoE expert forward includes token alignment, gate/up projections, BF16
+rounding, activation, the down projection, routing-weight placement, local
+top-k reduction, and distributed combine. Matching only a GEMM formula or
+weight layout is insufficient.
 
-## Contract
+The exact lanes make training evaluate the sampler's expert value program and
+attach a trainer-owned backward. The equality boundary is the forward output;
+the sampler does not need to implement autograd.
 
-Set `XORL_MOE_SGLANG_FUSED_EXPERTS=1` to make an EP1/TP1 trainer call the same
-SGLang expert forward used by serving. XoRL's GKN parameters are exposed as
-zero-copy transpose views (`[E,H,2I] -> [E,2I,H]` and `[E,I,H] -> [E,H,I]`),
-and the local orchestration preserves SGLang's Triton launches and combine.
+## Generic BF16 mechanism
 
-The equality boundary ends at the forward output. The sampler does not run
-backward, so the custom autograd wrapper reuses XoRL's grouped-GEMM backward to
-produce `dX`, routing-weight gradients, and gradients in the original GKN
-parameter layout. This keeps the scored function shared without requiring a
-serving kernel to become a training kernel.
+For supported BF16 experts, XoRL exposes GKN parameters through serving-layout
+views and invokes SGLang's fused expert forward. The custom autograd wrapper
+returns activation, routing-weight, and original-layout parameter gradients.
+Unsupported activation, bias, layout, or distribution combinations fail rather
+than falling back to the ordinary grouped-GEMM forward.
 
-The opt-in fails loudly for EP/TP expert distribution, expert biases, and
-unsupported activations. The current OSS expert container is gated-only; a
-future non-gated container needs its own explicit guard and contract. EP
-dispatch and combine order are separate contracts; this switch must not
-silently claim to cover them.
+Architecture-selected Qwen MoE uses this principle together with its qualified
+EP8 dispatch and ordered combine. The resolver, rather than a user-provided
+component flag, owns the production choice.
 
-SGLang and `sgl_kernel` must be importable in the training environment. The
-default path is unchanged when the variable is unset or `0`.
+## GLM-5.2 native-FP8 experts
 
-## Gates
+GLM's exact expert lane preserves the native block-FP8 weights and FP32 scales.
+Trainer and sampler use the same deterministic SGLang expert configuration,
+token alignment, activation roundpoints, and local reduction. Changing the
+number of routed rows changes the number of aligned M blocks, not the fixed
+K-axis program.
 
-Development layer replays established the mechanism, but campaign receipts and
-benchmark artifacts are intentionally not part of the public source tree. The
-public repository keeps the implementation and its conventional equality tests.
+Active rank-1 LoRA uses the same SGLang MoE hooks in both engines. Its shrink
+and expand GEMMs have fixed rank-aware blocks and no split-K partial merge.
+Trainer-only autograd supplies factor and activation gradients.
 
-Run the dependency-light contract suite with:
+EP dispatch and the 16-rank ordered combine remain explicit parts of the GLM
+contract; local expert equality alone does not qualify the distributed model.
+
+## Verification
 
 ```bash
 pytest tests/models/test_moe_sglang_fused_experts.py -q
+pytest tests/models/test_moe_sglang_fused_experts_ep.py -q
+pytest tests/models/test_glm52_exact_routed_experts_qlora.py -q
 ```
 
-Before enabling the path in a new environment, also replay a captured layer
-through both the live sampler kernel and this XoRL call and require
-`torch.equal`. Kernel-package upgrades require a fresh replay because the
-serving program itself is the contract.
+Package or kernel upgrades require a fresh cross-engine replay because the
+executed serving program—not its API name—is the contract.

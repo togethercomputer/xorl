@@ -1,61 +1,32 @@
 # Qwen3.5-family exact server-training program
 
-The official Qwen3.5-0.8B and Qwen3.6-35B-A3B geometries select their complete
-exact numerical programs automatically in server-training mode. On the paired
-SGLang server, `--rl-on-policy-target xorl` is the only activation switch.
-There is no per-component environment recipe and no faster non-exact fallback
-inside the admitted program.
+Qwen3.5-0.8B and Qwen3.6-35B-A3B use one architecture-selected numerical
+program in server training. Users do not assemble it from component flags.
 
-## System design
+## Admitted geometries
 
-The trainer and sampler execute the same numerical choices at every
-bit-relevant boundary:
+- Qwen3.5-0.8B dense: single rank.
+- Qwen3.6-35B-A3B MoE: WORLD8/DP8/EP8 or WORLD16/DP16/EP8.
 
-- Q/K L2 normalization uses the fixed serving launch geometry rather than an
-  autotuned reduction.
-- GDN convolution, gating, recurrent composition, and gated RMSNorm use the
-  paired exact kernels. Decode reconstructs the current partial chunk from the
-  last 64-token fp32 boundary state, matching teacher-forced prefill.
-- RoPE inverse frequencies, positions, and cosine/sine tables are constructed
-  on CPU in fp32 before bit-exact device transfer. Qwen uses the Class-B rotary
-  application program: one fp32 product-and-sum chain followed by one bf16
-  output round.
-- Trunk projections, RMSNorm-v2, router selection, and the float32 LM-head
-  scoring path use their batch-invariant implementations.
-- Qwen3.6 MoE uses the native EP8 ordered combine. The dense model does not
-  inherit MoE-only graph or transport optimizations.
+The resolver selects Class-B RoPE, RMSNorm-v2, exact GDN state handling,
+batch-invariant trunk and head programs, and the qualified attention program.
+The MoE model additionally selects deterministic routing, the serving-value
+expert forward, and the ordered EP8 combine.
 
-The Qwen3.6 serving program uses FA4, DP attention, a qualification-pinned local
-CUDA-graph bucket, DP8 admission, radix reuse, and 64-aligned continuation
-chunks. The corresponding trainer program admits WORLD8 with DP8 (one fully
-sharded replica) or WORLD16 with DP16 (two replicas, shard size 8); both use
-EP8. Qwen3.5-0.8B is admitted only at the single-rank dense geometry.
+On serving, `--rl-on-policy-target xorl` activates the paired program. The
+loader rejects incompatible topology, precision, attention, routing, cache,
+graph, and sampling choices rather than falling back to a different path.
 
-## Fail-closed envelope
+## LoRA
 
-The model loader rejects unqualified model geometry, topology, attention or
-MoE backends, precision overrides, and incompatible cache/graph settings.
-Serving rejects sampling transforms the trainer cannot replay, speculative
-decoding, session-state restoration, quantized model weights, and LoRA-wrapped
-LM heads for this program. It does not silently fall back to another numerical
-path.
+The supported single-adapter Qwen path uses canonical merged weights in the
+trainer forward and publishes the same bytes to serving. Dynamic multi-adapter
+execution is a different program and is not covered by this contract.
 
 ## Qualification
 
-A trainer/serving revision pair is qualified only by behavior produced by that
-pair. Capture the same prompt and seed in at least three sampler lifecycles and
-require identical retained token IDs and raw float32 logprob bytes. Replay the
-immutable capture through the full trainer model and require:
-
-- every retained token ID unchanged;
-- every raw float32 behavior-logprob byte unchanged;
-- token K3 and aggregate K3 exactly `0.0`;
-- an all-zero per-request error inventory.
-
-Run the exact and non-exact throughput arms in the same warm session when
-reporting overhead. Historical development-lineage results explain the design,
-but do not qualify a rewritten or released pair by ancestry.
-
-For generic dense and historical component recipes, see
-[DEFAULTS_AND_PARETO.md](DEFAULTS_AND_PARETO.md). Those recipes are not launch
-instructions for the architecture-selected Qwen3.5-family program.
+Qualification requires a repeatable sampler capture and full-depth trainer
+replay of the retained token IDs and decision-time FP32 log-probability bytes.
+Every retained byte must match and K3 must be exactly zero. A model or runtime
+revision is not qualified solely because it descends from an earlier passing
+revision.
