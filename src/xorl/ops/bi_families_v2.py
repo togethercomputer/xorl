@@ -820,11 +820,9 @@ def _v2_norm_use_split(rows: int, n_tiles: int) -> bool:
     many tiles, where the fused ``grid=(rows,)`` cannot fill the GPU.
 
     ``n_tiles`` must be the split kernel's 512-wide tile count, not the fused
-    kernel's 4096-wide chunk count. Boundary measured on H100/132 SMs,
-    CUDA-graph GPU-only, H in [2048, 32768] x M in [1, 2048]: 2 raw slower
-    choices out of 72, only 1 beyond a 1.01x tie margin, worst 1.092x. Both
-    realizations compute the same tree, so a wrong choice here costs speed
-    only; re-fit with families_v2/bench_norm_structure_switch.py.
+    kernel's 4096-wide chunk count. The threshold is a Hopper performance
+    policy. Both realizations compute the same tree, so retuning it may change
+    speed only; the fused-versus-split equality gate must still pass.
     """
     return n_tiles >= V2_NORM_SPLIT_MIN_TILES and rows <= n_tiles
 
