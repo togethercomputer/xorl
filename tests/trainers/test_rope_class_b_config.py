@@ -140,6 +140,7 @@ def test_canonical_glm_resolves_complete_exact_program(monkeypatch):
         router_fp32=True,
         lm_head_fp32=True,
         rmsnorm_mode="sglang_fused",
+        qwen35_rmsnorm_family=None,
         activation_native=False,
         rope_native=True,
         rope_class_b=True,
@@ -210,6 +211,7 @@ def test_non_glm_numerical_defaults_are_preserved():
         router_fp32=True,
         lm_head_fp32=True,
         rmsnorm_mode="native",
+        qwen35_rmsnorm_family=None,
         activation_native=False,
         rope_native=False,
         rope_class_b=False,
@@ -245,6 +247,7 @@ def test_exact_qwen35_resolves_the_certified_numerical_program(config_factory):
         router_fp32=True,
         lm_head_fp32=True,
         rmsnorm_mode="sglang_fused",
+        qwen35_rmsnorm_family="v1",
         activation_native=True,
         rope_native=True,
         rope_class_b=False,
@@ -281,6 +284,50 @@ def test_exact_qwen35_class_b_is_explicit_opt_in_only(config_factory):
     )
     assert program.rope_native is True
     assert program.rope_class_b is True
+
+
+@pytest.mark.parametrize("config_factory", [_exact_qwen35_dense_config, _exact_qwen35_moe_config])
+def test_exact_qwen35_rmsnorm_v2_is_an_explicit_architecture_scoped_candidate(config_factory):
+    config = config_factory()
+    config._qwen35_exact_contract = True
+    kwargs = {
+        "attn_implementation": None,
+        "non_glm_attn_default": "flash_attention_3",
+        "router_fp32": None,
+        "lm_head_fp32": None,
+        "rmsnorm_mode": None,
+        "qwen35_rmsnorm_family": "v2",
+        "activation_native": False,
+        "rope_native": None,
+        "rope_class_b": None,
+        "attention_cast_bf16": False,
+        "sparse_mla_enabled": None,
+        "sparse_mla_backend": None,
+    }
+
+    program = resolve_model_numerical_program(config, **kwargs)
+
+    assert program.qwen35_rmsnorm_family == "v2"
+    assert program.rmsnorm_mode == "sglang_fused"
+
+
+def test_non_qwen_rejects_qwen35_rmsnorm_v2():
+    with pytest.raises(ValueError, match="supported only by exact Qwen3.5/3.6"):
+        resolve_model_numerical_program(
+            PretrainedConfig(),
+            attn_implementation=None,
+            non_glm_attn_default="flash_attention_3",
+            router_fp32=None,
+            lm_head_fp32=None,
+            rmsnorm_mode=None,
+            qwen35_rmsnorm_family="v2",
+            activation_native=False,
+            rope_native=None,
+            rope_class_b=None,
+            attention_cast_bf16=False,
+            sparse_mla_enabled=None,
+            sparse_mla_backend=None,
+        )
 
 
 @pytest.mark.parametrize(

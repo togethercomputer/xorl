@@ -563,6 +563,14 @@ class ModelArguments:
             "'sglang_kernel' uses SGLang's production sgl_kernel RMSNorm kernels for diagnostics."
         },
     )
+    qwen35_rmsnorm_family: Optional[Literal["v1", "v2"]] = field(
+        default=None,
+        metadata={
+            "help": "Exact Qwen3.5/3.6 RMSNorm arithmetic candidate. Omitted resolves to the qualified "
+            "v1 program; 'v2' opts only Qwen zero-centered q/k, residual, and final norms into the "
+            "families-v2 tree. Other architectures reject this override."
+        },
+    )
     router_fp32: Optional[bool] = field(
         default=None,
         metadata={"help": "Upcast MoE router gate computation to float32; defaults to true after model resolution."},

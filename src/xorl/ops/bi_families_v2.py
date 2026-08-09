@@ -242,8 +242,6 @@ def rms_norm_v2(
     assert x.dtype == torch.bfloat16, "families v2 is bf16-only (contract dtype)"
     assert weight.ndim == 1 and weight.shape[0] == x.shape[1]
     assert x.is_cuda
-    if zero_centered:
-        assert residual is None, "zero-centered exists in no-residual form only (v1 rule kept)"
     rows, H = x.shape
     weight = weight.contiguous()
     if residual is not None:
@@ -273,7 +271,7 @@ def _rms_norm_v2_fused(x, weight, eps, residual, zero_centered):
             res_out.stride(0),
             eps,
             HAS_RESIDUAL=True,
-            ZERO_CENTERED=False,
+            ZERO_CENTERED=zero_centered,
             BLOCK_H=V2_NORM_BLOCK_H,
         )
         return out, res_out

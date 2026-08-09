@@ -20,6 +20,8 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requir
 HIDDEN = 2048
 N_TOKENS = 512
 EPS = 1e-6
+
+
 @pytest.mark.cpu
 def test_qwen35_exact_norm_selection_is_structural(monkeypatch):
     calls = []
@@ -162,6 +164,37 @@ def test_qwen3_5_moe_sglang_fused_rmsnorm_routes_same_families_as_sglang(monkeyp
         set_rmsnorm_mode("native")
 
 
+@pytest.mark.cpu
+def test_qwen3_5_moe_v2_candidate_dispatches_without_changing_default(monkeypatch):
+    calls = []
+
+    def fake_v2(hidden, _weight, _eps, *, residual=None):
+        calls.append(residual is not None)
+        if residual is None:
+            return hidden + 7
+        residual_out = hidden + residual
+        return residual_out + 7, residual_out
+
+    monkeypatch.setattr(modeling_qwen3_5_moe, "fast_zero_centered_families_v2_rms_norm", fake_v2)
+    set_rmsnorm_mode("sglang_fused")
+    try:
+        default = Qwen3_5MoeRMSNorm(4, exact_contract=True)
+        candidate = Qwen3_5MoeRMSNorm(4, exact_contract=True, rmsnorm_family="v2")
+        x = torch.ones(2, 4)
+        residual = torch.full_like(x, 3)
+        assert default.rmsnorm_family == "v1"
+        assert torch.equal(candidate(x), x + 7)
+        out, residual_out = candidate(x, residual=residual, prenorm=True)
+        assert torch.equal(out, x + residual + 7)
+        assert torch.equal(residual_out, x + residual)
+        assert calls == [False, True]
+    finally:
+        set_rmsnorm_mode("native")
+
+    with pytest.raises(RuntimeError, match="only in the exact training lane"):
+        Qwen3_5MoeRMSNorm(4, exact_contract=False, rmsnorm_family="v2")
+
+
 # --------------------------------------------------------------------------- #
 # Call sites: layer>0 input norm and the final norm must force family-2 in both
 # sglang and sglang_fused modes (§14 family assignment, ported from qwen3_moe).
@@ -205,6 +238,31 @@ def _tiny_config(**overrides) -> Qwen3_5MoeConfig:
     )
     kwargs.update(overrides)
     return Qwen3_5MoeConfig(**kwargs)
+
+
+@pytest.mark.cpu
+def test_qwen3_5_moe_v2_resolves_every_zero_centered_norm_site():
+    config = _tiny_config()
+    config._qwen35_exact_contract = True
+    config._qwen35_rmsnorm_family = "v2"
+    set_rmsnorm_mode("sglang_fused")
+    try:
+        model = Qwen3_5MoeModel(config)
+    finally:
+        set_rmsnorm_mode("native")
+
+    resolved = {
+        name: module.rmsnorm_family for name, module in model.named_modules() if isinstance(module, Qwen3_5MoeRMSNorm)
+    }
+    assert resolved
+    assert set(resolved.values()) == {"v2"}
+    assert "norm" in resolved
+    for layer_idx in range(config.num_hidden_layers):
+        prefix = f"layers.{layer_idx}"
+        assert resolved[f"{prefix}.input_layernorm"] == "v2"
+        assert resolved[f"{prefix}.post_attention_layernorm"] == "v2"
+        assert resolved[f"{prefix}.self_attn.q_norm"] == "v2"
+        assert resolved[f"{prefix}.self_attn.k_norm"] == "v2"
 
 
 @pytest.mark.parametrize(
@@ -320,9 +378,9 @@ def test_qwen3_5_trunk_contract_family1_bit_matches_interpose_kernel():
         out = norm(x)
         ref = rms_norm_batch_invariant(x.float(), 1.0 + norm.weight.float(), eps=EPS).to(x.dtype)
         with set_batch_invariant_mode(True):
-            ref_interpose = torch.nn.functional.rms_norm(
-                x.float(), (head_dim,), 1.0 + norm.weight.float(), eps=EPS
-            ).to(x.dtype)
+            ref_interpose = torch.nn.functional.rms_norm(x.float(), (head_dim,), 1.0 + norm.weight.float(), eps=EPS).to(
+                x.dtype
+            )
 
     assert torch.equal(out, ref)
     assert torch.equal(out, ref_interpose), "contract-lane family-1 must equal the aten interpose lane bit-for-bit"
@@ -387,12 +445,8 @@ def test_qwen3_5_family2_residual_norm_contract(monkeypatch):
 
     set_rmsnorm_mode("sglang_fused")
     try:
-        exact_norm = modeling_qwen3_5_moe.Qwen3_5MoeRMSNorm(
-            HIDDEN, eps=1e-6, exact_contract=True
-        ).to(device)
-        ordinary_norm = modeling_qwen3_5_moe.Qwen3_5MoeRMSNorm(
-            HIDDEN, eps=1e-6, exact_contract=False
-        ).to(device)
+        exact_norm = modeling_qwen3_5_moe.Qwen3_5MoeRMSNorm(HIDDEN, eps=1e-6, exact_contract=True).to(device)
+        ordinary_norm = modeling_qwen3_5_moe.Qwen3_5MoeRMSNorm(HIDDEN, eps=1e-6, exact_contract=False).to(device)
     finally:
         set_rmsnorm_mode("native")
     with torch.no_grad():

@@ -21,6 +21,7 @@ class TinyModel(nn.Module):
                 "router_fp32": False,
                 "lm_head_fp32": False,
                 "rmsnorm_mode": "sglang",
+                "qwen35_rmsnorm_family": "v2",
                 "activation_native": True,
                 "rope_native": True,
                 "rope_class_b": True,
@@ -49,6 +50,7 @@ def _trainer_args():
             lm_head_fp32=False,
             alltoall_combine_hidden_chunk_size=0,
             rmsnorm_mode="sglang",
+            qwen35_rmsnorm_family="v2",
             activation_native=True,
             rope_native=True,
             rope_class_b=True,
@@ -100,6 +102,7 @@ def test_local_trainer_forwards_model_numeric_alignment_flags(monkeypatch):
     assert captured["router_fp32"] is False
     assert captured["lm_head_fp32"] is False
     assert captured["rmsnorm_mode"] == "sglang"
+    assert captured["qwen35_rmsnorm_family"] == "v2"
     assert captured["activation_native"] is True
     assert captured["rope_native"] is True
     assert captured["rope_class_b"] is True

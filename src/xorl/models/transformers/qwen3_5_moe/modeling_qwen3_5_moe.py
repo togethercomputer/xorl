@@ -1,5 +1,5 @@
 from functools import partial
-from typing import Callable, Optional, Tuple, Unpack
+from typing import Callable, Literal, Optional, Tuple, Unpack
 
 import torch
 import torch.nn.functional as F
@@ -24,6 +24,7 @@ from xorl.models.layers.normalization import (
     eager_zero_centered_rms_norm,
     fast_zero_centered_batch_invariant_residual_rms_norm,
     fast_zero_centered_batch_invariant_rms_norm,
+    fast_zero_centered_families_v2_rms_norm,
     get_rmsnorm_mode,
     native_zero_centered_rms_norm,
     native_zero_centered_rms_norm_without_batch_invariant,
@@ -52,6 +53,7 @@ logger = logging.get_logger(__name__)
 
 def _adapt_qwen3_5_moe_config(config):
     exact_contract = bool(getattr(config, "_qwen35_exact_contract", False))
+    rmsnorm_family = getattr(config, "_qwen35_rmsnorm_family", "v1")
     if hasattr(config, "text_config"):
         adapted = Qwen3_5MoeConfig.from_hf_config(config)
     elif isinstance(config, Qwen3_5MoeConfig):
@@ -61,6 +63,7 @@ def _adapt_qwen3_5_moe_config(config):
     else:
         adapted = config
     adapted._qwen35_exact_contract = exact_contract
+    adapted._qwen35_rmsnorm_family = rmsnorm_family
     return adapted
 
 
@@ -100,10 +103,21 @@ class Qwen3_5MoeMLP(nn.Module):
 
 
 class Qwen3_5MoeRMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6, exact_contract: bool = False):
+    def __init__(
+        self,
+        dim: int,
+        eps: float = 1e-6,
+        exact_contract: bool = False,
+        rmsnorm_family: Literal["v1", "v2"] = "v1",
+    ):
         super().__init__()
+        if rmsnorm_family not in ("v1", "v2"):
+            raise ValueError(f"Unsupported Qwen3.5 MoE RMSNorm family: {rmsnorm_family!r}")
+        if rmsnorm_family == "v2" and not exact_contract:
+            raise RuntimeError("Qwen families-v2 RMSNorm is admitted only in the exact training lane.")
         self.eps = eps
         self.exact_contract = exact_contract
+        self.rmsnorm_family = rmsnorm_family
         self.weight = nn.Parameter(torch.zeros(dim))
         self.mode = get_rmsnorm_mode()
 
@@ -114,6 +128,25 @@ class Qwen3_5MoeRMSNorm(nn.Module):
         prenorm: bool = False,
         force_sglang_residual: bool = False,
     ):
+        if self.exact_contract and self.rmsnorm_family == "v2":
+            if self.mode != "sglang_fused":
+                raise RuntimeError(
+                    f"The Qwen families-v2 RMSNorm candidate requires rmsnorm_mode='sglang_fused'; got {self.mode!r}."
+                )
+            if residual is None:
+                out = fast_zero_centered_families_v2_rms_norm(x, self.weight, self.eps)
+                residual_out = None
+            else:
+                out, residual_out = fast_zero_centered_families_v2_rms_norm(
+                    x,
+                    self.weight,
+                    self.eps,
+                    residual=residual,
+                )
+            if residual_out is not None and prenorm:
+                return out, residual_out
+            return out
+
         residual_out: Optional[torch.Tensor] = None
         norm_input = x
         if residual is not None:
@@ -178,8 +211,13 @@ class Qwen3_5MoeAttention(nn.Module):
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
         exact_contract = bool(getattr(config, "_qwen35_exact_contract", False))
-        self.q_norm = Qwen3_5MoeRMSNorm(self.head_dim, eps=config.rms_norm_eps, exact_contract=exact_contract)
-        self.k_norm = Qwen3_5MoeRMSNorm(self.head_dim, eps=config.rms_norm_eps, exact_contract=exact_contract)
+        rmsnorm_family = getattr(config, "_qwen35_rmsnorm_family", "v1")
+        self.q_norm = Qwen3_5MoeRMSNorm(
+            self.head_dim, eps=config.rms_norm_eps, exact_contract=exact_contract, rmsnorm_family=rmsnorm_family
+        )
+        self.k_norm = Qwen3_5MoeRMSNorm(
+            self.head_dim, eps=config.rms_norm_eps, exact_contract=exact_contract, rmsnorm_family=rmsnorm_family
+        )
         self._attn_gate: torch.Tensor | None = None
 
     def _capture_diagnostic_component(self, name: str, value: torch.Tensor) -> None:
@@ -333,9 +371,7 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
 
         ps = get_parallel_state()
         if not ps.ep_enabled:
-            raise RuntimeError(
-                "Qwen3.5-MoE exact ordered combine requires trainer EP mirroring the serving EP size"
-            )
+            raise RuntimeError("Qwen3.5-MoE exact ordered combine requires trainer EP mirroring the serving EP size")
         if not hasattr(self.shared_expert, "gate_up_proj"):
             raise NotImplementedError("Qwen3.5-MoE exact ordered combine requires the fused shared-expert gate_up_proj")
         ep_size, ep_rank, ep_group = ps.ep_size, ps.ep_rank, ps.ep_group
@@ -472,11 +508,18 @@ class Qwen3_5MoeDecoderLayer(MoEGradientCheckpointingLayer):
             self.self_attn = Qwen3_5MoeAttention(config, layer_idx)
 
         exact_contract = bool(getattr(config, "_qwen35_exact_contract", False))
+        rmsnorm_family = getattr(config, "_qwen35_rmsnorm_family", "v1")
         self.input_layernorm = Qwen3_5MoeRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, exact_contract=exact_contract
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            exact_contract=exact_contract,
+            rmsnorm_family=rmsnorm_family,
         )
         self.post_attention_layernorm = Qwen3_5MoeRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps, exact_contract=exact_contract
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            exact_contract=exact_contract,
+            rmsnorm_family=rmsnorm_family,
         )
         if (layer_idx not in config.mlp_only_layers) and (
             config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
@@ -643,6 +686,7 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
             config.hidden_size,
             eps=config.rms_norm_eps,
             exact_contract=bool(getattr(config, "_qwen35_exact_contract", False)),
+            rmsnorm_family=getattr(config, "_qwen35_rmsnorm_family", "v1"),
         )
         self.rotary_emb = RotaryEmbedding(config=config)
         self.gradient_checkpointing = False

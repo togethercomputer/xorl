@@ -705,6 +705,7 @@ class Trainer:
             lm_head_fp32=args.model.lm_head_fp32,
             alltoall_combine_hidden_chunk_size=args.model.alltoall_combine_hidden_chunk_size,
             rmsnorm_mode=args.model.rmsnorm_mode,
+            qwen35_rmsnorm_family=args.model.qwen35_rmsnorm_family,
             activation_native=args.model.activation_native,
             rope_native=args.model.rope_native,
             rope_class_b=args.model.rope_class_b,
@@ -723,6 +724,7 @@ class Trainer:
         args.model.router_fp32 = numerical_program["router_fp32"]
         args.model.lm_head_fp32 = numerical_program["lm_head_fp32"]
         args.model.rmsnorm_mode = numerical_program["rmsnorm_mode"]
+        args.model.qwen35_rmsnorm_family = numerical_program["qwen35_rmsnorm_family"]
         args.model.activation_native = numerical_program["activation_native"]
         args.model.rope_native = numerical_program["rope_native"]
         args.model.rope_class_b = numerical_program["rope_class_b"]

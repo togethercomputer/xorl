@@ -161,6 +161,13 @@ class ServerArguments:
             "'sglang_kernel' uses SGLang's production sgl_kernel RMSNorm kernels for diagnostics."
         },
     )
+    qwen35_rmsnorm_family: Optional[Literal["v1", "v2"]] = field(
+        default=None,
+        metadata={
+            "help": "Exact Qwen3.5/3.6 RMSNorm arithmetic candidate. Omitted keeps the qualified v1 "
+            "program; 'v2' opts only Qwen zero-centered q/k, residual, and final norms into families-v2."
+        },
+    )
 
     activation_native: bool = field(
         default=False, metadata={"help": "Use native SiLU instead of fused Triton kernel for SGLang alignment."}
@@ -1404,6 +1411,7 @@ class ServerArguments:
                 "router_fp32": self.router_fp32,
                 "lm_head_fp32": self.lm_head_fp32,
                 "rmsnorm_mode": self.rmsnorm_mode,
+                "qwen35_rmsnorm_family": self.qwen35_rmsnorm_family,
                 "activation_native": self.activation_native,
                 "rope_native": self.rope_native,
                 "rope_class_b": self.rope_class_b,

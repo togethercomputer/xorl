@@ -203,6 +203,66 @@ class _FamiliesV2ResidualRMSNorm(torch.autograd.Function):
         )
 
 
+class _FamiliesV2ZeroCenteredRMSNorm(torch.autograd.Function):
+    """Differentiable Qwen/Gemma epilogue over the families-v2 tree."""
+
+    @staticmethod
+    def forward(ctx, hidden_states, weight, variance_epsilon):
+        out = rms_norm_v2(hidden_states, weight, variance_epsilon, zero_centered=True)
+        ctx.save_for_backward(hidden_states, weight)
+        ctx.variance_epsilon = variance_epsilon
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        hidden_states, weight = ctx.saved_tensors
+        effective_weight = 1.0 + weight.float()
+        grad_normed, grad_weight = fused_rms_norm_backward(
+            hidden_states,
+            effective_weight,
+            ctx.variance_epsilon,
+            grad_output,
+        )
+        return grad_normed.to(hidden_states.dtype), grad_weight.to(weight.dtype), None
+
+
+class _FamiliesV2ZeroCenteredResidualRMSNorm(torch.autograd.Function):
+    """Fused BF16 residual add plus the Qwen/Gemma families-v2 epilogue."""
+
+    @staticmethod
+    def forward(ctx, hidden_states, residual, weight, variance_epsilon):
+        out, residual_out = rms_norm_v2(
+            hidden_states,
+            weight,
+            variance_epsilon,
+            residual=residual,
+            zero_centered=True,
+        )
+        ctx.save_for_backward(residual_out, weight)
+        ctx.variance_epsilon = variance_epsilon
+        ctx.input_dtype = hidden_states.dtype
+        ctx.residual_dtype = residual.dtype
+        return out, residual_out
+
+    @staticmethod
+    def backward(ctx, grad_output, grad_residual_out):
+        residual_out, weight = ctx.saved_tensors
+        effective_weight = 1.0 + weight.float()
+        grad_total, grad_weight = fused_rms_norm_backward(
+            residual_out,
+            effective_weight,
+            ctx.variance_epsilon,
+            grad_output,
+            grad_residual_out=grad_residual_out,
+        )
+        return (
+            grad_total.to(ctx.input_dtype),
+            grad_total.to(ctx.residual_dtype),
+            grad_weight.to(weight.dtype),
+            None,
+        )
+
+
 def _families_v2_norm_eligible(hidden_states: torch.Tensor) -> bool:
     return families_v2_enabled() and hidden_states.is_cuda and hidden_states.dtype == torch.bfloat16
 
@@ -214,6 +274,58 @@ def _families_v2_rms_norm(hidden_states: torch.Tensor, weight: torch.Tensor, var
         x2d = x2d.contiguous()
     out = _FamiliesV2RMSNorm.apply(x2d, weight, variance_epsilon)
     return out.reshape(orig_shape)
+
+
+def fast_zero_centered_families_v2_rms_norm(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    variance_epsilon: float,
+    *,
+    residual: Optional[torch.Tensor] = None,
+) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    """Run the explicit Qwen families-v2 candidate without fallback.
+
+    The candidate is deliberately fail-loud: it is defined only for the BF16
+    CUDA contract used by exact Qwen3.5/3.6.  Production v1 callers never reach
+    this function.
+    """
+
+    if not hidden_states.is_cuda or hidden_states.dtype != torch.bfloat16:
+        raise RuntimeError(
+            "The Qwen families-v2 RMSNorm candidate requires CUDA BF16 input; "
+            f"got device={hidden_states.device}, dtype={hidden_states.dtype}."
+        )
+    if hidden_states.shape[-1] != weight.numel():
+        raise RuntimeError(
+            "The Qwen families-v2 RMSNorm candidate requires one weight per hidden feature; "
+            f"got hidden={hidden_states.shape[-1]}, weight={weight.numel()}."
+        )
+
+    original_shape = hidden_states.shape
+    hidden_2d = hidden_states.reshape(-1, original_shape[-1])
+    if hidden_2d.stride(-1) != 1:
+        hidden_2d = hidden_2d.contiguous()
+
+    if residual is None:
+        out = _FamiliesV2ZeroCenteredRMSNorm.apply(hidden_2d, weight, variance_epsilon)
+        return out.reshape(original_shape)
+
+    if residual.shape != hidden_states.shape or residual.dtype != torch.bfloat16 or not residual.is_cuda:
+        raise RuntimeError(
+            "The Qwen families-v2 residual RMSNorm candidate requires a CUDA BF16 residual "
+            f"matching the input shape; got shape={tuple(residual.shape)}, dtype={residual.dtype}, "
+            f"device={residual.device}."
+        )
+    residual_2d = residual.reshape(-1, original_shape[-1])
+    if residual_2d.stride(-1) != 1:
+        residual_2d = residual_2d.contiguous()
+    out, residual_out = _FamiliesV2ZeroCenteredResidualRMSNorm.apply(
+        hidden_2d,
+        residual_2d,
+        weight,
+        variance_epsilon,
+    )
+    return out.reshape(original_shape), residual_out.reshape(original_shape)
 
 
 def fast_sglang_rms_norm(

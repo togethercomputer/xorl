@@ -164,6 +164,14 @@ def test_v2_norm_goldens():
         "norm_v2_zero_centered",
         out=v2.rms_norm_v2(bf16((64, REAL_H), 131)[:, :DQK].contiguous(), w(DQK, 102), EPS, zero_centered=True),
     )
+    out, res = v2.rms_norm_v2(
+        bf16((64, REAL_H), 131),
+        w(REAL_H, 133),
+        EPS,
+        residual=bf16((64, REAL_H), 132),
+        zero_centered=True,
+    )
+    _check("norm_v2_zero_centered_residual_m64_h3840", out=out, residual_out=res)
     packed = bf16((256, (8 + 2 * 2) * DQK), 401)
     _check("qk_v2_strided_t256_h8_d128", out=v2.qk_norm_v2(packed[:, : 8 * DQK], w(DQK, 102), EPS, head_dim=DQK))
 

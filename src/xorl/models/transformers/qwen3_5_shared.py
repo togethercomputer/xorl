@@ -42,6 +42,11 @@ def _apply_qwen35_gdn_exact(model: torch.nn.Module) -> dict[str, int]:
         return dict(model._qwen35_gdn_exact_wrapped)
 
     config = model.config
+    rmsnorm_family = getattr(config, "_qwen35_rmsnorm_family", "v1")
+    if rmsnorm_family not in ("v1", "v2"):
+        raise ValueError(f"Unsupported exact Qwen RMSNorm family: {rmsnorm_family!r}")
+    if rmsnorm_family == "v2" and getattr(config, "_rmsnorm_mode", None) != "sglang_fused":
+        raise RuntimeError("The exact Qwen families-v2 RMSNorm candidate requires rmsnorm_mode='sglang_fused'.")
     is_moe = getattr(config, "model_type", None) in {
         "xorl_qwen3_5_moe",
         "qwen3_5_moe",
@@ -62,10 +67,10 @@ def _apply_qwen35_gdn_exact(model: torch.nn.Module) -> dict[str, int]:
     from xorl.ops.batch_invariant_ops import wrap_trunk_linears_batch_invariant  # noqa: PLC0415
     from xorl.ops.bi_families_v2 import _select_qwen35_families_v1  # noqa: PLC0415
 
-    # Exact Qwen reaches ce_mode='bi_fused'; its LM-head loss selects between
-    # v1 and v2 through this family pin. Keep the qualified v1 program until a
-    # direct final-head replay admits a migration.
+    # This candidate changes RMSNorm only. Keep the qualified v1 LM-head/LSE
+    # program pinned so the GPU discriminator has one numerical variable.
     _select_qwen35_families_v1()
+    norm_modules = []
     for module in model.modules():
         # LoRA injection runs before this exact-model hook.  The exact contract
         # is model-owned (not selected by the retired process-wide environment
@@ -73,6 +78,14 @@ def _apply_qwen35_gdn_exact(model: torch.nn.Module) -> dict[str, int]:
         # wrapper validates and composes with those modules.
         if isinstance(module, LoraModule):
             module.exact_merged_forward = True
+        if hasattr(module, "rmsnorm_family"):
+            norm_modules.append(module)
+            if module.rmsnorm_family != rmsnorm_family:
+                raise RuntimeError(
+                    "Exact Qwen RMSNorm resolution drifted during model construction: "
+                    f"expected {rmsnorm_family!r}, got {module.rmsnorm_family!r} on "
+                    f"{type(module).__qualname__}."
+                )
         if hasattr(module, "_native_ep_combine"):
             module._native_ep_combine = is_moe
         if hasattr(module, "_exact_batch_invariant_router"):
@@ -80,6 +93,9 @@ def _apply_qwen35_gdn_exact(model: torch.nn.Module) -> dict[str, int]:
             module.router._exact_batch_invariant = is_moe
             module.router.synthetic_routing_mode = None
             module.router.topk_policy = "default"
+
+    if not norm_modules:
+        raise RuntimeError("Exact Qwen model construction produced no resolved zero-centered RMSNorm modules.")
 
     wrapped = wrap_trunk_linears_batch_invariant(model)
     model._qwen35_gdn_exact_wrapped = dict(wrapped)

@@ -1412,6 +1412,7 @@ class ModelRunner:
             router_fp32=self.model_config.get("router_fp32"),
             lm_head_fp32=self.model_config.get("lm_head_fp32"),
             rmsnorm_mode=self.model_config.get("rmsnorm_mode"),
+            qwen35_rmsnorm_family=self.model_config.get("qwen35_rmsnorm_family"),
             activation_native=self.model_config.get("activation_native", False),
             rope_native=self.model_config.get("rope_native"),
             rope_class_b=self.model_config.get("rope_class_b"),

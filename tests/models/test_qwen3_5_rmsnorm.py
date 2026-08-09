@@ -86,6 +86,45 @@ def test_qwen3_5_sglang_fused_rmsnorm_routes_serving_families(monkeypatch):
         set_rmsnorm_mode("native")
 
 
+def test_qwen3_5_v2_candidate_is_explicit_and_fail_loud(monkeypatch):
+    calls = []
+
+    def fake_v2(hidden, _weight, _eps, *, residual=None):
+        calls.append(residual is not None)
+        if residual is None:
+            return hidden + 7
+        residual_out = hidden + residual
+        return residual_out + 7, residual_out
+
+    monkeypatch.setattr(modeling_qwen3_5, "fast_zero_centered_families_v2_rms_norm", fake_v2)
+    x = torch.ones(2, 4)
+    residual = torch.full_like(x, 3)
+
+    set_rmsnorm_mode("sglang_fused")
+    try:
+        v1 = modeling_qwen3_5.Qwen3_5RMSNorm(4, exact_contract=True)
+        v2 = modeling_qwen3_5.Qwen3_5RMSNorm(4, exact_contract=True, rmsnorm_family="v2")
+        assert v1.rmsnorm_family == "v1"
+        assert torch.equal(v2(x), x + 7)
+        out, residual_out = v2(x, residual=residual, prenorm=True)
+        assert torch.equal(residual_out, x + residual)
+        assert torch.equal(out, x + residual + 7)
+        assert calls == [False, True]
+    finally:
+        set_rmsnorm_mode("native")
+
+    with pytest.raises(RuntimeError, match="only in the exact training lane"):
+        modeling_qwen3_5.Qwen3_5RMSNorm(4, exact_contract=False, rmsnorm_family="v2")
+
+    set_rmsnorm_mode("native")
+    try:
+        rejected = modeling_qwen3_5.Qwen3_5RMSNorm(4, exact_contract=True, rmsnorm_family="v2")
+        with pytest.raises(RuntimeError, match="requires rmsnorm_mode='sglang_fused'"):
+            rejected(x)
+    finally:
+        set_rmsnorm_mode("native")
+
+
 class CaptureNorm(torch.nn.Module):
     def __init__(self, mode: str):
         super().__init__()
@@ -119,6 +158,47 @@ def _tiny_config(**overrides) -> Qwen3_5Config:
     )
     kwargs.update(overrides)
     return Qwen3_5Config(**kwargs)
+
+
+def test_qwen3_5_v2_resolves_every_zero_centered_norm_site():
+    config = _tiny_config()
+    config._qwen35_exact_contract = True
+    config._qwen35_rmsnorm_family = "v2"
+    set_rmsnorm_mode("sglang_fused")
+    try:
+        model = Qwen3_5TextModel(config)
+    finally:
+        set_rmsnorm_mode("native")
+
+    resolved = {
+        name: module.rmsnorm_family
+        for name, module in model.named_modules()
+        if isinstance(module, modeling_qwen3_5.Qwen3_5RMSNorm)
+    }
+    assert resolved
+    assert set(resolved.values()) == {"v2"}
+    assert "norm" in resolved
+    for layer_idx in range(config.num_hidden_layers):
+        prefix = f"layers.{layer_idx}"
+        assert resolved[f"{prefix}.input_layernorm"] == "v2"
+        assert resolved[f"{prefix}.post_attention_layernorm"] == "v2"
+        assert resolved[f"{prefix}.self_attn.q_norm"] == "v2"
+        assert resolved[f"{prefix}.self_attn.k_norm"] == "v2"
+
+
+def test_qwen3_5_gdn_gated_norm_remains_a_separate_exact_surface():
+    config = _tiny_config(layer_types=["linear_attention", "full_attention"])
+    config._qwen35_exact_contract = True
+    config._qwen35_rmsnorm_family = "v2"
+    set_rmsnorm_mode("sglang_fused")
+    try:
+        layer = Qwen3_5DecoderLayer(config, layer_idx=0)
+    finally:
+        set_rmsnorm_mode("native")
+
+    assert layer.linear_attn is not None
+    assert type(layer.linear_attn.o_norm).__name__ == "FusedRMSNormGated"
+    assert not hasattr(layer.linear_attn.o_norm, "rmsnorm_family")
 
 
 @pytest.mark.parametrize(

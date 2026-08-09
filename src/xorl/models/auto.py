@@ -395,6 +395,7 @@ class ResolvedModelNumericalProgram:
     router_fp32: bool
     lm_head_fp32: bool
     rmsnorm_mode: str
+    qwen35_rmsnorm_family: Optional[str]
     activation_native: bool
     rope_native: bool
     rope_class_b: bool
@@ -449,6 +450,7 @@ def resolve_model_numerical_program(
     attention_cast_bf16: bool,
     sparse_mla_enabled: Optional[bool],
     sparse_mla_backend: Optional[str],
+    qwen35_rmsnorm_family: Optional[str] = None,
 ) -> ResolvedModelNumericalProgram:
     """Resolve exact model numerics while preserving non-GLM defaults.
 
@@ -462,6 +464,8 @@ def resolve_model_numerical_program(
         rope_native=rope_native,
         rope_class_b=rope_class_b,
     )
+    if qwen35_rmsnorm_family not in (None, "v1", "v2"):
+        raise ValueError(f"qwen35_rmsnorm_family must be one of None, 'v1', or 'v2'; got {qwen35_rmsnorm_family!r}")
     if _is_exact_qwen35(config):
         requirements = {
             "attn_implementation": (attn_implementation, "flash_attention_4"),
@@ -484,6 +488,7 @@ def resolve_model_numerical_program(
             router_fp32=True,
             lm_head_fp32=True,
             rmsnorm_mode="sglang_fused",
+            qwen35_rmsnorm_family=qwen35_rmsnorm_family or "v1",
             activation_native=True,
             rope_native=True,
             rope_class_b=effective_rope_class_b,
@@ -493,11 +498,17 @@ def resolve_model_numerical_program(
         )
 
     if not _is_exact_glm52(config):
+        if qwen35_rmsnorm_family is not None:
+            raise ValueError(
+                "qwen35_rmsnorm_family is supported only by exact Qwen3.5/3.6 server training; "
+                f"got model_type={getattr(config, 'model_type', None)!r}."
+            )
         return ResolvedModelNumericalProgram(
             attn_implementation=attn_implementation or non_glm_attn_default,
             router_fp32=True if router_fp32 is None else router_fp32,
             lm_head_fp32=True if lm_head_fp32 is None else lm_head_fp32,
             rmsnorm_mode=rmsnorm_mode or "native",
+            qwen35_rmsnorm_family=None,
             activation_native=activation_native,
             rope_native=effective_rope_native,
             rope_class_b=effective_rope_class_b,
@@ -520,6 +531,8 @@ def resolve_model_numerical_program(
         for name, (requested, required) in requirements.items()
         if requested is not None and requested != required
     ]
+    if qwen35_rmsnorm_family is not None:
+        incompatible.append(f"qwen35_rmsnorm_family={qwen35_rmsnorm_family!r} (supported only by exact Qwen3.5/3.6)")
     if sparse_mla_backend not in (None, "auto", "flashmla"):
         incompatible.append(f"sparse_mla_backend={sparse_mla_backend!r} (requires 'flashmla')")
     if incompatible:
@@ -532,6 +545,7 @@ def resolve_model_numerical_program(
         router_fp32=True,
         lm_head_fp32=True,
         rmsnorm_mode="sglang_fused",
+        qwen35_rmsnorm_family=None,
         activation_native=False,
         rope_native=True,
         rope_class_b=True,
@@ -579,6 +593,7 @@ def build_foundation_model(
     rmsnorm_mode: Optional[
         Literal["eager", "native", "compile", "sglang", "sglang_fused", "sglang_jit", "sglang_kernel"]
     ] = None,
+    qwen35_rmsnorm_family: Optional[Literal["v1", "v2"]] = None,
     activation_native: bool = False,
     rope_native: Optional[bool] = None,
     rope_class_b: Optional[bool] = None,
@@ -641,6 +656,7 @@ def build_foundation_model(
         router_fp32=router_fp32,
         lm_head_fp32=lm_head_fp32,
         rmsnorm_mode=rmsnorm_mode,
+        qwen35_rmsnorm_family=qwen35_rmsnorm_family,
         activation_native=activation_native,
         rope_native=rope_native,
         rope_class_b=rope_class_b,
@@ -710,6 +726,7 @@ def build_foundation_model(
     )
     set_rmsnorm_mode(rmsnorm_mode)
     config._rmsnorm_mode = rmsnorm_mode
+    config._qwen35_rmsnorm_family = numerical_program.qwen35_rmsnorm_family
     config._activation_native = activation_native
     config._rope_native = effective_rope_native
     config._attention_cast_bf16 = attention_cast_bf16
