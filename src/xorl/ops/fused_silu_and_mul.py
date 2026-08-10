@@ -9,6 +9,32 @@ import triton
 import triton.language as tl
 
 
+_HOPPER_WIDE_MIN_ROWS = 192
+_HOPPER_OTHER_MIN_ROWS = 512
+_WIDE_INTERMEDIATE_SIZE = 8192
+
+
+def _exact_fused_swiglu_min_rows(intermediate_size: int) -> int:
+    """Return the measured conservative Hopper crossover."""
+    if intermediate_size >= _WIDE_INTERMEDIATE_SIZE:
+        return _HOPPER_WIDE_MIN_ROWS
+    return _HOPPER_OTHER_MIN_ROWS
+
+
+def _use_exact_fused_swiglu(input_tensor: torch.Tensor) -> bool:
+    """Admit the exact fused realization only on measured Hopper shapes."""
+    if not input_tensor.is_cuda or not input_tensor.is_contiguous():
+        return False
+    if input_tensor.dtype not in (torch.bfloat16, torch.float16):
+        return False
+    major, minor = torch.cuda.get_device_capability(input_tensor.device)
+    if (major, minor) != (9, 0):
+        return False
+    rows = input_tensor.numel() // input_tensor.shape[-1]
+    intermediate_size = input_tensor.shape[-1] // 2
+    return rows >= _exact_fused_swiglu_min_rows(intermediate_size)
+
+
 def _native_silu_and_mul(input_tensor: torch.Tensor) -> torch.Tensor:
     """Run SwiGLU with the eager PyTorch operation ordering used by serving."""
     assert input_tensor.shape[-1] % 2 == 0, "Last dimension must be even"
@@ -70,6 +96,8 @@ def silu_and_mul(input_tensor: torch.Tensor) -> torch.Tensor:
         Output tensor of shape [..., N]
     """
     assert input_tensor.shape[-1] % 2 == 0, "Last dimension must be even"
+    if not _use_exact_fused_swiglu(input_tensor):
+        return _native_silu_and_mul(input_tensor)
 
     original_shape = input_tensor.shape
     input_2d = input_tensor.view(-1, original_shape[-1])
@@ -131,14 +159,19 @@ def _silu_and_mul_backward_kernel(
         gate_f32 = gate.to(tl.float32)
         sigmoid_gate = tl.sigmoid(gate_f32)
         silu_gate = gate_f32 * sigmoid_gate
+        silu_gate_rounded = silu_gate.to(gate.dtype)
         silu_grad = sigmoid_gate + gate_f32 * sigmoid_gate * (1.0 - sigmoid_gate)
 
         # Compute gradients
         grad_out_f32 = grad_out.to(tl.float32)
         up_f32 = up.to(tl.float32)
 
-        d_gate = grad_out_f32 * up_f32 * silu_grad
-        d_up = grad_out_f32 * silu_gate
+        # Preserve the two BF16 boundaries from the forward graph. In
+        # particular, d_up consumes the rounded SiLU value, not the hidden
+        # FP32 temporary used to produce it.
+        product_grad = (grad_out_f32 * up_f32).to(gate.dtype).to(tl.float32)
+        d_gate = product_grad * silu_grad
+        d_up = grad_out_f32 * silu_gate_rounded.to(tl.float32)
 
         # Store gradients
         tl.store(grad_input_ptr + row_idx * 2 * N + col_offsets, d_gate.to(gate.dtype), mask=mask)
@@ -201,4 +234,6 @@ def fused_silu_and_mul(input_tensor: torch.Tensor) -> torch.Tensor:
     Returns:
         Output tensor of shape [..., N]
     """
+    if not _use_exact_fused_swiglu(input_tensor):
+        return _native_silu_and_mul(input_tensor)
     return SiluAndMulFunction.apply(input_tensor)

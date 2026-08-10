@@ -46,6 +46,12 @@ def _select_glm52_families_v2() -> None:
     _EXACT_FAMILIES_VERSION = "v2"
 
 
+def _select_qwen3_dense_families_v2() -> None:
+    """Pin exact dense Qwen3 to the shared v2 norm and lm-head trees."""
+    global _EXACT_FAMILIES_VERSION
+    _EXACT_FAMILIES_VERSION = "v2"
+
+
 def _select_nonexact_families() -> None:
     """Restore the pre-existing family selection for an ordinary model."""
     global _EXACT_FAMILIES_VERSION

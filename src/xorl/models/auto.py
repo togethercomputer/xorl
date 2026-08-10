@@ -263,6 +263,44 @@ def _is_exact_qwen35(config: PretrainedConfig) -> bool:
     return bool(getattr(config, "_qwen35_exact_contract", False))
 
 
+def _is_exact_qwen3_dense(config: PretrainedConfig) -> bool:
+    return bool(getattr(config, "_qwen3_dense_exact_contract", False))
+
+
+def _validate_exact_qwen3_dense_model_scope(config: PretrainedConfig) -> None:
+    if not _is_exact_qwen3_dense(config):
+        return
+    expected = {
+        "hidden_size": 4096,
+        "intermediate_size": 12288,
+        "num_hidden_layers": 36,
+        "num_attention_heads": 32,
+        "num_key_value_heads": 8,
+        "head_dim": 128,
+        "vocab_size": 151936,
+        "rms_norm_eps": 1e-6,
+        "rope_theta": 1_000_000,
+        "max_position_embeddings": 40960,
+        "hidden_act": "silu",
+        "tie_word_embeddings": False,
+        "attention_bias": False,
+        "use_sliding_window": False,
+    }
+    mismatches = []
+    for name, value in expected.items():
+        actual = getattr(config, name, None)
+        if name == "rope_theta" and actual is None:
+            rope_parameters = getattr(config, "rope_parameters", None)
+            if isinstance(rope_parameters, dict):
+                actual = rope_parameters.get("rope_theta")
+        if actual != value:
+            mismatches.append(f"{name}={actual!r} (requires {value!r})")
+    if mismatches:
+        raise ValueError(
+            "The exact Qwen3-8B program supports only the official model geometry: " + ", ".join(mismatches)
+        )
+
+
 def _is_qwen35_moe(config: PretrainedConfig) -> bool:
     return getattr(config, "model_type", None) in {
         "xorl_qwen3_5_moe",
@@ -427,6 +465,15 @@ def _resolve_rope_modes(
             )
         return True, True
 
+    if _is_exact_qwen3_dense(config):
+        if rope_native is False or rope_class_b is False:
+            raise ValueError(
+                "Exact Qwen3-8B server training requires native Class-B RoPE; "
+                "explicit rope_native=false or rope_class_b=false is incompatible "
+                "with the model's numerical contract"
+            )
+        return True, True
+
     effective_rope_native = bool(rope_native)
     effective_rope_class_b = bool(rope_class_b)
     if effective_rope_class_b and not effective_rope_native:
@@ -500,6 +547,36 @@ def resolve_model_numerical_program(
             sparse_mla_backend="auto",
         )
 
+    if _is_exact_qwen3_dense(config):
+        requirements = {
+            "attn_implementation": (attn_implementation, "flash_attention_4"),
+            "lm_head_fp32": (lm_head_fp32, True),
+            "rmsnorm_mode": (rmsnorm_mode, "sglang_fused"),
+            "activation_native": (activation_native, False),
+        }
+        incompatible = [
+            f"{name}={requested!r} (requires {required!r})"
+            for name, (requested, required) in requirements.items()
+            if requested is not None and requested != required
+        ]
+        if incompatible:
+            raise ValueError(
+                "Exact Qwen3-8B server training rejects incompatible numerical overrides: " + ", ".join(incompatible)
+            )
+        return ResolvedModelNumericalProgram(
+            attn_implementation="flash_attention_4",
+            router_fp32=True,
+            lm_head_fp32=True,
+            rmsnorm_mode="sglang_fused",
+            qwen35_rmsnorm_family=None,
+            activation_native=False,
+            rope_native=True,
+            rope_class_b=effective_rope_class_b,
+            attention_cast_bf16=False,
+            sparse_mla_enabled=False,
+            sparse_mla_backend="auto",
+        )
+
     if not _is_exact_glm52(config):
         if qwen35_rmsnorm_family is not None:
             raise ValueError(
@@ -564,6 +641,10 @@ def resolve_cross_entropy_mode(config: PretrainedConfig, ce_mode: Optional[str])
     if _is_exact_qwen35(config):
         if ce_mode not in (None, "bi_fused"):
             raise ValueError(f"Exact Qwen3.5-family server training requires ce_mode='bi_fused'; received {ce_mode!r}")
+        return "bi_fused"
+    if _is_exact_qwen3_dense(config):
+        if ce_mode not in (None, "bi_fused"):
+            raise ValueError(f"Exact Qwen3-8B server training requires ce_mode='bi_fused'; received {ce_mode!r}")
         return "bi_fused"
     if not _is_exact_glm52(config):
         return ce_mode or "compiled"
@@ -645,7 +726,13 @@ def build_foundation_model(
         "qwen3_5_moe_text",
     }
     config._qwen35_exact_contract = bool(server_training and qwen35_model_type)
+    config._qwen3_dense_exact_contract = bool(
+        server_training
+        and getattr(config, "model_type", None) == "qwen3"
+        and "Qwen3ForCausalLM" in _get_architectures(config)
+    )
     _validate_exact_qwen35_model_scope(config)
+    _validate_exact_qwen3_dense_model_scope(config)
     _validate_exact_qwen35_moe_program(
         config,
         moe_implementation=moe_implementation,
@@ -692,6 +779,10 @@ def build_foundation_model(
         logger.info_rank0(
             "Exact Qwen3.5-family server-training numerical program "
             f"(Class-B RoPE, RMSNorm {numerical_program.qwen35_rmsnorm_family}): {numerical_program}"
+        )
+    elif config._qwen3_dense_exact_contract:
+        logger.info_rank0(
+            f"Exact Qwen3-8B server-training numerical program (Class-B RoPE, RMSNorm families-v2): {numerical_program}"
         )
 
     if moe_implementation is not None:
@@ -870,5 +961,18 @@ def build_foundation_model(
     # Set the real implementation name so our model code dispatches correctly
     # via ATTENTION_FUNCTIONS (not HF's ALL_ATTENTION_FUNCTIONS).
     model.config._attn_implementation = attn_implementation
+
+    if config._qwen3_dense_exact_contract:
+        from xorl.ops.batch_invariant_ops import (  # noqa: PLC0415
+            wrap_trunk_linears_batch_invariant,
+        )
+        from xorl.ops.bi_families_v2 import (  # noqa: PLC0415
+            _select_qwen3_dense_families_v2,
+        )
+
+        _select_qwen3_dense_families_v2()
+        wrapped = wrap_trunk_linears_batch_invariant(model)
+        if not wrapped:
+            raise RuntimeError("Exact Qwen3-8B model construction produced no batch-invariant trunk linears")
 
     return model

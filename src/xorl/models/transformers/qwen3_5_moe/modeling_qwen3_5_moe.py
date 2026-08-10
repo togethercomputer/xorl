@@ -81,7 +81,10 @@ class Qwen3_5MoeMLP(nn.Module):
         self.gate_up_proj = nn.Linear(self.hidden_size, 2 * self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
-        self._use_fused_silu = config.hidden_act == "silu" and not getattr(config, "_activation_native", False)
+        activation_native = getattr(config, "_activation_native", False)
+        if getattr(config, "_qwen35_exact_contract", False):
+            activation_native = False
+        self._use_fused_silu = config.hidden_act == "silu" and not activation_native
 
     def unfuse_for_tp(self):
         device = self.gate_up_proj.weight.device
