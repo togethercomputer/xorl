@@ -1,0 +1,51 @@
+model:
+  model_path: Qwen/Qwen3-235B-A22B
+  tokenizer_path: Qwen/Qwen3-235B-A22B
+  attn_implementation: flash_attention_3
+  moe_implementation: quack
+  ep_dispatch: deepep
+  deepep_buffer_size_gb: 2.0
+  deepep_num_sms: 24
+  deepep_async_combine: false
+data:
+  datasets:
+  - path: dummy
+    type: tokenized
+    max_seq_len: 4096
+  select_columns:
+  - input_ids
+  - labels
+  sample_packing_method: sequential
+  sample_packing_sequence_len: 4096
+  dataloader_num_workers: 0
+  dataloader_pin_memory: false
+  pad_to_multiple_of: 128
+train:
+  output_dir: outputs/xorl-sim/qwen3_235b_a22b_2k_4node_ep8
+  data_parallel_mode: fsdp2
+  data_parallel_replicate_size: 1
+  data_parallel_shard_size: 32
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  ulysses_parallel_size: 1
+  ringattn_parallel_size: 1
+  expert_parallel_size: 8
+  micro_batch_size: 1
+  gradient_accumulation_steps: 1
+  optimizer: muon
+  optimizer_dtype: bf16
+  muon_momentum: 0.95
+  enable_mixed_precision: true
+  skip_param_upcast: true
+  fsdp_reduce_dtype: fp32
+  ce_mode: quack_linear
+  enable_gradient_checkpointing: true
+  gradient_checkpointing_method: recompute_before_dispatch
+  enable_full_shard: true
+  init_device: meta
+  max_steps: 8
+  save_steps: 0
+  save_epochs: 0
+  save_hf_weights: false
+  log_format: structured
+  use_wandb: false

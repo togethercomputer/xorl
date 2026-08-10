@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "name": "qwen3_6_35b_a3b",
+  "model": "Qwen/Qwen3.6-35B-A3B",
+  "description": "Portable Qwen3.6-35B 8k throughput, allocator-pressure, and static-K3 calibration pack.",
+  "captured_at": "2026-05-20",
+  "hardware": "32 NVIDIA H100 GPUs",
+  "balanced_routing": true,
+  "default_config": "configs/qwen3_6_35b_a3b_8k_4node_ep8_mbs8_fullrecompute_deepep.yaml",
+  "configs": [
+    "configs/qwen3_6_35b_a3b_8k_4node_ep8_mbs8_fullrecompute_deepep.yaml"
+  ],
+  "results": [
+    "results/qwen36_static_k3_summary_20260519.json"
+  ],
+  "golden": {
+    "behavior_point_count": 3,
+    "world_size": 32,
+    "global_batch_size": 256,
+    "default_tokens_per_sec": 261000.0,
+    "best_raw_tokens_per_sec": 261000.0,
+    "best_promotable_tokens_per_sec": null,
+    "analytic_peak_floor_gb": 18.14
+  },
+  "limitations": [
+    "The measurements use synthetic packed data and balanced routing.",
+    "The fastest recorded path fails its matching static K3 gate and is not promotable."
+  ]
+}
