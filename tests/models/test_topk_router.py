@@ -376,6 +376,19 @@ def test_routed_scaling_factor_rejected_on_softmax_path():
 # ---------------------------------------------------------------------------
 
 
+def test_from_config_reads_v4_fields():
+    """from_config picks up sqrtsoftplus + noaux_tc + scaling_factor from a V4 config."""
+    from xorl.models.transformers.deepseek_v4 import DeepseekV4Config  # noqa: PLC0415
+
+    cfg = DeepseekV4Config()
+    router = TopKRouter.from_config(cfg)
+    assert router.scoring_func == "sqrtsoftplus"
+    assert router.topk_method == "noaux_tc"
+    assert router.routed_scaling_factor == cfg.routed_scaling_factor
+    assert router.top_k == cfg.num_experts_per_tok
+    assert router.num_experts == cfg.n_routed_experts
+
+
 def test_from_config_legacy_softmax():
     """Legacy non-V4 configs land on the softmax path."""
 

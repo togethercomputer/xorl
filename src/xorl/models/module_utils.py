@@ -343,6 +343,8 @@ def _normalize_checkpoint_key_for_filter(key: str) -> Optional[str]:
         return None
     if key.startswith("model.language_model.model."):
         return "model." + key.removeprefix("model.language_model.model.")
+    if key.startswith("model.language_model.lm_head."):
+        return "lm_head." + key.removeprefix("model.language_model.lm_head.")
     if key.startswith("model.language_model."):
         return "model." + key.removeprefix("model.language_model.")
     if key.startswith("language_model."):

@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from xorl.distributed.torch_parallelize import build_parallelize_model
 from xorl.models.auto import build_foundation_model
 from xorl.models.transformers.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 from xorl.models.transformers.deepseek_v3.modeling_deepseek_v3 import DeepseekV3ForCausalLM
@@ -103,3 +104,23 @@ def test_validate_deepseek_v3_tensor_parallelism_rejects_tp(monkeypatch):
 
     with pytest.raises(ValueError, match="tensor parallelism is not supported yet"):
         validate_deepseek_v3_tensor_parallelism(_tiny_config())
+
+
+def test_build_parallelize_model_preserves_deepseek_tp_guard(monkeypatch):
+    model = DeepseekV3ForCausalLM(_tiny_config())
+    monkeypatch.setattr(
+        "xorl.distributed.torch_parallelize.get_parallel_state",
+        lambda: SimpleNamespace(fsdp_enabled=False, tp_enabled=True),
+    )
+    monkeypatch.setattr(
+        "xorl.models.transformers.deepseek_v3.support.get_parallel_state",
+        lambda: SimpleNamespace(tp_enabled=True),
+    )
+
+    with pytest.raises(ValueError, match="tensor parallelism is not supported yet"):
+        build_parallelize_model(
+            model,
+            init_device="cuda",
+            enable_mixed_precision=False,
+            enable_gradient_checkpointing=False,
+        )
