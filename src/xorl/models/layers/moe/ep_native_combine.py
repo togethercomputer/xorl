@@ -1,12 +1,10 @@
-"""Native-EP ordered combine for the exact Qwen3.5-MoE program.
+"""Native-EP canonical combine for the exact Qwen3.5-MoE program.
 
 The TRAINING half of the EP<n>/a2a-none BI-ops serving pairing: serving computes,
 on every rank, its contiguous expert slice's weighted contribution for ALL tokens
-plus a TP slice of the shared expert, adds them in bf16, and all-reduces — and
-NCCL's tree all-reduce over n intranode ranks is bitwise a SEQUENTIAL bf16 chain
-sum in rank order (n-1) -> 0 (identified against captured per-rank partials; see
-the exact-path component tests). The contributor order is part of the exact
-Qwen3.5 numerical program.
+plus a TP slice of the shared expert, adds them in bf16, transports the raw
+partials, and applies the version-1 adjacent-pair BF16 fold. Logical expert-slice
+identity, rather than collective history, determines the contributor order.
 
 The trainer mirrors this on its real EP group (trainer EP gives rank r exactly
 serving-rank-r's contiguous expert slice):
@@ -17,16 +15,16 @@ serving-rank-r's contiguous expert slice):
    shared-expert TP slice (trainable BI GEMMs and torch-native bf16 silu*mul),
    joined with the routed partial by serving's fused gate/sigmoid/mul/add;
 3. partials are exchanged RAW (all-to-all) — NEVER via an NCCL-summed
-   collective (the sum order must stay ours) — and every rank chain-sums its
-   own tokens' n partials locally in bf16, serving rank order (n-1) -> 0;
+   collective (the fold order must stay ours) — and every rank applies the
+   shared adjacent-pair BF16 tree to its own tokens' logical contributions;
 4. backward reverses the exchange (grad all-to-all), then the masked backward
    per rank. Grad REDUCTIONS (reduce-scatter of d(x), DP grad sync) stay stock
    NCCL — only forward bits are contracted.
 
 The exact Qwen3.5-MoE model path selects this combine structurally when trainer
-EP is active. EP8 is the admitted topology because it is the topology whose
-serving reduction was captured; a different contributor count is a different
-numerical program and is rejected before collectives begin.
+EP is active. EP8 remains the only admitted Qwen topology; other contributor
+counts require their own end-to-end topology qualification even though the
+shared arithmetic primitive admits them.
 """
 
 from __future__ import annotations
@@ -42,7 +40,7 @@ def validate_qwen35_native_ep_combine_size(ep_size: int) -> None:
     """Reject contributor counts not validated against Qwen serving."""
     if ep_size not in QWEN35_NATIVE_EP_COMBINE_SIZES:
         raise ValueError(
-            f"Qwen3.5-MoE exact ordered combine requires EP8 (expert_parallel_size=8); received {ep_size}. "
+            f"Qwen3.5-MoE canonical combine requires EP8 (expert_parallel_size=8); received {ep_size}. "
             "A different EP size requires a serving capture and a new "
             "byte-exact reduction-order validation."
         )
@@ -103,7 +101,7 @@ def gather_tokens_for_ep_combine(x: torch.Tensor, group, padded_rows: int | None
     Dispatcher DP slices can contain different packed sequence lengths. Native
     EP still needs every expert rank to see every slice, so shorter ranks are
     padded to the negotiated maximum before the equal-count NCCL gather. The
-    caller slices the final chain-summed result back to its original row count.
+    caller slices the final folded result back to its original row count.
     """
     if padded_rows is None:
         padded_rows = max_rows_for_ep_combine(x.shape[0], x.device, group)
@@ -178,20 +176,25 @@ def sglang_fused_gate_sigmoid_mul_add(
     return _SGLangFusedGateSigmoidMulAdd.apply(hidden_states, gate_weight, shared_output, routed_output)
 
 
-def exchange_and_chain_sum(partial: torch.Tensor, group, ep_size: int) -> torch.Tensor:
-    """RAW partial exchange + the serving-order bf16 chain sum.
+def exchange_and_canonical_fold(partial: torch.Tensor, group, ep_size: int) -> torch.Tensor:
+    """RAW partial exchange followed by the version-1 canonical BF16 fold.
 
     ``partial`` is this rank's [n*T, H] contribution for ALL gathered tokens.
     The all-to-all hands rank r the n per-rank partials for ITS OWN T rows;
-    the chain then sums them SEQUENTIALLY in serving rank order (n-1) -> 0 —
-    bitwise NCCL's intranode tree all-reduce (the K3 contract; never replace
-    with a summed collective or a stacked .sum()).
+    group-rank order is also Qwen's logical expert-slice ordinal order, so the
+    shared fold consumes the reshaped arrivals directly.
     """
+    from xorl.distributed.canonical_moe import canonical_moe_fold_v1  # noqa: PLC0415
     from xorl.distributed.moe.comm import _AllToAll  # noqa: PLC0415
 
+    validate_qwen35_native_ep_combine_size(ep_size)
+    if partial.ndim < 2:
+        raise ValueError("Qwen3.5-MoE canonical combine requires row and payload dimensions")
+    if partial.dtype is not torch.bfloat16:
+        raise TypeError("Qwen3.5-MoE canonical combine requires BF16 partials")
+    if partial.shape[0] % ep_size:
+        raise ValueError("Qwen3.5-MoE canonical combine rows must be divisible by EP size")
     exchanged = _AllToAll.apply(group, partial.contiguous(), None, None)  # [n*T, H], segment s from rank s
     rows = exchanged.shape[0] // ep_size
-    acc = exchanged[(ep_size - 1) * rows : ep_size * rows]
-    for s in range(ep_size - 2, -1, -1):
-        acc = acc + exchanged[s * rows : (s + 1) * rows]
-    return acc
+    logical_sources = exchanged.reshape(ep_size, rows, *exchanged.shape[1:])
+    return canonical_moe_fold_v1(logical_sources)

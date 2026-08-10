@@ -8,6 +8,7 @@ import torch.distributed as dist
 from distributed_utils import run_distributed_script
 
 from xorl.distributed.canonical_moe import (
+    CANONICAL_MOE_FOLD_VERSION,
     CANONICAL_MOE_REDUCE_VERSION,
     CanonicalMoEGraphMetadata,
     CanonicalMoETransport,
@@ -15,6 +16,7 @@ from xorl.distributed.canonical_moe import (
     OutputDistribution,
     ParallelPlan,
     ParallelRole,
+    canonical_moe_fold_v1,
     canonical_moe_reduce_cp_sharded_v3,
     canonical_moe_reduce_packed_ep16_v2,
     canonical_moe_reduce_reference,
@@ -37,6 +39,7 @@ def _explicit_tree(partials: torch.Tensor) -> torch.Tensor:
 @pytest.mark.cpu
 @pytest.mark.parametrize("contributors", [2, 4, 8, 16])
 def test_reference_is_the_adjacent_bf16_tree(contributors: int):
+    assert CANONICAL_MOE_FOLD_VERSION == "canonical_moe_fold_v1"
     rows = contributors + 2
     values = torch.zeros((contributors, rows, 3), dtype=torch.bfloat16)
     adversarial = torch.tensor(
@@ -59,6 +62,7 @@ def test_reference_is_the_adjacent_bf16_tree(contributors: int):
     expected = _explicit_tree(padded)
     expected[~metadata.valid_mask] = 0
     assert torch.equal(result, expected)
+    assert torch.equal(canonical_moe_fold_v1(padded), _explicit_tree(padded))
 
 
 @pytest.mark.cpu

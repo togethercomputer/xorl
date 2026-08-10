@@ -25,6 +25,7 @@ import torch.distributed as dist
 
 
 CANONICAL_MOE_REDUCE_VERSION = "canonical_moe_reduce_v1"
+CANONICAL_MOE_FOLD_VERSION = "canonical_moe_fold_v1"
 CANONICAL_MOE_PACKED_EP16_TRANSPORT_VERSION = "packed_ep16_v2"
 CANONICAL_MOE_CP_SHARDED_TRANSPORT_VERSION = "cp_sharded_v3"
 GLM52_NUM_LAYERS = 78
@@ -521,16 +522,26 @@ def _validate_runtime_plan(
     )
 
 
-def _adjacent_pairwise_bf16(partials: torch.Tensor) -> torch.Tensor:
-    """Evaluate the version-1 balanced tree over logical contributor axis 0."""
-    if partials.dtype is not torch.bfloat16:
-        raise TypeError("Pairwise canonical MoE arithmetic requires BF16 inputs")
-    if partials.shape[0] not in (2, 4, 8, 16):
-        raise ValueError("Pairwise canonical MoE arithmetic admits 2, 4, 8, or 16 contributors")
+def canonical_moe_fold_v1(partials_by_logical_ordinal: torch.Tensor) -> torch.Tensor:
+    """Evaluate the version-1 BF16 tree over logical contributor axis 0.
 
-    level = [partials[index] for index in range(partials.shape[0])]
-    while len(level) > 1:
-        level = [(level[index] + level[index + 1]).to(torch.bfloat16) for index in range(0, len(level), 2)]
+    Transport must put contributor ``C_i`` at index ``i`` before calling this
+    primitive. Every adjacent-pair level is a separate BF16 tensor addition,
+    so each internal tree node rounds to BF16 before the next level consumes
+    it. The operation is intentionally independent of model family and row
+    placement.
+    """
+    if partials_by_logical_ordinal.ndim < 2:
+        raise ValueError("Canonical MoE fold requires contributor and payload dimensions")
+    partials = partials_by_logical_ordinal
+    if partials.dtype is not torch.bfloat16:
+        raise TypeError("Canonical MoE fold requires BF16 inputs")
+    if partials.shape[0] not in (2, 4, 8, 16):
+        raise ValueError("Canonical MoE fold admits 2, 4, 8, or 16 contributors")
+
+    level = partials
+    while level.shape[0] > 1:
+        level = (level[0::2] + level[1::2]).to(torch.bfloat16)
     return level[0]
 
 
@@ -543,7 +554,7 @@ def canonical_moe_reduce_reference(
         raise ValueError("Reference partials must have contributor, row, and payload dimensions")
     if partials_by_logical_ordinal.shape[1] != metadata.capacity:
         raise ValueError("Reference partial row count must equal metadata capacity")
-    result = _adjacent_pairwise_bf16(partials_by_logical_ordinal)
+    result = canonical_moe_fold_v1(partials_by_logical_ordinal)
     return torch.where(
         metadata.valid_mask.view(-1, *([1] * (result.ndim - 1))),
         result,
@@ -593,7 +604,7 @@ def _transport_and_fold(
             physical_sources = receive.view(contributor_count, rows, *payload_shape)
             source_group_order = torch.tensor(logical_to_group, dtype=torch.long, device=chunk.device)
             logical_sources = physical_sources.index_select(0, source_group_order)
-            folded = _adjacent_pairwise_bf16(logical_sources)
+            folded = canonical_moe_fold_v1(logical_sources)
         elif transport is CanonicalMoETransport.PACKED_EP16_V2:
             if contributor_count != 16:
                 raise ValueError("packed_ep16_v2 requires exactly 16 logical contributors")
@@ -628,7 +639,7 @@ def _transport_and_fold(
             physical_sources = receive.view(contributor_count, packed_rows, *payload_shape)
             source_group_order = torch.tensor(logical_to_group, dtype=torch.long, device=chunk.device)
             logical_sources = physical_sources.index_select(0, source_group_order)
-            packed_folded = _adjacent_pairwise_bf16(logical_sources)
+            packed_folded = canonical_moe_fold_v1(logical_sources)
         else:
             raise ValueError(f"Unknown canonical MoE transport: {transport}")
 
@@ -747,7 +758,7 @@ class _CanonicalMoECPShardedV3(torch.autograd.Function):
         # contributor order before the first floating-point operation.
         logical_to_group = torch.tensor(runtime.logical_to_group_rank, dtype=torch.long, device=receive.device)
         logical_sources = receive.index_select(0, logical_to_group)
-        folded = _adjacent_pairwise_bf16(logical_sources)
+        folded = canonical_moe_fold_v1(logical_sources)
         local_valid = full_valid[runtime.local_group_rank]
         output = torch.where(
             local_valid.view(-1, *([1] * len(payload_shape))),
@@ -962,8 +973,9 @@ def canonical_moe_reduce_cp_sharded_v3(
 
 
 __all__ = [
-    "CANONICAL_MOE_PACKED_EP16_TRANSPORT_VERSION",
     "CANONICAL_MOE_CP_SHARDED_TRANSPORT_VERSION",
+    "CANONICAL_MOE_FOLD_VERSION",
+    "CANONICAL_MOE_PACKED_EP16_TRANSPORT_VERSION",
     "CANONICAL_MOE_REDUCE_VERSION",
     "CanonicalMoEGraphMetadata",
     "CanonicalMoEOutput",
@@ -974,6 +986,7 @@ __all__ = [
     "OutputDistribution",
     "ParallelPlan",
     "ParallelRole",
+    "canonical_moe_fold_v1",
     "canonical_moe_reduce_reference",
     "canonical_moe_reduce_packed_ep16_v2",
     "canonical_moe_reduce_cp_sharded_v3",

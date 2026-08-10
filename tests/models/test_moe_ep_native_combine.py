@@ -5,6 +5,7 @@ import torch
 
 from xorl.models.layers.moe.ep_native_combine import (
     QWEN35_NATIVE_EP_COMBINE_SIZES,
+    exchange_and_canonical_fold,
     gather_ids_for_ep_combine,
     gather_tokens_for_ep_combine,
     max_rows_for_ep_combine,
@@ -22,6 +23,64 @@ def test_qwen35_native_combine_admits_only_ep8():
     for size in (1, 2, 4, 16):
         with pytest.raises(ValueError, match="EP8"):
             validate_qwen35_native_ep_combine_size(size)
+
+
+def test_qwen35_exchange_uses_canonical_tree_and_preserves_backward(monkeypatch):
+    from xorl.distributed.moe.comm import _AllToAll  # noqa: PLC0415
+
+    monkeypatch.setattr(
+        _AllToAll,
+        "apply",
+        staticmethod(lambda _group, partial, _out_splits, _in_splits: partial),
+    )
+    contributors = torch.tensor(
+        [4096.0, -4096.0, 1.0, 1.0, 0.5, -0.5, 2.0, -2.0],
+        dtype=torch.bfloat16,
+    ).view(8, 1, 1)
+    leaf = contributors.expand(8, 3, 2).clone()
+    leaf[:, -1].zero_()  # deterministic padded row
+    leaf.requires_grad_(True)
+
+    result = exchange_and_canonical_fold(leaf.reshape(24, 2), group=None, ep_size=8)
+
+    level = leaf
+    while level.shape[0] > 1:
+        level = (level[0::2] + level[1::2]).bfloat16()
+    expected = level[0]
+    legacy = leaf[-1]
+    for ordinal in range(6, -1, -1):
+        legacy = legacy + leaf[ordinal]
+    assert torch.equal(result, expected)
+    assert not torch.equal(result[0], legacy[0])
+    assert torch.equal(result[-1], torch.zeros_like(result[-1]))
+
+    result.float().sum().backward()
+    assert leaf.grad is not None
+    assert torch.equal(leaf.grad, torch.ones_like(leaf.grad))
+
+
+@pytest.mark.parametrize(
+    ("partial", "ep_size", "message"),
+    [
+        (torch.zeros((16, 2), dtype=torch.float32), 8, "BF16"),
+        (torch.zeros((15, 2), dtype=torch.bfloat16), 8, "divisible"),
+        (torch.zeros((16, 2), dtype=torch.bfloat16), 4, "EP8"),
+    ],
+)
+def test_qwen35_exchange_fails_closed_before_transport(monkeypatch, partial, ep_size, message):
+    from xorl.distributed.moe.comm import _AllToAll  # noqa: PLC0415
+
+    called = False
+
+    def unexpected_transport(*_args):
+        nonlocal called
+        called = True
+        raise AssertionError("transport must not run")
+
+    monkeypatch.setattr(_AllToAll, "apply", staticmethod(unexpected_transport))
+    with pytest.raises((TypeError, ValueError), match=message):
+        exchange_and_canonical_fold(partial, group=None, ep_size=ep_size)
+    assert not called
 
 
 def _qwen_block(*, exact: bool = False):
@@ -195,7 +254,7 @@ def test_native_combine_captures_actual_operands(monkeypatch):
     monkeypatch.setattr(combine, "max_rows_for_ep_combine", lambda rows, _device, _group: rows)
     monkeypatch.setattr(combine, "gather_tokens_for_ep_combine", lambda value, _group, _rows: value)
     monkeypatch.setattr(combine, "gather_ids_for_ep_combine", lambda value, _group, _rows: value)
-    monkeypatch.setattr(combine, "exchange_and_chain_sum", lambda value, _group, _size: value)
+    monkeypatch.setattr(combine, "exchange_and_canonical_fold", lambda value, _group, _size: value)
     monkeypatch.setattr(
         combine,
         "sglang_fused_gate_sigmoid_mul_add",
