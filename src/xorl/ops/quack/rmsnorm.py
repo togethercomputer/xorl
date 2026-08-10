@@ -1,21 +1,36 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 
 import math
-from functools import partial
 from typing import Optional, Tuple, Type
+from functools import partial
 
 import cuda.bindings.driver as cuda
+
 import cutlass
 import cutlass.cute as cute
-import torch
 from cutlass import Float32, Int32, const_expr
+
+import torch
 from torch import Tensor
 
-from . import copy_utils, layout_utils, utils
+from . import utils as utils
+from . import copy_utils as copy_utils
+from . import layout_utils as layout_utils
 from .compile_utils import make_fake_tensor as fake_tensor
-from .cute_dsl_utils import torch2cute_dtype_map
 from .reduce import row_reduce
 from .reduction_base import ReductionBase
+from .cache_utils import jit_cache
+from .cute_dsl_utils import torch2cute_dtype_map
+from cutlass.base_dsl.arch import Arch
+
+
+def _ensure_contiguous(t):
+    """Ensure last-dim stride is 1. Under torch.compile use unconditional .contiguous()
+    (dynamo can't inspect strides on fake tensors); otherwise check first to avoid copies.
+    """
+    if torch.compiler.is_compiling():
+        return t.contiguous()
+    return t if t.stride(-1) == 1 else t.contiguous()
 
 
 class RMSNorm(ReductionBase):
@@ -33,10 +48,20 @@ class RMSNorm(ReductionBase):
         return 256
 
     def _set_cluster_n(self):
+        arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
+        # SM8x (Ampere/Ada) lacks cluster support
+        if arch < Arch.sm_90:
+            self.cluster_n = 1
+            return
+        # SM12x supports cluster up to 8
+        max_cluster = 8 if arch.major == 12 else 16
         N = self.N
         # cluster_n = 4 is faster and cluster_n = 2 for N=64k for some reason
         # Similarly cluster_n = 8 is faster for N=128k
-        if const_expr(self.dtype.width == 16):
+        if arch.major == 12 and const_expr(self.dtype.width >= 32):
+            # SM12x 99 KB SMEM: fp32 needs tighter clustering (conservative for residual case)
+            thresholds = [(8 * 1024, 1), (16 * 1024, 2), (32 * 1024, 4), (64 * 1024, 8)]
+        elif const_expr(self.dtype.width == 16):
             thresholds = [(16 * 1024, 1), (32 * 1024, 2), (64 * 1024, 4), (128 * 1024, 8)]
         else:
             thresholds = [(32 * 1024, 1), (64 * 1024, 2), (128 * 1024, 4), (256 * 1024, 8)]
@@ -44,16 +69,16 @@ class RMSNorm(ReductionBase):
             if N <= limit:
                 self.cluster_n = cluster
                 return
-        self.cluster_n = 16
+        self.cluster_n = max_cluster
 
     @cute.jit
     def __call__(
         self,
-        mX: cute.Tensor,
-        mW: Optional[cute.Tensor],
-        mB: Optional[cute.Tensor],
-        mRes: Optional[cute.Tensor],
-        mO: cute.Tensor,
+        mX: cute.Tensor,  # (b, N) or (b, H, N)
+        mW: Optional[cute.Tensor],  # (N,) or (H, N)
+        mB: Optional[cute.Tensor],  # (N,) or (H, N)
+        mRes: Optional[cute.Tensor],  # (b, N) or (b, H, N)
+        mO: cute.Tensor,  # (b, N) or (b, H, N)
         mResO: Optional[cute.Tensor],
         mRstd: Optional[cute.Tensor],
         mMean: Optional[cute.Tensor],
@@ -69,13 +94,20 @@ class RMSNorm(ReductionBase):
         tiled_copy, tiler_mn, threads_per_row = self._get_tiled_copy(vecsize=vecsize)
         num_threads = tiled_copy.size
         mW, mB = [
-            layout_utils.expand(mT, dim=0, size=tiler_mn[0]) if const_expr(mT is not None) else None for mT in (mW, mB)
+            layout_utils.expand(mT, dim=0, size=tiler_mn[0]) if const_expr(mT is not None) else None
+            for mT in (mW, mB)
         ]
         mRstd, mMean = [
-            layout_utils.expand(mT, dim=1, size=self.N) if const_expr(mT is not None) else None for mT in (mRstd, mMean)
+            layout_utils.expand(mT, dim=cute.rank(mT), size=self.N)
+            if const_expr(mT is not None)
+            else None
+            for mT in (mRstd, mMean)
         ]
-        self.kernel(mX, mW, mB, mRes, mO, mResO, mRstd, mMean, eps, tiler_mn, tiled_copy, threads_per_row).launch(
-            grid=[cute.ceil_div(mX.shape[0], tiler_mn[0]), self.cluster_n, 1],
+        num_heads = mX.shape[1] if const_expr(cute.rank(mX) == 3) else 1
+        self.kernel(
+            mX, mW, mB, mRes, mO, mResO, mRstd, mMean, eps, tiler_mn, tiled_copy, threads_per_row
+        ).launch(
+            grid=[cute.ceil_div(mX.shape[0], tiler_mn[0]), self.cluster_n, num_heads],
             block=[num_threads, 1, 1],
             cluster=[1, self.cluster_n, 1] if const_expr(self.cluster_n > 1) else None,
             stream=stream,
@@ -98,12 +130,14 @@ class RMSNorm(ReductionBase):
         threads_per_row: cutlass.Constexpr[int],
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        bidx, _, _ = cute.arch.block_idx()
+        bidx, _, bidz = cute.arch.block_idx()
         cluster_y = const_expr(0) if const_expr(self.cluster_n == 1) else cute.arch.block_idx()[1]
         tv_layout = tiled_copy.layout_tv_tiled
 
         smem = cutlass.utils.SmemAllocator()
-        sX = smem.allocate_tensor(mX.element_type, cute.make_ordered_layout(tiler_mn, order=(1, 0)), byte_alignment=16)
+        sX = smem.allocate_tensor(
+            mX.element_type, cute.make_ordered_layout(tiler_mn, order=(1, 0)), byte_alignment=16
+        )
         if const_expr(mRes is not None):
             sRes = smem.allocate_tensor(
                 mRes.element_type,
@@ -112,15 +146,23 @@ class RMSNorm(ReductionBase):
             )
         reduction_buffer, mbar_ptr = self._allocate_reduction_buffer_and_mbar(smem, tv_layout)
 
-        shape = mX.shape
+        # Slice per head
+        if const_expr(cute.rank(mX) == 3):
+            mX, mW, mB, mRes, mO, mResO, mRstd, mMean = [
+                mT[None, bidz, None] if const_expr(mT is not None) else None
+                for mT in (mX, mW, mB, mRes, mO, mResO, mRstd, mMean)
+            ]
+
+        shape = (cute.size(mX, mode=[0]), cute.size(mX, mode=[1]))
         idX = cute.make_identity_tensor(shape)
-        # slice for CTAs
+        # Slice for CTAs
         gX, gRes, gO, gResO, gRstd, gMean, cX = [
             cute.local_tile(mT, tiler_mn, (bidx, cluster_y)) if mT is not None else None
             for mT in (mX, mRes, mO, mResO, mRstd, mMean, idX)
         ]
         gW, gB = [
-            cute.local_tile(mT, tiler_mn, (0, cluster_y)) if const_expr(mT is not None) else None for mT in (mW, mB)
+            cute.local_tile(mT, tiler_mn, (0, cluster_y)) if const_expr(mT is not None) else None
+            for mT in (mW, mB)
         ]
 
         thr_copy_X = tiled_copy.get_slice(tidx)
@@ -140,17 +182,21 @@ class RMSNorm(ReductionBase):
         tXcX = thr_copy_X.partition_S(cX)[(0, None), None, None]
 
         # allocate fragments for gmem->rmem
-        tXrW = cute.make_fragment_like(tXgW) if const_expr(mW is not None) else None
-        tXrB = cute.make_fragment_like(tXgB) if const_expr(mB is not None) else None
-        tXrX, tXrO = [cute.make_fragment_like(t) for t in (tXgX, tXgO)]
+        tXrW = cute.make_rmem_tensor_like(tXgW) if const_expr(mW is not None) else None
+        tXrB = cute.make_rmem_tensor_like(tXgB) if const_expr(mB is not None) else None
+        tXrX, tXrO = [cute.make_rmem_tensor_like(t) for t in (tXgX, tXgO)]
         if const_expr(mRes is not None):
-            tXrRes = cute.make_fragment_like(tXgRes)
+            tXrRes = cute.make_rmem_tensor_like(tXgRes)
 
         num_warps = cute.size(tiled_copy) // cute.arch.WARP_SIZE
         self._initialize_cluster(tidx, mbar_ptr, num_warps)
 
         is_even_N = const_expr(shape[1] == tiler_mn[1] * self.cluster_n)
-        tXpX = copy_utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1]) if not is_even_N else None
+        tXpX = (
+            copy_utils.predicate_k(thr_copy_X.partition_S(cX), limit=shape[1])
+            if not is_even_N
+            else None
+        )
         # Each copy will use the same predicate
         copy = partial(copy_utils.copy, pred=tXpX)
 
@@ -174,7 +220,7 @@ class RMSNorm(ReductionBase):
             cute.autovec_copy(tXsRes, tXrRes)
             x += tXrRes.load().to(cute.Float32)
         if const_expr(mResO is not None):
-            tXrResO = cute.make_fragment_like(tXgResO)
+            tXrResO = cute.make_rmem_tensor_like(tXgResO)
             tXrResO.store(x.to(tXrResO.element_type))
             if row < shape[0]:
                 copy(tXrResO, tXgResO)
@@ -236,7 +282,11 @@ class RMSNorm(ReductionBase):
             rstd = cute.math.rsqrt(sum_sq_x / shape[1] + eps, fastmath=True)
         if const_expr(mRstd is not None):
             # Only the thread corresponding to column 0 writes out the rstd to gmem
-            if tXcX[0][1] == 0 and row < shape[0] and (self.cluster_n == 1 or cute.arch.block_idx_in_cluster() == 0):
+            if (
+                tXcX[0][1] == 0
+                and row < shape[0]
+                and (self.cluster_n == 1 or cute.arch.block_idx_in_cluster() == 0)
+            ):
                 tXrRstd[0] = rstd
         if const_expr(self.delay_w_load):
             if const_expr(mW is not None):
@@ -288,7 +338,7 @@ def _rmsnorm_fwd(
     """RMSNorm/LayerNorm forward pass.
     Args:
         x: Input tensor of shape (M, N)
-        weight: Optional weight tensor of shape (N,)
+        weight: Optional weight tensor of shape (N,) or (H, N) for per-head weight
         eps: Small value for numerical stability
         is_layernorm: If True, compute LayerNorm instead of RMSNorm
     Returns:
@@ -302,11 +352,13 @@ def _rmsnorm_fwd(
     if residual is not None:
         assert residual.dtype in supported_types, "Residual must be float16, bfloat16, or float32"
 
-    _, N = x.shape
+    N = x.size(-1)
+    per_head = (weight is not None and weight.dim() == 2) or (bias is not None and bias.dim() == 2)
     dtype, out_dtype, weight_dtype, bias_dtype, res_dtype, res_out_dtype = [
-        torch2cute_dtype_map[t.dtype] if t is not None else None for t in [x, out, weight, bias, residual, residual_out]
+        torch2cute_dtype_map[t.dtype] if t is not None else None
+        for t in [x, out, weight, bias, residual, residual_out]
     ]
-    compile_key = (
+    _compile_rmsnorm_fwd(
         dtype,
         out_dtype,
         res_dtype,
@@ -317,35 +369,105 @@ def _rmsnorm_fwd(
         rstd is not None,
         mean is not None,
         is_layernorm,
-    )
-    if compile_key not in _rmsnorm_fwd.compile_cache:
-        batch_sym = cute.sym_int()
-        all_dtypes = [dtype, out_dtype, res_dtype, weight_dtype, bias_dtype, res_out_dtype]
-        div = math.gcd(N, *(128 // dt.width for dt in all_dtypes if dt is not None))
-        x_cute, out_cute, res_cute, res_out_cute = [
-            fake_tensor(dt, (batch_sym, N), div) for dt in [dtype, out_dtype, res_dtype, res_out_dtype]
-        ]
-        weight_cute, bias_cute = [fake_tensor(dt, (N,), div) for dt in [weight_dtype, bias_dtype]]
-        rstd_cute = fake_tensor(Float32, (batch_sym,)) if rstd is not None else None
-        mean_cute = fake_tensor(Float32, (batch_sym,)) if mean is not None else None
-        _rmsnorm_fwd.compile_cache[compile_key] = cute.compile(
-            RMSNorm(dtype, N, is_layernorm=is_layernorm),
-            x_cute,
-            weight_cute,
-            bias_cute,
-            res_cute,
-            out_cute,
-            res_out_cute,
-            rstd_cute,
-            mean_cute,
-            Float32(0),  # eps, just for compilation
-            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-            options="--enable-tvm-ffi",
+        per_head,
+    )(x, weight, bias, residual, out, residual_out, rstd, mean, eps)
+
+
+@_rmsnorm_fwd.register_fake
+def _rmsnorm_fwd_fake(
+    x: Tensor,
+    weight: Optional[Tensor],
+    out: Tensor,
+    bias: Optional[Tensor] = None,
+    rstd: Optional[Tensor] = None,
+    mean: Optional[Tensor] = None,
+    residual: Optional[Tensor] = None,
+    residual_out: Optional[Tensor] = None,
+    eps: float = 1e-6,
+    is_layernorm: bool = False,
+) -> None:
+    # See softmax.py _softmax_fwd_fake for why register_fake is needed.
+    from .cache_utils import COMPILE_ONLY
+
+    if COMPILE_ONLY and not isinstance(x.size(-1), torch.SymInt):
+        N = x.size(-1)
+        per_head = (weight is not None and weight.dim() == 2) or (
+            bias is not None and bias.dim() == 2
         )
-    _rmsnorm_fwd.compile_cache[compile_key](x, weight, bias, residual, out, residual_out, rstd, mean, eps)
+        dtype, out_dtype, weight_dtype, bias_dtype, res_dtype, res_out_dtype = [
+            torch2cute_dtype_map[t.dtype] if t is not None else None
+            for t in [x, out, weight, bias, residual, residual_out]
+        ]
+        _compile_rmsnorm_fwd(
+            dtype,
+            out_dtype,
+            res_dtype,
+            weight_dtype,
+            bias_dtype,
+            res_out_dtype,
+            N,
+            rstd is not None,
+            mean is not None,
+            is_layernorm,
+            per_head,
+        )
+        _compile_rmsnorm_bwd(
+            N,
+            dtype,
+            dtype,
+            dtype,
+            weight_dtype,
+            bias is not None,
+            res_dtype,
+            res_out_dtype,
+            weight is not None,
+            per_head,
+        )
 
 
-_rmsnorm_fwd.compile_cache = {}
+@jit_cache
+def _compile_rmsnorm_fwd(
+    dtype,
+    out_dtype,
+    res_dtype,
+    weight_dtype,
+    bias_dtype,
+    res_out_dtype,
+    N,
+    has_rstd,
+    has_mean,
+    is_layernorm,
+    per_head,
+):
+    batch_sym = cute.sym_int()
+    head_sym = cute.sym_int() if per_head else None
+    batch_shape = (batch_sym, head_sym) if per_head else (batch_sym,)
+    all_dtypes = [dtype, out_dtype, res_dtype, weight_dtype, bias_dtype, res_out_dtype]
+    div = math.gcd(N, *(128 // dt.width for dt in all_dtypes if dt is not None))
+    x_cute, out_cute, res_cute, res_out_cute = [
+        fake_tensor(dt, (*batch_shape, N), div)
+        for dt in [dtype, out_dtype, res_dtype, res_out_dtype]
+    ]
+    weight_shape = (head_sym, N) if per_head else (N,)
+    weight_cute, bias_cute = [
+        fake_tensor(dt, weight_shape, div) for dt in [weight_dtype, bias_dtype]
+    ]
+    rstd_cute = fake_tensor(Float32, batch_shape) if has_rstd else None
+    mean_cute = fake_tensor(Float32, batch_shape) if has_mean else None
+    return cute.compile(
+        RMSNorm(dtype, N, is_layernorm=is_layernorm),
+        x_cute,
+        weight_cute,
+        bias_cute,
+        res_cute,
+        out_cute,
+        res_out_cute,
+        rstd_cute,
+        mean_cute,
+        Float32(0),  # eps, just for compilation
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
 
 
 def rmsnorm_fwd(
@@ -363,14 +485,17 @@ def rmsnorm_fwd(
     # so that _layer_norm_fwd_impl doesn't have to return them.
     out_dtype = x.dtype if out_dtype is None else out_dtype
     out = torch.empty_like(x, dtype=out_dtype)
-    rstd = torch.empty(x.shape[0], device=x.device, dtype=torch.float32) if store_rstd else None
-    if residual is not None:
+    rstd = torch.empty(*x.shape[:-1], device=x.device, dtype=torch.float32) if store_rstd else None
+    if residual is not None and residual_dtype is None:
         residual_dtype = residual.dtype
     if residual is not None or (residual_dtype is not None and residual_dtype != x.dtype):
-        residual_out = torch.empty_like(x, dtype=residual_dtype if residual_dtype is not None else x.dtype)
+        residual_out = torch.empty_like(
+            x, dtype=residual_dtype if residual_dtype is not None else x.dtype
+        )
     else:
         residual_out = None
-    _rmsnorm_fwd(x, weight, out, bias, rstd, None, residual, residual_out, eps, False)
+    if x.numel() > 0:
+        _rmsnorm_fwd(x, weight, out, bias, rstd, None, residual, residual_out, eps, False)
     # residual_out is None if residual is None and residual_dtype == input_dtype and dropout_p == 0.0
     if residual_out is None:
         residual_out = x
@@ -381,7 +506,7 @@ def rmsnorm_ref(x, w=None, bias=None, residual=None, eps=1e-6):
     x_f32 = x.float()
     if residual is not None:
         residual_f32 = residual.float()
-        x_f32 += residual_f32
+        x_f32 = x_f32 + residual_f32
     x_norm = x_f32 / (torch.sqrt(torch.mean(x_f32.square(), dim=-1, keepdim=True) + eps))
     out = x_norm * w if w is not None else x_norm
     if bias is not None:
@@ -431,12 +556,24 @@ class RMSNormBackward(ReductionBase):
         return 256
 
     def _set_cluster_n(self):
+        arch = cutlass.base_dsl.BaseDSL._get_dsl().get_arch_enum()
+        # SM8x (Ampere/Ada) lacks cluster support
+        if arch < Arch.sm_90:
+            self.cluster_n = 1
+            return
+        # SM12x supports cluster up to 8
+        max_cluster = 8 if arch.major == 12 else 16
         N = self.N
-        for limit, cluster in [(8 * 1024, 1), (16 * 1024, 2), (32 * 1024, 4), (64 * 1024, 8)]:
+        if arch.major == 12 and const_expr(self.dtype.width >= 32):
+            # SM12x 99 KB SMEM: fp32 bwd double-buffers 2 tensors, needs much tighter clustering
+            thresholds = [(1024, 1), (8 * 1024, 2), (16 * 1024, 4), (32 * 1024, 8)]
+        else:
+            thresholds = [(8 * 1024, 1), (16 * 1024, 2), (32 * 1024, 4), (64 * 1024, 8)]
+        for limit, cluster in thresholds:
             if N <= limit:
                 self.cluster_n = cluster
                 return
-        self.cluster_n = 16
+        self.cluster_n = max_cluster
 
     @cute.jit
     def __call__(
@@ -461,10 +598,15 @@ class RMSNormBackward(ReductionBase):
         vecsize = math.gcd(self.N, 128 // largest_dtype_width)
         tiled_copy, tiler_mn, threads_per_row = self._get_tiled_copy(vecsize=vecsize)
         num_threads = tiled_copy.size
-        mW = layout_utils.expand(mW, dim=0, size=tiler_mn[0]) if const_expr(mW is not None) else None
+        mW = (
+            layout_utils.expand(mW, dim=0, size=tiler_mn[0]) if const_expr(mW is not None) else None
+        )
         num_blocks = sm_count
-        self.kernel(mX, mW, mdO, mdResO, mRstd, mdX, mdW, mdB, mdRes, tiler_mn, tiled_copy, threads_per_row).launch(
-            grid=[num_blocks, self.cluster_n, 1],
+        num_heads = mX.shape[1] if const_expr(cute.rank(mX) == 3) else 1
+        self.kernel(
+            mX, mW, mdO, mdResO, mRstd, mdX, mdW, mdB, mdRes, tiler_mn, tiled_copy, threads_per_row
+        ).launch(
+            grid=[num_blocks, self.cluster_n, num_heads],
             block=[num_threads, 1, 1],
             cluster=[1, self.cluster_n, 1] if self.cluster_n > 1 else None,
             stream=stream,
@@ -487,10 +629,18 @@ class RMSNormBackward(ReductionBase):
         threads_per_row: cutlass.Constexpr[int],
     ):
         tidx, _, _ = cute.arch.thread_idx()
-        bidx_start, _, _ = cute.arch.block_idx()
+        bidx_start, _, bidz = cute.arch.block_idx()
         gdim, _, _ = cute.arch.grid_dim()
         cluster_y = const_expr(0) if const_expr(self.cluster_n == 1) else cute.arch.block_idx()[1]
         tv_layout = tiled_copy.layout_tv_tiled
+
+        # Slice per head
+        if const_expr(cute.rank(mX) == 3):
+            mX, mW, mdO, mdResO, mdX, mdW, mdB, mdRes = [
+                mT[None, bidz, None] if const_expr(mT is not None) else None
+                for mT in (mX, mW, mdO, mdResO, mdX, mdW, mdB, mdRes)
+            ]
+            mRstd = mRstd[None, bidz]
 
         shape = mX.shape
         M, N = shape[0], shape[1]
@@ -502,7 +652,9 @@ class RMSNormBackward(ReductionBase):
         smem_layout = cute.make_ordered_layout((tiler_mn[0], tiler_mn[1], 2), order=(1, 0, 2))
         sX = smem.allocate_tensor(mX.element_type, smem_layout, byte_alignment=16)
         sdO = smem.allocate_tensor(mdO.element_type, smem_layout, byte_alignment=16)
-        reduction_buffer, mbar_ptr = self._allocate_reduction_buffer_and_mbar(smem, tv_layout, is_persistent=True)
+        reduction_buffer, mbar_ptr = self._allocate_reduction_buffer_and_mbar(
+            smem, tv_layout, is_persistent=True
+        )
         if const_expr(mbar_ptr is not None):
             mbar_full_ptr, mbar_empty_ptr = mbar_ptr, mbar_ptr + 2
         else:
@@ -516,7 +668,9 @@ class RMSNormBackward(ReductionBase):
         ]
         gW = cute.local_tile(mW, tiler_mn, (0, cluster_y)) if mW is not None else None
         gdW, gdB = [
-            cute.local_tile(mT, (1, tiler_mn[1]), (bidx_start, cluster_y)) if const_expr(mT is not None) else None
+            cute.local_tile(mT, (1, tiler_mn[1]), (bidx_start, cluster_y))
+            if const_expr(mT is not None)
+            else None
             for mT in (mdW, mdB)
         ]
 
@@ -531,16 +685,22 @@ class RMSNormBackward(ReductionBase):
             tXgdRes = thr_copy_X.partition_D(gdRes)
         tXcX = thr_copy_X.partition_S(cX)[(0, None), None, None, None]
 
-        tXrX, tXrdO, tXrdX = [cute.make_fragment_like(thr[None, None, None, 0]) for thr in (tXgX, tXgdO, tXgdX)]
+        tXrX, tXrdO, tXrdX = [
+            cute.make_rmem_tensor_like(thr[None, None, None, 0]) for thr in (tXgX, tXgdO, tXgdX)
+        ]
         tXrdResO = None
         if const_expr(mdResO is not None):
-            tXrdResO = cute.make_fragment_like(tXgdResO[None, None, None, 0])
+            tXrdResO = cute.make_rmem_tensor_like(tXgdResO[None, None, None, 0])
         tXrdRes = None
         if const_expr(mdRes is not None):
-            tXrdRes = cute.make_fragment_like(tXgdRes[None, None, None, 0])
+            tXrdRes = cute.make_rmem_tensor_like(tXgdRes[None, None, None, 0])
 
         # This doesn't change across iterations
-        tXpX = None if is_even_N else copy_utils.predicate_k(thr_copy_X.partition_S(cX[None, None, 0]), limit=shape[1])
+        tXpX = (
+            None
+            if is_even_N
+            else copy_utils.predicate_k(thr_copy_X.partition_S(cX[None, None, 0]), limit=shape[1])
+        )
         # Each copy will use the same number of elements as X
         copy = partial(copy_utils.copy, pred=tXpX)
 
@@ -549,11 +709,11 @@ class RMSNormBackward(ReductionBase):
         if const_expr(mdW is not None):
             tXgdW = thr_copy_X.partition_S(gdW)
             # Always compute partial weight gradients in fp32
-            tXrdW = cute.make_fragment_like(tXgdW, Float32)
+            tXrdW = cute.make_rmem_tensor_like(tXgdW, Float32)
         if const_expr(mdB is not None):
             tXgdB = thr_copy_X.partition_S(gdB)
             # Always compute partial bias gradients in fp32
-            tXrdB = cute.make_fragment_like(tXgdB, Float32)
+            tXrdB = cute.make_rmem_tensor_like(tXgdB, Float32)
 
         num_warps = cute.size(tiled_copy) // cute.arch.WARP_SIZE
 
@@ -562,7 +722,7 @@ class RMSNormBackward(ReductionBase):
         tXrW = None
         if const_expr(mW is not None):
             tXgW = thr_copy_X.partition_S(gW)
-            tXrW = cute.make_fragment_like(tXgW)
+            tXrW = cute.make_rmem_tensor_like(tXgW)
             # Need this, otherwise rW can have arbitrary values that changes the reduction
             if const_expr(not is_even_N):
                 tXrW.fill(0.0)
@@ -606,8 +766,12 @@ class RMSNormBackward(ReductionBase):
                 )
             else:
                 if const_expr(tiler_mn[0] > 1):
-                    utils.fill_oob(tXsX[None, None, None, stage ^ 1], None, fill_value=mX.element_type.zero)
-                    utils.fill_oob(tXsdO[None, None, None, stage ^ 1], None, fill_value=mdO.element_type.zero)
+                    utils.fill_oob(
+                        tXsX[None, None, None, stage ^ 1], None, fill_value=mX.element_type.zero
+                    )
+                    utils.fill_oob(
+                        tXsdO[None, None, None, stage ^ 1], None, fill_value=mdO.element_type.zero
+                    )
             cute.arch.cp_async_commit_group()
             rstd = cutlass.Float.zero
             if row < M or tiler_mn[0] == 1:
@@ -649,7 +813,9 @@ class RMSNormBackward(ReductionBase):
                 cute.arch.sync_warp()
                 lane_idx = cute.arch.lane_idx()
                 if lane_idx < self.cluster_n:
-                    cute.arch.mbarrier_arrive(mbar_empty_ptr + stage, peer_cta_rank_in_cluster=lane_idx)
+                    cute.arch.mbarrier_arrive(
+                        mbar_empty_ptr + stage, peer_cta_rank_in_cluster=lane_idx
+                    )
 
             if const_expr(self.reload_wdy == "smem"):
                 cute.autovec_copy(tXsdO[None, None, None, stage], tXrdO)
@@ -693,8 +859,10 @@ class RMSNormBackward(ReductionBase):
                 cute.arch.barrier()
                 if row == 0:
                     for i in cutlass.range_constexpr(1, const_expr(tiler_mn[0])):
-                        tXrdW_other = cute.make_fragment_like(tXrdW)
-                        tXsdW_other = cute.make_tensor(tXsdW.iterator + i * sdW.stride[0], tXsdW.layout)
+                        tXrdW_other = cute.make_rmem_tensor_like(tXrdW)
+                        tXsdW_other = cute.make_tensor(
+                            tXsdW.iterator + i * sdW.stride[0], tXsdW.layout
+                        )
                         cute.autovec_copy(tXsdW_other, tXrdW_other)
                         tXrdW.store(tXrdW.load() + tXrdW_other.load())
                     copy(tXrdW, tXgdW)
@@ -712,8 +880,10 @@ class RMSNormBackward(ReductionBase):
                 cute.arch.barrier()
                 if row == 0:
                     for i in cutlass.range_constexpr(1, const_expr(tiler_mn[0])):
-                        tXrdB_other = cute.make_fragment_like(tXrdB)
-                        tXsdB_other = cute.make_tensor(tXsdB.iterator + i * sdB.stride[0], tXsdB.layout)
+                        tXrdB_other = cute.make_rmem_tensor_like(tXrdB)
+                        tXsdB_other = cute.make_tensor(
+                            tXsdB.iterator + i * sdB.stride[0], tXsdB.layout
+                        )
                         cute.autovec_copy(tXsdB_other, tXrdB_other)
                         tXrdB.store(tXrdB.load() + tXrdB_other.load())
                     copy(tXrdB, tXgdB)
@@ -735,13 +905,17 @@ class RMSNormBackward(ReductionBase):
 
 def _get_sm_count(N: int, device: torch.device) -> int:
     # This should be tuned on how many CTAs can be launched on each SM
-    sm_count_multiple = 16 if N <= 256 else (8 if N <= 1024 else (4 if N <= 2048 else (2 if N <= 4096 else 1)))
+    sm_count_multiple = (
+        16 if N <= 256 else (8 if N <= 1024 else (4 if N <= 2048 else (2 if N <= 4096 else 1)))
+    )
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
     # By right, if we're using cluster, this should be cluster_count not sm_count.
     # But for cluster >= 4, due to quantization we would need to query active max cluster.
     # Instead we just do sm_count * 2, which is reasonably larger than active_cluster_count to
     # avoid wave quantization.
-    sm_count = sm_count * sm_count_multiple if N <= 8192 else sm_count // 2 if N <= 16384 else sm_count * 2
+    sm_count = (
+        sm_count * sm_count_multiple if N <= 8192 else sm_count // 2 if N <= 16384 else sm_count * 2
+    )
 
     return sm_count
 
@@ -767,34 +941,35 @@ def _rmsnorm_bwd(
 ) -> None:
     """RMSNorm backward pass.
     Args:
-        x: Input tensor of shape (M, N)
-        weight: Optional weight tensor of shape (N,)
-        dout: Upstream gradients tensor of shape (M, N)
-        rstd: Reciprocal standard deviation tensor of shape (M,)
+        x: Input tensor of shape (M, N) or (M, H, N) for per-head
+        weight: Optional weight tensor of shape (N,) or (H, N) for per-head
+        dout: Upstream gradients tensor of shape (M, N) or (M, H, N)
+        rstd: Reciprocal standard deviation tensor of shape (M,) or (M, H)
     Returns:
         Tuple of (dx, dw) where:
         - dx: Input gradients tensor of same shape as x
         - dw: Weight gradients tensor of same shape as weight (or None if weight is None)
     """
-    assert x.dim() == 2, "Input must be 2D"
+    assert x.dim() in (2, 3), "Input must be 2D or 3D"
     assert x.is_cuda, "Input tensor must be on CUDA device"
     supported_types = {torch.float16, torch.bfloat16, torch.float32}
     assert x.dtype in supported_types, "Unsupported dtype"
+    per_head = x.dim() == 3
     if weight is not None:
-        assert weight.dim() == 1, "Weight must be 1D"
-        assert x.shape[-1] == weight.shape[0], "Last dimension of input must match weight dimension"
         assert weight.is_cuda, "Weight tensor must be on CUDA device"
         assert weight.dtype in supported_types, "Weight must be float32, float16 or bfloat16"
     if dresidual_out is not None:
         assert dresidual_out.shape == x.shape
         assert dresidual_out.is_cuda
-        assert dresidual_out.dtype in supported_types, "Residual must be float16, bfloat16, or float32"
+        assert dresidual_out.dtype in supported_types, (
+            "Residual must be float16, bfloat16, or float32"
+        )
     if dresidual is not None:
         assert dresidual.shape == x.shape
         assert dresidual.is_cuda
         assert dresidual.dtype in supported_types, "Residual must be float16, bfloat16, or float32"
 
-    N = x.size(1)
+    N = x.size(-1)
     if dw_partial is None and db_partial is None:
         assert sm_count is not None
     else:
@@ -803,7 +978,7 @@ def _rmsnorm_bwd(
         torch2cute_dtype_map[t.dtype] if t is not None else None
         for t in [x, dout, dx, weight, dresidual, dresidual_out]
     ]
-    compile_key = (
+    _compile_rmsnorm_bwd(
         N,
         dtype,
         dout_dtype,
@@ -812,39 +987,93 @@ def _rmsnorm_bwd(
         db_partial is not None,
         dres_dtype,
         dres_out_dtype,
-    )
-    if compile_key not in _rmsnorm_bwd.compile_cache:
-        batch_sym, batch_partial_sym = cute.sym_int(), cute.sym_int()
-        all_dtypes = [dtype, dout_dtype, dx_dtype, dres_dtype, dres_out_dtype]
-        div = math.gcd(N, *(128 // dt.width for dt in all_dtypes if dt is not None))
-        x_cute, dout_cute, dx_cute, dres_out_cute, dres_cute = [
-            fake_tensor(dt, (batch_sym, N), div) for dt in [dtype, dout_dtype, dx_dtype, dres_out_dtype, dres_dtype]
+        dw_partial is not None,
+        per_head,
+    )(x, weight, dout, dresidual_out, rstd, dx, dw_partial, dresidual, db_partial, sm_count)
+
+
+@_rmsnorm_bwd.register_fake
+def _rmsnorm_bwd_fake(
+    x: Tensor,
+    weight: Optional[Tensor],
+    dout: Tensor,
+    rstd: Tensor,
+    dx: Tensor,
+    dw_partial: Optional[Tensor],
+    db_partial: Optional[Tensor] = None,
+    dresidual_out: Optional[Tensor] = None,
+    dresidual: Optional[Tensor] = None,
+    sm_count: Optional[int] = None,
+) -> None:
+    # See softmax.py _softmax_fwd_fake for why register_fake is needed.
+    from .cache_utils import COMPILE_ONLY
+
+    if COMPILE_ONLY and not isinstance(x.size(-1), torch.SymInt):
+        N = x.size(-1)
+        per_head = x.dim() == 3
+        if dw_partial is None and db_partial is None and sm_count is None:
+            return
+        dtype, dout_dtype, dx_dtype, weight_dtype, dres_dtype, dres_out_dtype = [
+            torch2cute_dtype_map[t.dtype] if t is not None else None
+            for t in [x, dout, dx, weight, dresidual, dresidual_out]
         ]
-        weight_cute = fake_tensor(weight_dtype, (N,), div)
-        rstd_cute = fake_tensor(Float32, (batch_sym,))
-        dw_partial_cute = fake_tensor(Float32, (batch_partial_sym, N), div) if dw_partial is not None else None
-        db_partial_cute = fake_tensor(Float32, (batch_partial_sym, N), div) if db_partial is not None else None
-        _rmsnorm_bwd.compile_cache[compile_key] = cute.compile(
-            RMSNormBackward(dtype, N),
-            x_cute,
-            weight_cute,
-            dout_cute,
-            dres_out_cute,
-            rstd_cute,
-            dx_cute,
-            dw_partial_cute,
-            dres_cute,
-            db_partial_cute,
-            sm_count,
-            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-            options="--enable-tvm-ffi",
+        _compile_rmsnorm_bwd(
+            N,
+            dtype,
+            dout_dtype,
+            dx_dtype,
+            weight_dtype,
+            db_partial is not None,
+            dres_dtype,
+            dres_out_dtype,
+            dw_partial is not None,
+            per_head,
         )
-    _rmsnorm_bwd.compile_cache[compile_key](
-        x, weight, dout, dresidual_out, rstd, dx, dw_partial, dresidual, db_partial, sm_count
+
+
+@jit_cache
+def _compile_rmsnorm_bwd(
+    N,
+    dtype,
+    dout_dtype,
+    dx_dtype,
+    weight_dtype,
+    has_db_partial,
+    dres_dtype,
+    dres_out_dtype,
+    has_dw_partial,
+    per_head=False,
+):
+    batch_sym, batch_partial_sym = cute.sym_int(), cute.sym_int()
+    head_sym = cute.sym_int() if per_head else None
+    batch_shape = (batch_sym, head_sym) if per_head else (batch_sym,)
+    all_dtypes = [dtype, dout_dtype, dx_dtype, dres_dtype, dres_out_dtype]
+    div = math.gcd(N, *(128 // dt.width for dt in all_dtypes if dt is not None))
+    x_cute, dout_cute, dx_cute, dres_out_cute, dres_cute = [
+        fake_tensor(dt, (*batch_shape, N), div)
+        for dt in [dtype, dout_dtype, dx_dtype, dres_out_dtype, dres_dtype]
+    ]
+    weight_shape = (head_sym, N) if per_head else (N,)
+    weight_cute = fake_tensor(weight_dtype, weight_shape, div)
+    rstd_cute = fake_tensor(Float32, batch_shape)
+    dw_shape = (batch_partial_sym, head_sym, N) if per_head else (batch_partial_sym, N)
+    dw_partial_cute = fake_tensor(Float32, dw_shape, div) if has_dw_partial else None
+    db_partial_cute = fake_tensor(Float32, dw_shape, div) if has_db_partial else None
+    return cute.compile(
+        RMSNormBackward(dtype, N),
+        x_cute,
+        weight_cute,
+        dout_cute,
+        dres_out_cute,
+        rstd_cute,
+        dx_cute,
+        dw_partial_cute,
+        dres_cute,
+        db_partial_cute,
+        0,  # sm_count, just for compilation
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
     )
-
-
-_rmsnorm_bwd.compile_cache = {}
 
 
 def rmsnorm_bwd(
@@ -857,25 +1086,38 @@ def rmsnorm_bwd(
     has_residual: bool = False,
 ) -> Tuple[Tensor, Optional[Tensor], Optional[Tensor], Optional[Tensor]]:
     device = x.device
-    N = x.size(1)
+    N = x.size(-1)
+    per_head = x.dim() == 3
     dx = torch.empty_like(x)
     if dresidual_out is not None and dresidual_out.dtype != dx.dtype:
         dresidual = torch.empty_like(x, dtype=dresidual_out.dtype)
     else:
         dresidual = None
     sm_count = _get_sm_count(N, device)
+    if per_head:
+        H = x.size(1)
+        sm_count = max(round(sm_count / H), 1)
+    else:
+        H = None
     if weight is not None:
         # Always store partial gradients in fp32 for numerical accuracy
-        dw_partial = torch.empty(sm_count, N, device=device, dtype=torch.float32)
+        dw_shape = (sm_count, H, N) if per_head else (sm_count, N)
+        dw_partial = torch.empty(dw_shape, device=device, dtype=torch.float32)
     else:
         dw_partial = None
-    db_partial = torch.empty(sm_count, N, device=device, dtype=torch.float32) if has_bias else None
+    db_shape = (sm_count, H, N) if per_head else (sm_count, N)
+    db_partial = torch.empty(db_shape, device=device, dtype=torch.float32) if has_bias else None
 
-    _rmsnorm_bwd(x, weight, dout, rstd, dx, dw_partial, db_partial, dresidual_out, dresidual, sm_count)
-
-    # we have summed the partial gradients in fp32, now we convert back to the weight dtype
-    dw = dw_partial.sum(dim=0).to(weight.dtype) if weight is not None else None
-    db = db_partial.sum(dim=0).to(weight.dtype) if has_bias else None
+    if x.numel() > 0:
+        _rmsnorm_bwd(
+            x, weight, dout, rstd, dx, dw_partial, db_partial, dresidual_out, dresidual, sm_count
+        )
+        # we have summed the partial gradients in fp32, now we convert back to the weight dtype
+        dw = dw_partial.sum(dim=0).to(weight.dtype) if weight is not None else None
+        db = db_partial.sum(dim=0).to(weight.dtype) if has_bias else None
+    else:
+        dw = torch.zeros_like(weight) if weight is not None else None
+        db = torch.zeros_like(weight) if has_bias else None
     # dresidual is the same as dx in this case
     if has_residual and dresidual is None:
         dresidual = dx
@@ -883,6 +1125,14 @@ def rmsnorm_bwd(
 
 
 class RMSNormFunction(torch.autograd.Function):
+    """Autograd wrapper for rmsnorm.
+
+    All input reshaping (flattening batch dims, per-head layout) is done in the
+    rmsnorm() wrapper BEFORE calling .apply(). This function receives already-
+    flattened tensors so that tensor ranks never change between recompilations,
+    which is required for torch.compile compatibility.
+    """
+
     @staticmethod
     def forward(
         ctx,
@@ -895,11 +1145,9 @@ class RMSNormFunction(torch.autograd.Function):
         eps=1e-6,
         prenorm=False,
     ):
-        x_shape_og = x.shape
-        # Flatten input
-        x = x.reshape(-1, x.shape[-1])
+        x = _ensure_contiguous(x)
         if residual is not None:
-            residual = residual.reshape(-1, residual.shape[-1])
+            residual = _ensure_contiguous(residual)
         need_grad = any(ctx.needs_input_grad[:3])
         out, residual_out, rstd = rmsnorm_fwd(
             x,
@@ -913,40 +1161,30 @@ class RMSNormFunction(torch.autograd.Function):
         )
         ctx.save_for_backward(x if residual is None else residual_out, weight, rstd)
         ctx.has_bias = bias is not None
-        ctx.eps = eps
-        ctx.x_shape_og = x_shape_og
-        ctx.residual_dtype = residual.dtype if residual is not None else None
+        ctx.has_residual = residual is not None
         ctx.prenorm = prenorm
         if residual_out is None or not prenorm:
-            return out.reshape(x_shape_og)
+            return out
         else:
-            return out.reshape(x_shape_og), residual_out.reshape(x_shape_og)
+            return out, residual_out
 
     @staticmethod
     def backward(ctx, dout, *args):
         x, weight, rstd = ctx.saved_tensors
-        has_bias = ctx.has_bias
-        if ctx.prenorm and ctx.residual_dtype is not None:
-            dresidual_out = args[0]
-            dresidual_out = dresidual_out.reshape(-1, dresidual_out.shape[-1])
+        dout = _ensure_contiguous(dout)
+        if ctx.prenorm and ctx.has_residual:
+            dresidual_out = _ensure_contiguous(args[0])
         else:
             dresidual_out = None
-        x_shape_og = ctx.x_shape_og
-        # Reshape dout to match the flattened shape used in forward
-        dout = dout.view(-1, dout.shape[-1])
         dx, dw, db, dresidual = rmsnorm_bwd(
             x,
             weight,
             dout,
             rstd,
             dresidual_out,
-            has_bias,
-            has_residual=ctx.residual_dtype is not None,
+            ctx.has_bias,
+            has_residual=ctx.has_residual,
         )
-        dx = dx.view(x_shape_og)
-        if dresidual is not None:
-            dresidual = dresidual.reshape(x_shape_og)
-
         return dx, dw, db, dresidual, *([None] * 4)
 
 
@@ -963,21 +1201,36 @@ def rmsnorm(
     """RMSNorm with automatic differentiation support.
 
     Args:
-        x: Input tensor of shape (M, N)
-        weight: Optional weight tensor of shape (N,)
+        x: Input tensor of shape (M, N) or (B, S, H, D) for per-head mode
+        weight: Optional weight tensor of shape (N,) or (H, D) for per-head mode
         eps: Small value for numerical stability
 
     Returns:
         Normalized output tensor of same shape as x
     """
-    return RMSNormFunction.apply(x, weight, bias, residual, out_dtype, residual_dtype, eps, prenorm)
+    x_shape_og = x.shape
+    per_head = (weight is not None and weight.dim() == 2) or (bias is not None and bias.dim() == 2)
+    last_shape = x_shape_og[-1:] if not per_head else x_shape_og[-2:]
+    # Flatten batch dims before entering autograd.Function so tensor ranks
+    # are determined by per_head (which dynamo guards on via the if-branch),
+    # not by the original input shape. This ensures torch.compile can
+    # recompile the backward subgraph correctly when switching between
+    # per_head=False and per_head=True.
+    x_flat = x.reshape(-1, *last_shape)
+    res_flat = residual.reshape(-1, *last_shape) if residual is not None else None
+    result = RMSNormFunction.apply(
+        x_flat, weight, bias, res_flat, out_dtype, residual_dtype, eps, prenorm
+    )
+    if isinstance(result, tuple):
+        return tuple(r.reshape(x_shape_og) for r in result)
+    return result.reshape(x_shape_og)
 
 
 class QuackRMSNorm(torch.nn.RMSNorm):
     """RMSNorm module that behaves like torch.nn.RMSNorm.
 
     This class provides a drop-in replacement for torch.nn.RMSNorm that uses
-    the quack.rmsnorm implementation under the hood.
+    the rmsnorm implementation under the hood.
 
     Args:
         dim (int): The dimension to normalize over
@@ -988,7 +1241,9 @@ class QuackRMSNorm(torch.nn.RMSNorm):
         eps (float): A small constant for numerical stability
     """
 
-    def __init__(self, dim: int, eps: float = 1e-6, elementwise_affine: bool = True, device=None, dtype=None):
+    def __init__(
+        self, dim: int, eps: float = 1e-6, elementwise_affine: bool = True, device=None, dtype=None
+    ):
         super().__init__(dim, eps, elementwise_affine, device=device, dtype=dtype)
 
     def forward(self, x: Tensor) -> Tensor:

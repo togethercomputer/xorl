@@ -44,7 +44,7 @@ pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.server, pytest.mark.
 # Model and thresholds
 # ---------------------------------------------------------------------------
 
-QWEN3_8B_DIR = "/data/shared/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218"
+QWEN3_8B_DIR = os.environ.get("XORL_QWEN3_8B_DIR", "Qwen/Qwen3-8B")
 VOCAB_SIZE = 151936
 
 # Minimum TFLOPS per GPU (80% of corrected H100 baseline, flash_attention_3, seq_len=4096)

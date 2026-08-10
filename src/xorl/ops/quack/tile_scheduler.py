@@ -1,17 +1,17 @@
 # Copyright (c) 2025, Tri Dao.
 
+from typing import NamedTuple, Tuple, Optional
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Boolean, Float32, Int32, const_expr
+from cutlass import Int32, Float32, Boolean, const_expr
 
-from . import utils
-from .cute_dsl_utils import ArgumentsBase, ParamsBase
+from . import utils as utils
 from .fast_math import FastDivmod
 from .pipeline import PipelineStateWAdvance
+from .cute_dsl_utils import mlir_namedtuple
 
 
 class RasterOrderOption(IntEnum):
@@ -36,17 +36,23 @@ class PersistenceMode(IntEnum):
 def get_raster_order_from_option(
     raster_order_option: RasterOrderOption, problem_shape_ncluster_mn: cute.Shape, group_size: Int32
 ) -> RasterOrder:
-    raster_order = RasterOrder.AlongM if raster_order_option == RasterOrderOption.AlongM else RasterOrder.AlongN
+    raster_order = (
+        RasterOrder.AlongM
+        if raster_order_option == RasterOrderOption.AlongM
+        else RasterOrder.AlongN
+    )
     if raster_order_option == RasterOrderOption.Heuristic:
         problem_blocks_m = cute.round_up(problem_shape_ncluster_mn[0], group_size)
         problem_blocks_n = cute.round_up(problem_shape_ncluster_mn[1], group_size)
-        raster_order = RasterOrder.AlongM if problem_blocks_n > problem_blocks_m else RasterOrder.AlongN
+        raster_order = (
+            RasterOrder.AlongM if problem_blocks_n > problem_blocks_m else RasterOrder.AlongN
+        )
     return raster_order
 
 
 # Grouping arguments together that should be passed to __call__
-@dataclass
-class TileSchedulerOptions(ArgumentsBase):
+@mlir_namedtuple
+class TileSchedulerOptions(NamedTuple):
     max_active_clusters: Int32
     raster_order: cutlass.Constexpr[RasterOrderOption] = RasterOrderOption.Heuristic
     max_swizzle_size: Int32 = Int32(8)
@@ -55,7 +61,7 @@ class TileSchedulerOptions(ArgumentsBase):
 
 
 @dataclass
-class TileSchedulerArguments(ArgumentsBase):
+class TileSchedulerArguments:
     problem_shape_ntile_mnl: cute.Shape
     raster_order: cutlass.Constexpr[RasterOrderOption]
     group_size: Int32
@@ -67,7 +73,7 @@ class TileSchedulerArguments(ArgumentsBase):
 
 class TileScheduler:
     @dataclass
-    class Params(ParamsBase):
+    class Params:
         problem_shape_ncluster_mnl: cute.Shape
         raster_order: RasterOrder
         num_clusters_per_problem_fdd: FastDivmod
@@ -77,24 +83,33 @@ class TileScheduler:
         num_clusters_in_group_fdd: FastDivmod
         tile_count_semaphore: Optional[cute.Pointer]
         batch_idx_permute: Optional[cute.Tensor]
-        cluster_shape_mn: cutlass.Constexpr[cute.Shape]
+        cluster_shape_mnk: cutlass.Constexpr[cute.Shape]
         persistence_mode: cutlass.Constexpr[PersistenceMode]
 
         @staticmethod
         @cute.jit
         def create(args: TileSchedulerArguments, *, loc=None, ip=None) -> "TileScheduler.Params":
-            assert args.cluster_shape_mnk[2] == 1
-            cluster_shape_mn = const_expr(cute.select(args.cluster_shape_mnk, mode=[0, 1]))
             problem_shape_ntile_mn = cute.select(args.problem_shape_ntile_mnl, mode=[0, 1])
-            problem_shape_ncluster_mn = cute.ceil_div(problem_shape_ntile_mn, cluster_shape_mn)
-            problem_shape_ncluster_mnl = problem_shape_ncluster_mn + (args.problem_shape_ntile_mnl[2],)
+            problem_shape_ncluster_mn = (
+                cute.ceil_div(problem_shape_ntile_mn[0], args.cluster_shape_mnk[0]),
+                cute.ceil_div(problem_shape_ntile_mn[1], args.cluster_shape_mnk[1]),
+            )
+            problem_shape_ncluster_mnl = problem_shape_ncluster_mn + (
+                args.problem_shape_ntile_mnl[2],
+            )
             num_clusters_per_problem = cute.size(problem_shape_ncluster_mn)
-            raster_order = get_raster_order_from_option(args.raster_order, problem_shape_ncluster_mn, args.group_size)
+            raster_order = get_raster_order_from_option(
+                args.raster_order, problem_shape_ncluster_mn, args.group_size
+            )
             ncluster_fast = (
-                problem_shape_ncluster_mn[0] if raster_order == RasterOrder.AlongM else problem_shape_ncluster_mn[1]
+                problem_shape_ncluster_mn[0]
+                if raster_order == RasterOrder.AlongM
+                else problem_shape_ncluster_mn[1]
             )
             ncluster_slow = (
-                problem_shape_ncluster_mn[1] if raster_order == RasterOrder.AlongM else problem_shape_ncluster_mn[0]
+                problem_shape_ncluster_mn[1]
+                if raster_order == RasterOrder.AlongM
+                else problem_shape_ncluster_mn[0]
             )
             group_size = min(args.group_size, ncluster_fast)
             group_size_tail = ncluster_fast % group_size
@@ -111,9 +126,11 @@ class TileScheduler:
                 # Don't divide by 0
                 FastDivmod(group_size_tail if group_size_tail > 0 else 1),
                 FastDivmod(num_clusters_in_group),
-                args.tile_count_semaphore if const_expr(args.persistence_mode == PersistenceMode.DYNAMIC) else None,
+                args.tile_count_semaphore
+                if const_expr(args.persistence_mode == PersistenceMode.DYNAMIC)
+                else None,
                 args.batch_idx_permute,
-                cluster_shape_mn,
+                args.cluster_shape_mnk,
                 args.persistence_mode,
             )
 
@@ -192,7 +209,8 @@ class TileScheduler:
         )
         stages = 0
         if const_expr(
-            params.persistence_mode in [PersistenceMode.STATIC, PersistenceMode.DYNAMIC, PersistenceMode.CLC]
+            params.persistence_mode
+            in [PersistenceMode.STATIC, PersistenceMode.DYNAMIC, PersistenceMode.CLC]
         ):
             assert sched_smem is not None
             assert scheduler_pipeline is not None
@@ -224,31 +242,41 @@ class TileScheduler:
     ) -> Tuple[Int32, Int32, Int32]:
         if const_expr(params.persistence_mode in [PersistenceMode.NONE, PersistenceMode.CLC]):
             return (
-                params.cluster_shape_mn[0] * cute.size(params.problem_shape_ncluster_mnl[:2]),
-                params.cluster_shape_mn[1],
-                params.problem_shape_ncluster_mnl[2],
+                params.cluster_shape_mnk[0] * cute.size(params.problem_shape_ncluster_mnl[:2]),
+                params.cluster_shape_mnk[1],
+                params.cluster_shape_mnk[2] * params.problem_shape_ncluster_mnl[2],
             )
         else:
-            num_ctas_in_problem = cute.size(params.problem_shape_ncluster_mnl, loc=loc, ip=ip) * cute.size(
-                params.cluster_shape_mn
-            )
-            num_ctas_per_cluster = cute.size(params.cluster_shape_mn, loc=loc, ip=ip)
+            num_ctas_in_problem = cute.size(
+                params.problem_shape_ncluster_mnl, loc=loc, ip=ip
+            ) * cute.size(params.cluster_shape_mnk)
+            num_ctas_per_cluster = cute.size(params.cluster_shape_mnk, loc=loc, ip=ip)
             # Total ctas that can run in one wave
             num_ctas_per_wave = max_active_clusters * num_ctas_per_cluster
             num_persistent_ctas = cutlass.min(num_ctas_in_problem, num_ctas_per_wave)
             num_persistent_clusters = num_persistent_ctas // num_ctas_per_cluster
-            return (*params.cluster_shape_mn, num_persistent_clusters)
+            return (
+                params.cluster_shape_mnk[0],
+                params.cluster_shape_mnk[1],
+                params.cluster_shape_mnk[2] * num_persistent_clusters,
+            )
 
     @cute.jit
-    def _swizzle_cta(self, cluster_id_in_problem: Int32, *, loc=None, ip=None) -> Tuple[Int32, Int32]:
+    def _swizzle_cta(
+        self, cluster_id_in_problem: Int32, *, loc=None, ip=None
+    ) -> Tuple[Int32, Int32]:
         # CTA Swizzle to promote L2 data reuse
         params = self.params
         group_id, id_in_group = divmod(cluster_id_in_problem, params.num_clusters_in_group_fdd)
         cid_fast_in_group, cid_slow = Int32(0), Int32(0)
         if group_id < params.num_groups_regular:
             cid_slow, cid_fast_in_group = divmod(id_in_group, params.group_size_fdd)
+            # if cid_slow % 2 == 1:  # inner serpentine
+            #     cid_fast_in_group = params.group_size_fdd.divisor - 1 - cid_fast_in_group
         else:  # tail part
             cid_slow, cid_fast_in_group = divmod(id_in_group, params.group_size_tail_fdd)
+            # if cid_slow % 2 == 1:  # inner serpentine
+            #     cid_fast_in_group = params.group_size_tail_fdd.divisor - 1 - cid_fast_in_group
         if group_id % 2 == 1:  # serpentine order
             ncluster_slow = (
                 params.problem_shape_ncluster_mnl[1]
@@ -271,8 +299,8 @@ class TileScheduler:
         else:
             # Get the pid from cluster id
             bidx_in_cluster = cute.arch.block_in_cluster_idx()
-        pid_m = cid_m * self.params.cluster_shape_mn[0] + bidx_in_cluster[0]
-        pid_n = cid_n * self.params.cluster_shape_mn[1] + bidx_in_cluster[1]
+        pid_m = cid_m * self.params.cluster_shape_mnk[0] + bidx_in_cluster[0]
+        pid_n = cid_n * self.params.cluster_shape_mnk[1] + bidx_in_cluster[1]
         return pid_m, pid_n
 
     @cute.jit
@@ -298,14 +326,20 @@ class TileScheduler:
         if is_valid:
             if const_expr(params.persistence_mode in [PersistenceMode.NONE, PersistenceMode.CLC]):
                 cluster_id_in_problem = work_idx
-                _, _, bidz_ = cute.arch.block_idx()
+                _, _, bidz_ = cute.arch.cluster_idx()
             else:
                 bidz_, cluster_id_in_problem = divmod(work_idx, params.num_clusters_per_problem_fdd)
             if const_expr(bidz is not None):
                 bidz_ = bidz
             cid_m, cid_n = self._swizzle_cta(cluster_id_in_problem, loc=loc, ip=ip)
-            pid_m, pid_n = self._cluster_id_to_cta_id(cid_m, cid_n, block_zero_only=block_zero_only, loc=loc, ip=ip)
-            batch_idx = bidz_ if const_expr(params.batch_idx_permute is None) else params.batch_idx_permute[bidz_]
+            pid_m, pid_n = self._cluster_id_to_cta_id(
+                cid_m, cid_n, block_zero_only=block_zero_only, loc=loc, ip=ip
+            )
+            batch_idx = (
+                bidz_
+                if const_expr(params.batch_idx_permute is None)
+                else params.batch_idx_permute[bidz_]
+            )
         tile_coord_mnkl = (pid_m, pid_n, None, batch_idx)
         return cutlass.utils.WorkTileInfo(tile_coord_mnkl, is_valid)
 
@@ -319,10 +353,12 @@ class TileScheduler:
         #     return self._delinearize_work_idx(loc=loc, ip=ip)
         else:
             self._scheduler_pipeline.consumer_wait(self._pipeline_state)
-            pid_m, pid_n, batch_idx, is_valid_i32 = [self._sched_smem[i, self._pipeline_state.index] for i in range(4)]
+            pid_m, pid_n, batch_idx, is_valid_i32 = [
+                self._sched_smem[i, self._pipeline_state.index] for i in range(4)
+            ]
             # Need this fence since the STAS from the producer is using the async proxy.
             # Without this, we get race condition / deadlock.
-            if const_expr(cute.size(params.cluster_shape_mn) > 1):
+            if const_expr(cute.size(params.cluster_shape_mnk) > 1):
                 cute.arch.fence_view_async_shared()
             cute.arch.sync_warp()
             with cute.arch.elect_one():
@@ -344,9 +380,16 @@ class TileScheduler:
     def _fetch_next_work_idx(self, *, loc=None, ip=None) -> Int32 | Tuple[Int32, Int32, Boolean]:
         """should only be called by the scheduler warp"""
         params = self.params
-        num_persistent_clusters = Int32(cute.arch.grid_dim()[2])
+        num_persistent_clusters = cute.arch.cluster_dim()[2]
         if const_expr(params.persistence_mode == PersistenceMode.STATIC):
             return self._current_work_idx + num_persistent_clusters
+            # Serpentine: alternate wave direction for a bit better load balancing
+            # But currently seems a tiny bit slower, disabling for now.
+            # c = Int32(cute.arch.cluster_idx()[2])
+            # next_work_idx = self._current_work_idx + 2 * c + 1
+            # if self.num_tiles_executed % 2 == 1:
+            #     next_work_idx = self._current_work_idx + 2 * (num_persistent_clusters - 1 - c) + 1
+            # return next_work_idx
         elif const_expr(params.persistence_mode == PersistenceMode.DYNAMIC):
             next_work_linear_idx = Int32(0)
             if cute.arch.lane_idx() == 0:
@@ -370,24 +413,27 @@ class TileScheduler:
             cute.arch.sync_warp()
             with cute.arch.elect_one():
                 cute.arch.mbarrier_arrive_and_expect_tx(mbarrier_addr, 16, loc=loc, ip=ip)
-                # cute.arch.issue_clc_query(mbarrier_addr, clc_response_ptr, loc=loc, ip=ip)
                 utils.issue_clc_query_nomulticast(mbarrier_addr, clc_response_ptr, loc=loc, ip=ip)
             cute.arch.sync_warp()
             cute.arch.mbarrier_wait(mbarrier_addr, self._pipeline_state.phase, loc=loc, ip=ip)
             bidx, bidy, bidz, valid = cute.arch.clc_response(clc_response_ptr, loc=loc, ip=ip)
             cute.arch.fence_view_async_shared()
             cluster_idx = (
-                bidx // params.cluster_shape_mn[0],
-                bidy // params.cluster_shape_mn[1],
-                bidz,
+                bidx // params.cluster_shape_mnk[0],
+                bidy // params.cluster_shape_mnk[1],
+                bidz // params.cluster_shape_mnk[2],
             )
-            cluster_idx, batch_idx = type(self)._cluster_idx_to_work_idx_batch(params, cluster_idx, loc=loc, ip=ip)
+            cluster_idx, batch_idx = type(self)._cluster_idx_to_work_idx_batch(
+                params, cluster_idx, loc=loc, ip=ip
+            )
             return cluster_idx, batch_idx, Boolean(valid)
         else:
             return Int32(0)
 
     @cute.jit
-    def write_work_tile_to_smem(self, work_tile_info: cutlass.utils.WorkTileInfo, *, loc=None, ip=None):
+    def write_work_tile_to_smem(
+        self, work_tile_info: cutlass.utils.WorkTileInfo, *, loc=None, ip=None
+    ):
         params = self.params
         if const_expr(self._sched_smem is not None):
             # producer phase is always consumer_phase ^ 1
@@ -405,19 +451,21 @@ class TileScheduler:
                 Int32(work_tile_info.is_valid_tile),
             ]
             lane_idx = cute.arch.lane_idx()
-            if lane_idx < cute.size(params.cluster_shape_mn):
+            if lane_idx < cute.size(params.cluster_shape_mnk):
                 # cute.printf("Producer pid_m = {}, pid_n = {}, batch_idx = {}, is_valid = {}, after empty wait, idx = {}", sched_data[0], sched_data[1], sched_data[2], sched_data[3], self._current_work_idx)
                 pipeline_idx = self._pipeline_state.index
-                if const_expr(cute.size(params.cluster_shape_mn) == 1):
+                if const_expr(cute.size(params.cluster_shape_mnk) == 1):
                     for i in cutlass.range_constexpr(4):
                         self._sched_smem[i, pipeline_idx] = sched_data[i]
                     self._scheduler_pipeline.producer_commit(self._pipeline_state)
                 else:
                     peer_cta_rank_in_cluster = lane_idx
                     # Here we assume that the block idx in cluster is linearized such that
-                    # x is the fastest moving direction.
-                    bidx_in_cluster = peer_cta_rank_in_cluster % params.cluster_shape_mn[0]
-                    bidy_in_cluster = peer_cta_rank_in_cluster // params.cluster_shape_mn[0]
+                    # x is the fastest moving direction, followed by y, then z.
+                    bidx_in_cluster = peer_cta_rank_in_cluster % params.cluster_shape_mnk[0]
+                    bidy_in_cluster = (
+                        peer_cta_rank_in_cluster // params.cluster_shape_mnk[0]
+                    ) % params.cluster_shape_mnk[1]
                     mbar_ptr = self._scheduler_pipeline.producer_get_barrier(self._pipeline_state)
                     cute.arch.mbarrier_arrive_and_expect_tx(mbar_ptr, 16, peer_cta_rank_in_cluster)
                     utils.store_shared_remote_x4(
@@ -526,7 +574,7 @@ class TriangularTileScheduler(TileScheduler):
     """We assume the tile size per cluster is square (e.g., 128 x 256 per CTA, with cluster 2 x 1)"""
 
     @dataclass
-    class Params(ParamsBase):
+    class Params:
         problem_shape_ncluster_mnl: cute.Shape
         num_clusters_per_problem_fdd: FastDivmod
         group_size_inv_f32: Float32
@@ -536,17 +584,23 @@ class TriangularTileScheduler(TileScheduler):
         group_size_mul_group_size_fdd: FastDivmod
         group_size_tail_mul_group_size_fdd: FastDivmod
         tile_count_semaphore: Optional[cute.Pointer]
-        cluster_shape_mn: cutlass.Constexpr[cute.Shape]
+        cluster_shape_mnk: cutlass.Constexpr[cute.Shape]
         persistence_mode: cutlass.Constexpr[PersistenceMode]
 
         @staticmethod
         @cute.jit
-        def create(args: TileSchedulerArguments, *, loc=None, ip=None) -> "TriangularTileScheduler.Params":
+        def create(
+            args: TileSchedulerArguments, *, loc=None, ip=None
+        ) -> "TriangularTileScheduler.Params":
             assert args.cluster_shape_mnk[2] == 1
-            cluster_shape_mn = const_expr(cute.select(args.cluster_shape_mnk, mode=[0, 1]))
             problem_shape_ntile_mn = cute.select(args.problem_shape_ntile_mnl, mode=[0, 1])
-            problem_shape_ncluster_mn = cute.ceil_div(problem_shape_ntile_mn, cluster_shape_mn)
-            problem_shape_ncluster_mnl = problem_shape_ncluster_mn + (args.problem_shape_ntile_mnl[2],)
+            problem_shape_ncluster_mn = (
+                cute.ceil_div(problem_shape_ntile_mn[0], args.cluster_shape_mnk[0]),
+                cute.ceil_div(problem_shape_ntile_mn[1], args.cluster_shape_mnk[1]),
+            )
+            problem_shape_ncluster_mnl = problem_shape_ncluster_mn + (
+                args.problem_shape_ntile_mnl[2],
+            )
             cluster_m = problem_shape_ncluster_mn[0]
             # Assume that each cluster is responsible for a square tile
             num_clusters_per_problem = cluster_m * (cluster_m + 1) // 2
@@ -565,8 +619,10 @@ class TriangularTileScheduler(TileScheduler):
                 FastDivmod(group_size_tail if group_size_tail > 0 else 1),
                 FastDivmod(group_size * group_size),
                 FastDivmod((group_size_tail if group_size_tail > 0 else 1) * group_size),
-                args.tile_count_semaphore if const_expr(args.persistence_mode == PersistenceMode.DYNAMIC) else None,
-                cluster_shape_mn,
+                args.tile_count_semaphore
+                if const_expr(args.persistence_mode == PersistenceMode.DYNAMIC)
+                else None,
+                args.cluster_shape_mnk,
                 args.persistence_mode,
             )
 
@@ -590,11 +646,12 @@ class TriangularTileScheduler(TileScheduler):
         )
         stages = 0
         if const_expr(
-            params.persistence_mode in [PersistenceMode.STATIC, PersistenceMode.DYNAMIC, PersistenceMode.CLC]
+            params.persistence_mode
+            in [PersistenceMode.STATIC, PersistenceMode.DYNAMIC, PersistenceMode.CLC]
         ):
             assert sched_smem is not None
             assert scheduler_pipeline is not None
-            stages = const_expr(cute.size(sched_smem))
+            stages = const_expr(cute.size(sched_smem, mode=[1]))
         if const_expr(params.persistence_mode == PersistenceMode.CLC):
             if is_scheduler_warp:
                 TileScheduler._init_clc_mbarrier(sched_smem, loc=loc, ip=ip)
@@ -621,34 +678,53 @@ class TriangularTileScheduler(TileScheduler):
         ip=None,
     ) -> Tuple[Int32, Int32, Int32]:
         clusters = (params.num_clusters_per_problem_fdd.divisor, 1)
-        num_ctas_mnl = tuple(x * y for x, y in zip(clusters, params.cluster_shape_mn)) + (
-            params.problem_shape_ncluster_mnl[2],
+        num_ctas_mnl = (
+            clusters[0] * params.cluster_shape_mnk[0],
+            clusters[1] * params.cluster_shape_mnk[1],
+            params.cluster_shape_mnk[2] * params.problem_shape_ncluster_mnl[2],
         )
         if const_expr(params.persistence_mode in [PersistenceMode.NONE, PersistenceMode.CLC]):
             return num_ctas_mnl
         else:
             num_ctas_in_problem = cute.size(num_ctas_mnl, loc=loc, ip=ip)
-            num_ctas_per_cluster = cute.size(params.cluster_shape_mn, loc=loc, ip=ip)
+            num_ctas_per_cluster = cute.size(params.cluster_shape_mnk, loc=loc, ip=ip)
             # Total ctas that can run in one wave
             num_ctas_per_wave = max_active_clusters * num_ctas_per_cluster
             num_persistent_ctas = cutlass.min(num_ctas_in_problem, num_ctas_per_wave)
             num_persistent_clusters = num_persistent_ctas // num_ctas_per_cluster
-            return (*params.cluster_shape_mn, num_persistent_clusters)
+            return (
+                params.cluster_shape_mnk[0],
+                params.cluster_shape_mnk[1],
+                params.cluster_shape_mnk[2] * num_persistent_clusters,
+            )
 
     @cute.jit
-    def _swizzle_cta(self, cluster_id_in_problem: Int32, *, loc=None, ip=None) -> Tuple[Int32, Int32]:
+    def _swizzle_cta(
+        self, cluster_id_in_problem: Int32, *, loc=None, ip=None
+    ) -> Tuple[Int32, Int32]:
         # CTA Swizzle to promote L2 data reuse
         params = self.params
         group_size = params.group_size_fdd.divisor
-        group_id = utils.ceil((utils.sqrt(2 * cluster_id_in_problem + 2.25) - 0.5) * params.group_size_inv_f32) - 1
+        group_id = (
+            utils.ceil(
+                (utils.sqrt(2 * cluster_id_in_problem + 2.25) - 0.5) * params.group_size_inv_f32
+            )
+            - 1
+        )
         cid_m_start = group_id * group_size
         id_in_group = cluster_id_in_problem - (cid_m_start * (cid_m_start + 1)) // 2
-        group_size_actual = group_size if group_id < params.num_groups_regular else params.group_size_tail_fdd.divisor
+        group_size_actual = (
+            group_size
+            if group_id < params.num_groups_regular
+            else params.group_size_tail_fdd.divisor
+        )
         group_col, group_remainder = Int32(0), Int32(0)
         if group_id < params.num_groups_regular:
             group_col, group_remainder = divmod(id_in_group, params.group_size_mul_group_size_fdd)
         else:  # tail part
-            group_col, group_remainder = divmod(id_in_group, params.group_size_tail_mul_group_size_fdd)
+            group_col, group_remainder = divmod(
+                id_in_group, params.group_size_tail_mul_group_size_fdd
+            )
         cid_m_in_group, cid_n_in_group = Int32(0), Int32(0)
         if id_in_group >= group_size_actual * group_size * group_id:  # triangular tail
             cid_m_in_group, cid_n_in_group = triangular_idx_to_coord(group_remainder)
@@ -677,18 +753,25 @@ class TriangularTileScheduler(TileScheduler):
             if const_expr(params.persistence_mode == PersistenceMode.NONE):
                 is_valid = self.num_tiles_executed == 0
             else:
-                is_valid = work_idx < params.num_clusters_per_problem_fdd.divisor * params.problem_shape_ncluster_mnl[2]
+                is_valid = (
+                    work_idx
+                    < params.num_clusters_per_problem_fdd.divisor
+                    * params.problem_shape_ncluster_mnl[2]
+                )
         pid_m, pid_n, batch_idx = Int32(0), Int32(0), Int32(0)
         if is_valid:
             if const_expr(params.persistence_mode in [PersistenceMode.NONE, PersistenceMode.CLC]):
                 cluster_id_in_problem = work_idx
-                _, _, bidz_ = cute.arch.block_idx()
+                _, _, bidz_ = cute.arch.cluster_idx()
             else:
                 bidz_, cluster_id_in_problem = divmod(work_idx, params.num_clusters_per_problem_fdd)
+                cluster_id_in_problem = Int32(cluster_id_in_problem)  # divmod returns IntValue
             if const_expr(bidz is not None):
                 bidz_ = bidz
             cid_m, cid_n = self._swizzle_cta(cluster_id_in_problem, loc=loc, ip=ip)
-            pid_m, pid_n = self._cluster_id_to_cta_id(cid_m, cid_n, block_zero_only=block_zero_only, loc=loc, ip=ip)
+            pid_m, pid_n = self._cluster_id_to_cta_id(
+                cid_m, cid_n, block_zero_only=block_zero_only, loc=loc, ip=ip
+            )
             batch_idx = bidz_
         tile_coord_mnkl = (pid_m, pid_n, None, batch_idx)
         # tidx, _, _ = cute.arch.thread_idx()
@@ -699,7 +782,7 @@ class TriangularTileScheduler(TileScheduler):
 
 
 @dataclass
-class VarlenMTileSchedulerArguments(ParamsBase):
+class VarlenMTileSchedulerArguments:
     problem_shape_ntile_mnl: cute.Shape
     total_m: Int32
     cu_seqlens_m: cute.Tensor
@@ -713,7 +796,7 @@ class VarlenMTileSchedulerArguments(ParamsBase):
 
 class VarlenMTileScheduler(TileScheduler):
     @dataclass
-    class Params(ParamsBase):
+    class Params:
         problem_shape_ncluster_mnl: cute.Shape
         total_m: Int32
         cu_seqlens_m: cute.Tensor
@@ -724,28 +807,34 @@ class VarlenMTileScheduler(TileScheduler):
         num_clusters_in_group_fdd: FastDivmod
         tile_shape_mn: cutlass.Constexpr[cute.Shape]
         tile_count_semaphore: Optional[cute.Pointer]
-        cluster_shape_mn: cutlass.Constexpr[cute.Shape]
+        cluster_shape_mnk: cutlass.Constexpr[cute.Shape]
         persistence_mode: cutlass.Constexpr[PersistenceMode]
 
         @staticmethod
         @cute.jit
-        def create(args: TileSchedulerArguments, *, loc=None, ip=None) -> "VarlenMTileScheduler.Params":
-            assert args.cluster_shape_mnk[2] == 1
-            cluster_shape_mn = const_expr(cute.select(args.cluster_shape_mnk, mode=[0, 1]))
+        def create(
+            args: TileSchedulerArguments, *, loc=None, ip=None
+        ) -> "VarlenMTileScheduler.Params":
             # problem_shape_ntile_mnl[0] will be None for VarlenM
             problem_shape_ntile_mn = cute.select(args.problem_shape_ntile_mnl, mode=[0, 1])
             problem_shape_ncluster_mn = (
                 None,
-                cute.ceil_div(problem_shape_ntile_mn[1], cluster_shape_mn[1]),
+                cute.ceil_div(problem_shape_ntile_mn[1], args.cluster_shape_mnk[1]),
             )
-            problem_shape_ncluster_mnl = problem_shape_ncluster_mn + (args.problem_shape_ntile_mnl[2],)
+            problem_shape_ncluster_mnl = problem_shape_ncluster_mn + (
+                args.problem_shape_ntile_mnl[2],
+            )
             raster_order = const_expr(
                 RasterOrder.AlongM
                 if args.raster_order == RasterOrderOption.AlongM
                 else RasterOrder.AlongN  # For Heuristic we also use AlongN
             )
-            ncluster_fast = problem_shape_ncluster_mn[0 if raster_order == RasterOrder.AlongM else 1]
-            ncluster_slow = problem_shape_ncluster_mn[1 if raster_order == RasterOrder.AlongM else 0]
+            ncluster_fast = problem_shape_ncluster_mn[
+                0 if raster_order == RasterOrder.AlongM else 1
+            ]
+            ncluster_slow = problem_shape_ncluster_mn[
+                1 if raster_order == RasterOrder.AlongM else 0
+            ]
             if const_expr(ncluster_fast is not None):
                 group_size = min(args.group_size, ncluster_fast)
                 group_size_tail = ncluster_fast % group_size
@@ -764,11 +853,15 @@ class VarlenMTileScheduler(TileScheduler):
                 group_size,
                 FastDivmod(group_size) if ncluster_fast is not None else None,
                 # Don't divide by 0
-                FastDivmod(group_size_tail if group_size_tail > 0 else 1) if group_size_tail is not None else None,
+                FastDivmod(group_size_tail if group_size_tail > 0 else 1)
+                if group_size_tail is not None
+                else None,
                 FastDivmod(num_clusters_in_group) if num_clusters_in_group is not None else None,
                 args.tile_shape_mn,
-                args.tile_count_semaphore if const_expr(args.persistence_mode == PersistenceMode.DYNAMIC) else None,
-                cluster_shape_mn,
+                args.tile_count_semaphore
+                if const_expr(args.persistence_mode == PersistenceMode.DYNAMIC)
+                else None,
+                args.cluster_shape_mnk,
                 args.persistence_mode,
             )
 
@@ -806,7 +899,10 @@ class VarlenMTileScheduler(TileScheduler):
     def _cluster_idx_to_work_idx_batch(
         params: Params, cluster_idx: Tuple[Int32, Int32, Int32], *, loc=None, ip=None
     ) -> Tuple[Int32, Optional[Int32]]:
-        current_work_idx = Int32(cluster_idx[2])
+        if const_expr(params.persistence_mode in [PersistenceMode.NONE, PersistenceMode.CLC]):
+            current_work_idx = Int32(cluster_idx[0])
+        else:
+            current_work_idx = Int32(cluster_idx[2])
         batch_idx = None
         return current_work_idx, batch_idx
 
@@ -826,7 +922,8 @@ class VarlenMTileScheduler(TileScheduler):
         )
         stages = 0
         if const_expr(
-            params.persistence_mode in [PersistenceMode.STATIC, PersistenceMode.DYNAMIC, PersistenceMode.CLC]
+            params.persistence_mode
+            in [PersistenceMode.STATIC, PersistenceMode.DYNAMIC, PersistenceMode.CLC]
         ):
             assert sched_smem is not None
             assert scheduler_pipeline is not None
@@ -856,15 +953,23 @@ class VarlenMTileScheduler(TileScheduler):
         loc=None,
         ip=None,
     ) -> Tuple[Int32, Int32, Int32]:
-        block_size = params.tile_shape_mn[0] * params.cluster_shape_mn[0]
+        block_size = params.tile_shape_mn[0] * params.cluster_shape_mnk[0]
         num_batch = params.problem_shape_ncluster_mnl[2]
         total_clusters_m_max = (params.total_m + num_batch * (block_size - 1)) // block_size
         total_clusters_max = total_clusters_m_max * params.problem_shape_ncluster_mnl[1]
         if const_expr(params.persistence_mode in [PersistenceMode.NONE, PersistenceMode.CLC]):
-            return (*params.cluster_shape_mn, total_clusters_max)
+            return (
+                params.cluster_shape_mnk[0] * total_clusters_max,
+                params.cluster_shape_mnk[1],
+                params.cluster_shape_mnk[2],
+            )
         else:
             num_persistent_clusters = cutlass.min(max_active_clusters, total_clusters_max)
-            return (*params.cluster_shape_mn, num_persistent_clusters)
+            return (
+                params.cluster_shape_mnk[0],
+                params.cluster_shape_mnk[1],
+                params.cluster_shape_mnk[2] * num_persistent_clusters,
+            )
 
     @cute.jit
     def _swizzle_cta(
@@ -885,16 +990,26 @@ class VarlenMTileScheduler(TileScheduler):
             num_clusters = num_clusters_m * params.problem_shape_ncluster_mnl[1]
             if (group_id + 1) * num_clusters_in_group <= num_clusters:
                 cid_slow, cid_fast_in_group = divmod(id_in_group, params.group_size_fdd)
+                # if cid_slow % 2 == 1:  # inner serpentine
+                #     cid_fast_in_group = params.group_size_fdd.divisor - 1 - cid_fast_in_group
             else:  # tail part
                 cid_slow, cid_fast_in_group = divmod(id_in_group, params.group_size_tail_fdd)
+                # if cid_slow % 2 == 1:  # inner serpentine
+                #     cid_fast_in_group = params.group_size_tail_fdd.divisor - 1 - cid_fast_in_group
         else:
             assert params.raster_order == RasterOrder.AlongM
-            group_size_actual = cutlass.min(params.group_size, num_clusters_m - group_id * params.group_size)
+            group_size_actual = cutlass.min(
+                params.group_size, num_clusters_m - group_id * params.group_size
+            )
             cid_slow = id_in_group // group_size_actual
             cid_fast_in_group = id_in_group - cid_slow * group_size_actual
+            # if cid_slow % 2 == 1:  # inner serpentine
+            #     cid_fast_in_group = group_size_actual - 1 - cid_fast_in_group
         if group_id % 2 == 1:  # serpentine order
             ncluster_slow = (
-                params.problem_shape_ncluster_mnl[1] if params.raster_order == RasterOrder.AlongM else num_clusters_m
+                params.problem_shape_ncluster_mnl[1]
+                if params.raster_order == RasterOrder.AlongM
+                else num_clusters_m
             )
             cid_slow = ncluster_slow - 1 - cid_slow
         cid_fast = group_id * params.group_size + cid_fast_in_group
@@ -904,7 +1019,9 @@ class VarlenMTileScheduler(TileScheduler):
         return cid_m, cid_n
 
     @cute.jit
-    def _get_num_m_blocks(self, lane: Int32, bidb_start: Int32, block_size: cutlass.Constexpr[int]) -> Int32:
+    def _get_num_m_blocks(
+        self, lane: Int32, bidb_start: Int32, block_size: cutlass.Constexpr[int]
+    ) -> Int32:
         num_batch = self.params.problem_shape_ncluster_mnl[2]
         batch_idx = lane + bidb_start
         cur_cu_seqlen = Int32(0)
@@ -913,7 +1030,9 @@ class VarlenMTileScheduler(TileScheduler):
         next_cu_seqlen = cute.arch.shuffle_sync_down(cur_cu_seqlen, offset=1)
         seqlen = next_cu_seqlen - cur_cu_seqlen
         return (
-            cute.ceil_div(seqlen, block_size) if batch_idx < num_batch and lane < cute.arch.WARP_SIZE - 1 else Int32(0)
+            cute.ceil_div(seqlen, block_size)
+            if batch_idx < num_batch and lane < cute.arch.WARP_SIZE - 1
+            else Int32(0)
         )
 
     @cute.jit
@@ -931,7 +1050,7 @@ class VarlenMTileScheduler(TileScheduler):
         params = self.params
         lane_idx = cute.arch.lane_idx()
         num_batch = self.params.problem_shape_ncluster_mnl[2]
-        block_size = params.tile_shape_mn[0] * params.cluster_shape_mn[0]
+        block_size = params.tile_shape_mn[0] * params.cluster_shape_mnk[0]
         batch_idx = self._current_batch_idx
         next_tile_idx = work_idx
 
@@ -942,11 +1061,15 @@ class VarlenMTileScheduler(TileScheduler):
             is_valid = is_valid_
         if is_valid:
             while problems_end_tile <= next_tile_idx:
-                num_clusters_m = self._get_num_m_blocks(lane_idx, bidb_start=batch_idx, block_size=block_size)
+                num_clusters_m = self._get_num_m_blocks(
+                    lane_idx, bidb_start=batch_idx, block_size=block_size
+                )
                 num_clusters = num_clusters_m * params.problem_shape_ncluster_mnl[1]
                 num_clusters_cumulative = utils.warp_prefix_sum(num_clusters, lane_idx)
                 # Total number of blocks for the next 31 problems, same for all lanes
-                clusters_in_problems = cute.arch.shuffle_sync(num_clusters_cumulative, cute.arch.WARP_SIZE - 1)
+                clusters_in_problems = cute.arch.shuffle_sync(
+                    num_clusters_cumulative, cute.arch.WARP_SIZE - 1
+                )
                 problems_end_tile += clusters_in_problems
                 if problems_end_tile <= next_tile_idx:
                     batch_idx += cute.arch.WARP_SIZE - 1
@@ -967,7 +1090,9 @@ class VarlenMTileScheduler(TileScheduler):
             # The next problem to process is the first one that does not have ending tile position
             # that is greater than or equal to tile index.
             batch_idx_in_problems = cute.arch.popc(
-                cute.arch.vote_ballot_sync(problems_start_tile + num_clusters_cumulative <= next_tile_idx)
+                cute.arch.vote_ballot_sync(
+                    problems_start_tile + num_clusters_cumulative <= next_tile_idx
+                )
             )
             batch_idx += batch_idx_in_problems
             num_clusters_prev_lane = (
@@ -980,7 +1105,9 @@ class VarlenMTileScheduler(TileScheduler):
             cluster_id_in_problem = next_tile_idx - num_work_idx_before_cur_batch
             # if cute.arch.thread_idx()[0] == 128: cute.printf("SingleTileVarlenScheduler: tile_idx=%d, batch_idx=%d, cid_n=%d, cid_m=%d, is_valid = %d", self._tile_idx, batch_idx, cid_n, cid_m, is_valid)
             cid_m, cid_n = self._swizzle_cta(cluster_id_in_problem, num_clusters_m, loc=loc, ip=ip)
-        pid_m, pid_n = self._cluster_id_to_cta_id(cid_m, cid_n, block_zero_only=block_zero_only, loc=loc, ip=ip)
+        pid_m, pid_n = self._cluster_id_to_cta_id(
+            cid_m, cid_n, block_zero_only=block_zero_only, loc=loc, ip=ip
+        )
         tile_coord_mnkl = (pid_m, pid_n, None, batch_idx)
         self._current_batch_idx = batch_idx
         self._num_work_idx_before_cur_batch = num_work_idx_before_cur_batch
