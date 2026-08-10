@@ -21,16 +21,21 @@ Message Flow:
 """
 
 import json
-import pickle
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any, Dict, Optional
+
+import msgpack
+import torch
 
 from xorl.server.protocol.operations import (
     EmptyData,
     OperationPayload,
+    payload_from_dict,
+    payload_to_dict,
 )
 
 
@@ -68,6 +73,9 @@ class MessageType(str, Enum):
     LOAD_ADAPTER_STATE = "load_adapter_state"
     GET_ADAPTER_INFO = "get_adapter_info"
     KILL_SESSION = "kill_session"
+    START_ZORL_GENERATION = "start_zorl_generation"
+    APPLY_ZORL_REWARDS = "apply_zorl_rewards"
+    ABORT_ZORL_GENERATION = "abort_zorl_generation"
     SHUTDOWN = "shutdown"
     SAVE_FULL_WEIGHTS = "save_full_weights"
 
@@ -93,20 +101,7 @@ class BaseMessage:
     def from_json(cls, json_str: str) -> "BaseMessage":
         """Deserialize from JSON string."""
         data = json.loads(json_str)
-        # Determine which subclass to instantiate based on message_type
-        msg_type = data.get("message_type")
-
-        if msg_type == MessageType.READY:
-            return RunnerReady(**data)
-        elif msg_type == MessageType.ACKNOWLEDGEMENT:
-            return RunnerAck(**data)
-        elif msg_type == MessageType.RESPONSE:
-            return RunnerResponse(**data)
-        elif msg_type == MessageType.REQUEST:
-            return RunnerDispatchCommand(**data)
-        else:
-            # Fallback to base class
-            return cls(**data)
+        return _message_from_mapping(data)
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}(type={self.message_type}, id={self.message_id[:8]}...)"
@@ -227,14 +222,118 @@ class RunnerDispatchCommand(BaseMessage):
 # ============================================================================
 
 
+_WIRE_VERSION = 1
+_MAX_WIRE_BYTES = 1024 * 1024 * 1024
+_TENSOR_MARKER = "__xorl_tensor_v1__"
+_TORCH_DTYPES = {
+    str(dtype): dtype
+    for dtype in (
+        torch.bool,
+        torch.uint8,
+        torch.int8,
+        torch.int16,
+        torch.int32,
+        torch.int64,
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+        torch.float64,
+    )
+}
+
+
+def _msgpack_default(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach().cpu().contiguous()
+        raw = tensor.view(torch.uint8).numpy().tobytes()
+        return {
+            _TENSOR_MARKER: True,
+            "dtype": str(tensor.dtype),
+            "shape": list(tensor.shape),
+            "data": raw,
+        }
+    if isinstance(value, Enum):
+        return value.value
+    if isinstance(value, Path):
+        return str(value)
+    raise TypeError(f"Unsupported runner protocol value: {type(value).__name__}")
+
+
+def _msgpack_object_hook(value: Dict[str, Any]) -> Any:
+    if value.get(_TENSOR_MARKER) is not True:
+        return value
+    if set(value) != {_TENSOR_MARKER, "dtype", "shape", "data"}:
+        raise ValueError("Invalid tensor payload fields")
+    dtype = _TORCH_DTYPES.get(value["dtype"])
+    shape = value["shape"]
+    raw = value["data"]
+    if dtype is None or not isinstance(shape, list) or not isinstance(raw, bytes):
+        raise ValueError("Invalid tensor payload metadata")
+    if len(shape) > 16 or any(not isinstance(dim, int) or dim < 0 for dim in shape):
+        raise ValueError("Invalid tensor payload shape")
+    numel = 1
+    for dim in shape:
+        numel *= dim
+        if numel > _MAX_WIRE_BYTES:
+            raise ValueError("Tensor payload is too large")
+    expected_bytes = numel * torch.empty((), dtype=dtype).element_size()
+    if len(raw) != expected_bytes:
+        raise ValueError("Tensor payload byte count does not match its shape and dtype")
+    byte_tensor = torch.frombuffer(bytearray(raw), dtype=torch.uint8)
+    return byte_tensor.view(dtype).reshape(shape).clone()
+
+
+def _message_to_mapping(message: BaseMessage) -> Dict[str, Any]:
+    data = asdict(message)
+    if isinstance(message, RunnerDispatchCommand):
+        data["payload"] = payload_to_dict(message.payload)
+    return data
+
+
+def _message_from_mapping(data: Any) -> BaseMessage:
+    if not isinstance(data, dict):
+        raise ValueError("Runner protocol message must be a map")
+    msg_type = data.get("message_type")
+    if msg_type == MessageType.READY:
+        return RunnerReady(**data)
+    if msg_type == MessageType.ACKNOWLEDGEMENT:
+        return RunnerAck(**data)
+    if msg_type == MessageType.RESPONSE:
+        return RunnerResponse(**data)
+    if msg_type == MessageType.REQUEST:
+        operation = data.get("operation")
+        payload = data.get("payload")
+        if not isinstance(operation, str) or not isinstance(payload, dict):
+            raise ValueError("Runner request requires a string operation and map payload")
+        request_data = dict(data)
+        request_data["payload"] = payload_from_dict(operation, payload)
+        return RunnerDispatchCommand(**request_data)
+    raise ValueError(f"Unknown runner protocol message type: {msg_type!r}")
+
+
 def serialize_message(message: BaseMessage) -> bytes:
-    """Serialize message to bytes for ZMQ transmission."""
-    return pickle.dumps(message, protocol=pickle.HIGHEST_PROTOCOL)
+    """Serialize a typed message without executable object deserialization."""
+    if not isinstance(message, BaseMessage):
+        raise TypeError(f"Expected BaseMessage, got {type(message).__name__}")
+    envelope = {"version": _WIRE_VERSION, "message": _message_to_mapping(message)}
+    return msgpack.packb(envelope, use_bin_type=True, default=_msgpack_default)
 
 
 def deserialize_message(data: bytes) -> BaseMessage:
-    """Deserialize message from bytes."""
-    return pickle.loads(data)
+    """Deserialize a bounded, schema-checked MessagePack message."""
+    if not isinstance(data, bytes) or not data or len(data) > _MAX_WIRE_BYTES:
+        raise ValueError("Invalid runner protocol frame size")
+    envelope = msgpack.unpackb(
+        data,
+        raw=False,
+        strict_map_key=True,
+        object_hook=_msgpack_object_hook,
+    )
+    if not isinstance(envelope, dict) or set(envelope) != {"version", "message"}:
+        raise ValueError("Invalid runner protocol envelope")
+    if envelope["version"] != _WIRE_VERSION:
+        raise ValueError(f"Unsupported runner protocol version: {envelope['version']!r}")
+    return _message_from_mapping(envelope["message"])
 
 
 def create_ack_for_request(request: RunnerDispatchCommand) -> RunnerAck:

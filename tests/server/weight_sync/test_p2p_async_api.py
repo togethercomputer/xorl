@@ -5,6 +5,15 @@ from xorl.server.weight_sync.backends.base import EndpointConfig, TransportConfi
 from xorl.server.weight_sync.backends.p2p import P2PTransportBackend, _BucketTiming, _do_async_transfer
 
 
+@pytest.fixture(autouse=True)
+def _render_fake_endpoint_hosts_without_dns(monkeypatch):
+    monkeypatch.setattr(
+        p2p,
+        "build_http_endpoint_url",
+        lambda host, port, path: f"http://{host}:{port}{path}",
+    )
+
+
 class DoneEvent:
     def synchronize(self):
         return None

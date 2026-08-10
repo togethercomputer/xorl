@@ -137,8 +137,6 @@ class TestPPNcclTransferBuffer:
         t1 = torch.randn(4, 3, dtype=torch.bfloat16)
         t2 = torch.randn(2, 5, dtype=torch.bfloat16)
         t3 = torch.randn(8, dtype=torch.bfloat16)
-        buffer = [("a.weight", t1), ("b.weight", t2), ("c.bias", t3)]
-
         # Pre-compute what sender would produce
         meta = [("a.weight", [4, 3]), ("b.weight", [2, 5]), ("c.bias", [8])]
         flat = torch.cat([t1.reshape(-1), t2.reshape(-1), t3.reshape(-1)])

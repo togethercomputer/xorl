@@ -14,6 +14,7 @@ class TestWeightVersionForwarding:
         handler = MagicMock()
         handler.rank = 0
         handler._broadcast_buffer = WeightSyncHandler._broadcast_buffer.__get__(handler)
+        handler._strip_compile_orig_mod = WeightSyncHandler._strip_compile_orig_mod
 
         backend = MagicMock()
         buffer = [("layer.weight", torch.ones(2, 3, dtype=torch.bfloat16))]
