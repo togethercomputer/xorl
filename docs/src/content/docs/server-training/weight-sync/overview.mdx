@@ -127,8 +127,8 @@ POST /sync_inference_weights          # shorthand alias
   "group_name": "sync_group_0",
   "buffer_size_mb": 512,
   "pause_mode": "retract",
-  "flush_cache": false,
-  "cache_invalidation_mode": "auto"
+  "flush_cache": true,
+  "cache_invalidation_mode": "flush"
 }
 ```
 
@@ -138,11 +138,11 @@ POST /sync_inference_weights          # shorthand alias
 | `master_port` | `0` | Rendezvous port; `0` selects an ephemeral port. The xorl-client helper defaults to `29600` |
 | `group_name` | `"weight_sync_group"` | Group name used by transports that require a process group |
 | `buffer_size_mb` | `1024` | Transfer bucket size; reduce it if sync preparation exceeds memory |
-| `pause_mode` | `"in_place"` | `in_place`, `retract`, or `abort`. Use `retract` whenever cache invalidation may flush; `in_place` is safe only when the resolved invalidation mode is `none` and `flush_cache=false` |
-| `flush_cache` | `false` | Explicitly request receiver KV/prefix-cache invalidation |
-| `cache_invalidation_mode` | `"auto"` | `auto` flushes for the currently detected FP8-weight/FP8-KV combination; `flush` always flushes; `none` relies on receiver versioning. Pair `auto` or `flush` with `pause_mode: "retract"` |
+| `pause_mode` | `"in_place"` | `in_place`, `retract`, or `abort`. The raw default is not safe for an online weight update when cached state may exist. Use `retract` with cache invalidation; use `abort` only when dropping in-flight requests is acceptable |
+| `flush_cache` | `false` | Explicitly request receiver KV/prefix-cache invalidation. Set this to `true` for online updates against the pinned receiver |
+| `cache_invalidation_mode` | `"auto"` | `auto` adds a flush only for the detected FP8-weight/FP8-KV combination; it is not a general cache-safety policy. Select `flush` for online updates. `none` disables invalidation and is unsafe when cache entries can survive the update |
 
-The REST defaults are shown above, but the combination must be chosen as a unit. For an FP8-weight sync to an FP8-KV endpoint, `auto` resolves to a flush; retaining the running batch with `in_place` then makes the receiver reject the flush. Use `retract` with `auto`/`flush`, or use both `in_place` and `cache_invalidation_mode: "none"` when preserving in-flight requests and relying on versioned cache handling.
+The REST defaults are shown above, but callers must override them as a unit for online weight updates. The pinned receiver does not version KV or prefix-cache entries by weight: `weight_version` is control-plane metadata only. Therefore every update that may be followed by cache reuse must invalidate the cache. Because the receiver cannot flush while retaining a running batch in place, use `pause_mode: "retract"` with `cache_invalidation_mode: "flush"` (and `flush_cache: true`, as shown). Do not use `in_place` or `none` to preserve cache entries across a weight change.
 
 The sync is synchronous from the caller's perspective — the endpoint returns once all inference servers have received the weights.
 

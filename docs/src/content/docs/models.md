@@ -27,7 +27,7 @@ A registered architecture has a loadable XoRL implementation. It does not imply 
 | Qwen3.5 | `Qwen3_5ForCausalLM`, `Qwen3_5ForConditionalGeneration` | `examples/local/dummy/configs/full/qwen3_5_4b.yaml` |
 | Qwen3.5 MoE | `Qwen3_5MoeForCausalLM`, `Qwen3_5MoeForConditionalGeneration` | `examples/server/configs/full/qwen3_5_35b_a3b_full.yaml` |
 
-The registry is defined in [`src/xorl/models/registry.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/models/registry.py). The loader selects the first supported entry in the configuration's `architectures` field and reports the registered names when no match exists.
+The registry is defined in [`src/xorl/models/registry.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/models/registry.py). When `architectures` is a list, the loader selects its first entry (`architectures[0]`). It does not scan later entries for a supported architecture; if the first entry is not registered, loading fails and reports the registered names.
 
 ## Checkpoint format
 

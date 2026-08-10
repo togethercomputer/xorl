@@ -99,7 +99,7 @@ Two additional fixes on top of the upstream merge:
 
 ### KV Cache Flush on Weight Update
 
-Cache invalidation follows the sync request. `cache_invalidation_mode: auto` resolves to a flush for FP8 weight sync into an FP8-KV endpoint; `flush` always requests one, and `none` relies on receiver versioning. A flush must be paired with `pause_mode: retract` so no running batch is retained. Use `pause_mode: in_place` only with `cache_invalidation_mode: none` and `flush_cache: false`. See the [weight-sync overview](/xorl/server-training/weight-sync/overview/) for the valid combinations.
+The pinned receiver does not associate KV or prefix-cache entries with `weight_version`; that value is control-plane metadata only. Invalidate cached state after every online weight update that may be followed by cache reuse. Select `cache_invalidation_mode: flush` with `pause_mode: retract` (or `abort` when dropping requests is acceptable). Do not carry cached state across an update with `cache_invalidation_mode: none` or `pause_mode: in_place`. See the [weight-sync overview](/xorl/server-training/weight-sync/overview/) for the safe request.
 
 ---
 
