@@ -7,8 +7,8 @@ title: Adding New Tests
 Put tests in the appropriate subdirectory under `tests/`. Mirror the source layout in `src/xorl/`:
 
 ```
-src/xorl/data/collators/packing.py  →  tests/data/collators/test_packing.py
-src/xorl/models/moe/routing.py      →  tests/models/test_moe_routing.py
+src/xorl/data/collators/packing_concat_collator.py  →  tests/data/collators/test_packing_concat_collator.py
+src/xorl/models/layers/moe/router.py                →  tests/models/test_topk_router.py
 ```
 
 ## Basic structure

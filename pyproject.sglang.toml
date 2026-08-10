@@ -11,8 +11,8 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project.urls]
-"Homepage" = "https://github.com/xorl-org/xorl"
-"Source Code" = "https://github.com/xorl-org/xorl"
+"Homepage" = "https://github.com/togethercomputer/xorl"
+"Source Code" = "https://github.com/togethercomputer/xorl"
 
 [project]
 name = "xorl"

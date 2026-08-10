@@ -2,7 +2,7 @@
 title: "Parallelism Overview"
 ---
 
-xorl supports five orthogonal parallelism dimensions that can be freely composed. Each has its own dedicated guide:
+XoRL exposes five parallelism dimensions. They share a device-mesh model, but not every combination is implemented for every architecture, adapter mode, pipeline schedule, or server feature.
 
 | Dimension | Doc | Config field | When to use |
 |---|---|---|---|
@@ -26,7 +26,7 @@ FSDP2 alone covers the majority of use cases. Add other dimensions only when nee
 
 ## How the dimensions compose
 
-Each dimension slices the GPU grid along a different axis. All five can be active simultaneously — xorl builds a multi-dimensional `DeviceMesh` that assigns every GPU a unique coordinate across all active axes.
+Each dimension slices or overlays the GPU grid along a different axis. XoRL builds the corresponding `DeviceMesh` objects and validates the selected configuration. Passing the world-size equation is necessary but not sufficient: architecture and feature-specific checks still apply.
 
 <svg viewBox="0 0 700 326" xmlns="http://www.w3.org/2000/svg" style="max-width:700px;width:100%;margin:1.5rem 0">
   <defs>
@@ -117,11 +117,24 @@ EP is **not** part of the main device mesh — it uses a separate per-PP-stage m
 
 ## Key Constraints
 
-- **PP**: `gradient_accumulation_steps >= pipeline_parallel_size`
+- **PP**: schedule, virtual-stage count, and micro-batch count must satisfy the schedule-specific validator; only `DualPipeV` universally requires `n_microbatches >= PP × virtual_stages`
 - **EP**: `num_experts % expert_parallel_size == 0`
 - **Ulysses**: `num_attention_heads % ulysses_parallel_size == 0`
 - **Ring Attention**: each packed document length divisible by `2 × ringattn_parallel_size`
 - **TP**: `num_attention_heads % tensor_parallel_size == 0`; requires `merge_qkv: false`
+
+### Important compatibility boundaries
+
+| Combination | Current boundary |
+|---|---|
+| PP + CP | Supported by the ordinary one-stage-per-rank pipeline path and checked-in examples |
+| PP + EP | Supported with one model chunk per rank; virtual PP + EP is rejected |
+| Virtual/interleaved PP + weight sync | Not supported; weight sync currently handles one model chunk per rank |
+| TP + LoRA/QLoRA model modules | Not supported; output-only `lm_head_tensor_parallel_size` is a separate topology |
+| Server multi-adapter LoRA + PP | Not supported by the adapter coordinator |
+| Any combination with a model-specific numerical contract | Subject to that architecture's backend, dtype, and topology admission checks |
+
+Use the checked-in examples as known configuration shapes and treat a successful argument validation as a configuration check, not as throughput or train/infer parity evidence.
 
 ## Source
 

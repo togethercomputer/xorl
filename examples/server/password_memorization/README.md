@@ -10,19 +10,21 @@ All tests use the unified `run_password_test.py` script:
 python run_password_test.py --model <MODEL> --steps <N> --lr <LR> [options]
 ```
 
+`run_password_test.py` does **not** choose the training implementation. It connects to an already-running XoRL server, so full-weight, LoRA, and QLoRA examples require starting that server with the corresponding YAML under `examples/server/configs/{full,lora,qlora}/`. The `--model` flag selects the tokenizer/session model and must agree with the running server; it does not convert a full-weight server into LoRA or QLoRA mode.
+
 ### Examples
 
 ```bash
-# Qwen3-8B full bf16 → FP8 inference
+# Training server: configs/full/qwen3_8b_full.yaml
 python run_password_test.py --model Qwen/Qwen3-8B --steps 16 --lr 1e-5
 
-# Qwen3-8B LoRA → FP8 inference
+# Training server: configs/lora/qwen3_8b_lora.yaml
 python run_password_test.py --model Qwen/Qwen3-8B --steps 32 --lr 1e-4
 
-# Qwen3-8B QLoRA nvfp4 → FP8, cosine LR
+# Training server: configs/qlora/qwen3_8b_qlora_nvfp4.yaml
 python run_password_test.py --model Qwen/Qwen3-8B --steps 64 --lr 5e-5 --lr-schedule cosine
 
-# Qwen3-8B QLoRA block_fp8 → FP8
+# Training server: configs/qlora/qwen3_8b_qlora_block_fp8.yaml
 python run_password_test.py --model Qwen/Qwen3-8B --steps 64 --lr 5e-4
 
 # Qwen3-Coder-30B full bf16 → FP8
@@ -65,7 +67,9 @@ python run_password_test.py --model Qwen/Qwen3-8B --steps 48 --lr 5e-5 --sync-qu
 
 ---
 
-## Test Matrix
+## Historical smoke matrix
+
+The `3/3` results below record prior password-recall smokes. They are not bound here to a source revision, container, checkpoint hash, or terminal artifact, so treat them as example workload shapes rather than current certification. Re-run the selected row and retain its revisions and output before using it as a release gate.
 
 ### Qwen3-8B (4× H100)
 

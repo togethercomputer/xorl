@@ -15,7 +15,7 @@ pytest tests/ -x
 pytest tests/data/test_data_loader.py -v
 
 # Run a single test
-pytest tests/data/test_data_loader.py::TestMicroBatchCollator::test_micro_batch_splitting -v
+pytest tests/data/test_data_loader.py::TestMicroBatchCollatorAndDistributedDataloader::test_micro_batch_splitting_set_epoch_and_builder -v
 ```
 
 ## By category

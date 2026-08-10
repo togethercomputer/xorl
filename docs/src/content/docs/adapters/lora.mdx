@@ -117,7 +117,7 @@ For QKV-fused models (default `merge_qkv: true`), target the fused projection na
 |---|---|---|
 | `enable_lora` | `false` | Enable LoRA injection |
 | `lora_rank` | `16` | Rank r of the low-rank decomposition |
-| `lora_alpha` | `32` | Scaling factor; effective LR scale = alpha/rank |
+| `lora_alpha` | `16` | Scaling factor; effective scale = alpha/rank. Examples may override it to `32`. |
 | `lora_target_modules` | `null` | List of module name patterns to inject LoRA into |
 | `save_lora_only` | `false` | Save only LoRA weights in checkpoints |
 

@@ -3,7 +3,7 @@ title: "Backend: nccl_broadcast"
 ---
 
 
-`nccl_broadcast` is the default (and currently only) weight transport backend. It uses a dedicated NCCL process group to broadcast model weights from training rank 0 to all inference TP workers.
+`nccl_broadcast` is the default weight transport backend. It uses a dedicated NCCL process group to broadcast model weights from training rank 0 to all inference TP workers. XoRL also provides `p2p` and experimental `sparse_delta` transports; see the [weight-sync overview](/xorl/server-training/weight-sync/overview/) for their support boundaries.
 
 ## Architecture
 
@@ -26,7 +26,7 @@ For each sync call:
 2. **Bucket loop** — parameters are batched into `buffer_size_mb`-sized buckets and transferred sequentially:
    - HTTP calls to `/update_weights_from_distributed` on all endpoints are fired in parallel background threads.
    - `dist.broadcast(tensor, src=0, group=sync_group)` is called for each tensor. This call blocks until every inference rank has posted its recv, so no external synchronization is needed.
-   - The last bucket carries `flush_cache=True` to signal the inference server to drop its KV cache.
+   - The final bucket carries the request's resolved cache policy. `flush_cache=True` is sent only when explicitly requested or selected by `cache_invalidation_mode`.
 
 3. **NCCL group destroy** — `dist.destroy_process_group` on the training side; `/destroy_weights_update_group` on inference.
 
@@ -87,7 +87,7 @@ For each sync call:
   <text x="615" y="110" text-anchor="middle" font-size="9" fill="#64748b">/destroy_weights_...</text>
 
   {/* flush label */}
-  <text x="420" y="188" text-anchor="middle" font-size="9" fill="#64748b">Last bucket: flush_cache=True → inference drops KV cache</text>
+  <text x="420" y="188" text-anchor="middle" font-size="9" fill="#64748b">Final bucket carries the resolved cache-invalidation decision</text>
 </svg>
 
 ## Configuration
@@ -97,7 +97,7 @@ Parameters come from the `SyncWeightsData` request body (see [overview](/xorl/se
 | Field | Default | Description |
 |---|---|---|
 | `master_address` | `"localhost"` | IP of the training head node used for TCPStore rendezvous |
-| `master_port` | `29600` | Free port for the TCPStore; must not be in use during sync |
+| `master_port` | `0` in the REST API | `0` selects an ephemeral TCPStore port; the xorl-client helper currently defaults to `29600` |
 | `group_name` | `"weight_sync_group"` | Unique NCCL group name; use different names for parallel sync groups |
 | `buffer_size_mb` | `1024` | Bucket size in MB; larger = fewer round-trips, more peak GPU memory |
 
@@ -116,7 +116,7 @@ The backend temporarily unsets `TORCHELASTIC_USE_AGENT_STORE` during group init.
 | No direct PP transfer | `supports_direct_pp_transfer = False`; PP followers ship CPU buffers to rank 0. |
 | Sequential buckets | Buckets are sent one at a time; no pipelining across buckets. |
 
-Future backends can lift these restrictions by implementing the `WeightTransportBackend` interface with `supports_direct_ep_transfer = True` or `sender_ranks` returning multiple ranks.
+The P2P backend can lift the EP restriction when its direct-EP mode is enabled. `sparse_delta` and the default NCCL backend remain rank-0 transports. All backends declare these capabilities through `WeightTransportBackend` rather than through a global weight-sync guarantee.
 
 ## Backend Interface
 

@@ -27,7 +27,7 @@ xorl is a distributed training framework for large language models built for fle
   <LinkCard title="Local Training" description="torchrun-based training with FSDP2, TP, PP, and EP." href="/xorl/training/local_training/" />
   <LinkCard title="Server Training" description="REST API-driven training for online RL and live inference." href="/xorl/server-training/overview/" />
   <LinkCard title="Parallelism" description="Overview of all supported parallelism strategies." href="/xorl/parallelism/overview/" />
-  <LinkCard title="Config Reference" description="Full reference for all local and server config fields." href="/xorl/config-reference/local/" />
+  <LinkCard title="Config Reference" description="Common local and server fields, defaults, and interactions." href="/xorl/config-reference/local/" />
   <LinkCard title="Tests" description="How to run and write tests." href="/xorl/testing/overview/" />
   <LinkCard title="Development Guide" description="Workflow, PRs, code style, and authorship." href="/xorl/development/" />
 </CardGrid>
@@ -36,7 +36,7 @@ xorl is a distributed training framework for large language models built for fle
 
 <CardGrid>
   <Card title="Composable parallelism" icon="puzzle">
-    Data (FSDP2), Tensor, Pipeline, Expert, Ulysses sequence, and Ring Attention — all composable across any combination of dimensions.
+    Data (FSDP2), Tensor, Pipeline, Expert, Ulysses sequence, and Ring Attention, with validation and documented compatibility boundaries.
   </Card>
   <Card title="Local and server training" icon="rocket">
     Run directly with `torchrun` for offline training, or use the REST API server for online RL loops with live inference engines.
@@ -45,10 +45,10 @@ xorl is a distributed training framework for large language models built for fle
     Full LoRA support with QLoRA quantization in NVFP4, Block-FP8, and NF4 formats. Adaptive quantization noise and error correction built in.
   </Card>
   <Card title="Mixture of Experts" icon="random">
-    Fused expert kernels via Triton and Quack, Expert Parallelism with AllToAll and DeepEP (NVLink-optimized), routing cache and replay.
+    Fused expert kernels via Triton and Quack, Expert Parallelism with AllToAll and DeepEP, and route recording/replay.
   </Card>
   <Card title="Weight sync" icon="forward-slash">
-    NCCL broadcast from training ranks to SGLang inference endpoints after each step, enabling tight online RL integration.
+    NCCL broadcast, Mooncake P2P, and experimental sparse-delta transfers from training to inference endpoints.
   </Card>
   <Card title="Muon optimizer" icon="approve-check">
     Newton-Schulz orthogonalized gradient descent for 2D+ weight matrices, with Nesterov momentum and configurable LR scaling.

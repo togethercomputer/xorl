@@ -570,7 +570,7 @@ train:
   data_parallel_replicate_size: 1
   expert_parallel_size: 4
 
-  gradient_accumulation_steps: 4  # must be >= pipeline_parallel_size
+  gradient_accumulation_steps: 4  # extra micro-batches reduce the 1F1B bubble
   micro_batch_size: 1
 
   enable_mixed_precision: true
@@ -692,7 +692,7 @@ data_parallel_replicate_size: 4  # 4 node replicas (IB for grad all-reduce only)
 
 ### Gradient accumulation and PP pipeline depth
 
-When PP is enabled, `gradient_accumulation_steps` determines the number of micro-batches in the pipeline. It must satisfy `gradient_accumulation_steps >= pipeline_parallel_size` (usually `>= 2 × pp_size` for good bubble rate with 1F1B):
+When PP is enabled, `gradient_accumulation_steps` determines the number of micro-batches in the pipeline. The hard constraints depend on the selected schedule; for 1F1B, increasing the count relative to `pipeline_parallel_size` improves utilization:
 
 ```yaml
 pipeline_parallel_size: 4

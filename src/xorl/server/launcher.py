@@ -1621,7 +1621,8 @@ def main():
 Examples:
 
   # Auto-launch mode (world size automatically calculated from config)
-  python -m xorl.server.launcher --mode auto --config examples/qwen3/sft.yaml
+  python -m xorl.server.launcher --mode auto \\
+    --config examples/server/configs/full/qwen3_8b_full.yaml
 
   # Override config values via CLI
   python -m xorl.server.launcher --mode auto --config server.yaml \\
@@ -1632,7 +1633,8 @@ Examples:
   # Connect mode (workers launched separately)
   # Terminal 1: Launch workers manually
   torchrun --nnodes=1 --nproc-per-node=8 -m xorl.server.runner.runner_dispatcher \\
-    examples/qwen3/sft.yaml --worker.bind_address tcp://127.0.0.1:5556
+    examples/server/configs/full/qwen3_8b_full.yaml \\
+    --worker.bind_address tcp://127.0.0.1:5556
 
   # Terminal 2: Launch API server and engine
   python -m xorl.server.launcher --mode connect --worker-address tcp://127.0.0.1:5556

@@ -3,18 +3,24 @@ title: "Weight Sync"
 ---
 
 
-Weight sync transfers the current training model weights to one or more inference servers (e.g. SGLang) running on separate GPUs. This is the key mechanism for RL training loops where the policy model must be kept in sync between the training and inference sides.
+Weight sync transfers the current training model weights to one or more inference servers (for example, xorl-sglang) running on separate GPUs. The transfer backend is selected by `sync_inference_method` in the server configuration.
 
 ## Overview
 
 ```
-Training GPUs (xorl server)
-    │  NCCL broadcast
+Training GPUs (XoRL server)
+    │  configured transport
     ▼
-Inference GPUs (SGLang)
+Inference GPUs (xorl-sglang)
 ```
 
-xorl's training server broadcasts weights to registered inference endpoints using NCCL. The broadcast group is initialized on the first sync call and reused for subsequent syncs.
+| Backend | Status | Data path | Direct EP transfer |
+|---|---|---|---|
+| `nccl_broadcast` | Default | Training rank 0 broadcasts prepared buckets to inference TP workers | No |
+| `p2p` | Supported when Mooncake/RDMA prerequisites are installed on both sides | One-sided P2P writes into registered receiver parameter memory | Optional, when direct-EP mode is enabled |
+| `sparse_delta` | Experimental | Rank 0 writes packed sparse-delta files consumed by the receiver | No |
+
+The diagram below shows the default `nccl_broadcast` path. Its dedicated NCCL group is initialized and destroyed within each sync operation; that lifecycle is not a contract shared by the P2P or sparse-delta backends.
 
 <svg viewBox="0 0 700 180" style="max-width:700px;width:100%;margin:1.5rem 0" font-family="sans-serif">
   <defs>
@@ -77,7 +83,7 @@ xorl's training server broadcasts weights to registered inference endpoints usin
   <line x1="465" y1="90" x2="498" y2="90" stroke="#2563eb" stroke-width="1.5" marker-end="url(#ws-arr)"/>
 
   {/* bottom label */}
-  <text x="350" y="168" text-anchor="middle" font-size="9" fill="#64748b">Sequential per-module: FSDP all-gather → dequant/merge LoRA → optional FP8 → broadcast</text>
+  <text x="350" y="168" text-anchor="middle" font-size="9" fill="#64748b">Default backend: FSDP all-gather → dequant/merge LoRA → optional FP8 → NCCL broadcast</text>
 </svg>
 
 ## Registering Inference Endpoints
@@ -115,18 +121,24 @@ POST /sync_inference_weights          # shorthand alias
 ```json
 {
   "master_address": "training-node-01",
-  "master_port": 29600,
+  "master_port": 0,
   "group_name": "sync_group_0",
-  "buffer_size_mb": 512
+  "buffer_size_mb": 512,
+  "pause_mode": "in_place",
+  "flush_cache": false,
+  "cache_invalidation_mode": "auto"
 }
 ```
 
-| Field | Description |
-|---|---|
-| `master_address` | IP of the training head node (used for NCCL rendezvous) |
-| `master_port` | Free port for the NCCL sync group initialization |
-| `group_name` | Unique name for the NCCL process group (use different names for different inference clusters) |
-| `buffer_size_mb` | NCCL broadcast buffer size per chunk |
+| Field | REST default | Description |
+|---|---|---|
+| `master_address` | `""` | Training-head address used for rendezvous; auto-detected when empty |
+| `master_port` | `0` | Rendezvous port; `0` selects an ephemeral port. The xorl-client helper defaults to `29600` |
+| `group_name` | `"weight_sync_group"` | Group name used by transports that require a process group |
+| `buffer_size_mb` | `1024` | Transfer bucket size; reduce it if sync preparation exceeds memory |
+| `pause_mode` | `"in_place"` | `in_place`, `retract`, or `abort`; in-place operation requires `flush_cache=false` |
+| `flush_cache` | `false` | Explicitly request receiver KV/prefix-cache invalidation |
+| `cache_invalidation_mode` | `"auto"` | `auto` flushes for the currently detected FP8-weight/FP8-KV combination; `flush` always flushes; `none` relies on receiver versioning |
 
 The sync is synchronous from the caller's perspective — the endpoint returns once all inference servers have received the weights.
 
@@ -152,12 +164,16 @@ POST /api/v1/set_sync_quantization
 ```
 ```json
 {
-  "quantization": "fp8",      // "bf16" (no quant) or "fp8"
-  "skip_modules": ["lm_head", "embed_tokens"]
+  "quantization": {
+    "quant_method": "fp8",
+    "fmt": "e4m3",
+    "weight_block_size": [128, 128],
+    "modules_to_not_convert": ["lm_head", "embed_tokens"]
+  }
 }
 ```
 
-With FP8 quantization, weights are quantized (BF16 → FP8 E4M3) on the training side before broadcasting, then dequantized on the inference side. This halves the sync bandwidth but introduces a small precision loss.
+Set `quantization` to `null` for BF16 transfer. Online quantization currently accepts the Slime/SGLang-compatible block-FP8 E4M3 format with FP32 inverse scales; unsupported INT4, AWQ, compressed-tensors, and fake-quant formats fail before transport starts. The receiver installs the transferred FP8 tensors and scale metadata rather than treating them as BF16 weights.
 
 ## Sync with LoRA
 
@@ -203,30 +219,21 @@ requests.post(f"{inference_url}/wake_up")
 The sync handler (`server/weight_sync/handler.py`) proceeds in order:
 
 1. **Health check**: Verify all inference endpoints are reachable
-2. **Backend init**: Initialize NCCL broadcast group between training + inference ranks
+2. **Backend init**: Initialize the configured NCCL, P2P, or sparse-delta transport
 3. **Per-module transfer** (sequential across PP stages if PP > 1):
    - FSDP2 all-gather to reconstruct full parameter on rank 0
    - QLoRA dequantize + LoRA merge
    - Optional FP8 requantization
-   - NCCL broadcast to all inference ranks
+   - Transfer through the selected backend
 4. **Resume inference**: Signal inference servers to resume
 
 ### Multi-PP Support
 
-For PP-sharded training, each PP stage's parameters are synced independently in sequence. All PP ranks that hold a given layer participate in the broadcast for that layer.
+For ordinary PP-sharded training, each stage's parameters are prepared in sequence and routed to the backend sender. Virtual/interleaved PP creates multiple model chunks per rank and is not currently supported by weight sync.
 
 ### EP Support
 
-Expert-parallel models: EP ranks send their expert shards directly without gathering to rank 0 first (`supports_direct_ep_transfer: true`).
-
-## Benchmark: Qwen3-235B on 8 Nodes
-
-| Config | Sync time | Transfer size |
-|---|---|---|
-| BF16, 64 training GPUs → 8 inference GPUs | ~73s | ~471 GB |
-| FP8, same topology | ~40s | ~236 GB |
-
-With NVLink: ~22 GB/s effective bandwidth per sync.
+The default NCCL backend gathers expert material to rank 0 before transfer. The P2P backend can send from multiple EP ranks only when direct-EP mode is enabled and its sender/receiver topology checks pass. The experimental sparse-delta backend remains rank-0 based.
 
 ## Source
 

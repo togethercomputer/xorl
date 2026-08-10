@@ -63,9 +63,9 @@ result = resp.json()
 ```
 
 **`pause_mode`** controls how in-flight inference requests are handled:
-- `"retract"` (default): drain and re-queue requests; they re-execute after sync
+- `"retract"`: drain and re-queue requests; they re-execute after sync
 - `"abort"`: drop in-flight requests immediately
-- `"in_place"`: keep KV cache in place (only valid when `flush_cache=False`)
+- `"in_place"` (default): keep KV cache in place (only valid when `flush_cache=False`)
 
 **`quantization`** can be specified per-call to override the default set by
 `set_sync_quantization`. If omitted, the server uses the default (or
@@ -121,14 +121,18 @@ logprobs against the same training-state weights rather than against the receive
 
 ```
 weight_sync/
-├── handler.py           # Orchestration: unshard, extract, quantize, dispatch
-├── endpoint_manager.py  # HTTP pause/resume/health for inference endpoints
-├── nccl_broadcast.py    # Low-level NCCL primitives (WeightSynchronizer)
-├── sync_primitives.py   # QLoRA collective ops, FP8 quantization helpers
+├── handler.py              # Orchestration: unshard, extract, quantize, dispatch
+├── endpoint_manager.py     # HTTP pause/resume/health for inference endpoints
+├── quantization_config.py  # Sync quantization validation and normalization
+├── source_delta_capture.py # Sparse-delta source capture
+├── sparse_delta_files.py   # Sparse-delta file format helpers
 └── backends/
-    ├── base.py          # WeightTransportBackend ABC + TransportConfig dataclass
-    ├── nccl.py          # NCCLBroadcastBackend (current default)
-    └── __init__.py      # create_backend() factory
+    ├── base.py             # WeightTransportBackend ABC + TransportConfig dataclass
+    ├── nccl_broadcast.py   # NCCLBroadcastBackend (default)
+    ├── nccl_simple.py      # Simplified NCCL transfer helper
+    ├── p2p.py              # Mooncake RDMA P2P backend
+    ├── sparse_delta.py     # Experimental packed sparse-delta backend
+    └── __init__.py         # create_backend() factory
 ```
 
 ## Design: Two Orthogonal Concerns
@@ -219,7 +223,7 @@ prepare data.  `supports_direct_ep_transfer` and `supports_direct_pp_transfer`
 let a backend skip the gather-to-rank-0 step and instead have each EP/PP rank
 send its slice directly to inference.
 
-## Current Backend: `nccl_broadcast`
+## Default backend: `nccl_broadcast`
 
 ```
 Training rank 0  ──NCCL broadcast──►  SGLang TP workers (ranks 1..N)

@@ -23,7 +23,7 @@ from xorl.ops.loss.vocab_parallel_cross_entropy import vocab_parallel_cross_entr
 # Cross-entropy computation mode shared by the local-trainer (TrainingArguments)
 # and server-runner (ServerArguments) entry points so the Literal stays in sync.
 # ``bi_fused`` runs the shared batch-invariant projection and fixed-order LSE.
-CrossEntropyMode = Literal["eager", "compiled", "bi_fused"]
+CrossEntropyMode = Literal["eager", "compiled", "bi_fused", "quack_linear", "fused_quack"]
 
 
 # ---------------------------------------------------------------------------

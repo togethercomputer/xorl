@@ -8,25 +8,25 @@ title: "Inference: xorl-sglang"
 
 ## Why a Fork?
 
-The core RL training loop requires capabilities that upstream SGLang does not provide:
+The XoRL RL integration requires the following capabilities from its pinned inference engine:
 
-1. **Weight updates from training** — the training server must push new weights to the inference server after each policy update. Upstream SGLang does not expose a distributed weight-update API.
+1. **Weight updates from training** — the training server must push new weights to the inference server after policy updates using the selected NCCL, P2P, or sparse-delta transport.
 
-2. **Per-token logprob export** — RL loss functions require `logprobs` from the rollout (old policy). SGLang must return per-token log probabilities alongside completions.
+2. **Decision-time per-token logprob export** — RL losses require the log probability from the distribution that selected each retained token, returned alongside the completion.
 
-3. **MoE routing data export (R3)** — for MoE models, the inference server's routing decisions must be exported so training can replay them exactly, ensuring gradient consistency. Upstream SGLang does not export expert routing indices.
+3. **MoE routing data export (R3)** — supported MoE paths can export expert choices so the trainer can run a route-conditioned recomputation. Reusing routes does not by itself prove logprob parity or gradient correctness.
 
-4. **Numerical alignment flags** — training and inference must produce identical logits for the same input. xorl-sglang supports the same numerical alignment flags as the xorl training server (`router_fp32`, `lm_head_fp32`, `rmsnorm_mode`, `attention_cast_bf16`, etc.).
+4. **Numerical-program controls** — xorl-sglang exposes controls used to align trainer and sampler arithmetic (`router_fp32`, `lm_head_fp32`, RMSNorm/RoPE behavior, and related paths). Matching flag names is only configuration; exactness remains revision-, model-, topology-, and trace-specific evidence.
 
 ---
 
 ## What Was Modified
 
-xorl-sglang adds ~2,500 lines across 32 files on top of upstream SGLang. The changes fall into five categories. The `xorl-rl-target` branch in the repo contains all xorl-specific commits.
+The pinned xorl-sglang `main` branch carries the XoRL integration. The exact diff against upstream changes as the fork is rebased, so this page describes stable integration surfaces instead of line or file counts.
 
 ### 1. Weight Update Endpoints and Protocol
 
-The largest change (~1,700 lines in `model_runner.py`, `scheduler_update_weights_mixin.py`, `tokenizer_communicator_mixin.py`, `http_server.py`). xorl-sglang adds several HTTP endpoints for NCCL-based weight synchronization:
+xorl-sglang adds HTTP endpoints for NCCL weight synchronization as well as receiver support used by the P2P and sparse-delta transports. Representative NCCL endpoints include:
 
 | Endpoint | Description |
 |---|---|
@@ -59,7 +59,7 @@ routed_experts = completions[i].meta_info["routed_experts"]
 # Shape: [num_tokens, num_layers, top_k], dtype: int32, base64-encoded
 ```
 
-The training server decodes and replays these routing decisions via R3, ensuring training uses the same expert assignments as inference did. This is critical for gradient consistency in GRPO/PPO training with MoE models.
+The training server can decode and replay these routing decisions so the route-conditioned trainer computation uses the exported expert assignments. That controls a discrete selection surface; it is not independent evidence that the trainer and sampler logprobs, expert arithmetic, gradients, or updated weights agree.
 
 **Expert routing weights export** (`--enable-return-expert-logits`): In addition to expert indices, xorl-sglang can also capture and return `topk_weights` (the softmax routing probabilities). The `RoutedExpertsCapturer` allocates a separate `topk_weights_buffer` in float32 to record these per layer.
 
@@ -77,7 +77,7 @@ The `RoutingReplayHandler` in xorl decodes and distributes this data across cont
 
 Modified files: `qwen3_moe.py`, `qwen3.py`, `qwen2_moe.py`, `qwen2.py`, `layernorm.py`, `server_args.py`
 
-xorl and xorl-sglang must produce identical logits for the same input. Mismatched logits lead to incorrect importance sampling ratios and degraded RL performance. xorl-sglang adds:
+Exact on-policy work requires the trainer's retained-token logprob bytes to agree with the decision-time sampler bytes for the tested revision pair. xorl-sglang provides controls used by supported numerical programs:
 
 - **`--enable-fp32-router`**: MoE router gate computation in FP32. In `Qwen3MoeSparseMoeBlock`, when `rl_on_policy_target` is set, the router uses `F.linear` in float32 with explicit `F.softmax` + `torch.topk` instead of the fused TopK kernel.
 - **`--enable-fp32-lm-head`**: LM head logits in FP32 (already upstream, but used together with the router flag).
@@ -110,7 +110,7 @@ python -m sglang.launch_server \
 
 Modified files: `model_runner.py`, `batch_invariant_ops.py`
 
-When `--rl-on-policy-target xorl-batch-invariant` is set, xorl-sglang enables batch-invariant mode. This ensures that the model produces identical outputs regardless of how requests are batched together — a requirement for correct importance sampling in RL. Without this, different batching of the same request can produce different logits due to padding interactions in attention and MoE kernels.
+When `--rl-on-policy-target xorl-batch-invariant` is set, xorl-sglang selects its batch-invariant numerical path. Admission still requires tests for the intended model, shapes, topology, and batching states; the target name alone is not a parity certificate.
 
 ### 5. Bug Fixes
 
@@ -261,17 +261,17 @@ requests.post("http://inference-node:30000/wake_up")
 
 ## Upstream Compatibility
 
-xorl-sglang tracks upstream SGLang closely and aims to rebase regularly. The modifications touch 32 files but are concentrated in a few areas:
+xorl-sglang tracks upstream SGLang and periodically rebases. Integration work is concentrated in these areas:
 
 | Area | Files modified | Nature of change |
 |---|---|---|
-| Weight sync protocol | `model_runner.py`, `scheduler_update_weights_mixin.py`, `tokenizer_communicator_mixin.py`, `http_server.py` | New endpoints and NCCL recv logic (~1,700 lines added) |
+| Weight sync protocol | Model runner, scheduler update mixins, tokenizer communication, HTTP server, and RDMA/sparse receiver paths | NCCL, P2P, and sparse-delta receive/update surfaces |
 | Routing data export | `routed_experts_capturer.py`, `io_struct.py`, `detokenizer_manager.py`, `scheduler_output_processor_mixin.py` | Additions to existing generation path |
 | Numerical alignment | `qwen3_moe.py`, `qwen3.py`, `qwen2_moe.py`, `qwen2.py`, `layernorm.py` | Conditional paths gated on `rl_on_policy_target` |
 | CLI args | `server_args.py` | New flags: `--enable-fp32-router`, `--enable-return-expert-logits`, `--enable-rdma-weight-updates`, `--rl-on-policy-target xorl` |
 | Bug fixes | `schedule_batch.py`, `scheduler.py` | Prefill-only slot leak fix |
 
-The `main` branch is periodically rebased onto upstream SGLang. The `xorl-rl-target` branch contains the xorl-specific commits on top. If you need a feature from a newer upstream SGLang release, file an issue at the xorl-sglang repo.
+Use the submodule commit pinned by the XoRL checkout. Do not infer compatibility from an unpinned xorl-sglang or upstream SGLang branch; if a needed feature is absent from the pinned revision, file an issue in the xorl-sglang repository.
 
 ## Source
 

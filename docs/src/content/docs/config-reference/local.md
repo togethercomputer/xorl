@@ -2,11 +2,13 @@
 title: Local Training Config
 ---
 
-Local training uses a nested YAML with `model`, `data`, `train`, and `lora` sections, passed to:
+Local training uses a nested YAML with `model`, `data`, `train`, `lora`, and optional `distill` sections, passed to:
 
 ```bash
 torchrun --nproc_per_node=8 -m xorl.cli.train config.yaml
 ```
+
+This page is a curated reference for commonly used fields and important interactions, not a generated inventory of every dataclass member. For the exact field set and help text at your checkout, run `python -m xorl.cli.train --help` and inspect `src/xorl/arguments.py`. A stored default of `null` can resolve to an architecture-specific effective value during startup.
 
 Any field can be overridden on the command line with `--section.field value`:
 
@@ -30,9 +32,9 @@ torchrun --nproc_per_node=8 -m xorl.cli.train config.yaml \
 | `model_path` | `null` | HF Hub ID or local path to pre-trained weights. If `null`, model is randomly initialized. |
 | `config_path` | same as `model_path` | Path to model config. Useful when config and weights are in separate locations. |
 | `tokenizer_path` | same as `config_path` | Path to tokenizer. |
-| `attn_implementation` | `flash_attention_4` | Attention backend: `eager`, `sdpa`, `native` (PyTorch SDPA+cuDNN, no deps, Hopper+Blackwell), `flash_attention_3` (FA3, Hopper), `flash_attention_4` (FA4 CUTE, Hopper+Blackwell). |
+| `attn_implementation` | `null` (resolved) | Attention backend: `eager`, `sdpa`, `native` (PyTorch SDPA+cuDNN, no deps, Hopper+Blackwell), `flash_attention_3` (FA3, Hopper), or `flash_attention_4` (FA4 CUTE, Hopper+Blackwell). An omitted value resolves to FA3 for ordinary local-training models and to the required FA4 path for exact Qwen3.5-family and canonical GLM-5.2 programs. |
 | `moe_implementation` | `null` | MoE kernel: `null` (auto), `eager`, `triton` (Triton group GEMM), `native` (torch._grouped_mm), `quack`. |
-| `ep_dispatch` | `alltoall` | Expert-parallel dispatch: `alltoall` or `deepep` (NVLink-optimized). |
+| `ep_dispatch` | `alltoall` | Expert-parallel dispatch: `alltoall` or `deepep` (GPU-resident dispatch using intra-node fabric and, when configured, NVSHMEM/RDMA across nodes). |
 | `deepep_buffer_size_gb` | `2.0` | DeepEP NVLink buffer size per GPU in GB. Only active when `ep_dispatch: deepep`. |
 | `deepep_num_sms` | `20` | SMs assigned to DeepEP communication kernels. Must be even. Lower values leave more SMs for overlapped compute. |
 | `deepep_async_combine` | `false` | Overlap DeepEP combine with the next layer's compute (experimental, unsafe). Forced to `false` in code unless `XORL_DEEPEP_UNSAFE_ASYNC_COMBINE=1` is exported; without that env var, deferring the comm-stream sync races the transformer block's read of the combined tensor on the default stream. |
@@ -106,7 +108,10 @@ Each entry in `datasets` (or `test_datasets`) is a dict:
 | `data_parallel_replicate_size` | `-1` (1) | Number of data replicas for HSDP (Hybrid Sharded DP). `-1` = auto. `dp_size = replicate × shard`. |
 | `tensor_parallel_size` | `1` | TP degree. Shards weight matrices column/row-wise across GPUs. Requires `merge_qkv: false`. |
 | `pipeline_parallel_size` | `1` | PP stages. Splits model layers across GPUs. |
-| `pipeline_parallel_schedule` | `1F1B` | PP schedule: `1F1B` (interleaved, lower memory) or `GPipe` (simpler). |
+| `pipeline_parallel_schedule` | `1F1B` | PP schedule: `1F1B`, `GPipe`, `Interleaved1F1B`, `InterleavedZeroBubble`, `ZBVZeroBubble`, or `DualPipeV`. |
+| `pipeline_parallel_virtual_stages` | `1` | Model chunks per PP rank. Interleaved schedules use multiple chunks; ZBV/DualPipeV require exactly 2. |
+| `pipeline_parallel_input_weight` | `1` | Layer-equivalent embedding cost used for stage balancing. |
+| `pipeline_parallel_output_weight` | `1` | Layer-equivalent final-norm/LM-head/CE cost used for stage balancing. |
 | `pp_variable_seq_lengths` | `true` | Dynamically negotiate max seq length per PP step via all-reduce, avoiding padding to static max. |
 | `expert_parallel_size` | `1` | EP degree for MoE models. Distributes experts across GPUs. |
 | `ulysses_parallel_size` | `1` | Ulysses context parallelism degree. |
@@ -118,7 +123,7 @@ Each entry in `datasets` (or `test_datasets`) is a dict:
 :::caution[Field interactions]
 - `data_parallel_mode: fsdp2` **requires** `init_device: meta`
 - `tensor_parallel_size > 1` **requires** `merge_qkv: false` (in model section)
-- `pipeline_parallel_size > 1` **requires** `gradient_accumulation_steps >= pipeline_parallel_size`
+- PP micro-batch requirements are schedule-specific. Interleaved schedules validate round divisibility; `DualPipeV` requires `gradient_accumulation_steps >= pipeline_parallel_size × pipeline_parallel_virtual_stages`.
 - `expert_parallel_size > 1` is incompatible with `init_device: cpu`
 - TP + LoRA is **not supported** — use FSDP2 alone for LoRA fine-tuning
 :::
@@ -162,7 +167,7 @@ Each entry in `datasets` (or `test_datasets`) is a dict:
 | `enable_mixed_precision` | `true` | BF16 mixed-precision training. |
 | `skip_param_upcast` | `false` | Skip the generic full-model fp32 parameter upcast before FSDP wrapping. This keeps checkpoint-native BF16 parameters for lower-memory full-weight runs. |
 | `enable_gradient_checkpointing` | `true` | Enable activation recomputation to reduce memory. |
-| `gradient_checkpointing_method` | `recompute_full_layer` | What to recompute in backward. Valid values: `recompute_full_layer` (recompute entire decoder layer, most memory-efficient), `recompute_before_dispatch` (recompute attn+router, keep dispatch+expert+combine, +25-34% throughput), `no_recompute` (no recomputation, max throughput, highest memory). See [gradient checkpointing guide](/xorl/training/local_training#gradient-checkpointing). |
+| `gradient_checkpointing_method` | `recompute_full_layer` | What to recompute in backward. Valid values: `recompute_full_layer` (recompute the decoder layer, lowest retained-activation memory), `recompute_before_dispatch` (recompute attention/router but retain dispatch, expert, and combine intermediates), and `no_recompute` (retain all supported activations). Throughput and fit depend on sequence shape and topology. See [gradient checkpointing guide](/xorl/training/local_training#gradient-checkpointing). |
 | `enable_reentrant` | `false` | Use reentrant gradient checkpointing. Default (non-reentrant) is generally preferred. |
 | `enable_full_shard` | `true` | FSDP2 full parameter sharding (ZeRO-3). Set `false` for ZeRO-2. |
 | `enable_forward_prefetch` | `true` | Prefetch next FSDP unit's parameters during forward pass. Also controls manual EP/module prefetch setup when required by the model. |
@@ -170,8 +175,11 @@ Each entry in `datasets` (or `test_datasets`) is a dict:
 | `activation_gpu_limit` | `0.0` | GB of activations to keep on GPU when offloading. `0.0` = offload all. |
 | `enable_compile` | `false` | `torch.compile` for model forward pass. |
 | `compile_dynamic_shapes` | `false` | Pass `dynamic=True` to `torch.compile`; keep disabled unless a workload has benchmarked a dynamic-shape win. |
-| `ce_mode` | `compiled` | Cross-entropy implementation: `compiled` (`torch.compile` + auto-chunker), `quack_linear` (Quack chunked linear+CE scalar loss; non-PP local trainer only), or `eager` (materializes logits). |
+| `ce_mode` | `null` (resolved) | Ordinary models resolve to `compiled`; current exact Qwen3.5/GLM-5.2 programs resolve to `bi_fused`. Explicit modes also include `eager`, `quack_linear`, and `fused_quack`, subject to loss/topology checks. |
 | `ce_num_chunks` | `8` | Number of token chunks for chunked/compiled cross-entropy. |
+| `enable_fp8_training` | `false` | Experimental full-weight block-FP8 compute with BF16/FP32 master parameters. Mutually exclusive with QARL. |
+| `enable_qarl` | `false` | Experimental dense full-weight E4M3 fake-quant training with STE gradients. Mutually exclusive with full-weight FP8 training. |
+| `qarl_quant_cfg` | `null` | QARL format alias or configuration; initial support accepts `FP8_DEFAULT_CFG`, `fp8`, or an admitted E4M3 dictionary. |
 | `init_device` | `cuda` | Device for weight initialization: `cpu` (rank 0 only), `cuda`, `meta` (required for FSDP2), `npu`. |
 | `load_weights_mode` | `grouped` | `grouped`: one reader per node for dense/shared weights plus one reader per EP-FSDP group for expert weights, with rank-0 fallback when grouped fanout groups are unavailable. `all_ranks`: every rank reads from disk. `skip`: skip HuggingFace weight loading and materialize model weights from `load_checkpoint_path` (DCP). |
 | `enable_full_determinism` | `false` | Full determinism mode. Requires `allow_cuda_launch_blocking: true`. Degrades performance. |
@@ -221,6 +229,18 @@ Each entry in `datasets` (or `test_datasets`) is a dict:
 | Field | Default | Description |
 |---|---|---|
 | `seed` | `42` | Global random seed for reproducibility. |
+
+---
+
+## `distill` section
+
+| Field | Default | Description |
+|---|---|---|
+| `enable_distillation` | `false` | Enable streaming distillation mode. |
+| `teacher_model_path` | `null` | Hugging Face ID or local path for the teacher model. |
+| `distillation_loss_type` | `forward_kl` | Distillation objective: `forward_kl` or `reverse_kl`. |
+| `distillation_loss_weight` | `1.0` | Weight applied to the distillation loss. |
+| `stream_num_workers` | `32` | Workers used to load streamed teacher activations. |
 
 ---
 

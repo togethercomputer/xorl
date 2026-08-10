@@ -316,7 +316,7 @@ class DataArguments:
     sample_packing_group_size: Optional[int] = field(
         default=100000,
         metadata={
-            "help": "The number of samples packed at a time. Increasing this value helps with packing, but usually only slightly (<%1)."
+            "help": "The number of samples packed at a time. Increasing this value helps with packing, but usually only slightly (<1%%)."
         },
     )
     sample_packing_bin_size: Optional[int] = field(
@@ -610,7 +610,7 @@ class ModelArguments:
         metadata={
             "help": "Backend for sparse-MLA dispatch when `sparse_mla_enabled=True`. "
             "'auto' (default) picks tilelang on CUDA + bf16 when the kernel's shape "
-            "constraints hold (`dim_plus_tail_dim == 576`, `topk % 64 == 0`), else "
+            "constraints hold (`dim_plus_tail_dim == 576`, `topk %% 64 == 0`), else "
             "the torch reference. 'torch' is the dense-gather reference, correct but "
             "slow; useful for CPU/CI and as a fallback. 'tilelang' forces the "
             "vendored kernel. 'flashmla' uses the sampler-exact public "
@@ -1204,10 +1204,10 @@ class TrainingArguments:
                 "                                dispatch + combine alltoall. Lowest memory.\n"
                 "                                Required for 128k+ seq. (default)\n"
                 "  'recompute_before_dispatch' — recompute attn + layernorm + router; keep\n"
-                "                                dispatch + expert + combine. +20% speed,\n"
-                "                                more memory than recompute_full_layer.\n"
-                "  'no_recompute'              — no recomputation, max throughput. +34% speed\n"
-                "                                but highest memory, only fits short seq.\n"
+                "                                dispatch + expert + combine. Uses more memory\n"
+                "                                but avoids replaying expert communication.\n"
+                "  'no_recompute'              — no recomputation and highest activation memory;\n"
+                "                                use only after a shape-matched fit check.\n"
             )
         },
     )
@@ -1295,7 +1295,8 @@ class TrainingArguments:
             "(model_runner) applies enable_high_precision_for_bf16() unconditionally — so out of the box "
             "local training does NOT match server/K3 numerics. Local runs must opt in (set True) whenever "
             "trainer-recomputed logprobs need to match the values measured by the K3 harness against the "
-            "server. Kept opt-in for throughput: measured +5.5% step time on a 30B-A3B MoE at 128k."
+            "server. Kept opt-in because the higher-precision matmul settings can reduce throughput; "
+            "benchmark them on the intended model and topology."
         },
     )
     allow_cuda_launch_blocking: bool = field(

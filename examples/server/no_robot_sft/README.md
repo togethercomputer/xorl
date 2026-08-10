@@ -1,6 +1,6 @@
 # Server Training Examples (Tinker/Tomi API)
 
-These examples demonstrate server-mode training where Xorl runs as a training server and an external client (using the [xorl_client](https://github.com/xorl-org/xorl_client) SDK) drives the training loop.
+These examples demonstrate server-mode training where XoRL runs as a training server and an external client (using the [xorl-client](https://github.com/togethercomputer/xorl-client) SDK) drives the training loop.
 
 ## Prerequisites
 

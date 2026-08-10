@@ -2,54 +2,59 @@
 title: Supported Models
 ---
 
-xorl currently supports the following model architectures.
+XoRL discovers model implementations through the architecture names in the checkpoint configuration. The table below reflects the classes registered by the current source tree.
 
-## Architectures
+:::caution[What “registered” means]
+A registered architecture has a loadable XoRL implementation. It does not imply that every attention backend, precision, adapter mode, parallel topology, weight-sync backend, or trainer/sampler revision pair has been qualified. A checked-in example is a stronger copy/paste starting point, but it is still not an end-to-end K3 certificate.
+:::
 
-| Architecture | HuggingFace class | Example models | Notes |
-|---|---|---|---|
-| Qwen3 (dense) | `Qwen3ForCausalLM` | `Qwen/Qwen3-8B`, `Qwen/Qwen3-32B` | Standard transformer with GQA, SwiGLU, RoPE. |
-| Qwen3-MoE | `Qwen3MoeForCausalLM` | `Qwen/Qwen3-30B-A3B`, `Qwen/Qwen3-235B-A22B` | Mixture-of-Experts with top-k routing. Weight conversion is automatic — see below. |
-| Qwen3.5 (dense) | `Qwen3_5ForCausalLM` | `Qwen/Qwen3.5-7B` | Qwen3.5 dense with hybrid full/linear attention layers. |
-| Qwen3.5-MoE | `Qwen3_5MoeForCausalLM` | `Qwen/Qwen3.5-35B-A3B`, `Qwen/Qwen3.5-397B-A17B` | Qwen3.5 MoE with hybrid attention and grouped expert routing. |
+## Registered architectures
 
-Model selection is config-based: xorl reads `model_type` from `config.json` inside `model_path` and instantiates the appropriate class automatically.
+| Model family | Registered Hugging Face architecture name(s) | Checked-in example |
+|---|---|---|
+| DeepSeek V3 | `DeepseekV3ForCausalLM` | — |
+| DeepSeek V4 | `DeepseekV4ForCausalLM` | — |
+| GLM-4 MoE | `Glm4MoeForCausalLM` | `examples/local/dummy/configs/full/glm4_moe_ep8.yaml` |
+| GLM-5 / GLM MoE DSA | `Glm5ForCausalLM`, `GlmMoeDsaForCausalLM` | — |
+| GPT-OSS | `GptOssForCausalLM` | `examples/local/dummy/configs/full/gpt_oss_20b_ep8.yaml` |
+| Llama | `LlamaForCausalLM` | `examples/local/dummy/configs/full/llama3_8b.yaml` |
+| MiniMax M3 sparse | `MiniMaxM3SparseForCausalLM`, `MiniMaxM3SparseForConditionalGeneration` | — |
+| Nemotron-H | `NemotronHForCausalLM` | — |
+| OLMo 2 | `Olmo2ForCausalLM` | — |
+| Qwen2 | `Qwen2ForCausalLM` | — |
+| Qwen3 | `Qwen3ForCausalLM` | `examples/local/dummy/configs/full/qwen3_8b.yaml` |
+| Qwen3 MoE / Coder MoE | `Qwen3MoeForCausalLM` | `examples/local/dummy/configs/full/qwen3_30b_a3b_ep8.yaml` |
+| Qwen3.5 | `Qwen3_5ForCausalLM`, `Qwen3_5ForConditionalGeneration` | `examples/local/dummy/configs/full/qwen3_5_4b.yaml` |
+| Qwen3.5 MoE | `Qwen3_5MoeForCausalLM`, `Qwen3_5MoeForConditionalGeneration` | `examples/server/configs/full/qwen3_5_35b_a3b_full.yaml` |
+
+The registry is defined in [`src/xorl/models/registry.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/models/registry.py). The loader selects the first supported entry in the configuration's `architectures` field and reports the registered names when no match exists.
 
 ## Checkpoint format
 
-xorl expects checkpoints in HuggingFace format:
+XoRL accepts Hugging Face-style checkpoints:
 
-- `config.json` — model architecture config
-- `*.safetensors` — weight shards (single file or multi-shard)
-- `tokenizer.json` / `tokenizer_config.json` — tokenizer files
+- `config.json` containing an admitted architecture and model configuration
+- one or more `*.safetensors` weight files
+- tokenizer files such as `tokenizer.json` and `tokenizer_config.json`
 
-Specify the checkpoint with `model_path` (local path or HF Hub ID). Use `config_path` and `tokenizer_path` separately if your config/tokenizer lives in a different location than the weights.
+Specify the checkpoint with `model_path`, using either a local path or Hugging Face Hub ID. Use `config_path` and `tokenizer_path` when configuration or tokenizer artifacts live elsewhere.
 
-## Key config fields for model loading
+## Model-loading fields
 
 | Field | Description |
 |---|---|
-| `model_path` | Local path or HF Hub ID for weights. |
-| `config_path` | Path to `config.json`. Defaults to `model_path`. |
-| `tokenizer_path` | Path to tokenizer files. Defaults to `config_path`. |
-| `attn_implementation` | Attention backend: `flash_attention_3`, `flash_attention_4`, `native`, `sdpa`, `eager`. |
-| `moe_implementation` | MoE kernel: `null` (auto), `triton`, `native`, `quack`, `eager`. |
+| `model_path` | Local checkpoint path or Hugging Face Hub ID. |
+| `config_path` | Configuration path. Defaults to `model_path`. |
+| `tokenizer_path` | Tokenizer path. Defaults to `config_path`. |
+| `attn_implementation` | Requested attention backend. Availability is architecture-specific. |
+| `moe_implementation` | Requested MoE kernel, such as `triton`, `native`, `quack`, or `eager`. Availability is architecture-specific. |
 
-## Tested configurations
+## Checked-in server configurations
 
-The following model + training-mode combinations have pre-built example configs under `examples/server/configs/`:
+Concrete server examples currently cover Qwen3, Qwen3-MoE/Coder, Qwen3.5-MoE, and GPT-OSS across selected full-weight, LoRA, and QLoRA modes. Browse [`examples/server/configs/`](https://github.com/togethercomputer/xorl/tree/main/examples/server/configs) for the exact filenames; do not infer an unlisted filename by changing a model size in another example.
 
-| Model | Full weights | LoRA |
-|---|---|---|
-| Qwen3-8B | `qwen3_8b_full.yaml` | `qwen3_8b_lora.yaml` |
-| Qwen3-30B-A3B (MoE) | `qwen3_30b_a3b_full.yaml` | — |
-| Qwen3-Coder-30B-A3B (MoE) | `qwen3_coder_30b_a3b_full.yaml` | `qwen3_coder_30b_a3b_lora.yaml` |
-| Qwen3-235B-A22B (MoE) | `qwen3_235b_a22b_8node_ep64.yaml` | — |
-| Qwen3.5-35B-A3B (MoE) | `qwen3_5_35b_a3b_full.yaml` | `qwen3_5_35b_a3b_lora.yaml` |
-| Qwen3.5-397B-A17B (MoE) | `qwen3_5_397b_a17b_full.yaml` | `qwen3_5_397b_a17b_lora.yaml` |
+## MoE checkpoint conversion
 
-## MoE models: automatic weight conversion
+For supported MoE families, model loading converts the source checkpoint representation into the fused expert layout required by the selected XoRL kernels. The conversion and admitted layouts are architecture-specific; no separate user preprocessing step is required for the checked-in examples.
 
-MoE checkpoints from HuggingFace store experts as a `ModuleList` (one module per expert). xorl uses fused grouped-kernel (GKN) tensors for efficient expert dispatch. This conversion happens **automatically during model loading** — no separate preprocessing step is needed. Simply point `model_path` at the standard HuggingFace checkpoint and xorl will fuse the expert weights on the fly.
-
-See the [MoE section](/xorl/moe/overview) for details on MoE-specific config options including `expert_parallel_size`, `ep_dispatch`, and `moe_implementation`.
+See [Mixture of Experts](/xorl/moe/overview/) for `expert_parallel_size`, `ep_dispatch`, and MoE implementation options.

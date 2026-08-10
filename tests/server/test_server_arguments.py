@@ -43,19 +43,26 @@ def _load_server_arguments_fn():
     fake_session_spec_mod.build_default_session_spec = lambda *args, **kwargs: None
 
     module = importlib.util.module_from_spec(spec)
-    with patch.dict(
-        sys.modules,
-        {
-            "xorl.server.api_server": fake_api_server_pkg,
-            "xorl.server.api_server.server": fake_api_server_mod,
-            "xorl.server.orchestrator": fake_orchestrator_pkg,
-            "xorl.server.orchestrator.orchestrator": fake_orchestrator_mod,
-            "xorl.server.session_spec": fake_session_spec_mod,
-            "xorl.server.utils": fake_utils_pkg,
-            "xorl.server.utils.network": fake_network_mod,
-        },
-    ):
+    stubs = {
+        "xorl.server.api_server": fake_api_server_pkg,
+        "xorl.server.api_server.server": fake_api_server_mod,
+        "xorl.server.orchestrator": fake_orchestrator_pkg,
+        "xorl.server.orchestrator.orchestrator": fake_orchestrator_mod,
+        "xorl.server.session_spec": fake_session_spec_mod,
+        "xorl.server.utils": fake_utils_pkg,
+        "xorl.server.utils.network": fake_network_mod,
+    }
+    missing = object()
+    previous = {name: sys.modules.get(name, missing) for name in stubs}
+    sys.modules.update(stubs)
+    try:
         spec.loader.exec_module(module)
+    finally:
+        for name, value in previous.items():
+            if value is missing:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = value
 
     return module.load_server_arguments
 

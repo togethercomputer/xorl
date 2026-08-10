@@ -13,7 +13,7 @@ QLoRA stores base model weights in a quantized format and adds trainable LoRA ad
 |---|---|---|---|
 | `nvfp4` | 4-bit (FP4 E2M1) | 16 | Hopper (H100) with ModelOpt checkpoints |
 | `block_fp8` | 8-bit (FP8 E4M3) | 128×128 block | Hopper, from HF FP8 checkpoints |
-| `nf4` | 4-bit (NF4) | 64 | Any GPU, quantizes from BF16 at init |
+| `nf4` | 4-bit (NF4) | 64 | Supported CUDA paths; quantizes from BF16 at initialization |
 
 <svg viewBox="0 0 700 200" style="max-width:700px;width:100%;margin:1.5rem 0" font-family="sans-serif">
   {/* background */}
@@ -99,7 +99,7 @@ lora:
 
 ### NF4
 
-NF4 quantizes BF16 weights on-the-fly during model initialization. No pre-quantized checkpoint required. Works on any GPU.
+NF4 quantizes BF16 weights during model initialization, so it does not require a pre-quantized checkpoint. Kernel and performance support still depend on the installed CUDA/PyTorch stack and target GPU; it is not a hardware-independent CPU fallback.
 
 ```yaml
   quant_format: nf4
@@ -142,7 +142,7 @@ Block-wise FP8 E4M3 quantization. Compatible with HF FP8 checkpoints (e.g., Qwen
 | `lora_alpha` | `16` | LoRA scaling factor |
 | `lora_target_modules` | `null` | Module names to inject QLoRA into |
 | `save_lora_only` | `false` | Save only LoRA weights (not packed base) |
-| `exclude_modules` | `null` | Keep these modules in BF16 (e.g. `lm_head`) |
+| `exclude_modules` (local) / `qlora_exclude_modules` (server) | `null` | Keep these modules in BF16 (for example, `lm_head`) |
 | `merge_lora_interval` | `0` | Merge LoRA into base every N steps (0 = off) |
 | `reset_optimizer_on_merge` | `false` | Reset optimizer states on merge (ReLoRA) |
 | `enable_aqn` | `false` | Adaptive Quantization Noise |
@@ -196,8 +196,10 @@ Approximate memory reduction versus BF16 full fine-tuning (per parameter):
 | Config | Memory vs BF16 |
 |---|---|
 | BF16 + LoRA (rank 16) | ~100% base + tiny LoRA |
-| NF4 + LoRA (rank 16) | ~25% base + tiny LoRA |
-| NVFP4 + LoRA (rank 16) | ~12% base + tiny LoRA |
+| NF4 + LoRA (rank 16) | Roughly 25% packed base, plus scales/metadata and LoRA |
+| NVFP4 + LoRA (rank 16) | Roughly 25% packed base, plus scales/metadata and LoRA |
+
+These figures compare raw 4-bit payloads with 16-bit weights. Actual resident memory also includes scales, correction tensors, padding, adapters, optimizer state, temporary dequantization buffers, and allocator overhead; measure the selected format and model rather than treating the table as a fit guarantee.
 
 ## Example Configs
 
@@ -207,7 +209,7 @@ See `examples/local/dummy/configs/qlora/` and `examples/server/configs/qlora/` f
 
 | File | Description |
 |---|---|
-| [`src/xorl/ops/block_fp8.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/ops/block_fp8.py) | Block FP8 quantization/dequantization ops |
-| [`src/xorl/ops/nf4.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/ops/nf4.py) | NF4 quantization ops |
+| [`src/xorl/ops/quantize/block_fp8_quantize.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/ops/quantize/block_fp8_quantize.py) | Block FP8 quantization/dequantization ops |
+| [`src/xorl/ops/quantize/nf4_quantize.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/ops/quantize/nf4_quantize.py) | NF4 quantization ops |
 | [`src/xorl/qlora/`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/qlora/) | QLoRA module implementations |
-| [`src/xorl/qlora/detect_prequantized.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/qlora/detect_prequantized.py) | Auto-detect pre-quantized checkpoints |
+| [`src/xorl/qlora/utils.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/qlora/utils.py) | Pre-quantized checkpoint detection and loading helpers |
