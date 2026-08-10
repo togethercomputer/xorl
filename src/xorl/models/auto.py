@@ -270,34 +270,72 @@ def _is_exact_qwen3_dense(config: PretrainedConfig) -> bool:
 def _validate_exact_qwen3_dense_model_scope(config: PretrainedConfig) -> None:
     if not _is_exact_qwen3_dense(config):
         return
-    expected = {
-        "hidden_size": 4096,
-        "intermediate_size": 12288,
-        "num_hidden_layers": 36,
-        "num_attention_heads": 32,
-        "num_key_value_heads": 8,
+    mismatches = []
+
+    positive_integer_fields = (
+        "hidden_size",
+        "intermediate_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "vocab_size",
+        "max_position_embeddings",
+    )
+    for name in positive_integer_fields:
+        value = getattr(config, name, None)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            mismatches.append(f"{name}={value!r} (requires a positive integer)")
+
+    required_values = {
         "head_dim": 128,
-        "vocab_size": 151936,
-        "rms_norm_eps": 1e-6,
-        "rope_theta": 1_000_000,
-        "max_position_embeddings": 40960,
         "hidden_act": "silu",
-        "tie_word_embeddings": False,
         "attention_bias": False,
         "use_sliding_window": False,
+        "attention_dropout": 0.0,
     }
-    mismatches = []
-    for name, value in expected.items():
+    for name, required in required_values.items():
         actual = getattr(config, name, None)
-        if name == "rope_theta" and actual is None:
-            rope_parameters = getattr(config, "rope_parameters", None)
-            if isinstance(rope_parameters, dict):
-                actual = rope_parameters.get("rope_theta")
-        if actual != value:
-            mismatches.append(f"{name}={actual!r} (requires {value!r})")
+        if actual != required:
+            mismatches.append(f"{name}={actual!r} (requires {required!r})")
+
+    rope_scaling = getattr(config, "rope_scaling", None)
+    if isinstance(rope_scaling, dict):
+        rope_type = rope_scaling.get("rope_type", rope_scaling.get("type", "default"))
+        unsupported_keys = set(rope_scaling) - {"rope_type", "type", "rope_theta"}
+        if rope_type not in (None, "default") or unsupported_keys:
+            mismatches.append(f"rope_scaling={rope_scaling!r} (only default RoPE is supported)")
+    elif rope_scaling:
+        mismatches.append(f"rope_scaling={rope_scaling!r} (only default RoPE is supported)")
+
+    rope_theta = getattr(config, "rope_theta", None)
+    if rope_theta is None:
+        rope_parameters = getattr(config, "rope_parameters", None)
+        if isinstance(rope_parameters, dict):
+            rope_theta = rope_parameters.get("rope_theta")
+    if not isinstance(rope_theta, (int, float)) or isinstance(rope_theta, bool) or rope_theta <= 0:
+        mismatches.append(f"rope_theta={rope_theta!r} (requires a positive number)")
+
+    rms_norm_eps = getattr(config, "rms_norm_eps", None)
+    if not isinstance(rms_norm_eps, (int, float)) or isinstance(rms_norm_eps, bool) or rms_norm_eps <= 0:
+        mismatches.append(f"rms_norm_eps={rms_norm_eps!r} (requires a positive number)")
+
+    num_attention_heads = getattr(config, "num_attention_heads", None)
+    num_key_value_heads = getattr(config, "num_key_value_heads", None)
+    if (
+        isinstance(num_attention_heads, int)
+        and isinstance(num_key_value_heads, int)
+        and num_attention_heads > 0
+        and num_key_value_heads > 0
+        and num_attention_heads % num_key_value_heads != 0
+    ):
+        mismatches.append(
+            "num_attention_heads must be divisible by num_key_value_heads "
+            f"(got {num_attention_heads} and {num_key_value_heads})"
+        )
+
     if mismatches:
         raise ValueError(
-            "The exact Qwen3-8B program supports only the official model geometry: " + ", ".join(mismatches)
+            "The exact dense Qwen3 program does not support this architecture configuration: " + ", ".join(mismatches)
         )
 
 
@@ -468,7 +506,7 @@ def _resolve_rope_modes(
     if _is_exact_qwen3_dense(config):
         if rope_native is False or rope_class_b is False:
             raise ValueError(
-                "Exact Qwen3-8B server training requires native Class-B RoPE; "
+                "Exact dense Qwen3 server training requires native Class-B RoPE; "
                 "explicit rope_native=false or rope_class_b=false is incompatible "
                 "with the model's numerical contract"
             )
@@ -561,7 +599,7 @@ def resolve_model_numerical_program(
         ]
         if incompatible:
             raise ValueError(
-                "Exact Qwen3-8B server training rejects incompatible numerical overrides: " + ", ".join(incompatible)
+                "Exact dense Qwen3 server training rejects incompatible numerical overrides: " + ", ".join(incompatible)
             )
         return ResolvedModelNumericalProgram(
             attn_implementation="flash_attention_4",
@@ -644,7 +682,7 @@ def resolve_cross_entropy_mode(config: PretrainedConfig, ce_mode: Optional[str])
         return "bi_fused"
     if _is_exact_qwen3_dense(config):
         if ce_mode not in (None, "bi_fused"):
-            raise ValueError(f"Exact Qwen3-8B server training requires ce_mode='bi_fused'; received {ce_mode!r}")
+            raise ValueError(f"Exact dense Qwen3 server training requires ce_mode='bi_fused'; received {ce_mode!r}")
         return "bi_fused"
     if not _is_exact_glm52(config):
         return ce_mode or "compiled"
@@ -782,7 +820,8 @@ def build_foundation_model(
         )
     elif config._qwen3_dense_exact_contract:
         logger.info_rank0(
-            f"Exact Qwen3-8B server-training numerical program (Class-B RoPE, RMSNorm families-v2): {numerical_program}"
+            "Exact dense Qwen3 server-training numerical program "
+            f"(Class-B RoPE, RMSNorm families-v2): {numerical_program}"
         )
 
     if moe_implementation is not None:
@@ -973,6 +1012,6 @@ def build_foundation_model(
         _select_qwen3_dense_families_v2()
         wrapped = wrap_trunk_linears_batch_invariant(model)
         if not wrapped:
-            raise RuntimeError("Exact Qwen3-8B model construction produced no batch-invariant trunk linears")
+            raise RuntimeError("Exact dense Qwen3 model construction produced no batch-invariant trunk linears")
 
     return model

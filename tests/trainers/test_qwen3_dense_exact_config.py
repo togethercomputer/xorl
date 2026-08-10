@@ -1,4 +1,4 @@
-"""Configuration tests for the exact Qwen3-8B trainer program."""
+"""Configuration tests for the exact dense Qwen3 trainer program."""
 
 import pytest
 
@@ -31,6 +31,8 @@ def _config(**overrides):
         "tie_word_embeddings": False,
         "attention_bias": False,
         "use_sliding_window": False,
+        "attention_dropout": 0.0,
+        "rope_scaling": None,
     }
     values.update(overrides)
     config = Qwen3Config(**values)
@@ -56,7 +58,7 @@ def _program(config, **overrides):
     return resolve_model_numerical_program(config, **values)
 
 
-def test_qwen3_8b_resolves_shared_exact_program():
+def test_dense_qwen3_resolves_shared_exact_program():
     config = _config()
     _validate_exact_qwen3_dense_model_scope(config)
     program = _program(config)
@@ -86,17 +88,72 @@ def test_qwen3_8b_resolves_shared_exact_program():
         ("rope_class_b", False),
     ],
 )
-def test_qwen3_8b_rejects_numerical_opt_out(name, value):
+def test_dense_qwen3_rejects_numerical_opt_out(name, value):
     with pytest.raises(ValueError):
         _program(_config(), **{name: value})
 
 
-def test_qwen3_8b_rejects_geometry_drift():
-    with pytest.raises(ValueError, match="official model geometry"):
-        _validate_exact_qwen3_dense_model_scope(_config(hidden_size=2048))
+@pytest.mark.parametrize(
+    "geometry",
+    [
+        {
+            "hidden_size": 1024,
+            "intermediate_size": 3072,
+            "num_hidden_layers": 28,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 8,
+            "tie_word_embeddings": True,
+        },
+        {
+            "hidden_size": 2048,
+            "intermediate_size": 6144,
+            "num_hidden_layers": 28,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 8,
+            "tie_word_embeddings": True,
+        },
+        {
+            "hidden_size": 2560,
+            "intermediate_size": 9728,
+            "num_hidden_layers": 36,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "rope_theta": 5_000_000,
+            "max_position_embeddings": 262144,
+            "tie_word_embeddings": True,
+        },
+        {
+            "hidden_size": 5120,
+            "intermediate_size": 25600,
+            "num_hidden_layers": 64,
+            "num_attention_heads": 64,
+            "num_key_value_heads": 8,
+        },
+    ],
+)
+def test_dense_qwen3_accepts_family_geometries(geometry):
+    _validate_exact_qwen3_dense_model_scope(_config(**geometry))
 
 
-def test_qwen3_8b_accepts_transformers_v5_rope_parameters():
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"hidden_act": "gelu"},
+        {"head_dim": 64},
+        {"attention_bias": True},
+        {"attention_dropout": 0.1},
+        {"use_sliding_window": True},
+        {"rope_scaling": {"rope_type": "yarn", "factor": 4.0}},
+        {"num_key_value_heads": 7},
+        {"hidden_size": 0},
+    ],
+)
+def test_dense_qwen3_rejects_unsupported_capabilities(override):
+    with pytest.raises(ValueError, match="does not support this architecture configuration"):
+        _validate_exact_qwen3_dense_model_scope(_config(**override))
+
+
+def test_dense_qwen3_accepts_transformers_v5_rope_parameters():
     config = _config()
     config.rope_theta = None
     config.rope_parameters = {"rope_theta": 1_000_000}
