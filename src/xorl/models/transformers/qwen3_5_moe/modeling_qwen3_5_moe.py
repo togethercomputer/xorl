@@ -2,7 +2,6 @@ from functools import partial
 from typing import Callable, Literal, Optional, Tuple, Unpack
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from xorl.distributed.parallel_state import get_parallel_state
@@ -101,7 +100,12 @@ class Qwen3_5MoeMLP(nn.Module):
                 gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
                 x = self.act_fn(gate) * up
         else:
-            x = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+            gate = self.gate_proj(x)
+            up = self.up_proj(x)
+            if self._use_fused_silu:
+                x = fused_silu_and_mul(torch.cat([gate, up], dim=-1))
+            else:
+                x = self.act_fn(gate) * up
         return self.down_proj(x)
 
 
@@ -441,8 +445,7 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
         w_slice = torch.cat((w_gu[lo_s : lo_s + shard], w_gu[inter + lo_s : inter + lo_s + shard]), dim=0)
         gate_up = _BatchInvariantTrunkLinearFn.apply(gathered, w_slice, None)
         self._capture_diagnostic_component("moe_native_shared_gate_up", gate_up)
-        gate, up = gate_up.chunk(2, dim=-1)
-        act = F.silu(gate) * up  # torch-native bf16 (serving's BI-ops lane; NOT the fused kernel)
+        act = fused_silu_and_mul(gate_up)
         self._capture_diagnostic_component("moe_native_shared_act", act)
         down = _BatchInvariantTrunkLinearFn.apply(act, w_down[:, lo_s : lo_s + shard].contiguous(), None)
         self._capture_diagnostic_component("moe_native_shared_down", down)

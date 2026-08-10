@@ -1,7 +1,8 @@
 """Fused SiLU-and-multiply (SwiGLU activation) using Triton kernels.
 
 Computes: output = SiLU(input[:, :N]) * input[:, N:]
-Used by both dense MLP (SwiGLU) and MoE expert layers.
+Used by dense MLPs and unfused shared-expert MLPs. Routed-expert backends own
+their activation inside the fused MoE program and are deliberately separate.
 """
 
 import torch
@@ -9,20 +10,8 @@ import triton
 import triton.language as tl
 
 
-_HOPPER_WIDE_MIN_ROWS = 192
-_HOPPER_OTHER_MIN_ROWS = 512
-_WIDE_INTERMEDIATE_SIZE = 8192
-
-
-def _exact_fused_swiglu_min_rows(intermediate_size: int) -> int:
-    """Return the measured conservative Hopper crossover."""
-    if intermediate_size >= _WIDE_INTERMEDIATE_SIZE:
-        return _HOPPER_WIDE_MIN_ROWS
-    return _HOPPER_OTHER_MIN_ROWS
-
-
-def _use_exact_fused_swiglu(input_tensor: torch.Tensor) -> bool:
-    """Admit the exact fused realization only on measured Hopper shapes."""
+def _use_fp32_fused_swiglu(input_tensor: torch.Tensor) -> bool:
+    """Admit the shared tiled realization on contiguous Hopper inputs."""
     if not input_tensor.is_cuda or not input_tensor.is_contiguous():
         return False
     if input_tensor.dtype not in (torch.bfloat16, torch.float16):
@@ -30,9 +19,7 @@ def _use_exact_fused_swiglu(input_tensor: torch.Tensor) -> bool:
     major, minor = torch.cuda.get_device_capability(input_tensor.device)
     if (major, minor) != (9, 0):
         return False
-    rows = input_tensor.numel() // input_tensor.shape[-1]
-    intermediate_size = input_tensor.shape[-1] // 2
-    return rows >= _exact_fused_swiglu_min_rows(intermediate_size)
+    return True
 
 
 def _native_silu_and_mul(input_tensor: torch.Tensor) -> torch.Tensor:
@@ -40,6 +27,15 @@ def _native_silu_and_mul(input_tensor: torch.Tensor) -> torch.Tensor:
     assert input_tensor.shape[-1] % 2 == 0, "Last dimension must be even"
     split = input_tensor.shape[-1] // 2
     return torch.nn.functional.silu(input_tensor[..., :split]) * input_tensor[..., split:]
+
+
+def _fp32_silu_and_mul(input_tensor: torch.Tensor) -> torch.Tensor:
+    """Keep the SiLU result in FP32 through the multiply and round once."""
+    assert input_tensor.shape[-1] % 2 == 0, "Last dimension must be even"
+    split = input_tensor.shape[-1] // 2
+    gate = input_tensor[..., :split].float()
+    up = input_tensor[..., split:].float()
+    return (torch.nn.functional.silu(gate) * up).to(input_tensor.dtype)
 
 
 @triton.jit
@@ -60,27 +56,20 @@ def _silu_and_mul_kernel(
         BLOCK_SIZE: Block size for processing
     """
     row_idx = tl.program_id(0)
+    block_start = tl.program_id(1) * BLOCK_SIZE
+    col_offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = col_offsets < N
 
-    # Process in blocks along the N dimension
-    for block_start in range(0, N, BLOCK_SIZE):
-        col_offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = col_offsets < N
+    gate_ptr = input_ptr + row_idx * 2 * N + col_offsets
+    up_ptr = input_ptr + row_idx * 2 * N + N + col_offsets
+    gate = tl.load(gate_ptr, mask=mask, other=0.0)
+    up = tl.load(up_ptr, mask=mask, other=0.0)
 
-        # Load gate (first half) and up (second half)
-        gate_ptr = input_ptr + row_idx * 2 * N + col_offsets
-        up_ptr = input_ptr + row_idx * 2 * N + N + col_offsets
-
-        gate = tl.load(gate_ptr, mask=mask, other=0.0)
-        up = tl.load(up_ptr, mask=mask, other=0.0)
-
-        # Compute SiLU(gate) * up
-        gate_f32 = gate.to(tl.float32)
-        silu_gate = gate_f32 * tl.sigmoid(gate_f32)
-        result = silu_gate.to(gate.dtype) * up
-
-        # Store result
-        out_ptr = output_ptr + row_idx * N + col_offsets
-        tl.store(out_ptr, result, mask=mask)
+    gate_f32 = gate.to(tl.float32)
+    silu_gate = gate_f32 * tl.sigmoid(gate_f32)
+    result = silu_gate * up.to(tl.float32)
+    out_ptr = output_ptr + row_idx * N + col_offsets
+    tl.store(out_ptr, result, mask=mask)
 
 
 def silu_and_mul(input_tensor: torch.Tensor) -> torch.Tensor:
@@ -96,8 +85,8 @@ def silu_and_mul(input_tensor: torch.Tensor) -> torch.Tensor:
         Output tensor of shape [..., N]
     """
     assert input_tensor.shape[-1] % 2 == 0, "Last dimension must be even"
-    if not _use_exact_fused_swiglu(input_tensor):
-        return _native_silu_and_mul(input_tensor)
+    if not _use_fp32_fused_swiglu(input_tensor):
+        return _fp32_silu_and_mul(input_tensor)
 
     original_shape = input_tensor.shape
     input_2d = input_tensor.view(-1, original_shape[-1])
@@ -111,8 +100,8 @@ def silu_and_mul(input_tensor: torch.Tensor) -> torch.Tensor:
         device=input_tensor.device,
     )
 
-    BLOCK_SIZE = 1024
-    grid = (num_tokens,)
+    BLOCK_SIZE = min(1024, triton.next_power_of_2(N))
+    grid = (num_tokens, triton.cdiv(N, BLOCK_SIZE))
 
     _silu_and_mul_kernel[grid](
         input_2d,
@@ -143,39 +132,25 @@ def _silu_and_mul_backward_kernel(
         d_up = grad_output * SiLU(gate)
     """
     row_idx = tl.program_id(0)
+    block_start = tl.program_id(1) * BLOCK_SIZE
+    col_offsets = block_start + tl.arange(0, BLOCK_SIZE)
+    mask = col_offsets < N
 
-    for block_start in range(0, N, BLOCK_SIZE):
-        col_offsets = block_start + tl.arange(0, BLOCK_SIZE)
-        mask = col_offsets < N
+    grad_out = tl.load(grad_output_ptr + row_idx * N + col_offsets, mask=mask, other=0.0)
+    gate = tl.load(input_ptr + row_idx * 2 * N + col_offsets, mask=mask, other=0.0)
+    up = tl.load(input_ptr + row_idx * 2 * N + N + col_offsets, mask=mask, other=0.0)
 
-        # Load grad_output
-        grad_out = tl.load(grad_output_ptr + row_idx * N + col_offsets, mask=mask, other=0.0)
+    gate_f32 = gate.to(tl.float32)
+    sigmoid_gate = tl.sigmoid(gate_f32)
+    silu_gate = gate_f32 * sigmoid_gate
+    silu_grad = sigmoid_gate + gate_f32 * sigmoid_gate * (1.0 - sigmoid_gate)
+    grad_out_f32 = grad_out.to(tl.float32)
+    up_f32 = up.to(tl.float32)
 
-        # Load gate and up
-        gate = tl.load(input_ptr + row_idx * 2 * N + col_offsets, mask=mask, other=0.0)
-        up = tl.load(input_ptr + row_idx * 2 * N + N + col_offsets, mask=mask, other=0.0)
-
-        # Compute SiLU and its gradient
-        gate_f32 = gate.to(tl.float32)
-        sigmoid_gate = tl.sigmoid(gate_f32)
-        silu_gate = gate_f32 * sigmoid_gate
-        silu_gate_rounded = silu_gate.to(gate.dtype)
-        silu_grad = sigmoid_gate + gate_f32 * sigmoid_gate * (1.0 - sigmoid_gate)
-
-        # Compute gradients
-        grad_out_f32 = grad_out.to(tl.float32)
-        up_f32 = up.to(tl.float32)
-
-        # Preserve the two BF16 boundaries from the forward graph. In
-        # particular, d_up consumes the rounded SiLU value, not the hidden
-        # FP32 temporary used to produce it.
-        product_grad = (grad_out_f32 * up_f32).to(gate.dtype).to(tl.float32)
-        d_gate = product_grad * silu_grad
-        d_up = grad_out_f32 * silu_gate_rounded.to(tl.float32)
-
-        # Store gradients
-        tl.store(grad_input_ptr + row_idx * 2 * N + col_offsets, d_gate.to(gate.dtype), mask=mask)
-        tl.store(grad_input_ptr + row_idx * 2 * N + N + col_offsets, d_up.to(up.dtype), mask=mask)
+    d_gate = grad_out_f32 * up_f32 * silu_grad
+    d_up = grad_out_f32 * silu_gate
+    tl.store(grad_input_ptr + row_idx * 2 * N + col_offsets, d_gate.to(gate.dtype), mask=mask)
+    tl.store(grad_input_ptr + row_idx * 2 * N + N + col_offsets, d_up.to(up.dtype), mask=mask)
 
 
 def silu_and_mul_backward(grad_output: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
@@ -197,8 +172,8 @@ def silu_and_mul_backward(grad_output: torch.Tensor, input_tensor: torch.Tensor)
 
     grad_input = torch.empty_like(input_2d)
 
-    BLOCK_SIZE = 1024
-    grid = (num_tokens,)
+    BLOCK_SIZE = min(1024, triton.next_power_of_2(N))
+    grid = (num_tokens, triton.cdiv(N, BLOCK_SIZE))
 
     _silu_and_mul_backward_kernel[grid](
         grad_output_2d,
@@ -234,6 +209,6 @@ def fused_silu_and_mul(input_tensor: torch.Tensor) -> torch.Tensor:
     Returns:
         Output tensor of shape [..., N]
     """
-    if not _use_exact_fused_swiglu(input_tensor):
-        return _native_silu_and_mul(input_tensor)
+    if not _use_fp32_fused_swiglu(input_tensor):
+        return _fp32_silu_and_mul(input_tensor)
     return SiluAndMulFunction.apply(input_tensor)

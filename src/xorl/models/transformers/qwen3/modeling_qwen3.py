@@ -62,7 +62,12 @@ class Qwen3MLP(nn.Module):
                 gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
                 x = self.act_fn(gate) * up
         else:
-            x = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+            gate = self.gate_proj(x)
+            up = self.up_proj(x)
+            if self._use_fused_silu:
+                x = fused_silu_and_mul(torch.cat([gate, up], dim=-1))
+            else:
+                x = self.act_fn(gate) * up
         return self.down_proj(x)
 
 

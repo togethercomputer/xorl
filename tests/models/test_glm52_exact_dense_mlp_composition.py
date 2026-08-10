@@ -228,9 +228,10 @@ def test_official_tp1_dense_vertical_composition_bytes_and_manual_vjp() -> None:
             intermediate_size,
             base_output=raw_gate_up_base.clone(),
         )
-        # S4's exact SiluAndMul.forward_native is this literal two-operation
-        # expression, including the BF16 SiLU store before multiplication.
-        raw_activation = F.silu(raw_gate_up[:, :intermediate_size]) * raw_gate_up[:, intermediate_size:]
+        raw_activation = (
+            F.silu(raw_gate_up[:, :intermediate_size].float())
+            * raw_gate_up[:, intermediate_size:].float()
+        ).to(torch.bfloat16)
         raw_down_base = triton_w8a8_block_fp8_linear(
             raw_activation,
             raw_down_weight,

@@ -332,7 +332,9 @@ def _manual_local_vjp(
     )
     with torch.enable_grad(), torch.autocast(device_type="cuda", enabled=False):
         gate_up_input = exact_gate_up.detach().requires_grad_(True)
-        activation = F.silu(gate_up_input[:, :128]) * gate_up_input[:, 128:]
+        activation = (
+            F.silu(gate_up_input[:, :128].float()) * gate_up_input[:, 128:].float()
+        ).to(torch.bfloat16)
         (gate_up_grad,) = torch.autograd.grad(
             activation,
             gate_up_input,
@@ -437,7 +439,9 @@ def test_official_shared_expert_actual_operands_fold_and_surrogate_vjp() -> None
         128,
         base_output=raw_gate_up_base.clone(),
     )
-    raw_activated = F.silu(raw_gate_up[:, :128]) * raw_gate_up[:, 128:]
+    raw_activated = (
+        F.silu(raw_gate_up[:, :128].float()) * raw_gate_up[:, 128:].float()
+    ).to(torch.bfloat16)
     raw_down_base = triton_w8a8_block_fp8_linear(
         raw_activated,
         base.down_weight,

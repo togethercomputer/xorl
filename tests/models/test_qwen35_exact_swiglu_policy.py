@@ -15,14 +15,14 @@ def _config(*, exact: bool, activation_native: bool) -> SimpleNamespace:
     )
 
 
-def test_exact_qwen35_dense_and_shared_mlp_select_exact_fused_swiglu():
+def test_exact_qwen35_dense_and_shared_mlp_select_fp32_swiglu():
     config = _config(exact=True, activation_native=True)
 
     assert Qwen3_5MLP(config)._use_fused_silu
     assert Qwen3_5MoeMLP(config)._use_fused_silu
 
 
-def test_exact_glm52_dense_and_shared_mlp_select_exact_fused_swiglu():
+def test_exact_glm52_dense_and_shared_mlp_select_fp32_swiglu():
     config = SimpleNamespace(
         hidden_size=6144,
         intermediate_size=12288,
@@ -31,8 +31,6 @@ def test_exact_glm52_dense_and_shared_mlp_select_exact_fused_swiglu():
     )
 
     assert Glm5MLP(config)._use_fused_silu
-
-
 def test_nonexact_qwen35_preserves_native_override():
     config = _config(exact=False, activation_native=True)
 

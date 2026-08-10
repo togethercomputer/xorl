@@ -25,6 +25,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from xorl.ops.block_fp8_native import NativeBlockFP8Linear, _sglang_native_block_fp8_linear_value
+from xorl.ops.fused_silu_and_mul import fused_silu_and_mul
 
 
 GLM52_EXACT_TP16_SHARED_EXPERT_QLORA_CONTRACT_VERSION = "glm52_exact_tp16_shared_expert_rank1_qlora_v1"
@@ -522,9 +523,7 @@ class Glm52ExactTP16SharedExpertBlockFP8QLoRA(nn.Module):
             self.shard_size,
             base_output=gate_up_base,
         )
-        # Exact SGLang target mode resolves SiluAndMul.forward_native to this
-        # two-operation expression, including its BF16 intermediate stores.
-        activated = F.silu(gate_up[:, : self.shard_size]) * gate_up[:, self.shard_size :]
+        activated = fused_silu_and_mul(gate_up)
 
         down_base = _sglang_native_block_fp8_linear_value(
             activated,
@@ -675,7 +674,7 @@ class Glm52ExactTP16SharedExpertBlockFP8QLoRA(nn.Module):
         if need_activation:
             with torch.enable_grad(), torch.autocast(device_type=input.device.type, enabled=False):
                 gate_up_input = exact_gate_up.detach().requires_grad_(True)
-                activation = F.silu(gate_up_input[:, : self.shard_size]) * gate_up_input[:, self.shard_size :]
+                activation = fused_silu_and_mul(gate_up_input)
                 (gate_up_grad,) = torch.autograd.grad(
                     activation,
                     gate_up_input,

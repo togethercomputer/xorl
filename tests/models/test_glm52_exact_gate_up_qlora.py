@@ -427,7 +427,9 @@ def test_official_fused_gate_up_literal_bytes_graph_metadata_zero_and_gradients(
     assert torch.equal(cold_actual.view(torch.uint8), expected.view(torch.uint8))
     assert torch.equal(warm_actual.view(torch.uint8), cold_actual.view(torch.uint8))
     trainer_activation = fused_silu_and_mul(cold_actual)
-    sampler_activation = F.silu(expected[:, :intermediate_size]) * expected[:, intermediate_size:]
+    sampler_activation = (
+        F.silu(expected[:, :intermediate_size].float()) * expected[:, intermediate_size:].float()
+    ).to(torch.bfloat16)
     assert torch.equal(trainer_activation.view(torch.uint8), sampler_activation.view(torch.uint8))
 
     # Build the exact adapter-merged metadata used after S4's production
