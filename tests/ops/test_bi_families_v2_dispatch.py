@@ -12,7 +12,8 @@ import torch
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
-SHIPPED_H = (2048, 3840, 4096)
+# Qwen3.6, dense Qwen3, and GLM-5.2 representative hidden sizes.
+SHIPPED_H = (2048, 3840, 4096, 6144)
 DEEP_H = 16384
 
 
