@@ -221,6 +221,34 @@ def test_factor_only_snapshot_guard_leaves_ordinary_models_unrestricted():
     manager._require_factor_only_exact_active_lora("ordinary save")
 
 
+@pytest.mark.parametrize("rank", [0, 1])
+def test_single_writer_full_weight_save_has_one_collective_completion(monkeypatch, tmp_path, rank):
+    manager = object.__new__(CheckpointManager)
+    manager.rank = rank
+    manager.model = nn.Linear(2, 2)
+    manager.extract_full_weights_with_ep = lambda: {"weight": torch.ones(2, 2)} if rank == 0 else {}
+
+    save_calls = []
+    barrier_calls = []
+    monkeypatch.setattr(_MODULE, "save_model_weights", lambda **kwargs: save_calls.append(kwargs))
+    monkeypatch.setattr(_MODULE.dist, "barrier", lambda: barrier_calls.append(True))
+
+    result = manager._save_full_weights_single_writer(
+        str(tmp_path / "full"),
+        "bfloat16",
+        base_model_path=None,
+    )
+
+    assert len(barrier_calls) == 1
+    if rank == 0:
+        assert len(save_calls) == 1
+        assert save_calls[0]["global_rank"] is None
+        assert result["status"] == "success"
+    else:
+        assert save_calls == []
+        assert result == {"status": "skipped", "reason": "non-rank-0"}
+
+
 def test_save_adapter_state_requests_dtype_preserving_lora_checkpoint(monkeypatch, tmp_path):
     manager = _build_checkpoint_manager()
     captured = {}

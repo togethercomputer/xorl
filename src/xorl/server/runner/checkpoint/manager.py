@@ -731,14 +731,18 @@ class CheckpointManager:
             self.model.get_checkpoint_handler() if hasattr(self.model, "get_checkpoint_handler") else None
         )
 
-        # save_model_weights handles dtype conversion, sharding, and index.json
-        save_model_weights(
-            output_dir=output_path,
-            state_dict=state_dict,
-            global_rank=self.rank,
-            save_dtype=dtype,
-            checkpoint_handler=checkpoint_handler,
-        )
+        # extract_model_weights() returns the complete CPU state only on rank 0.
+        # Let that rank write without save_model_weights()'s per-shard distributed
+        # barriers; non-writer ranks have no shard map with which to rendezvous.
+        # The manager's barrier below is the single collective completion point.
+        if self.rank == 0:
+            save_model_weights(
+                output_dir=output_path,
+                state_dict=state_dict,
+                global_rank=None,
+                save_dtype=dtype,
+                checkpoint_handler=checkpoint_handler,
+            )
 
         # Copy config files from base model (server-specific)
         if self.rank == 0 and base_model_path and os.path.isdir(base_model_path):
