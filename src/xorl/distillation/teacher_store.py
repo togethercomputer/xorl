@@ -254,6 +254,33 @@ class TeacherHeadShardView:
                     tensor[local_start:local_end],
                 )
 
+    def load_rows_device(self, start: int, end: int) -> torch.Tensor:
+        """Load an arbitrary contiguous vocab-row range onto this view's device."""
+        spec = self.store.head_spec(self.teacher_id)
+        start = int(start)
+        end = int(end)
+        if start < 0 or end < start or end > spec.vocab_size:
+            raise ValueError(f"Invalid teacher head row range [{start}, {end}) for vocab size {spec.vocab_size}")
+        pieces: list[torch.Tensor] = []
+        for shard in spec.shards:
+            overlap_start = max(start, shard.start)
+            overlap_end = min(end, shard.end)
+            if overlap_start >= overlap_end:
+                continue
+            tensor = self._device_tensor(shard, self._cpu_tensor(shard))
+            local_start = overlap_start - shard.start
+            local_end = overlap_end - shard.start
+            pieces.append(tensor[local_start:local_end])
+        if not pieces:
+            hidden = spec.hidden_size
+            dtype = self.dtype
+            if dtype is None:
+                dtype = getattr(torch, spec.dtype, torch.float32)
+            return torch.empty((0, hidden), device=self.device, dtype=dtype)
+        if len(pieces) == 1:
+            return pieces[0].contiguous()
+        return torch.cat(pieces, dim=0).contiguous()
+
     def clear_device_cache(self) -> None:
         self._device_cache.clear()
 

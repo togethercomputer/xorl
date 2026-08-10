@@ -15,6 +15,41 @@ class TeacherFiles:
     hidden_caches: dict[str, str]
 
 
+class FakeMooncakeClient:
+    """In-memory stand-in for ``mooncake.store.MooncakeDistributedStore``.
+
+    Implements only the byte-level object API used by ``MooncakeHiddenStore``.
+    """
+
+    def __init__(self) -> None:
+        self.objects: dict[str, bytes] = {}
+
+    def put(self, key: str, value: bytes) -> int:
+        self.objects[key] = bytes(value)
+        return 0
+
+    def get(self, key: str) -> bytes:
+        return self.objects.get(key, b"")
+
+    def is_exist(self, key: str) -> int:
+        return 1 if key in self.objects else 0
+
+    def remove(self, key: str) -> int:
+        self.objects.pop(key, None)
+        return 0
+
+
+def make_mooncake_hidden_cache(store, teacher_caches: Mapping[str, torch.Tensor]) -> dict[str, dict]:
+    """Put per-teacher hidden tensors into a (fake) Mooncake store.
+
+    Returns ``{teacher_id: metadata}`` shaped for ``teacher_hidden_caches``.
+    """
+    metas: dict[str, dict] = {}
+    for teacher_id, tensor in teacher_caches.items():
+        metas[str(teacher_id)] = store.put_hidden(f"opd/test/teacher/{teacher_id}/hidden", tensor)
+    return metas
+
+
 def save_tensor_file(path: str | Path, key: str, tensor: torch.Tensor) -> str:
     path = Path(path)
     save_file({key: tensor.detach().cpu().contiguous()}, str(path))
@@ -40,17 +75,6 @@ def make_teacher_files(
             teacher_hidden_caches[teacher_id],
         )
     return TeacherFiles(heads=head_paths, hidden_caches=cache_paths)
-
-
-def save_teacher_hidden_cache(hiddens: list[torch.Tensor], path: str | Path) -> list[list[int]]:
-    """Concatenate per-sample hidden states and return per-sample cache indices."""
-    cache_indices: list[list[int]] = []
-    offset = 0
-    for hidden in hiddens:
-        cache_indices.append(list(range(offset, offset + hidden.shape[0])))
-        offset += hidden.shape[0]
-    save_tensor_file(path, "hidden_states", torch.cat(hiddens, dim=0))
-    return cache_indices
 
 
 def reference_opd_loss(
