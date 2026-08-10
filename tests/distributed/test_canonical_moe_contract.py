@@ -65,6 +65,24 @@ def test_reference_is_the_adjacent_bf16_tree(contributors: int):
     assert torch.equal(canonical_moe_fold_v1(padded), _explicit_tree(padded))
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_shared_fold_replays_in_cuda_graph():
+    partials = torch.randn((8, 64, 32), device="cuda", dtype=torch.bfloat16)
+    canonical_moe_fold_v1(partials)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        folded = canonical_moe_fold_v1(partials)
+    first = folded.clone()
+    partials[0].add_(8.0)
+    graph.replay()
+
+    assert not torch.equal(first, folded)
+    assert torch.equal(folded, _explicit_tree(partials))
+
+
 @pytest.mark.cpu
 def test_graph_metadata_has_deterministic_padding_and_capacity_guard():
     metadata = CanonicalMoEGraphMetadata.build(
