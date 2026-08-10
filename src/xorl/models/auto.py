@@ -347,6 +347,79 @@ def _is_qwen35_moe(config: PretrainedConfig) -> bool:
     }
 
 
+def _validate_exact_qwen35_dense_capabilities(config: PretrainedConfig) -> list[str]:
+    mismatches = []
+
+    positive_integer_fields = (
+        "hidden_size",
+        "intermediate_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "vocab_size",
+        "max_position_embeddings",
+        "linear_num_value_heads",
+    )
+    for name in positive_integer_fields:
+        value = getattr(config, name, None)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            mismatches.append(f"{name}={value!r} (requires a positive integer)")
+
+    required_values = {
+        "head_dim": 256,
+        "hidden_act": "silu",
+        "attention_bias": False,
+        "use_sliding_window": False,
+        "attention_dropout": 0.0,
+        "attn_output_gate": True,
+        "linear_num_key_heads": 16,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+        "full_attention_interval": 4,
+    }
+    for name, required in required_values.items():
+        actual = getattr(config, name, None)
+        if actual != required:
+            mismatches.append(f"{name}={actual!r} (requires {required!r})")
+
+    rms_norm_eps = getattr(config, "rms_norm_eps", None)
+    if not isinstance(rms_norm_eps, (int, float)) or isinstance(rms_norm_eps, bool) or rms_norm_eps <= 0:
+        mismatches.append(f"rms_norm_eps={rms_norm_eps!r} (requires a positive number)")
+
+    rope_theta = getattr(config, "rope_theta", None)
+    if rope_theta is None:
+        rope_parameters = getattr(config, "rope_parameters", None)
+        if isinstance(rope_parameters, dict):
+            rope_theta = rope_parameters.get("rope_theta")
+    if not isinstance(rope_theta, (int, float)) or isinstance(rope_theta, bool) or rope_theta <= 0:
+        mismatches.append(f"rope_theta={rope_theta!r} (requires a positive number)")
+
+    partial_rotary_factor = getattr(config, "partial_rotary_factor", None)
+    if partial_rotary_factor != 0.25:
+        mismatches.append(f"partial_rotary_factor={partial_rotary_factor!r} (requires 0.25)")
+
+    num_attention_heads = getattr(config, "num_attention_heads", None)
+    num_key_value_heads = getattr(config, "num_key_value_heads", None)
+    if (
+        isinstance(num_attention_heads, int)
+        and isinstance(num_key_value_heads, int)
+        and num_attention_heads > 0
+        and num_key_value_heads > 0
+        and num_attention_heads % num_key_value_heads != 0
+    ):
+        mismatches.append(
+            "num_attention_heads must be divisible by num_key_value_heads "
+            f"(got {num_attention_heads} and {num_key_value_heads})"
+        )
+
+    linear_num_value_heads = getattr(config, "linear_num_value_heads", None)
+    if isinstance(linear_num_value_heads, int) and linear_num_value_heads > 0 and linear_num_value_heads % 16 != 0:
+        mismatches.append(f"linear_num_value_heads={linear_num_value_heads!r} (requires a multiple of 16)")
+
+    return mismatches
+
+
 def _validate_exact_qwen35_model_scope(config: PretrainedConfig) -> None:
     if not _is_exact_qwen35(config):
         return
@@ -371,41 +444,31 @@ def _validate_exact_qwen35_model_scope(config: PretrainedConfig) -> None:
             "linear_conv_kernel_dim": 4,
             "full_attention_interval": 4,
         }
+        mismatches = [
+            f"{name}={getattr(scope_config, name, None)!r} (requires {value!r})"
+            for name, value in expected.items()
+            if getattr(scope_config, name, None) != value
+        ]
         model_name = "Qwen3.6-35B-A3B"
     else:
-        expected = {
-            "vocab_size": 248320,
-            "hidden_size": 1024,
-            "num_hidden_layers": 24,
-            "num_attention_heads": 8,
-            "num_key_value_heads": 2,
-            "linear_num_key_heads": 16,
-            "linear_num_value_heads": 16,
-            "linear_key_head_dim": 128,
-            "linear_value_head_dim": 128,
-            "linear_conv_kernel_dim": 4,
-            "full_attention_interval": 4,
-        }
-        model_name = "Qwen3.5-0.8B"
-    mismatches = [
-        f"{name}={getattr(scope_config, name, None)!r} (requires {value!r})"
-        for name, value in expected.items()
-        if getattr(scope_config, name, None) != value
-    ]
-    expected_layer_types = tuple(
-        "full_attention" if (layer_idx + 1) % 4 == 0 else "linear_attention"
-        for layer_idx in range(expected["num_hidden_layers"])
-    )
+        mismatches = _validate_exact_qwen35_dense_capabilities(scope_config)
+        model_name = "dense Qwen3.5"
+    num_hidden_layers = getattr(scope_config, "num_hidden_layers", None)
     # ``full_attention_interval`` uniquely defines this schedule.  Some HF
     # config representations materialize ``layer_types`` while others retain
     # only the interval, so validate the derived list when it is present rather
     # than rejecting an otherwise identical checkpoint representation.
     layer_types = getattr(scope_config, "layer_types", None)
-    if layer_types is not None and tuple(layer_types) != expected_layer_types:
-        mismatches.append("layer_types does not match the certified full-attention interval")
+    if isinstance(num_hidden_layers, int) and num_hidden_layers > 0 and layer_types is not None:
+        expected_layer_types = tuple(
+            "full_attention" if (layer_idx + 1) % 4 == 0 else "linear_attention"
+            for layer_idx in range(num_hidden_layers)
+        )
+        if tuple(layer_types) != expected_layer_types:
+            mismatches.append("layer_types does not match the certified full-attention interval")
     if mismatches:
         raise ValueError(
-            f"The exact Qwen3.5-family server-training program is certified only for {model_name}: "
+            f"The exact Qwen3.5-family server-training program does not support this {model_name} configuration: "
             + ", ".join(mismatches)
         )
 

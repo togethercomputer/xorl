@@ -35,8 +35,8 @@ def _exact_glm52_config() -> Glm5Config:
     )
 
 
-def _exact_qwen35_dense_config() -> Qwen3_5Config:
-    return Qwen3_5Config(
+def _exact_qwen35_dense_config(**overrides) -> Qwen3_5Config:
+    values = dict(
         hidden_size=1024,
         intermediate_size=3584,
         num_hidden_layers=24,
@@ -50,6 +50,8 @@ def _exact_qwen35_dense_config() -> Qwen3_5Config:
         linear_key_head_dim=128,
         linear_value_head_dim=128,
     )
+    values.update(overrides)
+    return Qwen3_5Config(**values)
 
 
 def _exact_qwen35_moe_config() -> Qwen3_5MoeConfig:
@@ -499,14 +501,74 @@ def test_exact_qwen35_model_scope_rejects_wrong_materialized_layer_types():
     config = _exact_qwen35_moe_config()
     config.layer_types[3] = "linear_attention"
     config._qwen35_exact_contract = True
-    with pytest.raises(ValueError, match="certified only.*layer_types"):
+    with pytest.raises(ValueError, match="does not support.*layer_types"):
         _validate_exact_qwen35_model_scope(config)
 
 
-@pytest.mark.parametrize("config_factory", [_exact_qwen35_dense_config, _exact_qwen35_moe_config])
-def test_exact_qwen35_model_scope_rejects_nearby_geometry(config_factory):
-    config = config_factory()
+def test_exact_qwen35_moe_model_scope_rejects_nearby_geometry():
+    config = _exact_qwen35_moe_config()
     config.hidden_size += 1
     config._qwen35_exact_contract = True
-    with pytest.raises(ValueError, match="certified only.*hidden_size"):
+    with pytest.raises(ValueError, match="does not support.*hidden_size"):
+        _validate_exact_qwen35_model_scope(config)
+
+
+@pytest.mark.parametrize(
+    "geometry",
+    [
+        dict(
+            hidden_size=2048,
+            intermediate_size=6144,
+            num_hidden_layers=24,
+            num_attention_heads=8,
+            num_key_value_heads=2,
+            linear_num_value_heads=16,
+        ),
+        dict(
+            hidden_size=2560,
+            intermediate_size=9216,
+            num_hidden_layers=32,
+            num_attention_heads=16,
+            num_key_value_heads=4,
+            linear_num_value_heads=32,
+        ),
+        dict(
+            hidden_size=4096,
+            intermediate_size=12288,
+            num_hidden_layers=32,
+            num_attention_heads=16,
+            num_key_value_heads=4,
+            linear_num_value_heads=32,
+        ),
+        dict(
+            hidden_size=5120,
+            intermediate_size=17408,
+            num_hidden_layers=64,
+            num_attention_heads=24,
+            num_key_value_heads=4,
+            linear_num_value_heads=48,
+        ),
+    ],
+)
+def test_exact_qwen35_dense_model_scope_admits_family_geometries(geometry):
+    config = _exact_qwen35_dense_config(**geometry)
+    config._qwen35_exact_contract = True
+    _validate_exact_qwen35_model_scope(config)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("head_dim", 128),
+        ("attention_bias", True),
+        ("linear_num_key_heads", 8),
+        ("linear_num_value_heads", 24),
+        ("linear_conv_kernel_dim", 3),
+        ("full_attention_interval", 8),
+    ],
+)
+def test_exact_qwen35_dense_model_scope_rejects_unsupported_capabilities(name, value):
+    config = _exact_qwen35_dense_config(**{name: value})
+    config._qwen35_exact_contract = True
+    with pytest.raises(ValueError, match=rf"does not support.*{name}"):
         _validate_exact_qwen35_model_scope(config)
