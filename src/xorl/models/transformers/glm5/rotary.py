@@ -24,8 +24,10 @@ def glm5_apply_rotary_pos_emb(
     cos: torch.Tensor,
     sin: torch.Tensor,
     interleaved: bool = False,
+    class_b: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if rope_class_b_enabled() and q.is_cuda:
+    use_class_b = rope_class_b_enabled() if class_b is None else class_b
+    if use_class_b and q.is_cuda:
         return stock_fused_apply_rotary_pos_emb(q, k, cos, sin, interleaved=interleaved)
 
     if interleaved:

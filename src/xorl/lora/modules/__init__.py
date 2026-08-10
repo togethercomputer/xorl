@@ -6,10 +6,12 @@ of LoRA modules for different layer types.
 """
 
 from .base import LoraModule
+from .delta_linear import LoraDeltaLinear
 from .linear import LoraLinear
 
 
 __all__ = [
     "LoraModule",
+    "LoraDeltaLinear",
     "LoraLinear",
 ]

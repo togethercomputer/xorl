@@ -13,6 +13,7 @@ from torch.utils.checkpoint import noop_context_fn
 
 from xorl.distributed.checkpoint import CheckpointFunction
 from xorl.distributed.fsdp2 import BF16StochasticAllToAllReduceScatter, clip_grad_norm
+from xorl.distributed.gradient_reduction import GradientReductionDomain, validate_gradient_reduction_domain
 from xorl.distributed.parallel_state import get_parallel_state
 from xorl.distributed.pipeline_parallel import (
     generate_llm_fqn_per_model_part,
@@ -39,6 +40,42 @@ if is_torch_version_greater_than("2.4"):
 
 
 logger = logging.get_logger(__name__)
+
+
+def _topmost_modules_matching(root: "nn.Module", classes: tuple[type, ...]) -> list["nn.Module"]:
+    """Select matching descendants without descending into a selected unit.
+
+    Mixed-precision-excluded modules are independent FSDP units. Wrapping a
+    matching descendant after its matching parent would create nested units
+    over one logical ownership boundary, so traversal stops at the first
+    match on each branch.
+    """
+
+    selected: list[nn.Module] = []
+
+    def visit(module: nn.Module) -> None:
+        for child in module.children():
+            if isinstance(child, classes):
+                selected.append(child)
+            else:
+                visit(child)
+
+    visit(root)
+    return selected
+
+
+def _exact_lm_head_replicated_params(lm_head: "nn.Module | None") -> set[nn.Parameter]:
+    """Return exact-head factors that must remain replicated over vocab TP."""
+
+    if lm_head is None or not getattr(lm_head, "_glm52_exact_tp16_lm_head", False):
+        return set()
+    names = tuple(getattr(lm_head, "_glm52_exact_replicated_parameter_names", ()))
+    if names != ("lora_A",):
+        raise RuntimeError("The exact GLM-5.2 lm head must declare only lora_A as TP16-replicated")
+    parameter = getattr(lm_head, "lora_A", None)
+    if not isinstance(parameter, nn.Parameter) or parameter.dtype is not torch.float32:
+        raise RuntimeError("The exact GLM-5.2 lm-head lora_A must be an FP32 Parameter")
+    return {parameter}
 
 
 def _compile_module(mod: "nn.Module", *, dynamic_shapes: bool) -> "nn.Module":
@@ -91,13 +128,15 @@ def _bf16_mixed_precision_policy(
     )
 
 
-def _decoder_bf16_mixed_precision_policy(reduce_dtype: torch.dtype = torch.float32):
+def _decoder_bf16_mixed_precision_policy(
+    reduce_dtype: torch.dtype = torch.float32,
+    *,
+    class_b: bool = False,
+):
     """Preserve the fp32 RoPE table when the Class-B contract is active."""
-    from xorl.models.layers.rope import rope_class_b_enabled  # noqa: PLC0415
-
     return _bf16_mixed_precision_policy(
         reduce_dtype=reduce_dtype,
-        cast_forward_inputs=not rope_class_b_enabled(),
+        cast_forward_inputs=not class_b,
     )
 
 
@@ -118,12 +157,22 @@ def _expert_mixed_precision_policy(ep_fsdp_mesh_size: int, reduce_dtype: torch.d
     return _bf16_mixed_precision_policy(reduce_dtype=reduce_dtype)
 
 
+def _expert_fsdp_kwargs_for_module(expert_fsdp_kwargs: dict, experts_mod: nn.Module) -> dict:
+    """Keep frozen byte-packed expert state sharded without numerically casting it."""
+
+    module_kwargs = dict(expert_fsdp_kwargs)
+    if getattr(experts_mod, "fsdp_requires_full_precision", False):
+        module_kwargs.pop("mp_policy", None)
+    return module_kwargs
+
+
 def _load_model_weights(
     model: "nn.Module",
     weights_path: str,
     load_weights_mode: str,
     weight_device: str,
     dtensor_factory=None,
+    strict_weight_loading: bool = False,
 ) -> None:
     """Dispatch HF weight loading by mode.
 
@@ -138,7 +187,13 @@ def _load_model_weights(
         return
     if load_weights_mode == "grouped":
         logger.info_rank0("Loading model weights with one reader per node (dense) + per EP-FSDP group (experts)...")
-        grouped_load_weights(model, weights_path, weight_device, dtensor_factory=dtensor_factory)
+        grouped_load_weights(
+            model,
+            weights_path,
+            weight_device,
+            dtensor_factory=dtensor_factory,
+            strict=strict_weight_loading,
+        )
     elif load_weights_mode == "all_ranks":
         logger.info_rank0("Every rank reading weights from disk independently...")
         all_ranks_load_weights(model, weights_path, weight_device, dtensor_factory=dtensor_factory)
@@ -376,7 +431,10 @@ def parallelize_model_fsdp2(
         reduce_dtype = _resolve_fsdp_reduce_dtype(fsdp_reduce_dtype)
         mp_policy = _bf16_mixed_precision_policy(reduce_dtype=reduce_dtype)
         fsdp_kwargs["mp_policy"] = mp_policy
-        decoder_mp_policy = _decoder_bf16_mixed_precision_policy(reduce_dtype=reduce_dtype)
+        decoder_mp_policy = _decoder_bf16_mixed_precision_policy(
+            reduce_dtype=reduce_dtype,
+            class_b=bool(getattr(model.config, "_rope_class_b", False)),
+        )
         if not decoder_mp_policy.cast_forward_inputs:
             logger.info_rank0(
                 "Class-B RoPE FSDP transport engaged: decoder cast_forward_inputs=False "
@@ -432,30 +490,19 @@ def parallelize_model_fsdp2(
         layer_mod._fsdp_modules = []
         # ep enabled and this layer contains the expert module
         if parallel_state.ep_enabled and experts_mod is not None and not getattr(experts_mod, "_skip_fsdp", False):
-            # Block LoRA experts with eFSDP > 1: LoRA + EP + eFSDP gradient
-            # interaction has not been validated. Until it is, require ep_fsdp_size=1.
-            from xorl.lora.modules.base import LoraModule  # noqa: PLC0415
-
-            if isinstance(experts_mod, LoraModule):
-                assert parallel_state.dp_shard_in_ep_size <= 1, (
-                    f"LoRA expert modules are not yet supported with ep_fsdp_size > 1 "
-                    f"(got {parallel_state.dp_shard_in_ep_size}). "
-                    f"Use ep_fsdp_size=1 for LoRA + EP training."
-                )
             # shard expert
-            fully_shard(experts_mod, **expert_fsdp_kwargs)
+            fully_shard(experts_mod, **_expert_fsdp_kwargs_for_module(expert_fsdp_kwargs, experts_mod))
             layer_mod._fsdp_modules.append(experts_mod)
             fsdp_wrapped_experts.append(experts_mod)
         # shard module that needs to ignore mixed precision control
         if mp_ignored_classes:
-            for sub_mod in layer_mod.modules():
-                if isinstance(sub_mod, mp_ignored_classes) and sub_mod is not layer_mod:
-                    # this will also create a AllGather communication group
-                    # when modules here are small (like gating), this would slightly impacts the performance
-                    # a better method might be adding them to ignored_params of fully_shard
-                    # but then they will need to be initialized separately
-                    fully_shard(sub_mod, **fsdp_kwargs_without_mp)
-                    layer_mod._fsdp_modules.append(sub_mod)
+            for sub_mod in _topmost_modules_matching(layer_mod, mp_ignored_classes):
+                # this will also create a AllGather communication group
+                # when modules here are small (like gating), this would slightly impacts the performance
+                # a better method might be adding them to ignored_params of fully_shard
+                # but then they will need to be initialized separately
+                fully_shard(sub_mod, **fsdp_kwargs_without_mp)
+                layer_mod._fsdp_modules.append(sub_mod)
 
         # shard everything else in the decoder layer
         # If experts_mod has _skip_fsdp, exclude its params from the parent FSDP unit
@@ -494,6 +541,11 @@ def parallelize_model_fsdp2(
         norm_mod = getattr(base_model, "norm_f", None)
     lm_head_mod = getattr(model, "lm_head", None)
     lm_head_tp = getattr(parallel_state, "lm_head_tp_size", 1) > 1
+    exact_lm_head = bool(lm_head_mod is not None and getattr(lm_head_mod, "_glm52_exact_tp16_lm_head", False))
+    if exact_lm_head and not fsdp_sharded_lm_head_loss:
+        raise RuntimeError("The exact GLM-5.2 lm head requires fsdp_sharded_lm_head_loss=true")
+    if exact_lm_head and getattr(parallel_state, "lm_head_tp_size", 1) != 16:
+        raise RuntimeError("The exact GLM-5.2 lm head requires lm_head_tensor_parallel_size=16")
     if fsdp_sharded_lm_head_loss:
         if pp_enabled:
             raise NotImplementedError("fsdp_sharded_lm_head_loss is not supported with pipeline parallelism.")
@@ -538,6 +590,9 @@ def parallelize_model_fsdp2(
             # NOT the model's FSDP mesh. The body keeps the normal fsdp_mesh.
             lm_head_fsdp_kwargs = dict(fsdp_kwargs)
             lm_head_fsdp_kwargs["mesh"] = parallel_state.lm_head_mesh
+            exact_replicated_params = _exact_lm_head_replicated_params(lm_head_mod)
+            if exact_replicated_params:
+                lm_head_fsdp_kwargs["ignored_params"] = exact_replicated_params
             fully_shard(lm_head_mod, **lm_head_fsdp_kwargs)
             # Sum (not average) the lm_head grad over its replica dim (DP x cp_replica):
             # the loss is normalized by global valid tokens, and cp_replica grads are
@@ -565,6 +620,7 @@ def parallelize_model_fsdp2(
     for _, _, experts_mod in layer_pairs:
         if experts_mod is not None and getattr(experts_mod, "_skip_fsdp", False):
             root_ignored_params.update(experts_mod.parameters())
+    root_ignored_params.update(_exact_lm_head_replicated_params(lm_head_mod))
     if root_ignored_params:
         root_fsdp_kwargs = dict(fsdp_kwargs)
         root_fsdp_kwargs["ignored_params"] = root_ignored_params
@@ -678,6 +734,7 @@ def parallelize_model_fsdp2(
             load_weights_mode=load_weights_mode,
             weight_device=weight_device,
             dtensor_factory=distribute_tensor,
+            strict_weight_loading=bool(kwargs.get("strict_weight_loading", False)),
         )
 
     # Build EP param groups now (torchtitan eFSDP design: track groups at wrap time,
@@ -716,9 +773,10 @@ def _build_ep_param_groups(model: "nn.Module") -> None:
     optimizer or before the optimizer is constructed.
     """
     try:
-        from torch.distributed._tensor import DTensor  # noqa: PLC0415
+        from torch.distributed._tensor import DTensor, Replicate  # noqa: PLC0415
     except ImportError:
         DTensor = None
+        Replicate = None
 
     # _skip_fsdp expert modules hold plain tensor params (not wrapped by FSDP)
     skip_fsdp_param_ids: set = set()
@@ -727,25 +785,50 @@ def _build_ep_param_groups(model: "nn.Module") -> None:
             for p in m.parameters():
                 skip_fsdp_param_ids.add(id(p))
 
+    fqn2spec_info = getattr(model, "_fqn2spec_info", {}) or {}
     ep_params = []
+    ep_replicated_params = []
+    ep_replicated_gradient_sync_params = []
     non_ep_params = []
-    for p in model.parameters():
+    for name, p in model.named_parameters():
+        spec_info = fqn2spec_info.get(name) or getattr(p, "spec_info", None)
+        is_ep_replicated = Replicate is not None and isinstance(getattr(spec_info, "placement", None), Replicate)
+        gradient_reduction = validate_gradient_reduction_domain(
+            getattr(spec_info, "gradient_reduction", GradientReductionDomain.NONE)
+        )
+        needs_ep_gradient_sync = is_ep_replicated and gradient_reduction is GradientReductionDomain.EP_SUM
         if id(p) in skip_fsdp_param_ids:
             ep_params.append(p)
+            if is_ep_replicated:
+                ep_replicated_params.append(p)
+                if needs_ep_gradient_sync:
+                    ep_replicated_gradient_sync_params.append(p)
             continue
         if DTensor is not None and isinstance(p, DTensor):
             mesh = getattr(p, "device_mesh", None)
             names = getattr(mesh, "mesh_dim_names", ()) if mesh is not None else ()
             if "ep_fsdp" in names:
                 ep_params.append(p)
+                if is_ep_replicated:
+                    ep_replicated_params.append(p)
+                    if needs_ep_gradient_sync:
+                        ep_replicated_gradient_sync_params.append(p)
                 continue
         non_ep_params.append(p)
 
-    model._ep_param_groups = {"ep": ep_params, "non_ep": non_ep_params}
+    model._ep_param_groups = {
+        "ep": ep_params,
+        "ep_replicated": ep_replicated_params,
+        "ep_replicated_gradient_sync": ep_replicated_gradient_sync_params,
+        "non_ep": non_ep_params,
+    }
+    model._ep_replicated_gradient_sync_enabled = bool(ep_replicated_gradient_sync_params)
     logger.info_rank0(
         f"eFSDP param groups (torchtitan design): "
         f"{len(ep_params)} EP params (ep_fsdp mesh), "
-        f"{len(non_ep_params)} non-EP params (full DP mesh)"
+        f"{len(non_ep_params)} non-EP params (full DP mesh), "
+        f"{len(ep_replicated_params)} replicated EP params, "
+        f"{len(ep_replicated_gradient_sync_params)} requiring EP gradient sync"
     )
 
 
@@ -912,6 +995,7 @@ def build_parallelize_model(
                         load_weights_mode=load_weights_mode,
                         weight_device=get_device_type(),
                         dtensor_factory=distribute_tensor,
+                        strict_weight_loading=bool(kwargs.get("strict_weight_loading", False)),
                     )
                     kwargs["skip_weight_loading"] = True
 
@@ -1060,6 +1144,7 @@ def build_parallelize_model(
                 load_weights_mode=load_weights_mode,
                 weight_device=get_device_type(),
                 dtensor_factory=distribute_tensor,
+                strict_weight_loading=bool(kwargs.get("strict_weight_loading", False)),
             )
             # Mark weights as already loaded so FSDP path skips loading
             kwargs["skip_weight_loading"] = True

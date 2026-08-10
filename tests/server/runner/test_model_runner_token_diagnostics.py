@@ -56,6 +56,37 @@ def test_compute_token_diagnostics_labels_none_returns_none():
     assert ModelRunner._compute_token_diagnostics(hs, w, None, topk=4) is None
 
 
+def test_compute_kl_token_diagnostics_maps_cp_shard_positions():
+    new_logprobs = torch.tensor([[-1.0, -4.0, -1.0, -2.0]])
+    old_logprobs = torch.tensor([[-1.0, -1.0, -2.0, -3.0]])
+    labels = torch.tensor([[IGNORE_INDEX, 5, 6, 7]])
+    full_position_ids = torch.tensor([[0, 1, 2, 0, 1, 2, 3, 4]])
+
+    out = ModelRunner._compute_kl_token_diagnostics(
+        new_logprobs=new_logprobs,
+        old_logprobs=old_logprobs,
+        labels=labels,
+        topk=2,
+        rank=9,
+        batch_idx=3,
+        position_ids=full_position_ids,
+        cp_rank=1,
+    )
+
+    assert len(out) == 2
+    assert out[0]["rank"] == 9
+    assert out[0]["cp_rank"] == 1
+    assert out[0]["micro_batch"] == 3
+    assert out[0]["local_token_index"] == 1
+    assert out[0]["packed_token_index"] == 5
+    assert out[0]["sample_index_in_microbatch"] == 1
+    assert out[0]["position_id"] == 2
+    assert out[0]["target_id"] == 5
+    assert out[0]["log_ratio"] == pytest.approx(-3.0)
+    assert out[0]["ratio"] == pytest.approx(torch.exp(torch.tensor(-3.0)).item())
+    assert out[0]["k3"] > out[1]["k3"]
+
+
 def test_compute_token_diagnostics_all_ignore_returns_empty_lists():
     """All-IGNORE labels → dict with all empty lists (not None)."""
     hs = torch.zeros(1, 4, 8)
@@ -254,6 +285,28 @@ def test_compute_token_diagnostics_reports_hidden_component_summaries():
     assert summary["components"][1]["mean"] == pytest.approx(8.0)
 
 
+def test_compute_token_diagnostics_samples_component_width_independently():
+    hidden_states = torch.tensor([[[1.0, 2.0, 3.0, 4.0], [4.0, 6.0, 8.0, 10.0]]])
+    weight = torch.eye(4)
+    labels = torch.tensor([[IGNORE_INDEX, 1]])
+    topk_ids = torch.tensor([[3, 4], [5, 6]])
+
+    out = ModelRunner._compute_token_diagnostics(
+        hidden_states,
+        weight,
+        labels,
+        topk=2,
+        hidden_components=[{"layer": 0, "name": "moe_topk_ids", "order": 30, "tensor": topk_ids}],
+        hidden_sample_count=2,
+    )
+
+    summary = out["hidden_component_summaries"][0]
+    component = summary["components"][0]
+    assert summary["sample_indices"] == [0, 3]
+    assert component["sample_indices"] == [0, 1]
+    assert component["sample_values"] == pytest.approx([5.0, 6.0])
+
+
 def test_write_hidden_component_tensor_dump_writes_ranked_pt(tmp_path):
     output_prefix = tmp_path / "component-dump"
     labels = torch.tensor([[IGNORE_INDEX, 7]])
@@ -361,6 +414,102 @@ def test_hidden_component_hooks_capture_residual_and_mlp_equation_terms():
     torch.testing.assert_close(by_name["post_attention_residual"], post_attention_residual)
     torch.testing.assert_close(by_name["mlp"], mlp)
     torch.testing.assert_close(by_name["layer_output"], expected_layer_output)
+
+
+def test_hidden_component_hooks_capture_moe_internal_callback_components():
+    class DummyMlp(torch.nn.Module):
+        def forward(self, hidden_states):
+            capture = getattr(self, "_diagnostic_capture_component", None)
+            if callable(capture):
+                capture("moe_input", hidden_states.reshape(-1, hidden_states.shape[-1]))
+                capture(
+                    "moe_topk_ids",
+                    torch.tensor([[1, 2], [3, 4]], device=hidden_states.device),
+                )
+                capture("moe_experts_output", hidden_states.reshape(-1, hidden_states.shape[-1]) + 0.5)
+            return hidden_states + 1.0
+
+    class DummyLayer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.mlp = DummyMlp()
+
+        def forward(self, hidden_states):
+            return (self.mlp(hidden_states),)
+
+    class DummyInner(torch.nn.Module):
+        def __init__(self, layer):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([layer])
+
+    class DummyOuter(torch.nn.Module):
+        def __init__(self, layer):
+            super().__init__()
+            self.model = DummyInner(layer)
+
+    layer = DummyLayer()
+    runner = object.__new__(ModelRunner)
+    runner.model = DummyOuter(layer)
+
+    captures, handles = runner._install_hidden_component_hooks([0])
+    hidden_states = torch.ones(1, 2, 3)
+    try:
+        layer(hidden_states)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    by_name = {capture["name"]: capture["tensor"] for capture in captures}
+    assert {"moe_input", "moe_topk_ids", "moe_experts_output"}.issubset(by_name)
+    torch.testing.assert_close(by_name["moe_input"], torch.ones(2, 3))
+    torch.testing.assert_close(by_name["moe_topk_ids"], torch.tensor([[1, 2], [3, 4]]))
+    torch.testing.assert_close(by_name["moe_experts_output"], torch.full((2, 3), 1.5))
+    assert "_diagnostic_capture_component" not in layer.mlp.__dict__
+
+
+def test_hidden_component_hooks_accept_native_moe_operand_components():
+    class DummyMlp(torch.nn.Module):
+        def forward(self, hidden_states):
+            capture = self._diagnostic_capture_component
+            capture("moe_native_gathered_input", hidden_states)
+            capture("moe_native_local_partial", hidden_states + 1.0)
+            capture("moe_native_combined", hidden_states + 2.0)
+            return hidden_states + 2.0
+
+    class DummyLayer(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.mlp = DummyMlp()
+
+        def forward(self, hidden_states):
+            return (self.mlp(hidden_states),)
+
+    class DummyInner(torch.nn.Module):
+        def __init__(self, layer):
+            super().__init__()
+            self.layers = torch.nn.ModuleList([layer])
+
+    class DummyOuter(torch.nn.Module):
+        def __init__(self, layer):
+            super().__init__()
+            self.model = DummyInner(layer)
+
+    layer = DummyLayer()
+    runner = object.__new__(ModelRunner)
+    runner.model = DummyOuter(layer)
+    captures, handles = runner._install_hidden_component_hooks([0])
+    hidden_states = torch.ones(1, 2, 3)
+    try:
+        layer(hidden_states)
+    finally:
+        for handle in handles:
+            handle.remove()
+
+    by_name = {capture["name"]: capture for capture in captures}
+    assert by_name["moe_native_gathered_input"]["order"] == 80
+    assert by_name["moe_native_local_partial"]["order"] == 89
+    assert by_name["moe_native_combined"]["order"] == 90
+    torch.testing.assert_close(by_name["moe_native_local_partial"]["tensor"], hidden_states + 1.0)
 
 
 def test_hidden_component_hooks_capture_shared_expert_split():

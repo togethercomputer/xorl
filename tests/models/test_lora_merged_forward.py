@@ -1,4 +1,4 @@
-"""Unit tests for the LoRA merged-forward K3 contract lane (XORL_LORA_MERGED_FORWARD).
+"""Unit tests for the exact-model LoRA merged-forward contract.
 
 Covers the canonical fold (pinned fp32-accumulate/cast-once order), the
 straight-through folded-weight autograd, the LoraLinear merged forward, the
@@ -7,6 +7,8 @@ byte-consistency helper. Cross-engine bitwise gates (trainer merged forward vs
 sglang postfold serving) live in experiments/k3_tests/lora_path_xengine.py.
 """
 
+from unittest.mock import patch
+
 import pytest
 import torch
 
@@ -14,6 +16,7 @@ from xorl.lora.fold import (
     FoldedLoraWeightGateUpGKN,
     FoldedLoraWeightGKN,
     FoldedLoraWeightLinear,
+    _factor_grad_dtype,
     canonical_lora_fold_gkn,
     canonical_lora_fold_linear,
 )
@@ -76,6 +79,26 @@ class TestCanonicalFold:
 
 
 class TestFoldedWeightAutograd:
+    def test_factor_grad_dtype_honors_fsdp_metadata(self):
+        factor_A = torch.ones(4, 8, dtype=torch.bfloat16, requires_grad=True)
+        factor_B = torch.ones(16, 4, dtype=torch.bfloat16, requires_grad=True)
+        assert _factor_grad_dtype(factor_A[:2]) == torch.bfloat16
+        assert _factor_grad_dtype(factor_B[:, :2]) == torch.bfloat16
+        factor_A.grad_dtype = torch.float32
+        factor_B.grad_dtype = torch.float32
+        assert _factor_grad_dtype(factor_A[:2]) == torch.float32
+        assert _factor_grad_dtype(factor_B[:, :2]) == torch.float32
+
+        A = factor_A[:2]
+        B = factor_B[:, :2]
+        W = torch.zeros(16, 8, dtype=torch.bfloat16)
+        folded = canonical_lora_fold_linear(W, A.detach(), B.detach(), SCALING)
+        FoldedLoraWeightLinear.apply(folded, A, B, SCALING).float().sum().backward()
+        assert factor_A.grad.dtype == torch.float32
+        assert factor_B.grad.dtype == torch.float32
+        assert torch.count_nonzero(factor_A.grad) > 0
+        assert torch.count_nonzero(factor_B.grad) > 0
+
     def _reference_grads(self, W, A, B, scaling, grad_w, shared_a=False, shared_b=False):
         A_ref = A.detach().clone().requires_grad_(True)
         B_ref = B.detach().clone().requires_grad_(True)
@@ -148,9 +171,9 @@ class TestLoraLinearMerged:
         torch.nn.init.normal_(layer.lora_B, std=0.02)  # nonzero delta
         return layer
 
-    def test_merged_forward_bits(self, monkeypatch):
-        monkeypatch.setenv("XORL_LORA_MERGED_FORWARD", "1")
+    def test_merged_forward_bits(self):
         layer = self._layer()
+        layer.exact_merged_forward = True
         x = torch.randn(6, H)
         want = torch.nn.functional.linear(
             x, canonical_lora_fold_linear(layer.weight, layer.lora_A, layer.lora_B, layer.scaling), None
@@ -159,8 +182,7 @@ class TestLoraLinearMerged:
             got = layer(x)
         assert torch.equal(got, want)
 
-    def test_flag_off_keeps_legacy_path(self, monkeypatch):
-        monkeypatch.delenv("XORL_LORA_MERGED_FORWARD", raising=False)
+    def test_flag_off_keeps_legacy_path(self):
         layer = self._layer()
         x = torch.randn(6, H)
         base = torch.nn.functional.linear(x, layer.weight, None)
@@ -168,12 +190,30 @@ class TestLoraLinearMerged:
         want = base + (lora * layer.scaling)
         assert torch.allclose(layer(x), want, rtol=0, atol=0)
 
-    def test_merged_grads_close_to_unmerged(self, monkeypatch):
+    def test_exact_and_ordinary_modules_do_not_share_selection_state(self):
+        exact = self._layer()
+        ordinary = self._layer()
+        ordinary.load_state_dict(exact.state_dict())
+        exact.exact_merged_forward = True
+        x = torch.randn(6, H)
+
+        exact_first = exact(x)
+        ordinary_out = ordinary(x)
+        exact_second = exact(x)
+
+        assert torch.equal(exact_first, exact_second)
+        expected_ordinary = torch.nn.functional.linear(x, ordinary.weight, None) + (
+            torch.nn.functional.linear(torch.nn.functional.linear(x, ordinary.lora_A), ordinary.lora_B)
+            * ordinary.scaling
+        )
+        assert torch.equal(ordinary_out, expected_ordinary)
+
+    def test_merged_grads_close_to_unmerged(self):
         layer = self._layer()
         x = torch.randn(6, H)
         grads = {}
         for flag in ("0", "1"):
-            monkeypatch.setenv("XORL_LORA_MERGED_FORWARD", flag)
+            layer.exact_merged_forward = flag == "1"
             layer.lora_A.grad = layer.lora_B.grad = None
             layer.invalidate_merged_weight_cache()
             layer(x).square().mean().backward()
@@ -183,9 +223,9 @@ class TestLoraLinearMerged:
         for a, b in zip(grads["0"], grads["1"]):
             assert torch.allclose(a, b, rtol=5e-2, atol=1e-5)
 
-    def test_cache_invalidation_on_step_and_runtime_config(self, monkeypatch):
-        monkeypatch.setenv("XORL_LORA_MERGED_FORWARD", "1")
+    def test_cache_invalidation_on_step_and_runtime_config(self):
         layer = self._layer()
+        layer.exact_merged_forward = True
         w1 = layer._merged_weight()
         assert layer._merged_weight() is w1  # cache hit
         opt = torch.optim.SGD([layer.lora_A, layer.lora_B], lr=1e-2)
@@ -223,9 +263,9 @@ class TestMoEExpertsLoRAMerged:
                 getattr(mod, f"{proj}_lora_B").normal_(std=0.02)
         return mod
 
-    def test_merged_weights_match_canonical_fold(self, monkeypatch):
-        monkeypatch.setenv("XORL_LORA_MERGED_FORWARD", "1")
+    def test_merged_weights_match_canonical_fold(self):
         mod = self._module()
+        mod.exact_merged_forward = True
         gate_up_f, down_f = mod._merged_weights()
         s = mod._active_scaling()
         gA, gB = mod._active_lora_views("gate_proj")
@@ -238,9 +278,9 @@ class TestMoEExpertsLoRAMerged:
         assert torch.equal(mod.canonical_merged_proj_weight("gate_proj"), gate_up_f[..., :I])
         assert torch.equal(mod.canonical_merged_proj_weight("down_proj"), down_f)
 
-    def test_cache_keyed_on_versions(self, monkeypatch):
-        monkeypatch.setenv("XORL_LORA_MERGED_FORWARD", "1")
+    def test_cache_keyed_on_versions(self):
         mod = self._module()
+        mod.exact_merged_forward = True
         g1, d1 = mod._merged_weights()
         g2, d2 = mod._merged_weights()
         assert g1 is g2 and d1 is d2
@@ -249,22 +289,91 @@ class TestMoEExpertsLoRAMerged:
         g3, _ = mod._merged_weights()
         assert g3 is not g1 and not torch.equal(g1, g3)
 
-    def test_auto_supported_requires_flag(self, monkeypatch):
+    def test_auto_supported_requires_exact_model_program(self):
         mod = self._module()
-        monkeypatch.delenv("XORL_LORA_MERGED_FORWARD", raising=False)
         assert not mod.sglang_fused_experts_auto_supported()
-        monkeypatch.setenv("XORL_LORA_MERGED_FORWARD", "1")
+        mod.exact_merged_forward = True
         assert mod.sglang_fused_experts_auto_supported()
 
-    def test_fused_flag_without_merged_flag_raises(self, monkeypatch):
-        monkeypatch.delenv("XORL_LORA_MERGED_FORWARD", raising=False)
+    def test_fused_flag_without_merged_flag_raises(self):
         mod = self._module()
-        with pytest.raises(NotImplementedError, match="XORL_LORA_MERGED_FORWARD"):
+        with pytest.raises(NotImplementedError, match="merged"):
             mod.sglang_fused_experts_forward(
                 torch.randn(3, H).to(torch.bfloat16),
                 torch.rand(3, 2).to(torch.bfloat16),
                 torch.randint(0, E, (3, 2)),
             )
+
+    def test_native_ep_keyword_routes_to_masked_lora_partial(self, monkeypatch):
+        mod = self._module()
+        mod.exact_merged_forward = True
+        hidden = torch.randn(3, H).to(torch.bfloat16)
+        routing = torch.rand(3, 2).to(torch.bfloat16)
+        local_ids = torch.tensor([[0, -1], [1, -1], [-1, 2]], dtype=torch.int32)
+        expected = torch.randn_like(hidden)
+        calls = []
+
+        def masked_partial(got_hidden, got_routing, got_ids):
+            calls.append((got_hidden, got_routing, got_ids))
+            return expected
+
+        monkeypatch.setattr(mod, "sglang_ep_native_routed_partial", masked_partial)
+        got = mod(hidden, routing, sglang_ep_native_local_ids=local_ids)
+        assert got is expected
+        assert calls == [(hidden, routing, local_ids)]
+
+    def test_native_ep_no_grad_uses_canonical_fold_and_filter(self, monkeypatch):
+        mod = self._module()
+        mod.exact_merged_forward = True
+        hidden = torch.randn(3, H).to(torch.bfloat16)
+        routing = torch.rand(3, 2).to(torch.bfloat16)
+        local_ids = torch.tensor([[0, -1], [1, -1], [-1, 2]], dtype=torch.int32)
+        expected = torch.randn_like(hidden)
+        gate_up_f, down_f = mod._merged_weights()
+        captured = {}
+
+        def fake_kernel(
+            got_hidden,
+            got_gate_up,
+            got_down,
+            got_routing,
+            got_ids,
+            _impl,
+            _activation,
+            _swiglu_limit,
+            _bias,
+            *,
+            weight_cache,
+            filter_expert,
+        ):
+            captured.update(
+                hidden=got_hidden,
+                gate_up=got_gate_up,
+                down=got_down,
+                routing=got_routing,
+                ids=got_ids,
+                weight_cache=weight_cache,
+                filter_expert=filter_expert,
+            )
+            return expected
+
+        with (
+            patch("xorl.models.layers.moe.experts.MoEExperts._load_sglang_fused_experts_impl", return_value=object()),
+            patch("xorl.models.layers.moe.experts._sglang_fused_experts_kernel_call", side_effect=fake_kernel),
+            torch.no_grad(),
+        ):
+            got = mod.sglang_ep_native_routed_partial(hidden, routing, local_ids)
+
+        assert got is expected
+        assert captured == {
+            "hidden": hidden,
+            "gate_up": gate_up_f,
+            "down": down_f,
+            "routing": routing,
+            "ids": local_ids,
+            "weight_cache": None,
+            "filter_expert": True,
+        }
 
 
 class TestTrunkWrapComposition:
@@ -274,11 +383,10 @@ class TestTrunkWrapComposition:
         model.q_proj = LoraLinear(H, H, r=R, lora_alpha=R, dtype=torch.bfloat16)
         return model
 
-    def test_wrap_raises_without_merged_flag(self, monkeypatch):
+    def test_wrap_raises_without_merged_flag(self):
         from xorl.ops.batch_invariant_ops import wrap_trunk_linears_batch_invariant  # noqa: PLC0415
 
-        monkeypatch.delenv("XORL_LORA_MERGED_FORWARD", raising=False)
-        with pytest.raises(NotImplementedError, match="XORL_LORA_MERGED_FORWARD"):
+        with pytest.raises(NotImplementedError, match="canonical merged-LoRA"):
             wrap_trunk_linears_batch_invariant(self._model())
 
     def test_wrap_composes_with_merged_flag(self, monkeypatch):
@@ -287,8 +395,8 @@ class TestTrunkWrapComposition:
             wrap_trunk_linears_batch_invariant,
         )
 
-        monkeypatch.setenv("XORL_LORA_MERGED_FORWARD", "1")
         model = self._model()
+        model.q_proj.exact_merged_forward = True
         try:
             wrapped = wrap_trunk_linears_batch_invariant(model)
             assert wrapped == {"q_proj": 1}

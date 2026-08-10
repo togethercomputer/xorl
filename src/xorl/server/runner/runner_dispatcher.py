@@ -75,6 +75,7 @@ from xorl.data.collators import TextSequenceShardCollator
 from xorl.distributed.parallel_state import get_parallel_state
 from xorl.ops.shared_prefix import shared_prefix_repack_batch
 from xorl.server.protocol.operations import (
+    AbortGradientEpochData,
     AdapterStateData,
     EmptyData,
     LoadStateData,
@@ -83,15 +84,17 @@ from xorl.server.protocol.operations import (
     SaveFullWeightsData,
     SaveLoraOnlyData,
     SaveStateData,
-    ZORLAbortGenerationData,
-    ZORLApplyRewardsData,
-    ZORLStartGenerationData,
 )
 from xorl.server.protocol.orchestrator_runner import (
     RunnerDispatchCommand,
     RunnerResponse,
 )
 from xorl.server.runner.adapters import AdapterCoordinator
+from xorl.server.runner.adapters.gradient_finalizer import (
+    AdapterGradientCollectiveFailure,
+    AdapterGradientMutationFailure,
+)
+from xorl.server.runner.adapters.gradient_ownership import AdapterGradientUniformRejection
 from xorl.server.runner.model_runner import ModelRunner
 from xorl.server.runner.utils import (
     Rank0Protocol,
@@ -119,6 +122,9 @@ from xorl.trainers.training_utils import count_valid_tokens
 
 
 logger = logging.getLogger(__name__)
+
+
+_ADAPTER_GRADIENT_FATAL_EXIT_CODE = 70
 ROUTING_PAYLOAD_REF_KEY = "__xorl_routing_payload_ref__"
 
 
@@ -223,17 +229,27 @@ class RunnerDispatcher:
             f"RunnerDispatcher initialized (rank={rank}/{world_size}, bind_address={bind_address}, device={device})"
         )
 
+    def _resolve_server_artifact(
+        self,
+        candidate: str | os.PathLike[str],
+        *,
+        must_exist: bool = False,
+    ) -> Path:
+        """Confine artifacts to this server instance's output directory."""
+        return resolve_server_artifact(
+            candidate,
+            must_exist=must_exist,
+            root=getattr(self, "output_dir", None),
+        )
+
     # Operations that participate in cross-rank error sync.
     # These ops execute on every rank, and rank-0 success is not trustworthy if any
     # worker rank failed locally.
     _ERROR_SYNC_OPS = {
-        "forward_backward",
         "forward",
         "optim_step",
+        "abort_gradient_epoch",
         "register_session",
-        "start_zorl_generation",
-        "apply_zorl_rewards",
-        "abort_zorl_generation",
     }
 
     def _sync_error_state(self) -> Optional[str]:
@@ -389,7 +405,20 @@ class RunnerDispatcher:
                 # Execute command based on type
                 try:
                     await self._handle_worker_command(command_dict)
+                    if command_type == "optim_step":
+                        # Make publication part of the command whose existing
+                        # completion rendezvous all ranks must still pass.
+                        self._commit_adapter_optimizer_publication(command_dict)
                     logger.debug(f"Rank {self.rank}: Command {command_type} completed successfully")
+                except AdapterGradientUniformRejection as uniform_error:
+                    # forward_backward has no post-command error collective.
+                    # These are safe only when rank-uniform by construction:
+                    # broadcast request rejection, globally identical D <= 0,
+                    # or the explicit whole-epoch abort command.
+                    logger.warning(f"Rank {self.rank}: Uniform command rejection: {uniform_error}")
+                    self._worker_error = None
+                except (AdapterGradientCollectiveFailure, AdapterGradientMutationFailure) as fatal_error:
+                    self._terminate_after_adapter_gradient_failure(fatal_error)
                 except Exception as cmd_error:
                     # Log gracefully - only include traceback for unexpected errors
                     error_msg = str(cmd_error)
@@ -407,10 +436,32 @@ class RunnerDispatcher:
                     try:
                         cross_rank_error = self._sync_error_state()
                         if cross_rank_error:
+                            if command_type == "optim_step":
+                                self._terminate_after_adapter_gradient_failure(
+                                    AdapterGradientMutationFailure(
+                                        "Optimizer command completion failed after mutation; "
+                                        "publish nothing and restart from checkpoint"
+                                    )
+                                )
                             logger.warning(f"Rank {self.rank}: Cross-rank error detected: {cross_rank_error}")
                         self._worker_error = None
-                    except Exception:
+                    except (AdapterGradientCollectiveFailure, AdapterGradientMutationFailure) as fatal_error:
+                        self._terminate_after_adapter_gradient_failure(fatal_error)
+                    except Exception as sync_error:
                         self._worker_error = None
+                        if command_type == "optim_step":
+                            self._terminate_after_adapter_gradient_failure(
+                                AdapterGradientCollectiveFailure(
+                                    "Optimizer command completion failed after mutation; terminate the process"
+                                )
+                            )
+                        logger.error(
+                            "Rank %s: error-state synchronization failed for %s: %s",
+                            self.rank,
+                            command_type,
+                            sync_error,
+                            exc_info=True,
+                        )
 
             except asyncio.CancelledError:
                 logger.info(f"Rank {self.rank}: Worker event loop cancelled")
@@ -438,6 +489,7 @@ class RunnerDispatcher:
         "forward": "_handle_forward",
         "forward_backward": "_handle_forward_backward",
         "optim_step": "_handle_optim_step",
+        "abort_gradient_epoch": "_handle_abort_gradient_epoch",
         "save_state": "_handle_save_state",
         "save_lora_only": "_handle_save_lora_only",
         "save_full_weights": "_handle_save_full_weights",
@@ -453,9 +505,6 @@ class RunnerDispatcher:
         "load_adapter_state": "_handle_load_adapter_state",
         "get_adapter_info": "_handle_get_adapter_info",
         "kill_session": "_handle_kill_session",
-        "start_zorl_generation": "_handle_start_zorl_generation",
-        "apply_zorl_rewards": "_handle_apply_zorl_rewards",
-        "abort_zorl_generation": "_handle_abort_zorl_generation",
     }
 
     # Commands handled on rank 0 only (no broadcast needed)
@@ -472,6 +521,7 @@ class RunnerDispatcher:
             RunnerResponse with results or error
         """
         start_time = time.time()
+        command_type: Optional[str] = None
 
         try:
             # Handle rank-0-only commands (no broadcast)
@@ -543,22 +593,40 @@ class RunnerDispatcher:
                 )
             result = await getattr(self, handler_name)(command_dict)
 
+            if command_type == "optim_step":
+                # Publication is local but remains externally invisible until
+                # every rank passes the existing command-completion rendezvous.
+                self._commit_adapter_optimizer_publication(command_dict)
+
             # Post-execution error sync for lockstep ops.
             if command_type in self._ERROR_SYNC_OPS:
                 cross_rank_error = self._sync_error_state()
                 if cross_rank_error:
                     self._worker_error = None
+                    if command_type == "optim_step":
+                        raise AdapterGradientMutationFailure(
+                            "Optimizer command completion failed after mutation; "
+                            "publish nothing and restart from checkpoint"
+                        )
                     return RunnerResponse(
                         request_id=request.message_id,
                         success=False,
                         error=f"Cross-rank error: {cross_rank_error}",
                         execution_time=time.time() - start_time,
                     )
-
             return RunnerResponse(
                 request_id=request.message_id, success=True, result=result, execution_time=time.time() - start_time
             )
 
+        except (AdapterGradientCollectiveFailure, AdapterGradientMutationFailure) as fatal_error:
+            self._terminate_after_adapter_gradient_failure(fatal_error)
+        except AdapterGradientUniformRejection as uniform_error:
+            return RunnerResponse(
+                request_id=request.message_id,
+                success=False,
+                error=str(uniform_error),
+                execution_time=time.time() - start_time,
+            )
         except Exception as e:
             # Log gracefully - only include traceback for unexpected errors
             error_msg = str(e)
@@ -579,6 +647,54 @@ class RunnerDispatcher:
             return RunnerResponse(
                 request_id=request.message_id, success=False, error=str(e), execution_time=time.time() - start_time
             )
+
+    def _terminate_after_adapter_gradient_failure(self, error: BaseException) -> None:
+        """Terminate this worker after a collective or post-mutation failure."""
+
+        logger.critical(
+            "Rank %s: fatal adapter-gradient failure; terminating distributed worker: %s",
+            self.rank,
+            error,
+            exc_info=True,
+        )
+        os._exit(_ADAPTER_GRADIENT_FATAL_EXIT_CODE)
+
+    def _commit_adapter_optimizer_publication(self, command_dict: Dict[str, Any]) -> None:
+        """Reuse command completion as the authoritative publication commit."""
+
+        manager = getattr(self.trainer, "_adapter_manager", None)
+        if manager is None:
+            manager = getattr(self.trainer, "adapter_manager", None)
+        commit = getattr(manager, "commit_optimizer_publication", None)
+        if commit is None:
+            return
+        payload = command_dict.get("payload")
+        model_id = getattr(payload, "model_id", None) or "default"
+        try:
+            commit(model_id)
+        except (AdapterGradientCollectiveFailure, AdapterGradientMutationFailure):
+            raise
+        except BaseException as error:
+            self._poison_adapter_after_mutation(model_id)
+            raise AdapterGradientMutationFailure(
+                "Adapter optimizer publication commit failed after mutation; publish nothing and restart from checkpoint"
+            ) from error
+
+    def _poison_adapter_after_mutation(self, model_id: str) -> None:
+        """Best-effort local poison for failures after an adapter step returned."""
+
+        manager = getattr(self.trainer, "_adapter_manager", None)
+        if manager is None:
+            manager = getattr(self.trainer, "adapter_manager", None)
+        get_state = getattr(manager, "get_adapter_state", None)
+        if get_state is None:
+            return
+        try:
+            state = get_state(model_id)
+            state.poisoned = True
+            state.publication_eligible = False
+        except Exception:
+            logger.exception("Failed to poison adapter %s after post-mutation failure", model_id)
 
     async def _handle_worker_command(self, command_dict: Dict[str, Any]):
         """
@@ -615,11 +731,30 @@ class RunnerDispatcher:
     # ========================================================================
 
     async def _handle_forward_backward(self, command_dict: Dict[str, Any]) -> Dict[str, Any]:
-        """Handle forward_backward on all ranks."""
-        if self.rank == 0:
-            return await self._handle_compute_rank0_scatter(command_dict, with_backward=True)
-        await self._handle_compute_worker_receive(command_dict, with_backward=True)
-        return {}
+        """Handle forward_backward without a redundant post-command error sync.
+
+        Failure classification is deliberately narrow:
+
+        * rank-uniform: broadcast-parameter rejection, globally identical
+          nonpositive denominator, and explicit epoch abort;
+        * process-fatal: local gradient/presence/shape/layout failures, device
+          errors, collective or completion-rendezvous failures, commit failures,
+          and every other potentially rank-asymmetric exception.
+        """
+
+        try:
+            if self.rank == 0:
+                return await self._handle_compute_rank0_scatter(command_dict, with_backward=True)
+            await self._handle_compute_worker_receive(command_dict, with_backward=True)
+            return {}
+        except AdapterGradientUniformRejection:
+            raise
+        except (AdapterGradientCollectiveFailure, AdapterGradientMutationFailure):
+            raise
+        except BaseException as error:
+            raise AdapterGradientCollectiveFailure(
+                "Rank-asymmetric forward_backward failure before completion; terminate the distributed process"
+            ) from error
 
     async def _handle_forward(self, command_dict: Dict[str, Any]) -> Dict[str, Any]:
         """Handle forward on all ranks (no gradient computation)."""
@@ -779,8 +914,25 @@ class RunnerDispatcher:
                 model_id=model_id,
                 routed_expert_logits=routed_expert_logits,
             )
-        del my_batches
         self._gather_is_metrics(result, cp_enabled, is_rank0=is_rank0)
+        gathered = self._completion_rendezvous(result, my_batches, parallel_state, is_rank0=is_rank0)
+        if with_backward:
+            try:
+                self.trainer.commit_forward_backward_completion(model_id)
+            except (AdapterGradientCollectiveFailure, AdapterGradientMutationFailure):
+                raise
+            except BaseException as error:
+                raise AdapterGradientCollectiveFailure(
+                    "Adapter-gradient capture commit failed after completion rendezvous; terminate the process"
+                ) from error
+        if is_rank0:
+            try:
+                self._merge_completion_payloads(result, gathered or [])
+            except BaseException as error:
+                raise AdapterGradientCollectiveFailure(
+                    "Rank-zero response processing failed after capture commit; terminate the process"
+                ) from error
+        del my_batches
         return result
 
     @staticmethod
@@ -952,10 +1104,10 @@ class RunnerDispatcher:
             "total_input_tokens_local": total_input_tokens,
             "parallel": {
                 "ep_enabled": bool(getattr(parallel_state, "ep_enabled", False)),
-                "ep_size": int(getattr(parallel_state, "ep_size", 1)),
-                "dp_size": int(getattr(parallel_state, "dp_size", 1)),
-                "cp_size": int(getattr(parallel_state, "cp_size", 1)),
-                "pp_size": int(getattr(parallel_state, "pp_size", 1)),
+                "ep_size": int(getattr(parallel_state, "ep_size", 1) or 1),
+                "dp_size": int(getattr(parallel_state, "dp_size", 1) or 1),
+                "cp_size": int(getattr(parallel_state, "cp_size", 1) or 1),
+                "pp_size": int(getattr(parallel_state, "pp_size", 1) or 1),
             },
             "routing": {
                 "routed_experts_count": len(routed_experts or []),
@@ -1097,7 +1249,8 @@ class RunnerDispatcher:
     def _batch_parallel_rank_and_size(self, parallel_state, cp_size: int, pp_size: int) -> tuple[int, int]:
         """Return the logical data slice rank/size for request batch dispatch.
 
-        Every rank gets a distinct slice (CP/SP ranks share one); EP groups no
+        Every logical data replica gets a distinct slice; FSDP, CP/SP, TP, and
+        same-stage ranks share that slice. EP groups no
         longer duplicate a slice across their ranks unless the legacy
         XORL_SERVER_EP_DUPLICATE_BATCHES rollback switch is set — see
         batch_slice_rank_and_size for the correctness argument.
@@ -1524,10 +1677,12 @@ class RunnerDispatcher:
     def _gather_is_metrics(self, result: Dict[str, Any], cp_enabled: bool, *, is_rank0: bool) -> None:
         """Gather importance-sampling metrics across ranks via all_gather.
 
-        All ranks must call this together when SP is enabled.
+        All ranks must call this together when SP is enabled or when an
+        explicit cross-rank forward/backward diagnostic was requested.
         Rank 0 merges IS metrics into its result dict; workers just participate.
         """
-        if not (self.world_size > 1 and cp_enabled):
+        diagnostic_topk = int(result.get("forward_backward_kl_top_tokens_requested", 0) or 0)
+        if not (self.world_size > 1 and (cp_enabled or diagnostic_topk > 0)):
             return
 
         logger.debug(f"Rank {self.rank}: Gathering results from all ranks to merge IS metrics...")
@@ -1542,13 +1697,149 @@ class RunnerDispatcher:
                         if key.startswith("is_") and key not in result:
                             result[key] = rank_result[key]
                             logger.debug(f"Rank {self.rank}: Copied IS metric '{key}' from rank {i}")
+            topk_requested = max(
+                int((rank_result or {}).get("forward_backward_kl_top_tokens_requested", 0) or 0)
+                for rank_result in all_results
+            )
+            if topk_requested > 0:
+                top_tokens: list[dict[str, Any]] = []
+                for rank_result in all_results:
+                    if rank_result:
+                        top_tokens.extend(rank_result.get("forward_backward_kl_top_tokens") or [])
+                top_tokens.sort(key=lambda item: float(item.get("k3", float("-inf"))), reverse=True)
+                result["forward_backward_kl_top_tokens_requested"] = topk_requested
+                result["forward_backward_kl_top_tokens"] = top_tokens[:topk_requested]
             logger.debug(f"Rank {self.rank}: Final result keys: {list(result.keys())}")
 
         del all_results
 
+    _PACKED_OUTPUT_FIELDS = (
+        "packed_logprobs",
+        "packed_losses",
+        "packed_position_ids",
+        "packed_token_diagnostics",
+    )
+
+    @classmethod
+    def _merge_per_token_output_payloads(cls, payloads: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Merge one canonical observer payload per logical data slice.
+
+        CP ranks and pipeline stages may share a logical data slice.  Their
+        observer payloads must either be empty or byte-for-byte equivalent;
+        silently picking one would make a diagnostic response look complete
+        while hiding a replica disagreement.
+        """
+        by_slice: Dict[int, List[Dict[str, Any]]] = {}
+        for payload in payloads:
+            if not payload:
+                continue
+            by_slice.setdefault(int(payload["slice_rank"]), []).append(payload)
+
+        canonical: List[Dict[str, Any]] = []
+        for slice_rank in sorted(by_slice):
+            candidates = by_slice[slice_rank]
+            nonempty = [
+                payload
+                for payload in candidates
+                if any(payload.get(field) for field in cls._PACKED_OUTPUT_FIELDS) or payload.get("per_sample_k3")
+            ]
+            if not nonempty:
+                continue
+            first = nonempty[0]
+            comparable = {
+                field: first.get(field) for field in (*cls._PACKED_OUTPUT_FIELDS, "per_sample_k3") if field in first
+            }
+            for other in nonempty[1:]:
+                other_comparable = {
+                    field: other.get(field) for field in (*cls._PACKED_OUTPUT_FIELDS, "per_sample_k3") if field in other
+                }
+                if other_comparable != comparable:
+                    ranks = [int(payload["rank"]) for payload in nonempty]
+                    raise RuntimeError(
+                        f"per-token observer outputs disagree for logical data slice {slice_rank} across ranks {ranks}"
+                    )
+            canonical.append(first)
+
+        merged: Dict[str, Any] = {}
+        for field in (*cls._PACKED_OUTPUT_FIELDS, "per_sample_k3"):
+            values: List[Any] = []
+            present = False
+            for payload in canonical:
+                if field in payload:
+                    present = True
+                    values.extend(payload[field])
+            if present:
+                merged[field] = values
+        return merged
+
+    def _completion_rendezvous(
+        self,
+        result: Dict[str, Any],
+        my_batches: List[Dict[str, Any]],
+        parallel_state: Any,
+        *,
+        is_rank0: bool,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Gather raw result payloads at the mandatory command-completion boundary.
+
+        Every successful distributed ``forward`` and ``forward_backward`` call
+        reaches this helper.  ``gather_object`` first exchanges object sizes on
+        all ranks, so it cannot return anywhere until every rank contributes.
+        This rendezvous property is load-bearing: a future pre-sized tensor
+        gather must preserve it without adding another collective.  World size
+        one completes locally.
+        """
+
+        cp_size = max(1, int(getattr(parallel_state, "cp_size", 1)))
+        pp_size = int(getattr(parallel_state, "pp_size", 1)) if getattr(parallel_state, "pp_enabled", False) else 1
+        slice_rank, _ = self._batch_parallel_rank_and_size(parallel_state, cp_size, pp_size)
+        real_batch_count = sum(int(batch.get("num_samples", 1) or 0) > 0 for batch in my_batches)
+        real_sample_count = sum(max(0, int(batch.get("num_samples", 1) or 0)) for batch in my_batches)
+
+        payload: Dict[str, Any] = {
+            "rank": self.rank,
+            "slice_rank": slice_rank,
+        }
+        for field in self._PACKED_OUTPUT_FIELDS:
+            if field in result:
+                payload[field] = result[field][:real_batch_count]
+        if "per_sample_k3" in result:
+            payload["per_sample_k3"] = result["per_sample_k3"][:real_sample_count]
+
+        if self.world_size <= 1:
+            return [payload] if is_rank0 else None
+
+        gathered = [None] * self.world_size if is_rank0 else None
+        try:
+            dist.gather_object(payload, gathered, dst=0, group=self.cpu_group)
+        except BaseException as error:
+            raise AdapterGradientCollectiveFailure(
+                "Completion rendezvous failed; terminate the distributed process"
+            ) from error
+        return gathered
+
+    @classmethod
+    def _merge_completion_payloads(
+        cls,
+        result: Dict[str, Any],
+        gathered: List[Dict[str, Any]],
+    ) -> None:
+        """Merge rank-zero response data only after capture commitment."""
+
+        merged = cls._merge_per_token_output_payloads(gathered)
+        for field in (*cls._PACKED_OUTPUT_FIELDS, "per_sample_k3"):
+            result.pop(field, None)
+        result.update(merged)
+
     # ========================================================================
     # Optim Step Handlers
     # ========================================================================
+
+    async def _handle_abort_gradient_epoch(self, command_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """Handle idempotent whole-epoch abort on every rank."""
+
+        p: AbortGradientEpochData = command_dict.get("payload", AbortGradientEpochData())
+        return self.trainer.abort_gradient_epoch(p.model_id)
 
     async def _handle_optim_step(self, command_dict: Dict[str, Any]) -> Dict[str, Any]:
         """Handle optim_step on all ranks (unified handler)."""
@@ -1576,23 +1867,30 @@ class RunnerDispatcher:
             model_id=model_id,
             sparse_delta_capture=p.sparse_delta_capture,
         )
+        try:
+            if capture_requested:
+                rank_capture = result.get("sparse_delta_capture")
+                if self.world_size > 1 and dist.is_available() and dist.is_initialized():
+                    all_rank_captures = [None] * self.world_size
+                    dist.all_gather_object(all_rank_captures, rank_capture)
+                else:
+                    all_rank_captures = [rank_capture]
+                if self.rank == 0:
+                    result["sparse_delta_capture"] = write_sparse_source_delta_global_manifest(all_rank_captures)
 
-        if capture_requested:
-            rank_capture = result.get("sparse_delta_capture")
-            if self.world_size > 1 and dist.is_available() and dist.is_initialized():
-                all_rank_captures = [None] * self.world_size
-                dist.all_gather_object(all_rank_captures, rank_capture)
-            else:
-                all_rank_captures = [rank_capture]
-            if self.rank == 0:
-                result["sparse_delta_capture"] = write_sparse_source_delta_global_manifest(all_rank_captures)
+            # Add auto-load info to result if adapter was loaded from checkpoint
+            if was_auto_loaded and self.rank == 0:
+                result["auto_loaded"] = True
+                result["auto_load_path"] = auto_load_path
 
-        # Add auto-load info to result if adapter was loaded from checkpoint
-        if was_auto_loaded and self.rank == 0:
-            result["auto_loaded"] = True
-            result["auto_load_path"] = auto_load_path
-
-        return result if self.rank == 0 else {}
+            return result if self.rank == 0 else {}
+        except (AdapterGradientCollectiveFailure, AdapterGradientMutationFailure):
+            raise
+        except BaseException as error:
+            self._poison_adapter_after_mutation(model_id)
+            raise AdapterGradientMutationFailure(
+                "Optimizer handler tail failed after adapter mutation; publish nothing and restart from checkpoint"
+            ) from error
 
     # ========================================================================
     # Save/Load State Handlers
@@ -1621,7 +1919,7 @@ class RunnerDispatcher:
                 current_step = getattr(self.trainer, "step", 0)
                 checkpoint_path = checkpoint_path.rstrip("/")
                 checkpoint_path = f"{checkpoint_path}_{timestamp}_step_{current_step}"
-        checkpoint_path = str(resolve_server_artifact(checkpoint_path))
+        checkpoint_path = str(self._resolve_server_artifact(checkpoint_path))
 
         return {
             "command": "save_state",
@@ -1636,7 +1934,7 @@ class RunnerDispatcher:
     async def _prepare_load_state_command(self, request: RunnerDispatchCommand) -> Dict[str, Any]:
         """Prepare load_state command."""
         p: LoadStateData = request.payload
-        checkpoint_path = str(resolve_server_artifact(p.checkpoint_path, must_exist=True))
+        checkpoint_path = str(self._resolve_server_artifact(p.checkpoint_path, must_exist=True))
         return {
             "command": "load_state",
             "request_id": request.message_id,
@@ -1650,7 +1948,7 @@ class RunnerDispatcher:
     async def _handle_save_state(self, command_dict: Dict[str, Any]) -> Dict[str, Any]:
         """Handle save_state on all ranks (unified handler)."""
         p: SaveStateData = command_dict.get("payload", SaveStateData())
-        checkpoint_path = str(resolve_server_artifact(p.checkpoint_path))
+        checkpoint_path = str(self._resolve_server_artifact(p.checkpoint_path))
         save_optimizer = p.save_optimizer
         model_id = validate_identifier(p.model_id or "default", name="model_id")
 
@@ -1688,7 +1986,7 @@ class RunnerDispatcher:
             "command": "save_lora_only",
             "request_id": request.message_id,
             "payload": SaveLoraOnlyData(
-                lora_path=str(resolve_server_artifact(p.lora_path)),
+                lora_path=str(self._resolve_server_artifact(p.lora_path)),
                 model_id=validate_identifier(p.model_id or "default", name="model_id"),
             ),
         }
@@ -1700,7 +1998,7 @@ class RunnerDispatcher:
             "command": "save_full_weights",
             "request_id": request.message_id,
             "payload": SaveFullWeightsData(
-                output_path=str(resolve_server_artifact(p.output_path)),
+                output_path=str(self._resolve_server_artifact(p.output_path)),
                 dtype=p.dtype,
                 base_model_path=p.base_model_path,
             ),
@@ -1712,7 +2010,7 @@ class RunnerDispatcher:
         Saves only LoRA adapter weights in PEFT-compatible format.
         """
         p: SaveLoraOnlyData = command_dict.get("payload", SaveLoraOnlyData())
-        lora_path = str(resolve_server_artifact(p.lora_path))
+        lora_path = str(self._resolve_server_artifact(p.lora_path))
         model_id = validate_identifier(p.model_id or "default", name="model_id")
 
         logger.debug(f"Rank {self.rank}: Saving LoRA adapter to {lora_path} for model_id={model_id}")
@@ -1739,7 +2037,7 @@ class RunnerDispatcher:
         Saves full model weights as safetensors with config files for SGLang loading.
         """
         p: SaveFullWeightsData = command_dict.get("payload", SaveFullWeightsData())
-        output_path = str(resolve_server_artifact(p.output_path))
+        output_path = str(self._resolve_server_artifact(p.output_path))
         dtype = p.dtype
         base_model_path = p.base_model_path
 
@@ -1763,7 +2061,7 @@ class RunnerDispatcher:
     async def _handle_load_state(self, command_dict: Dict[str, Any]) -> Dict[str, Any]:
         """Handle load_state on all ranks (unified handler)."""
         p: LoadStateData = command_dict.get("payload", LoadStateData())
-        checkpoint_path = str(resolve_server_artifact(p.checkpoint_path, must_exist=True))
+        checkpoint_path = str(self._resolve_server_artifact(p.checkpoint_path, must_exist=True))
         load_optimizer = p.load_optimizer
         model_id = validate_identifier(p.model_id or "default", name="model_id")
 
@@ -1829,9 +2127,9 @@ class RunnerDispatcher:
         # If no output path provided, default to checkpoints/hf_weights/
         if output_path is None:
             output_path = "hf_weights"
-        output_path = str(resolve_server_artifact(output_path))
+        output_path = str(self._resolve_server_artifact(output_path))
         if checkpoint_path is not None:
-            checkpoint_path = str(resolve_server_artifact(checkpoint_path, must_exist=True))
+            checkpoint_path = str(self._resolve_server_artifact(checkpoint_path, must_exist=True))
 
         return {
             "command": "save_weights_for_sampler",
@@ -1848,8 +2146,8 @@ class RunnerDispatcher:
         p: SaveStateData = command_dict.get("payload", SaveStateData())
         checkpoint_path = p.checkpoint_path
         if checkpoint_path is not None:
-            checkpoint_path = str(resolve_server_artifact(checkpoint_path, must_exist=True))
-        output_path = str(resolve_server_artifact(command_dict.get("output_path")))
+            checkpoint_path = str(self._resolve_server_artifact(checkpoint_path, must_exist=True))
+        output_path = str(self._resolve_server_artifact(command_dict.get("output_path")))
         save_dtype = command_dict.get("save_dtype", "bfloat16")
 
         logger.debug(f"Rank {self.rank}: Saving HF weights from {checkpoint_path} to {output_path}, dtype={save_dtype}")
@@ -1950,55 +2248,6 @@ class RunnerDispatcher:
 
     async def _handle_kill_session(self, command_dict: Dict[str, Any]) -> Dict[str, Any]:
         return await self._adapter_coordinator.handle_kill_session(command_dict)
-
-    async def _handle_start_zorl_generation(self, command_dict: Dict[str, Any]) -> Dict[str, Any]:
-        """Handle start_zorl_generation on all ranks."""
-        p: ZORLStartGenerationData = command_dict.get("payload", ZORLStartGenerationData())
-        model_id = p.model_id or "default"
-
-        was_auto_loaded, auto_load_path = self._adapter_coordinator.auto_load_if_evicted(
-            model_id,
-            allow_fresh_materialization=False,
-        )
-        result = self.trainer.start_zorl_generation(
-            model_id=model_id,
-            num_pairs=p.num_pairs,
-            materialization=p.materialization,
-            owner_url=p.owner_url,
-        )
-        if was_auto_loaded and self.rank == 0:
-            result["auto_loaded"] = True
-            result["auto_load_path"] = auto_load_path
-        return result if self.rank == 0 else {}
-
-    async def _handle_apply_zorl_rewards(self, command_dict: Dict[str, Any]) -> Dict[str, Any]:
-        """Handle apply_zorl_rewards on all ranks."""
-        p: ZORLApplyRewardsData = command_dict.get("payload", ZORLApplyRewardsData())
-        model_id = p.model_id or "default"
-
-        was_auto_loaded, auto_load_path = self._adapter_coordinator.auto_load_if_evicted(
-            model_id,
-            allow_fresh_materialization=False,
-        )
-        result = self.trainer.apply_zorl_rewards(
-            model_id=model_id,
-            generation_id=p.generation_id,
-            candidate_rewards=p.candidate_rewards,
-            learning_rate=p.learning_rate,
-        )
-        if was_auto_loaded and self.rank == 0:
-            result["auto_loaded"] = True
-            result["auto_load_path"] = auto_load_path
-        return result if self.rank == 0 else {}
-
-    async def _handle_abort_zorl_generation(self, command_dict: Dict[str, Any]) -> Dict[str, Any]:
-        """Handle abort_zorl_generation on all ranks."""
-        p: ZORLAbortGenerationData = command_dict.get("payload", ZORLAbortGenerationData())
-        result = self.trainer.abort_zorl_generation(
-            model_id=p.model_id or "default",
-            generation_id=p.generation_id,
-        )
-        return result if self.rank == 0 else {}
 
 
 if __name__ == "__main__":

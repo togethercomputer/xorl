@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from xorl.server.protocol.operations import AdapterStateData, LoadStateData
+from xorl.server.protocol.orchestrator_runner import RunnerDispatchCommand
 
 
 _MODULE_PATH = Path(__file__).resolve().parents[3] / "src" / "xorl" / "server" / "runner" / "runner_dispatcher.py"
@@ -49,6 +50,69 @@ class _FakeTrainerSingleTenant:
     def load_state(self, checkpoint_path, load_optimizer=True, model_id=None):
         self.load_state_calls.append((checkpoint_path, load_optimizer, model_id))
         return {"success": True, "model_id": model_id}
+
+
+def test_handle_request_rank0_preserves_prepare_error():
+    dispatcher = object.__new__(RunnerDispatcher)
+    dispatcher.rank = 0
+
+    async def _prepare_load_state_command(request):
+        raise ValueError("checkpoint path rejected")
+
+    dispatcher._prepare_load_state_command = _prepare_load_state_command
+    request = RunnerDispatchCommand.create(
+        "load_state",
+        LoadStateData(
+            checkpoint_path="/outside/checkpoint",
+            load_optimizer=False,
+            model_id="policy-a",
+        ),
+        request_id="req-load-state",
+    )
+
+    response = asyncio.run(dispatcher._handle_request_rank0(request))
+
+    assert response.success is False
+    assert response.error == "checkpoint path rejected"
+
+
+def test_prepare_load_state_uses_server_output_dir_as_artifact_root(tmp_path, monkeypatch):
+    output_dir = tmp_path / "server-output"
+    checkpoint_path = output_dir / "weights" / "policy-a"
+    checkpoint_path.mkdir(parents=True)
+    unrelated_root = tmp_path / "unrelated-root"
+    unrelated_root.mkdir()
+    monkeypatch.setenv("XORL_SERVER_ARTIFACT_ROOT", str(unrelated_root))
+
+    dispatcher = object.__new__(RunnerDispatcher)
+    dispatcher.output_dir = str(output_dir)
+    request = RunnerDispatchCommand.create(
+        "load_state",
+        LoadStateData(
+            checkpoint_path=str(checkpoint_path),
+            load_optimizer=False,
+            model_id="policy-a",
+        ),
+        request_id="req-load-state",
+    )
+
+    command = asyncio.run(dispatcher._prepare_load_state_command(request))
+
+    assert command["payload"].checkpoint_path == str(checkpoint_path)
+    with pytest.raises(ValueError, match="escapes configured root"):
+        asyncio.run(
+            dispatcher._prepare_load_state_command(
+                RunnerDispatchCommand.create(
+                    "load_state",
+                    LoadStateData(
+                        checkpoint_path=str(unrelated_root),
+                        load_optimizer=False,
+                        model_id="policy-a",
+                    ),
+                    request_id="req-load-state-outside",
+                )
+            )
+        )
 
 
 def test_handle_load_state_uses_adapter_coordinator_for_multi_adapter(tmp_path, monkeypatch):

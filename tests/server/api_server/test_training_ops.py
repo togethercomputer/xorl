@@ -161,29 +161,3 @@ async def test_forward_backward_surfaces_profile_and_executor_timing_metrics():
     assert response.metrics["executor_total_s"] == pytest.approx(0.92)
     assert response.metrics["backward_compute_time"] == pytest.approx(0.45)
     assert response.metrics["forward_compute_time"] == pytest.approx(0.35)
-
-
-async def test_zorl_candidate_uri_accepts_real_path_within_sampler_root(tmp_path):
-    server = _build_server()
-    server.output_dir = str(tmp_path)
-    candidate = tmp_path / "sampler_weights" / "zorl" / "generation-a" / "candidate-a"
-    candidate.mkdir(parents=True)
-
-    model_path, lora_name = server._zorl_candidate_uri("session-a", str(candidate))
-
-    assert lora_name == "zorl/generation-a/candidate-a"
-    assert model_path.endswith("/sampler_weights/zorl/generation-a/candidate-a")
-
-
-async def test_zorl_candidate_uri_rejects_symlink_escape(tmp_path):
-    server = _build_server()
-    server.output_dir = str(tmp_path)
-    sampler_root = tmp_path / "sampler_weights"
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    sampler_root.mkdir()
-    candidate = sampler_root / "candidate"
-    candidate.symlink_to(outside, target_is_directory=True)
-
-    with pytest.raises(ValueError, match="Symlinked paths are not allowed"):
-        server._zorl_candidate_uri("session-a", str(candidate))

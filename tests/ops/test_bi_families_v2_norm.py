@@ -78,6 +78,21 @@ def test_norm_v2_within_one_ulp_of_fp64_reference():
     assert _max_ulp(rms_norm_v2(x, weight, EPS), _reference(x, weight)) <= 1
     zero_centered = rms_norm_v2(x, weight, EPS, zero_centered=True)
     assert _max_ulp(zero_centered, _reference(x, weight, zero_centered=True)) <= 1
+    zero_centered_residual, zero_centered_residual_out = rms_norm_v2(
+        x,
+        weight,
+        EPS,
+        residual=residual,
+        zero_centered=True,
+    )
+    assert torch.equal(zero_centered_residual_out, residual_out)
+    assert (
+        _max_ulp(
+            zero_centered_residual,
+            _reference(x, weight, residual=residual, zero_centered=True),
+        )
+        <= 1
+    )
 
 
 @requires_cuda
@@ -118,16 +133,32 @@ def test_fused_and_split_realizations_are_bitwise_identical(monkeypatch, hidden_
     fused_out, fused_residual = rms_norm_v2(x, weight, EPS, residual=residual)
     fused_plain = rms_norm_v2(x, weight, EPS)
     fused_zero_centered = rms_norm_v2(x, weight, EPS, zero_centered=True)
+    fused_zero_centered_residual = rms_norm_v2(
+        x,
+        weight,
+        EPS,
+        residual=residual,
+        zero_centered=True,
+    )
 
     _force(monkeypatch, "split")
     split_out, split_residual = rms_norm_v2(x, weight, EPS, residual=residual)
     split_plain = rms_norm_v2(x, weight, EPS)
     split_zero_centered = rms_norm_v2(x, weight, EPS, zero_centered=True)
+    split_zero_centered_residual = rms_norm_v2(
+        x,
+        weight,
+        EPS,
+        residual=residual,
+        zero_centered=True,
+    )
 
     assert torch.equal(fused_out, split_out)
     assert torch.equal(fused_residual, split_residual)
     assert torch.equal(fused_plain, split_plain)
     assert torch.equal(fused_zero_centered, split_zero_centered)
+    assert torch.equal(fused_zero_centered_residual[0], split_zero_centered_residual[0])
+    assert torch.equal(fused_zero_centered_residual[1], split_zero_centered_residual[1])
 
 
 @requires_cuda

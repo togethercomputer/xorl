@@ -1,7 +1,7 @@
 # Server-side configuration for XORL Training Server
 # Qwen3-Coder-30B-A3B LoRA (bf16 base + LoRA rank 32)
 #
-# 8× H100: EP=8, Ulysses SP=8
+# 4× H100: EP=4, Ulysses SP=4
 
 # ============================================================================
 # Model Configuration
@@ -9,7 +9,7 @@
 model_path: Qwen/Qwen3-Coder-30B-A3B-Instruct
 tokenizer_path: Qwen/Qwen3-Coder-30B-A3B-Instruct
 attn_implementation: flash_attention_3  # eager, sdpa, native, flash_attention_3, flash_attention_4
-moe_implementation: quack  # eager, triton, native, quack
+moe_implementation: quack  # certified expert-factor LoRA backend
 
 # ============================================================================
 # Parallelism Configuration

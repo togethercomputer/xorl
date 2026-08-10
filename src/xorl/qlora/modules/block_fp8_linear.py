@@ -49,7 +49,10 @@ class BlockFP8QLoRALinear(QLoRALinear):
             torch.empty(out_features, pw_cols, dtype=torch.float32, device=device),
             requires_grad=False,
         )
-        bs_shape = (out_features // 128, (in_features // 128) * 4)
+        # Official GLM projections include widths such as 576. Block scales
+        # cover partial edge tiles, matching the checkpoint's ceil-divided
+        # [out/128, in/128] scale layout.
+        bs_shape = (math.ceil(out_features / 128), math.ceil(in_features / 128) * 4)
         self.register_buffer("weight_block_scales", torch.empty(*bs_shape, dtype=torch.uint8, device=device))
 
         self._scale_dtypes = {"weight_block_scales": torch.float32}

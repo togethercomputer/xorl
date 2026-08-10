@@ -50,6 +50,7 @@ def generate_server_config(
     lora_rank: int = 8,
     lora_alpha: int = 8,
     lora_target_modules: Optional[List[str]] = None,
+    moe_hybrid_shared_lora: bool = False,
     # QLoRA
     enable_qlora: bool = False,
     quant_format: str = "nvfp4",
@@ -128,6 +129,7 @@ def generate_server_config(
         config["lora_rank"] = lora_rank
         config["lora_alpha"] = lora_alpha
         config["lora_target_modules"] = lora_target_modules
+        config["moe_hybrid_shared_lora"] = moe_hybrid_shared_lora
 
     if enable_qlora:
         config["enable_qlora"] = True
@@ -422,7 +424,7 @@ def run_sft_steps(training_client, data, num_steps=5, lr=1e-3) -> list:
 
     for step in range(num_steps):
         fwd_bwd = training_client.forward_backward(data, loss_fn="causallm_loss")
-        optim = training_client.optim_step(learning_rate=lr)
+        optim = training_client.optim_step({"learning_rate": lr})
         result = fwd_bwd.result()
         optim.result()
 
@@ -460,6 +462,9 @@ def _create_lora_client(base_url, model_dir, model_id="test", rank=8):
     training_client = service_client.create_lora_training_client(
         base_model=model_dir,
         rank=rank,
+        # The server owns dropout/target-module policy. Passing None omits
+        # unsupported per-session overrides in current xorl_client versions.
+        dropout=None,
         model_id=model_id,
     )
     return service_client, training_client

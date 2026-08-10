@@ -11,10 +11,204 @@ shapes so checkpoints load cleanly, and the forward returns top-k indices for
 the dense DSA mask and the sparse-MLA path.
 """
 
-import torch
-from torch import nn
+import importlib
 
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torch.distributed.tensor import DTensor
+
+from xorl.models.exact_contract import glm52_exact_forward_enabled
+from xorl.models.layers.moe.moe_block import _moe_bi_router_enabled
 from xorl.models.transformers.glm5.rotary import glm5_apply_rotary_pos_emb
+from xorl.models.transformers.glm5.sparse_selector import (
+    GLM52_SELECTOR_VERSION,
+    select_glm52_logical_indices,
+)
+from xorl.ops.batch_invariant_ops import bi_bf16_fp32_linear, matmul_persistent
+from xorl.ops.rope_class_b import build_class_b_cos_sin
+
+
+GLM52_FUSED_INDEX_K_IMPORT = "sglang.kernels.ops.quantization.dsv32.elementwise.fused_k_indexer_norm_rope"
+
+
+def _load_fused_sampler_index_k_prepare():
+    module = importlib.import_module("sglang.kernels.ops.quantization.dsv32.elementwise")
+    kernel = getattr(module, "fused_k_indexer_norm_rope", None)
+    if not callable(kernel):
+        raise RuntimeError(f"GLM-5.2 exact indexer requires {GLM52_FUSED_INDEX_K_IMPORT}")
+    return kernel
+
+
+def _fused_sampler_index_k_prepare(
+    raw_key: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_bias: torch.Tensor,
+    eps: float,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    *,
+    interleaved: bool,
+    _native_kernel_for_testing=None,
+) -> torch.Tensor:
+    """Run serving's fused LayerNorm + RoPE program before index-K quantization."""
+
+    if not interleaved:
+        raise RuntimeError("GLM-5.2 exact indexer K preparation requires interleaved RoPE")
+    if raw_key.dtype is not torch.bfloat16 or raw_key.shape[-1] != 128:
+        raise TypeError(
+            "GLM-5.2 exact indexer K preparation requires BF16 keys with width 128, "
+            f"got dtype={raw_key.dtype} shape={tuple(raw_key.shape)}"
+        )
+    if tuple(norm_weight.shape) != (128,) or tuple(norm_bias.shape) != (128,):
+        raise ValueError("GLM-5.2 exact indexer K LayerNorm parameters must both have width 128")
+    if norm_weight.dtype is not torch.float32 or norm_bias.dtype is not torch.float32:
+        raise TypeError("GLM-5.2 exact indexer K LayerNorm parameters must be FP32")
+    cos, sin = position_embeddings
+    if cos.dtype is not torch.float32 or sin.dtype is not torch.float32:
+        raise TypeError("GLM-5.2 exact indexer K preparation requires FP32 cos/sin")
+    if cos.shape != sin.shape or cos.shape[:-1] != raw_key.shape[:-1] or cos.shape[-1] != 64:
+        raise ValueError(
+            "GLM-5.2 exact indexer K position embeddings must match the key rows with width 64, "
+            f"got key={tuple(raw_key.shape)} cos={tuple(cos.shape)} sin={tuple(sin.shape)}"
+        )
+
+    cos_half, sin_half = build_class_b_cos_sin(cos, sin)
+    cos_sin_cache = torch.cat((cos_half, sin_half), dim=-1).contiguous()
+    flat_key = raw_key.reshape(-1, raw_key.shape[-1])
+    if flat_key.stride(-1) != 1:
+        raise RuntimeError("GLM-5.2 exact indexer K projection must be contiguous within each row")
+    positions = torch.arange(flat_key.shape[0], device=flat_key.device, dtype=torch.int64)
+    kernel = _native_kernel_for_testing or _load_fused_sampler_index_k_prepare()
+    prepared = kernel(
+        flat_key,
+        norm_weight,
+        norm_bias,
+        eps,
+        cos_sin_cache,
+        positions,
+    )
+    if prepared.dtype is not torch.bfloat16 or tuple(prepared.shape) != tuple(flat_key.shape):
+        raise RuntimeError(
+            "GLM-5.2 fused indexer K preparation returned an invalid tensor: "
+            f"dtype={prepared.dtype} shape={tuple(prepared.shape)}"
+        )
+    return prepared.view_as(raw_key)
+
+
+def _mix_sampler_index_k_preparation(
+    split_prepared_key: torch.Tensor,
+    raw_key: torch.Tensor,
+    norm_weight: torch.Tensor,
+    norm_bias: torch.Tensor,
+    eps: float,
+    position_embeddings: tuple[torch.Tensor, torch.Tensor],
+    sampler_prefill_lengths: torch.Tensor | None,
+    *,
+    query_offset: int,
+    interleaved: bool,
+    _native_kernel_for_testing=None,
+) -> torch.Tensor:
+    """Keep sampler prefill numerics and use fused decode numerics only after its boundary."""
+
+    if sampler_prefill_lengths is None:
+        return split_prepared_key
+    if sampler_prefill_lengths.ndim != 1 or sampler_prefill_lengths.numel() != raw_key.shape[0]:
+        raise ValueError(
+            "GLM-5.2 sampler_prefill_lengths must contain one boundary per batch row, "
+            f"got {tuple(sampler_prefill_lengths.shape)} for batch={raw_key.shape[0]}"
+        )
+    if sampler_prefill_lengths.dtype not in (torch.int32, torch.int64):
+        raise TypeError("GLM-5.2 sampler_prefill_lengths must be an integer tensor")
+    if query_offset < 0:
+        raise ValueError(f"GLM-5.2 exact indexer query_offset must be nonnegative, got {query_offset}")
+
+    cos, sin = position_embeddings
+    mixed_rows = []
+    local_length = raw_key.shape[1]
+    for batch_index in range(raw_key.shape[0]):
+        prefill_length = int(sampler_prefill_lengths[batch_index].item())
+        if prefill_length <= 0:
+            raise ValueError(f"GLM-5.2 sampler prefill length must be positive, got {prefill_length}")
+        suffix_start = min(max(prefill_length - query_offset, 0), local_length)
+        if suffix_start == local_length:
+            mixed_rows.append(split_prepared_key[batch_index : batch_index + 1])
+            continue
+        fused_suffix = _fused_sampler_index_k_prepare(
+            raw_key[batch_index : batch_index + 1, suffix_start:],
+            norm_weight,
+            norm_bias,
+            eps,
+            (
+                cos[batch_index : batch_index + 1, suffix_start:],
+                sin[batch_index : batch_index + 1, suffix_start:],
+            ),
+            interleaved=interleaved,
+            _native_kernel_for_testing=_native_kernel_for_testing,
+        )
+        mixed_rows.append(
+            torch.cat(
+                (split_prepared_key[batch_index : batch_index + 1, :suffix_start], fused_suffix),
+                dim=1,
+            )
+        )
+    return torch.cat(mixed_rows, dim=0)
+
+
+def _fused_bf16_indexer_projection(
+    hidden_states: torch.Tensor,
+    wk_weight: torch.Tensor,
+    weights_proj_weight: torch.Tensor,
+    *,
+    index_head_dim: int,
+    index_n_heads: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Match SGLang's fused BF16 ``wk + weights_proj`` projection."""
+
+    if isinstance(wk_weight, DTensor) or isinstance(weights_proj_weight, DTensor):
+        raise RuntimeError("GLM-5.2 fused indexer projection requires full plain weights")
+    expected_wk_shape = (index_head_dim, hidden_states.shape[-1])
+    expected_gate_shape = (index_n_heads, hidden_states.shape[-1])
+    if tuple(wk_weight.shape) != expected_wk_shape or tuple(weights_proj_weight.shape) != expected_gate_shape:
+        raise ValueError(
+            "GLM-5.2 fused indexer projection received invalid weight shapes: "
+            f"wk={tuple(wk_weight.shape)} expected={expected_wk_shape}, "
+            f"weights_proj={tuple(weights_proj_weight.shape)} expected={expected_gate_shape}"
+        )
+    if not (
+        hidden_states.dtype is torch.bfloat16
+        and wk_weight.dtype is torch.bfloat16
+        and weights_proj_weight.dtype is torch.bfloat16
+    ):
+        raise TypeError("GLM-5.2 fused indexer projection requires BF16 activations and weights")
+    if not (hidden_states.device == wk_weight.device == weights_proj_weight.device):
+        raise RuntimeError("GLM-5.2 fused indexer projection inputs must share one device")
+
+    fused_weight = torch.cat((wk_weight, weights_proj_weight), dim=0).contiguous()
+    flat_hidden = hidden_states.reshape(-1, hidden_states.shape[-1])
+    if hidden_states.is_cuda:
+        # SGLang's deterministic serving contract interposes its
+        # batch-invariant ``aten::mm`` on this otherwise ordinary fused
+        # linear.  Call the vendored equivalent directly so the trainer does
+        # not depend on global matmul interposition.
+        projected = matmul_persistent(flat_hidden, fused_weight.t())
+    else:
+        projected = F.linear(flat_hidden, fused_weight)
+    projected = projected.view(*hidden_states.shape[:-1], index_head_dim + index_n_heads)
+    return projected.split((index_head_dim, index_n_heads), dim=-1)
+
+
+def _scale_fused_bf16_indexer_head_gates(
+    head_weights: torch.Tensor,
+    *,
+    index_n_heads: int,
+) -> torch.Tensor:
+    """Match SGLang's FP32 gate scaling after the fused BF16 projection."""
+
+    if head_weights.dtype is not torch.bfloat16:
+        raise TypeError(f"GLM-5.2 fused indexer gate scaling requires BF16 gates, got {head_weights.dtype}")
+    if index_n_heads <= 0:
+        raise ValueError(f"GLM-5.2 fused indexer gate scaling requires positive head count, got {index_n_heads}")
+    return head_weights.float() * index_n_heads**-0.5
 
 
 class Glm5DsaIndexer(nn.Module):
@@ -46,12 +240,18 @@ class Glm5DsaIndexer(nn.Module):
 
         self._head_weight_scale = self.index_n_heads**-0.5
         self._softmax_scale = self.index_head_dim**-0.5
+        self.selector_version = (
+            GLM52_SELECTOR_VERSION if glm52_exact_forward_enabled(config) else "legacy_torch_or_tilelang"
+        )
 
     def project(
         self,
         hidden_states: torch.Tensor,
         q_compressed: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        *,
+        sampler_prefill_lengths: torch.Tensor | None = None,
+        query_offset: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute index_query, index_key, head_weights.
 
@@ -63,14 +263,61 @@ class Glm5DsaIndexer(nn.Module):
           index_key ``[B, S, index_head_dim]``, head_weights ``[B, S, index_n_heads]``
         """
         B, S, _ = hidden_states.shape
+        cos, sin = position_embeddings
 
         index_q = self.wq_b(q_compressed)
         index_q = index_q.view(B, S, self.index_n_heads, self.index_head_dim)
 
-        index_k = self.wk(hidden_states)
-        index_k = self.k_norm(index_k)
+        exact_fused_projection = self.selector_version == GLM52_SELECTOR_VERSION and hidden_states.is_cuda
+        if exact_fused_projection:
+            wk_weight = self.wk(return_dequantized_weight=True)
+            index_k, head_weights = _fused_bf16_indexer_projection(
+                hidden_states,
+                wk_weight,
+                self.weights_proj.weight,
+                index_head_dim=self.index_head_dim,
+                index_n_heads=self.index_n_heads,
+            )
+            raw_index_k = index_k
+        else:
+            index_k = self.wk(hidden_states)
+            raw_index_k = None
 
-        head_weights = self.weights_proj(hidden_states).float() * self._head_weight_scale
+        if exact_fused_projection:
+            try:
+                from flashinfer.norm import layernorm as sampler_layer_norm  # noqa: PLC0415
+            except (ImportError, AttributeError) as error:
+                raise RuntimeError(
+                    "GLM-5.2 native selector requires the sampler's FlashInfer LayerNorm kernel"
+                ) from error
+            index_k_shape = index_k.shape
+            index_k = sampler_layer_norm(
+                index_k.reshape(-1, index_k_shape[-1]),
+                self.k_norm.weight.float(),
+                self.k_norm.bias.float(),
+                self.k_norm.eps,
+            ).view(index_k_shape)
+        else:
+            index_k = self.k_norm(index_k)
+
+        if exact_fused_projection:
+            # Serving's compiled scaler promotes the fused BF16 gate before
+            # applying the head scale; materializing this multiply in BF16
+            # changes every FP32 score weight.
+            head_weights = _scale_fused_bf16_indexer_head_gates(
+                head_weights,
+                index_n_heads=self.index_n_heads,
+            )
+        elif _moe_bi_router_enabled(self.config):
+            if hidden_states.dtype is not torch.bfloat16 or self.weights_proj.weight.dtype is not torch.bfloat16:
+                raise TypeError(
+                    "GLM-5.2 batch-invariant indexer projection requires BF16 hidden states and BF16 weights"
+                )
+            head_weights = bi_bf16_fp32_linear(hidden_states, self.weights_proj.weight)
+        else:
+            head_weights = self.weights_proj(hidden_states).float()
+        if not exact_fused_projection:
+            head_weights = head_weights * self._head_weight_scale
 
         # Split (pe, no-pe) bands so we can apply the indexer's RoPE to
         # the leading `qk_rope_head_dim`, matching the GLM DSA reference.
@@ -79,17 +326,30 @@ class Glm5DsaIndexer(nn.Module):
         k_pe = index_k[..., : self.qk_rope_head_dim].unsqueeze(2)  # [B, S, 1, qk_rope_head_dim]
         k_no_pe = index_k[..., self.qk_rope_head_dim :]
 
-        cos, sin = position_embeddings
         q_pe, k_pe = glm5_apply_rotary_pos_emb(
             q_pe,
             k_pe,
             cos,
             sin,
             interleaved=getattr(self.config, "indexer_rope_interleave", True),
+            class_b=bool(getattr(self.config, "_rope_class_b", False) or glm52_exact_forward_enabled(self.config)),
         )
 
         index_q = torch.cat([q_pe, q_no_pe], dim=-1)
         index_k = torch.cat([k_pe.squeeze(2), k_no_pe], dim=-1)
+        if exact_fused_projection:
+            assert raw_index_k is not None
+            index_k = _mix_sampler_index_k_preparation(
+                index_k,
+                raw_index_k,
+                self.k_norm.weight.float(),
+                self.k_norm.bias.float(),
+                self.k_norm.eps,
+                position_embeddings,
+                sampler_prefill_lengths,
+                query_offset=query_offset,
+                interleaved=getattr(self.config, "indexer_rope_interleave", True),
+            )
 
         return index_q, index_k, head_weights
 
@@ -389,6 +649,7 @@ class Glm5DsaIndexer(nn.Module):
         q_compressed: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None = None,
+        sampler_prefill_lengths: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """One-shot indexer: project + score + top-k.
 
@@ -399,7 +660,12 @@ class Glm5DsaIndexer(nn.Module):
         # Hard top-k indices are not differentiable. Avoid building a useless
         # autograd graph through the quadratic indexer score path.
         with torch.no_grad():
-            index_q, index_k, head_weights = self.project(hidden_states, q_compressed, position_embeddings)
+            index_q, index_k, head_weights = self.project(
+                hidden_states,
+                q_compressed,
+                position_embeddings,
+                sampler_prefill_lengths=sampler_prefill_lengths,
+            )
             return self.select_topk(index_q, index_k, head_weights, attention_mask)
 
     def select_topk(
@@ -420,6 +686,26 @@ class Glm5DsaIndexer(nn.Module):
         """
         B, Q, H, D = index_q.shape
         K = index_k.shape[1]
+
+        if self.selector_version == GLM52_SELECTOR_VERSION:
+            allowed = self._build_allowed_mask_block(
+                attention_mask,
+                B,
+                0,
+                Q,
+                0,
+                K,
+                index_q.device,
+                query_offset=query_offset,
+            )
+            return select_glm52_logical_indices(
+                index_q,
+                index_k,
+                head_weights,
+                allowed,
+                topk=self.index_topk,
+                apply_hadamard=False,
+            ).logical_indices.values
 
         # Tilelang fast path — handles BOTH Q==K (no ulysses) and Q<K with
         # query_offset (ulysses) for pure-causal attention. ~14x speedup vs

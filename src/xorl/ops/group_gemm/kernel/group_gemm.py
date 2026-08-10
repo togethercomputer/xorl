@@ -178,6 +178,7 @@ def group_gemm_same_nk(
     activation: Optional[ActivationType] = None,
     save_activation: bool = False,
     c: Optional[torch.Tensor] = None,
+    output_dtype: Optional[torch.dtype] = None,
 ):
     """Grouped gemm for same nk
 
@@ -191,6 +192,7 @@ def group_gemm_same_nk(
     activation -- activation type if needed
     save_activation -- return the activation's input or not
     c -- which tensor accumulate to, c = c + ggemm(a, b)
+    output_dtype -- dtype for a fresh output; mutually exclusive with c
     """
     if transpose_b:
         G, N, K = b.shape
@@ -211,9 +213,16 @@ def group_gemm_same_nk(
 
     assert a.is_contiguous() and b.is_contiguous(), "Not implemented: Noncontiguous input."
 
+    if c is not None and output_dtype is not None:
+        raise ValueError("output_dtype cannot be combined with an accumulation tensor c")
+
     c_is_none = c is None
     if c_is_none:
-        c = torch.empty((a.shape[1] if transpose_a else a.shape[0], N), dtype=a.dtype, device=a.device)
+        c = torch.empty(
+            (a.shape[1] if transpose_a else a.shape[0], N),
+            dtype=a.dtype if output_dtype is None else output_dtype,
+            device=a.device,
+        )
 
     if save_activation:
         act = torch.empty_like(c)

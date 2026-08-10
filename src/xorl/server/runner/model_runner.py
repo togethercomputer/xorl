@@ -25,7 +25,7 @@ import time
 import uuid
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional
 
 import torch
 import torch.distributed as dist
@@ -47,6 +47,8 @@ from xorl.distillation import (
     TeacherActivationCache,
     TeacherHeadManager,
 )
+from xorl.distributed.ep_gradients import synchronize_ep_replicated_gradients
+from xorl.distributed.gradient_reduction import GradientReductionDomain
 from xorl.distributed.offloading import build_activation_offloading_context
 from xorl.distributed.parallel_state import get_parallel_state, init_parallel_state
 from xorl.distributed.pipeline_parallel import (
@@ -57,10 +59,18 @@ from xorl.distributed.pipeline_parallel import (
 )
 from xorl.distributed.sequence_parallel.data import gather_outputs
 from xorl.lora import LoraLinear
-from xorl.lora.utils import get_lora_state_dict
+from xorl.lora.expert_adapter_contract import (
+    ExpertAdapterFactorOwnership,
+    ExpertAdapterGradientContract,
+    ZeroTokenGradientBehavior,
+)
+from xorl.lora.fold import lora_merged_forward_enabled
+from xorl.models import resolve_cross_entropy_mode
 from xorl.models.layers.moe.routing_replay import set_replay_stage
 from xorl.models.transformers.deepseek_v3.support import deepseek_v3_default_lora_targets
+from xorl.models.transformers.glm5.index_share import IndexShareMode
 from xorl.models.transformers.glm5.support import glm5_default_lora_targets
+from xorl.ops.batch_invariant_ops import enable_batch_invariant_mode, get_batch_invariant_ops
 from xorl.ops.loss import (
     LossOutput,
     OPDLossMetrics,
@@ -75,6 +85,21 @@ from xorl.ops.loss import (
 from xorl.ops.shared_prefix import shared_prefix_remap_to_original
 from xorl.optim import build_optimizer
 from xorl.server.runner.adapters import LoRAAdapterManager
+from xorl.server.runner.adapters.gradient_finalizer import AdapterGradientMutationFailure
+from xorl.server.runner.adapters.gradient_ownership import (
+    AdapterGradientOwnershipError,
+    AdapterGradientUniformRejection,
+    GradientPresencePolicy,
+    GradientRepresentation,
+    GradientScaleState,
+    ParameterOwnershipDeclaration,
+    ProducerFamily,
+    ReductionAuthority,
+    ReductionAxis,
+    ReductionDomainPlan,
+    ReductionOperation,
+    TopologyFamily,
+)
 from xorl.server.runner.checkpoint import CheckpointManager
 from xorl.server.runner.grad_sync import hsdp_all_reduce_microbatch_context, should_defer_hsdp_all_reduce
 from xorl.server.runner.utils import (
@@ -91,15 +116,6 @@ from xorl.server.weight_sync.source_delta_capture import (
     snapshot_sparse_delta_tensors,
     sparse_delta_capture_enabled,
     write_sparse_source_delta_rank,
-)
-from xorl.server.zorl import (
-    ZORLSessionState,
-    build_zorl_candidate_lora_state_dict,
-    build_zorl_fresh_ab_base_update_from_rewards,
-    build_zorl_fresh_ab_candidate_lora_state_dict,
-    build_zorl_update_from_rewards,
-    filter_zorl_materialized_candidates,
-    normalize_zorl_materialization,
 )
 from xorl.trainers.model_builder import (
     build_training_model,
@@ -412,7 +428,6 @@ class ModelRunner:
         self.model_config = config.get("model", {})
         self.train_config = config.get("train", {})
         self.lora_config = config.get("lora", {})
-        self.zorl_config = config.get("zorl", {})
         self._validate_multi_adapter_lora_config()
         if self.train_config.get("load_weights_mode") == "skip" and not self.train_config.get("load_checkpoint_path"):
             raise ValueError(
@@ -421,7 +436,7 @@ class ModelRunner:
             )
 
         # Cross-entropy mode
-        self.ce_mode = self.train_config.get("ce_mode", "eager")
+        self.ce_mode = self.train_config.get("ce_mode")
 
         # LM head fp32 flag for loss functions
         self.lm_head_fp32 = self.model_config.get("lm_head_fp32", True)
@@ -463,7 +478,6 @@ class ModelRunner:
         self._adapter_manager: Optional[LoRAAdapterManager] = None
         self._lora_session_specs: Dict[str, Dict[str, Any]] = {}
         self._default_lora_session_spec: Optional[Dict[str, Any]] = None
-        self._zorl_sessions: Dict[str, ZORLSessionState] = {}
         self._checkpoint_mgr: Optional[CheckpointManager] = None
 
         # Single-tenant session tracking (for full-weights training mode)
@@ -487,12 +501,13 @@ class ModelRunner:
         # Disable TF32 and BF16 reduced-precision accumulation for
         # consistent numerics across parallelism strategies.
         helper.enable_high_precision_for_bf16()
-        if os.environ.get("XORL_BATCH_INVARIANT_MATMUL", "0") == "1":
-            from xorl.ops.batch_invariant_ops import (  # noqa: PLC0415
-                enable_batch_invariant_mode,
-                get_batch_invariant_ops,
-            )
 
+        # Optional: route aten::{mm,addmm,bmm,_log_softmax,mean.dim,rms_norm,mm.dtype}
+        # through the same batch-invariant Triton kernels SGLang uses, so the linear
+        # layers, router gate matmul, lm_head, RMSNorm and (for the eager MoE
+        # backend) the per-expert torch.matmul GEMMs match SGLang's reduction order
+        # bit-for-bit. Gated, default-off; forward-path correctness experiment.
+        if os.environ.get("XORL_BATCH_INVARIANT_MATMUL", "0") == "1":
             enable_batch_invariant_mode()
             logger.info(
                 "XORL_BATCH_INVARIANT_MATMUL=1: enabled batch-invariant (SGLang-matched) ops=%s",
@@ -507,7 +522,7 @@ class ModelRunner:
         self._initialize_optimizer()
         self._initialize_checkpointer()
         self._checkpoint_mgr = self._build_checkpoint_manager()
-        self._load_initial_checkpoint()
+        self._restore_initial_base_checkpoint()
         if enable_full_determinism:
             # Enabling deterministic algorithms before Kimi DCP/meta materialization
             # makes startup pathologically slow; training and adapter init happen below.
@@ -530,21 +545,16 @@ class ModelRunner:
                 optimizer_dtype=self.train_config.get("optimizer_dtype", "bf16"),
                 optimizer_kwargs=self._get_optimizer_kwargs(),
                 weight_decay=self.train_config.get("weight_decay", 0.01),
+                gradient_ownership_bucket_bytes=int(
+                    self.train_config.get("adapter_gradient_ownership_bucket_bytes", 64 * 1024 * 1024)
+                ),
             )
             self._default_lora_session_spec = build_default_session_spec(
                 base_model=self.model_config.get("model_name") or self.model_config.get("model_path"),
                 train_config=self.train_config,
                 lora_config=self.lora_config,
-                zorl_config=self.zorl_config,
             )
-            self.register_session(
-                model_id="default",
-                session_spec=self._default_lora_session_spec,
-                materialize=True,
-                initialize_fresh=False,
-            )
-            self._adapter_manager.current_adapter_id = "default"
-            self._checkpoint_mgr._adapter_manager = self._adapter_manager
+            self._initialize_default_lora_adapter()
             logger.info("Multi-adapter manager initialized with default adapter")
 
         # Initialize tokenizer for sampling (only on rank 0)
@@ -599,92 +609,6 @@ class ModelRunner:
             return
         self._lora_session_specs[model_id] = self._adapter_manager.get_adapter_session_spec(model_id)
 
-    def _seed_loaded_zorl_parent_family(self, model_id: str) -> None:
-        """Mark a loaded LoRA checkpoint as the active ZORL parent family."""
-        state = getattr(self, "_zorl_sessions", {}).get(model_id)
-        if state is None:
-            return
-        state.seed_loaded_parent_family()
-
-    def get_zorl_session_state(self, model_id: str) -> Optional[Dict[str, Any]]:
-        """Get a snapshot of the ZORL runtime state for a model_id, if enabled."""
-
-        state = getattr(self, "_zorl_sessions", {}).get(model_id)
-        if state is None:
-            return None
-        return state.snapshot()
-
-    def _require_zorl_session(self, model_id: str) -> ZORLSessionState:
-        """Return the ZORL runtime state for a session or raise."""
-        state = getattr(self, "_zorl_sessions", {}).get(model_id)
-        if state is None:
-            raise ValueError(f"Session {model_id!r} is not ZORL-enabled")
-        if self._adapter_manager is None:
-            raise RuntimeError("ZORL requires the multi-adapter LoRA manager")
-        if model_id not in self._lora_session_specs:
-            raise ValueError(f"LoRA session spec not registered for model_id={model_id}")
-        return state
-
-    def _zorl_generation_export_dir(self, generation_id: str) -> str:
-        """Return the sampler-weight export directory for one ZORL generation."""
-        generation_id = validate_identifier(generation_id, name="generation_id")
-        output_dir = Path(self.train_config.get("output_dir", "outputs"))
-        return str(resolve_path_within(output_dir, Path("sampler_weights") / "zorl" / generation_id))
-
-    def _cleanup_zorl_generation_exports(
-        self,
-        generation_id: str,
-        *,
-        candidate_ids: Optional[set[str]] = None,
-    ) -> int:
-        """Delete exported candidate adapters for one generation on rank 0."""
-        export_dir = self._zorl_generation_export_dir(generation_id)
-        deleted = 0
-        if self.rank == 0 and os.path.isdir(export_dir):
-            if candidate_ids is None:
-                deleted = sum(1 for entry in os.scandir(export_dir) if entry.is_dir())
-                shutil.rmtree(export_dir, ignore_errors=True)
-            else:
-                for candidate_id in sorted(candidate_ids):
-                    candidate_id = validate_identifier(candidate_id, name="candidate_id")
-                    candidate_path = os.path.join(export_dir, candidate_id)
-                    if os.path.isdir(candidate_path):
-                        shutil.rmtree(candidate_path, ignore_errors=True)
-                        deleted += 1
-        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
-            dist.barrier()
-        return deleted
-
-    @staticmethod
-    def _normalize_zorl_pair_scores(
-        raw_scores: List[float],
-        *,
-        normalization: str = "standard",
-    ) -> List[float]:
-        """Normalize pairwise reward scores with a stable z-score fallback."""
-        score_tensor = torch.tensor(raw_scores, dtype=torch.float32)
-        if score_tensor.numel() == 0:
-            raise ValueError("ZORL rewards must contain at least one valid pair score")
-
-        if normalization == "none":
-            return [float(value) for value in score_tensor.tolist()]
-        if normalization != "standard":
-            raise ValueError(f"Unsupported ZORL score normalization {normalization!r}")
-
-        if score_tensor.numel() > 1:
-            mean = score_tensor.mean()
-            std = score_tensor.std(unbiased=False)
-            if float(std.item()) > 1e-6:
-                normalized = (score_tensor - mean) / (std + 1e-6)
-            else:
-                max_abs = score_tensor.abs().max()
-                normalized = score_tensor / max_abs if float(max_abs.item()) > 0.0 else torch.zeros_like(score_tensor)
-        else:
-            max_abs = score_tensor.abs().max()
-            normalized = score_tensor / max_abs if float(max_abs.item()) > 0.0 else torch.zeros_like(score_tensor)
-
-        return [float(value) for value in normalized.tolist()]
-
     def register_session(
         self,
         model_id: str,
@@ -712,21 +636,20 @@ class ModelRunner:
                 f"existing={existing_spec!r}, requested={session_spec!r}"
             )
 
-        if not hasattr(self, "_zorl_sessions"):
-            self._zorl_sessions = {}
         self._lora_session_specs[model_id] = deepcopy(session_spec)
-        zorl_state = ZORLSessionState.from_session_spec(model_id, session_spec)
-        if zorl_state is not None:
-            self._zorl_sessions.setdefault(model_id, zorl_state)
-        else:
-            self._zorl_sessions.pop(model_id, None)
 
         materialized = False
         if materialize and self._adapter_manager is not None and not self._adapter_manager.has_adapter(model_id):
-            self._adapter_manager.register_adapter(
+            parallel_state = get_parallel_state()
+            group_memberships = self._adapter_manager.register_adapter(
                 model_id=model_id,
                 session_spec=session_spec,
                 initialize_fresh=initialize_fresh,
+                local_group_memberships=self._local_adapter_gradient_group_memberships(parallel_state),
+            )
+            self._compile_registered_adapter_gradient_ownership(
+                model_id,
+                group_memberships=group_memberships,
             )
             materialized = True
 
@@ -738,583 +661,475 @@ class ModelRunner:
             "session_spec": deepcopy(self._lora_session_specs[model_id]),
         }
 
+    def _initialize_default_lora_adapter(self) -> None:
+        """Create the default adapter only after base checkpoint restoration."""
+
+        if not getattr(self, "_base_checkpoint_restore_complete", False):
+            raise RuntimeError("Default LoRA adapter initialization requires completed base checkpoint restoration")
+        self.register_session(
+            model_id="default",
+            session_spec=self._default_lora_session_spec,
+            materialize=True,
+            # Base checkpoints intentionally exclude LoRA tensors. In the
+            # meta/FSDP startup path those factor buffers came from to_empty(),
+            # so they must never be snapshotted as an initialized adapter.
+            # A later load_adapter_state call replaces this fresh state.
+            initialize_fresh=True,
+        )
+        self._adapter_manager.current_adapter_id = "default"
+        self._checkpoint_mgr._adapter_manager = self._adapter_manager
+
+    @staticmethod
+    def _adapter_gradient_hash(payload: Any) -> str:
+        return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+    @staticmethod
+    def _local_adapter_gradient_group_memberships(parallel_state: Any) -> dict[str, tuple[int, ...]]:
+        """Return this rank's public ownership groups for the layout-discovery exchange."""
+
+        def _public_group_members(group: Any) -> tuple[int, ...]:
+            if group is None or not dist.is_available() or not dist.is_initialized():
+                return (0,)
+            return tuple(sorted(dist.get_process_group_ranks(group)))
+
+        memberships: dict[str, tuple[int, ...]] = {}
+        sp_group = parallel_state.sp_grad_sync_group
+        output_group = getattr(parallel_state, "lm_head_tp_replica_group", None)
+        output_tp_group = getattr(parallel_state, "lm_head_tp_group", None)
+        ep_group = (
+            parallel_state.ep_group
+            if bool(getattr(parallel_state, "ep_enabled", getattr(parallel_state, "ep_size", 1) > 1))
+            else None
+        )
+        if sp_group is not None:
+            memberships["sequence_parallel"] = _public_group_members(sp_group)
+        if output_group is not None:
+            memberships["output_projection_replica"] = _public_group_members(output_group)
+        if output_tp_group is not None:
+            memberships["output_projection_tp"] = _public_group_members(output_tp_group)
+        if ep_group is not None:
+            memberships["expert_parallel_replica"] = _public_group_members(ep_group)
+        return memberships
+
+    def _compile_registered_adapter_gradient_ownership(
+        self,
+        model_id: str,
+        *,
+        group_memberships: Mapping[str, tuple[tuple[int, ...], ...]] | None = None,
+    ) -> None:
+        """Compile generic execution properties for one materialized adapter."""
+
+        if self._adapter_manager is None:
+            return
+        state = self._adapter_manager.get_adapter_state(model_id)
+        parallel_state = get_parallel_state()
+        named_parameters = dict(self.model.named_parameters())
+        try:
+            from torch.distributed.fsdp import FSDPModule  # noqa: PLC0415
+        except ImportError:  # pragma: no cover - pinned torch provides this public type
+            FSDPModule = ()  # type: ignore[assignment,misc]
+
+        lm_head = getattr(self.model, "lm_head", None)
+        direct_parameter_ids: set[int] = set()
+        managed_fsdp_parameter_ids: set[int] = set()
+        producer_by_parameter_id: dict[int, ProducerFamily] = {}
+        merged_forward_by_parameter_id: dict[int, bool] = {}
+        expert_guard_by_parameter_id: dict[int, dict[str, Any]] = {}
+        expert_contract_by_parameter_id: dict[int, ExpertAdapterGradientContract] = {}
+        exact_lm_head_guard_by_parameter_id: dict[int, dict[str, Any]] = {}
+        configured_hybrid_shared = bool(
+            getattr(self._adapter_manager, "lora_config", {}).get("moe_hybrid_shared_lora", False)
+        )
+
+        def _walk_module_tree(module: nn.Module, *, inherited_fsdp: bool = False, direct: bool = False) -> None:
+            managed_fsdp = inherited_fsdp or isinstance(module, FSDPModule)
+            direct = direct or module is lm_head
+            selector = getattr(module, "adapter_gradient_producer_family", None)
+            selected = selector() if callable(selector) else selector
+            producer = None
+            expert_guard: dict[str, Any] | None = None
+            expert_contract: ExpertAdapterGradientContract | None = None
+            has_expert_adapter_factors = any(
+                "_proj_lora_A" in local_name or "_proj_lora_B" in local_name
+                for local_name, _parameter in module.named_parameters(recurse=False)
+            )
+            if selected is not None:
+                try:
+                    producer = ProducerFamily(str(selected))
+                except ValueError as error:
+                    raise RuntimeError(f"Unsupported adapter-gradient producer property {selected!r}") from error
+                direct = direct or producer is ProducerFamily.DIRECT_OUTPUT_PROJECTION
+                if has_expert_adapter_factors:
+                    try:
+                        contract_selector = getattr(module, "expert_adapter_gradient_contract", None)
+                        if contract_selector is None:
+                            raise ValueError("module does not declare an execution contract")
+                        expert_contract = contract_selector() if callable(contract_selector) else contract_selector
+                    except (TypeError, ValueError) as error:
+                        raise AdapterGradientOwnershipError(
+                            f"Expert adapter module {type(module).__qualname__} declared an invalid execution contract: "
+                            f"{error}"
+                        ) from error
+                    if not isinstance(expert_contract, ExpertAdapterGradientContract):
+                        raise AdapterGradientOwnershipError(
+                            f"Expert adapter module {type(module).__qualname__} returned an invalid contract object"
+                        )
+                    try:
+                        expert_contract = expert_contract.for_active_rank(
+                            int(state.session_spec["lora_config"]["lora_rank"])
+                        )
+                    except (KeyError, TypeError, ValueError) as error:
+                        raise AdapterGradientOwnershipError(
+                            f"Expert adapter module {type(module).__qualname__} could not specialize its factor "
+                            f"contract to the registered session rank: {error}"
+                        ) from error
+                    if expert_contract.backend.producer_family != producer.value:
+                        raise AdapterGradientOwnershipError(
+                            "Expert adapter producer does not match its execution contract: "
+                            f"module={producer.value!r}, contract={expert_contract.backend.producer_family!r}"
+                        )
+                    contract_hybrid_shared = any(
+                        ownership is ExpertAdapterFactorOwnership.EP_REPLICATED
+                        for _name, ownership in expert_contract.factor_ownership
+                    )
+                    if contract_hybrid_shared != configured_hybrid_shared:
+                        raise AdapterGradientOwnershipError(
+                            "Expert adapter factor sharing does not match server checkpoint metadata; "
+                            f"compiled_hybrid_shared={contract_hybrid_shared}, "
+                            f"configured_moe_hybrid_shared_lora={configured_hybrid_shared}"
+                        )
+
+                    ep_size = int(getattr(parallel_state, "ep_size", 1))
+                    ep_enabled = bool(getattr(parallel_state, "ep_enabled", ep_size > 1))
+                    if ep_enabled:
+                        if not expert_contract.backend.supports_ep:
+                            raise AdapterGradientOwnershipError(
+                                f"Expert backend {expert_contract.backend.name!r} does not provide LoRA EP execution"
+                            )
+                        ep_dispatch = getattr(module, "ep_dispatch", None)
+                        if ep_dispatch not in expert_contract.backend.supported_dispatch_methods:
+                            raise AdapterGradientOwnershipError(
+                                f"Expert dispatch {ep_dispatch!r} is not supported by backend "
+                                f"{expert_contract.backend.name!r}; supported="
+                                f"{expert_contract.backend.supported_dispatch_methods}"
+                            )
+                        ep_fsdp_size = int(getattr(parallel_state, "dp_shard_in_ep_size", 1))
+                        if ep_fsdp_size > 1 and not expert_contract.supports_efsdp_replication:
+                            raise AdapterGradientOwnershipError(
+                                f"Expert adapter backend {expert_contract.backend.name!r} does not support "
+                                f"eFSDP replication; got ep_fsdp_size={ep_fsdp_size}"
+                            )
+                    elif not expert_contract.backend.supports_local:
+                        raise AdapterGradientOwnershipError(
+                            f"Expert backend {expert_contract.backend.name!r} does not provide local LoRA execution"
+                        )
+                    if (
+                        expert_contract.backend.zero_token_gradient_behavior
+                        is not ZeroTokenGradientBehavior.STRUCTURAL_ZERO
+                    ):
+                        raise AdapterGradientOwnershipError(
+                            "Expert adapter execution must materialize structural zero gradients for zero-token owners"
+                        )
+                    expert_guard = expert_contract.config_guard_fields()
+                    expert_guard["expert_ep_dispatch"] = getattr(module, "ep_dispatch", None)
+            for local_name, parameter in module.named_parameters(recurse=False):
+                if "lora_A" in local_name or "lora_B" in local_name:
+                    merged_forward_by_parameter_id[id(parameter)] = bool(lora_merged_forward_enabled(module))
+                    if producer is not None:
+                        producer_by_parameter_id[id(parameter)] = producer
+                    if expert_guard is not None:
+                        expert_guard_by_parameter_id[id(parameter)] = dict(expert_guard)
+                    if expert_contract is not None:
+                        expert_contract_by_parameter_id[id(parameter)] = expert_contract
+                    if getattr(module, "_glm52_exact_tp16_lm_head", False):
+                        exact_op = getattr(module, "_glm52_exact_selected_logprob", None)
+                        contract_version = getattr(exact_op, "contract_version", None)
+                        if not isinstance(contract_version, str) or not contract_version:
+                            raise AdapterGradientOwnershipError(
+                                "Exact GLM-5.2 lm-head factors require a selected-logprob contract version"
+                            )
+                        exact_lm_head_guard_by_parameter_id[id(parameter)] = {
+                            "exact_lm_head_contract": contract_version,
+                            "exact_lm_head_factor": local_name,
+                            "exact_lm_head_tp_size": 16,
+                            "exact_lm_head_vjp_tp_completed": True,
+                        }
+                    if direct:
+                        direct_parameter_ids.add(id(parameter))
+                    if managed_fsdp and hasattr(parameter, "to_local") and hasattr(parameter, "placements"):
+                        managed_fsdp_parameter_ids.add(id(parameter))
+            for child in module.children():
+                _walk_module_tree(child, inherited_fsdp=managed_fsdp, direct=direct)
+
+        _walk_module_tree(self.model)
+
+        expert_factor_groups: dict[str, set[str]] = {}
+        expert_contracts_by_owner: dict[str, ExpertAdapterGradientContract] = {}
+        ep_size = int(getattr(parallel_state, "ep_size", 1))
+        ep_enabled = bool(getattr(parallel_state, "ep_enabled", ep_size > 1))
+        for name, layout in state.tensor_layouts.items():
+            parameter = named_parameters[name]
+            expert_contract = expert_contract_by_parameter_id.get(id(parameter))
+            if expert_contract is None:
+                continue
+
+            owner_path, separator, local_name = name.rpartition(".")
+            if not separator:
+                raise AdapterGradientOwnershipError(f"Expert adapter ownership found an unscoped factor {name!r}")
+            try:
+                factor_ownership = expert_contract.ownership_for(local_name)
+            except ValueError as error:
+                raise AdapterGradientOwnershipError(
+                    f"Expert adapter factor {name!r} is outside its declared contract"
+                ) from error
+            expected_shape = dict(expert_contract.factor_shapes)[local_name]
+            if tuple(layout.logical_shape) != expected_shape:
+                raise AdapterGradientOwnershipError(
+                    f"Expert adapter factor {name!r} does not match its declared logical shape; "
+                    f"expected={expected_shape}, actual={layout.logical_shape}"
+                )
+            existing_contract = expert_contracts_by_owner.setdefault(owner_path, expert_contract)
+            if existing_contract != expert_contract:
+                raise AdapterGradientOwnershipError(
+                    f"Expert adapter module {owner_path!r} declared inconsistent factor contracts"
+                )
+            expert_factor_groups.setdefault(owner_path, set()).add(local_name)
+
+            if expert_contract.requires_managed_fsdp:
+                if id(parameter) not in managed_fsdp_parameter_ids:
+                    raise AdapterGradientOwnershipError(
+                        f"Expert adapter factor {name!r} requires managed FSDP ownership"
+                    )
+                if not (hasattr(parameter, "to_local") and hasattr(parameter, "placements")):
+                    raise AdapterGradientOwnershipError(f"Expert adapter factor {name!r} requires an FSDP DTensor")
+
+            if not ep_enabled:
+                if layout.gradient_reduction is not GradientReductionDomain.NONE:
+                    raise AdapterGradientOwnershipError(
+                        f"Local expert adapter factor {name!r} unexpectedly declares "
+                        f"gradient reduction {layout.gradient_reduction.value!r}"
+                    )
+                continue
+            if not layout.is_ep_owned:
+                raise AdapterGradientOwnershipError(f"Expert adapter factor {name!r} lacks an explicit EP placement")
+            if factor_ownership is ExpertAdapterFactorOwnership.EP_REPLICATED:
+                if layout.gradient_reduction is not expert_contract.backend.gradient_reduction_domain or (
+                    ep_size > 1 and not layout.needs_ep_gradient_sync
+                ):
+                    raise AdapterGradientOwnershipError(
+                        f"EP-replicated expert factor {name!r} lacks its declared "
+                        f"{expert_contract.backend.gradient_reduction_domain.value} reduction"
+                    )
+            elif layout.gradient_reduction is not GradientReductionDomain.NONE or layout.needs_ep_gradient_sync:
+                raise AdapterGradientOwnershipError(
+                    f"Owner-sharded expert factor {name!r} declares an unexpected replicated reduction"
+                )
+
+        for owner_path, contract in expert_contracts_by_owner.items():
+            expected_factors = {name for name, _ownership in contract.factor_ownership}
+            actual_factors = expert_factor_groups.get(owner_path, set())
+            if actual_factors != expected_factors:
+                raise AdapterGradientOwnershipError(
+                    f"Expert adapter module {owner_path!r} does not expose its exact declared factor universe; "
+                    f"missing={sorted(expected_factors - actual_factors)}, "
+                    f"extra={sorted(actual_factors - expected_factors)}"
+                )
+
+        sp_group = parallel_state.sp_grad_sync_group
+        local_group_memberships = self._local_adapter_gradient_group_memberships(parallel_state)
+        if group_memberships is None:
+            group_memberships = self._adapter_manager.gradient_ownership_group_memberships(model_id)
+        output_group_size = len(local_group_memberships.get("output_projection_replica", (0,)))
+        declarations: dict[str, ParameterOwnershipDeclaration] = {}
+        guard_payloads: dict[str, dict[str, Any]] = {}
+        for name, layout in state.tensor_layouts.items():
+            parameter = named_parameters[name]
+            if id(parameter) in direct_parameter_ids:
+                producer = ProducerFamily.DIRECT_OUTPUT_PROJECTION
+                topology = TopologyFamily.DIRECT_OUTPUT_PROJECTION
+            else:
+                try:
+                    producer = producer_by_parameter_id[id(parameter)]
+                except KeyError:
+                    raise RuntimeError(f"Adapter parameter {name!r} has no declared execution producer") from None
+                if layout.needs_ep_gradient_sync:
+                    topology = TopologyFamily.EP_REPLICATED_SHARED
+                elif layout.is_ep_owned:
+                    topology = TopologyFamily.OWNER_SHARDED
+                else:
+                    topology = TopologyFamily.DENSE_REPLICATED
+
+            is_dtensor = hasattr(parameter, "to_local") and hasattr(parameter, "placements")
+            if layout.needs_ep_gradient_sync:
+                representation = GradientRepresentation.REPLICATED_LOCAL_CONTRIBUTION
+            elif layout.is_ep_owned:
+                representation = GradientRepresentation.OWNER_LOCAL_CONTRIBUTION
+            elif is_dtensor:
+                representation = GradientRepresentation.FSDP_COMPLETED_LOCAL_SHARD
+            else:
+                representation = GradientRepresentation.FULL_LOGICAL_CONTRIBUTION
+
+            completed: list[ReductionDomainPlan] = []
+            capture: list[ReductionDomainPlan] = []
+            pending: list[ReductionDomainPlan] = []
+            if is_dtensor and producer is ProducerFamily.DIRECT_OUTPUT_PROJECTION:
+                # Direct weight consumers bypass the FSDP module lifecycle. In
+                # particular, a sharded LoRA-B times LoRA-A produces a DTensor
+                # gradient with a Partial placement for A. Complete that public
+                # boundary contribution into the parameter's compiled placement
+                # during transactional capture, without private FSDP hooks.
+                representation = GradientRepresentation.DIRECT_DTENSOR_CONTRIBUTION
+                capture.append(
+                    ReductionDomainPlan(
+                        ReductionAxis.FSDP_SHARD,
+                        ReductionAuthority.ADAPTER_CAPTURE,
+                        ReductionOperation.SUM,
+                        "direct_dtensor_placement",
+                    )
+                )
+            elif is_dtensor:
+                completed.append(
+                    ReductionDomainPlan(
+                        ReductionAxis.FSDP_SHARD,
+                        ReductionAuthority.FSDP,
+                        ReductionOperation.SUM,
+                        "fsdp_shard",
+                    )
+                )
+            exact_lm_head_guard = exact_lm_head_guard_by_parameter_id.get(id(parameter))
+            if exact_lm_head_guard is not None and exact_lm_head_guard["exact_lm_head_factor"] == "lora_A":
+                completed.append(
+                    ReductionDomainPlan(
+                        ReductionAxis.OUTPUT_PROJECTION_REPLICA,
+                        ReductionAuthority.EXACT_LM_HEAD_VJP,
+                        ReductionOperation.SUM,
+                        "output_projection_tp",
+                    )
+                )
+            if sp_group is not None:
+                pending.append(
+                    ReductionDomainPlan(
+                        ReductionAxis.SEQUENCE_PARALLEL,
+                        ReductionAuthority.ADAPTER_FINALIZER,
+                        ReductionOperation.SUM,
+                        "sequence_parallel",
+                    )
+                )
+            if producer is ProducerFamily.DIRECT_OUTPUT_PROJECTION and output_group_size > 1:
+                pending.append(
+                    ReductionDomainPlan(
+                        ReductionAxis.OUTPUT_PROJECTION_REPLICA,
+                        ReductionAuthority.ADAPTER_FINALIZER,
+                        ReductionOperation.SUM,
+                        "output_projection_replica",
+                    )
+                )
+            if layout.needs_ep_gradient_sync:
+                pending.append(
+                    ReductionDomainPlan(
+                        ReductionAxis.EXPERT_PARALLEL_REPLICA,
+                        ReductionAuthority.ADAPTER_FINALIZER,
+                        ReductionOperation.SUM,
+                        "expert_parallel_replica",
+                    )
+                )
+            expert_contract = expert_contract_by_parameter_id.get(id(parameter))
+            if expert_contract is not None and ep_enabled:
+                local_name = name.rpartition(".")[2]
+                factor_ownership = expert_contract.ownership_for(local_name)
+                ep_pending = [domain for domain in pending if domain.axis is ReductionAxis.EXPERT_PARALLEL_REPLICA]
+                if factor_ownership is ExpertAdapterFactorOwnership.EP_REPLICATED:
+                    if topology is not TopologyFamily.EP_REPLICATED_SHARED or len(ep_pending) != 1:
+                        raise AdapterGradientOwnershipError(
+                            f"EP-replicated expert factor {name!r} requires EP_REPLICATED_SHARED "
+                            "with exactly one pending EP sum"
+                        )
+                elif topology is not TopologyFamily.OWNER_SHARDED or ep_pending:
+                    raise AdapterGradientOwnershipError(
+                        f"Owner-sharded expert factor {name!r} requires OWNER_SHARDED with no EP sum"
+                    )
+            guard_payload = {
+                "producer": producer.value,
+                "topology": topology.value,
+                "representation": representation.value,
+                "merged_forward": merged_forward_by_parameter_id[id(parameter)],
+                "sp_pending": sp_group is not None,
+                "output_replica_size": output_group_size,
+                "ep_size": int(getattr(parallel_state, "ep_size", 1)),
+                "managed_fsdp_shard": id(parameter) in managed_fsdp_parameter_ids,
+                "lora_rank": int(state.session_spec["lora_config"]["lora_rank"]),
+                "lora_alpha": int(state.session_spec["lora_config"]["lora_alpha"]),
+            }
+            guard_payload.update(expert_guard_by_parameter_id.get(id(parameter), {}))
+            guard_payload.update(exact_lm_head_guard_by_parameter_id.get(id(parameter), {}))
+            guard_payloads[name] = guard_payload
+            declarations[name] = ParameterOwnershipDeclaration(
+                topology=topology,
+                producer=producer,
+                representation=representation,
+                completed_domains=tuple(completed),
+                capture_domains=tuple(capture),
+                pending_domains=tuple(pending),
+                presence=GradientPresencePolicy.REQUIRED_IF_ACTIVE,
+                config_guard_fingerprint=self._adapter_gradient_hash(guard_payload),
+                config_guard_fields=tuple(sorted(guard_payload.items())),
+                managed_fsdp_shard=id(parameter) in managed_fsdp_parameter_ids,
+            )
+
+        model_generation = self._adapter_gradient_hash(
+            {
+                "parameters": [
+                    (layout.fqn, layout.logical_shape, str(layout.dtype))
+                    for layout in sorted(state.tensor_layouts.values(), key=lambda item: item.fqn)
+                ],
+                "guards": guard_payloads,
+            }
+        )
+        adapter_generation = self._adapter_gradient_hash(
+            {
+                "session_spec": state.session_spec,
+            }
+        )
+        compile_rank = int(
+            self.rank
+            if hasattr(self, "rank")
+            else dist.get_rank()
+            if dist.is_available() and dist.is_initialized()
+            else 0
+        )
+        self._adapter_manager.compile_gradient_ownership_plan(
+            model_id,
+            declarations,
+            model_generation=model_generation,
+            adapter_generation=adapter_generation,
+            tensor_parallel_size=int(
+                getattr(
+                    parallel_state,
+                    "tp_size",
+                    getattr(self, "train_config", {}).get("tensor_parallel_size", 1),
+                )
+            ),
+            group_memberships=group_memberships,
+            rank=compile_rank,
+        )
+
     def ensure_lora_adapter(self, model_id: str, *, initialize_fresh: bool = True) -> None:
         """Materialize a registered LoRA session into the resident adapter registry."""
         if self._adapter_manager is None:
             raise RuntimeError("Cannot materialize LoRA adapter: adapter manager not initialized")
         session_spec = self.get_lora_session_spec(model_id)
         if not self._adapter_manager.has_adapter(model_id):
-            self._adapter_manager.register_adapter(
+            parallel_state = get_parallel_state()
+            group_memberships = self._adapter_manager.register_adapter(
                 model_id=model_id,
                 session_spec=session_spec,
                 initialize_fresh=initialize_fresh,
+                local_group_memberships=self._local_adapter_gradient_group_memberships(parallel_state),
             )
-
-    def start_zorl_generation(
-        self,
-        model_id: str = "default",
-        *,
-        num_pairs: Optional[int] = None,
-        materialization: Optional[Dict[str, Any]] = None,
-        owner_url: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        """Plan one ZORL generation and export its candidate LoRA adapters."""
-        zorl_state = self._require_zorl_session(model_id)
-        self.ensure_lora_adapter(model_id, initialize_fresh=False)
-
-        start_time = time.time()
-        global_num_pairs = int(num_pairs if num_pairs is not None else zorl_state.config["num_perturbation_pairs"])
-        materialization_plan = normalize_zorl_materialization(materialization, num_pairs=global_num_pairs)
-        local_pair_indices = materialization_plan.local_pair_indices(num_pairs=global_num_pairs)
-        local_pair_count = len(local_pair_indices)
-        plan = zorl_state.begin_generation(num_pairs=num_pairs)
-        local_candidates_to_export = filter_zorl_materialized_candidates(
-            plan.candidates,
-            materialization_plan,
-            num_pairs=global_num_pairs,
-        )
-        materialized_candidate_ids = {
-            validate_identifier(candidate.candidate_id, name="candidate_id") for candidate in local_candidates_to_export
-        }
-        export_dir = self._zorl_generation_export_dir(plan.generation_id)
-        session_spec = self.get_lora_session_spec(model_id)
-
-        try:
-            if self.rank == 0:
-                os.makedirs(export_dir, exist_ok=True)
-                if materialization_plan.mode == "all":
-                    shutil.rmtree(export_dir, ignore_errors=True)
-                    os.makedirs(export_dir, exist_ok=True)
-                else:
-                    for candidate_id in materialized_candidate_ids:
-                        shutil.rmtree(os.path.join(export_dir, candidate_id), ignore_errors=True)
-            if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
-                dist.barrier()
-
-            if plan.family_refreshed:
-                self._adapter_manager.reinitialize_adapter_for_zorl_family(
-                    model_id,
-                    a_seed=plan.family.a_seed,
-                    a_init=plan.family.a_init,
-                )
-                self._sync_registered_lora_session_spec(model_id)
-
-            adapter_state = self._adapter_manager.get_adapter_state(model_id)
-            b_sigma = float(zorl_state.config["b_sigma"])
-            perturbation_mode = str(zorl_state.config.get("perturbation_mode", "b_only"))
-            # With EP enabled, adapter_state.lora_params are rank-local
-            # (num_local_experts per rank). Gather across EP ranks once so every
-            # candidate writes the full-expert state. This is a collective op —
-            # all ranks must call it even though only rank 0 writes files. Key
-            # off train_config.expert_parallel_size (guaranteed consistent
-            # across ranks) rather than `model._fqn2spec_info` — a rank-local
-            # attribute predicate would deadlock if any rank's check disagreed
-            # with the others.
-            model = getattr(self, "model", None)
-            ep_size = int(self.train_config.get("expert_parallel_size", 1)) if self.train_config else 1
-            has_ep = ep_size > 1 and model is not None
-            if perturbation_mode == "fresh_ab" and ep_size > 1:
-                # The fresh_ab fold draws its seeded noise from the adapter's
-                # rank-local parameter shapes; with EP > 1 the candidate export
-                # gathers to full-expert shapes so the export and fold noise
-                # streams would diverge. Reject rather than silently corrupt.
-                raise NotImplementedError(
-                    "ZORL perturbation_mode='fresh_ab' does not support expert_parallel_size > 1 "
-                    "(export noise is drawn on EP-gathered shapes; the base fold is rank-local)"
-                )
-            if has_ep:
-                gathered_lora = get_lora_state_dict(model)
-                # Strip FSDP/compile wrappers and map to adapter_state.lora_params keys.
-                gathered_by_key: Dict[str, torch.Tensor] = {}
-                for raw_name, tensor in gathered_lora.items():
-                    clean = raw_name.replace("_fsdp_wrapped_module.", "").replace("_orig_mod.", "")
-                    gathered_by_key[clean] = tensor
-
-                # Build nn.Parameter-like wrapper objects so build_zorl_candidate_lora_state_dict
-                # works unchanged (it accesses .data on each value).
-                class _TensorView:
-                    __slots__ = ("data", "shape")
-
-                    def __init__(self, t: torch.Tensor):
-                        self.data = t
-                        self.shape = t.shape
-
-                source_params: Dict[str, Any] = {
-                    name: _TensorView(gathered_by_key[name])
-                    for name in adapter_state.lora_params.keys()
-                    if name in gathered_by_key
-                }
-                missing = set(adapter_state.lora_params.keys()) - set(source_params.keys())
-                if missing:
-                    logger.warning(
-                        f"ZORL gather: {len(missing)} adapter keys missing from model gather; "
-                        f"falling back to rank-local for those: {sorted(missing)[:3]}..."
-                    )
-                    for n in missing:
-                        source_params[n] = adapter_state.lora_params[n]
-            else:
-                source_params = adapter_state.lora_params
-            candidates: List[Dict[str, Any]] = []
-            for candidate in local_candidates_to_export:
-                candidate_id = validate_identifier(candidate.candidate_id, name="candidate_id")
-                candidate_path = os.path.join(export_dir, candidate_id)
-                if perturbation_mode == "fresh_ab":
-                    # EGGROLL-style probe: candidate REPLACES the parent factors
-                    # with (A = eps_A, B = sign * sigma * eps_B); the pair shares
-                    # eps_A and the parent LoRA-B stays == 0 (its served delta is
-                    # zero — the accumulated update lives in the BASE weights).
-                    candidate_state_dict = build_zorl_fresh_ab_candidate_lora_state_dict(
-                        source_params,
-                        a_seed=int(candidate.a_seed),
-                        b_seed=candidate.b_seed,
-                        direction=candidate.direction,
-                        b_sigma=b_sigma,
-                    )
-                else:
-                    candidate_state_dict = build_zorl_candidate_lora_state_dict(
-                        source_params,
-                        b_seed=candidate.b_seed,
-                        direction=candidate.direction,
-                        b_sigma=b_sigma,
-                    )
-                self._checkpoint_mgr.save_explicit_lora_checkpoint(
-                    candidate_path,
-                    lora_state_dict=candidate_state_dict,
-                    session_spec=session_spec,
-                )
-                candidates.append(
-                    {
-                        "candidate_id": candidate.candidate_id,
-                        "perturbation_index": candidate.perturbation_index,
-                        "direction": candidate.direction,
-                        "b_seed": candidate.b_seed,
-                        "a_seed": candidate.a_seed,
-                        "path": candidate_path,
-                        "owner_url": owner_url,
-                    }
-                )
-
-            if not hasattr(self, "_zorl_generation_materialized_candidate_ids"):
-                self._zorl_generation_materialized_candidate_ids = {}
-            self._zorl_generation_materialized_candidate_ids[(model_id, plan.generation_id)] = set(
-                materialized_candidate_ids
-            )
-
-            return {
-                "model_id": model_id,
-                "generation_id": plan.generation_id,
-                "generation_index": plan.generation,
-                "family_id": plan.family.family_id,
-                "family_refreshed": plan.family_refreshed,
-                "b_sigma": b_sigma,
-                "perturbation_mode": perturbation_mode,
-                "num_pairs": global_num_pairs,
-                "global_num_pairs": global_num_pairs,
-                "global_population": len(plan.candidates),
-                "materialization": {
-                    "mode": materialization_plan.mode,
-                    "shard_index": materialization_plan.shard_index,
-                    "num_shards": materialization_plan.num_shards,
-                    "pair_start": materialization_plan.pair_start,
-                    "pair_end": materialization_plan.pair_end,
-                },
-                "shard_index": materialization_plan.shard_index,
-                "num_shards": materialization_plan.num_shards,
-                "local_num_pairs": local_pair_count,
-                "candidates": candidates,
-                "execution_time": time.time() - start_time,
-            }
-        except Exception:
-            if (
-                zorl_state.active_generation is not None
-                and zorl_state.active_generation.generation_id == plan.generation_id
-            ):
-                zorl_state.abort_generation(plan.generation_id)
-            self._cleanup_zorl_generation_exports(
-                plan.generation_id,
-                candidate_ids=materialized_candidate_ids if materialization_plan.mode != "all" else None,
-            )
-            raise
-
-    def apply_zorl_rewards(
-        self,
-        model_id: str,
-        generation_id: str,
-        candidate_rewards: List[Dict[str, Any]],
-        *,
-        learning_rate: Optional[float] = None,
-    ) -> Dict[str, Any]:
-        """Apply a ZORL update from externally aggregated candidate rewards."""
-        zorl_state = self._require_zorl_session(model_id)
-        if zorl_state.active_generation is None:
-            raise ValueError(f"No active ZORL generation for model_id={model_id}")
-        if zorl_state.active_generation.generation_id != generation_id:
-            raise ValueError(
-                f"Active ZORL generation mismatch for model_id={model_id}: "
-                f"expected {zorl_state.active_generation.generation_id}, got {generation_id}"
-            )
-
-        plan = zorl_state.active_generation
-        adapter_state = self._adapter_manager.get_adapter_state(model_id)
-        reward_by_candidate = {str(item["candidate_id"]): item for item in candidate_rewards}
-        score_normalizations = {
-            str(item.get("_zorl_score_normalization") or item.get("zorl_score_normalization") or "standard")
-            for item in candidate_rewards
-        }
-        if len(score_normalizations) != 1:
-            raise ValueError(
-                "All ZORL candidate rewards in one apply call must use the same "
-                f"score normalization, got {sorted(score_normalizations)}"
-            )
-        score_normalization = next(iter(score_normalizations))
-
-        raw_pair_scores: List[float] = []
-        seed_score_pairs: List[tuple[int, Optional[int], float]] = []
-        used_pairs = 0
-        dropped_pairs = 0
-        pair_specs: Dict[int, Dict[str, Any]] = {}
-        for candidate in plan.candidates:
-            pair_specs.setdefault(candidate.perturbation_index, {})[candidate.direction] = candidate
-
-        for pair_index in sorted(pair_specs):
-            directions = pair_specs[pair_index]
-            positive = directions.get("positive")
-            negative = directions.get("negative")
-
-            positive_reward = None if positive is None else reward_by_candidate.get(positive.candidate_id)
-            negative_reward = None if negative is None else reward_by_candidate.get(negative.candidate_id)
-
-            if positive is not None and negative is not None:
-                if positive_reward is None or negative_reward is None:
-                    dropped_pairs += 1
-                    continue
-                positive_rollouts = positive_reward.get("num_rollouts")
-                negative_rollouts = negative_reward.get("num_rollouts")
-                if (
-                    positive_rollouts is not None
-                    and negative_rollouts is not None
-                    and int(positive_rollouts) != int(negative_rollouts)
-                ):
-                    dropped_pairs += 1
-                    continue
-                raw_score = float(positive_reward["reward_mean"]) - float(negative_reward["reward_mean"])
-                chosen = positive
-            elif positive_reward is not None and positive is not None:
-                raw_score = float(positive_reward["reward_mean"])
-                chosen = positive
-            elif negative_reward is not None and negative is not None:
-                raw_score = -float(negative_reward["reward_mean"])
-                chosen = negative
-            else:
-                dropped_pairs += 1
-                continue
-
-            raw_pair_scores.append(raw_score)
-            # Antithetic siblings share both seeds, so either direction's spec
-            # identifies the pair's noise draws.
-            seed_score_pairs.append(
-                (int(chosen.b_seed), None if chosen.a_seed is None else int(chosen.a_seed), raw_score)
-            )
-            used_pairs += 1
-
-        if not seed_score_pairs:
-            raise ValueError(f"No valid ZORL reward pairs for generation {generation_id}")
-
-        normalized_scores = self._normalize_zorl_pair_scores(
-            raw_pair_scores,
-            normalization=score_normalization,
-        )
-        effective_lr = (
-            float(learning_rate) if learning_rate is not None else float(self._adapter_manager.get_lr(model_id))
-        )
-        perturbation_mode = str(zorl_state.config.get("perturbation_mode", "b_only"))
-
-        if perturbation_mode == "fresh_ab":
-            # fresh_ab: the reward-weighted update is a full base-weight-shaped
-            # direction (rank <= N*r), unrepresentable in the rank-r parent.
-            # Fold it into the BASE weights through the base-model optimizer;
-            # the parent adapter (A arbitrary, B == 0) is left untouched.
-            update_norm, grad_norm = self._apply_zorl_fresh_ab_base_update(
+            self._compile_registered_adapter_gradient_ownership(
                 model_id,
-                pair_seeds_and_scores=[
-                    (a_seed, b_seed, normalized_score)
-                    for (b_seed, a_seed, _raw_score), normalized_score in zip(
-                        seed_score_pairs, normalized_scores, strict=True
-                    )
-                ],
-                learning_rate=effective_lr,
+                group_memberships=group_memberships,
             )
-        else:
-            update, update_norm = build_zorl_update_from_rewards(
-                adapter_state.lora_params,
-                pair_seeds_and_scores=[
-                    (b_seed, normalized_score)
-                    for (b_seed, _a_seed, _raw_score), normalized_score in zip(
-                        seed_score_pairs, normalized_scores, strict=True
-                    )
-                ],
-            )
-
-            for param in adapter_state.lora_params.values():
-                param.grad = None
-            for name, param in adapter_state.lora_params.items():
-                if "lora_B" not in name:
-                    continue
-                param.grad = (-update[name]).to(device=param.device, dtype=param.dtype)
-
-            grad_norm = float(
-                self._adapter_manager.optim_step(model_id, effective_lr, None, accumulated_valid_tokens=0)
-            )
-            self._sync_registered_lora_session_spec(model_id)
-        zorl_state.complete_generation(generation_id)
-        materialized_ids = getattr(self, "_zorl_generation_materialized_candidate_ids", {}).pop(
-            (model_id, generation_id),
-            None,
-        )
-        deleted_candidates = self._cleanup_zorl_generation_exports(generation_id, candidate_ids=materialized_ids)
-
-        reward_values = [float(item["reward_mean"]) for item in reward_by_candidate.values()]
-        reward_tensor = torch.tensor(reward_values, dtype=torch.float32)
-        pair_score_tensor = torch.tensor(raw_pair_scores, dtype=torch.float32)
-
-        return {
-            "model_id": model_id,
-            "generation_id": generation_id,
-            "applied": True,
-            "used_pairs": used_pairs,
-            "dropped_pairs": dropped_pairs,
-            "family_id": plan.family.family_id,
-            "next_generation_index": zorl_state.generation,
-            "deleted_candidates": deleted_candidates,
-            "metrics": {
-                "reward_mean": float(reward_tensor.mean().item()),
-                "reward_std": float(reward_tensor.std(unbiased=False).item()) if reward_tensor.numel() > 1 else 0.0,
-                "pair_delta_mean": float(pair_score_tensor.mean().item()),
-                "pair_delta_std": float(pair_score_tensor.std(unbiased=False).item())
-                if pair_score_tensor.numel() > 1
-                else 0.0,
-                "update_norm": float(update_norm),
-                "grad_norm": grad_norm,
-                "learning_rate": effective_lr,
-                "b_sigma": float(zorl_state.config["b_sigma"]),
-                "perturbation_mode": perturbation_mode,
-                "score_normalization": score_normalization,
-            },
-        }
-
-    def _resolve_zorl_fresh_ab_base_params(
-        self,
-        module_keys,
-    ) -> Dict[str, tuple[str, torch.nn.Parameter, Optional[tuple[int, int]]]]:
-        """Map fresh_ab LoRA module keys onto the live base weight parameters.
-
-        Returns module_key -> (base_param_name, base_param, last_dim_slice)
-        where ``last_dim_slice`` is a (start, length) window on the base
-        parameter's last dim (used for the fused MoE ``gate_up_proj`` storage);
-        ``None`` means the module key maps onto the whole parameter.
-        """
-        named_base_params: Dict[str, torch.nn.Parameter] = {}
-        for raw_name, param in self.model.named_parameters():
-            clean = raw_name.replace("_fsdp_wrapped_module.", "").replace("_orig_mod.", "")
-            named_base_params[clean] = param
-
-        resolution: Dict[str, tuple[str, torch.nn.Parameter, Optional[tuple[int, int]]]] = {}
-        for module_key in sorted(module_keys):
-            weight_name = f"{module_key}.weight"
-            if weight_name in named_base_params:
-                # Standard LoraLinear module (attention/MLP/lm_head).
-                resolution[module_key] = (weight_name, named_base_params[weight_name], None)
-                continue
-            if module_key in named_base_params:
-                # MoE expert weight stored directly as an nn.Parameter
-                # (e.g. ``...experts.down_proj`` in (G, K, N) layout).
-                resolution[module_key] = (module_key, named_base_params[module_key], None)
-                continue
-            parent, _, leaf = module_key.rpartition(".")
-            fused_name = f"{parent}.gate_up_proj" if parent else "gate_up_proj"
-            if leaf in ("gate_proj", "up_proj") and fused_name in named_base_params:
-                # Fused MoE gate/up storage: [E, hidden, 2*intermediate] with
-                # gate occupying the first half of the last dim.
-                fused_param = named_base_params[fused_name]
-                intermediate = int(fused_param.shape[-1]) // 2
-                start = 0 if leaf == "gate_proj" else intermediate
-                resolution[module_key] = (fused_name, fused_param, (start, intermediate))
-                continue
-            raise ValueError(
-                f"Cannot resolve base weight parameter for fresh_ab LoRA module {module_key!r} "
-                f"(tried {weight_name!r}, {module_key!r}, and fused {fused_name!r})"
-            )
-        return resolution
-
-    def _get_zorl_fresh_ab_base_optimizer(
-        self,
-        base_params: Dict[str, torch.nn.Parameter],
-        *,
-        lr: float,
-    ):
-        """Lazily build (and cache) the Muon optimizer over the fresh_ab base weights.
-
-        Structural note: in LoRA server mode the shared ``self.optimizer`` and
-        the per-adapter optimizers only cover LoRA parameters (base params are
-        frozen and filtered out by ``build_optimizer``), so the fresh_ab fold
-        cannot reuse either. This builds a dedicated optimizer over exactly the
-        LoRA-targeted base weights via the same ``build_optimizer`` factory,
-        configured for the ES fold recipe: momentum-off Muon, full-weight
-        Newton-Schulz (``muon_distributed_mode='full_gradient'``), and the
-        ``match_rms_adamw`` lr scale (0.2*sqrt(max dim)) so Muon reuses the
-        AdamW/GRPO learning rate.
-        """
-        param_names = tuple(sorted(base_params))
-        cached = getattr(self, "_zorl_fresh_ab_base_optimizer", None)
-        cached_names = getattr(self, "_zorl_fresh_ab_base_optimizer_param_names", None)
-        if cached is not None and cached_names == param_names:
-            return cached
-
-        optimizer_kwargs = dict(self._get_optimizer_kwargs() or {})
-        optimizer_kwargs.setdefault("muon_momentum", 0.0)
-        optimizer_kwargs.setdefault("muon_nesterov", False)
-        optimizer_kwargs.setdefault("muon_adjust_lr_fn", "match_rms_adamw")
-        if not torch.cuda.is_available():
-            optimizer_kwargs.setdefault("muon_ns_use_quack_kernels", False)
-        optimizer_kwargs["muon_distributed_mode"] = "full_gradient"
-        optimizer_kwargs["muon_lr"] = float(lr)
-
-        wrapper_module = LoRAAdapterManager._build_parameter_module(base_params)
-        # The optimizer factory skips frozen params; the base weights are frozen
-        # in LoRA mode, so flip requires_grad only for the build. The optimizer
-        # itself only reads .grad, which we assign manually during the fold.
-        flipped = [param for param in base_params.values() if not param.requires_grad]
-        try:
-            for param in flipped:
-                param.requires_grad_(True)
-            optimizer = build_optimizer(
-                wrapper_module,
-                lr=float(lr),
-                weight_decay=0.0,
-                fused=False,
-                optimizer_type="muon",
-                optimizer_dtype=self.train_config.get("optimizer_dtype", "bf16"),
-                optimizer_kwargs=optimizer_kwargs,
-            )
-        finally:
-            for param in flipped:
-                param.requires_grad_(False)
-
-        self._zorl_fresh_ab_base_optimizer = optimizer
-        self._zorl_fresh_ab_base_optimizer_param_names = param_names
-        logger.info(
-            f"ZORL fresh_ab base optimizer initialized over {len(base_params)} base weight params "
-            f"(muon, full_gradient NS, adjust_lr_fn={optimizer_kwargs['muon_adjust_lr_fn']})"
-        )
-        return optimizer
-
-    def _apply_zorl_fresh_ab_base_update(
-        self,
-        model_id: str,
-        *,
-        pair_seeds_and_scores: List[tuple[int, int, float]],
-        learning_rate: float,
-    ) -> tuple[float, float]:
-        """Fold the fresh_ab reward-weighted update into the base fp32 masters.
-
-        Builds G[module] = (1/N) * sum_i z_i * scaling * (eps_B,i @ eps_A,i)
-        for every LoRA-targeted base weight, sets ``param.grad = -G`` (sliced
-        to the local DTensor shard when the base is FSDP-sharded; G itself is
-        seed-deterministic and identical on every rank), and steps the
-        dedicated Muon base optimizer so the applied delta is
-        ``+adjusted_lr * NS(G)``. Muon's spectrally-scaled step is its own
-        trust region, so no gradient clipping is applied (matching the sglang
-        fresh_ab Muon path); the reported grad_norm is ||G||_F.
-
-        Returns (update_norm, grad_norm).
-        """
-        adapter_state = self._adapter_manager.get_adapter_state(model_id)
-        session_spec = self.get_lora_session_spec(model_id)
-        lora_config = session_spec["lora_config"]
-        scaling = float(lora_config["lora_alpha"]) / float(lora_config["lora_rank"])
-
-        updates, update_norm = build_zorl_fresh_ab_base_update_from_rewards(
-            adapter_state.lora_params,
-            pair_seeds_and_scores=pair_seeds_and_scores,
-            scaling=scaling,
-        )
-        resolution = self._resolve_zorl_fresh_ab_base_params(updates.keys())
-
-        # Assemble the (negated) full-shape gradient per base parameter. Fused
-        # MoE gate/up modules write into disjoint last-dim windows of one param.
-        base_params: Dict[str, torch.nn.Parameter] = {}
-        base_grads: Dict[str, torch.Tensor] = {}
-        for module_key, (param_name, param, last_dim_slice) in resolution.items():
-            update = updates[module_key]
-            if param_name not in base_grads:
-                base_params[param_name] = param
-                base_grads[param_name] = torch.zeros(tuple(param.shape), dtype=torch.float32)
-            target = (
-                base_grads[param_name]
-                if last_dim_slice is None
-                else base_grads[param_name].narrow(-1, last_dim_slice[0], last_dim_slice[1])
-            )
-            if tuple(update.shape) != tuple(target.shape):
-                raise ValueError(
-                    f"fresh_ab update shape {tuple(update.shape)} does not match base weight "
-                    f"target {param_name!r} shape {tuple(target.shape)} (module {module_key!r})"
-                )
-            target.add_(update, alpha=-1.0)
-
-        optimizer = self._get_zorl_fresh_ab_base_optimizer(base_params, lr=float(learning_rate))
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = float(learning_rate)
-
-        try:
-            from torch.distributed._tensor import DTensor  # noqa: PLC0415
-
-            from xorl.optim.muon import _shard_full_to_local  # noqa: PLC0415
-
-            has_dtensor = True
-        except ImportError:
-            has_dtensor = False
-
-        for param_name, param in base_params.items():
-            grad_full = base_grads[param_name]
-            if has_dtensor and isinstance(param, DTensor):
-                grad_local = _shard_full_to_local(
-                    grad_full.to(device=param.device, dtype=param.dtype),
-                    param.device_mesh,
-                    param.placements,
-                )
-                param.grad = DTensor.from_local(grad_local, param.device_mesh, param.placements, run_check=False)
-            else:
-                param.grad = grad_full.to(device=param.device, dtype=param.dtype)
-
-        optimizer.step()
-        optimizer.zero_grad()
-        for param in base_params.values():
-            param.grad = None
-
-        grad_norm = float(update_norm)
-        logger.info(
-            f"ZORL fresh_ab fold applied: model_id={model_id} modules={len(resolution)} "
-            f"base_params={len(base_params)} update_norm={update_norm:.6e} lr={learning_rate:.3e}"
-        )
-        return float(update_norm), grad_norm
-
-    def abort_zorl_generation(self, model_id: str, generation_id: str) -> Dict[str, Any]:
-        """Abort an active ZORL generation and delete its exported candidates."""
-        zorl_state = self._require_zorl_session(model_id)
-        aborted = zorl_state.abort_generation(generation_id)
-        materialized_ids = getattr(self, "_zorl_generation_materialized_candidate_ids", {}).pop(
-            (model_id, aborted.generation_id),
-            None,
-        )
-        deleted_candidates = self._cleanup_zorl_generation_exports(
-            aborted.generation_id, candidate_ids=materialized_ids
-        )
-        return {
-            "success": True,
-            "model_id": model_id,
-            "generation_id": aborted.generation_id,
-            "deleted_candidates": deleted_candidates,
-        }
 
     def _check_not_sleeping(self, operation: str) -> None:
         """Raise if the model is in sleep mode (CPU-offloaded)."""
@@ -1401,8 +1216,6 @@ class ModelRunner:
             if self._adapter_manager is not None and self._adapter_manager.has_adapter(model_id):
                 self._adapter_manager.remove_adapter(model_id)
             self._lora_session_specs.pop(model_id, None)
-            if hasattr(self, "_zorl_sessions"):
-                self._zorl_sessions.pop(model_id, None)
 
             return {
                 "success": True,
@@ -1500,9 +1313,19 @@ class ModelRunner:
         lora_enabled = self.lora_config.get("enable_lora", False)
         enable_mixed_precision = self.train_config.get("enable_mixed_precision", False)
         enable_qlora = self.lora_config.get("enable_qlora", False)
+        block_fp8_qlora_training = self.lora_config.get("block_fp8_qlora_training", False)
 
-        # Resolve target_modules from Tinker-style or flat config
-        target_modules = self._resolve_lora_target_modules() if lora_enabled else None
+        # The strict GLM lane owns its complete target set and must not depend
+        # on permissive discovery or a remote-config lookup. Other adapter
+        # modes retain the existing Tinker/flat-config resolution.
+        target_modules = (
+            glm5_default_lora_targets(train_attn=True, train_mlp=True, train_unembed=True)
+            if block_fp8_qlora_training
+            else self._resolve_lora_target_modules()
+            if lora_enabled
+            else None
+        )
+        construction_target_modules = None if block_fp8_qlora_training else target_modules
 
         model_dtype = resolve_training_model_dtype(
             enable_lora=lora_enabled,
@@ -1518,7 +1341,8 @@ class ModelRunner:
             config_path=self.model_config.get("config_path"),
             weights_path=self.model_config.get("model_path"),
             torch_dtype=model_dtype,
-            attn_implementation=self.model_config.get("attn_implementation", "sdpa"),
+            attn_implementation=self.model_config.get("attn_implementation"),
+            non_glm_attn_default="flash_attention_4",
             moe_implementation=self.model_config.get("moe_implementation"),
             moe_routing_weights_before_down=self.model_config.get("moe_routing_weights_before_down", "auto"),
             ep_dispatch=self.model_config.get("ep_dispatch", "alltoall"),
@@ -1533,9 +1357,11 @@ class ModelRunner:
             enable_lora=lora_enabled,
             lora_rank=self.lora_config.get("max_lora_rank", self.lora_config.get("lora_rank", 32)),
             lora_alpha=self.lora_config.get("lora_alpha", 16),
-            lora_target_modules=target_modules,
+            lora_target_modules=construction_target_modules,
+            lora_target_manifest=self.lora_config.get("lora_target_manifest"),
             moe_hybrid_shared_lora=self.lora_config.get("moe_hybrid_shared_lora", False),
             enable_qlora=enable_qlora,
+            block_fp8_qlora_training=block_fp8_qlora_training,
             quant_format=self.lora_config.get("quant_format", "nvfp4"),
             quant_group_size=self.lora_config.get("quant_group_size", 16),
             qlora_exclude_modules=self.lora_config.get("exclude_modules"),
@@ -1592,20 +1418,46 @@ class ModelRunner:
             pp_num_layers_in_first_stage=self.train_config.get("pipeline_parallel_num_layers_in_first_stage"),
             pp_num_layers_in_last_stage=self.train_config.get("pipeline_parallel_num_layers_in_last_stage"),
             freeze_router=self.train_config.get("freeze_router", False),
-            router_fp32=self.model_config.get("router_fp32", True),
-            lm_head_fp32=self.model_config.get("lm_head_fp32", True),
-            rmsnorm_mode=self.model_config.get("rmsnorm_mode", "native"),
+            router_fp32=self.model_config.get("router_fp32"),
+            lm_head_fp32=self.model_config.get("lm_head_fp32"),
+            rmsnorm_mode=self.model_config.get("rmsnorm_mode"),
+            qwen35_rmsnorm_family=self.model_config.get("qwen35_rmsnorm_family"),
             activation_native=self.model_config.get("activation_native", False),
-            rope_native=self.model_config.get("rope_native", False),
-            rope_class_b=self.model_config.get("rope_class_b", False),
+            rope_native=self.model_config.get("rope_native"),
+            rope_class_b=self.model_config.get("rope_class_b"),
             attention_cast_bf16=self.model_config.get("attention_cast_bf16", False),
-            sparse_mla_enabled=self.model_config.get("sparse_mla_enabled", False),
-            sparse_mla_backend=self.model_config.get("sparse_mla_backend", "auto"),
+            sparse_mla_enabled=self.model_config.get("sparse_mla_enabled"),
+            sparse_mla_backend=self.model_config.get("sparse_mla_backend"),
             flash_attention_deterministic=self.model_config.get("flash_attention_deterministic", False),
+            server_training=True,
         )
 
         self.model = result.model
+        if getattr(get_parallel_state(), "lm_head_tp_size", 1) > 1:
+            sync_lm_head_tp_parameters(
+                self.model,
+                get_parallel_state().lm_head_tp_replica_group,
+                get_parallel_state().lm_head_tp_group,
+            )
         self.model_config_obj = result.model_config
+        numerical_program = self.model_config_obj._resolved_numerical_program
+        self.model_config.update(
+            {
+                "attn_implementation": numerical_program["attn_implementation"],
+                "router_fp32": numerical_program["router_fp32"],
+                "lm_head_fp32": numerical_program["lm_head_fp32"],
+                "rmsnorm_mode": numerical_program["rmsnorm_mode"],
+                "activation_native": numerical_program["activation_native"],
+                "rope_native": numerical_program["rope_native"],
+                "rope_class_b": numerical_program["rope_class_b"],
+                "attention_cast_bf16": numerical_program["attention_cast_bf16"],
+                "sparse_mla_enabled": numerical_program["sparse_mla_enabled"],
+                "sparse_mla_backend": numerical_program["sparse_mla_backend"],
+            }
+        )
+        self.lm_head_fp32 = numerical_program["lm_head_fp32"]
+        self.ce_mode = resolve_cross_entropy_mode(self.model_config_obj, self.ce_mode)
+        self.train_config["ce_mode"] = self.ce_mode
         self.pp_enabled = result.pp_enabled
         self.pp_stages = result.pp_stages
         self.model_parts = result.model_parts
@@ -1616,6 +1468,7 @@ class ModelRunner:
         self.is_prequantized = result.is_prequantized
         self.checkpoint_quant_format = result.checkpoint_quant_format
         self.exclude_modules = result.exclude_modules
+        self.glm52_adapter_inventory = getattr(result, "glm52_adapter_inventory", None)
 
         # Save LoRA metadata for checkpoint manager
         if lora_enabled or enable_qlora:
@@ -1636,6 +1489,14 @@ class ModelRunner:
         explicit_target_modules = self.lora_config.get("lora_target_modules", None)
         if explicit_target_modules is not None:
             return explicit_target_modules
+
+        target_manifest = self.lora_config.get("lora_target_manifest")
+        if target_manifest is not None:
+            from xorl.lora.target_manifest import load_lora_target_manifest  # noqa: PLC0415
+
+            loaded_manifest = load_lora_target_manifest(target_manifest)
+            assert loaded_manifest is not None
+            return list(loaded_manifest["target_modules"])
 
         config_path = self.model_config.get("config_path") or self.model_config.get("model_path")
         model_type = None
@@ -1684,8 +1545,6 @@ class ModelRunner:
                 "pipeline_parallel_size > 1 is not supported with multi-adapter LoRA server training. "
                 "Adapter coordination currently assumes identical local LoRA layouts on every rank."
             )
-        if self.zorl_config.get("enabled", False) and not self.lora_config.get("enable_lora", False):
-            raise ValueError("ZORL requires enable_lora=True")
         max_lora_rank = self.lora_config.get("max_lora_rank", self.lora_config.get("lora_rank", 32))
         default_rank = self.lora_config.get("lora_rank", 32)
         if max_lora_rank < default_rank:
@@ -1872,6 +1731,13 @@ class ModelRunner:
         self._checkpoint_mgr.load_state(checkpoint_path, load_optimizer=load_optimizer)
         self._sync_from_checkpoint_state()
 
+    def _restore_initial_base_checkpoint(self) -> None:
+        """Restore the base checkpoint and publish completion only on success."""
+
+        self._base_checkpoint_restore_complete = False
+        self._load_initial_checkpoint()
+        self._base_checkpoint_restore_complete = True
+
     def register_lora_adapter(self, model_id: str, lr: Optional[float]) -> Dict[str, Any]:
         """
         Materialize a registered LoRA session into the adapter manager.
@@ -1899,10 +1765,16 @@ class ModelRunner:
             session_spec = self.get_lora_session_spec(model_id)
             if lr is not None:
                 session_spec["optimizer_config"]["learning_rate"] = lr
-            self._adapter_manager.register_adapter(
+            parallel_state = get_parallel_state()
+            group_memberships = self._adapter_manager.register_adapter(
                 model_id=model_id,
                 session_spec=session_spec,
                 initialize_fresh=True,
+                local_group_memberships=self._local_adapter_gradient_group_memberships(parallel_state),
+            )
+            self._compile_registered_adapter_gradient_ownership(
+                model_id,
+                group_memberships=group_memberships,
             )
         self._sync_registered_lora_session_spec(model_id)
 
@@ -1925,6 +1797,20 @@ class ModelRunner:
         """Get lm_head weight, merging LoRA delta on-the-fly if needed."""
         lm_head = self.model.lm_head
         if isinstance(lm_head, LoraLinear):
+            if getattr(lm_head, "_glm52_exact_tp16_lm_head", False):
+                # The exact selected-logprob op consumes the physical local
+                # base shard plus live A/B factors. Materializing B@A here
+                # would both duplicate TP16 state and change the value program.
+                if lora_merged_forward_enabled(lm_head):
+                    raise RuntimeError("The exact GLM-5.2 lm head rejects merged-forward mode")
+                return lm_head.weight
+            if lora_merged_forward_enabled(lm_head):
+                # The loss path consumes the LM-head weight directly instead
+                # of calling ``LoraLinear.forward``.  Use the same canonical
+                # folded straight-through weight here so training consumes
+                # the bytes exported to serving while gradients still reach
+                # the adapter factors.
+                return lm_head.merged_weight_for_forward()
             return lm_head.weight + lm_head.get_delta_weight().to(lm_head.weight.dtype)
         return lm_head.weight
 
@@ -1946,6 +1832,14 @@ class ModelRunner:
         except ImportError:  # pragma: no cover - optional in lightweight import contexts.
             return None
         return lm_head if isinstance(lm_head, FP8Linear) else None
+
+    @staticmethod
+    def _get_loss_lm_head_module(lm_head):
+        """Return a module that owns the loss projection, when one is required."""
+
+        if lm_head is not None and getattr(lm_head, "_glm52_exact_tp16_lm_head", False):
+            return lm_head
+        return ModelRunner._get_fp8_lm_head_module(lm_head)
 
     def _collect_per_token_outputs(self, per_token_tensors, micro_batch, accumulators):
         """Gather per-token outputs across the unified SP group and append to accumulators."""
@@ -1975,7 +1869,6 @@ class ModelRunner:
                     gather_dim=-1,
                     padding_dim=-1,
                     unpad_dim_size=original_seq_len,
-                    scale_grad=False,
                     group=sp_group,
                 )
 
@@ -2276,6 +2169,8 @@ class ModelRunner:
             "k_attn_input": 14,
             "v_attn_input": 15,
             "attn_output": 16,
+            "attention_gate": 16,
+            "attn_output_gated": 17,
             "o_proj_output": 17,
             "attention": 18,
             "post_attention_norm_input": 19,
@@ -2331,6 +2226,30 @@ class ModelRunner:
             "final_mlp_output_override": 48,
             "final_residual_output": 49,
             "layer_output_override": 50,
+            "moe_native_gathered_input": 80,
+            "moe_native_gathered_routing": 81,
+            "moe_native_gathered_ids": 82,
+            "moe_native_local_ids": 83,
+            "moe_native_routed": 84,
+            "moe_native_shared_gate_value": 85,
+            "moe_native_shared_gate_up": 86,
+            "moe_native_shared_act": 87,
+            "moe_native_shared_down": 88,
+            "moe_native_local_partial": 89,
+            "moe_native_combined": 90,
+            "gdn_q_input": 60,
+            "gdn_k_input": 61,
+            "gdn_v_input": 62,
+            "gdn_a_input": 63,
+            "gdn_b_input": 64,
+            "gdn_gate_input": 65,
+            "gdn_conv_q": 66,
+            "gdn_conv_k": 67,
+            "gdn_conv_v": 68,
+            "gdn_g": 69,
+            "gdn_beta": 70,
+            "gdn_scan_out": 71,
+            "gdn_normed": 72,
         }
 
         layer_output_overrides = self._load_diagnostic_layer_output_overrides()
@@ -3089,7 +3008,6 @@ class ModelRunner:
             gather_dim=1,
             padding_dim=1,
             unpad_dim_size=original_seq_len,
-            scale_grad=False,
             group=sequence_group,
         )
 
@@ -3106,7 +3024,6 @@ class ModelRunner:
             gather_dim=-1,
             padding_dim=-1,
             unpad_dim_size=original_seq_len,
-            scale_grad=False,
             group=sequence_group,
         )
         micro_batch = dict(micro_batch)
@@ -3314,7 +3231,12 @@ class ModelRunner:
 
             t_forward = _now()
             with self.model_fwd_context:
-                outputs = self.model(**model_inputs, use_cache=False, output_hidden_states=False)
+                outputs = self.model(
+                    **model_inputs,
+                    use_cache=False,
+                    output_hidden_states=False,
+                    **self._index_share_forward_kwargs(IndexShareMode.FORWARD_ONLY),
+                )
             hidden_states, micro_batch = self._gather_teacher_cache_sequences(
                 outputs.last_hidden_state, micro_batch, ps
             )
@@ -3929,7 +3851,12 @@ class ModelRunner:
 
         # Frozen teacher: weights are shared with the student, so a no_grad forward is
         # the only thing that keeps it out of the autograd graph.
-        fwd_kwargs = {"input_ids": fwd_ids, "use_cache": False, "output_hidden_states": False}
+        fwd_kwargs = {
+            "input_ids": fwd_ids,
+            "use_cache": False,
+            "output_hidden_states": False,
+            **self._index_share_forward_kwargs(IndexShareMode.FORWARD_ONLY),
+        }
         # Block-diagonal (per-sample) teacher attention under PACKING: teacher_position_ids
         # resets to 0 at each packed sample (built by the server packer). Derive varlen
         # cu_seqlens so the teacher forward does NOT attend across packed samples — matching
@@ -5178,7 +5105,8 @@ class ModelRunner:
                     # Use the packer-emitted PER-MICRO-BATCH-LOCAL view
                     # (teacher_cache_local_indices), NOT teacher_cache_indices: the
                     # latter carries GLOBAL teacher-cache rows for the KL hidden-fetch
-                    # and walks out of bounds here.
+                    # and walks out of bounds here (see
+                    # the OPRD warm-cache index rebase analysis).
                     local_cache_indices = micro_batch.get("teacher_cache_local_indices")
                     if local_cache_indices is None:
                         raise ValueError(
@@ -5472,6 +5400,22 @@ class ModelRunner:
             return torch.zeros((), dtype=torch.float32, device=tensor.device)
         return tensor.reshape(-1)[:1].float().sum() * 0.0
 
+    def _index_share_forward_kwargs(self, mode: IndexShareMode) -> Dict[str, IndexShareMode]:
+        if callable(getattr(self.model, "release_index_share_context", None)):
+            return {"index_share_mode": mode}
+        return {}
+
+    def _release_index_share_contexts(self) -> None:
+        candidates = [getattr(self, "model", None), *(getattr(self, "model_parts", None) or [])]
+        seen: set[int] = set()
+        for model_part in candidates:
+            if model_part is None or id(model_part) in seen:
+                continue
+            seen.add(id(model_part))
+            release = getattr(model_part, "release_index_share_context", None)
+            if callable(release):
+                release()
+
     @staticmethod
     def _clear_diagnostic_decode_cache(model: nn.Module) -> None:
         for module in model.modules():
@@ -5568,6 +5512,7 @@ class ModelRunner:
                     past_key_values=past_key_values,
                     output_hidden_states=diagnostic_hidden_states,
                     diagnostic_decode_cache=True,
+                    **self._index_share_forward_kwargs(IndexShareMode.FORWARD_ONLY),
                 )
                 returned_past_key_values = getattr(outputs, "past_key_values", None)
                 if returned_past_key_values is not None:
@@ -5631,7 +5576,7 @@ class ModelRunner:
         }
 
         effective_weight = self._get_effective_lm_head_weight()
-        fp8_lm_head = self._get_fp8_lm_head_module(getattr(self.model, "lm_head", None))
+        loss_lm_head = self._get_loss_lm_head_module(getattr(self.model, "lm_head", None))
         token_sum_reducer = TokenPartial(scale=torch.tensor(1.0, device=hidden_states.device))
         loss_tp_group = self._get_loss_tp_group()
         result = causallm_loss_function(
@@ -5643,7 +5588,7 @@ class ModelRunner:
             lm_head_fp32=self.lm_head_fp32,
             loss_reducer=token_sum_reducer,
             tp_group=loss_tp_group,
-            lm_head=fp8_lm_head,
+            lm_head=loss_lm_head,
             logprob_temperature=logprob_temperature,
         )
 
@@ -5663,7 +5608,7 @@ class ModelRunner:
                 weight=effective_weight,
                 labels=labels,
                 topk=diagnostic_topk,
-                lm_head=fp8_lm_head,
+                lm_head=loss_lm_head,
                 lm_head_fp32=self.lm_head_fp32,
                 per_token_logprobs=result.per_token_logprobs if return_per_token else None,
                 include_weight_reference=diagnostic_reference_logits,
@@ -5676,7 +5621,14 @@ class ModelRunner:
                 per_token_outputs["token_diagnostics"] = token_diagnostics
         return result.loss, per_token_outputs, None, None, outputs
 
-    def _compute_micro_batch_loss(self, micro_batch, loss_fn, loss_fn_params):
+    def _compute_micro_batch_loss(
+        self,
+        micro_batch,
+        loss_fn,
+        loss_fn_params,
+        *,
+        index_share_mode: IndexShareMode = IndexShareMode.FORWARD_ONLY,
+    ):
         """Compute loss for a single micro-batch."""
         params = loss_fn_params or {}
         return_per_token = params.get("return_per_token", True)
@@ -5694,6 +5646,21 @@ class ModelRunner:
 
         exclude_keys = self._LOSS_EXCLUDE_KEYS.get(loss_fn, set())
         model_inputs = {k: v for k, v in micro_batch.items() if k not in exclude_keys}
+        sampler_prefill_lengths = params.get("sampler_prefill_lengths")
+        if sampler_prefill_lengths is not None:
+            if isinstance(sampler_prefill_lengths, int):
+                sampler_prefill_lengths = [sampler_prefill_lengths]
+            if not isinstance(sampler_prefill_lengths, (list, tuple)) or not sampler_prefill_lengths:
+                raise ValueError("sampler_prefill_lengths must be a nonempty integer list")
+            if any(
+                isinstance(value, bool) or not isinstance(value, int) or value <= 0 for value in sampler_prefill_lengths
+            ):
+                raise ValueError("sampler_prefill_lengths must contain positive integers")
+            model_inputs["sampler_prefill_lengths"] = torch.tensor(
+                sampler_prefill_lengths,
+                dtype=torch.long,
+                device=model_inputs["input_ids"].device,
+            )
 
         # Shared-prefix: the dispatcher already repacked input_ids / loss fields and
         # attached a SharedPrefixContext. Move its index tensors to the model device
@@ -5836,6 +5803,7 @@ class ModelRunner:
                     output_hidden_states=(
                         diagnostic_hidden_states or (capture_student_layers and not use_opd_selected_layer_hooks)
                     ),
+                    **self._index_share_forward_kwargs(index_share_mode),
                 )
         finally:
             for handle in opd_selected_layer_handles:
@@ -5877,7 +5845,7 @@ class ModelRunner:
             )
             logger.info("Full hidden-component diagnostic tensors saved to %s", saved_path)
         effective_weight = self._get_effective_lm_head_weight()
-        fp8_lm_head = self._get_fp8_lm_head_module(getattr(self.model, "lm_head", None))
+        loss_lm_head = self._get_loss_lm_head_module(getattr(self.model, "lm_head", None))
         loss_lm_head_fp32 = self.lm_head_fp32
         if "lm_head_fp32" in params:
             raw_lm_head_fp32 = params["lm_head_fp32"]
@@ -5911,7 +5879,7 @@ class ModelRunner:
                 lm_head_fp32=loss_lm_head_fp32,
                 loss_reducer=token_sum_reducer,
                 tp_group=loss_tp_group,
-                lm_head=fp8_lm_head,
+                lm_head=loss_lm_head,
                 logprob_temperature=logprob_temperature,
             )
             local_loss_sum = _result.loss
@@ -5931,7 +5899,7 @@ class ModelRunner:
                     weight=effective_weight,
                     labels=labels,
                     topk=diagnostic_topk,
-                    lm_head=fp8_lm_head,
+                    lm_head=loss_lm_head,
                     lm_head_fp32=loss_lm_head_fp32,
                     per_token_logprobs=_result.per_token_logprobs,
                     include_weight_reference=diagnostic_reference_logits,
@@ -5963,7 +5931,7 @@ class ModelRunner:
                 loss_reducer=token_sum_reducer,
                 metric_reducer=token_sum_reducer,
                 tp_group=loss_tp_group,
-                lm_head=fp8_lm_head,
+                lm_head=loss_lm_head,
                 logprob_temperature=logprob_temperature,
             )
             local_loss_sum = _result.loss
@@ -5988,7 +5956,7 @@ class ModelRunner:
                     weight=effective_weight,
                     labels=target_tokens,
                     topk=diagnostic_topk,
-                    lm_head=fp8_lm_head,
+                    lm_head=loss_lm_head,
                     lm_head_fp32=loss_lm_head_fp32,
                     per_token_logprobs=_result.per_token_logprobs,
                     include_weight_reference=diagnostic_reference_logits,
@@ -6016,8 +5984,6 @@ class ModelRunner:
             if kl_type in {"low_var_kl", "low_variance_kl"}:
                 kl_type = "k3"
 
-            parallel_state = get_parallel_state()
-            tp_group = parallel_state.tp_group if parallel_state.tp_enabled else None
             _result = drgrpo_loss_function(
                 hidden_states=hidden_states,
                 weight=effective_weight,
@@ -6032,11 +5998,11 @@ class ModelRunner:
                 kl_type=kl_type,
                 ce_mode=self.ce_mode,
                 num_chunks=params.get("num_chunks", 8),
-                tp_group=tp_group,
+                tp_group=loss_tp_group,
                 lm_head_fp32=loss_lm_head_fp32,
                 loss_reducer=token_sum_reducer,
                 metric_reducer=token_sum_reducer,
-                lm_head=fp8_lm_head,
+                lm_head=loss_lm_head,
                 logprob_temperature=logprob_temperature,
             )
             local_loss_sum = _result.loss
@@ -6087,7 +6053,7 @@ class ModelRunner:
                 loss_reducer=token_sum_reducer,
                 metric_reducer=token_sum_reducer,
                 tp_group=loss_tp_group,
-                lm_head=fp8_lm_head,
+                lm_head=loss_lm_head,
                 logprob_temperature=logprob_temperature,
             )
             local_loss_sum = _result.loss
@@ -6310,6 +6276,32 @@ class ModelRunner:
         model_id="default",
         abort_callback=None,
     ):
+        try:
+            return self._forward_loop_impl(
+                micro_batches,
+                loss_fn,
+                loss_fn_params,
+                compute_backward=compute_backward,
+                r3_enabled=r3_enabled,
+                model_id=model_id,
+                abort_callback=abort_callback,
+            )
+        finally:
+            # A successful backward releases each micro-batch below. This
+            # boundary owns setup/loss failures after a successful forward.
+            self._release_index_share_contexts()
+
+    def _forward_loop_impl(
+        self,
+        micro_batches,
+        loss_fn,
+        loss_fn_params,
+        *,
+        compute_backward=True,
+        r3_enabled=False,
+        model_id="default",
+        abort_callback=None,
+    ):
         """Core forward (+ optional backward) loop shared between forward and forward_backward."""
         params = loss_fn_params or {}
         use_distsignsgd = getattr(self, "_use_distsignsgd", False)
@@ -6341,6 +6333,16 @@ class ModelRunner:
         profile_phase_timings = bool(params.get("profile_phase_timings", params.get("opd_profile_timings", False)))
         profile_sync_cuda = bool(params.get("opd_profile_sync_cuda", False))
         normalize_loss_before_backward = bool(params.get("normalize_loss_before_backward", False))
+        ownership_capture_open = False
+        if compute_backward and self._adapter_manager is not None:
+            ownership_capture_open = self._adapter_manager.begin_gradient_capture(
+                model_id,
+                scale_state=(
+                    GradientScaleState.PRE_NORMALIZED
+                    if normalize_loss_before_backward
+                    else GradientScaleState.RAW_NUMERATOR
+                ),
+            )
         forward_compute_time = 0.0
         backward_compute_time = 0.0
         server_model_forward_ms = 0.0
@@ -6389,7 +6391,12 @@ class ModelRunner:
             profile_start = _profile_phase_now() if profile_phase_timings else 0.0
             with self.model_fwd_context:
                 local_loss_sum, per_token_outputs, is_metrics, is_metric_ops, outputs = self._compute_micro_batch_loss(
-                    micro_batch, loss_fn, params
+                    micro_batch,
+                    loss_fn,
+                    params,
+                    index_share_mode=(
+                        IndexShareMode.TRAINING_WITH_BACKWARD if compute_backward else IndexShareMode.FORWARD_ONLY
+                    ),
                 )
             if profile_phase_timings:
                 forward_compute_time += _profile_phase_elapsed(profile_start)
@@ -6503,8 +6510,11 @@ class ModelRunner:
                     defer_hsdp_all_reduce,
                     is_last_micro_batch=batch_idx == len(micro_batches) - 1,
                 ):
-                    with self.model_bwd_context:
-                        backward_loss.backward()
+                    try:
+                        with self.model_bwd_context:
+                            backward_loss.backward()
+                    finally:
+                        self._release_index_share_contexts()
                 if profile_phase_timings:
                     backward_compute_time += _profile_phase_elapsed(profile_start)
 
@@ -6514,7 +6524,9 @@ class ModelRunner:
                     # ranks holding only IGNORE_INDEX tokens may hit early-return
                     # paths with a different dtype than the normal-return path.
                     loss_report = local_loss_sum.detach().float()
-                    dist.all_reduce(loss_report, op=dist.ReduceOp.SUM, group=ps.fsdp_group if self.pp_enabled else None)
+                    loss_report_group = ps.fsdp_group if self.pp_enabled else None
+                    if dist.get_world_size(group=loss_report_group) > 1:
+                        dist.all_reduce(loss_report, op=dist.ReduceOp.SUM, group=loss_report_group)
                     if global_valid_tokens.item() > 0:
                         total_loss += (loss_report / global_valid_tokens).item()
             else:
@@ -6548,13 +6560,37 @@ class ModelRunner:
 
         # CP/SP gradient sync (backward only)
         if compute_backward:
+            if ownership_capture_open:
+                self._adapter_manager.stage_gradient_numerators(
+                    model_id,
+                    denominator=float(global_valid_tokens.item()),
+                    backward_completed=True,
+                )
+            sp_exclusions = (
+                self._adapter_manager.adapter_sync_exclusions(model_id, ReductionAxis.SEQUENCE_PARALLEL)
+                if self._adapter_manager is not None
+                else frozenset()
+            )
+            output_exclusions = (
+                self._adapter_manager.adapter_sync_exclusions(
+                    model_id,
+                    ReductionAxis.OUTPUT_PROJECTION_REPLICA,
+                )
+                if self._adapter_manager is not None
+                else frozenset()
+            )
             sync_sp_gradients(
                 self.model,
                 get_parallel_state().sp_grad_sync_group,
                 skip_dtensor_grads=use_distsignsgd,
+                excluded_parameter_ids=sp_exclusions,
             )
             if getattr(get_parallel_state(), "lm_head_tp_size", 1) > 1:
-                sync_lm_head_tp_gradient(self.model, get_parallel_state().lm_head_tp_replica_group)
+                sync_lm_head_tp_gradient(
+                    self.model,
+                    get_parallel_state().lm_head_tp_replica_group,
+                    excluded_parameter_ids=output_exclusions,
+                )
             # Accumulate valid tokens for deferred normalization at optim_step
             if not normalize_loss_before_backward:
                 self._accumulated_valid_tokens[model_id] = (
@@ -6620,7 +6656,7 @@ class ModelRunner:
         # valid-token micro-batch (small batch on a large gang, or ulysses
         # sequence sharding) otherwise carry a different metric-key set and the
         # all-reduce inside _finalize_loss_metrics mismatches in size -> NCCL
-        # hang. This call was dropped in an earlier GLM5 rebase and is restored here.
+        # hang. (Call was dropped during a GLM-5 rebase; restored.)
         if loss_fn == "opd_loss":
             self._ensure_opd_loss_metric_accumulators(
                 accumulated_loss_metrics,
@@ -6880,7 +6916,7 @@ class ModelRunner:
                         ce_mode=self.ce_mode,
                         lm_head_fp32=self.lm_head_fp32,
                         loss_reducer=TokenPartial(scale=torch.tensor(1.0, device=hidden_per_mb[batch_idx].device)),
-                        lm_head=self._get_fp8_lm_head_module(lm_head),
+                        lm_head=self._get_loss_lm_head_module(lm_head),
                     )
                     payloads.append(
                         [
@@ -6933,6 +6969,70 @@ class ModelRunner:
     # =========================================================================
 
     def forward_backward(
+        self,
+        micro_batches: List[Dict[str, Any]],
+        loss_fn: str = "causallm_loss",
+        loss_fn_params: Optional[Dict[str, Any]] = None,
+        abort_callback: Optional[callable] = None,
+        model_id: str = "default",
+        routed_experts: Optional[List[List[List[List[int]]]]] = None,
+        routed_expert_logits: Optional[List[Any]] = None,
+    ) -> Dict[str, Any]:
+        """Execute and stage one forward/backward capture.
+
+        Distributed command completion is owned by RunnerDispatcher.  It calls
+        ``commit_forward_backward_completion`` only after the unconditional
+        result rendezvous has completed on every rank.
+        """
+
+        try:
+            result = self._forward_backward_impl(
+                micro_batches,
+                loss_fn=loss_fn,
+                loss_fn_params=loss_fn_params,
+                abort_callback=abort_callback,
+                model_id=model_id,
+                routed_experts=routed_experts,
+                routed_expert_logits=routed_expert_logits,
+            )
+            return result
+        except AdapterGradientUniformRejection:
+            if self._adapter_manager is not None and self._adapter_manager.has_adapter(model_id):
+                self.abort_gradient_epoch(model_id)
+            raise
+        except BaseException:
+            if self._adapter_manager is not None and self._adapter_manager.has_adapter(model_id):
+                self._adapter_manager.abort_gradient_capture(model_id)
+            raise
+
+    def commit_forward_backward_completion(self, model_id: str = "default") -> None:
+        """Commit staged capture and monotonic success at the result boundary."""
+
+        if self._adapter_manager is not None:
+            if self._adapter_manager.gradient_capture_is_open(model_id):
+                self._adapter_manager.commit_gradient_capture(model_id)
+            self._adapter_manager.increment_forward_backward_step(model_id)
+        else:
+            self.global_forward_backward_step += 1
+
+    def abort_gradient_epoch(self, model_id: str = "default") -> Dict[str, Any]:
+        """Discard all unmutated adapter-gradient work for one optimizer epoch."""
+
+        if self._adapter_manager is None:
+            raise RuntimeError("abort_gradient_epoch requires multi-adapter LoRA state")
+        self._adapter_manager.abort_gradient_epoch(model_id)
+        self._accumulated_valid_tokens[model_id] = 0
+        self._accumulated_active_microbatches[model_id] = 0
+        self._accumulated_active_voter_total[model_id] = 0
+        state = self._adapter_manager.get_adapter_state(model_id)
+        return {
+            "success": True,
+            "model_id": model_id,
+            "step": state.global_step,
+            "forward_backward_step": state.global_forward_backward_step,
+        }
+
+    def _forward_backward_impl(
         self,
         micro_batches: List[Dict[str, Any]],
         loss_fn: str = "causallm_loss",
@@ -7072,11 +7172,16 @@ class ModelRunner:
                     }
 
                     with self.model_fwd_context:
-                        outputs = self.model(**model_inputs, use_cache=False, output_hidden_states=False)
+                        outputs = self.model(
+                            **model_inputs,
+                            use_cache=False,
+                            output_hidden_states=False,
+                            **self._index_share_forward_kwargs(IndexShareMode.FORWARD_ONLY),
+                        )
                     hidden_states = outputs.last_hidden_state
 
                     effective_weight = self._get_effective_lm_head_weight()
-                    fp8_lm_head = self._get_fp8_lm_head_module(getattr(self.model, "lm_head", None))
+                    loss_lm_head = self._get_loss_lm_head_module(getattr(self.model, "lm_head", None))
 
                     labels = mb.get("target_tokens", mb.get("labels"))
 
@@ -7089,7 +7194,7 @@ class ModelRunner:
                         ce_mode=self.ce_mode,
                         lm_head_fp32=self.lm_head_fp32,
                         tp_group=self._get_loss_tp_group(),
-                        lm_head=fp8_lm_head,
+                        lm_head=loss_lm_head,
                         logprob_temperature=ref_logprob_temperature,
                     )
                     ref_logprobs = _ref_result.per_token_logprobs
@@ -7168,21 +7273,26 @@ class ModelRunner:
                 self._routing_handler.cleanup()
         else:
             # Standard forward-backward via unified loop
-            result = self._forward_loop(
-                micro_batches,
-                loss_fn,
-                loss_fn_params,
-                compute_backward=True,
-                r3_enabled=r3_enabled,
-                model_id=model_id,
-                abort_callback=abort_callback,
-            )
+            try:
+                result = self._forward_loop(
+                    micro_batches,
+                    loss_fn,
+                    loss_fn_params,
+                    compute_backward=True,
+                    r3_enabled=r3_enabled,
+                    model_id=model_id,
+                    abort_callback=abort_callback,
+                )
+            except Exception:
+                if self._adapter_manager is not None:
+                    self._adapter_manager.abort_gradient_capture(model_id)
+                raise
 
-        # Capture gradients into adapter's own parameters (for multi-adapter isolation)
-        # This must happen AFTER all micro-batches have accumulated gradients in model params,
-        # but BEFORE optim_step. Each adapter has its own .grad slots to prevent collision.
         if self._adapter_manager is not None:
-            self._adapter_manager.capture_gradients(model_id)
+            self._adapter_manager.trace_model_gradient_stage(
+                model_id,
+                stage="after_efsdp_reduce_scatter",
+            )
 
         # Get step counter (use adapter manager if available, else global)
         if self._adapter_manager is not None:
@@ -7198,6 +7308,8 @@ class ModelRunner:
         if params.get("profile_clear_gradients_after_backward", False):
             clear_start = time.perf_counter()
             synchronize()
+            if self._adapter_manager is not None and self._adapter_manager.gradient_capture_is_open(model_id):
+                self._adapter_manager.abort_gradient_capture(model_id)
             if self.optimizer is not None:
                 try:
                     self.optimizer.zero_grad(set_to_none=True)
@@ -7213,12 +7325,6 @@ class ModelRunner:
                     gc.collect()
                 torch.cuda.empty_cache()
             result["opd_profile_clear_gradients_ms"] = (time.perf_counter() - clear_start) * 1000.0
-
-        # Increment step counter (use adapter manager if available, else global)
-        if self._adapter_manager is not None:
-            self._adapter_manager.increment_forward_backward_step(model_id)
-        else:
-            self.global_forward_backward_step += 1
 
         # Synchronize to ensure all async GPU operations complete
         synchronize()
@@ -7358,7 +7464,7 @@ class ModelRunner:
         Execute optimizer step using xorl's optimizer logic.
 
         For multi-adapter training: Uses the adapter's own optimizer and parameters.
-        The gradients were previously captured into the adapter's params via capture_gradients().
+        Adapter gradients were committed as raw numerators at the completion rendezvous.
 
         For single-adapter training: Uses the shared optimizer on model parameters.
 
@@ -7381,6 +7487,7 @@ class ModelRunner:
 
         start_time = time.time()
         skip_optim_empty_cache = False
+        adapter_mutated = False
         capture_config = dict(sparse_delta_capture or {})
         capture_snapshots: dict[str, torch.Tensor] | None = None
         capture_snapshot_s = 0.0
@@ -7391,16 +7498,9 @@ class ModelRunner:
             capture_snapshots = snapshot_sparse_delta_tensors(self.model, capture_config)
             capture_snapshot_s = time.perf_counter() - t_capture
 
-        # Determine gradient clip value
-        # If gradient_clip is provided, use it; otherwise fall back to config
-        # Default to a large value (10000.0) to ensure we always use the
-        # distributed-aware clip_grad_norm_ path for correct grad norm computation.
-        # This effectively means "no clipping" while still computing grad_norm correctly.
-        DEFAULT_MAX_GRAD_NORM = 10000.0
-        if gradient_clip is not None:
-            clip_value = gradient_clip
-        else:
-            clip_value = self.train_config.get("max_grad_norm", DEFAULT_MAX_GRAD_NORM)
+        # A missing/non-positive threshold means disabled clipping, but the
+        # adapter manager still computes and reports the real logical norm.
+        clip_value = gradient_clip if gradient_clip is not None else self.train_config.get("max_grad_norm")
 
         # Pop accumulated valid tokens for this model_id (deferred normalization)
         accumulated = self._accumulated_valid_tokens.pop(model_id, 0)
@@ -7410,6 +7510,10 @@ class ModelRunner:
 
         # Multi-adapter path: use adapter's own optimizer on adapter's own parameters
         if self._adapter_manager is not None:
+            # This is the only fallible periodic-merge check for the adapter
+            # path; keep it before optimizer mutation so configuration errors
+            # remain ordinary command rejections.
+            self._maybe_merge_lora()
             # Determine learning rate: explicit lr > adapter's stored lr
             if lr is not None:
                 effective_lr = lr
@@ -7424,18 +7528,19 @@ class ModelRunner:
                 adapter_state = self._adapter_manager.get_adapter_state(model_id)
                 self._apply_optim_step_adam_hparams(adapter_state.optimizer, beta1, beta2, eps)
 
-            # Step the adapter's optimizer (handles LR update, grad clip, step, zero_grad)
-            # Gradients are in the adapter's params (captured by capture_gradients in forward_backward)
-            # Pass accumulated_valid_tokens for deferred gradient normalization
+            # Finalize the compiled raw-numerator epoch and mutate the adapter optimizer.
             grad_norm = self._adapter_manager.optim_step(
                 model_id,
                 effective_lr,
                 clip_value,
-                accumulated_valid_tokens=accumulated,
             )
-            self._sync_registered_lora_session_spec(model_id)
-            current_step = self._adapter_manager.get_global_step(model_id)
-            current_lr = effective_lr
+            adapter_mutated = True
+            try:
+                self._sync_registered_lora_session_spec(model_id)
+                current_step = self._adapter_manager.get_global_step(model_id)
+                current_lr = effective_lr
+            except BaseException as error:
+                self._raise_adapter_post_mutation_failure(model_id, error)
 
         # Single-adapter path: use shared optimizer on model parameters
         else:
@@ -7470,6 +7575,19 @@ class ModelRunner:
                 use_distsignsgd=use_distsignsgd,
             )
 
+            # Keep repeated forward_backward accumulation local until the step
+            # boundary.  One coalesced EP reduction here avoids multiplying
+            # already-reduced gradients when callers accumulate several calls.
+            sync_stats = synchronize_ep_replicated_gradients(self.model)
+            if sync_stats.configured_parameter_count:
+                logger.info_rank0(
+                    "EP replicated gradient sync: "
+                    f"configured_parameters={sync_stats.configured_parameter_count} "
+                    f"participating_parameters={sync_stats.participating_parameter_count} "
+                    f"buckets={sync_stats.bucket_count} "
+                    f"gradient_bytes={sync_stats.gradient_bytes} "
+                    f"reduced_bytes={sync_stats.reduced_bytes}"
+                )
             grad_norm = clip_gradients(
                 self.model_parts if self.pp_enabled else self.model,
                 clip_value,
@@ -7503,47 +7621,67 @@ class ModelRunner:
             # Collect mean grad_norm across data parallel group for logging
             grad_norm = all_reduce(grad_norm, group=ps.fsdp_group)
 
-        # Periodic LoRA merge (if configured)
-        self._maybe_merge_lora()
+        try:
+            # Periodic merge for the shared-optimizer path still belongs after
+            # mutation. The adapter path validated its unsupported merge config
+            # before mutation above.
+            if self._adapter_manager is None:
+                self._maybe_merge_lora()
 
-        result = {
-            "step": current_step,
-            "grad_norm": grad_norm,
-            "lr": current_lr,
-            "optim_step_time": time.time() - start_time,
-            "model_id": model_id,
-            "optim_empty_cache_skipped": skip_optim_empty_cache,
-        }
-        if capture_snapshots is not None:
-            capture_result = write_sparse_source_delta_rank(
-                model=self.model,
-                before=capture_snapshots,
-                config=capture_config,
-                rank=self.rank,
-                world_size=self.world_size,
-                model_id=model_id,
-                step=current_step,
-                snapshot_s=capture_snapshot_s,
+            result = {
+                "step": current_step,
+                "grad_norm": grad_norm,
+                "lr": current_lr,
+                "optim_step_time": time.time() - start_time,
+                "model_id": model_id,
+                "optim_empty_cache_skipped": skip_optim_empty_cache,
+            }
+            if capture_snapshots is not None:
+                capture_result = write_sparse_source_delta_rank(
+                    model=self.model,
+                    before=capture_snapshots,
+                    config=capture_config,
+                    rank=self.rank,
+                    world_size=self.world_size,
+                    model_id=model_id,
+                    step=current_step,
+                    snapshot_s=capture_snapshot_s,
+                )
+                result["sparse_delta_capture"] = capture_result
+
+            logger.info(
+                f"optim_step step={current_step} grad_norm={grad_norm:.4f} "
+                f"lr={current_lr:.2e} empty_cache_skipped={skip_optim_empty_cache} "
+                f"time={result['optim_step_time']:.2f}s"
             )
-            result["sparse_delta_capture"] = capture_result
+            logger.debug(
+                f"Rank {self.rank}: optim_step step={current_step}, "
+                f"grad_norm={grad_norm:.6f}, lr={current_lr:.2e}, "
+                f"clip={clip_value}, accumulated_valid_tokens={accumulated}, "
+                f"accumulated_active_microbatches={accumulated_active_microbatches}, "
+                f"accumulated_active_voter_total={accumulated_active_voter_total}, "
+                f"model_id={model_id}, time={result['optim_step_time']:.3f}s"
+            )
 
-        logger.info(
-            f"optim_step step={current_step} grad_norm={grad_norm:.4f} "
-            f"lr={current_lr:.2e} empty_cache_skipped={skip_optim_empty_cache} "
-            f"time={result['optim_step_time']:.2f}s"
-        )
-        logger.debug(
-            f"Rank {self.rank}: optim_step step={current_step}, "
-            f"grad_norm={grad_norm:.6f}, lr={current_lr:.2e}, "
-            f"clip={clip_value}, accumulated_valid_tokens={accumulated}, "
-            f"accumulated_active_microbatches={accumulated_active_microbatches}, "
-            f"accumulated_active_voter_total={accumulated_active_voter_total}, "
-            f"model_id={model_id}, time={result['optim_step_time']:.3f}s"
-        )
+            synchronize()
+            return result
+        except (AdapterGradientMutationFailure, KeyboardInterrupt):
+            raise
+        except BaseException as error:
+            if adapter_mutated:
+                self._raise_adapter_post_mutation_failure(model_id, error)
+            raise
 
-        synchronize()
+    def _raise_adapter_post_mutation_failure(self, model_id: str, error: BaseException) -> None:
+        """Poison an adapter and classify any post-step tail failure as fatal."""
 
-        return result
+        assert self._adapter_manager is not None
+        state = self._adapter_manager.get_adapter_state(model_id)
+        state.poisoned = True
+        state.publication_eligible = False
+        raise AdapterGradientMutationFailure(
+            "Adapter optimizer handler failed after mutation; publish nothing and restart from checkpoint"
+        ) from error
 
     def _maybe_merge_lora(self) -> None:
         """Periodic LoRA merge at merge_lora_interval."""
@@ -7578,17 +7716,37 @@ class ModelRunner:
         self.global_step = self._checkpoint_mgr.global_step
         self.global_forward_backward_step = self._checkpoint_mgr.global_forward_backward_step
         if getattr(get_parallel_state(), "lm_head_tp_size", 1) > 1:
-            sync_lm_head_tp_parameters(self.model, get_parallel_state().lm_head_tp_replica_group)
+            sync_lm_head_tp_parameters(
+                self.model,
+                get_parallel_state().lm_head_tp_replica_group,
+                get_parallel_state().lm_head_tp_group,
+            )
 
     def save_adapter_state(self, model_id, path=None, save_optimizer=True):
         self._sync_checkpoint_state()
         return self._checkpoint_mgr.save_adapter_state(model_id, path, save_optimizer)
 
     def load_adapter_state(self, model_id, path=None, load_optimizer=True, lr=None):
+        registered_before = self._adapter_manager.has_adapter(model_id)
+        if registered_before:
+            resident_plan = self._adapter_manager.get_adapter_state(model_id).gradient_ownership_plan
+            if resident_plan is None:
+                # A resident session must establish its direct topology contract
+                # before checkpoint code is allowed to mutate it.
+                self._compile_registered_adapter_gradient_ownership(model_id)
         result = self._checkpoint_mgr.load_adapter_state(model_id, path, load_optimizer, lr=lr)
+        try:
+            if not registered_before:
+                # Public coordinator restores materialize before this method;
+                # this branch is retained for direct single-rank callers. A
+                # failed compile removes the newly created state below.
+                self._compile_registered_adapter_gradient_ownership(model_id)
+        except Exception:
+            if not registered_before and self._adapter_manager.has_adapter(model_id):
+                self._adapter_manager.remove_adapter(model_id)
+            raise
         self._sync_from_checkpoint_state()
         self._sync_registered_lora_session_spec(model_id)
-        self._seed_loaded_zorl_parent_family(model_id)
         return result
 
     def save_state(self, checkpoint_path, save_optimizer=True, model_id=None):
@@ -7596,12 +7754,15 @@ class ModelRunner:
         return self._checkpoint_mgr.save_state(checkpoint_path, save_optimizer, model_id)
 
     def load_state(self, checkpoint_path, load_optimizer=True, model_id=None):
+        if self._adapter_manager is not None:
+            target_model_id = model_id or self._adapter_manager.current_adapter_id or "default"
+            return self.load_adapter_state(
+                target_model_id,
+                checkpoint_path,
+                load_optimizer=load_optimizer,
+            )
         result = self._checkpoint_mgr.load_state(checkpoint_path, load_optimizer, model_id)
         self._sync_from_checkpoint_state()
-        loaded_model_id = result.get("model_id", model_id)
-        if loaded_model_id is not None:
-            self._sync_registered_lora_session_spec(loaded_model_id)
-            self._seed_loaded_zorl_parent_family(loaded_model_id)
         return result
 
     def save_lora_only(self, lora_path, model_id="default"):

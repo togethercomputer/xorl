@@ -1,5 +1,7 @@
 import importlib.util
 import json
+import os
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -8,6 +10,8 @@ from unittest.mock import patch
 import pytest
 import torch
 import yaml
+
+from xorl.server.removed_config import reject_removed_configuration_fields
 
 
 pytestmark = [pytest.mark.cpu, pytest.mark.server]
@@ -70,6 +74,181 @@ def load_server_arguments(config_path, *args, **kwargs):
     if not Path(str(config_path)).exists():
         pytest.skip(f"config '{config_path}' not present (experiments/ configs are outside the src+tests merge scope)")
     return _load_server_arguments_impl(config_path, *args, **kwargs)
+
+
+def test_flat_yaml_rejects_removed_adapter_ownership_mode(tmp_path):
+    config_path = tmp_path / "server_config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model_path": "Qwen/Qwen3-8B",
+                "adapter_gradient_ownership_mode": "observe",
+                "shared_config_key_not_owned_by_server": True,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="adapter_gradient_ownership_mode.*authoritative-only"):
+        load_server_arguments(str(config_path))
+
+
+def test_nested_yaml_rejects_removed_zorl_field_before_filtering(tmp_path):
+    config_path = tmp_path / "server_config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {"model_path": "Qwen/Qwen3-8B"},
+                "train": {"zorl_b_sigma": 0.01},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="train.zorl_b_sigma.*ZORL was removed"):
+        load_server_arguments(str(config_path))
+
+
+def test_nested_yaml_rejects_removed_zorl_section(tmp_path):
+    config_path = tmp_path / "server_config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {"model_path": "Qwen/Qwen3-8B"},
+                "zorl": {"enabled": True, "sigma": 0.01},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="zorl.*ZORL was removed"):
+        load_server_arguments(str(config_path))
+
+
+def test_load_server_arguments_rejects_removed_cli_override(tmp_path):
+    config_path = tmp_path / "server_config.yaml"
+    config_path.write_text(yaml.safe_dump({"model_path": "Qwen/Qwen3-8B"}), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="adapter_gradient_ownership_shadow_canary.*authoritative-only"):
+        load_server_arguments(
+            str(config_path),
+            overrides={"adapter_gradient_ownership_shadow_canary": True},
+        )
+
+
+def test_removed_field_inventory_allows_unrelated_unknown_fields():
+    payload = {"shared_config_key_not_owned_by_server": {"future_nested_key": True}}
+    assert reject_removed_configuration_fields(payload, context="test config") is payload
+
+
+_SHIPPED_MOE_LORA_CONFIGS = (
+    "examples/server/configs/lora/qwen3_5_35b_a3b_lora.yaml",
+    "examples/server/configs/lora/qwen3_coder_30b_a3b_lora.yaml",
+)
+_SHIPPED_QWEN_MOE_QLORA_CONFIGS = (
+    "examples/server/configs/qlora/qwen3_235b_a22b_qlora_nf4.yaml",
+    "examples/server/configs/qlora/qwen3_235b_a22b_qlora_nvfp4.yaml",
+    "examples/server/configs/qlora/qwen3_30b_a3b_qlora_nf4.yaml",
+    "examples/server/configs/qlora/qwen3_30b_a3b_qlora_nvfp4.yaml",
+    "examples/server/configs/qlora/qwen3_coder_30b_a3b_qlora.yaml",
+)
+
+
+@pytest.fixture(scope="module")
+def clean_shipped_adapter_arguments():
+    """Parse shipped configs in a clean process, outside this module's launcher stubs."""
+
+    root = Path(__file__).resolve().parents[2]
+    relative_paths = _SHIPPED_MOE_LORA_CONFIGS + _SHIPPED_QWEN_MOE_QLORA_CONFIGS
+    script = """
+import json
+import sys
+from xorl.server.launcher import load_server_arguments
+
+result = {}
+for path in sys.argv[1:]:
+    args = load_server_arguments(path)
+    result[path] = {
+        "moe_implementation": args.moe_implementation,
+        "moe_hybrid_shared_lora": args.moe_hybrid_shared_lora,
+        "lora_target_modules": args.lora_target_modules,
+    }
+print("XORL_SHIPPED_CONFIG_ARGS=" + json.dumps(result, sort_keys=True))
+"""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.pathsep.join((str(root / "src"), str(root), env.get("PYTHONPATH", "")))
+    completed = subprocess.run(
+        [sys.executable, "-c", script, *(str(root / path) for path in relative_paths)],
+        cwd=root,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    marker = "XORL_SHIPPED_CONFIG_ARGS="
+    payload = next(line.removeprefix(marker) for line in completed.stdout.splitlines() if line.startswith(marker))
+    parsed = json.loads(payload)
+    return {path: parsed[str(root / path)] for path in relative_paths}
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    _SHIPPED_MOE_LORA_CONFIGS,
+)
+def test_shipped_moe_lora_examples_restore_certified_quack(relative_path, clean_shipped_adapter_arguments):
+    config_path = Path(__file__).resolve().parents[2] / relative_path
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    parsed = clean_shipped_adapter_arguments[relative_path]
+    assert config["moe_implementation"] == parsed["moe_implementation"] == "quack"
+    assert config.get("moe_hybrid_shared_lora", False) is parsed["moe_hybrid_shared_lora"] is False
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    _SHIPPED_QWEN_MOE_QLORA_CONFIGS,
+)
+def test_shipped_qwen_quantized_moe_examples_restore_quack_expert_targets(
+    relative_path, clean_shipped_adapter_arguments
+):
+    config_path = Path(__file__).resolve().parents[2] / relative_path
+    config = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    parsed = clean_shipped_adapter_arguments[relative_path]
+    expected_targets = [
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    ]
+    assert config["moe_implementation"] == parsed["moe_implementation"] == "quack"
+    assert config["lora_target_modules"] == parsed["lora_target_modules"] == expected_targets
+    assert config["moe_hybrid_shared_lora"] is parsed["moe_hybrid_shared_lora"] is True
+
+
+def test_canonical_moe_and_rope_auto_defaults_serialize(tmp_path):
+    config_path = tmp_path / "server_config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {"model_path": "synthetic"},
+                "train": {"output_dir": str(tmp_path / "outputs")},
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = load_server_arguments(str(config_path))
+    model_config = args.to_config_dict()["model"]
+    assert model_config["attn_implementation"] is None
+    assert model_config["router_fp32"] is None
+    assert model_config["lm_head_fp32"] is None
+    assert model_config["rmsnorm_mode"] is None
+    assert model_config["rope_native"] is None
+    assert model_config["rope_class_b"] is None
+    assert model_config["sparse_mla_enabled"] is None
+    assert args.to_config_dict()["train"]["ce_mode"] is None
 
 
 def test_load_server_arguments_threads_signsgd_through_nested_config(tmp_path):
@@ -396,6 +575,102 @@ def test_load_server_arguments_threads_fp8_training_into_train_config(tmp_path):
     assert train_config["fp8_training_target_modules"] == ["q_proj", "k_proj"]
     assert train_config["fp8_training_exclude_modules"] == ["lm_head"]
     assert train_config["fp8_training_allow_bf16_fallback"] is False
+
+
+def test_load_server_arguments_threads_glm52_block_fp8_qlora_mode(tmp_path):
+    config_path = tmp_path / "server_config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {
+                    "model_path": "zai-org/GLM-5.2-FP8",
+                    "moe_implementation": "triton",
+                    "ep_dispatch": "deepep",
+                    "merge_qkv": True,
+                },
+                "train": {
+                    "freeze_router": True,
+                    "output_dir": str(tmp_path / "outputs"),
+                },
+                "lora": {
+                    "enable_lora": True,
+                    "enable_qlora": True,
+                    "block_fp8_qlora_training": True,
+                    "quant_format": "block_fp8",
+                    "quant_group_size": 128,
+                    "moe_hybrid_shared_lora": True,
+                    "lora_export_format": "sglang_shared_outer",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    args = load_server_arguments(str(config_path))
+    config = args.to_config_dict()
+
+    assert args.block_fp8_qlora_training is True
+    assert config["lora"]["enable_lora"] is True
+    assert config["lora"]["enable_qlora"] is True
+    assert config["lora"]["block_fp8_qlora_training"] is True
+    assert config["lora"]["quant_format"] == "block_fp8"
+    assert config["lora"]["quant_group_size"] == 128
+    assert config["lora"]["moe_hybrid_shared_lora"] is True
+
+
+def _exact_glm52_rank1_server_config(tmp_path):
+    return {
+        "model": {
+            "model_path": "zai-org/GLM-5.2-FP8",
+            "moe_implementation": "triton",
+            "ep_dispatch": "alltoall",
+            "merge_qkv": True,
+        },
+        "train": {
+            "freeze_router": True,
+            "output_dir": str(tmp_path / "outputs"),
+            "expert_parallel_size": 16,
+            "ulysses_parallel_size": 16,
+            "lm_head_tensor_parallel_size": 16,
+            "fsdp_sharded_lm_head_loss": True,
+        },
+        "lora": {
+            "enable_lora": True,
+            "enable_qlora": True,
+            "block_fp8_qlora_training": True,
+            "lora_rank": 1,
+            "max_lora_rank": 1,
+            "lora_alpha": 1,
+            "quant_format": "block_fp8",
+            "quant_group_size": 128,
+            "moe_hybrid_shared_lora": True,
+            "lora_export_format": "sglang_shared_outer",
+        },
+    }
+
+
+def test_load_server_arguments_admits_exact_glm52_rank1_world16_tuple(tmp_path):
+    config_path = tmp_path / "server_config.yaml"
+    config_path.write_text(yaml.safe_dump(_exact_glm52_rank1_server_config(tmp_path)), encoding="utf-8")
+
+    args = load_server_arguments(str(config_path))
+
+    assert (args.lora_rank, args.max_lora_rank, args.lora_alpha) == (1, 1, 1)
+    assert args.ep_dispatch == "alltoall"
+    assert (args.expert_parallel_size, args.ulysses_parallel_size) == (16, 16)
+    assert args.lm_head_tensor_parallel_size == 16
+    assert args.fsdp_sharded_lm_head_loss is True
+    assert args.get_total_gpus() == 16
+
+
+def test_load_server_arguments_rejects_rank1_exact_lane_with_non_tp16_lm_head(tmp_path):
+    payload = _exact_glm52_rank1_server_config(tmp_path)
+    payload["train"]["lm_head_tensor_parallel_size"] = 1
+    config_path = tmp_path / "server_config.yaml"
+    config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="lm_head_tensor_parallel_size=1"):
+        load_server_arguments(str(config_path))
 
 
 def test_load_server_arguments_threads_qarl_into_train_config(tmp_path):
@@ -771,6 +1046,37 @@ def test_load_server_arguments_threads_lm_head_tp_loss_fields(tmp_path):
     assert train_config["lm_head_tensor_parallel_size"] == 8
     assert train_config["fsdp_sharded_lm_head_loss"] is True
     assert train_config["fsdp_sharded_lm_head_loss_num_chunks"] == 4
+
+
+def test_model_tensor_parallel_lora_is_rejected_but_output_head_tp_remains_distinct(tmp_path):
+    rejected_path = tmp_path / "rejected.yaml"
+    rejected_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {"model_path": "synthetic"},
+                "train": {"tensor_parallel_size": 2},
+                "lora": {"enable_lora": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="tensor_parallel_size > 1"):
+        load_server_arguments(str(rejected_path))
+
+    admitted_path = tmp_path / "output_head.yaml"
+    admitted_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {"model_path": "synthetic"},
+                "train": {"lm_head_tensor_parallel_size": 2},
+                "lora": {"enable_lora": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = load_server_arguments(str(admitted_path))
+    assert args.tensor_parallel_size == 1
+    assert args.lm_head_tensor_parallel_size == 2
 
 
 def test_qwen3_8b_fp8_bf16_islands_example_config_loads():
@@ -1838,6 +2144,39 @@ def test_load_server_arguments_preserves_runner_compatibility_fields(tmp_path):
     assert config["train"]["moe_grad_reduce_mode"] == "bf16_a2a_fp32_sum"
     assert config["train"]["optimizer_kwargs"]["muon_distributed_mode"] == "full_gradient"
     assert config["lora"]["lora_export_format"] == "sglang_shared_outer"
+
+
+def test_load_server_arguments_threads_sparse_mla_into_model_config(tmp_path):
+    config_path = tmp_path / "server_config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model_path": "zai-org/GLM-5",
+                "sparse_mla_enabled": True,
+                "sparse_mla_backend": "flashmla",
+                "output_dir": str(tmp_path / "outputs"),
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    fake_qarl = types.ModuleType("xorl.qarl")
+    fake_qarl.normalize_qarl_quant_cfg = lambda value: value
+    fake_qarl.qarl_unsupported_scope_reason = lambda **_kwargs: None
+    fake_packing = types.ModuleType("xorl.server.orchestrator.packing")
+    fake_packing.ON_OVERSIZED_MODES = {"error", "skip", "truncate"}
+    fake_packing.PACKING_STRATEGIES = {"sequential", "best_fit", "balanced_dp"}
+    with patch.dict(
+        sys.modules,
+        {"xorl.qarl": fake_qarl, "xorl.server.orchestrator.packing": fake_packing},
+    ):
+        args = load_server_arguments(str(config_path))
+    model_config = args.to_config_dict()["model"]
+
+    assert args.sparse_mla_enabled is True
+    assert args.sparse_mla_backend == "flashmla"
+    assert model_config["sparse_mla_enabled"] is True
+    assert model_config["sparse_mla_backend"] == "flashmla"
 
 
 def test_load_server_arguments_threads_moe_routing_weights_before_down(tmp_path):

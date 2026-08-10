@@ -7,8 +7,41 @@ Follows the same pattern as ``layers.attention.backend.ATTENTION_FUNCTIONS``.
 
 from typing import Callable, Dict
 
+import torch
+
+from xorl.distributed.gradient_reduction import GradientReductionDomain
+from xorl.lora.expert_adapter_contract import (
+    ExpertAdapterBackendContract,
+    ZeroTokenGradientBehavior,
+)
+
 
 MOE_EXPERT_BACKENDS: Dict[str, Callable] = {}
+
+
+class _ZeroTokenLoRAOutput(torch.autograd.Function):
+    """Keep empty expert compute connected to every active local LoRA factor."""
+
+    @staticmethod
+    def forward(ctx, permute_tokens, output_width, *lora_factors):
+        ctx.save_for_backward(permute_tokens, *lora_factors)
+        return permute_tokens.new_empty((0, int(output_width)))
+
+    @staticmethod
+    def backward(ctx, _grad_output):
+        permute_tokens, *lora_factors = ctx.saved_tensors
+        return torch.zeros_like(permute_tokens), None, *(torch.zeros_like(value) for value in lora_factors)
+
+
+def zero_token_lora_output(
+    permute_tokens: torch.Tensor,
+    output_width: int,
+    *lora_factors: torch.Tensor,
+) -> torch.Tensor:
+    """Return an empty output whose backward materializes structural zero gradients."""
+
+    return _ZeroTokenLoRAOutput.apply(permute_tokens, output_width, *lora_factors)
+
 
 # Eager is always available (no kernel deps)
 from .eager import eager_ep_compute, eager_ep_compute_lora, eager_expert_forward
@@ -323,7 +356,11 @@ except ImportError:
     pass
 
 # DeepEP dispatch (optional — requires deep_ep package)
+DEEPEP_AVAILABLE = False
 try:
+    from xorl.distributed.moe.deepep import (
+        DEEPEP_AVAILABLE,
+    )
     from xorl.distributed.moe.deepep import (
         token_pre_dispatch as deepep_pre_dispatch,
     )
@@ -331,8 +368,9 @@ try:
         tokens_post_combine as deepep_post_combine,
     )
 
-    EP_DISPATCH["deepep"] = deepep_pre_dispatch
-    EP_COMBINE["deepep"] = deepep_post_combine
+    if DEEPEP_AVAILABLE:
+        EP_DISPATCH["deepep"] = deepep_pre_dispatch
+        EP_COMBINE["deepep"] = deepep_post_combine
 except ImportError:
     pass
 
@@ -407,6 +445,54 @@ except ImportError:
     pass
 
 
+# Explicit contract for replicated hybrid-LoRA factors. Every backend returns
+# local shared-factor gradients. The adapter optimizer performs the single
+# canonical coalesced EP sum after all streamed backward calls have accumulated.
+EP_SHARED_GRADIENT_REDUCTION = {
+    "eager": GradientReductionDomain.EP_SUM,
+    "native": GradientReductionDomain.EP_SUM,
+    "triton": GradientReductionDomain.EP_SUM,
+    "triton_w4a4": GradientReductionDomain.EP_SUM,
+    "quack": GradientReductionDomain.EP_SUM,
+}
+
+
+def ep_lora_gradient_reduction_domain(moe_implementation: str) -> GradientReductionDomain:
+    """Return the registered replicated-gradient contract for an EP backend."""
+
+    try:
+        return EP_SHARED_GRADIENT_REDUCTION[moe_implementation]
+    except KeyError as exc:
+        supported = ", ".join(sorted(EP_SHARED_GRADIENT_REDUCTION))
+        raise ValueError(
+            f"Unsupported MoE backend {moe_implementation!r} for hybrid shared LoRA; "
+            f"register its gradient reduction contract first (supported: {supported})"
+        ) from exc
+
+
+def expert_adapter_backend_contract(moe_implementation: str) -> ExpertAdapterBackendContract:
+    """Return the live LoRA execution capabilities of one registered backend.
+
+    This is deliberately derived from the actual local/EP registries.  Merely
+    naming a known backend is insufficient: if its optional implementation did
+    not import, ownership compilation fails before training starts.
+    """
+
+    reduction = ep_lora_gradient_reduction_domain(moe_implementation)
+    supports_local = moe_implementation == "eager" or moe_implementation in MOE_EXPERT_BACKENDS_LORA
+    supports_ep = moe_implementation in EP_EXPERT_COMPUTE_LORA
+    dispatch_methods = tuple(sorted(set(EP_DISPATCH) & set(EP_COMBINE))) if supports_ep else ()
+    return ExpertAdapterBackendContract(
+        name=moe_implementation,
+        producer_family="module_managed" if moe_implementation == "eager" else "fused_managed",
+        supports_local=supports_local,
+        supports_ep=supports_ep,
+        supported_dispatch_methods=dispatch_methods,
+        gradient_reduction_domain=reduction,
+        zero_token_gradient_behavior=ZeroTokenGradientBehavior.STRUCTURAL_ZERO,
+    )
+
+
 __all__ = [
     "MOE_EXPERT_BACKENDS",
     "EP_EXPERT_COMPUTE",
@@ -415,4 +501,10 @@ __all__ = [
     "EP_COMBINE",
     "EP_EXPERT_COMPUTE_LORA",
     "MOE_EXPERT_BACKENDS_LORA",
+    "zero_token_lora_output",
+    "EP_SHARED_GRADIENT_REDUCTION",
+    "GradientReductionDomain",
+    "ep_lora_gradient_reduction_domain",
+    "expert_adapter_backend_contract",
+    "DEEPEP_AVAILABLE",
 ]

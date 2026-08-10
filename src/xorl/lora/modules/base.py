@@ -40,6 +40,7 @@ class LoraModule:
     r: int
     lora_alpha: int
     scaling: float
+    exact_merged_forward: bool = False
 
     @classmethod
     @abstractmethod

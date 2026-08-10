@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-# The K3 GDN trainer contract, vendored from the serving implementation.
+from contextlib import contextmanager
+from contextvars import ContextVar
+
+# The K3 GDN trainer contract (P5), vendored from xorl-sglang.
 #
-# Under XORL_BI_GDN=1 the two remaining GDN cross-engine terms that live on the
-# trainer side are contracted by running serving's exact kernels with real
+# The exact Qwen3.5-family model path contracts the two remaining GDN
+# cross-engine terms by running serving's exact kernels with real
 # gradients (closed-form backward — gradients do not enter the forward K3):
 #
 #   - gating: the trainer's torch-composed
@@ -18,23 +21,37 @@ from __future__ import annotations
 #     (per-row numerics are invariant to ROWS_PER_BLOCK, which only tiles
 #     rows; serving pins 4 under piecewise cuda graphs and so do we).
 #
-# Kernel bodies are byte-identical to xorl-sglang @ the PR base
-# (python/sglang/srt/layers/attention/fla/{fused_gdn_gating,layernorm_gated}.py);
-# only imports/drivers are adapted. The companion serving-side flag is
-# SGLANG_BI_GDN_PREFILL (scan composition adoption); enable both for the
-# Qwen3.5 GDN parity lane, alongside XORL_BI_TRUNK_LINEAR for the trunk.
+# Kernel bodies follow the same numerical program as the serving kernels;
+# only imports/drivers are adapted. Model setup engages this module directly,
+# so there is no per-feature environment switch to coordinate.
 #
 # Portions adapted from flash-linear-attention (Tri Dao layernorm_gated),
 # MIT/BSD licenses per upstream.
-import os
-
 import torch
 import triton
 import triton.language as tl
 
 
-def is_gdn_contract_enabled() -> bool:
-    return os.environ.get("XORL_BI_GDN", "").lower() in {"1", "true", "yes", "on"}
+_GDN_CONTRACT_ENABLED: ContextVar[bool] = ContextVar("xorl_gdn_contract_enabled", default=False)
+
+
+@contextmanager
+def gdn_contract(enabled: bool):
+    """Scope Qwen3.5 GDN arithmetic to one module invocation.
+
+    Checkpoint recomputation re-enters the owning ``GatedDeltaNet`` module and
+    therefore re-establishes the same value. Separate model instances cannot
+    change one another's numerical program.
+    """
+    token = _GDN_CONTRACT_ENABLED.set(enabled)
+    try:
+        yield
+    finally:
+        _GDN_CONTRACT_ENABLED.reset(token)
+
+
+def _is_gdn_contract_enabled() -> bool:
+    return _GDN_CONTRACT_ENABLED.get()
 
 
 # --- vendored from sglang fla/fused_gdn_gating.py -----------------------------
@@ -68,8 +85,11 @@ def fused_gdn_gating_kernel(
     softplus_x = tl.where(beta * x <= threshold, (1 / beta) * tl.log(1 + tl.exp(beta * x)), x)
     blk_g = -tl.exp(blk_A_log.to(tl.float32)) * softplus_x
     tl.store(g + off, blk_g.to(g.dtype.element_ty), mask=mask)
+    # P5 fp32-beta convention (paired with serving's fused_gdn_gating):
+    # beta stays fp32; the old bf16 round disagreed with decode's in-kernel
+    # fp32 gating on every token.
     blk_beta_output = tl.sigmoid(blk_b.to(tl.float32))
-    tl.store(beta_output + off, blk_beta_output.to(b.dtype.element_ty), mask=mask)
+    tl.store(beta_output + off, blk_beta_output.to(beta_output.dtype.element_ty), mask=mask)
 
 
 def _fused_gdn_gating_fwd(
@@ -112,9 +132,9 @@ class _BIFusedGDNGating(torch.autograd.Function):
 
     Forward bits match serving's ``fused_gdn_gating``:
     ``g = -exp(A_log) * softplus(a + dt_bias)`` (fp32),
-    ``beta = fp32(bf16(sigmoid(b)))`` (the kernel stores sigmoid through the
-    input dtype). Backward uses the analytic derivatives of the reference
-    composition; the bf16 rounding on beta is straight-through.
+    ``beta = sigmoid(b)`` (fp32 — the fp32-beta convention, paired with the
+    serving-side change). Backward uses the analytic derivatives of the
+    reference composition.
     """
 
     @staticmethod

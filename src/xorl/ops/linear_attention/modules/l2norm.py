@@ -11,6 +11,11 @@ from xorl.ops.linear_attention.utils import IS_AMD, autotune_cache_kwargs, input
 BT_LIST = [8, 16, 32, 64, 128]
 NUM_WARPS_AUTOTUNE = [1, 2, 4, 8, 16] if IS_AMD else [1, 2, 4, 8, 16, 32]
 
+# The GDN q/k normalization reduction is bit-relevant. SGLang's Qwen3.5
+# contract uses BT16/w8/stages3; independent autotuning can select another
+# reduction tree and move a handful of bf16 elements by one ULP.
+_L2NORM_FWD_CONFIGS = [triton.Config({"BT": 16}, num_warps=8, num_stages=3)]
+
 
 @triton.autotune(
     configs=[triton.Config({}, num_warps=num_warps) for num_warps in NUM_WARPS_AUTOTUNE],
@@ -70,7 +75,7 @@ def l2norm_bwd_kernel1(
 
 
 @triton.autotune(
-    configs=[triton.Config({"BT": BT}, num_warps=num_warps) for num_warps in [1, 2, 4, 8, 16] for BT in BT_LIST],
+    configs=_L2NORM_FWD_CONFIGS,
     key=["D", "NB"],
     **autotune_cache_kwargs,
 )

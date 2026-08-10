@@ -11,7 +11,7 @@ import pytest
 import torch
 import triton
 
-from xorl.ops import bi_gemm_configs
+from xorl.ops import batch_invariant_ops
 from xorl.ops.batch_invariant_ops import (
     _deepgemm_ready,
     _matmul_persistent_deepgemm,
@@ -32,6 +32,19 @@ SHAPES = [
     (4096, 3840, 11520),
     (3072, 3840, 8192),  # BI lm-head chunk shape (fp32-out in production)
 ]
+
+
+@pytest.mark.cpu
+def test_ambient_legacy_envs_cannot_change_the_production_program(monkeypatch):
+    monkeypatch.setenv("XORL_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM", "0")
+    monkeypatch.setenv("SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT", "1")
+    monkeypatch.setenv("SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_COMPARISON_TEST", "1")
+    monkeypatch.setenv("XORL_BI_GEMM_CONFIG_TABLE", "0")
+
+    assert batch_invariant_ops._ENABLE_MM_DEEPGEMM is True
+    assert not hasattr(batch_invariant_ops, "_ENABLE_MM_FALLBACK_VARIANT")
+    assert not hasattr(batch_invariant_ops, "_ENABLE_MM_COMPARISON_TEST")
+    assert lookup_mm_config(torch.bfloat16, 1, 3840, 3840) != dict(BASELINE_CONFIG["torch.bfloat16"], BLOCK_SIZE_K=64)
 
 
 def _launch(a, b, cfg, out_dtype=None):
@@ -97,7 +110,7 @@ def test_table_config_bitwise_equals_baseline(dtype, shape):
     # launcher — table config with OutOfResources->baseline fallback — and
     # assert bit-neutrality down to raw accumulator bits
     if dtype == torch.bfloat16:
-        from triton.runtime.errors import OutOfResources
+        from triton.runtime.errors import OutOfResources  # noqa: PLC0415
 
         cfg32 = lookup_mm_config(dtype, M, N, K, out_itemsize=4)
         try:
@@ -135,11 +148,3 @@ def test_deepgemm_bitwise_equals_triton():
         out_dg = _matmul_persistent_deepgemm(a, b)
         assert out_dg is not None
         assert torch.equal(out_dg, _launch(a, b, base)), f"deep_gemm bits differ at {(M, K, N)}"
-
-
-@requires_cuda
-@pytest.mark.gpu
-def test_kill_switch_returns_baseline(monkeypatch):
-    monkeypatch.setattr(bi_gemm_configs, "_TABLE_ENABLED", False)
-    cfg = lookup_mm_config(torch.bfloat16, 1, 3840, 3840)
-    assert cfg == dict(BASELINE_CONFIG["torch.bfloat16"], BLOCK_SIZE_K=64)

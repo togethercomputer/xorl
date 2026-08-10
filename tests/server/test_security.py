@@ -89,6 +89,20 @@ def test_server_artifact_path_is_confined_to_configured_root(tmp_path, monkeypat
         resolve_server_artifact(tmp_path / "outside")
 
 
+def test_explicit_server_artifact_root_is_authoritative(tmp_path, monkeypatch):
+    output_dir = tmp_path / "server-output"
+    output_dir.mkdir()
+    checkpoint = output_dir / "weights" / "adapter"
+    checkpoint.mkdir(parents=True)
+    environment_root = tmp_path / "environment-root"
+    environment_root.mkdir()
+    monkeypatch.setenv("XORL_SERVER_ARTIFACT_ROOT", str(environment_root))
+
+    assert resolve_server_artifact(checkpoint, must_exist=True, root=output_dir) == checkpoint
+    with pytest.raises(ValueError, match="escapes configured root"):
+        resolve_server_artifact(environment_root, root=output_dir)
+
+
 def test_diagnostic_input_requires_configured_root_and_regular_private_file(tmp_path, monkeypatch):
     root = tmp_path / "diagnostics"
     root.mkdir()

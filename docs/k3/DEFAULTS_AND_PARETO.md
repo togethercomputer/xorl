@@ -1,50 +1,59 @@
 # Numerical-contract selection
 
-The generic XoRL defaults support many model and topology combinations; they do
-not promise exact trainer/sampler parity everywhere. Exact lanes opt into a
-complete, paired numerical program and fail on unsupported combinations.
+Generic XoRL defaults support many models and topologies; they do not promise
+exact trainer/sampler parity everywhere. For the model families below, server
+training selects one architecture-aware numerical program before module
+construction and rejects incompatible overrides.
 
-## Generic contract surfaces
+## Architecture-selected programs
 
-| Surface | Trainer selection | Required paired behavior |
+| Model lane | Admitted trainer topology | Contract ownership |
 |---|---|---|
-| Attention | `attn_implementation` | Same backend family and KV split schedule |
-| RMSNorm | `rmsnorm_mode: sglang_fused` | Same canonical BF16 row and RMSNorm-v2 tree |
-| RoPE | `rope_native: true` | Same table construction and rotary application arithmetic |
-| Dense projections | `XORL_BI_TRUNK_LINEAR=1` | Paired batch-invariant GEMM contract |
-| LM head | `lm_head_fp32: true`, `ce_mode: bi_fused` | Paired projection and vocabulary-normalization trees |
-| Router | `router_fp32: true`, `XORL_MOE_BI_ROUTER=1` | Paired gate GEMM, selection, and renormalization |
-| Experts | `XORL_MOE_SGLANG_FUSED_EXPERTS=1` where supported | Same expert forward; trainer-owned backward |
-| Single-adapter LoRA | `XORL_LORA_MERGED_FORWARD=1` | Canonical folded weight used by trainer and sampler |
+| Qwen3.5 dense | single rank | model resolver selects GDN, RoPE, RMSNorm, trunk, and head arithmetic |
+| Qwen3.6-35B-A3B | WORLD8/DP8/EP8 or WORLD16/DP16/EP8 | model resolver additionally selects router, expert forward, and ordered EP combine |
+| GLM-5.2 native FP8 | WORLD16/PP1/TP1/DP1/EP16/CP16 | model resolver selects sparse MLA, native-FP8 projections, routed/shared experts, head, and distributed combine |
 
-These are lower-level contract mechanisms, not a mix-and-match recipe for an
-arbitrary model. A model-specific resolver may select them as one unit.
+On the paired serving engine, `--rl-on-policy-target xorl` selects the matching
+architecture program. Component environment variables are diagnostic surfaces,
+not launch instructions for these lanes.
 
-## Supported generic lane
+The selected program owns all bit-relevant choices together:
 
-The generic dense lane requires BF16 TP1 projection and head execution, a plain
-LM head, a paired SGLang build, and matching attention, RoPE, RMSNorm, GEMM, and
-LM-head implementations. Tensor-sharded heads, speculative decoding, sampling
-transforms the trainer does not replay, and silent kernel fallback are outside
-this envelope.
+- RoPE table construction and Class-B rotary application;
+- RMSNorm-v2 row formation, reduction, reciprocal, and affine rounding;
+- dense GEMM K-axis accumulation;
+- attention/GDN backend and state handling;
+- router arithmetic and selected-expert ordering;
+- expert projection, activation, routing-weight, and local-combine arithmetic;
+- distributed expert combine; and
+- LM-head projection and vocabulary normalization.
 
-The generic MoE overlay additionally requires paired router arithmetic and a
-serving-layout expert forward. Expert dispatch and distributed combine are
-separate contracts; enabling the expert kernel alone does not qualify an EP
-topology.
+## LoRA programs
 
-The generic folded-LoRA lane is single-adapter only. Multi-adapter dynamic
-serving uses a different forward program and requires its own contract.
+Qwen's exact single-adapter program uses a canonical folded weight for its
+trainer forward and synchronized sampler weight. GLM-5.2 instead keeps the
+native-FP8 base frozen and executes active rank-1 LoRA through the same SGLang
+forward kernels in trainer and sampler, with trainer-owned autograd.
+
+These are separate admitted programs. Dynamic multi-adapter serving and
+arbitrary ranks, scales, or target sets do not inherit either contract.
+
+## Generic mechanisms
+
+The lower-level attention, RMSNorm, GEMM, head, expert, and fold mechanisms in
+this directory remain useful for other models, but a new combination must earn
+its own topology and end-to-end qualification. Do not assemble a model launch
+by copying individual environment flags from historical campaigns.
 
 ## Qualification
 
-Before treating a configuration as exact:
+For each trainer/sampler revision pair:
 
-1. assert that every selected contract engaged;
+1. assert the resolved model program and every fail-closed topology check;
 2. generate tokens and retain the sampler's decision-time FP32 log-probability
    bytes;
-3. replay the same token IDs through the trainer; and
+3. replay the same token IDs through the full trainer; and
 4. require byte equality for every retained token and K3 exactly zero.
 
-Performance measurements are meaningful only after this correctness gate and
-belong with the benchmark run that produced them, not in this source document.
+Performance results and cluster-specific launch records belong with the run
+that produced them, not in this source contract.

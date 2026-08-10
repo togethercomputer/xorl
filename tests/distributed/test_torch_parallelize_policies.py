@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from torch import nn
 
 from xorl.distributed.torch_parallelize import (
     _coerce_optional_bool_config,
@@ -9,7 +10,11 @@ from xorl.distributed.torch_parallelize import (
     _expert_mixed_precision_policy,
     _resolve_fsdp_reduce_dtype,
     _sequence_parallel_fully_folded_into_fsdp,
+    _topmost_modules_matching,
 )
+from xorl.models.transformers.glm5.exact_qlora import Glm52ExactTP1BlockFP8QLoRALinear
+from xorl.models.transformers.glm5.exact_shared_expert_qlora import Glm52ExactTP16SharedExpertBlockFP8QLoRA
+from xorl.ops.block_fp8_native import NativeBlockFP8Linear
 
 
 class _FakeBlock:
@@ -28,6 +33,40 @@ class _FakeBlock:
 
 def _fake_blocks():
     return [_FakeBlock("block0"), _FakeBlock("block1"), _FakeBlock("block2")]
+
+
+def test_mixed_precision_ignored_selection_stops_at_topmost_matching_unit() -> None:
+    class _Protected(nn.Module):
+        pass
+
+    root = nn.Module()
+    root.composite = _Protected()
+    root.composite.nested = _Protected()
+    root.ordinary = nn.Module()
+    root.ordinary.protected = _Protected()
+
+    selected = _topmost_modules_matching(root, (_Protected,))
+
+    assert selected == [root.composite, root.ordinary.protected]
+
+
+def test_exact_shared_expert_is_one_topmost_full_precision_fsdp_unit() -> None:
+    root = nn.Module()
+    root.shared = Glm52ExactTP16SharedExpertBlockFP8QLoRA(device="meta")
+
+    selected = _topmost_modules_matching(
+        root,
+        (
+            NativeBlockFP8Linear,
+            Glm52ExactTP1BlockFP8QLoRALinear,
+            Glm52ExactTP16SharedExpertBlockFP8QLoRA,
+        ),
+    )
+
+    assert selected == [root.shared]
+    assert all(
+        projection not in selected for projection in (root.shared.gate_proj, root.shared.up_proj, root.shared.down_proj)
+    )
 
 
 def test_singleton_expert_mp_policy_uses_bf16_reduce_dtype() -> None:

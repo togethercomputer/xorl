@@ -1,5 +1,6 @@
 import json
 import types
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Union
 
@@ -16,8 +17,10 @@ from transformers import (
 from ..distributed.parallel_state import get_parallel_state
 from ..ops.moe.triton import resolve_routing_weights_before_down, set_routing_weights_before_down
 from ..utils import logging
+from .exact_contract import glm52_exact_active_lora_enabled, glm52_exact_forward_enabled, set_glm52_exact_active_lora
 from .layers.attention import get_attention_fn
 from .layers.normalization import set_rmsnorm_mode
+from .layers.rope import set_rope_class_b, set_rope_native
 from .loader import ModelLoader, get_loader
 from .transformers.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 from .transformers.deepseek_v3.support import validate_deepseek_v3_router_settings
@@ -211,12 +214,373 @@ def _load_config_with_rank0_priority(
     return config
 
 
+def _is_canonical_glm52(config: PretrainedConfig) -> bool:
+    if not (isinstance(config, Glm5Config) and getattr(config, "indexer_types", None) is not None):
+        return False
+    _validate_canonical_glm52_model_scope(config)
+    return True
+
+
+def _is_exact_glm52(config: PretrainedConfig) -> bool:
+    return glm52_exact_forward_enabled(config)
+
+
+def _validate_canonical_glm52_model_scope(config: PretrainedConfig) -> None:
+    if not (isinstance(config, Glm5Config) and getattr(config, "indexer_types", None) is not None):
+        return
+    expected = {
+        "vocab_size": 154880,
+        "hidden_size": 6144,
+        "num_hidden_layers": 78,
+        "first_k_dense_replace": 3,
+        "n_routed_experts": 256,
+        "num_experts_per_tok": 8,
+        "index_topk": 2048,
+        "index_topk_freq": 4,
+    }
+    mismatches = [
+        f"{name}={getattr(config, name, None)!r} (requires {value!r})"
+        for name, value in expected.items()
+        if getattr(config, name, None) != value
+    ]
+    indexer_types = tuple(config.indexer_types)
+    expected_indexer_types = tuple(
+        "full" if layer_idx < 3 or (layer_idx - 2) % 4 == 0 else "shared" for layer_idx in range(78)
+    )
+    if indexer_types != expected_indexer_types:
+        mismatches.append("indexer_types does not match the official 78-layer selector schedule")
+    mlp_layer_types = getattr(config, "mlp_layer_types", None)
+    expected_mlp_types = ("dense",) * 3 + ("sparse",) * 75
+    if mlp_layer_types is None or tuple(mlp_layer_types) != expected_mlp_types:
+        mismatches.append("mlp_layer_types does not match 3 dense + 75 sparse blocks")
+    if mismatches:
+        raise ValueError(
+            "The exact GLM-5.2 program supports only the official model geometry: " + ", ".join(mismatches)
+        )
+
+
+def _is_exact_qwen35(config: PretrainedConfig) -> bool:
+    return bool(getattr(config, "_qwen35_exact_contract", False))
+
+
+def _is_qwen35_moe(config: PretrainedConfig) -> bool:
+    return getattr(config, "model_type", None) in {
+        "xorl_qwen3_5_moe",
+        "qwen3_5_moe",
+        "qwen3_5_moe_text",
+    }
+
+
+def _validate_exact_qwen35_model_scope(config: PretrainedConfig) -> None:
+    if not _is_exact_qwen35(config):
+        return
+    # Hugging Face multimodal checkpoints expose the language-model geometry
+    # under ``text_config``.  The normal XORL path converts that section to a
+    # local config before reaching this validator, but callers may also pass an
+    # AutoConfig instance directly to ``build_foundation_model``.
+    scope_config = getattr(config, "text_config", config)
+    if _is_qwen35_moe(config):
+        expected = {
+            "vocab_size": 248320,
+            "hidden_size": 2048,
+            "num_hidden_layers": 40,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 2,
+            "num_experts": 256,
+            "num_experts_per_tok": 8,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 32,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128,
+            "linear_conv_kernel_dim": 4,
+            "full_attention_interval": 4,
+        }
+        model_name = "Qwen3.6-35B-A3B"
+    else:
+        expected = {
+            "vocab_size": 248320,
+            "hidden_size": 1024,
+            "num_hidden_layers": 24,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 2,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 16,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128,
+            "linear_conv_kernel_dim": 4,
+            "full_attention_interval": 4,
+        }
+        model_name = "Qwen3.5-0.8B"
+    mismatches = [
+        f"{name}={getattr(scope_config, name, None)!r} (requires {value!r})"
+        for name, value in expected.items()
+        if getattr(scope_config, name, None) != value
+    ]
+    expected_layer_types = tuple(
+        "full_attention" if (layer_idx + 1) % 4 == 0 else "linear_attention"
+        for layer_idx in range(expected["num_hidden_layers"])
+    )
+    # ``full_attention_interval`` uniquely defines this schedule.  Some HF
+    # config representations materialize ``layer_types`` while others retain
+    # only the interval, so validate the derived list when it is present rather
+    # than rejecting an otherwise identical checkpoint representation.
+    layer_types = getattr(scope_config, "layer_types", None)
+    if layer_types is not None and tuple(layer_types) != expected_layer_types:
+        mismatches.append("layer_types does not match the certified full-attention interval")
+    if mismatches:
+        raise ValueError(
+            f"The exact Qwen3.5-family server-training program is certified only for {model_name}: "
+            + ", ".join(mismatches)
+        )
+
+
+def _validate_exact_qwen35_moe_program(
+    config: PretrainedConfig,
+    *,
+    moe_implementation: Optional[str],
+    ep_dispatch: str,
+    deepep_async_combine: bool,
+) -> None:
+    if not (_is_exact_qwen35(config) and _is_qwen35_moe(config)):
+        return
+    incompatible = []
+    if moe_implementation not in (None, "triton"):
+        incompatible.append(f"moe_implementation={moe_implementation!r} (requires 'triton')")
+    if ep_dispatch != "alltoall":
+        incompatible.append(f"ep_dispatch={ep_dispatch!r} (requires 'alltoall')")
+    if deepep_async_combine:
+        incompatible.append("deepep_async_combine=True (requires False)")
+    if incompatible:
+        raise ValueError(
+            "Exact Qwen3.5-MoE server training rejects incompatible MoE overrides: " + ", ".join(incompatible)
+        )
+
+
+def _validate_exact_qwen35_topology(config: PretrainedConfig, parallel_state: Any) -> None:
+    if not _is_exact_qwen35(config):
+        return
+    topology = (
+        parallel_state.world_size,
+        parallel_state.dp_size,
+        parallel_state.dp_replicate_size,
+        parallel_state.dp_shard_size,
+        parallel_state.tp_size,
+        parallel_state.pp_size,
+        parallel_state.ep_size,
+        parallel_state.cp_size,
+        parallel_state.ringattn_size,
+        parallel_state.ulysses_size,
+    )
+    admitted = (
+        (
+            (8, 8, 1, 8, 1, 1, 8, 1, 1, 1),
+            (16, 16, 2, 8, 1, 1, 8, 1, 1, 1),
+        )
+        if _is_qwen35_moe(config)
+        else ((1, 1, 1, 1, 1, 1, 1, 1, 1, 1),)
+    )
+    if topology not in admitted:
+        raise ValueError(
+            "The Qwen3.5-family exact server-training path is admitted only for "
+            "WORLD/DP/DP-replicate/DP-shard/TP/PP/EP/CP/Ring/Ulysses="
+            f"{admitted}; got {topology}"
+        )
+
+
+@dataclass(frozen=True)
+class ResolvedModelNumericalProgram:
+    """Bit-relevant model choices resolved before module construction."""
+
+    attn_implementation: str
+    router_fp32: bool
+    lm_head_fp32: bool
+    rmsnorm_mode: str
+    qwen35_rmsnorm_family: Optional[str]
+    activation_native: bool
+    rope_native: bool
+    rope_class_b: bool
+    attention_cast_bf16: bool
+    sparse_mla_enabled: bool
+    sparse_mla_backend: str
+
+
+def _resolve_rope_modes(
+    config: PretrainedConfig,
+    *,
+    rope_native: Optional[bool],
+    rope_class_b: Optional[bool],
+) -> tuple[bool, bool]:
+    if _is_exact_glm52(config):
+        if rope_native is False or rope_class_b is False:
+            raise ValueError(
+                "Canonical GLM-5.2 requires native Class-B RoPE; explicit rope_native=false "
+                "or rope_class_b=false is incompatible with the model's numerical contract"
+            )
+        return True, True
+
+    if _is_exact_qwen35(config):
+        if rope_native is False or rope_class_b is False:
+            raise ValueError(
+                "Exact Qwen3.5-family server training requires native Class-B RoPE; "
+                "explicit rope_native=false or rope_class_b=false is incompatible "
+                "with the model's numerical contract"
+            )
+        return True, True
+
+    effective_rope_native = bool(rope_native)
+    effective_rope_class_b = bool(rope_class_b)
+    if effective_rope_class_b and not effective_rope_native:
+        raise ValueError(
+            "rope_class_b=True requires rope_native=True: the Class-B contract uses "
+            "the CPU-built serving-layout cos/sin cache selected by rope_native"
+        )
+    return effective_rope_native, effective_rope_class_b
+
+
+def resolve_model_numerical_program(
+    config: PretrainedConfig,
+    *,
+    attn_implementation: Optional[str],
+    non_glm_attn_default: str,
+    router_fp32: Optional[bool],
+    lm_head_fp32: Optional[bool],
+    rmsnorm_mode: Optional[str],
+    activation_native: bool,
+    rope_native: Optional[bool],
+    rope_class_b: Optional[bool],
+    attention_cast_bf16: bool,
+    sparse_mla_enabled: Optional[bool],
+    sparse_mla_backend: Optional[str],
+    qwen35_rmsnorm_family: Optional[str] = None,
+) -> ResolvedModelNumericalProgram:
+    """Resolve exact model numerics while preserving non-GLM defaults.
+
+    Canonical GLM-5.2 is a numerical program, not a collection of optional
+    optimizations. Omitted values select that program and incompatible
+    explicit values fail before weights are loaded.
+    """
+
+    effective_rope_native, effective_rope_class_b = _resolve_rope_modes(
+        config,
+        rope_native=rope_native,
+        rope_class_b=rope_class_b,
+    )
+    if qwen35_rmsnorm_family not in (None, "v1", "v2"):
+        raise ValueError(f"qwen35_rmsnorm_family must be one of None, 'v1', or 'v2'; got {qwen35_rmsnorm_family!r}")
+    if _is_exact_qwen35(config):
+        requirements = {
+            "attn_implementation": (attn_implementation, "flash_attention_4"),
+            "router_fp32": (router_fp32, True),
+            "lm_head_fp32": (lm_head_fp32, True),
+            "rmsnorm_mode": (rmsnorm_mode, "sglang_fused"),
+        }
+        incompatible = [
+            f"{name}={requested!r} (requires {required!r})"
+            for name, (requested, required) in requirements.items()
+            if requested is not None and requested != required
+        ]
+        if qwen35_rmsnorm_family not in (None, "v2"):
+            incompatible.append(f"qwen35_rmsnorm_family={qwen35_rmsnorm_family!r} (requires 'v2')")
+        if incompatible:
+            raise ValueError(
+                "Exact Qwen3.5-family server training rejects incompatible numerical overrides: "
+                + ", ".join(incompatible)
+            )
+        return ResolvedModelNumericalProgram(
+            attn_implementation="flash_attention_4",
+            router_fp32=True,
+            lm_head_fp32=True,
+            rmsnorm_mode="sglang_fused",
+            qwen35_rmsnorm_family="v2",
+            activation_native=True,
+            rope_native=True,
+            rope_class_b=effective_rope_class_b,
+            attention_cast_bf16=True,
+            sparse_mla_enabled=False,
+            sparse_mla_backend="auto",
+        )
+
+    if not _is_exact_glm52(config):
+        if qwen35_rmsnorm_family is not None:
+            raise ValueError(
+                "qwen35_rmsnorm_family is supported only by exact Qwen3.5/3.6 server training; "
+                f"got model_type={getattr(config, 'model_type', None)!r}."
+            )
+        return ResolvedModelNumericalProgram(
+            attn_implementation=attn_implementation or non_glm_attn_default,
+            router_fp32=True if router_fp32 is None else router_fp32,
+            lm_head_fp32=True if lm_head_fp32 is None else lm_head_fp32,
+            rmsnorm_mode=rmsnorm_mode or "native",
+            qwen35_rmsnorm_family=None,
+            activation_native=activation_native,
+            rope_native=effective_rope_native,
+            rope_class_b=effective_rope_class_b,
+            attention_cast_bf16=attention_cast_bf16,
+            sparse_mla_enabled=False if sparse_mla_enabled is None else sparse_mla_enabled,
+            sparse_mla_backend=sparse_mla_backend or "auto",
+        )
+
+    requirements = {
+        "attn_implementation": (attn_implementation, "flash_attention_4"),
+        "router_fp32": (router_fp32, True),
+        "lm_head_fp32": (lm_head_fp32, True),
+        "rmsnorm_mode": (rmsnorm_mode, "sglang_fused"),
+        "activation_native": (activation_native, False),
+        "attention_cast_bf16": (attention_cast_bf16, False),
+        "sparse_mla_enabled": (sparse_mla_enabled, True),
+    }
+    incompatible = [
+        f"{name}={requested!r} (requires {required!r})"
+        for name, (requested, required) in requirements.items()
+        if requested is not None and requested != required
+    ]
+    if qwen35_rmsnorm_family is not None:
+        incompatible.append(f"qwen35_rmsnorm_family={qwen35_rmsnorm_family!r} (supported only by exact Qwen3.5/3.6)")
+    if sparse_mla_backend not in (None, "auto", "flashmla"):
+        incompatible.append(f"sparse_mla_backend={sparse_mla_backend!r} (requires 'flashmla')")
+    if incompatible:
+        raise ValueError(
+            "Canonical GLM-5.2 exact forward rejects incompatible numerical overrides: " + ", ".join(incompatible)
+        )
+
+    return ResolvedModelNumericalProgram(
+        attn_implementation="flash_attention_4",
+        router_fp32=True,
+        lm_head_fp32=True,
+        rmsnorm_mode="sglang_fused",
+        qwen35_rmsnorm_family=None,
+        activation_native=False,
+        rope_native=True,
+        rope_class_b=True,
+        attention_cast_bf16=False,
+        sparse_mla_enabled=True,
+        sparse_mla_backend="flashmla",
+    )
+
+
+def resolve_cross_entropy_mode(config: PretrainedConfig, ce_mode: Optional[str]) -> str:
+    """Resolve the loss-side member of the canonical numerical program."""
+
+    if _is_exact_qwen35(config):
+        if ce_mode not in (None, "bi_fused"):
+            raise ValueError(f"Exact Qwen3.5-family server training requires ce_mode='bi_fused'; received {ce_mode!r}")
+        return "bi_fused"
+    if not _is_exact_glm52(config):
+        return ce_mode or "compiled"
+    if ce_mode not in (None, "bi_fused"):
+        raise ValueError(f"Canonical GLM-5.2 exact forward requires ce_mode='bi_fused'; received {ce_mode!r}")
+    return "bi_fused"
+
+
 def build_foundation_model(
     config_path: Union[str, PretrainedConfig],
     weights_path: Optional[str] = None,
     torch_dtype: Literal["float16", "bfloat16", "float32"] = "bfloat16",
     attn_implementation: Optional[
         Literal["eager", "sdpa", "native", "flash_attention_3", "flash_attention_4", "minimax_msa"]
+    ] = None,
+    non_glm_attn_default: Literal[
+        "eager", "sdpa", "native", "flash_attention_3", "flash_attention_4", "minimax_msa"
     ] = "flash_attention_4",
     moe_implementation: Optional[Literal["eager", "triton", "native", "quack"]] = None,
     moe_routing_weights_before_down: Union[bool, str] = "auto",
@@ -227,17 +591,23 @@ def build_foundation_model(
     deepep_num_sms: int = 20,
     deepep_async_combine: bool = False,
     alltoall_combine_hidden_chunk_size: int = 0,
-    router_fp32: bool = True,
-    lm_head_fp32: bool = True,
-    rmsnorm_mode: Literal[
-        "eager", "native", "compile", "sglang", "sglang_fused", "sglang_jit", "sglang_kernel"
-    ] = "native",
+    router_fp32: Optional[bool] = None,
+    lm_head_fp32: Optional[bool] = None,
+    rmsnorm_mode: Optional[
+        Literal["eager", "native", "compile", "sglang", "sglang_fused", "sglang_jit", "sglang_kernel"]
+    ] = None,
+    qwen35_rmsnorm_family: Optional[Literal["v1", "v2"]] = None,
     activation_native: bool = False,
-    rope_native: bool = False,
+    rope_native: Optional[bool] = None,
+    rope_class_b: Optional[bool] = None,
     attention_cast_bf16: bool = False,
-    sparse_mla_enabled: bool = False,
-    sparse_mla_backend: str = "auto",
+    sparse_mla_enabled: Optional[bool] = None,
+    sparse_mla_backend: Optional[str] = None,
     flash_attention_deterministic: bool = False,
+    server_training: bool = False,
+    block_fp8_qlora_training: bool = False,
+    lora_rank: Optional[int] = None,
+    lora_alpha: Optional[int] = None,
     init_device: Literal["cpu", "cuda", "npu", "meta"] = "cuda",
     config_kwargs: Optional[Dict[str, Any]] = None,
 ) -> nn.Module:
@@ -255,6 +625,74 @@ def build_foundation_model(
         config = _load_local_xorl_config(config_path, config_kwargs)
         if config is None:
             config = _load_config_with_rank0_priority(config_path, config_kwargs)
+
+    glm52_model = _is_canonical_glm52(config)
+    if block_fp8_qlora_training and not glm52_model:
+        raise ValueError("block_fp8_qlora_training is supported only for the official GLM-5.2 model")
+    exact_active_lora = bool(
+        server_training and glm52_model and block_fp8_qlora_training and (lora_rank, lora_alpha) == (1, 1)
+    )
+    config._glm52_block_fp8_qlora = bool(block_fp8_qlora_training)
+    config._glm52_exact_contract = bool(server_training and glm52_model and not block_fp8_qlora_training)
+    set_glm52_exact_active_lora(config, enabled=exact_active_lora)
+    canonical_glm52 = _is_exact_glm52(config)
+    qwen35_model_type = getattr(config, "model_type", None) in {
+        "xorl_qwen3_5",
+        "xorl_qwen3_5_moe",
+        "qwen3_5",
+        "qwen3_5_text",
+        "qwen3_5_moe",
+        "qwen3_5_moe_text",
+    }
+    config._qwen35_exact_contract = bool(server_training and qwen35_model_type)
+    _validate_exact_qwen35_model_scope(config)
+    _validate_exact_qwen35_moe_program(
+        config,
+        moe_implementation=moe_implementation,
+        ep_dispatch=ep_dispatch,
+        deepep_async_combine=deepep_async_combine,
+    )
+    numerical_program = resolve_model_numerical_program(
+        config,
+        attn_implementation=attn_implementation,
+        non_glm_attn_default=non_glm_attn_default,
+        router_fp32=router_fp32,
+        lm_head_fp32=lm_head_fp32,
+        rmsnorm_mode=rmsnorm_mode,
+        qwen35_rmsnorm_family=qwen35_rmsnorm_family,
+        activation_native=activation_native,
+        rope_native=rope_native,
+        rope_class_b=rope_class_b,
+        attention_cast_bf16=attention_cast_bf16,
+        sparse_mla_enabled=sparse_mla_enabled,
+        sparse_mla_backend=sparse_mla_backend,
+    )
+    attn_implementation = numerical_program.attn_implementation
+    router_fp32 = numerical_program.router_fp32
+    lm_head_fp32 = numerical_program.lm_head_fp32
+    rmsnorm_mode = numerical_program.rmsnorm_mode
+    activation_native = numerical_program.activation_native
+    effective_rope_native = numerical_program.rope_native
+    attention_cast_bf16 = numerical_program.attention_cast_bf16
+    sparse_mla_enabled = numerical_program.sparse_mla_enabled
+    sparse_mla_backend = numerical_program.sparse_mla_backend
+    # Exact GLM/Qwen modules carry architecture-scoped RoPE choices on their
+    # config and never consult mutable process-wide selectors. Preserve the
+    # legacy selectors only for non-target models that still use the generic
+    # rotary helper.
+    if not (canonical_glm52 or config._qwen35_exact_contract):
+        set_rope_native(numerical_program.rope_native)
+        set_rope_class_b(numerical_program.rope_class_b)
+    config._rope_native = numerical_program.rope_native
+    config._rope_class_b = numerical_program.rope_class_b
+    config._resolved_numerical_program = asdict(numerical_program)
+    if canonical_glm52:
+        logger.info_rank0(f"Canonical GLM-5.2 numerical program: {numerical_program}")
+    elif config._qwen35_exact_contract:
+        logger.info_rank0(
+            "Exact Qwen3.5-family server-training numerical program "
+            f"(Class-B RoPE, RMSNorm {numerical_program.qwen35_rmsnorm_family}): {numerical_program}"
+        )
 
     if moe_implementation is not None:
         if moe_implementation not in ["eager", "triton", "native", "quack"]:
@@ -291,8 +729,9 @@ def build_foundation_model(
     )
     set_rmsnorm_mode(rmsnorm_mode)
     config._rmsnorm_mode = rmsnorm_mode
+    config._qwen35_rmsnorm_family = numerical_program.qwen35_rmsnorm_family
     config._activation_native = activation_native
-    config._rope_native = rope_native
+    config._rope_native = effective_rope_native
     config._attention_cast_bf16 = attention_cast_bf16
     config._sparse_mla_enabled = sparse_mla_enabled
     config._sparse_mla_backend = sparse_mla_backend
@@ -324,6 +763,49 @@ def build_foundation_model(
         )
 
     ps = get_parallel_state()
+    _validate_exact_qwen35_topology(config, ps)
+    if isinstance(config, Glm5Config) and config.num_hidden_layers == 78:
+        if glm52_exact_active_lora_enabled(config):
+            topology = (
+                ps.world_size,
+                ps.pp_size,
+                ps.tp_size,
+                ps.dp_size,
+                ps.ep_size,
+                ps.cp_size,
+            )
+            certified = (16, 1, 1, 1, 16, 16)
+            lm_head_tp_size = getattr(ps, "lm_head_tp_size", 1)
+            if topology != certified or ps.ringattn_size != 1 or ps.ulysses_size != 16 or lm_head_tp_size != 16:
+                raise ValueError(
+                    "The GLM-5.2 exact active-LoRA path is certified only for "
+                    f"WORLD/PP/TP/DP/EP/CP={certified} with Ring1/Ulysses16/lm-head-TP16; got {topology} "
+                    f"with Ring{ps.ringattn_size}/Ulysses{ps.ulysses_size}/lm-head-TP{lm_head_tp_size}"
+                )
+            config._glm52_pipeline_layer_ranges = ((0, 78),)
+        elif canonical_glm52 and server_training:
+            topology = (
+                ps.world_size,
+                ps.pp_size,
+                ps.tp_size,
+                ps.dp_size,
+                ps.ep_size,
+                ps.cp_size,
+            )
+            certified = (16, 1, 1, 1, 16, 16)
+            if topology != certified or ps.ringattn_size != 1 or ps.ulysses_size != 16:
+                raise ValueError(
+                    "The GLM-5.2 exact server-training path is certified only for "
+                    f"WORLD/PP/TP/DP/EP/CP={certified} with Ring1/Ulysses16; got {topology} "
+                    f"with Ring{ps.ringattn_size}/Ulysses{ps.ulysses_size}"
+                )
+            config._glm52_pipeline_layer_ranges = ((0, 78),)
+        elif ps.pp_size == 1:
+            config._glm52_pipeline_layer_ranges = ((0, 78),)
+        elif ps.pp_size == 2:
+            config._glm52_pipeline_layer_ranges = ((0, 38), (38, 78))
+        else:
+            raise ValueError("GLM-5.2 supports only PP1 or the supported 38/40 PP2 split")
     if ps.ringattn_size > 1 and has_linear_attention_layers(config):
         logger.warning_once(LINEAR_ATTENTION_RING_UNSUPPORTED_MESSAGE)
         raise ValueError(LINEAR_ATTENTION_RING_UNSUPPORTED_MESSAGE)

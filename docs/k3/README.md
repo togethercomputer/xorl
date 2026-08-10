@@ -1,26 +1,26 @@
 # Train/serve numerical contracts
 
-This directory documents the stable arithmetic contracts used to make trainer
-and sampler forward values agree. It contains production mechanisms and their
-conventional verification commands, not campaign receipts, benchmark outputs,
-or environment-specific launch records.
+This directory documents stable production mechanisms and conventional tests.
+It intentionally excludes campaign receipts, frozen benchmark outputs,
+cluster-specific launch records, and promotion manifests.
 
-## Contracts
+## Shared arithmetic contracts
 
 - [Attention](ATTENTION_CONTRACT.md): backend identity and KV-reduction shape.
 - [RMSNorm](RMSNORM_CONTRACT.md): canonical BF16 rows and explicit reduction trees.
 - [GEMM](GEMM_CONTRACT.md): fixed K-axis accumulation with tunable output geometry.
 - [LM head](LM_HEAD_CONTRACT.md): projection and vocabulary-normalization trees.
-- [LoRA](LORA_CONTRACT.md): canonical folds and exact-forward/trainable-backward boundaries.
-- [Contract selection](DEFAULTS_AND_PARETO.md): supported generic lanes and fail-closed rules.
+- [LoRA](LORA_CONTRACT.md): Qwen folded and GLM active-LoRA forward contracts.
+- [MoE experts](moe-serving-expert-kernel.md): serving-value forwards with trainer-owned backward.
+- [Contract selection](DEFAULTS_AND_PARETO.md): architecture-selected support envelopes.
+- [Qwen3.5 family](QWEN35_GDN_ZERO_K3_RUNBOOK.md): supported dense and MoE geometries.
 
 ## Rules
 
 1. Match arithmetic and rounding boundaries, not merely mathematical formulas.
-2. A shape, topology, or backend outside a documented envelope must fail rather
-   than silently use another numerical program.
+2. Unsupported shapes, topologies, and backends fail instead of silently
+   selecting another numerical program.
 3. Forward bytes define the train/serve contract. A trainer may use a separate
    checked backward implementation.
-4. Qualify a trainer/sampler revision pair with real decision-time FP32
-   log-probability bytes. Results from another source pair are evidence about
-   the design, not qualification of the new pair.
+4. Qualification belongs to an exact trainer/sampler revision pair and uses
+   real decision-time FP32 log-probability bytes.

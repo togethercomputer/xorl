@@ -7,31 +7,113 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
+from xorl.distributed.canonical_moe import (
+    CANONICAL_MOE_REDUCE_VERSION,
+    CanonicalMoEGraphMetadata,
+    CanonicalMoETransport,
+    LocalMoEContribution,
+    OutputDistribution,
+    ParallelPlan,
+    canonical_moe_reduce_cp_sharded_v3,
+    canonical_moe_reduce_packed_ep16_v2,
+    canonical_moe_reduce_v1,
+    resolve_canonical_moe_transport,
+)
 from xorl.distributed.moe.deepep import sync_pending_combine
 from xorl.distributed.parallel_state import get_parallel_state
 from xorl.distributed.sequence_parallel.data import gather_outputs
 from xorl.distributed.sequence_parallel.strategy import get_cp_strategy
 from xorl.models.base import XorlPreTrainedModel
-from xorl.models.layers import ACT2FN, RMSNorm, RotaryEmbedding
+from xorl.models.exact_contract import glm52_exact_forward_enabled
+from xorl.models.layers import (
+    ACT2FN,
+    RMS_NORM_FAMILY_NO_RESIDUAL,
+    RMS_NORM_FAMILY_RESIDUAL_TREE,
+    RMSNorm,
+    RotaryEmbedding,
+)
 from xorl.models.layers.attention import is_flash_attention, update_causal_mask
 from xorl.models.layers.attention.backend import ATTENTION_FUNCTIONS
 from xorl.models.layers.attention.backend.eager import eager_attention_forward
 from xorl.models.layers.moe import MoEBlock
 from xorl.models.layers.moe.experts import MoEExperts
+from xorl.models.layers.moe.moe_block import _BIRouterGemm, _moe_bi_router_enabled
 from xorl.models.layers.moe.routing_replay import get_replay_stage
 from xorl.models.outputs import MoeCausalLMOutput, MoeModelOutput
 from xorl.models.transformers.glm5 import parallelize
 from xorl.models.transformers.glm5.checkpoint_handler import Glm5CheckpointHandler
 from xorl.models.transformers.glm5.configuration_glm5 import Glm5Config
+from xorl.models.transformers.glm5.exact_absorbed_kv_b_qlora import (
+    Glm52ExactTP1AbsorbedKvBBlockFP8QLoRA,
+)
+from xorl.models.transformers.glm5.exact_routed_experts_qlora import (
+    Glm52ExactEP16BlockFP8QLoRARoutedExperts,
+)
+from xorl.models.transformers.glm5.exact_shared_expert_qlora import (
+    Glm52ExactTP16SharedExpertBlockFP8QLoRA,
+)
+from xorl.models.transformers.glm5.index_share import (
+    CanonicalLogicalIndices,
+    IndexShareContext,
+    IndexShareContextManager,
+    IndexShareMode,
+)
 from xorl.models.transformers.glm5.indexer import Glm5DsaIndexer
+from xorl.models.transformers.glm5.layer_plan import Glm52LayerPlan, Glm52LayerSpec, IndexerType, MLPType
+from xorl.models.transformers.glm5.native_fp8 import (
+    Glm52NativeBlockFP8Experts,
+    replace_glm52_native_fp8_modules,
+)
 from xorl.models.transformers.glm5.rotary import glm5_apply_rotary_pos_emb
 from xorl.models.transformers.glm5.sparse_mla import sparse_mla_dispatch
 from xorl.models.transformers.glm5.support import validate_glm5_sequence_parallel
+from xorl.ops.block_fp8_native import NativeBlockFP8Linear
 from xorl.ops.fused_silu_and_mul import fused_silu_and_mul
 from xorl.utils import logging
 
 
 logger = logging.get_logger(__name__)
+GLM52_LOCAL_PARTIAL_POLICY = "glm52_routed_final_scaled_then_shared_ep_slice_bf16_v2"
+_GLM52_CANONICAL_TRAINER_TOPOLOGIES = ((16, 1, 1, 1),)
+
+
+def _glm52_serving_grouped_topk(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    correction_bias: torch.Tensor,
+    *,
+    top_k: int,
+    num_expert_group: int,
+    topk_group: int,
+    routed_scaling_factor: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run the exact public SGLang GLM grouped-top-k dispatcher.
+
+    The selected experts and normalized FP32 weights are part of the forward
+    numerical contract. Reconstructing this policy in trainer code is not
+    sufficient: dispatcher-specific operation ordering can change the weight
+    bytes even when the selected ids agree.
+    """
+
+    from sglang.srt.layers.moe.topk import biased_grouped_topk  # noqa: PLC0415
+
+    routing_weights, selected_experts = biased_grouped_topk(
+        hidden_states=hidden_states,
+        gating_output=router_logits,
+        correction_bias=correction_bias,
+        topk=top_k,
+        renormalize=True,
+        num_expert_group=num_expert_group,
+        topk_group=topk_group,
+        num_fused_shared_experts=0,
+        routed_scaling_factor=routed_scaling_factor,
+        apply_routed_scaling_factor_on_output=False,
+    )
+    if routing_weights.dtype is not torch.float32:
+        raise TypeError(f"GLM-5.2 serving grouped top-k must return FP32 weights, got {routing_weights.dtype}")
+    if selected_experts.dtype is not torch.int32:
+        raise TypeError(f"GLM-5.2 serving grouped top-k must return int32 ids, got {selected_experts.dtype}")
+    return routing_weights, selected_experts
 
 
 class Glm5MLP(nn.Module):
@@ -63,8 +145,32 @@ class Glm5TopkRouter(nn.Module):
         self.weight = nn.Parameter(torch.empty(config.n_routed_experts, config.hidden_size))
         self.register_buffer("e_score_correction_bias", torch.zeros(config.n_routed_experts))
 
+    def _apply(self, fn, recurse: bool = True):
+        correction_bias = self._buffers.pop("e_score_correction_bias")
+        try:
+            result = super()._apply(fn, recurse=recurse)
+        finally:
+            target_probe = fn(torch.empty(0, dtype=torch.float32, device=correction_bias.device))
+            if correction_bias.is_meta:
+                restored_bias = torch.empty(
+                    correction_bias.shape,
+                    dtype=torch.float32,
+                    device=target_probe.device,
+                )
+            else:
+                restored_bias = correction_bias.to(
+                    device=target_probe.device,
+                    dtype=torch.float32,
+                )
+            self._buffers["e_score_correction_bias"] = restored_bias
+        return result
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = hidden_states.view(-1, self.hidden_size)
+        if _moe_bi_router_enabled(self.config):
+            if hidden_states.dtype is not torch.bfloat16 or self.weight.dtype is not torch.bfloat16:
+                raise TypeError("GLM-5.2 batch-invariant router requires BF16 hidden states and BF16 gate weights")
+            return _BIRouterGemm.apply(hidden_states, self.weight)
         if getattr(self.config, "_router_fp32", False):
             return F.linear(hidden_states.float(), self.weight.float())
         return F.linear(hidden_states, self.weight)
@@ -98,7 +204,11 @@ class Glm5MlaAttention(nn.Module):
             self.q_proj = nn.Linear(config.hidden_size, self.num_heads * self.qk_head_dim, bias=False)
         else:
             self.q_a_proj = nn.Linear(config.hidden_size, config.q_lora_rank, bias=config.attention_bias)
-            self.q_a_layernorm = RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps)
+            self.q_a_layernorm = RMSNorm(
+                config.q_lora_rank,
+                eps=config.rms_norm_eps,
+                family=RMS_NORM_FAMILY_NO_RESIDUAL,
+            )
             self.q_b_proj = nn.Linear(config.q_lora_rank, self.num_heads * self.qk_head_dim, bias=False)
 
         self.kv_a_proj_with_mqa = nn.Linear(
@@ -106,7 +216,11 @@ class Glm5MlaAttention(nn.Module):
             self.kv_lora_rank + self.qk_rope_head_dim,
             bias=config.attention_bias,
         )
-        self.kv_a_layernorm = RMSNorm(self.kv_lora_rank, eps=config.rms_norm_eps)
+        self.kv_a_layernorm = RMSNorm(
+            self.kv_lora_rank,
+            eps=config.rms_norm_eps,
+            family=RMS_NORM_FAMILY_NO_RESIDUAL,
+        )
         self.kv_b_proj = nn.Linear(
             self.kv_lora_rank,
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
@@ -146,6 +260,7 @@ class Glm5MlaAttention(nn.Module):
             cos,
             sin,
             interleaved=getattr(self.config, "rope_interleave", True),
+            class_b=bool(getattr(self.config, "_rope_class_b", False) or glm52_exact_forward_enabled(self.config)),
         )
         k_rot = k_rot.expand(*k_pass.shape[:-1], -1)
 
@@ -201,9 +316,47 @@ class Glm5MlaAttention(nn.Module):
 class Glm5Attention(Glm5MlaAttention):
     """MLA + DSA indexer with dense and sparse execution paths."""
 
-    def __init__(self, config: Glm5Config, layer_idx: int):
+    def __init__(
+        self,
+        config: Glm5Config,
+        layer_idx: int,
+        *,
+        layer_plan: Glm52LayerPlan | None = None,
+    ):
         super().__init__(config, layer_idx)
-        self.indexer = Glm5DsaIndexer(config)
+        self.layer_plan = layer_plan
+        self.layer_spec: Glm52LayerSpec | None = None if layer_plan is None else layer_plan.layers[layer_idx]
+        allocate_indexer = self.layer_spec is None or self.layer_spec.indexer_type is IndexerType.FULL
+        self.indexer = Glm5DsaIndexer(config) if allocate_indexer else None
+
+    def _compute_or_consume_indices(
+        self,
+        compute,
+        index_share_context: IndexShareContext | None,
+    ) -> torch.Tensor:
+        if self.layer_plan is None or self.layer_spec is None:
+            if self.indexer is None:
+                raise RuntimeError("Legacy GLM attention unexpectedly has no DSA indexer")
+            return compute()
+        if index_share_context is None:
+            raise RuntimeError("GLM-5.2 layer-plan execution requires an IndexShareContext")
+        if self.layer_spec.indexer_type is IndexerType.FULL:
+            if self.indexer is None:
+                raise RuntimeError(f"Full-indexer layer {self.layer_idx} has no indexer module")
+            return index_share_context.get_or_publish(
+                producer_layer_index=self.layer_idx,
+                layer_plan=self.layer_plan,
+                produce_payload=lambda: CanonicalLogicalIndices(compute()),
+            ).values
+        if self.indexer is not None:
+            raise RuntimeError(f"Shared-index layer {self.layer_idx} allocated an indexer module")
+        producer_layer_index = self.layer_spec.index_producer_layer
+        if producer_layer_index is None:
+            raise RuntimeError(f"Shared-index layer {self.layer_idx} has no planned producer")
+        return index_share_context.require(
+            producer_layer_index=producer_layer_index,
+            layer_plan=self.layer_plan,
+        ).values
 
     def _gather_ulysses_sequence_no_grad(self, tensor: torch.Tensor, group: dist.ProcessGroup) -> torch.Tensor:
         world_size = dist.get_world_size(group)
@@ -213,12 +366,30 @@ class Glm5Attention(Glm5MlaAttention):
         dist.all_gather(pieces, tensor.contiguous(), group=group)
         return torch.cat(pieces, dim=1)
 
-    def _split_kv_b_weight(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def _split_kv_b_weight(self, *, compute_dtype: torch.dtype | None = None) -> tuple[torch.Tensor, torch.Tensor]:
         from torch.distributed.tensor import DTensor, Replicate  # noqa: PLC0415
 
-        weight = self.kv_b_proj.weight
-        if isinstance(weight, DTensor):
-            weight = weight.full_tensor()
+        from xorl.qlora.modules.linear import QLoRALinear  # noqa: PLC0415
+
+        if isinstance(self.kv_b_proj, Glm52ExactTP1AbsorbedKvBBlockFP8QLoRA):
+            raise RuntimeError(
+                "GLM-5.2 exact absorbed kv_b owns its dequantization and both base BMMs; "
+                "the legacy materialized-weight path is not admitted"
+            )
+        if isinstance(self.kv_b_proj, NativeBlockFP8Linear):
+            # Invoke the module's real forward boundary so an eFSDP wrapper
+            # unshards the packed bytes/scales before reproducing SGLang's
+            # block-FP8 -> BF16 MLA post-load transform.
+            weight = self.kv_b_proj(return_dequantized_weight=True)
+        elif isinstance(self.kv_b_proj, QLoRALinear):
+            # Sparse MLA consumes kv_b through its absorb-form weight boundary
+            # instead of QLoRALinear.forward().  Dequantize the immutable base
+            # here, then add the differentiable adapter delta below.
+            weight = self.kv_b_proj._dequantize_weight()
+        else:
+            weight = self.kv_b_proj.weight
+            if isinstance(weight, DTensor):
+                weight = weight.full_tensor()
 
         if hasattr(self.kv_b_proj, "get_delta_weight"):
             lora_A = self.kv_b_proj.lora_A
@@ -229,6 +400,13 @@ class Glm5Attention(Glm5MlaAttention):
                 lora_B = lora_B.redistribute(placements=(Replicate(),) * lora_B.device_mesh.ndim).to_local()
             delta = (lora_B @ lora_A) * self.kv_b_proj.scaling
             weight = weight + delta.to(weight.dtype)
+
+        if compute_dtype is not None:
+            # Sparse MLA consumes kv_b through its absorb-form weight instead
+            # of the projection's normal forward boundary.  Match
+            # QLoRALinear.forward() by aligning the materialized FP8 base plus
+            # differentiable FP32 LoRA delta to the activation compute dtype.
+            weight = weight.to(compute_dtype)
 
         weight = weight.view(
             self.num_heads,
@@ -243,7 +421,7 @@ class Glm5Attention(Glm5MlaAttention):
         self,
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
         batch_size, seq_length, _ = hidden_states.shape
         q_compressed = self.q_a_layernorm(self.q_a_proj(hidden_states))
         q = self.q_b_proj(q_compressed).view(batch_size, seq_length, self.num_heads, self.qk_head_dim)
@@ -257,8 +435,12 @@ class Glm5Attention(Glm5MlaAttention):
         )
         kv_no_pe = self.kv_a_layernorm(kv_no_pe)
 
-        w_kc, w_vc = self._split_kv_b_weight()
-        q_no_pe_absorbed = torch.einsum("bshd,hdc->bshc", q_no_pe, w_kc)
+        if isinstance(self.kv_b_proj, Glm52ExactTP1AbsorbedKvBBlockFP8QLoRA):
+            q_no_pe_absorbed = self.kv_b_proj(q_no_pe, branch="q")
+            w_vc = None
+        else:
+            w_kc, w_vc = self._split_kv_b_weight(compute_dtype=q_no_pe.dtype)
+            q_no_pe_absorbed = torch.einsum("bshd,hdc->bshc", q_no_pe, w_kc)
 
         cos, sin = position_embeddings
         k_pe = k_pe.view(batch_size, seq_length, 1, self.qk_rope_head_dim)
@@ -268,12 +450,26 @@ class Glm5Attention(Glm5MlaAttention):
             cos,
             sin,
             interleaved=getattr(self.config, "rope_interleave", True),
+            class_b=bool(getattr(self.config, "_rope_class_b", False) or glm52_exact_forward_enabled(self.config)),
         )
         k_pe = k_pe.squeeze(2)
 
         q_absorbed = torch.cat([q_no_pe_absorbed, q_pe], dim=-1)
         kv_compressed = torch.cat([kv_no_pe, k_pe], dim=-1)
         return q_absorbed, kv_compressed, q_compressed, w_vc
+
+    def _project_absorbed_value(
+        self,
+        attn_compressed: torch.Tensor,
+        w_vc: torch.Tensor | None,
+    ) -> torch.Tensor:
+        if isinstance(self.kv_b_proj, Glm52ExactTP1AbsorbedKvBBlockFP8QLoRA):
+            if w_vc is not None:
+                raise RuntimeError("GLM-5.2 exact absorbed kv_b must not receive a legacy materialized V weight")
+            return self.kv_b_proj(attn_compressed, branch="v")
+        if w_vc is None:
+            raise RuntimeError("GLM-5.2 generic absorbed MLA requires its materialized V weight")
+        return torch.einsum("bshk,hdk->bshd", attn_compressed, w_vc)
 
     def _gather_full_dsa_inputs(
         self,
@@ -288,11 +484,11 @@ class Glm5Attention(Glm5MlaAttention):
             raise ValueError("GLM-5 DSA does not support ring attention yet.")
 
         group = ps.ulysses_group
-        full_hidden = gather_outputs(hidden_states, gather_dim=1, scale_grad=True, group=group)
-        full_q_compressed = gather_outputs(q_compressed, gather_dim=1, scale_grad=True, group=group)
+        full_hidden = gather_outputs(hidden_states, gather_dim=1, group=group)
+        full_q_compressed = gather_outputs(q_compressed, gather_dim=1, group=group)
         cos, sin = position_embeddings
-        full_cos = gather_outputs(cos, gather_dim=1, scale_grad=False, group=group)
-        full_sin = gather_outputs(sin, gather_dim=1, scale_grad=False, group=group)
+        full_cos = gather_outputs(cos, gather_dim=1, group=group)
+        full_sin = gather_outputs(sin, gather_dim=1, group=group)
         return full_hidden, full_q_compressed, (full_cos, full_sin)
 
     def _full_attention_mask_for_dsa(
@@ -322,7 +518,6 @@ class Glm5Attention(Glm5MlaAttention):
                     return gather_outputs(
                         attention_mask,
                         gather_dim=query_dim,
-                        scale_grad=False,
                         group=ps.ulysses_group,
                     )
 
@@ -388,13 +583,24 @@ class Glm5Attention(Glm5MlaAttention):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None,
+        index_share_context: IndexShareContext | None = None,
+        sampler_prefill_lengths: torch.Tensor | None = None,
         **_kwargs,
     ) -> tuple[torch.Tensor, None]:
         ps = get_parallel_state()
         q, kv, q_compressed, w_vc = self._project_qkv_absorb(hidden_states, position_embeddings)
 
         if not ps.cp_enabled:
-            topk_indices = self.indexer(hidden_states, q_compressed, position_embeddings, attention_mask)
+            topk_indices = self._compute_or_consume_indices(
+                lambda: self.indexer(
+                    hidden_states,
+                    q_compressed,
+                    position_embeddings,
+                    attention_mask,
+                    sampler_prefill_lengths=sampler_prefill_lengths,
+                ),
+                index_share_context,
+            )
             attn_compressed = sparse_mla_dispatch(
                 q,
                 kv,
@@ -403,7 +609,7 @@ class Glm5Attention(Glm5MlaAttention):
                 kv_lora_rank=self.kv_lora_rank,
                 backend=getattr(self.config, "_sparse_mla_backend", "auto"),
             )
-            attn_out = torch.einsum("bshk,hdk->bshd", attn_compressed, w_vc)
+            attn_out = self._project_absorbed_value(attn_compressed, w_vc)
             projected = self._project_output(attn_out)
             return projected, None
 
@@ -411,24 +617,30 @@ class Glm5Attention(Glm5MlaAttention):
             raise ValueError("GLM-5 sparse MLA supports Ulysses but not ring attention yet.")
 
         group = ps.ulysses_group
-        with torch.no_grad():
-            local_index_q, local_index_k, local_head_weights = self.indexer.project(
-                hidden_states,
-                q_compressed,
-                position_embeddings,
-            )
-            full_index_k = self._gather_ulysses_sequence_no_grad(local_index_k, group)
-            full_seq_len = full_index_k.shape[1]
-            sparse_attention_mask = self._sparse_attention_mask_for_dsa(attention_mask, full_seq_len)
-            query_offset = dist.get_rank(group) * hidden_states.shape[1]
-            local_topk_indices = self.indexer.select_topk(
-                local_index_q,
-                full_index_k,
-                local_head_weights,
-                sparse_attention_mask,
-                query_offset=query_offset,
-            )
-        full_kv = gather_outputs(kv, gather_dim=1, scale_grad=True, group=group)
+        query_offset = dist.get_rank(group) * hidden_states.shape[1]
+
+        def compute_local_indices() -> torch.Tensor:
+            with torch.no_grad():
+                local_index_q, local_index_k, local_head_weights = self.indexer.project(
+                    hidden_states,
+                    q_compressed,
+                    position_embeddings,
+                    sampler_prefill_lengths=sampler_prefill_lengths,
+                    query_offset=query_offset,
+                )
+                full_index_k = self._gather_ulysses_sequence_no_grad(local_index_k, group)
+                full_seq_len = full_index_k.shape[1]
+                sparse_attention_mask = self._sparse_attention_mask_for_dsa(attention_mask, full_seq_len)
+                return self.indexer.select_topk(
+                    local_index_q,
+                    full_index_k,
+                    local_head_weights,
+                    sparse_attention_mask,
+                    query_offset=query_offset,
+                )
+
+        local_topk_indices = self._compute_or_consume_indices(compute_local_indices, index_share_context)
+        full_kv = gather_outputs(kv, gather_dim=1, group=group)
 
         attn_compressed = sparse_mla_dispatch(
             q,
@@ -439,7 +651,7 @@ class Glm5Attention(Glm5MlaAttention):
             backend=getattr(self.config, "_sparse_mla_backend", "auto"),
             query_offset=query_offset,
         )
-        attn_out = torch.einsum("bshk,hdk->bshd", attn_compressed, w_vc)
+        attn_out = self._project_absorbed_value(attn_compressed, w_vc)
 
         projected = self._project_output(attn_out)
         return projected, None
@@ -495,12 +707,19 @@ class Glm5Attention(Glm5MlaAttention):
         hidden_states: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None,
+        index_share_context: IndexShareContext | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         ps = get_parallel_state()
         validate_glm5_sequence_parallel(self.config, parallel_state=ps)
         if getattr(self.config, "_sparse_mla_enabled", False):
-            return self.forward_sparse(hidden_states, position_embeddings, attention_mask, **kwargs)
+            return self.forward_sparse(
+                hidden_states,
+                position_embeddings,
+                attention_mask,
+                index_share_context=index_share_context,
+                **kwargs,
+            )
 
         if getattr(self.config, "_dsa_mask_disabled", False):
             return super().forward(hidden_states, position_embeddings, attention_mask, **kwargs)
@@ -513,7 +732,15 @@ class Glm5Attention(Glm5MlaAttention):
         )
         full_seq_len = full_hidden.shape[1]
         full_attention_mask = self._full_attention_mask_for_dsa(attention_mask, full_seq_len)
-        topk_indices = self.indexer(full_hidden, full_q_compressed, full_position_embeddings, full_attention_mask)
+        topk_indices = self._compute_or_consume_indices(
+            lambda: self.indexer(
+                full_hidden,
+                full_q_compressed,
+                full_position_embeddings,
+                full_attention_mask,
+            ),
+            index_share_context,
+        )
         combined_mask = self._build_dsa_mask(
             topk_indices,
             full_seq_len,
@@ -525,7 +752,7 @@ class Glm5Attention(Glm5MlaAttention):
 
 
 class Glm5MoEBlock(MoEBlock):
-    def __init__(self, config: Glm5Config):
+    def __init__(self, config: Glm5Config, *, layer_idx: int | None = None):
         super().__init__(
             hidden_size=config.hidden_size,
             num_experts=config.n_routed_experts,
@@ -537,6 +764,7 @@ class Glm5MoEBlock(MoEBlock):
             train_router=getattr(config, "train_router", False),
         )
         self.config = config
+        self.layer_idx = layer_idx
         self.gate = Glm5TopkRouter(config)
         self.experts.ep_dispatch = getattr(config, "_ep_dispatch", "alltoall")
         self.experts.deepep_buffer_size_gb = getattr(config, "_deepep_buffer_size_gb", 2.0)
@@ -550,19 +778,42 @@ class Glm5MoEBlock(MoEBlock):
             config,
             intermediate_size=config.moe_intermediate_size * config.n_shared_experts,
         )
+        self.canonical_contract_version = CANONICAL_MOE_REDUCE_VERSION if glm52_exact_forward_enabled(config) else None
+        # No user-facing transport knob: the exact GLM path resolves the best
+        # certified transport for the geometry internally (see
+        # resolve_canonical_moe_transport) and rejects unsupported geometry.
+        self.canonical_moe_transport = CanonicalMoETransport.AUTO
+        if self.canonical_contract_version is not None:
+            if not self.norm_topk_prob:
+                raise RuntimeError("GLM-5.2 canonical routing requires norm_topk_prob=true")
+            if self.n_group <= 0 or self.num_experts % self.n_group:
+                raise ValueError("GLM-5.2 canonical routing requires equal nonempty expert groups")
+            if not 1 <= self.topk_group <= self.n_group:
+                raise ValueError("GLM-5.2 canonical routing topk_group must be within n_group")
+            selectable_experts = self.topk_group * (self.num_experts // self.n_group)
+            if not 1 <= self.top_k <= selectable_experts:
+                raise ValueError("GLM-5.2 canonical routing top_k exceeds the selected expert groups")
 
     def route(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         flat_hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
-        router_logits = self.gate(flat_hidden_states)
-
         stage = get_replay_stage()
         replay = self._routing_replay
+
+        if self.canonical_contract_version is not None and (stage is not None or replay is not None):
+            raise RuntimeError("GLM-5.2 canonical MoE canonical path forbids routing replay and recomputation")
+        if self.canonical_contract_version is not None and not _moe_bi_router_enabled(self.config):
+            raise RuntimeError("GLM-5.2 canonical MoE requires its model-level exact router declaration")
+        router_logits = self.gate(flat_hidden_states)
 
         if stage is not None and replay is not None:
             cached_weights = None
             if stage == "record":
                 with torch.no_grad():
-                    _, selected_experts = self._route_tokens_to_experts(router_logits, flat_hidden_states.dtype)
+                    _, selected_experts = self._route_tokens_to_experts(
+                        router_logits,
+                        flat_hidden_states.dtype,
+                        hidden_states=flat_hidden_states,
+                    )
                 replay.record(selected_experts)
             elif stage == "replay_forward":
                 selected_experts = replay.pop_forward()
@@ -585,6 +836,7 @@ class Glm5MoEBlock(MoEBlock):
             routing_weights, selected_experts = self._route_tokens_to_experts(
                 router_logits,
                 flat_hidden_states.dtype,
+                hidden_states=flat_hidden_states,
             )
 
         ep_dispatch = getattr(self.experts, "ep_dispatch", "alltoall")
@@ -603,9 +855,33 @@ class Glm5MoEBlock(MoEBlock):
         self,
         router_logits: torch.Tensor,
         input_dtype: torch.dtype,
+        *,
+        hidden_states: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        correction_bias = self.gate.e_score_correction_bias
+        if correction_bias.dtype is not torch.float32:
+            raise TypeError("GLM-5.2 e_score_correction_bias must remain FP32 through checkpoint and runtime")
+        if correction_bias.shape != (self.num_experts,) or not bool(torch.all(torch.isfinite(correction_bias))):
+            raise ValueError("GLM-5.2 e_score_correction_bias failed shape/finite validation")
+        if self.canonical_contract_version is not None:
+            if not _moe_bi_router_enabled(self.config):
+                raise RuntimeError("GLM-5.2 canonical MoE requires its model-level exact router declaration")
+            if hidden_states is None:
+                raise RuntimeError("GLM-5.2 canonical grouped top-k requires the pre-gate hidden states")
+            if hidden_states.dtype is not torch.bfloat16 or router_logits.dtype is not torch.float32:
+                raise TypeError("GLM-5.2 canonical routing requires BF16 hidden states and FP32 BI router logits")
+            return _glm52_serving_grouped_topk(
+                hidden_states,
+                router_logits,
+                correction_bias,
+                top_k=self.top_k,
+                num_expert_group=self.n_group,
+                topk_group=self.topk_group,
+                routed_scaling_factor=self.routed_scaling_factor,
+            )
+
         router_scores = router_logits.sigmoid()
-        choice_scores = router_scores + self.gate.e_score_correction_bias.float()
+        choice_scores = router_scores + correction_bias
         experts_per_group = self.num_experts // self.n_group
         group_topk = min(2, experts_per_group)
         group_scores = choice_scores.view(-1, self.n_group, experts_per_group).topk(group_topk, dim=-1)[0].sum(dim=-1)
@@ -638,7 +914,18 @@ class Glm5MoEBlock(MoEBlock):
         hidden_states: torch.Tensor,
         routing_weights: torch.Tensor,
         selected_experts: torch.Tensor,
+        absolute_positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self.canonical_contract_version is not None:
+            if absolute_positions is None:
+                raise RuntimeError("GLM-5.2 canonical MoE execution requires explicit absolute positions")
+            return self._canonical_ep_forward(
+                hidden_states,
+                routing_weights,
+                selected_experts,
+                absolute_positions,
+            )
+
         residuals = hidden_states
         batch_size, sequence_length, hidden_dim = hidden_states.shape
         flat_hidden_states = hidden_states.view(-1, hidden_dim)
@@ -653,31 +940,308 @@ class Glm5MoEBlock(MoEBlock):
         sync_pending_combine()
         return expert_output + shared_output
 
-    def forward(self, hidden_states: torch.Tensor):
+    def _canonical_routed_local_partial(
+        self,
+        gathered: torch.Tensor,
+        gathered_routing: torch.Tensor,
+        gathered_ids: torch.Tensor,
+        local_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        if not isinstance(self.experts, Glm52NativeBlockFP8Experts):
+            raise RuntimeError("GLM-5.2 canonical path requires native block-FP8 experts")
+        kwargs = {
+            "sglang_ep_native_local_ids": local_ids,
+            "routed_scaling_factor": self.routed_scaling_factor,
+        }
+        if isinstance(self.experts, Glm52ExactEP16BlockFP8QLoRARoutedExperts):
+            kwargs["selected_experts"] = gathered_ids
+        return self.experts(gathered, gathered_routing, **kwargs).to(torch.bfloat16)
+
+    def _canonical_shared_local_partial(
+        self,
+        gathered: torch.Tensor,
+        *,
+        contributor_ordinal: int,
+        contributor_count: int,
+    ) -> torch.Tensor:
+        if isinstance(self.shared_experts, Glm52ExactTP16SharedExpertBlockFP8QLoRA):
+            return self.shared_experts(gathered, contributor_ordinal=contributor_ordinal)
+
+        intermediate_size = self.shared_experts.intermediate_size
+        if intermediate_size % contributor_count:
+            raise RuntimeError("GLM-5.2 shared-expert width must divide evenly across EP contributors")
+        shard = intermediate_size // contributor_count
+        shard_start = contributor_ordinal * shard
+        shard_end = shard_start + shard
+        if isinstance(self.shared_experts.gate_proj, NativeBlockFP8Linear):
+            if not isinstance(self.shared_experts.up_proj, NativeBlockFP8Linear) or not isinstance(
+                self.shared_experts.down_proj, NativeBlockFP8Linear
+            ):
+                raise RuntimeError("GLM-5.2 native FP8 shared experts require all three projections")
+            gate = self.shared_experts.gate_proj(
+                gathered,
+                output_range=(shard_start, shard_end),
+            )
+            up = self.shared_experts.up_proj(
+                gathered,
+                output_range=(shard_start, shard_end),
+            )
+        else:
+            gate = F.linear(gathered, self.shared_experts.gate_proj.weight[shard_start:shard_end])
+            up = F.linear(gathered, self.shared_experts.up_proj.weight[shard_start:shard_end])
+        activated = F.silu(gate) * up
+        if isinstance(self.shared_experts.down_proj, NativeBlockFP8Linear):
+            return self.shared_experts.down_proj(
+                activated,
+                input_range=(shard_start, shard_end),
+            ).to(torch.bfloat16)
+        return F.linear(
+            activated,
+            self.shared_experts.down_proj.weight[:, shard_start:shard_end],
+        ).to(torch.bfloat16)
+
+    def _canonical_ep_forward(
+        self,
+        hidden_states: torch.Tensor,
+        routing_weights: torch.Tensor,
+        selected_experts: torch.Tensor,
+        absolute_positions: torch.Tensor,
+    ) -> torch.Tensor:
+        from xorl.models.layers.moe.ep_native_combine import (  # noqa: PLC0415
+            gather_ids_for_ep_combine,
+            gather_tokens_for_ep_combine,
+            max_rows_for_ep_combine,
+        )
+
+        ps = get_parallel_state()
+        if not ps.ep_enabled or ps.ep_size != 16 or ps.cp_size != 16:
+            raise RuntimeError("GLM-5.2 exact trainer path requires aliased EP16/CP16")
+        admitted = _GLM52_CANONICAL_TRAINER_TOPOLOGIES
+        topology = (dist.get_world_size(), ps.pp_size, ps.tp_size, ps.dp_size)
+        if topology not in admitted:
+            raise RuntimeError(
+                f"GLM-5.2 canonical MoE trainer path does not admit WORLD/PP/TP/DP={topology}; "
+                f"admitted topologies are {admitted}"
+            )
+        if ps.ringattn_size != 1 or ps.ulysses_size != 16:
+            raise RuntimeError("GLM-5.2 canonical MoE trainer path requires Ring1 and Ulysses equal to EP")
+        if ps.dp_replicate_size != 1 or ps.dp_shard_size != ps.dp_size or ps.cp_fsdp_mode != "all":
+            raise RuntimeError(
+                "GLM-5.2 canonical trainer path requires DP-replicate1, fully sharded DP, and cp_fsdp_mode=all"
+            )
+        if ps.ep_group is None or ps.ulysses_group is None:
+            raise RuntimeError("GLM-5.2 canonical MoE requires the stage-local CP and EP process groups to alias")
+        get_group_ranks = getattr(dist, "get_process_group_ranks", None)
+        if get_group_ranks is not None and tuple(get_group_ranks(ps.ep_group)) != tuple(
+            get_group_ranks(ps.ulysses_group)
+        ):
+            raise RuntimeError("GLM-5.2 canonical MoE requires identical stage-local CP and EP rank membership")
+        if self.experts.ep_dispatch == "deepep":
+            raise RuntimeError("GLM-5.2 canonical MoE canonical path does not support DeepEP")
+        if hidden_states.dtype is not torch.bfloat16:
+            raise TypeError("GLM-5.2 canonical local partials require BF16 hidden states")
+        if self.config.hidden_act != "silu":
+            raise RuntimeError("GLM-5.2 canonical shared-expert policy is versioned for silu only")
+
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        flat = hidden_states.reshape(-1, hidden_dim)
+        local_rows = flat.shape[0]
+        local_positions = absolute_positions.reshape(-1)
+        if local_positions.numel() != local_rows:
+            raise ValueError(
+                f"absolute_positions has {local_positions.numel()} rows, expected {local_rows} local hidden rows"
+            )
+
+        group = ps.ep_group
+        padded_rows = max_rows_for_ep_combine(local_rows, flat.device, group)
+        gathered = gather_tokens_for_ep_combine(flat, group, padded_rows)
+        gathered_routing = gather_tokens_for_ep_combine(routing_weights.reshape(local_rows, -1), group, padded_rows)
+        gathered_ids = gather_ids_for_ep_combine(selected_experts.reshape(local_rows, -1), group, padded_rows)
+        gathered_positions = gather_ids_for_ep_combine(local_positions[:, None], group, padded_rows).squeeze(-1)
+        local_valid = torch.ones((local_rows, 1), dtype=torch.int32, device=flat.device)
+        gathered_valid = gather_ids_for_ep_combine(local_valid, group, padded_rows).squeeze(-1) >= 0
+
+        ep_rank = dist.get_rank(group)
+        if isinstance(self.experts, Glm52ExactEP16BlockFP8QLoRARoutedExperts):
+            local_experts = self.experts.num_local_experts
+        else:
+            local_experts = int(self.experts.gate_up_proj.shape[0])
+        if local_experts * ps.ep_size != self.experts.num_experts:
+            raise RuntimeError("GLM-5.2 canonical MoE requires equal contiguous expert slices")
+        expert_start = ep_rank * local_experts
+        local_ids = torch.where(
+            (gathered_ids >= expert_start) & (gathered_ids < expert_start + local_experts),
+            gathered_ids - expert_start,
+            gathered_ids.new_full((), -1),
+        ).to(torch.int32)
+        routed = self._canonical_routed_local_partial(gathered, gathered_routing, gathered_ids, local_ids)
+        shared = self._canonical_shared_local_partial(
+            gathered,
+            contributor_ordinal=ep_rank,
+            contributor_count=ps.ep_size,
+        )
+        local_partial = (routed + shared).to(torch.bfloat16)
+
+        capacity = int(getattr(self.config, "_glm52_canonical_moe_capacity", local_partial.shape[0]))
+        if local_partial.shape[0] > capacity:
+            raise RuntimeError(
+                f"GLM-5.2 canonical MoE row count {local_partial.shape[0]} exceeds configured capacity {capacity}"
+            )
+        if local_partial.shape[0] < capacity:
+            pad_rows = capacity - local_partial.shape[0]
+            local_partial = torch.cat(
+                (local_partial, local_partial.new_zeros((pad_rows, hidden_dim))),
+                dim=0,
+            )
+            gathered_positions = torch.cat(
+                (gathered_positions, gathered_positions.new_full((pad_rows,), -1)),
+                dim=0,
+            )
+            gathered_valid = torch.cat(
+                (gathered_valid, gathered_valid.new_zeros((pad_rows,))),
+                dim=0,
+            )
+        logical_rows = torch.arange(capacity, dtype=torch.int64, device=flat.device)
+        logical_rows = logical_rows.masked_fill(~gathered_valid, -1)
+        metadata = CanonicalMoEGraphMetadata(
+            logical_row_ids=logical_rows,
+            absolute_positions=gathered_positions.to(torch.int64),
+            valid_mask=gathered_valid,
+            capacity=capacity,
+            valid_rows=int(gathered_valid.sum().item()),
+        )
+        contribution = LocalMoEContribution(local_partial, metadata, GLM52_LOCAL_PARTIAL_POLICY)
+        plan = ParallelPlan.glm52_trainer(
+            world_size=dist.get_world_size(),
+            pp_size=ps.pp_size,
+            dp_size=ps.dp_size,
+            contributor_count=ps.ep_size,
+        )
+        resolved_transport = resolve_canonical_moe_transport(
+            self.canonical_moe_transport,
+            plan=plan,
+            capacity=capacity,
+            local_rows=local_rows,
+            graph_mode=False,
+            consumer_sharded_output=True,
+        )
+        previous_transport = getattr(self.config, "_resolved_canonical_moe_transport", None)
+        if previous_transport is None:
+            self.config._resolved_canonical_moe_transport = resolved_transport.value
+            logger.info_rank0(
+                "Resolved GLM-5.2 canonical MoE transport: "
+                f"requested={self.canonical_moe_transport.value}, resolved={resolved_transport.value}, "
+                f"EP={plan.ep_size}, CP={plan.cp_size}, capacity={capacity}, local_rows={local_rows}, graph=False"
+            )
+        elif previous_transport != resolved_transport.value:
+            raise RuntimeError(
+                "GLM-5.2 canonical MoE transport geometry changed within one model: "
+                f"{previous_transport} -> {resolved_transport.value}"
+            )
+
+        if resolved_transport is CanonicalMoETransport.CP_SHARDED_V3:
+            canonical = canonical_moe_reduce_cp_sharded_v3(
+                contribution,
+                plan=plan,
+                group=group,
+                physical_global_rank=dist.get_rank(),
+                graph_mode=False,
+            )
+        else:
+            canonical_reduce = (
+                canonical_moe_reduce_packed_ep16_v2
+                if resolved_transport is CanonicalMoETransport.PACKED_EP16_V2
+                else canonical_moe_reduce_v1
+            )
+            canonical = canonical_reduce(
+                contribution,
+                plan=plan,
+                group=group,
+                output_distribution=OutputDistribution.REPLICATED_CANONICAL,
+                physical_global_rank=dist.get_rank(),
+                chunk_rows=int(getattr(self.config, "_glm52_canonical_moe_chunk_rows", capacity)),
+                graph_mode=False,
+            )
+        if resolved_transport is CanonicalMoETransport.CP_SHARDED_V3:
+            local_canonical = canonical.tensor[:local_rows]
+        else:
+            source_start = ep_rank * padded_rows
+            source_end = source_start + local_rows
+            local_canonical = canonical.tensor[source_start:source_end]
+        return local_canonical.reshape(batch_size, sequence_length, hidden_dim)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        absolute_positions: torch.Tensor | None = None,
+    ):
         routing_weights, selected_experts, router_logits = self.route(hidden_states)
-        hidden_states = self.forward_experts_with_shared(hidden_states, routing_weights, selected_experts)
+        hidden_states = self.forward_experts_with_shared(
+            hidden_states,
+            routing_weights,
+            selected_experts,
+            absolute_positions,
+        )
         return hidden_states, router_logits
 
 
 class Glm5DecoderLayer(nn.Module):
-    def __init__(self, config: Glm5Config, layer_idx: int):
+    def __init__(
+        self,
+        config: Glm5Config,
+        layer_idx: int,
+        *,
+        layer_plan: Glm52LayerPlan | None = None,
+    ):
         super().__init__()
         self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
-        self.self_attn = Glm5Attention(config, layer_idx)
-        if layer_idx >= config.first_k_dense_replace:
-            self.mlp = Glm5MoEBlock(config)
+        self.layer_spec = None if layer_plan is None else layer_plan.layers[layer_idx]
+        self.self_attn = Glm5Attention(config, layer_idx, layer_plan=layer_plan)
+        is_sparse_mlp = (
+            layer_idx >= config.first_k_dense_replace
+            if self.layer_spec is None
+            else self.layer_spec.mlp_type is MLPType.SPARSE
+        )
+        if is_sparse_mlp:
+            self.mlp = Glm5MoEBlock(config, layer_idx=layer_idx)
         else:
             self.mlp = Glm5MLP(config)
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            family=(RMS_NORM_FAMILY_NO_RESIDUAL if layer_idx == 0 else RMS_NORM_FAMILY_RESIDUAL_TREE),
+        )
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            family=RMS_NORM_FAMILY_RESIDUAL_TREE,
+        )
         self.gradient_checkpointing = False
+
+    @staticmethod
+    def _local_absolute_positions(
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor | None,
+    ) -> torch.Tensor | None:
+        if position_ids is None:
+            return None
+        local_length = hidden_states.shape[1]
+        if position_ids.shape[-1] == local_length:
+            return position_ids
+        ps = get_parallel_state()
+        if ps.cp_enabled and position_ids.shape[-1] == local_length * ps.cp_size:
+            start = ps.cp_rank * local_length
+            return position_ids[..., start : start + local_length]
+        raise ValueError(f"Cannot map position_ids width {position_ids.shape[-1]} to {local_length} local GLM rows")
 
     def _pre_mlp_forward(
         self,
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        index_share_context: IndexShareContext | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         residual = hidden_states
@@ -686,6 +1250,7 @@ class Glm5DecoderLayer(nn.Module):
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_embeddings=position_embeddings,
+            index_share_context=index_share_context,
             **kwargs,
         )
         hidden_states, residual = self.post_attention_layernorm(
@@ -700,12 +1265,14 @@ class Glm5DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        index_share_context: IndexShareContext | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor]:
         hidden_states, residual, self_attn_weights = self._pre_mlp_forward(
             hidden_states,
             attention_mask=attention_mask,
             position_embeddings=position_embeddings,
+            index_share_context=index_share_context,
             **kwargs,
         )
         if not isinstance(self.mlp, Glm5MoEBlock):
@@ -721,8 +1288,10 @@ class Glm5DecoderLayer(nn.Module):
         output_attentions: Optional[bool] = False,
         output_router_logits: Optional[bool] = False,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        index_share_context: IndexShareContext | None = None,
         **kwargs,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
+        local_absolute_positions = self._local_absolute_positions(hidden_states, position_ids)
         _checkpoint_method = getattr(self, "_gradient_checkpointing_method", None)
         _selective = (
             self.training
@@ -743,18 +1312,28 @@ class Glm5DecoderLayer(nn.Module):
                 hidden_states,
                 attention_mask,
                 position_embeddings=position_embeddings,
+                index_share_context=index_share_context,
                 **kwargs,
             )
-            hidden_states = self.mlp.forward_experts_with_shared(hidden_states, routing_weights, selected_experts)
+            hidden_states = self.mlp.forward_experts_with_shared(
+                hidden_states,
+                routing_weights,
+                selected_experts,
+                local_absolute_positions,
+            )
         elif _selective:
             hidden_states, residual, self_attn_weights = self._gradient_checkpointing_func(
                 self._pre_mlp_forward,
                 hidden_states,
                 attention_mask,
                 position_embeddings=position_embeddings,
+                index_share_context=index_share_context,
                 **kwargs,
             )
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.mlp(
+                hidden_states,
+                **({"absolute_positions": local_absolute_positions} if isinstance(self.mlp, Glm5MoEBlock) else {}),
+            )
             if isinstance(hidden_states, tuple):
                 hidden_states, router_logits = hidden_states
             else:
@@ -764,9 +1343,13 @@ class Glm5DecoderLayer(nn.Module):
                 hidden_states,
                 attention_mask=attention_mask,
                 position_embeddings=position_embeddings,
+                index_share_context=index_share_context,
                 **kwargs,
             )
-            hidden_states = self.mlp(hidden_states)
+            hidden_states = self.mlp(
+                hidden_states,
+                **({"absolute_positions": local_absolute_positions} if isinstance(self.mlp, Glm5MoEBlock) else {}),
+            )
             if isinstance(hidden_states, tuple):
                 hidden_states, router_logits = hidden_states
             else:
@@ -787,6 +1370,30 @@ class Glm5PreTrainedModel(XorlPreTrainedModel):
     base_model_prefix = "model"
     _no_split_modules = ["Glm5DecoderLayer"]
     supports_tensor_parallelism = True
+
+    def get_ignore_modules_in_mixed_precision(self):
+        # Dense native-FP8 and exact active-QLoRA modules are separately
+        # fully_shard-wrapped without an MP policy. The exact QLoRA wrapper
+        # owns FP32 master factors and performs its one BF16 rounding inside
+        # the value path. Native experts use the dedicated expert FSDP branch
+        # and must not appear here (which would double-wrap them).
+        if getattr(self.config, "quantization_config", None) is not None:
+            # Keep the base model independent of adapter implementation at
+            # import time; exact_qlora may grow model-specific construction
+            # helpers without creating a modeling import cycle.
+            from xorl.models.transformers.glm5.exact_qlora import (  # noqa: PLC0415
+                Glm52ExactTP1BlockFP8QLoRALinear,
+            )
+            from xorl.models.transformers.glm5.exact_shared_expert_qlora import (  # noqa: PLC0415
+                Glm52ExactTP16SharedExpertBlockFP8QLoRA,
+            )
+
+            return (
+                NativeBlockFP8Linear,
+                Glm52ExactTP1BlockFP8QLoRALinear,
+                Glm52ExactTP16SharedExpertBlockFP8QLoRA,
+            )
+        return None
 
     def _init_weights(self, module):
         std = self.config.initializer_range
@@ -827,6 +1434,8 @@ class Glm5PreTrainedModel(XorlPreTrainedModel):
             num_hidden_layers=self.config.num_hidden_layers,
             device=kwargs.get("device"),
             dtype=kwargs.get("dtype"),
+            model=self,
+            load_family=kwargs.get("load_family"),
         )
 
 
@@ -835,11 +1444,33 @@ class Glm5Model(Glm5PreTrainedModel):
         super().__init__(config)
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
+        self.layer_plan: Glm52LayerPlan | None = None
+        self._index_share_context_managers: dict[tuple[int, int], IndexShareContextManager] = {}
+        if config.indexer_types is not None or config.mlp_layer_types is not None:
+            if config.indexer_types is None or config.mlp_layer_types is None:
+                raise ValueError("GLM-5.2 requires indexer_types and mlp_layer_types together")
+            # Pipeline staging is explicit: without configured ranges the
+            # model is one stage. (Multi-stage construction must pass
+            # _glm52_pipeline_layer_ranges; no implicit per-depth split.)
+            configured_ranges = getattr(config, "_glm52_pipeline_layer_ranges", None)
+            ranges = (
+                ((0, config.num_hidden_layers),)
+                if configured_ranges is None
+                else tuple(tuple(int(value) for value in stage) for stage in configured_ranges)
+            )
+            self.layer_plan = Glm52LayerPlan.from_config(config, pipeline_layer_ranges=ranges)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
-            [Glm5DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+            [
+                Glm5DecoderLayer(config, layer_idx, layer_plan=self.layer_plan)
+                for layer_idx in range(config.num_hidden_layers)
+            ]
         )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            family=RMS_NORM_FAMILY_RESIDUAL_TREE,
+        )
         self.rotary_emb = RotaryEmbedding(config=config)
         self.gradient_checkpointing = False
         self._skip_causal_mask = is_flash_attention(config._attn_implementation)
@@ -851,6 +1482,37 @@ class Glm5Model(Glm5PreTrainedModel):
     def set_input_embeddings(self, value):
         self.embed_tokens = value
 
+    def _index_share_manager_for_local_layers(self) -> IndexShareContextManager | None:
+        if self.layer_plan is None:
+            return None
+        local_layers = tuple(index for index, layer in enumerate(self.layers) if layer is not None)
+        if not local_layers:
+            raise RuntimeError("GLM-5.2 model part owns no decoder layers")
+        candidates = [
+            stage
+            for stage in self.layer_plan.pipeline_layer_ranges
+            if local_layers[0] == stage[0]
+            and local_layers[-1] == stage[1] - 1
+            and len(local_layers) == stage[1] - stage[0]
+        ]
+        if len(candidates) != 1:
+            raise RuntimeError(
+                "GLM-5.2 canonical path requires each executing model part to own exactly one complete planned "
+                f"pipeline stage; local layers are {local_layers[0]}..{local_layers[-1]}"
+            )
+        stage = candidates[0]
+        manager = self._index_share_context_managers.get(stage)
+        if manager is None:
+            manager = IndexShareContextManager(self.layer_plan, stage)
+            self._index_share_context_managers[stage] = manager
+        return manager
+
+    def release_index_share_context(self) -> None:
+        """Idempotently release a retained backward-bearing invocation."""
+
+        for manager in self._index_share_context_managers.values():
+            manager.end_active()
+
     def forward(
         self,
         input_ids: torch.LongTensor = None,
@@ -860,6 +1522,7 @@ class Glm5Model(Glm5PreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         output_router_logits: Optional[bool] = None,
+        index_share_mode: IndexShareMode | str | None = None,
         **kwargs,
     ) -> MoeModelOutput:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -908,54 +1571,70 @@ class Glm5Model(Glm5PreTrainedModel):
         all_self_attns = () if output_attentions else None
         all_router_logits = () if output_router_logits else None
 
-        for layer_idx, decoder_layer in enumerate(self.layers):
-            if decoder_layer is None:
-                continue
-            _grad_ckpt_method = (
-                getattr(self, "_gradient_checkpointing_method", "recompute_full_layer")
-                if self.gradient_checkpointing and self.training
-                else None
+        index_share_manager = self._index_share_manager_for_local_layers()
+        if index_share_manager is not None and index_share_mode is None:
+            raise RuntimeError(
+                "GLM-5.2 IndexShare execution requires explicit index_share_mode="
+                "'training_with_backward' or 'forward_only'"
             )
-            _use_outer_checkpoint = _grad_ckpt_method == "recompute_full_layer"
-
-            if _use_outer_checkpoint:
-                layer_outputs = self._gradient_checkpointing_func(
-                    decoder_layer.__call__,
-                    hidden_states,
-                    causal_mask,
-                    position_ids,
-                    output_attentions,
-                    output_router_logits,
-                    position_embeddings,
-                    **kwargs,
+        index_share_context = None if index_share_manager is None else index_share_manager.begin(mode=index_share_mode)
+        forward_succeeded = False
+        try:
+            for layer_idx, decoder_layer in enumerate(self.layers):
+                if decoder_layer is None:
+                    continue
+                _grad_ckpt_method = (
+                    getattr(self, "_gradient_checkpointing_method", "recompute_full_layer")
+                    if self.gradient_checkpointing and self.training
+                    else None
                 )
-            else:
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=causal_mask,
-                    position_ids=position_ids,
-                    output_attentions=output_attentions,
-                    output_router_logits=output_router_logits,
-                    position_embeddings=position_embeddings,
-                    **kwargs,
-                )
+                _use_outer_checkpoint = _grad_ckpt_method == "recompute_full_layer"
 
-            hidden_states = layer_outputs[0]
+                if _use_outer_checkpoint:
+                    layer_outputs = self._gradient_checkpointing_func(
+                        decoder_layer.__call__,
+                        hidden_states,
+                        causal_mask,
+                        position_ids,
+                        output_attentions,
+                        output_router_logits,
+                        position_embeddings,
+                        index_share_context=index_share_context,
+                        **kwargs,
+                    )
+                else:
+                    layer_outputs = decoder_layer(
+                        hidden_states,
+                        attention_mask=causal_mask,
+                        position_ids=position_ids,
+                        output_attentions=output_attentions,
+                        output_router_logits=output_router_logits,
+                        position_embeddings=position_embeddings,
+                        index_share_context=index_share_context,
+                        **kwargs,
+                    )
 
-            if output_attentions:
-                all_self_attns += (layer_outputs[1],)
-            if output_router_logits and layer_outputs[-1] is not None:
-                all_router_logits += (layer_outputs[-1],)
+                hidden_states = layer_outputs[0]
 
-        hidden_states = self.norm(hidden_states) if self.norm is not None else hidden_states
-        if output_hidden_states:
-            _ = output_hidden_states
+                if output_attentions:
+                    all_self_attns += (layer_outputs[1],)
+                if output_router_logits and layer_outputs[-1] is not None:
+                    all_router_logits += (layer_outputs[-1],)
 
-        return MoeModelOutput(
-            last_hidden_state=hidden_states,
-            attentions=all_self_attns,
-            router_logits=all_router_logits,
-        )
+            hidden_states = self.norm(hidden_states) if self.norm is not None else hidden_states
+            if output_hidden_states:
+                _ = output_hidden_states
+
+            result = MoeModelOutput(
+                last_hidden_state=hidden_states,
+                attentions=all_self_attns,
+                router_logits=all_router_logits,
+            )
+            forward_succeeded = True
+            return result
+        finally:
+            if index_share_manager is not None:
+                index_share_manager.finish_forward(index_share_context, succeeded=forward_succeeded)
 
 
 class Glm5ForCausalLM(Glm5PreTrainedModel):
@@ -972,6 +1651,13 @@ class Glm5ForCausalLM(Glm5PreTrainedModel):
         self.num_experts = config.n_routed_experts
         self.num_experts_per_tok = config.num_experts_per_tok
         self.post_init()
+        if getattr(config, "quantization_config", None) is not None and not getattr(
+            config, "_glm52_block_fp8_qlora", False
+        ):
+            replace_glm52_native_fp8_modules(
+                self,
+                config.quantization_config,
+            )
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -991,6 +1677,9 @@ class Glm5ForCausalLM(Glm5PreTrainedModel):
     def get_decoder(self):
         return self.model
 
+    def release_index_share_context(self) -> None:
+        self.model.release_index_share_context()
+
     def get_pp_module_config(self):
         return {
             "input_fqns": ["model.embed_tokens"],
@@ -1009,6 +1698,7 @@ class Glm5ForCausalLM(Glm5PreTrainedModel):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         output_router_logits: Optional[bool] = None,
+        index_share_mode: IndexShareMode | str | None = None,
         **kwargs,
     ) -> MoeCausalLMOutput:
         if output_router_logits is None:
@@ -1021,6 +1711,7 @@ class Glm5ForCausalLM(Glm5PreTrainedModel):
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             output_router_logits=output_router_logits,
+            index_share_mode=index_share_mode,
             **kwargs,
         )
         return MoeCausalLMOutput(

@@ -691,6 +691,7 @@ class Orchestrator:
         "forward": "execute_forward",
         "forward_backward": "execute_forward_backward",
         "optim_step": "execute_optim_step",
+        "abort_gradient_epoch": "execute_abort_gradient_epoch",
         "save_state": "execute_save_state",
         "save_lora_only": "execute_save_lora_only",
         "save_full_weights": "execute_save_full_weights",
@@ -706,9 +707,6 @@ class Orchestrator:
         "load_adapter_state": "execute_load_adapter_state",
         "get_adapter_info": "execute_get_adapter_info",
         "kill_session": "execute_kill_session",
-        "start_zorl_generation": "execute_start_zorl_generation",
-        "apply_zorl_rewards": "execute_apply_zorl_rewards",
-        "abort_zorl_generation": "execute_abort_zorl_generation",
     }
 
     def _process_engine_step(self) -> bool:

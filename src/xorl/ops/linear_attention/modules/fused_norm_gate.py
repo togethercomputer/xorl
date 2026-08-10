@@ -5,7 +5,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from xorl.ops.linear_attention.modules.bi_contract import bi_rms_norm_gated, is_gdn_contract_enabled
+from xorl.ops.linear_attention.modules.bi_contract import _is_gdn_contract_enabled, bi_rms_norm_gated
 
 
 def rms_norm_gated(
@@ -78,13 +78,13 @@ class FusedRMSNormGated(nn.Module):
         prenorm: bool = False,
         residual_in_fp32: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if is_gdn_contract_enabled() and x.is_cuda:
+        if _is_gdn_contract_enabled() and x.is_cuda:
             # GDN contract: serving's layernorm_gated kernel kills the
             # rare bf16-ULP gated-RMSNorm tail. Only the GDN o_norm config is
             # contracted; anything else voids the bitwise claim, so fail loud.
             if residual is not None or prenorm or self.bias is not None or self.weight is None:
                 raise NotImplementedError(
-                    "XORL_BI_GDN gated-RMSNorm contract covers the GDN o_norm config only (no residual/prenorm/bias)."
+                    "Exact Qwen3.5 gated RMSNorm covers only the GDN o_norm config (no residual/prenorm/bias)."
                 )
             return bi_rms_norm_gated(x, self.weight, g, self.eps, activation=self.activation)
         return rms_norm_gated(

@@ -33,6 +33,7 @@ from xorl.ops.batch_invariant_ops import (  # noqa: E402
     set_batch_invariant_mode,
     set_trunk_linear_contract,
 )
+from xorl.ops.bi_families_v2 import rms_norm_v2 as xorl_rms_norm_v2  # noqa: E402
 
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -173,3 +174,28 @@ def test_zero_centered_family1_twin_bitwise(shape):
         serving_funnel = sgl_bio.bi_rms_norm(x, w, EPS, family=RMS_NORM_FAMILY_NO_RESIDUAL, zero_centered=True)
     assert torch.equal(xorl_fn, xorl_funnel), "zero-centered wrapper diverged from the xorl funnel"
     assert torch.equal(xorl_fn, serving_funnel), "zero-centered twin diverged cross-engine"
+
+
+@pytest.mark.parametrize("shape", [(64, 128), (64, 3840)])
+@pytest.mark.parametrize("with_residual", [False, True])
+def test_zero_centered_families_v2_candidate_bitwise(shape, with_residual):
+    """The opt-in Qwen families-v2 candidate is one shared arithmetic tree.
+
+    Cover both the q/k-style no-residual form and the decoder-layer fused
+    residual form.  The small shape selects the fused realization; the hidden
+    size exercises the production-width epilogue.
+    """
+    x = _make(shape, 11)
+    w = _make((shape[-1],), 312)
+    residual = _make(shape, 12) if with_residual else None
+    with torch.no_grad():
+        xorl_result = xorl_rms_norm_v2(x, w, EPS, residual=residual, zero_centered=True)
+        serving_result = sgl_bio.rms_norm_v2(x, w, EPS, residual=residual, zero_centered=True)
+
+    if with_residual:
+        xorl_out, xorl_residual = xorl_result
+        serving_out, serving_residual = serving_result
+        assert torch.equal(xorl_residual, serving_residual)
+        assert torch.equal(xorl_out, serving_out)
+    else:
+        assert torch.equal(xorl_result, serving_result)

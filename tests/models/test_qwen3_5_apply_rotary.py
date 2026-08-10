@@ -5,8 +5,11 @@ import pytest
 import torch
 
 from xorl.models.layers.rope import rotate_half
+from xorl.models.transformers import qwen3_5_shared
 from xorl.models.transformers.qwen3_5 import modeling_qwen3_5
+from xorl.models.transformers.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
 from xorl.models.transformers.qwen3_5_moe import modeling_qwen3_5_moe
+from xorl.models.transformers.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig
 from xorl.models.transformers.qwen3_5_shared import qwen3_5_apply_rotary_pos_emb
 
 
@@ -106,6 +109,53 @@ def test_interleaved_pairwise_rotation_d8():
     torch.testing.assert_close(q_out, q, atol=1e-6, rtol=1e-6)
 
 
+def test_class_b_dispatches_before_eager_qwen_math(monkeypatch):
+    sentinel = (object(), object())
+    calls = []
+
+    class _CudaInput:
+        is_cuda = True
+        dtype = torch.bfloat16
+        ndim = 4
+        shape = (1, 2, 1, 4)
+
+    def _stock(q, k, cos, sin, *, interleaved):
+        calls.append((q, k, cos, sin, interleaved))
+        return sentinel
+
+    monkeypatch.setattr(qwen3_5_shared, "stock_fused_apply_rotary_pos_emb", _stock)
+    q, k = (_CudaInput() for _ in range(2))
+    cos = torch.zeros((1, 2, 4), dtype=torch.float32)
+    sin = torch.zeros_like(cos)
+
+    assert qwen3_5_shared.qwen3_5_apply_rotary_pos_emb(q, k, cos, sin, class_b=True) is sentinel
+    assert calls == [(q, k, cos, sin, False)]
+
+
+@pytest.mark.parametrize(
+    ("q", "k", "cos", "sin", "message"),
+    [
+        (
+            torch.zeros((1, 2, 1, 4), dtype=torch.bfloat16),
+            torch.zeros((1, 2, 1, 4), dtype=torch.bfloat16),
+            torch.zeros((1, 2, 4), dtype=torch.float32),
+            torch.zeros((1, 2, 4), dtype=torch.float32),
+            "requires CUDA",
+        ),
+        (
+            torch.zeros((1, 2, 1, 4), dtype=torch.float32),
+            torch.zeros((1, 2, 1, 4), dtype=torch.float32),
+            torch.zeros((1, 2, 4), dtype=torch.float32),
+            torch.zeros((1, 2, 4), dtype=torch.float32),
+            "requires CUDA",
+        ),
+    ],
+)
+def test_class_b_fails_loudly_outside_cuda_contract(q, k, cos, sin, message):
+    with pytest.raises(RuntimeError, match=message):
+        qwen3_5_apply_rotary_pos_emb(q, k, cos, sin, class_b=True)
+
+
 @pytest.mark.parametrize("modeling_module", [modeling_qwen3_5, modeling_qwen3_5_moe])
 def test_qwen35_modeling_does_not_pass_interleaved_to_rotary(modeling_module):
     """Regression: Qwen3.5/3.6 attention must NOT pass `interleaved=` into
@@ -129,3 +179,31 @@ def test_qwen35_modeling_does_not_pass_interleaved_to_rotary(modeling_module):
         f"{modeling_module.__name__} calls `qwen3_5_apply_rotary_pos_emb(..., interleaved=...)` "
         f"at line(s) {offenders}; this must not be plumbed from `mrope_interleaved`."
     )
+
+
+@pytest.mark.parametrize(
+    ("attention_type", "config_type"),
+    [
+        (modeling_qwen3_5.Qwen3_5Attention, Qwen3_5Config),
+        (modeling_qwen3_5_moe.Qwen3_5MoeAttention, Qwen3_5MoeConfig),
+    ],
+)
+def test_qwen35_exact_attention_casts_post_rope_qk_to_bf16(attention_type, config_type):
+    config = config_type(
+        hidden_size=8,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=4,
+        num_hidden_layers=1,
+        layer_types=["full_attention"],
+    )
+    config._attention_cast_bf16 = True
+    attention = attention_type(config, layer_idx=0)
+
+    hidden = torch.randn(1, 3, 8)
+    cos, sin = _build_halved_cos_sin(batch=1, seq=3, head_dim=4)
+    query, key, value = attention._project_qkv(hidden, (cos, sin))
+
+    assert query.dtype is torch.bfloat16
+    assert key.dtype is torch.bfloat16
+    assert value.dtype is torch.float32

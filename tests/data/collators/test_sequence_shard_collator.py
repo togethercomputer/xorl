@@ -188,3 +188,50 @@ class TestCollatorCall:
             result["teacher_hidden_states"],
             torch.tensor([[[3.25, 3.5], [4.25, 4.5], [0.0, 0.0]]]),
         )
+
+    @pytest.mark.parametrize("cp_rank", [0, 15])
+    @patch("xorl.data.collators.sequence_shard_collator.get_parallel_state")
+    def test_drgrpo_side_channels_follow_cp16_target_shard(self, mock_parallel_state, cp_rank):
+        """Canonical and reference logprobs must follow the same padded CP slice as labels."""
+        cp_size = 16
+        seq_len = 4099
+        chunk_size = 257
+        mock_parallel_state.return_value = _make_mock_ps(cp_size=cp_size, cp_rank=cp_rank)
+        collator = TextSequenceShardCollator(pad_token_id=0)
+
+        input_ids = torch.arange(seq_len).unsqueeze(0)
+        target_tokens = torch.cat([torch.arange(1, seq_len), torch.tensor([IGNORE_INDEX])]).unsqueeze(0)
+        old_logprobs = torch.arange(seq_len, dtype=torch.float32).add(0.25).unsqueeze(0)
+        advantages = torch.arange(seq_len, dtype=torch.float32).add(0.5).unsqueeze(0)
+        ref_logprobs = torch.arange(seq_len, dtype=torch.float32).neg().sub(0.75).unsqueeze(0)
+        result = collator(
+            {
+                "input_ids": input_ids,
+                "attention_mask": torch.ones_like(input_ids),
+                "labels": target_tokens.clone(),
+                "target_tokens": target_tokens.clone(),
+                "position_ids": torch.arange(seq_len).unsqueeze(0),
+                "old_logprobs": old_logprobs,
+                "advantages": advantages,
+                "ref_logprobs": ref_logprobs,
+            }
+        )
+
+        start = cp_rank * chunk_size
+        end = min(start + chunk_size, seq_len)
+        valid_length = end - start
+        assert result["labels"].shape == (1, chunk_size)
+        for field in ("target_tokens", "old_logprobs", "advantages", "ref_logprobs"):
+            assert result[field].shape == result["labels"].shape
+
+        torch.testing.assert_close(result["target_tokens"][0, :valid_length], target_tokens[0, start:end])
+        torch.testing.assert_close(result["old_logprobs"][0, :valid_length], old_logprobs[0, start:end])
+        torch.testing.assert_close(result["advantages"][0, :valid_length], advantages[0, start:end])
+        torch.testing.assert_close(result["ref_logprobs"][0, :valid_length], ref_logprobs[0, start:end])
+        if valid_length < chunk_size:
+            assert torch.equal(
+                result["target_tokens"][0, valid_length:],
+                torch.full((chunk_size - valid_length,), IGNORE_INDEX),
+            )
+            for field in ("old_logprobs", "advantages", "ref_logprobs"):
+                assert torch.equal(result[field][0, valid_length:], torch.zeros(chunk_size - valid_length))

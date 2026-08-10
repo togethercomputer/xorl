@@ -6,22 +6,18 @@ the trees to frozen BYTES: deterministic integer-assembled inputs (no torch
 RNG, no libm — identical on every venv) run through this repo's kernels and
 must hash to the goldens recorded at the 2026-07-09 N6 re-anchor
 (data/bi_golden_trees.json; serving twin checks the same file). v1 trees are
-the kill-switch reference; v2 trees are the [PROD] contract. Goldens are
+the frozen reference; v2 trees are the [PROD] contract. Goldens are
 H100/sm90-specific. Regenerate with a paired trainer/serving golden capture
 and update the JSON fixture in the same change.
 """
 
 import hashlib
 import json
-import os
 from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
-
-
-os.environ["XORL_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM"] = "0"  # goldens pin the Triton tree
 
 from xorl.ops import batch_invariant_ops as v1
 from xorl.ops import bi_families_v2 as v2
@@ -36,6 +32,12 @@ requires_h100 = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (9, 0),
     reason="goldens are H100/sm90-specific",
 )
+
+
+@pytest.fixture(autouse=True)
+def _pin_triton_reference_tree(monkeypatch):
+    """Keep this module's golden oracle local to each test invocation."""
+    monkeypatch.setattr(v1, "_ENABLE_MM_DEEPGEMM", False)
 
 
 def _splitmix64(n, seed):
@@ -162,6 +164,14 @@ def test_v2_norm_goldens():
         "norm_v2_zero_centered",
         out=v2.rms_norm_v2(bf16((64, REAL_H), 131)[:, :DQK].contiguous(), w(DQK, 102), EPS, zero_centered=True),
     )
+    out, res = v2.rms_norm_v2(
+        bf16((64, REAL_H), 131),
+        w(REAL_H, 133),
+        EPS,
+        residual=bf16((64, REAL_H), 132),
+        zero_centered=True,
+    )
+    _check("norm_v2_zero_centered_residual_m64_h3840", out=out, residual_out=res)
     packed = bf16((256, (8 + 2 * 2) * DQK), 401)
     _check("qk_v2_strided_t256_h8_d128", out=v2.qk_norm_v2(packed[:, : 8 * DQK], w(DQK, 102), EPS, head_dim=DQK))
 

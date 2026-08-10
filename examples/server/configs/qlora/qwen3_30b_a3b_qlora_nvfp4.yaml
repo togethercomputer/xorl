@@ -46,7 +46,8 @@ quant_group_size: 16
 enable_lora: true
 lora_rank: 32
 lora_alpha: 32
-# Use default target_modules (fused: qkv_proj, o_proj, gate_up_proj, down_proj)
+moe_hybrid_shared_lora: true
+lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
 # Skip initial checkpoint
 skip_initial_checkpoint: true

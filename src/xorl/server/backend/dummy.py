@@ -93,6 +93,10 @@ class DummyBackend(Backend):
         }
         return result
 
+    async def abort_gradient_epoch(self, model_id="default", request_id=None):
+        self._maybe_fail("abort_gradient_epoch")
+        return {"success": True, "model_id": model_id, "step": self._step}
+
     async def save_state(
         self, checkpoint_path=None, save_optimizer=True, use_timestamp=False, model_id=None, request_id=None
     ):
@@ -154,83 +158,6 @@ class DummyBackend(Backend):
 
     async def kill_session(self, model_id="default", save_checkpoint=True, request_id=None):
         return {"success": True, "message": "dummy session killed"}
-
-    async def start_zorl_generation(
-        self,
-        model_id="default",
-        num_pairs=None,
-        materialization=None,
-        owner_url=None,
-        request_id=None,
-    ):
-        global_num_pairs = int(num_pairs or 1)
-        shard_index = int((materialization or {}).get("shard_index", 0))
-        num_shards = int((materialization or {}).get("num_shards", 1))
-        return {
-            "model_id": model_id,
-            "generation_id": f"{model_id}-family-000000-g000000",
-            "generation_index": 0,
-            "family_id": f"{model_id}-family-000000",
-            "family_refreshed": True,
-            "b_sigma": 0.01,
-            "num_pairs": global_num_pairs,
-            "global_num_pairs": global_num_pairs,
-            "global_population": 2 * global_num_pairs,
-            "shard_index": shard_index,
-            "num_shards": num_shards,
-            "local_num_pairs": 1,
-            "candidates": [
-                {
-                    "candidate_id": f"{model_id}-family-000000-g000000-p0000+",
-                    "perturbation_index": 0,
-                    "direction": "positive",
-                    "b_seed": 123,
-                    "path": "/tmp/dummy-zorl/+",
-                    "owner_url": owner_url,
-                },
-                {
-                    "candidate_id": f"{model_id}-family-000000-g000000-p0000-",
-                    "perturbation_index": 0,
-                    "direction": "negative",
-                    "b_seed": 123,
-                    "path": "/tmp/dummy-zorl/-",
-                    "owner_url": owner_url,
-                },
-            ],
-        }
-
-    async def apply_zorl_rewards(
-        self,
-        model_id="default",
-        generation_id="",
-        candidate_rewards=None,
-        learning_rate=None,
-        request_id=None,
-    ):
-        self._step += 1
-        return {
-            "model_id": model_id,
-            "generation_id": generation_id,
-            "applied": True,
-            "used_pairs": 1,
-            "dropped_pairs": 0,
-            "family_id": f"{model_id}-family-000000",
-            "next_generation_index": self._step,
-            "deleted_candidates": 2,
-            "metrics": {
-                "reward_mean": 0.5,
-                "reward_std": 0.1,
-                "pair_delta_mean": 0.2,
-                "pair_delta_std": 0.0,
-                "update_norm": 1.0,
-                "grad_norm": 1.0,
-                "learning_rate": learning_rate or 1e-3,
-                "b_sigma": 0.01,
-            },
-        }
-
-    async def abort_zorl_generation(self, model_id="default", generation_id="", request_id=None):
-        return {"success": True, "model_id": model_id, "generation_id": generation_id, "deleted_candidates": 2}
 
     async def health_check(self, request_id=None):
         return {"status": "healthy"}

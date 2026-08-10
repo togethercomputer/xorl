@@ -2,6 +2,7 @@
 
 import math
 import os
+import re
 
 import pytest
 
@@ -29,10 +30,16 @@ class TestQwen3_30B_MoE:
 
     @skip_if_gpu_count_less_than(4)
     @pytest.mark.slow
-    def test_moe_ep2_fsdp4_lora_sft(self, tmp_workspace):
-        """Qwen3-30B-A3B MoE EP=2 + FSDP(dp_shard=4) with LoRA on 4 GPUs."""
+    def test_moe_ep2_efsd2_hybrid_shared_lora_sft(self, tmp_workspace, monkeypatch):
+        """Qwen3-30B-A3B native MoE EP=2 + eFSDP=2 with hybrid shared LoRA."""
+        # Exercise the expensive correctness diagnostics in the production
+        # topology gate: shared gradients/weights/moments must agree across EP
+        # replicas, while expert-local rectangles remain single-owner. The
+        # positive reducer telemetry assertion proves this is the shared-factor
+        # path rather than the vacuous disjoint-expert path.
+        monkeypatch.setenv("XORL_VALIDATE_ADAPTER_REPLICAS", "1")
         model_dir = "Qwen/Qwen3-30B-A3B"
-        output_dir = os.path.join(tmp_workspace, "output_moe_ep2_fsdp4")
+        output_dir = os.path.join(tmp_workspace, "output_moe_ep2_efsd2")
         api_port = _get_free_port()
 
         config_path = generate_server_config(
@@ -44,16 +51,25 @@ class TestQwen3_30B_MoE:
             moe_implementation="native",
             enable_lora=True,
             lora_rank=8,
+            moe_hybrid_shared_lora=True,
         )
 
         server = ServerProcess(config_path, num_gpus=4, api_port=api_port, output_dir=output_dir)
         try:
             _start_server_or_fail(server, timeout=600)
 
-            _, training_client = _create_lora_client(server.base_url, model_dir, model_id="test-moe-ep2-fsdp4")
+            _, training_client = _create_lora_client(server.base_url, model_dir, model_id="test-moe-ep2-efsd2")
             data = generate_random_sft_data(num_samples=8, seq_len=64, vocab_size=151936)
             losses = run_sft_steps(training_client, data, num_steps=2)
             assert all(not math.isnan(l) for l in losses), f"NaN in losses: {losses}"
             assert all(l > 0 for l in losses), f"Non-positive loss: {losses}"
+            log = server.get_log()
+            assert "hybrid_shared=True" in log
+            assert re.search(
+                r"EP replicated gradient sync: configured_parameters=[1-9][0-9]* "
+                r"participating_parameters=[1-9][0-9]* buckets=[1-9][0-9]* "
+                r"gradient_bytes=[1-9][0-9]* reduced_bytes=[1-9][0-9]*",
+                log,
+            ), "shared-factor reducer telemetry was not emitted"
         finally:
             server.stop()

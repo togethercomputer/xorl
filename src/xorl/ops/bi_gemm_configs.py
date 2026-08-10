@@ -8,15 +8,10 @@ was admitted only after torch.equal against the pinned baseline on multiple
 seeds plus a cross-M row-invariance check (xorl
 experiments/k3_tests/tools/tune_bi_gemm.py, H100, 2026-07-07).
 
-This file is vendored IDENTICALLY in both engines
-(sglang/srt/batch_invariant_ops/bi_gemm_configs.py and
-xorl/ops/bi_gemm_configs.py) — one table, shipped to both, re-gated bitwise.
-Kill switch: SGLANG_BI_GEMM_CONFIG_TABLE=0 or XORL_BI_GEMM_CONFIG_TABLE=0
-falls back to the pinned baseline config everywhere (bits identical either way).
+The shape-keyed table is the production configuration. The pinned baseline is
+retained only as an internal launch-failure fallback; it is not a user-selectable
+mode.
 """
-
-import os
-
 
 # The bit-relevant axis: pinned per dtype, NEVER shape-keyed.
 PINNED_BLOCK_K = {
@@ -25,7 +20,7 @@ PINNED_BLOCK_K = {
     "torch.float32": 32,
 }
 
-# The pre-R1 one-config-per-dtype baselines (also the kill-switch fallback).
+# The pre-R1 one-config-per-dtype baselines (also the launch-failure fallback).
 BASELINE_CONFIG = {
     "torch.bfloat16": {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "GROUP_SIZE_M": 8, "num_stages": 3, "num_warps": 8},
     "torch.float16": {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "GROUP_SIZE_M": 8, "num_stages": 3, "num_warps": 8},
@@ -96,16 +91,6 @@ TABLE = {
 # END GENERATED TABLE
 
 
-def _table_enabled() -> bool:
-    return not (
-        os.environ.get("SGLANG_BI_GEMM_CONFIG_TABLE", "1") == "0"
-        or os.environ.get("XORL_BI_GEMM_CONFIG_TABLE", "1") == "0"
-    )
-
-
-_TABLE_ENABLED = _table_enabled()
-
-
 # Conservative H100 dynamic-smem budget. The persistent kernel needs
 # num_stages * (BM*BK + BK*BN) * in_elt for the pipeline plus BM*BN*out_elt for
 # the epilogue store staging when the output is wider than the inputs (the BI
@@ -138,20 +123,19 @@ def lookup_mm_config(dtype, M: int, N: int, K: int, out_itemsize: int | None = N
     in_elt = _ELT[key]
     out_elt = out_itemsize if out_itemsize is not None else in_elt
     cfg = None
-    if _TABLE_ENABLED:
-        buckets = TABLE.get((key, K, N))
-        exact = buckets is not None
-        if buckets is None:
-            buckets = CLASS_DEFAULTS.get(key)
-        if buckets is not None:
-            for max_m, bucket_cfg in buckets:
-                if max_m is None or M <= max_m:
-                    # exact entries were measured/launch-validated at their out
-                    # dtype; class defaults get the conservative smem model (the
-                    # launch sites also fall back to baseline on OutOfResources)
-                    if exact or _fits(bucket_cfg, block_k, in_elt, out_elt):
-                        cfg = bucket_cfg
-                    break
+    buckets = TABLE.get((key, K, N))
+    exact = buckets is not None
+    if buckets is None:
+        buckets = CLASS_DEFAULTS.get(key)
+    if buckets is not None:
+        for max_m, bucket_cfg in buckets:
+            if max_m is None or M <= max_m:
+                # exact entries were measured/launch-validated at their out
+                # dtype; class defaults get the conservative smem model (the
+                # launch sites also fall back to baseline on OutOfResources)
+                if exact or _fits(bucket_cfg, block_k, in_elt, out_elt):
+                    cfg = bucket_cfg
+                break
     if cfg is None:
         cfg = BASELINE_CONFIG[key]
     return dict(cfg, BLOCK_SIZE_K=block_k)

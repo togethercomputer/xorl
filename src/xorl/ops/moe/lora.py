@@ -14,7 +14,6 @@ The key advantage over weight-merging approaches:
 """
 
 import torch
-import torch.distributed as dist
 
 from xorl.ops.group_gemm.kernel.moe import expert_histogram, moe_add_gather, moe_gather, moe_scatter
 from xorl.ops.moe.triton import _apply_swiglu_clamp_backward, _maybe_clamp_swiglu_gate
@@ -455,26 +454,21 @@ def make_ep_lora_compute(gemm_nk, gemm_mn):
 
             grad_permute_tokens = grad_permute_tokens_1 + grad_permute_tokens_2
 
-            # === Reduce gradients for shared weights ===
-            from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
-
-            ep_group = get_parallel_state().ep_group
-
+            # Keep shared-factor gradients local. The adapter optimizer owns
+            # the one canonical coalesced EP reduction after all streamed
+            # forward/backward calls have been captured.
             if gate_A_shared:
                 grad_gate_proj_lora_A = grad_gate_proj_lora_A_full.sum(dim=0, keepdim=True)
-                dist.all_reduce(grad_gate_proj_lora_A, group=ep_group)
             else:
                 grad_gate_proj_lora_A = grad_gate_proj_lora_A_full
 
             if up_A_shared:
                 grad_up_proj_lora_A = grad_up_proj_lora_A_full.sum(dim=0, keepdim=True)
-                dist.all_reduce(grad_up_proj_lora_A, group=ep_group)
             else:
                 grad_up_proj_lora_A = grad_up_proj_lora_A_full
 
             if down_B_shared:
                 grad_down_proj_lora_B = grad_down_proj_lora_B_full.sum(dim=0, keepdim=True)
-                dist.all_reduce(grad_down_proj_lora_B, group=ep_group)
             else:
                 grad_down_proj_lora_B = grad_down_proj_lora_B_full
 

@@ -1,11 +1,4 @@
-"""Server-mode engagement regression for XORL_BI_TRUNK_LINEAR.
-
-#467 as merged read the env only in the offline Trainer class, so server-mode RL
-training (ModelRunner -> build_training_model) silently never wrapped — the flag
-was a no-op in every server-RL run. These tests pin the build_training_model
-wire: with the env set, trunk linears must be wrapped BEFORE parallelization
-(FSDP2 shards the wrapped modules), and without it nothing is touched.
-"""
+"""Server-training model-program selection before FSDP2."""
 
 from types import SimpleNamespace
 
@@ -13,6 +6,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from xorl.ops import bi_families_v2
 from xorl.ops.batch_invariant_ops import is_trunk_linear_contract_enabled, set_trunk_linear_contract
 from xorl.trainers.model_builder import build_training_model
 
@@ -41,20 +35,34 @@ class TinyTrunkModel(nn.Module):
         self.lm_head = nn.Linear(16, 8, bias=False, dtype=torch.bfloat16)
 
 
+class ExactTinyTrunkModel(TinyTrunkModel):
+    def _apply_qwen35_gdn_exact(self):
+        from xorl.ops.batch_invariant_ops import wrap_trunk_linears_batch_invariant
+
+        return wrap_trunk_linears_batch_invariant(self)
+
+
 @pytest.fixture(autouse=True)
 def _reset_contract_state():
     yield
     set_trunk_linear_contract(False)
+    bi_families_v2._select_nonexact_families()
 
 
-def _build(monkeypatch, captured):
+def _build(monkeypatch, captured, *, model=None, server_training=False, freeze_router=False):
     def fake_parallelize(model, **_kwargs):
         captured["wrapped_at_parallelize"] = sum(
             1 for _, m in model.named_modules() if getattr(m, "_xorl_bi_trunk_wrapped", False)
         )
         return model
 
-    monkeypatch.setattr("xorl.trainers.model_builder.build_foundation_model", lambda **_kwargs: TinyTrunkModel())
+    model = TinyTrunkModel() if model is None else model
+
+    def fake_build_foundation_model(**kwargs):
+        captured["server_training_at_build"] = kwargs["server_training"]
+        return model
+
+    monkeypatch.setattr("xorl.trainers.model_builder.build_foundation_model", fake_build_foundation_model)
     monkeypatch.setattr("xorl.trainers.model_builder._parallelize", fake_parallelize)
     monkeypatch.setattr("xorl.trainers.model_builder.helper.print_device_mem_info", lambda *args, **kwargs: None)
 
@@ -63,23 +71,58 @@ def _build(monkeypatch, captured):
         weights_path="unused",
         enable_mixed_precision=False,
         enable_gradient_checkpointing=False,
+        server_training=server_training,
+        freeze_router=freeze_router,
     )
 
 
-def test_server_mode_build_wraps_trunk_linears_with_env(monkeypatch):
-    monkeypatch.setenv("XORL_BI_TRUNK_LINEAR", "1")
+def test_exact_server_model_wraps_trunk_linears_before_parallelize(monkeypatch):
     captured = {}
-    result = _build(monkeypatch, captured)
+    result = _build(monkeypatch, captured, model=ExactTinyTrunkModel(), server_training=True)
 
+    assert captured["server_training_at_build"] is True
     assert captured["wrapped_at_parallelize"] == 10, "wrap must land before parallelization (pre-FSDP2)"
     assert not getattr(result.model.lm_head, "_xorl_bi_trunk_wrapped", False)
     assert is_trunk_linear_contract_enabled()
 
 
-def test_server_mode_build_does_not_wrap_without_env(monkeypatch):
-    monkeypatch.delenv("XORL_BI_TRUNK_LINEAR", raising=False)
+def test_non_exact_server_model_does_not_wrap(monkeypatch):
     captured = {}
-    _build(monkeypatch, captured)
+    _build(monkeypatch, captured, server_training=True)
 
+    assert captured["server_training_at_build"] is True
     assert captured["wrapped_at_parallelize"] == 0
     assert not is_trunk_linear_contract_enabled()
+
+
+def test_exact_model_is_not_implicitly_engaged_outside_server_training(monkeypatch):
+    captured = {}
+    _build(monkeypatch, captured, model=ExactTinyTrunkModel(), server_training=False)
+
+    assert captured["server_training_at_build"] is False
+    assert captured["wrapped_at_parallelize"] == 0
+
+
+def test_glm52_selects_v2_family_structurally(monkeypatch):
+    captured = {}
+    model = TinyTrunkModel()
+    model.config = SimpleNamespace(
+        model_type="xorl_glm5",
+        indexer_types=["full"],
+        _glm52_exact_contract=True,
+    )
+    monkeypatch.setenv("XORL_FAMILIES_V2", "0")
+
+    _build(monkeypatch, captured, model=model, freeze_router=True)
+
+    assert bi_families_v2.families_v2_enabled() is True
+
+
+def test_ordinary_model_restores_nonexact_family_selection(monkeypatch):
+    captured = {}
+    bi_families_v2._select_glm52_families_v2()
+    monkeypatch.setenv("XORL_FAMILIES_V2", "0")
+
+    _build(monkeypatch, captured)
+
+    assert bi_families_v2.families_v2_enabled() is False

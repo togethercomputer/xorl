@@ -1,16 +1,5 @@
-"""Vendoring gates for the families-v2 contract module, trainer side.
+"""Functional tests for the trainer's families-v2 reduction trees."""
 
-Serving twin: sglang test/registered/rl/test_bi_families_v2.py, which pins the
-same digest. ``bi_families_v2.py`` is vendored byte-identical into both engines
-because the trainer and the sampler must evaluate the same reduction trees; if
-the two copies can drift, that guarantee is only a convention.
-
-Single-repo CI has no sibling checkout, so each suite pins the file's sha256.
-Editing either copy reddens that repo's gate until the digest is re-pinned in
-both suites, which is exactly the byte-equality contract.
-"""
-
-import hashlib
 import os
 from pathlib import Path
 
@@ -20,8 +9,6 @@ import torch
 from xorl.ops import bi_families_v2 as v2
 from xorl.ops.batch_invariant_ops import bi_lm_head_selected_logprob
 
-
-BI_FAMILIES_V2_SHA256 = "fd4c5bac2a52d2148b8e4d0e9afa4e46e8c62689a68c2bc0e309f671597799e6"
 
 H, V = 1024, 20480
 
@@ -40,44 +27,39 @@ def test_vendored_module_is_self_contained():
         assert banned not in source, f"engine import {banned!r} in the vendored module"
 
 
-def test_vendored_module_matches_pinned_digest():
-    ours = hashlib.sha256(Path(v2.__file__).read_bytes()).hexdigest()
-    assert ours == BI_FAMILIES_V2_SHA256, (
-        f"vendored bi_families_v2.py changed (sha256 {ours}); if that is intended, re-pin "
-        f"BI_FAMILIES_V2_SHA256 in xorl tests/ops/test_bi_families_v2.py AND in the serving "
-        f"engine's test/registered/rl/test_bi_families_v2.py, and land both together"
-    )
-
-
-def test_vendored_copies_are_byte_identical_if_sibling_present():
-    """Strictly stronger than the digest gate, but needs both trees present."""
-    sibling = os.environ.get("BI_FAMILIES_V2_SIBLING")
-    if not sibling or not Path(sibling).exists():
-        pytest.skip("sibling engine checkout not available (set BI_FAMILIES_V2_SIBLING)")
-    ours = hashlib.sha256(Path(v2.__file__).read_bytes()).hexdigest()
-    theirs = hashlib.sha256(Path(sibling).read_bytes()).hexdigest()
-    assert ours == theirs, "vendored bi_families_v2.py copies drifted"
-
-
-def test_kill_switch_is_a_paired_rollback():
-    """Either engine's variable rolls this engine back, so one setting applied
-    to both moves both. A setting that moved only one would put the trainer and
-    the sampler on different trees."""
+def test_nonexact_family_selection_preserves_legacy_rollback():
     saved = {name: os.environ.get(name) for name in v2.FAMILIES_V2_ENV_VARS}
+    selected = v2._EXACT_FAMILIES_VERSION
     try:
+        v2._EXACT_FAMILIES_VERSION = None
         for name in v2.FAMILIES_V2_ENV_VARS:
             os.environ.pop(name, None)
-        assert v2.families_v2_enabled() is True, "families v2 is default on"
+        assert v2.families_v2_enabled() is True
         for name in v2.FAMILIES_V2_ENV_VARS:
             os.environ[name] = "0"
-            assert v2.families_v2_enabled() is False, f"{name}=0 must roll back"
+            assert v2.families_v2_enabled() is False
             del os.environ[name]
     finally:
+        v2._EXACT_FAMILIES_VERSION = selected
         for name, value in saved.items():
             if value is None:
                 os.environ.pop(name, None)
             else:
                 os.environ[name] = value
+
+
+def test_exact_family_selection_ignores_legacy_rollback(monkeypatch):
+    selected = v2._EXACT_FAMILIES_VERSION
+    try:
+        monkeypatch.setenv("XORL_FAMILIES_V2", "0")
+        v2._select_glm52_families_v2()
+        assert v2.families_v2_enabled() is True
+
+        monkeypatch.setenv("XORL_FAMILIES_V2", "1")
+        v2._select_qwen35_families_v1()
+        assert v2.families_v2_enabled() is False
+    finally:
+        v2._EXACT_FAMILIES_VERSION = selected
 
 
 @requires_cuda

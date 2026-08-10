@@ -16,12 +16,21 @@ LoRA weight parameter names are preserved exactly for checkpoint compatibility::
 """
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Optional
 
 import torch
 import torch.nn as nn
 
+from xorl.distributed.gradient_reduction import GradientReductionDomain
+
+from ....lora.expert_adapter_contract import (
+    ExpertAdapterFactorOwnership,
+    ExpertAdapterGradientContract,
+    gated_expert_factor_ownership,
+    gated_expert_factor_shapes,
+    validate_gated_silu_expert_adapter_semantics,
+)
 from ....lora.fold import (
     FoldedLoraWeightGateUpGKN,
     FoldedLoraWeightGKN,
@@ -33,7 +42,15 @@ from ....lora.modules.base import LoraModule
 from ....ops.group_gemm.kernel import compute_lora_scaling
 from ....utils import logging
 from ..activations import ACT2FN
-from .backend import EP_COMBINE, EP_DISPATCH, EP_EXPERT_COMPUTE_LORA, MOE_EXPERT_BACKENDS_LORA
+from .backend import (
+    EP_COMBINE,
+    EP_DISPATCH,
+    EP_EXPERT_COMPUTE_LORA,
+    MOE_EXPERT_BACKENDS_LORA,
+    ep_lora_gradient_reduction_domain,
+    expert_adapter_backend_contract,
+    zero_token_lora_output,
+)
 from .common import split_gate_up_proj
 
 
@@ -53,6 +70,14 @@ class MoELoRAConfig:
     def __post_init__(self):
         if self.target_modules is None:
             self.target_modules = ["gate_proj", "up_proj", "down_proj"]
+        selected = tuple(self.target_modules)
+        supported = {"gate_proj", "up_proj", "down_proj"}
+        unsupported = set(selected) - supported
+        if not selected or len(set(selected)) != len(selected) or unsupported:
+            raise ValueError(
+                f"MoE LoRA target_modules must be a non-empty subset of {sorted(supported)}; got {list(selected)!r}"
+            )
+        self.target_modules = list(selected)
 
 
 class MoEExpertsLoRA(LoraModule, nn.Module):
@@ -70,6 +95,48 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
     weights at the local (sharded) shape.
     """
 
+    def adapter_gradient_producer_family(self) -> str:
+        """Return the fixed producer selected by this execution plan."""
+
+        from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
+
+        if lora_merged_forward_enabled(self) or get_parallel_state().ep_enabled or self.moe_implementation != "eager":
+            return "fused_managed"
+        return "module_managed"
+
+    @property
+    def expert_adapter_gradient_contract(self) -> ExpertAdapterGradientContract:
+        """Declare the configured backend and factor ownership to the compiler."""
+
+        try:
+            validate_gated_silu_expert_adapter_semantics(self)
+        except NotImplementedError as error:
+            raise ValueError(str(error)) from error
+        roles = tuple(self.lora_config.target_modules)
+        backend = replace(
+            expert_adapter_backend_contract(self.moe_implementation),
+            producer_family=self.adapter_gradient_producer_family(),
+        )
+        return ExpertAdapterGradientContract(
+            backend=backend,
+            factor_layout="gkn_gate_up_down",
+            projection_roles=roles,
+            factor_ownership=gated_expert_factor_ownership(
+                roles,
+                hybrid_shared=self.lora_config.hybrid_shared,
+            ),
+            factor_shapes=gated_expert_factor_shapes(
+                roles,
+                num_experts=self.num_experts,
+                hidden_size=self.hidden_dim,
+                intermediate_size=self.intermediate_size,
+                rank=self.r,
+                hybrid_shared=self.lora_config.hybrid_shared,
+            ),
+            supports_efsdp_replication=True,
+            guard_fields=(("expert_hybrid_shared", self.lora_config.hybrid_shared),),
+        )
+
     def __init__(
         self,
         num_experts: int,
@@ -86,15 +153,30 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         self.hidden_dim = hidden_dim
         self.intermediate_size = intermediate_size
         self.hidden_act = hidden_act
+        self.gated = True
         self.moe_implementation = moe_implementation
         self.lora_config = lora_config or MoELoRAConfig()
         self.r = self.lora_config.r
         self.lora_alpha = self.lora_config.lora_alpha
         self.swiglu_limit = float(swiglu_limit)
+        self.gate_up_bias = None
+        self.down_bias = None
         self.active_r = self.r
         self.active_lora_alpha = self.lora_alpha
         self.use_rslora = self.lora_config.use_rslora
-        self.swiglu_limit = float(swiglu_limit)
+        self._ep_gradient_reduction_domain = ep_lora_gradient_reduction_domain(moe_implementation)
+        factor_ownership = gated_expert_factor_ownership(
+            self.lora_config.target_modules,
+            hybrid_shared=self.lora_config.hybrid_shared,
+        )
+        self._ep_gradient_reduction_by_parameter = {
+            name: (
+                self._ep_gradient_reduction_domain
+                if ownership is ExpertAdapterFactorOwnership.EP_REPLICATED
+                else GradientReductionDomain.NONE
+            )
+            for name, ownership in factor_ownership
+        }
 
         # Base weights (frozen) in (G, K, N) format
         self.gate_up_proj = nn.Parameter(
@@ -121,6 +203,27 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         # - gate/up: lora_A shared [1, hidden, r], lora_B per-expert [E, r, inter]
         # - down: lora_A per-expert [E, inter, r], lora_B shared [1, r, hidden]
         shared_exp = 1 if hybrid else num_exp
+
+        # ParallelPlan shards parameters, not buffers. Unselected projection
+        # factors are structural zeros consumed by the same fused backend API,
+        # so their owner-specific expert dimension must already be EP-local.
+        # A post-EP construction explicitly supplies a smaller num_local_experts;
+        # a pre-EP construction derives the future local size from parallel state.
+        self._zero_factor_experts = num_exp
+        if num_local_experts is None or num_local_experts == num_experts:
+            try:
+                from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
+
+                parallel_state = get_parallel_state()
+                ep_size = int(parallel_state.ep_size) if parallel_state.ep_enabled else 1
+                if ep_size > 1:
+                    if num_exp % ep_size:
+                        raise ValueError(f"Expert count {num_exp} is not divisible by expert parallel size {ep_size}")
+                    self._zero_factor_experts = num_exp // ep_size
+            except RuntimeError:
+                # Construction outside an initialized distributed runtime is
+                # local; a later EP plan is responsible for parameters.
+                pass
 
         self._create_lora_params("gate_proj", shared_exp, num_exp, r, hidden_dim, intermediate_size)
         self._create_lora_params("up_proj", shared_exp, num_exp, r, hidden_dim, intermediate_size)
@@ -164,8 +267,18 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
             setattr(self, f"{name}_lora_A", nn.Parameter(torch.empty(A_experts, in_features, r)))
             setattr(self, f"{name}_lora_B", nn.Parameter(torch.empty(B_experts, r, out_features)))
         else:
-            self.register_buffer(f"{name}_lora_A", torch.zeros(A_experts, in_features, r))
-            self.register_buffer(f"{name}_lora_B", torch.zeros(B_experts, r, out_features))
+            local_A_experts = 1 if A_experts == 1 else self._zero_factor_experts
+            local_B_experts = 1 if B_experts == 1 else self._zero_factor_experts
+            self.register_buffer(
+                f"{name}_lora_A",
+                torch.zeros(local_A_experts, in_features, r),
+                persistent=False,
+            )
+            self.register_buffer(
+                f"{name}_lora_B",
+                torch.zeros(local_B_experts, r, out_features),
+                persistent=False,
+            )
 
     def reset_lora_parameters(self):
         """Initialize LoRA weights: kaiming_uniform for A, zeros for B."""
@@ -217,7 +330,7 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         self.reset_lora_parameters()
 
     # ------------------------------------------------------------------
-    # Merged-forward K3 contract lane (XORL_LORA_MERGED_FORWARD=1)
+    # Merged-forward exact-model contract lane
     # ------------------------------------------------------------------
 
     def sglang_moe_tp_sim_enabled(self, parallel_state) -> bool:
@@ -226,11 +339,11 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
 
     def sglang_fused_experts_auto_supported(self) -> bool:
         """Auto-default eligibility mirror of :meth:`MoEExperts.sglang_fused_experts_auto_supported`:
-        under ``XORL_LORA_MERGED_FORWARD=1`` the adapted experts fold their delta
+        under the exact model program the adapted experts fold their delta
         (canonical fold) and run the contracted serving kernel on the merged
         weights, so the ep=1 auto-enable applies to them too."""
         return (
-            lora_merged_forward_enabled()
+            lora_merged_forward_enabled(self)
             and self.hidden_act in {"silu", "gelu", "gelu_tanh"}
             and self.swiglu_limit == 0.0
         )
@@ -261,11 +374,10 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
 
         Fold = :func:`xorl.lora.fold.canonical_lora_fold_gkn` per projection
         (fp32 accumulate, cast once) — the exact arithmetic the weight-sync
-        merged extraction ships under the same flag, so the trainer forward and
+        merged extraction ships under the same exact program, so the trainer forward and
         the serving engine see identical merged bytes. Cached per module, keyed
         on adapter/base param versions and the active rank/alpha; the optimizer
-        step's in-place update invalidates the key. ``XORL_LORA_MERGED_FORWARD_CACHE=0``
-        refolds on every call (bounded memory)."""
+        step's in-place update invalidates the key."""
         cache = getattr(self, "_merged_weight_cache", None)
         if cache is None:
             cache = {}
@@ -351,9 +463,8 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         forward on the merged weights (bit-identical to a serving engine that
         received the folded weights), backward through the low-rank factors.
 
-        Mirrors :meth:`MoEExperts.sglang_fused_experts_forward`; requires
-        ``XORL_LORA_MERGED_FORWARD=1`` (a fused-experts flag alone must not
-        silently change what the adapters train against)."""
+        Mirrors :meth:`MoEExperts.sglang_fused_experts_forward`; the exact
+        model program must select canonical merged-LoRA execution."""
         from .experts import (  # noqa: PLC0415
             _MOE_SGLANG_FUSED_EXPERTS_ENV,
             MoEExperts,
@@ -362,19 +473,18 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
             moe_sglang_fused_experts_weight_mode,
         )
 
-        if not lora_merged_forward_enabled():
+        if not lora_merged_forward_enabled(self):
             raise NotImplementedError(
-                f"{_MOE_SGLANG_FUSED_EXPERTS_ENV}=1 on LoRA-adapted experts requires the merged-forward "
-                "contract lane: set XORL_LORA_MERGED_FORWARD=1 (canonical fold + serving kernel on merged "
-                "weights), or drop the fused-experts flag to keep the stock LoRA backends."
+                f"{_MOE_SGLANG_FUSED_EXPERTS_ENV}=1 on LoRA-adapted experts requires canonical "
+                "merged-LoRA execution, selected automatically by the exact model program."
             )
         if self.hidden_act not in {"silu", "gelu_tanh"} or self.swiglu_limit != 0.0:
             raise NotImplementedError(
-                "XORL_LORA_MERGED_FORWARD=1 supports gated silu/gelu_tanh without swiglu_limit only"
+                "Canonical merged-LoRA experts support gated silu/gelu_tanh without swiglu_limit only"
             )
         if moe_sglang_fused_experts_weight_mode() == "cached":
             raise NotImplementedError(
-                "XORL_LORA_MERGED_FORWARD=1 does not compose with "
+                "Canonical merged-LoRA execution does not compose with "
                 "XORL_MOE_SGLANG_FUSED_EXPERTS_WEIGHT_MODE=cached (the transpose cache cannot track "
                 "per-step merged weights); use the strided (default) or transient mode."
             )
@@ -442,11 +552,11 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
             )
         if self.hidden_act not in {"silu", "gelu_tanh"} or self.swiglu_limit != 0.0:
             raise NotImplementedError(
-                "XORL_LORA_MERGED_FORWARD=1 supports gated silu/gelu_tanh without swiglu_limit only"
+                "Canonical merged-LoRA experts support gated silu/gelu_tanh without swiglu_limit only"
             )
         if moe_sglang_fused_experts_weight_mode() == "cached":
             raise NotImplementedError(
-                "XORL_LORA_MERGED_FORWARD=1 does not compose with WEIGHT_MODE=cached; use strided/transient."
+                "Canonical merged-LoRA execution does not compose with WEIGHT_MODE=cached; use strided/transient."
             )
         fused_experts_impl = MoEExperts._load_sglang_fused_experts_impl()
         activation = "gelu" if self.hidden_act == "gelu_tanh" else self.hidden_act
@@ -455,9 +565,16 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         permute_tokens, cumsum, ctx = EP_DISPATCH[self.ep_dispatch](**dispatch_kwargs)
         expert_scores = getattr(ctx, "expert_scores", getattr(ctx, "permuted_scores", None))
         if expert_scores is None:
-            raise ValueError("XORL_LORA_MERGED_FORWARD=1 EP compute requires dispatched expert scores")
+            raise ValueError("Canonical merged-LoRA EP compute requires dispatched expert scores")
 
-        if self._merged_lora_needs_grad(permute_tokens, expert_scores):
+        if permute_tokens.shape[0] == 0 and self._merged_lora_needs_grad(permute_tokens, expert_scores):
+            factors = tuple(
+                value
+                for projection in ("gate_proj", "up_proj", "down_proj")
+                for value in self._active_lora_views(projection)
+            )
+            expert_output = zero_token_lora_output(permute_tokens, self.hidden_dim, *factors)
+        elif self._merged_lora_needs_grad(permute_tokens, expert_scores):
             gate_up_w, down_w = self._merged_trainable_weights()
             expert_output = _SglangFusedExpertsEPTrainFunction.apply(
                 permute_tokens,
@@ -497,12 +614,82 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         combine_kwargs = self._build_combine_kwargs(expert_output, ctx, dispatch_kwargs, parallel_state)
         return EP_COMBINE[self.ep_dispatch](**combine_kwargs)
 
+    def sglang_ep_native_routed_partial(
+        self,
+        hidden_flat: torch.Tensor,
+        routing_flat: torch.Tensor,
+        local_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """LoRA-aware local partial for the native EP ordered-combine lane.
+
+        The native combine enters through ``Module.__call__`` so FSDP
+        materializes this rank's expert slice. Fold the active LoRA factors
+        into that slice with the same canonical arithmetic used by weight
+        sync, then run the masked serving kernel (``-1`` means non-local).
+        Forward bits therefore remain the serving bytes while the custom
+        folded-weight autograd sends gradients into the low-rank factors.
+        """
+        from .experts import (  # noqa: PLC0415
+            MoEExperts,
+            _sglang_fused_experts_kernel_call,
+            _SglangFusedExpertsTrainFunction,
+            moe_sglang_fused_experts_weight_mode,
+        )
+
+        if not lora_merged_forward_enabled(self):
+            raise NotImplementedError(
+                "Native EP combine on LoRA-adapted experts requires canonical merged-LoRA execution"
+            )
+        if self.hidden_act not in {"silu", "gelu_tanh"} or self.swiglu_limit != 0.0:
+            raise NotImplementedError("LoRA native EP combine supports gated silu/gelu_tanh without swiglu_limit only")
+        if moe_sglang_fused_experts_weight_mode() == "cached":
+            raise NotImplementedError(
+                "Canonical merged-LoRA execution does not compose with WEIGHT_MODE=cached; use strided/transient."
+            )
+
+        fused_experts_impl = MoEExperts._load_sglang_fused_experts_impl()
+        activation = "gelu" if self.hidden_act == "gelu_tanh" else self.hidden_act
+        e_local = int(self.gate_up_proj.shape[0])
+
+        if self._merged_lora_needs_grad(hidden_flat, routing_flat):
+            gate_up_w, down_w = self._merged_trainable_weights()
+            return _SglangFusedExpertsTrainFunction.apply(
+                hidden_flat,
+                routing_flat,
+                local_ids,
+                gate_up_w,
+                down_w,
+                fused_experts_impl,
+                activation,
+                self.hidden_act,
+                self.swiglu_limit,
+                e_local,
+                None,
+                True,
+            )
+
+        gate_up_f, down_f = self._merged_weights()
+        return _sglang_fused_experts_kernel_call(
+            hidden_flat,
+            gate_up_f,
+            down_f,
+            routing_flat,
+            local_ids,
+            fused_experts_impl,
+            activation,
+            self.swiglu_limit,
+            None,
+            weight_cache=None,
+            filter_expert=True,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         routing_weights: torch.Tensor = None,
         selected_experts: torch.Tensor = None,
         expert_idx: int = None,
+        sglang_ep_native_local_ids: torch.Tensor = None,
     ) -> torch.Tensor:
         """Forward pass with LoRA.
 
@@ -510,6 +697,13 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         For all implementations: checks EP first, falls back to local path.
         """
         from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
+
+        if sglang_ep_native_local_ids is not None:
+            return self.sglang_ep_native_routed_partial(
+                hidden_states,
+                routing_weights,
+                sglang_ep_native_local_ids,
+            )
 
         parallel_state = get_parallel_state()
 
@@ -521,7 +715,6 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
             return self._eager_lora_forward(hidden_states, expert_idx)
 
         # Local path — registry-based
-
         fn = MOE_EXPERT_BACKENDS_LORA[self.moe_implementation]
         gate_proj = self.gate_proj.contiguous()
         up_proj = self.up_proj.contiguous()
@@ -558,20 +751,19 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         Uses the same dispatch/combine as ``MoEExperts._ep_forward()`` but
         routes to the LoRA-aware EP compute registry. Under the explicit
         ``XORL_MOE_SGLANG_FUSED_EXPERTS=1`` contract flag the merged-forward
-        lane replaces the LoRA compute (and requires
-        ``XORL_LORA_MERGED_FORWARD=1`` — mirroring MoEExperts, EP never
-        auto-enables the parity kernel).
+        lane replaces the LoRA compute; the exact model program selects that
+        lane automatically.
         """
         from .experts import _moe_sglang_fused_experts_env_state  # noqa: PLC0415
 
         explicit_sglang_fused = _moe_sglang_fused_experts_env_state()
         if explicit_sglang_fused is True:
-            if not lora_merged_forward_enabled():
+            if not lora_merged_forward_enabled(self):
                 from .experts import _MOE_SGLANG_FUSED_EXPERTS_ENV  # noqa: PLC0415
 
                 raise NotImplementedError(
                     f"{_MOE_SGLANG_FUSED_EXPERTS_ENV}=1 on LoRA-adapted experts requires "
-                    "XORL_LORA_MERGED_FORWARD=1 (canonical fold + serving kernel on merged weights); "
+                    "canonical merged-LoRA execution (canonical fold + serving kernel on merged weights); "
                     "a partially-contracted LoRA lane would silently void the contract."
                 )
             return self._merged_ep_forward(hidden_states, routing_weights, selected_experts, parallel_state)
@@ -600,21 +792,33 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         permute_tokens, cumsum, ctx = dispatch_fn(**dispatch_kwargs)
 
         # Step 2: Expert computation with LoRA
-        expert_output = compute_fn(
-            permute_tokens,
-            cumsum,
-            gate_proj,
-            up_proj,
-            self.down_proj,
-            gate_proj_lora_A,
-            gate_proj_lora_B,
-            up_proj_lora_A,
-            up_proj_lora_B,
-            down_proj_lora_A,
-            down_proj_lora_B,
-            self._active_scaling(),
-            self.swiglu_limit,
-        )
+        if permute_tokens.shape[0] == 0:
+            expert_output = zero_token_lora_output(
+                permute_tokens,
+                self.hidden_dim,
+                gate_proj_lora_A,
+                gate_proj_lora_B,
+                up_proj_lora_A,
+                up_proj_lora_B,
+                down_proj_lora_A,
+                down_proj_lora_B,
+            )
+        else:
+            expert_output = compute_fn(
+                permute_tokens,
+                cumsum,
+                gate_proj,
+                up_proj,
+                self.down_proj,
+                gate_proj_lora_A,
+                gate_proj_lora_B,
+                up_proj_lora_A,
+                up_proj_lora_B,
+                down_proj_lora_A,
+                down_proj_lora_B,
+                self._active_scaling(),
+                self.swiglu_limit,
+            )
 
         expert_scores = getattr(ctx, "expert_scores", getattr(ctx, "permuted_scores", None))
         if expert_scores is not None:
@@ -711,6 +915,7 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
     @classmethod
     def from_module(cls, module: nn.Module, r: int, lora_alpha: int, **kwargs):
         """Create from an existing MoEExperts module, copying base weights."""
+        validate_gated_silu_expert_adapter_semantics(module)
         target_modules = kwargs.get("target_modules", ["gate_proj", "up_proj", "down_proj"])
         use_rslora = kwargs.get("use_rslora", False)
         hybrid_shared = kwargs.get("hybrid_shared", False)
@@ -770,6 +975,7 @@ def inject_lora_into_experts(
     hybrid_shared: bool = False,
 ) -> None:
     """Replace ``block.experts`` with a :class:`MoEExpertsLoRA` instance."""
+    validate_gated_silu_expert_adapter_semantics(block.experts)
     if target_modules is None:
         target_modules = ["gate_proj", "up_proj", "down_proj"]
 

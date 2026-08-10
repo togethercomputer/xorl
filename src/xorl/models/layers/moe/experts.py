@@ -26,7 +26,6 @@ _MOE_SGLANG_FUSED_EXPERTS_ENV = "XORL_MOE_SGLANG_FUSED_EXPERTS"
 _MOE_SGLANG_FUSED_EXPERTS_SLOT_COMBINE_ENV = "XORL_MOE_SGLANG_FUSED_EXPERTS_SLOT_COMBINE"
 _MOE_SGLANG_FUSED_EXPERTS_CACHE_ENV = "XORL_MOE_SGLANG_FUSED_EXPERTS_CACHE_WEIGHTS"
 _MOE_SGLANG_FUSED_EXPERTS_WEIGHT_MODE_ENV = "XORL_MOE_SGLANG_FUSED_EXPERTS_WEIGHT_MODE"
-_MOE_SGLANG_EP_COMBINE_SIM_ENV = "XORL_MOE_SGLANG_EP_COMBINE_SIM"
 _MOE_SGLANG_FUSED_EXPERTS_WEIGHT_MODES = ("transient", "cached", "strided")
 _SG_LANG_MOE_TP_SIM_ENV = "XORL_SGLANG_MOE_TP_SIM"
 _SG_LANG_MOE_TP_SIM_SIZE_ENV = "XORL_SGLANG_MOE_TP_SIM_SIZE"
@@ -130,8 +129,8 @@ def moe_sglang_fused_experts_enabled(
       sglang + sgl_kernel stack; otherwise the stock path is kept (explicit
       ``1`` keeps the loud ImportError / NotImplementedError instead).
     - ``ep_size > 1``: auto-DISABLED — measured +2.71% step time at EP8, and
-      DeepEP dispatch cannot reproduce the serving reduction tree (explicit
-      ``1`` under EP still requires ``ep_dispatch='alltoall'``).
+      serving's reduction chain has not been reproduced on DeepEP's combine
+      (explicit ``1`` under EP still requires ``ep_dispatch='alltoall'``).
 
     ``ep_size=None`` falls back to the global parallel state; ``device=None``
     falls back to ``torch.cuda.is_available()``.
@@ -161,7 +160,7 @@ def moe_sglang_fused_experts_enabled(
             _log_moe_sglang_fused_experts_auto_once(
                 "sglang-fused experts auto-disabled (ep=1): expert module outside the validated parity "
                 "envelope (needs gated silu/gelu_tanh, no biases, no FP8; LoRA experts require "
-                f"XORL_LORA_MERGED_FORWARD=1); set {_MOE_SGLANG_FUSED_EXPERTS_ENV}=1 to force"
+                f"their model-owned exact_merged_forward property); set {_MOE_SGLANG_FUSED_EXPERTS_ENV}=1 to force"
             )
             return False
     if not _moe_sglang_fused_experts_stack_available():
@@ -178,20 +177,6 @@ def moe_sglang_fused_experts_enabled(
         "to restore the stock tree"
     )
     return True
-
-
-def moe_sglang_ep_combine_sim_size() -> int:
-    """Simulated serving EP size for the EP-combine contract (0 = off).
-
-    ``XORL_MOE_SGLANG_EP_COMBINE_SIM=<n>`` makes the Qwen3.5-MoE block reproduce
-    an EP<n>/a2a-none BI-ops serving engine's MoE output bitwise: per-rank routed
-    partials via the serving kernel on contiguous expert slices, TP-sliced shared
-    expert, bf16 per-rank adds, and the NCCL-tree-equivalent sequential bf16
-    chain sum in rank order (n-1) -> 0 (forward-only)."""
-    raw = os.environ.get(_MOE_SGLANG_EP_COMBINE_SIM_ENV, "").strip()
-    if not raw or raw.lower() in {"0", "false", "off", "no"}:
-        return 0
-    return int(raw)
 
 
 def moe_sglang_fused_experts_slot_combine_enabled() -> bool:
@@ -266,6 +251,68 @@ def moe_sglang_fused_experts_weight_mode() -> str:
     return "cached" if moe_sglang_fused_experts_cache_enabled() else "strided"
 
 
+def _validate_sglang_swiglu_limit(swiglu_limit: float | None) -> None:
+    """Reject XoRL's positive SwiGLU clamp on SGLang fused-MoE paths.
+
+    The two arguments are not interchangeable: XoRL ``swiglu_limit`` clamps
+    only the gate pre-activation symmetrically, while SGLang ``gemm1_limit``
+    caps the post-SiLU gate and clamps the up branch symmetrically. Forwarding
+    a positive value would silently change the model's activation program.
+    """
+    if swiglu_limit is not None and float(swiglu_limit) > 0:
+        raise NotImplementedError(
+            "SGLang fused MoE paths do not support positive swiglu_limit: XoRL clamps only the gate "
+            "pre-activation symmetrically, while SGLang gemm1_limit caps the post-SiLU gate and clamps "
+            "the up branch symmetrically. Set swiglu_limit=0 or use a XoRL-native expert backend."
+        )
+
+
+def _scale_moe_grad_by_fp32_routing(
+    grad_output: torch.Tensor,
+    routing_weights: torch.Tensor,
+) -> torch.Tensor:
+    """Apply serving's routing multiply before the BF16 gradient boundary.
+
+    SGLang consumes FP32 top-k weights and multiplies them into the FP32 down
+    accumulator before storing BF16.  The corresponding backward therefore
+    multiplies the upstream gradient by the unrounded FP32 routing weight and
+    casts the product once for XoRL's BF16 grouped-GEMM kernels.  Casting the
+    routing weight first changes dX, dW13, and dW2 for ordinary GLM-5.2 scores.
+    """
+    if grad_output.shape[0] != routing_weights.numel():
+        raise ValueError(
+            "routing-gradient row mismatch: "
+            f"grad_output has {grad_output.shape[0]} rows, routing_weights has {routing_weights.numel()} values"
+        )
+    scaled_fp32 = grad_output.to(torch.float32) * routing_weights.reshape(-1, 1).to(torch.float32)
+    return scaled_fp32.to(grad_output.dtype)
+
+
+def _group_gemm_same_nk_fp32_accumulator(
+    group_gemm_same_nk,
+    *,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    cumsum_M: torch.Tensor,
+    max_M: int,
+) -> torch.Tensor:
+    """Run the BF16 grouped GEMM while retaining its FP32 accumulator.
+
+    ``group_gemm_same_nk`` can store a fresh output in FP32 while leaving its
+    input and dot-product program unchanged.  A fresh output is essential:
+    using the API's ``c=`` accumulation mode would let Triton autotuning replay
+    and accumulate the first invocation repeatedly.  This is needed only for
+    d(routing), whose forward operand is SGLang's pre-cast FP32 down accumulator.
+    """
+    return group_gemm_same_nk(
+        a=a,
+        b=b,
+        cumsum_M=cumsum_M,
+        max_M=max_M,
+        output_dtype=torch.float32,
+    )
+
+
 def _cached_serving_transpose(cache: dict | None, name: str, param: torch.Tensor) -> torch.Tensor:
     if cache is None:
         return param.transpose(1, 2).contiguous()
@@ -302,6 +349,7 @@ def _sglang_fused_experts_kernel_call(
     and consumes fp32 top-k weights (StandardTopKOutput contract; the upcast
     is exact for bf16/fp16 routing weights).
     """
+    _validate_sglang_swiglu_limit(swiglu_limit)
     if moe_sglang_fused_experts_weight_mode() == "strided":
         w13 = gate_up_proj.transpose(1, 2)
         w2 = down_proj.transpose(1, 2)
@@ -327,7 +375,8 @@ def _sglang_fused_experts_kernel_call(
         no_combine=False,
         routed_scaling_factor=None,
         gemm1_alpha=None,
-        gemm1_limit=swiglu_limit if swiglu_limit > 0 else None,
+        gemm1_limit=None,
+        gate_up_interleaved=False,
         # tp1/ep1 serving contract (num_experts == num_local_experts) unless the
         # EP-combine simulation passes locally-mapped ids with -1 masking.
         filter_expert=filter_expert,
@@ -339,13 +388,20 @@ class _SglangFusedExpertsTrainFunction(torch.autograd.Function):
 
     forward: SGLang's ``fused_experts_impl`` — numerically identical to the
     inference path (the serving reduction tree defines K3).
-    backward: xorl's proven grouped-GEMM MoE backward
-    (:class:`xorl.ops.moe.triton.TritonMoeExpertsFunction` math): the cheap
+    backward: xorl's grouped-GEMM MoE backward, with the serving forward's
+    FP32-routing-after-down cast boundary preserved: the cheap
     intermediates (scatter bookkeeping + gate/up GEMM) are recomputed with
     xorl's kernels from the saved inputs, then dgrad/wgrad grouped GEMMs, the
     activation backward, and the weighted-combine backward (including
     d(topk_weights) so the router trains). Backward does not need cross-engine
     parity — only correctness; weight grads come out directly in GKN layout.
+
+    ``filter_expert=True`` (EP-combine partials, P5): ids may contain
+    ``-1`` for slots owned by other EP ranks. The forward kernel filters them
+    natively; the bookkeeping/backward compacts the valid (token, slot) pairs
+    into a dense topk=1 sub-problem (the bookkeeping kernels are not -1-safe),
+    runs the stock math there, and scatters d(x)/d(topk_weights) back with
+    masked slots hard-zero.
     """
 
     @staticmethod
@@ -362,6 +418,7 @@ class _SglangFusedExpertsTrainFunction(torch.autograd.Function):
         swiglu_limit: float,
         num_experts: int,
         weight_cache: dict | None = None,
+        filter_expert: bool = False,
     ) -> torch.Tensor:
         from xorl.ops.group_gemm.kernel.moe import (  # noqa: PLC0415
             expert_histogram,
@@ -379,17 +436,49 @@ class _SglangFusedExpertsTrainFunction(torch.autograd.Function):
             swiglu_limit,
             gate_up_bias=None,
             weight_cache=weight_cache,
+            filter_expert=filter_expert,
         )
         # Save the xorl scatter bookkeeping alongside the inputs (mirrors the
         # stock TritonMoeExpertsFunction contract): moe_index_compute uses
         # relaxed atomics, so the intra-expert row permutation is only
         # reproducible if backward reuses the one drawn here.
-        splits = expert_histogram(selected_flat, int(num_experts))
-        cumsum_t = torch.cumsum(splits, dim=0)
-        scatter_index = moe_index_compute(selected_flat, cumsum_t)
-        ctx.save_for_backward(
-            hidden_flat, routing_flat, selected_flat, gate_up_proj, down_proj, cumsum_t, scatter_index
-        )
+        if filter_expert:
+            # Masked-id lane (EP-combine partials): the bookkeeping kernels are
+            # NOT -1-safe (scatter indices for masked slots land outside the
+            # valid region), so compact the valid (token, slot) pairs into a
+            # dense topk=1 sub-problem first; backward runs the stock math on
+            # it and scatters grads back (masked slots stay hard-zero).
+            valid_flat = (selected_flat.reshape(-1) >= 0).nonzero(as_tuple=False).squeeze(1)
+            pair_token = torch.div(valid_flat, int(selected_flat.shape[1]), rounding_mode="floor")
+            compact_ids = selected_flat.reshape(-1)[valid_flat].reshape(-1, 1).contiguous()
+            if compact_ids.numel():
+                splits = expert_histogram(compact_ids, int(num_experts))
+                cumsum_t = torch.cumsum(splits, dim=0)
+                scatter_index = moe_index_compute(compact_ids, cumsum_t)
+            else:
+                cumsum_t = torch.cumsum(
+                    torch.zeros(int(num_experts), dtype=torch.int32, device=selected_flat.device), dim=0
+                )
+                scatter_index = torch.empty_like(compact_ids, dtype=torch.int64)
+            ctx.save_for_backward(
+                hidden_flat,
+                routing_flat,
+                selected_flat,
+                gate_up_proj,
+                down_proj,
+                cumsum_t,
+                scatter_index,
+                valid_flat,
+                pair_token,
+            )
+        else:
+            splits = expert_histogram(selected_flat, int(num_experts))
+            cumsum_t = torch.cumsum(splits, dim=0)
+            scatter_index = moe_index_compute(selected_flat, cumsum_t)
+            ctx.save_for_backward(
+                hidden_flat, routing_flat, selected_flat, gate_up_proj, down_proj, cumsum_t, scatter_index
+            )
+        ctx.filter_expert = bool(filter_expert)
         ctx.hidden_act = hidden_act
         ctx.swiglu_limit = float(swiglu_limit or 0.0)
         ctx.num_experts = int(num_experts)
@@ -409,20 +498,61 @@ class _SglangFusedExpertsTrainFunction(torch.autograd.Function):
             _moe_gate_activation_backward,
         )
 
-        (
-            hidden_states,
-            gate_weights,
-            expert_index,
-            gate_up_proj,
-            down_proj,
-            cumsum_t,
-            scatter_index,
-        ) = ctx.saved_tensors
+        if ctx.filter_expert:
+            (
+                hidden_states,
+                gate_weights,
+                expert_index,
+                gate_up_proj,
+                down_proj,
+                cumsum_t,
+                scatter_index,
+                valid_flat,
+                pair_token,
+            ) = ctx.saved_tensors
+        else:
+            (
+                hidden_states,
+                gate_weights,
+                expert_index,
+                gate_up_proj,
+                down_proj,
+                cumsum_t,
+                scatter_index,
+            ) = ctx.saved_tensors
+            valid_flat = pair_token = None
+
+        if valid_flat is not None and valid_flat.numel() == 0:
+            # Every slot masked (no local pairs): the kernel produced zeros, so
+            # all grads are exactly zero (materialized to keep grad reduction
+            # uniform across EP ranks).
+            return (
+                torch.zeros_like(hidden_states),  # hidden_flat
+                torch.zeros_like(gate_weights) if ctx.needs_input_grad[1] else None,  # routing_flat
+                None,  # selected_flat
+                torch.zeros_like(gate_up_proj) if gate_up_proj.requires_grad else None,  # gate_up_proj
+                torch.zeros_like(down_proj) if down_proj.requires_grad else None,  # down_proj
+                None,  # fused_experts_impl
+                None,  # activation
+                None,  # hidden_act
+                None,  # swiglu_limit
+                None,  # num_experts
+                None,  # weight_cache
+                None,  # filter_expert
+            )
 
         # Recompute the cheap xorl-forward intermediates the stock backward
-        # consumes (scatter + gate/up grouped GEMM; the down GEMM is not needed)
-        # from the bookkeeping saved in forward.
-        scatter_output = moe_scatter(hidden_states, scatter_index)
+        # consumes (scatter + gate/up grouped GEMM) from the bookkeeping saved
+        # in forward. The down accumulator is recomputed only when routing
+        # itself needs a gradient. The masked lane presents the compacted valid
+        # pairs as a topk=1 problem; both lanes use the same expert math.
+        if valid_flat is not None:
+            hidden_rows = hidden_states.index_select(0, pair_token)
+            pair_weights = gate_weights.reshape(-1)[valid_flat].reshape(-1, 1)
+        else:
+            hidden_rows = hidden_states
+            pair_weights = gate_weights.reshape(-1, 1)
+        scatter_output = moe_scatter(hidden_rows, scatter_index)
         max_M = scatter_output.shape[0]
         gate_up_output = group_gemm_same_nk(
             a=scatter_output,
@@ -434,23 +564,48 @@ class _SglangFusedExpertsTrainFunction(torch.autograd.Function):
         gate_output = gate_up_output[..., :intermediate]
         up_output = gate_up_output[..., intermediate:]
 
-        # From here on: verbatim TritonMoeExpertsFunction.backward math (gated),
-        # with routing weights kept in the activation dtype for the grouped GEMMs.
+        # The serving forward applies each FP32 routing weight to the FP32 down
+        # accumulator, then stores BF16.  Preserve that ordering in backward:
+        # d(routing) contracts against the pre-cast FP32 accumulator, while the
+        # expert-path upstream gradient is multiplied by the unrounded FP32
+        # score and cast once at the grouped-GEMM boundary.
         compute_dtype = gate_up_output.dtype
-        reshaped_gate_weight = gate_weights.reshape(-1, 1).to(compute_dtype)
-        scattered_gate_weight = torch.empty_like(reshaped_gate_weight)
-        scattered_gate_weight[scatter_index.flatten()] = reshaped_gate_weight
+        pair_weights_fp32 = pair_weights.to(torch.float32)
+        scattered_pair_weights = torch.empty_like(pair_weights_fp32)
+        scattered_pair_weights[scatter_index.flatten()] = pair_weights_fp32
         grad_output = grad_output.view(-1, grad_output.shape[-1]).to(compute_dtype)
+        if pair_token is not None:
+            grad_output = grad_output.index_select(0, pair_token)
 
         gate_for_activation = _maybe_clamp_swiglu_gate(gate_output, ctx.swiglu_limit)
         gate_activation = _moe_gate_activation(gate_for_activation, ctx.hidden_act)
         gated_activation = gate_activation * up_output
-        gated_weighted = gated_activation * scattered_gate_weight
 
         grad_down_output = moe_scatter(grad_output, scatter_index)
 
-        grad_gated_weighted = group_gemm_same_nk(
-            a=grad_down_output,
+        grad_gate_weight = None
+        if ctx.needs_input_grad[1]:
+            down_accumulator = _group_gemm_same_nk_fp32_accumulator(
+                group_gemm_same_nk,
+                a=gated_activation,
+                b=down_proj,
+                cumsum_M=cumsum_t,
+                max_M=max_M,
+            )
+            grad_gate_weight = torch.sum(down_accumulator * grad_down_output.to(torch.float32), dim=-1)[
+                scatter_index.flatten()
+            ]
+            if valid_flat is not None:
+                # Masked slots belong to another EP rank and remain exact zero.
+                grad_gate_weight_full = grad_gate_weight.new_zeros(gate_weights.numel())
+                grad_gate_weight_full[valid_flat] = grad_gate_weight
+                grad_gate_weight = grad_gate_weight_full
+            grad_gate_weight = grad_gate_weight.reshape(gate_weights.shape).to(gate_weights.dtype)
+            del down_accumulator
+
+        grad_scaled = _scale_moe_grad_by_fp32_routing(grad_down_output, scattered_pair_weights)
+        grad_gated_activation = group_gemm_same_nk(
+            a=grad_scaled,
             b=down_proj,
             cumsum_M=cumsum_t,
             max_M=max_M,
@@ -461,19 +616,14 @@ class _SglangFusedExpertsTrainFunction(torch.autograd.Function):
         if down_proj.requires_grad:
             grad_down_proj = torch.empty_like(down_proj)
             group_gemm_same_mn(
-                a=gated_weighted,
-                b=grad_down_output,
+                a=gated_activation,
+                b=grad_scaled,
                 c=grad_down_proj,
                 cumsum_K=cumsum_t,
                 max_K=max_M,
                 transpose_a=True,
             )
-        del grad_down_output, gated_weighted
-
-        grad_gated_activation = grad_gated_weighted * scattered_gate_weight
-        grad_gate_weight = torch.sum(gated_activation * grad_gated_weighted, dim=-1)[scatter_index.flatten()]
-        grad_gate_weight = grad_gate_weight.reshape(gate_weights.shape).to(gate_weights.dtype)
-        del gated_activation, grad_gated_weighted
+        del grad_down_output, grad_scaled, scattered_pair_weights, gated_activation
 
         grad_up_output = gate_activation * grad_gated_activation
         grad_gate_activation = grad_gated_activation * up_output
@@ -506,11 +656,18 @@ class _SglangFusedExpertsTrainFunction(torch.autograd.Function):
         )
         del grad_gate_up_act, scatter_output
 
-        grad_hidden_states = (
-            grad_scatter_output[scatter_index.flatten()]
-            .reshape(hidden_states.shape[0], scatter_index.shape[1], -1)
-            .sum(dim=1)
-        )
+        grad_pair_rows = grad_scatter_output[scatter_index.flatten()]
+        if valid_flat is not None:
+            # Scatter the per-pair grads back to the full (token, slot) layout
+            # (unique indices — deterministic, no atomics), then the stock
+            # per-token sum over slots.
+            grad_full = grad_pair_rows.new_zeros(gate_weights.numel(), grad_pair_rows.shape[-1])
+            grad_full[valid_flat] = grad_pair_rows
+            grad_pair_rows = grad_full
+            num_slots = int(gate_weights.shape[-1])
+        else:
+            num_slots = int(scatter_index.shape[1])
+        grad_hidden_states = grad_pair_rows.reshape(hidden_states.shape[0], num_slots, -1).sum(dim=1)
 
         return (
             grad_hidden_states,  # hidden_flat
@@ -524,6 +681,7 @@ class _SglangFusedExpertsTrainFunction(torch.autograd.Function):
             None,  # swiglu_limit
             None,  # num_experts
             None,  # weight_cache
+            None,  # filter_expert
         )
 
 
@@ -555,6 +713,7 @@ def _sglang_fused_experts_ep_kernel_call(
     variant), a transient transpose-copy, or the ``weight_cache`` copy — all
     three bit-identical.
     """
+    _validate_sglang_swiglu_limit(swiglu_limit)
     num_local_experts = int(gate_up_proj.shape[0])
     counts = torch.diff(cumsum.to(torch.int64), prepend=cumsum.new_zeros(1, dtype=torch.int64))
     local_expert_ids = torch.repeat_interleave(
@@ -597,7 +756,8 @@ def _sglang_fused_experts_ep_kernel_call(
         no_combine=False,
         routed_scaling_factor=None,
         gemm1_alpha=None,
-        gemm1_limit=swiglu_limit if swiglu_limit > 0 else None,
+        gemm1_limit=None,
+        gate_up_interleaved=False,
         # ids are already local (0..E_local-1) against the local weight slice.
         filter_expert=False,
     )
@@ -611,9 +771,9 @@ class _SglangFusedExpertsEPTrainFunction(torch.autograd.Function):
     serving reduction tree defines K3). The kernel applies the dispatched
     routing weight on the fp32 down-GEMM accumulator, i.e. after-down
     semantics ``down(g) * s``.
-    backward: xorl's stock after-down EP backward
-    (:class:`xorl.ops.moe.triton.TritonEPGroupGemm`, routing-after-down
-    branch): the gate/up grouped GEMM is recomputed from the saved pair rows
+    backward: xorl's after-down EP grouped-GEMM backward with the serving
+    FP32-routing cast boundary preserved: the gate/up grouped GEMM is
+    recomputed from the saved pair rows
     (deterministic — the dispatch order pins the row permutation, no scatter
     bookkeeping to replay), then dgrad/wgrad grouped GEMMs, the activation
     backward, and d(pair_scores) via the unscaled down-output recompute (one
@@ -637,6 +797,7 @@ class _SglangFusedExpertsEPTrainFunction(torch.autograd.Function):
         gated: bool,
         weight_cache: dict | None = None,
     ) -> torch.Tensor:
+        _validate_sglang_swiglu_limit(swiglu_limit)
         permute_tokens = permute_tokens.contiguous()
         if permute_tokens.shape[0] == 0:
             # A rank can legitimately receive zero pair rows; the serving kernel
@@ -708,28 +869,37 @@ class _SglangFusedExpertsEPTrainFunction(torch.autograd.Function):
         gate_output = gate_up_output[..., :intermediate]
         up_output = gate_up_output[..., intermediate:]
 
-        # From here on: verbatim TritonEPGroupGemm.backward math
-        # (routing-after-down branch, gated, act-quant off).
+        # Match the serving routing-after-down program: the FP32 score scales
+        # the FP32 down accumulator before its BF16 store.  d(routing) uses the
+        # retained-precision accumulator; all expert-path gradients multiply
+        # by the unrounded score before the BF16 grouped-GEMM boundary.
         gate_for_activation = _maybe_clamp_swiglu_gate(gate_output, ctx.swiglu_limit)
         gate_activation = _moe_gate_activation(gate_for_activation, ctx.hidden_act)
         gated_output = gate_activation * up_output
 
         compute_dtype = gated_output.dtype
         expert_scores_dtype = expert_scores.dtype
-        scores = expert_scores.reshape(-1).to(compute_dtype)
+        scores_fp32 = expert_scores.reshape(-1).to(torch.float32)
         grad_output = grad_output.to(compute_dtype)
 
-        # d(pair_scores) needs the UNSCALED down output (the kernel folded the
-        # weight into the fp32 accumulator, so recompute with one extra GEMM).
         grad_expert_scores = None
         if ctx.needs_input_grad[1]:
-            down_output = group_gemm_same_nk(a=gated_output, b=down_proj, cumsum_M=cumsum, max_M=max_M)
-            grad_expert_scores = (
-                (down_output * grad_output).sum(dim=-1).to(expert_scores_dtype).reshape(expert_scores.shape)
+            down_accumulator = _group_gemm_same_nk_fp32_accumulator(
+                group_gemm_same_nk,
+                a=gated_output,
+                b=down_proj,
+                cumsum_M=cumsum,
+                max_M=max_M,
             )
-            del down_output
+            grad_expert_scores = (
+                (down_accumulator * grad_output.to(torch.float32))
+                .sum(dim=-1)
+                .to(expert_scores_dtype)
+                .reshape(expert_scores.shape)
+            )
+            del down_accumulator
 
-        grad_scaled = grad_output * scores.unsqueeze(-1)
+        grad_scaled = _scale_moe_grad_by_fp32_routing(grad_output, scores_fp32)
 
         grad_gated_output = group_gemm_same_nk(
             a=grad_scaled,
@@ -1467,6 +1637,8 @@ class MoEExperts(nn.Module):
         routing_weights: torch.Tensor = None,
         selected_experts: torch.Tensor = None,
         expert_idx: int = None,
+        *,
+        sglang_ep_native_local_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Dispatch to the configured backend.
 
@@ -1476,6 +1648,17 @@ class MoEExperts(nn.Module):
         When Expert Parallelism is enabled, all backends
         use the unified dispatch → compute → combine path via ``_ep_forward()``.
         """
+        # Keep the native EP serving-kernel path behind ``nn.Module.__call__``.
+        # In EP8 the experts module is an FSDP unit; calling the helper method
+        # directly bypasses FSDP's pre-forward mixed-precision hook and leaves
+        # FP32 master weights paired with BF16 activations in Triton's tl.dot.
+        if sglang_ep_native_local_ids is not None:
+            return self.sglang_ep_native_routed_partial(
+                hidden_states,
+                routing_weights,
+                sglang_ep_native_local_ids,
+            )
+
         from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
 
         parallel_state = get_parallel_state()
@@ -2094,29 +2277,45 @@ class MoEExperts(nn.Module):
     @staticmethod
     def _ensure_sglang_server_args() -> None:
         try:
-            from sglang.srt.server_args import (  # noqa: PLC0415
-                ServerArgs,
-                get_global_server_args,
-                set_global_server_args_for_scheduler,
-            )
+            from sglang.srt.runtime_context import get_exec, get_server_args, publish  # noqa: PLC0415
+            from sglang.srt.server_args import ServerArgs  # noqa: PLC0415
         except ImportError as exc:
             raise ImportError(
                 f"{_SG_LANG_MOE_TP_SIM_ENV}=sglang requires an environment with sglang and sgl_kernel installed"
             ) from exc
 
         try:
-            get_global_server_args()
+            get_server_args()
         except ValueError:
-            server_args = ServerArgs(model_path=os.environ.get("XORL_SGLANG_MOE_MODEL_PATH", "dummy"))
-            server_args.enable_deterministic_inference = True
-            server_args.enable_fused_moe_sum_all_reduce = False
-            server_args.rl_on_policy_target = "xorl-batch-invariant"
-            set_global_server_args_for_scheduler(server_args)
+            publish(
+                ServerArgs(
+                    model_path=os.environ.get("XORL_SGLANG_MOE_MODEL_PATH", "dummy"),
+                    enable_deterministic_inference=True,
+                    enable_fused_moe_sum_all_reduce=False,
+                    rl_on_policy_target="xorl-batch-invariant",
+                ),
+                role="scheduler",
+            )
+
+        try:
+            exec_config = get_exec()
+            deterministic = bool(exec_config.deterministic.enable_deterministic_inference)
+            fused_sum_all_reduce = bool(exec_config.moe.enable_fused_moe_sum_all_reduce)
+        except (AttributeError, ValueError) as exc:
+            raise RuntimeError("SGLang MoE parity requires a published exec runtime context") from exc
+        if not deterministic or fused_sum_all_reduce:
+            raise RuntimeError(
+                "SGLang MoE parity requires enable_deterministic_inference=True and "
+                "enable_fused_moe_sum_all_reduce=False "
+                f"(got deterministic={deterministic}, fused_sum_all_reduce={fused_sum_all_reduce})"
+            )
 
     @staticmethod
     def _load_sglang_fused_experts_impl():
         try:
-            from sglang.srt.layers.moe.fused_moe_triton.fused_moe import fused_experts_impl  # noqa: PLC0415
+            from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (  # noqa: PLC0415
+                fused_experts_impl,
+            )
         except ImportError as exc:
             raise ImportError(
                 f"{_SG_LANG_MOE_TP_SIM_ENV}=sglang requires an environment with sglang and sgl_kernel installed"
@@ -2155,57 +2354,64 @@ class MoEExperts(nn.Module):
             StandardTopKOutput,
         )
 
-    def sglang_moe_ep_sim_routed_partial(
+    def sglang_ep_native_routed_partial(
         self,
         hidden_flat: torch.Tensor,
         routing_flat: torch.Tensor,
-        selected_flat: torch.Tensor,
-        ep_rank: int,
-        ep_size: int,
+        local_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """One simulated EP rank's routed-expert partial through the serving kernel.
+        """This EP rank's routed partial for the gathered full token batch
+        (native-EP ordered combine for the exact Qwen3.5-MoE program).
 
-        EP8/a2a-none serving computes, on every rank, the weighted contribution
-        of its contiguous ``num_experts // ep_size`` expert slice for ALL tokens
-        (global top-k ids mapped local, ``-1`` = non-local, ``filter_expert``),
-        then all-reduces the per-rank partials. This method reproduces one such
-        partial bitwise on local full-width weights (EP-combine
-        simulation; forward-only — the combine contract raises under grad).
+        It runs on the module's LOCAL expert slice (trainer EP gives rank r exactly
+        serving-rank-r's contiguous slice) with ids already mapped local
+        (``-1`` = non-local). Trainable through the masked
+        :class:`_SglangFusedExpertsTrainFunction`; the no-grad path is the bare
+        kernel call (identical bits).
         """
-        if torch.is_grad_enabled() and (
+        if not self.gated:
+            raise NotImplementedError("Qwen3.5-MoE exact ordered combine supports gated MoE experts only")
+        if self.down_bias is not None or self.gate_up_bias is not None:
+            raise NotImplementedError("Qwen3.5-MoE exact ordered combine does not support expert biases")
+        _validate_sglang_swiglu_limit(self.swiglu_limit)
+        fused_experts_impl = self._load_sglang_fused_experts_impl()
+        e_local = int(self.gate_up_proj.shape[0])
+        activation = "gelu" if self.hidden_act == "gelu_tanh" else self.hidden_act
+
+        needs_grad = torch.is_grad_enabled() and (
             hidden_flat.requires_grad
             or routing_flat.requires_grad
             or self.gate_up_proj.requires_grad
             or self.down_proj.requires_grad
-        ):
-            raise RuntimeError(
-                f"{_MOE_SGLANG_EP_COMBINE_SIM_ENV} is a forward-only K3 lane (scoring/replay); "
-                "training support requires the masked-id backward audit."
-            )
-        if not self.gated:
-            raise NotImplementedError(f"{_MOE_SGLANG_EP_COMBINE_SIM_ENV} supports gated MoE experts only")
-        if self.down_bias is not None or self.gate_up_bias is not None:
-            raise NotImplementedError(f"{_MOE_SGLANG_EP_COMBINE_SIM_ENV} does not support expert biases")
-        if self.num_experts % ep_size != 0:
-            raise ValueError(
-                f"{_MOE_SGLANG_EP_COMBINE_SIM_ENV}: num_experts={self.num_experts} "
-                f"not divisible by simulated ep_size={ep_size}"
-            )
-        fused_experts_impl = self._load_sglang_fused_experts_impl()
-        experts_per_rank = self.num_experts // ep_size
-        lo = ep_rank * experts_per_rank
-        mapping = torch.full((self.num_experts,), -1, dtype=torch.int32, device=selected_flat.device)
-        mapping[lo : lo + experts_per_rank] = torch.arange(
-            experts_per_rank, dtype=torch.int32, device=selected_flat.device
         )
+        if needs_grad:
+            if self.hidden_act not in {"silu", "gelu_tanh"}:
+                raise NotImplementedError(
+                    "Qwen3.5-MoE exact ordered-combine training supports silu/gelu_tanh only "
+                    f"(got hidden_act={self.hidden_act!r})"
+                )
+            return _SglangFusedExpertsTrainFunction.apply(
+                hidden_flat,
+                routing_flat,
+                local_ids,
+                self.gate_up_proj,
+                self.down_proj,
+                fused_experts_impl,
+                activation,
+                self.hidden_act,
+                self.swiglu_limit,
+                e_local,
+                None,
+                True,
+            )
         return _sglang_fused_experts_kernel_call(
             hidden_flat,
-            self.gate_up_proj[lo : lo + experts_per_rank],
-            self.down_proj[lo : lo + experts_per_rank],
+            self.gate_up_proj,
+            self.down_proj,
             routing_flat,
-            mapping[selected_flat.long()],
+            local_ids,
             fused_experts_impl,
-            "gelu" if self.hidden_act == "gelu_tanh" else self.hidden_act,
+            activation,
             self.swiglu_limit,
             None,
             weight_cache=None,
@@ -2250,6 +2456,7 @@ class MoEExperts(nn.Module):
             raise NotImplementedError(
                 f"{_MOE_SGLANG_FUSED_EXPERTS_ENV}=1 does not support hidden_act={self.hidden_act!r}"
             )
+        _validate_sglang_swiglu_limit(self.swiglu_limit)
 
         try:
             fused_experts_impl = self._load_sglang_fused_experts_impl()
@@ -2328,6 +2535,7 @@ class MoEExperts(nn.Module):
             and self.gate_up_bias is None
             and self.down_bias is None
             and self.hidden_act in {"silu", "gelu_tanh"}
+            and self.swiglu_limit <= 0.0
             and not self.fp8_training_enabled
         )
 
@@ -2352,7 +2560,7 @@ class MoEExperts(nn.Module):
             return
         setattr(MoEExperts, flag_attr, True)
         try:
-            from sglang.srt.layers.moe.fused_moe_triton.fused_moe import (  # noqa: PLC0415
+            from sglang.srt.layers.moe.moe_runner.triton_utils import (  # noqa: PLC0415
                 try_get_optimal_moe_config,
             )
 
@@ -2430,6 +2638,7 @@ class MoEExperts(nn.Module):
             raise NotImplementedError(
                 f"{_MOE_SGLANG_FUSED_EXPERTS_ENV}=1 does not support hidden_act={self.hidden_act!r}"
             )
+        _validate_sglang_swiglu_limit(self.swiglu_limit)
 
         try:
             fused_experts_impl = self._load_sglang_fused_experts_impl()
@@ -2586,6 +2795,7 @@ class MoEExperts(nn.Module):
         parallel_state,
     ) -> torch.Tensor:
         """Diagnostic TP-shard simulation using SGLang's fused experts kernel."""
+        _validate_sglang_swiglu_limit(self.swiglu_limit)
         tp_size, shard_intermediate = self._validate_sglang_moe_tp_sim_inputs(
             routing_weights,
             selected_experts,
@@ -2636,7 +2846,8 @@ class MoEExperts(nn.Module):
                 apply_router_weight_on_input=False,
                 no_combine=False,
                 routed_scaling_factor=None,
-                gemm1_limit=self.swiglu_limit if self.swiglu_limit > 0 else None,
+                gemm1_limit=None,
+                gate_up_interleaved=False,
                 filter_expert=False,
             )
             output = _sglang_moe_tp_sim_accumulate(output, shard_output)
@@ -2653,6 +2864,7 @@ class MoEExperts(nn.Module):
         parallel_state,
     ) -> torch.Tensor:
         """Diagnostic TP-shard simulation through SGLang's MoeRunner wrapper."""
+        _validate_sglang_swiglu_limit(self.swiglu_limit)
         tp_size, shard_intermediate = self._validate_sglang_moe_tp_sim_inputs(
             routing_weights,
             selected_experts,
@@ -2711,8 +2923,9 @@ class MoEExperts(nn.Module):
                 no_combine=False,
                 routed_scaling_factor=None,
                 gemm1_alpha=None,
-                gemm1_clamp_limit=self.swiglu_limit if self.swiglu_limit > 0 else None,
+                gemm1_clamp_limit=None,
                 is_gated=self.gated,
+                gate_up_interleaved=False,
             )
             topk_output = StandardTopKOutput(
                 topk_weights=routing_flat,
@@ -2773,10 +2986,11 @@ class MoEExperts(nn.Module):
         sglang_fused_experts = explicit_sglang_fused is True
         if sglang_fused_experts and self.ep_dispatch != "alltoall":
             raise NotImplementedError(
-                f"{_MOE_SGLANG_FUSED_EXPERTS_ENV}=1 supports ep_dispatch='alltoall' only. DeepEP's "
-                "combine reduces partial expert outputs across ranks inside the kernel after an "
-                "intermediate bf16 cast of the per-rank partials, so SGLang's serving reduction "
-                "tree cannot be reproduced on that path."
+                f"{_MOE_SGLANG_FUSED_EXPERTS_ENV}=1 supports ep_dispatch='alltoall' only: the DeepEP "
+                "combine's order and rounding schedule differ, and serving's reduction chain cannot "
+                "currently be reproduced on that path. No mechanism is asserted here — the installed "
+                "DeepEP wheel ships no CUDA source, so its reduction is not inspectable from the box "
+                "this runs on."
             )
         if sglang_fused_experts and self.fp8_training_enabled:
             raise NotImplementedError(f"{_MOE_SGLANG_FUSED_EXPERTS_ENV}=1 does not support FP8 MoE compute under EP")

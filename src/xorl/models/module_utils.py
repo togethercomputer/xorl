@@ -27,6 +27,7 @@ from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, SAFE_WEIGHTS_NAME, WEIGH
 from transformers.utils.hub import cached_file, get_checkpoint_shard_files
 
 from xorl.distributed.parallel_state import get_parallel_state
+from xorl.lora.fold import lora_merged_forward_enabled
 from xorl.lora.modules.linear import LoraLinear
 from xorl.models.checkpoint_handlers.buffers import (  # noqa: F401
     FUSED_EXPERT_PATTERN,
@@ -1830,7 +1831,9 @@ def grouped_load_weights(
     weights_path: str,
     init_device: Literal["cpu", "cuda", "npu"] = "cuda",
     dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
-):
+    *,
+    strict: bool = False,
+) -> None:
     """Load weights with a hybrid dense/expert grouped strategy.
 
     Dense/shared tensors are loaded once per node and broadcast inside a
@@ -1838,6 +1841,8 @@ def grouped_load_weights(
     leader and fanned out only to the ranks that share that expert shard.
     """
     if not dist.is_available() or not dist.is_initialized():
+        if strict:
+            raise RuntimeError("Strict grouped weight loading requires an initialized distributed environment.")
         logger.warning_once("Distributed environment not initialized, falling back to all_ranks_load_weights.")
         return all_ranks_load_weights(model, weights_path, init_device, dtensor_factory)
 
@@ -1880,11 +1885,20 @@ def grouped_load_weights(
 
     fanout_group = _get_grouped_weight_load_group(_ps)
     if fanout_group is None:
+        if strict:
+            raise RuntimeError(
+                "Strict grouped weight loading requires an EP/FSDP fanout group; refusing rank-0 fallback."
+            )
         logger.info_rank0("Grouped weight loading requires EP/FSDP groups; using rank-0 load fallback.")
         return rank0_load_and_broadcast_weights(model, weights_path, init_device, dtensor_factory)
 
     buffer_dict = {name: buffer.clone() for name, buffer in model.named_buffers()}
     parameter_names_to_load = {name for name, _ in model.named_parameters()}
+    non_persistent_buffer_names: Set[str] = set()
+    for module_fqn, module in model.named_modules():
+        for local_name in getattr(module, "_non_persistent_buffers_set", set()):
+            non_persistent_buffer_names.add(f"{module_fqn}.{local_name}" if module_fqn else local_name)
+    persistent_buffer_names_to_load = set(buffer_dict) - non_persistent_buffer_names
 
     _compiled_key_map = _build_compiled_key_map(parameter_names_to_load, buffer_dict)
 
@@ -1925,6 +1939,7 @@ def grouped_load_weights(
             checkpoint_keys=checkpoint_keys or set(),
             ep_rank=0,
             ep_size=1,
+            load_family="dense",
             is_broadcast=False,
             weights_path=weights_path,
             device=model_device,
@@ -1937,6 +1952,7 @@ def grouped_load_weights(
             checkpoint_keys=checkpoint_keys or set(),
             ep_rank=ep_rank,
             ep_size=ep_size,
+            load_family="expert",
             is_broadcast=False,
             weights_path=weights_path,
             device=model_device,
@@ -1976,6 +1992,12 @@ def grouped_load_weights(
                 _expected_skip_prefixes.add(key)
 
     parameter_names_to_load -= _expected_skip_keys
+    persistent_buffer_names_to_load -= _expected_skip_keys
+    loaded_parameter_names: Set[str] = set()
+    loaded_persistent_buffer_names: Set[str] = set()
+    duplicate_parameter_names: Set[str] = set()
+    duplicate_persistent_buffer_names: Set[str] = set()
+    unexpected_parameter_names: Set[str] = set()
 
     def _should_skip_qlora_expert_key(key: str, prefixes: set) -> bool:
         for prefix in prefixes:
@@ -1989,25 +2011,40 @@ def grouped_load_weights(
 
     def _dispatch_loaded_tensor(param_name: str, param_tensor: torch.Tensor, *, expect_expert: bool) -> None:
         model_name = _compiled_key_map.get(param_name, param_name)
+
+        # QLoRA base tensors are source-only checkpoint state.  They are loaded
+        # by the deferred pre-quantized path and are not model parameters for
+        # this dispatch pass, so queue-family validation does not apply to them.
+        if param_name in _expected_skip_keys or model_name in _expected_skip_keys:
+            return
+        if _expected_skip_prefixes and _should_skip_qlora_expert_key(model_name, _expected_skip_prefixes):
+            return
+
         is_expert = _is_expert_parameter_name(model_name, parallel_plan)
         if expect_expert != is_expert:
             raise RuntimeError(
                 f"Grouped weight loading misrouted {'expert' if expect_expert else 'dense'} tensor "
                 f"{param_name} -> {model_name}"
             )
-
-        if param_name in _expected_skip_keys or model_name in _expected_skip_keys:
-            return
-        if _expected_skip_prefixes and _should_skip_qlora_expert_key(model_name, _expected_skip_prefixes):
-            return
         if model_name in buffer_dict:
+            if model_name in loaded_persistent_buffer_names:
+                duplicate_persistent_buffer_names.add(model_name)
+                return
             buffer_dict[model_name] = param_tensor.clone()
+            if model_name in persistent_buffer_names_to_load:
+                persistent_buffer_names_to_load.discard(model_name)
+                loaded_persistent_buffer_names.add(model_name)
+            return
+        if model_name in loaded_parameter_names:
+            duplicate_parameter_names.add(model_name)
             return
         if model_name in parameter_names_to_load:
             parameter_names_to_load.discard(model_name)
+            loaded_parameter_names.add(model_name)
             _dispatch_parameter(model, model_name, param_tensor, dtensor_factory, parallel_plan)
             return
         if global_expected_keys is None or param_name not in global_expected_keys:
+            unexpected_parameter_names.add(model_name)
             logger.warning_rank0(f"Unexpected key in state dict: {param_name}.")
 
     def _broadcast_queue_and_dispatch(
@@ -2254,6 +2291,11 @@ def grouped_load_weights(
         dtensor_factory,
         qlora_skip_prefixes=_expected_skip_prefixes,
         qlora_skip_fn=_should_skip_qlora_expert_key,
+        strict=strict,
+        unexpected_parameter_names=unexpected_parameter_names,
+        duplicate_parameter_names=duplicate_parameter_names,
+        persistent_buffer_names_left=persistent_buffer_names_to_load,
+        duplicate_persistent_buffer_names=duplicate_persistent_buffer_names,
     )
 
 
@@ -2264,11 +2306,36 @@ def post_process_after_weight_loading(
     dtensor_factory: Optional[Callable[["torch.Tensor", Any, Any], "torch.Tensor"]] = None,
     qlora_skip_prefixes: Optional[set] = None,
     qlora_skip_fn: Optional[Callable] = None,
+    strict: bool = False,
+    unexpected_parameter_names: Optional[Set[str]] = None,
+    duplicate_parameter_names: Optional[Set[str]] = None,
+    persistent_buffer_names_left: Optional[Set[str]] = None,
+    duplicate_persistent_buffer_names: Optional[Set[str]] = None,
 ):
     """
     shared logic after weight loading that handles buffer, missing weight keys and tied embedding weights.
     """
     parameter_names_left = parameter_names_left or set()
+    unexpected_parameter_names = unexpected_parameter_names or set()
+    duplicate_parameter_names = duplicate_parameter_names or set()
+    persistent_buffer_names_left = persistent_buffer_names_left or set()
+    duplicate_persistent_buffer_names = duplicate_persistent_buffer_names or set()
+
+    if strict and (
+        parameter_names_left
+        or unexpected_parameter_names
+        or duplicate_parameter_names
+        or persistent_buffer_names_left
+        or duplicate_persistent_buffer_names
+    ):
+        raise RuntimeError(
+            "Strict checkpoint source-to-target coverage failed: "
+            f"missing_parameters={sorted(parameter_names_left)}, "
+            f"missing_persistent_buffers={sorted(persistent_buffer_names_left)}, "
+            f"unexpected={sorted(unexpected_parameter_names)}, "
+            f"duplicate_parameters={sorted(duplicate_parameter_names)}, "
+            f"duplicate_persistent_buffers={sorted(duplicate_persistent_buffer_names)}"
+        )
 
     # Build QLoRA skip prefixes if not provided (for call sites that don't pass them)
     if qlora_skip_prefixes is None:
@@ -2735,6 +2802,10 @@ def save_model_assets(output_dir: Union[str, "os.PathLike"], model_assets: Seque
 
 def get_lm_head_weight(lm_head: nn.Module, *, fsdp_sharded_loss: bool = False) -> torch.Tensor:
     """Get lm_head weight, merging LoRA delta if applicable."""
+    if getattr(lm_head, "_glm52_exact_tp16_lm_head", False):
+        if lora_merged_forward_enabled(lm_head):
+            raise RuntimeError("The exact GLM-5.2 lm head rejects merged-forward mode")
+        return lm_head.weight
     if fsdp_sharded_loss and isinstance(lm_head, LoraLinear):
         raise NotImplementedError("fsdp_sharded_lm_head_loss is not supported with LoRA lm_head adapters.")
     if isinstance(lm_head, LoraLinear):
@@ -2767,7 +2838,8 @@ def compute_loss(
     """
     fn_name = loss_fn_name or "causallm_loss"
     loss_fn = get_loss_function(fn_name)
-    fsdp_sharded_loss = bool(getattr(lm_head, "_xorl_fsdp_sharded_lm_head_loss", False))
+    exact_lm_head = bool(getattr(lm_head, "_glm52_exact_tp16_lm_head", False))
+    fsdp_sharded_loss = bool(getattr(lm_head, "_xorl_fsdp_sharded_lm_head_loss", False)) and not exact_lm_head
     if fsdp_sharded_loss and fn_name not in {"causallm_loss", "cross_entropy"}:
         raise NotImplementedError(f"fsdp_sharded_lm_head_loss is not supported for loss function {fn_name!r}.")
     weight = get_lm_head_weight(lm_head, fsdp_sharded_loss=fsdp_sharded_loss)
@@ -2854,7 +2926,12 @@ def compute_loss(
         FP8Linear = None
     if FP8Linear is not None and isinstance(lm_head, FP8Linear) and fn_name in {"causallm_loss", "cross_entropy"}:
         loss_kwargs["lm_head"] = lm_head
-    if ps.tp_enabled:
+    if exact_lm_head:
+        if not getattr(lm_head, "_xorl_fsdp_sharded_lm_head_loss", False):
+            raise RuntimeError("The exact GLM-5.2 lm head was not prepared for sharded TP16 loss")
+        loss_kwargs["lm_head"] = lm_head
+        loss_kwargs["tp_group"] = ps.lm_head_tp_group
+    elif ps.tp_enabled:
         loss_kwargs["tp_group"] = ps.tp_group
     if loss_fn_inputs:
         loss_kwargs.update(loss_fn_inputs)

@@ -65,10 +65,10 @@ class ServerArguments:
     tokenizer_path: Optional[str] = field(default=None, metadata={"help": "Path to tokenizer. Defaults to config_path"})
 
     attn_implementation: Optional[Literal["eager", "sdpa", "native", "flash_attention_3", "flash_attention_4"]] = field(
-        default="flash_attention_4",
+        default=None,
         metadata={
             "help": "Attention implementation. 'native': PyTorch SDPA+cuDNN (no deps, Hopper+Blackwell). "
-            "'flash_attention_3': FA3 (Hopper). 'flash_attention_4': FA4 CUTE (Hopper+Blackwell, default)."
+            "Omitting it preserves the FA4 server default and selects the required FA4 path for canonical GLM-5.2."
         },
     )
 
@@ -135,41 +135,50 @@ class ServerArguments:
     )
 
     # SGLang numerical alignment flags
-    router_fp32: bool = field(
-        default=True, metadata={"help": "Upcast MoE router gate computation to float32 for numerical stability."}
+    router_fp32: Optional[bool] = field(
+        default=None,
+        metadata={"help": "Upcast MoE router gate computation to float32; defaults to true after model resolution."},
     )
 
-    lm_head_fp32: bool = field(
-        default=True, metadata={"help": "Upcast LM head logits computation to float32 for numerical stability."}
+    lm_head_fp32: Optional[bool] = field(
+        default=None,
+        metadata={"help": "Upcast LM head logits computation to float32; defaults to true after model resolution."},
     )
 
-    rmsnorm_mode: Literal["eager", "native", "compile", "sglang", "sglang_fused", "sglang_jit", "sglang_kernel"] = (
-        field(
-            default="native",
-            metadata={
-                "help": "RMSNorm implementation mode. 'native' uses torch.nn.functional.rms_norm "
-                "and is the default. 'compile' runs that native path through torch.compile. "
-                "'eager' uses the plain eager implementation. 'sglang' uses native RMSNorm for "
-                "no-residual calls and SGLang's native residual RMSNorm reduction order. "
-                "'sglang_fused' matches 'sglang' bit-for-bit but replaces its eager residual-style "
-                "norms with fused batch-invariant Triton kernels (faster training, K3 preserved). "
-                "'sglang_jit' uses SGLang's JIT CUDA RMSNorm kernels for forward parity diagnostics. "
-                "'sglang_kernel' uses SGLang's production sgl_kernel RMSNorm kernels for diagnostics."
-            },
-        )
+    rmsnorm_mode: Optional[
+        Literal["eager", "native", "compile", "sglang", "sglang_fused", "sglang_jit", "sglang_kernel"]
+    ] = field(
+        default=None,
+        metadata={
+            "help": "RMSNorm implementation mode. Omitted means native for ordinary models "
+            "and the serving-exact fused implementation for canonical GLM-5.2. "
+            "'compile' runs that native path through torch.compile. "
+            "'eager' uses the plain eager implementation. 'sglang' uses native RMSNorm for "
+            "no-residual calls and SGLang's native residual RMSNorm reduction order. "
+            "'sglang_fused' matches 'sglang' bit-for-bit but replaces its eager residual-style "
+            "norms with fused batch-invariant Triton kernels (faster training, K3 preserved). "
+            "'sglang_jit' uses SGLang's JIT CUDA RMSNorm kernels for forward parity diagnostics. "
+            "'sglang_kernel' uses SGLang's production sgl_kernel RMSNorm kernels for diagnostics."
+        },
+    )
+    qwen35_rmsnorm_family: Optional[Literal["v1", "v2"]] = field(
+        default=None,
+        metadata={"help": "Exact Qwen3.5/3.6 RMSNorm arithmetic. Exact Qwen models require the qualified v2 tree."},
     )
 
     activation_native: bool = field(
         default=False, metadata={"help": "Use native SiLU instead of fused Triton kernel for SGLang alignment."}
     )
 
-    rope_native: bool = field(
-        default=False, metadata={"help": "Use naive RoPE implementation instead of flash_attn fused kernel."}
+    rope_native: Optional[bool] = field(
+        default=None,
+        metadata={"help": "Use native RoPE. Auto-enables for canonical GLM-5.2 when omitted."},
     )
-    rope_class_b: bool = field(
-        default=False,
+    rope_class_b: Optional[bool] = field(
+        default=None,
         metadata={
-            "help": "Use compiled Class-B RoPE fp32-chain numerics aligned with SGLang's stock fused CUDA kernel."
+            "help": "Use compiled Class-B RoPE fp32-chain numerics. Auto-enables for canonical GLM-5.2 and "
+            "exact Qwen3.5-family training when omitted."
         },
     )
 
@@ -180,6 +189,22 @@ class ServerArguments:
     flash_attention_deterministic: bool = field(
         default=False,
         metadata={"help": "Request FlashAttention deterministic backward kernels when available."},
+    )
+
+    sparse_mla_enabled: Optional[bool] = field(
+        default=None,
+        metadata={
+            "help": "Enable the GLM-5 sparse-MLA path instead of materializing dense attention masks. "
+            "Canonical GLM-5.2 enables it structurally when omitted."
+        },
+    )
+
+    sparse_mla_backend: Literal["auto", "torch", "tilelang", "flashmla"] = field(
+        default="auto",
+        metadata={
+            "help": "Sparse-MLA backend used when sparse_mla_enabled is true. "
+            "'flashmla' selects the GLM-5.2 serving-exact forward with a separately gated TileLang backward."
+        },
     )
 
     # Multimodal model configuration
@@ -611,10 +636,11 @@ class ServerArguments:
         default="meta", metadata={"help": "Device for model initialization"}
     )
 
-    ce_mode: CrossEntropyMode = field(
-        default="compiled",
+    ce_mode: Optional[CrossEntropyMode] = field(
+        default=None,
         metadata={
-            "help": "Cross-entropy implementation: 'bi_fused' (RECOMMENDED for server RL: batch-invariant "
+            "help": "Cross-entropy implementation. Omitted means compiled for ordinary models and "
+            "bi_fused for canonical GLM-5.2. 'bi_fused' is the batch-invariant "
             "K3 lm-head contract, fp32-class; needs tp=1, no z-loss, bf16 hidden/weight, lm_head_fp32), "
             "'compiled' (torch.compile), 'quack_linear' (Quack scalar loss; return_per_token uses fused "
             "selected-logprob CE), 'fused_quack', or 'eager' (baseline, may OOM at 32K)"
@@ -1012,10 +1038,23 @@ class ServerArguments:
 
     lora_alpha: int = field(default=16, metadata={"help": "LoRA alpha scaling parameter"})
 
+    adapter_gradient_ownership_bucket_bytes: int = field(
+        default=64 * 1024 * 1024,
+        metadata={"help": "Maximum bytes in one adapter-gradient residual-transport bucket"},
+    )
+
     lora_target_modules: Optional[List[str]] = field(
         default=None,
         metadata={
             "help": "List of module names to apply LoRA to (e.g., ['q_proj', 'k_proj', 'v_proj', 'o_proj']). If None, uses default based on model architecture."
+        },
+    )
+
+    lora_target_manifest: Optional[Union[Dict[str, Any], str]] = field(
+        default=None,
+        metadata={
+            "help": "Strict LoRA target manifest mapping or JSON path. Validates exact module counts and ranks "
+            "before the server accepts training work."
         },
     )
 
@@ -1041,6 +1080,14 @@ class ServerArguments:
         default=False, metadata={"help": "Enable QLoRA (quantized LoRA) for memory-efficient training"}
     )
 
+    block_fp8_qlora_training: bool = field(
+        default=False,
+        metadata={
+            "help": "Enable the complete official GLM-5.2 block-FP8 QLoRA target set. "
+            "Requires block_fp8, Triton experts, DeepEP, and hybrid-shared expert LoRA."
+        },
+    )
+
     quant_format: str = field(
         default="nvfp4", metadata={"help": "Quantization format for QLoRA: 'nvfp4', 'block_fp8', or 'nf4'"}
     )
@@ -1061,45 +1108,6 @@ class ServerArguments:
             "help": "How to restore multi-adapter LoRA checkpoints. 'all_ranks': each rank loads adapter state locally. "
             "'rank0_broadcast': rank 0 loads once and broadcasts weights, metadata, and optimizer state."
         },
-    )
-
-    # ========================================================================
-    # ZORL Configuration
-    # ========================================================================
-
-    enable_zorl: bool = field(
-        default=False,
-        metadata={"help": "Enable zeroth-order LoRA search metadata and session defaults for server training."},
-    )
-
-    zorl_b_sigma: float = field(
-        default=0.01,
-        metadata={"help": "Perturbation scale applied to LoRA-B when planning ZORL candidates."},
-    )
-
-    zorl_num_perturbation_pairs: int = field(
-        default=8,
-        metadata={"help": "Number of perturbation seeds per ZORL generation before antithetic expansion."},
-    )
-
-    zorl_a_refresh_interval: int = field(
-        default=16,
-        metadata={"help": "Generations between fresh LoRA-A family refreshes. 0 disables auto-refresh."},
-    )
-
-    zorl_antithetic_sampling: bool = field(
-        default=True,
-        metadata={"help": "Emit both positive and negative LoRA-B perturbations for each ZORL seed."},
-    )
-
-    zorl_a_init: Literal["gaussian_jl"] = field(
-        default="gaussian_jl",
-        metadata={"help": "Initialization scheme used for fresh ZORL LoRA-A families."},
-    )
-
-    zorl_seed: Optional[int] = field(
-        default=None,
-        metadata={"help": "Optional base RNG seed for ZORL family refresh and perturbation planning."},
     )
 
     # ========================================================================
@@ -1225,6 +1233,56 @@ class ServerArguments:
             raise ValueError("enable_fp8_training is a full-weight mode and cannot be combined with LoRA or QLoRA")
         if self.enable_qarl and (self.enable_lora or self.enable_qlora):
             raise ValueError("enable_qarl is a full-weight mode and cannot be combined with LoRA or QLoRA")
+        if self.max_lora_rank is None:
+            self.max_lora_rank = self.lora_rank
+        if self.max_lora_rank < self.lora_rank:
+            raise ValueError(
+                f"max_lora_rank ({self.max_lora_rank}) must be >= lora_rank ({self.lora_rank}) for the default session"
+            )
+        if self.block_fp8_qlora_training:
+            exact_active_lora = (self.lora_rank, self.lora_alpha) == (1, 1)
+            requirements = {
+                "enable_lora": (self.enable_lora, True),
+                "enable_qlora": (self.enable_qlora, True),
+                "quant_format": (self.quant_format, "block_fp8"),
+                "quant_group_size": (self.quant_group_size, 128),
+                "moe_hybrid_shared_lora": (self.moe_hybrid_shared_lora, True),
+                "moe_implementation": (self.moe_implementation, "triton"),
+                "ep_dispatch": (self.ep_dispatch, "alltoall" if exact_active_lora else "deepep"),
+                "freeze_router": (self.freeze_router, True),
+                "merge_qkv": (self.merge_qkv, True),
+                "lora_export_format": (self.lora_export_format, "sglang_shared_outer"),
+            }
+            if exact_active_lora:
+                requirements.update(
+                    {
+                        "max_lora_rank": (self.max_lora_rank, 1),
+                        "tensor_parallel_size": (self.tensor_parallel_size, 1),
+                        "pipeline_parallel_size": (self.pipeline_parallel_size, 1),
+                        "expert_parallel_size": (self.expert_parallel_size, 16),
+                        "ulysses_parallel_size": (self.ulysses_parallel_size, 16),
+                        "ringattn_parallel_size": (self.ringattn_parallel_size, 1),
+                        "lm_head_tensor_parallel_size": (self.lm_head_tensor_parallel_size, 16),
+                        "data_parallel_replicate_size": (self.data_parallel_replicate_size, 1),
+                        "data_parallel_shard_size": (self.data_parallel_shard_size, 1),
+                        "data_parallel_mode": (self.data_parallel_mode, "fsdp2"),
+                        "cp_fsdp_mode": (self.cp_fsdp_mode, "all"),
+                        "fsdp_sharded_lm_head_loss": (self.fsdp_sharded_lm_head_loss, True),
+                    }
+                )
+            mismatches = [
+                f"{name}={actual!r} (requires {expected!r})"
+                for name, (actual, expected) in requirements.items()
+                if actual != expected
+            ]
+            if mismatches:
+                raise ValueError("GLM-5.2 block-FP8 QLoRA rejects unsupported configuration: " + ", ".join(mismatches))
+            if self.lora_target_modules is not None or self.lora_target_manifest is not None:
+                raise ValueError("GLM-5.2 block-FP8 QLoRA uses its complete deterministic target set")
+            if self.qlora_exclude_modules is not None:
+                raise ValueError("GLM-5.2 block-FP8 QLoRA derives checkpoint exclusions and rejects user overrides")
+            if self.merge_lora_interval:
+                raise ValueError("GLM-5.2 block-FP8 QLoRA publishes dynamic adapters and does not merge into the base")
         if self.enable_qarl:
             if self.qarl_calib_size < 0:
                 raise ValueError("qarl_calib_size must be non-negative")
@@ -1275,6 +1333,11 @@ class ServerArguments:
                 "pipeline_parallel_size > 1 is not supported with multi-adapter LoRA server training. "
                 "Adapter coordination currently assumes identical local LoRA layouts on every rank."
             )
+        if (self.enable_lora or self.enable_qlora) and self.tensor_parallel_size > 1:
+            raise ValueError(
+                "tensor_parallel_size > 1 is not supported for adapter-bearing model modules; "
+                "lm_head_tensor_parallel_size is a separate output-only topology"
+            )
         if self.pipeline_parallel_size > 1:
             # Deferred import keeps server_arguments import-light (pulls in torch).
             from xorl.distributed.pipeline_parallel import validate_pp_schedule_config  # noqa: PLC0415
@@ -1291,13 +1354,8 @@ class ServerArguments:
             raise ValueError("pipeline_parallel_virtual_stages requires pipeline_parallel_size > 1.")
         if self.enable_lora and self.merge_lora_interval > 0:
             raise ValueError("merge_lora_interval is not supported with multi-adapter LoRA server training")
-        if self.max_lora_rank is None:
-            self.max_lora_rank = self.lora_rank
-        if self.max_lora_rank < self.lora_rank:
-            raise ValueError(
-                f"max_lora_rank ({self.max_lora_rank}) must be >= lora_rank ({self.lora_rank}) for the default session"
-            )
-
+        if self.adapter_gradient_ownership_bucket_bytes <= 0:
+            raise ValueError("adapter_gradient_ownership_bucket_bytes must be positive")
         if self.load_weights_mode not in {"grouped", "all_ranks", "skip"}:
             raise ValueError(
                 f"Unsupported load_weights_mode={self.load_weights_mode!r}. Expected one of: grouped, all_ranks, skip."
@@ -1309,8 +1367,6 @@ class ServerArguments:
                 "load_checkpoint_path to materialize parameters from a DCP checkpoint. "
                 "Set load_checkpoint_path or choose a different load_weights_mode."
             )
-        if self.enable_zorl and not self.enable_lora:
-            raise ValueError("enable_zorl requires enable_lora=True")
         if self.receiver_kv_cache_dtype is not None:
             receiver_kv_cache_dtype = str(self.receiver_kv_cache_dtype).strip().lower()
             if receiver_kv_cache_dtype in {"", "none", "null"}:
@@ -1352,11 +1408,14 @@ class ServerArguments:
                 "router_fp32": self.router_fp32,
                 "lm_head_fp32": self.lm_head_fp32,
                 "rmsnorm_mode": self.rmsnorm_mode,
+                "qwen35_rmsnorm_family": self.qwen35_rmsnorm_family,
                 "activation_native": self.activation_native,
                 "rope_native": self.rope_native,
                 "rope_class_b": self.rope_class_b,
                 "attention_cast_bf16": self.attention_cast_bf16,
                 "flash_attention_deterministic": self.flash_attention_deterministic,
+                "sparse_mla_enabled": self.sparse_mla_enabled,
+                "sparse_mla_backend": self.sparse_mla_backend,
             },
             "train": {
                 "output_dir": self.output_dir,
@@ -1428,6 +1487,7 @@ class ServerArguments:
                 "adam_betas": self.adam_betas,
                 "adam_eps": self.adam_eps,
                 "optimizer_dtype": self.optimizer_dtype,
+                "adapter_gradient_ownership_bucket_bytes": self.adapter_gradient_ownership_bucket_bytes,
                 "cautious_weight_decay": self.cautious_weight_decay,
                 "muon_lr": self.muon_lr,
                 "muon_momentum": self.muon_momentum,
@@ -1478,24 +1538,17 @@ class ServerArguments:
                 "max_lora_rank": self.max_lora_rank,
                 "lora_alpha": self.lora_alpha,
                 "lora_target_modules": self.lora_target_modules,
+                "lora_target_manifest": self.lora_target_manifest,
                 "moe_hybrid_shared_lora": self.moe_hybrid_shared_lora,
                 "lora_export_format": self.lora_export_format,
                 "enable_qlora": self.enable_qlora,
+                "block_fp8_qlora_training": self.block_fp8_qlora_training,
                 "quant_format": self.quant_format,
                 "quant_group_size": self.quant_group_size,
                 "exclude_modules": self.qlora_exclude_modules,
                 "merge_lora_interval": self.merge_lora_interval,
                 "reset_optimizer_on_merge": self.reset_optimizer_on_merge,
                 "adapter_state_load_mode": self.adapter_state_load_mode,
-            },
-            "zorl": {
-                "enabled": self.enable_zorl,
-                "b_sigma": self.zorl_b_sigma,
-                "num_perturbation_pairs": self.zorl_num_perturbation_pairs,
-                "a_refresh_interval": self.zorl_a_refresh_interval,
-                "antithetic_sampling": self.zorl_antithetic_sampling,
-                "a_init": self.zorl_a_init,
-                "seed": self.zorl_seed,
             },
         }
         return config

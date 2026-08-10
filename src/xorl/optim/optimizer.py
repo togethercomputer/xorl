@@ -617,19 +617,33 @@ def build_ep_fsdp2_optimizer(
             for p in m.parameters():
                 skip_fsdp_param_ids.add(id(p))
 
+    configured_ep_replicated_ids = {id(p) for p in getattr(model, "_ep_param_groups", {}).get("ep_replicated", [])}
+    configured_ep_replicated_gradient_sync_ids = {
+        id(p) for p in getattr(model, "_ep_param_groups", {}).get("ep_replicated_gradient_sync", [])
+    }
     ep_params: List[torch.nn.Parameter] = []
+    ep_replicated_params: List[torch.nn.Parameter] = []
+    ep_replicated_gradient_sync_params: List[torch.nn.Parameter] = []
     non_ep_params: List[torch.nn.Parameter] = []
     for p in model.parameters():
         if not p.requires_grad:
             continue
         if id(p) in skip_fsdp_param_ids:
             ep_params.append(p)
+            if id(p) in configured_ep_replicated_ids:
+                ep_replicated_params.append(p)
+            if id(p) in configured_ep_replicated_gradient_sync_ids:
+                ep_replicated_gradient_sync_params.append(p)
             continue
         if DTensor is not None and isinstance(p, DTensor):
             mesh = getattr(p, "device_mesh", None)
             names = getattr(mesh, "mesh_dim_names", []) if mesh is not None else []
             if "ep_fsdp" in names:
                 ep_params.append(p)
+                if id(p) in configured_ep_replicated_ids:
+                    ep_replicated_params.append(p)
+                if id(p) in configured_ep_replicated_gradient_sync_ids:
+                    ep_replicated_gradient_sync_params.append(p)
                 continue
         non_ep_params.append(p)
 
@@ -704,6 +718,8 @@ def build_ep_fsdp2_optimizer(
     all_non_ep_params = [p for g in non_ep_groups for p in g.get("params", [])] if non_ep_groups else []
     model._ep_param_groups = {
         "ep": all_ep_params,
+        "ep_replicated": ep_replicated_params,
+        "ep_replicated_gradient_sync": ep_replicated_gradient_sync_params,
         "non_ep": all_non_ep_params,
     }
     # Build MultiOptimizer and attach a pre-step hook to sanitize DTensor states

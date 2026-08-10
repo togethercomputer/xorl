@@ -14,7 +14,22 @@ class TinyModel(nn.Module):
 
     def __init__(self):
         super().__init__()
-        self.config = SimpleNamespace(model_type="tiny")
+        self.config = SimpleNamespace(
+            model_type="tiny",
+            _resolved_numerical_program={
+                "attn_implementation": "flash_attention_3",
+                "router_fp32": False,
+                "lm_head_fp32": False,
+                "rmsnorm_mode": "sglang",
+                "qwen35_rmsnorm_family": "v2",
+                "activation_native": True,
+                "rope_native": True,
+                "rope_class_b": True,
+                "attention_cast_bf16": True,
+                "sparse_mla_enabled": False,
+                "sparse_mla_backend": "auto",
+            },
+        )
 
 
 def _trainer_args():
@@ -34,9 +49,11 @@ def _trainer_args():
             router_fp32=False,
             lm_head_fp32=False,
             alltoall_combine_hidden_chunk_size=0,
-            rmsnorm_mode="eager",
+            rmsnorm_mode="sglang",
+            qwen35_rmsnorm_family="v2",
             activation_native=True,
             rope_native=True,
+            rope_class_b=True,
             attention_cast_bf16=True,
             sparse_mla_enabled=False,
             sparse_mla_backend="auto",
@@ -45,6 +62,7 @@ def _trainer_args():
             freeze_router=False,
         ),
         train=SimpleNamespace(
+            ce_mode=None,
             enable_mixed_precision=True,
             skip_param_upcast=False,
             init_device="meta",
@@ -55,7 +73,12 @@ def _trainer_args():
             qarl_quant_sequence_length=None,
             qarl_calib_data=None,
         ),
-        lora=SimpleNamespace(enable_lora=False, enable_qlora=False),
+        lora=SimpleNamespace(
+            enable_lora=False,
+            enable_qlora=False,
+            lora_rank=16,
+            lora_alpha=16,
+        ),
     )
 
 
@@ -67,6 +90,7 @@ def test_local_trainer_forwards_model_numeric_alignment_flags(monkeypatch):
         return TinyModel()
 
     trainer = Trainer.__new__(Trainer)
+    trainer._causallm_loss_params = {}
     trainer.args = _trainer_args()
 
     monkeypatch.setattr("xorl.trainers.trainer.build_foundation_model", fake_build_foundation_model)
@@ -77,6 +101,12 @@ def test_local_trainer_forwards_model_numeric_alignment_flags(monkeypatch):
 
     assert captured["router_fp32"] is False
     assert captured["lm_head_fp32"] is False
+    assert captured["rmsnorm_mode"] == "sglang"
+    assert captured["qwen35_rmsnorm_family"] == "v2"
     assert captured["activation_native"] is True
     assert captured["rope_native"] is True
+    assert captured["rope_class_b"] is True
     assert captured["attention_cast_bf16"] is True
+    assert captured["moe_routing_weights_before_down"] is True
+    assert captured["lora_rank"] == 16
+    assert captured["lora_alpha"] == 16

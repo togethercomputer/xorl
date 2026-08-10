@@ -6,6 +6,8 @@ from typing import Optional
 
 import torch
 
+from xorl.models.layers.rope import stock_fused_apply_rotary_pos_emb
+
 
 QWEN3_5_CHECKPOINT_CONVERSION_MAPPING = {
     r"^model\.language_model\.": "model.",
@@ -34,6 +36,73 @@ LINEAR_ATTENTION_RING_UNSUPPORTED_MESSAGE = (
 )
 
 
+def _apply_qwen35_gdn_exact(model: torch.nn.Module) -> dict[str, int]:
+    """Apply the exact Qwen3.5-family trainer program once, before FSDP."""
+    if getattr(model, "_qwen35_gdn_exact_applied", False):
+        return dict(model._qwen35_gdn_exact_wrapped)
+
+    config = model.config
+    rmsnorm_family = getattr(config, "_qwen35_rmsnorm_family", "v2")
+    if rmsnorm_family not in ("v1", "v2"):
+        raise ValueError(f"Unsupported exact Qwen RMSNorm family: {rmsnorm_family!r}")
+    if rmsnorm_family == "v2" and getattr(config, "_rmsnorm_mode", None) != "sglang_fused":
+        raise RuntimeError("The exact Qwen families-v2 RMSNorm program requires rmsnorm_mode='sglang_fused'.")
+    is_moe = getattr(config, "model_type", None) in {
+        "xorl_qwen3_5_moe",
+        "qwen3_5_moe",
+        "qwen3_5_moe_text",
+    }
+    if is_moe:
+        from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
+        from xorl.models.layers.moe.ep_native_combine import (  # noqa: PLC0415
+            validate_qwen35_native_ep_combine_size,
+        )
+
+        ps = get_parallel_state()
+        if not ps.ep_enabled:
+            raise ValueError("Exact Qwen3.5-MoE server training requires expert parallelism")
+        validate_qwen35_native_ep_combine_size(ps.ep_size)
+
+    from xorl.lora.modules.base import LoraModule  # noqa: PLC0415
+    from xorl.ops.batch_invariant_ops import wrap_trunk_linears_batch_invariant  # noqa: PLC0415
+    from xorl.ops.bi_families_v2 import _select_qwen35_families_v1  # noqa: PLC0415
+
+    # RMSNorm uses the qualified v2 tree. The LM-head/LSE remains on its
+    # separately qualified v1 program; that selector does not control norms.
+    _select_qwen35_families_v1()
+    norm_modules = []
+    for module in model.modules():
+        # LoRA injection runs before this exact-model hook.  The exact contract
+        # is model-owned (not selected by the retired process-wide environment
+        # switch), so propagate it to every injected adapter before the trunk
+        # wrapper validates and composes with those modules.
+        if isinstance(module, LoraModule):
+            module.exact_merged_forward = True
+        if hasattr(module, "rmsnorm_family"):
+            norm_modules.append(module)
+            if module.rmsnorm_family != rmsnorm_family:
+                raise RuntimeError(
+                    "Exact Qwen RMSNorm resolution drifted during model construction: "
+                    f"expected {rmsnorm_family!r}, got {module.rmsnorm_family!r} on "
+                    f"{type(module).__qualname__}."
+                )
+        if hasattr(module, "_native_ep_combine"):
+            module._native_ep_combine = is_moe
+        if hasattr(module, "_exact_batch_invariant_router"):
+            module._exact_batch_invariant_router = is_moe
+            module.router._exact_batch_invariant = is_moe
+            module.router.synthetic_routing_mode = None
+            module.router.topk_policy = "default"
+
+    if not norm_modules:
+        raise RuntimeError("Exact Qwen model construction produced no resolved zero-centered RMSNorm modules.")
+
+    wrapped = wrap_trunk_linears_batch_invariant(model)
+    model._qwen35_gdn_exact_wrapped = dict(wrapped)
+    model._qwen35_gdn_exact_applied = True
+    return wrapped
+
+
 def qwen3_5_rotate_half(x: torch.Tensor, interleaved: bool = False) -> torch.Tensor:
     if not interleaved:
         x1 = x[..., : x.shape[-1] // 2]
@@ -50,7 +119,34 @@ def qwen3_5_apply_rotary_pos_emb(
     cos: torch.Tensor,
     sin: torch.Tensor,
     interleaved: bool = False,
+    class_b: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if class_b:
+        if not q.is_cuda or not k.is_cuda:
+            raise RuntimeError("Qwen3.5-family Class-B RoPE requires CUDA q/k tensors")
+        if q.dtype is not torch.bfloat16 or k.dtype is not torch.bfloat16:
+            raise RuntimeError(f"Qwen3.5-family Class-B RoPE requires BF16 q/k tensors; got q={q.dtype}, k={k.dtype}")
+        if q.ndim != 4 or k.ndim != 4 or cos.ndim != 3 or sin.ndim != 3:
+            raise RuntimeError(
+                "Qwen3.5-family Class-B RoPE requires q/k [B,S,H,D] and cos/sin [B,S,D]; "
+                f"got q={tuple(q.shape)}, k={tuple(k.shape)}, cos={tuple(cos.shape)}, sin={tuple(sin.shape)}"
+            )
+        if q.shape[:2] != k.shape[:2] or q.shape[:2] != cos.shape[:2] or cos.shape != sin.shape:
+            raise RuntimeError(
+                "Qwen3.5-family Class-B RoPE received incompatible token/table shapes: "
+                f"q={tuple(q.shape)}, k={tuple(k.shape)}, cos={tuple(cos.shape)}, sin={tuple(sin.shape)}"
+            )
+        if cos.dtype is not torch.float32 or sin.dtype is not torch.float32:
+            raise RuntimeError(
+                f"Qwen3.5-family Class-B RoPE requires fp32 cos/sin; got cos={cos.dtype}, sin={sin.dtype}"
+            )
+        if cos.shape[-1] % 2 or cos.shape[-1] > min(q.shape[-1], k.shape[-1]):
+            raise RuntimeError(
+                "Qwen3.5-family Class-B RoPE requires an even rotary dimension no larger than q/k; "
+                f"got rotary={cos.shape[-1]}, q={q.shape[-1]}, k={k.shape[-1]}"
+            )
+        return stock_fused_apply_rotary_pos_emb(q, k, cos, sin, interleaved=interleaved)
+
     # `interleaved` describes the q/k feature-layout convention only.
     #   - `False` (default): standard half-rotate. Used by Qwen3.5/Qwen3.6
     #     (HF/SGLang). Qwen's `mrope_interleaved` is about T/H/W frequency

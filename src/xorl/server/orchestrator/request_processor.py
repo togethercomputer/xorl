@@ -66,9 +66,6 @@ from xorl.server.protocol.operations import (
     SaveLoraOnlyData,
     SaveStateData,
     SyncWeightsData,
-    ZORLAbortGenerationData,
-    ZORLApplyRewardsData,
-    ZORLStartGenerationData,
 )
 from xorl.server.runner.utils import batch_packed_rows
 from xorl.server.side_payloads import (
@@ -987,6 +984,21 @@ class RequestProcessor:
             build_output,
         )
 
+    async def execute_abort_gradient_epoch(self, request: OrchestratorRequest) -> OrchestratorOutputs:
+        """Discard all unmutated captures after an ambiguous forward response."""
+
+        p = request.payload
+        return await self._execute_operation(
+            request,
+            "abort_gradient_epoch",
+            self.backend.abort_gradient_epoch(
+                model_id=p.model_id,
+                request_id=request.request_id,
+            ),
+            OutputType.ABORT_GRADIENT_EPOCH,
+            lambda result: [result],
+        )
+
     async def execute_save_state(self, request: OrchestratorRequest) -> OrchestratorOutputs:
         """Execute checkpoint save on workers."""
         p: SaveStateData = request.payload
@@ -1329,58 +1341,6 @@ class RequestProcessor:
             ),
             OutputType.KILL_SESSION,
             build_output,
-        )
-
-    async def execute_start_zorl_generation(self, request: OrchestratorRequest) -> OrchestratorOutputs:
-        """Execute ZORL generation planning on workers."""
-        p: ZORLStartGenerationData = request.payload
-
-        return await self._execute_operation(
-            request,
-            "start_zorl_generation",
-            self.backend.start_zorl_generation(
-                model_id=p.model_id,
-                num_pairs=p.num_pairs,
-                materialization=p.materialization,
-                owner_url=p.owner_url,
-                request_id=request.request_id,
-            ),
-            OutputType.START_ZORL_GENERATION,
-            lambda result: [result],
-        )
-
-    async def execute_apply_zorl_rewards(self, request: OrchestratorRequest) -> OrchestratorOutputs:
-        """Execute ZORL reward application on workers."""
-        p: ZORLApplyRewardsData = request.payload
-
-        return await self._execute_operation(
-            request,
-            "apply_zorl_rewards",
-            self.backend.apply_zorl_rewards(
-                model_id=p.model_id,
-                generation_id=p.generation_id,
-                candidate_rewards=p.candidate_rewards,
-                learning_rate=p.learning_rate,
-                request_id=request.request_id,
-            ),
-            OutputType.APPLY_ZORL_REWARDS,
-            lambda result: [result],
-        )
-
-    async def execute_abort_zorl_generation(self, request: OrchestratorRequest) -> OrchestratorOutputs:
-        """Execute ZORL generation abort on workers."""
-        p: ZORLAbortGenerationData = request.payload
-
-        return await self._execute_operation(
-            request,
-            "abort_zorl_generation",
-            self.backend.abort_zorl_generation(
-                model_id=p.model_id,
-                generation_id=p.generation_id,
-                request_id=request.request_id,
-            ),
-            OutputType.ABORT_ZORL_GENERATION,
-            lambda result: [result],
         )
 
     # ========================================================================

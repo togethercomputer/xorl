@@ -12,6 +12,10 @@ def get_ep_plan() -> ParallelPlan:
     ep_plan = {
         "model.layers.*.mlp.experts.gate_up_proj": Shard(0),
         "model.layers.*.mlp.experts.down_proj": Shard(0),
+        "model.layers.*.mlp.experts.gate_up_packed_weight_f32": Shard(0),
+        "model.layers.*.mlp.experts.gate_up_weight_scale_inv": Shard(0),
+        "model.layers.*.mlp.experts.down_packed_weight_f32": Shard(0),
+        "model.layers.*.mlp.experts.down_weight_scale_inv": Shard(0),
         "model.layers.*.mlp.experts.gate_proj_lora_A": Shard(0),
         "model.layers.*.mlp.experts.gate_proj_lora_B": Shard(0),
         "model.layers.*.mlp.experts.up_proj_lora_A": Shard(0),

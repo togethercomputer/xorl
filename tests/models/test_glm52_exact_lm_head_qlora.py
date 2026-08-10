@@ -1,0 +1,449 @@
+from __future__ import annotations
+
+import sys
+
+import pytest
+import torch
+import torch.nn.functional as F
+
+import xorl.models.transformers.glm5.exact_lm_head_qlora as lm_head_impl
+from xorl.models.transformers.glm5.exact_lm_head_qlora import (
+    GLM52_EXACT_TP16_LM_HEAD_CONTRACT_VERSION,
+    GLM52_LM_HEAD_HIDDEN_SIZE,
+    GLM52_LM_HEAD_LOCAL_VOCAB_SIZE,
+    GLM52_LM_HEAD_PADDED_VOCAB_SIZE,
+    GLM52_LM_HEAD_TP_SIZE,
+    GLM52_LM_HEAD_VOCAB_SIZE,
+    Glm52ExactTP16LmHeadSelectedLogprob,
+    _Glm52ExactTP16LmHeadFunction,
+    _local_qlora_surrogate_vjp,
+    _rank_order_vocab_from_stacked,
+    glm52_lm_head_shard,
+)
+
+
+def _component(tp_rank: int = 0) -> Glm52ExactTP16LmHeadSelectedLogprob:
+    shard = glm52_lm_head_shard(tp_rank)
+    return Glm52ExactTP16LmHeadSelectedLogprob(
+        tp_rank=tp_rank,
+        vocab_start=shard.vocab_start,
+        vocab_end=shard.vocab_end,
+        padded_vocab_start=shard.padded_vocab_start,
+        padded_vocab_end=shard.padded_vocab_end,
+    )
+
+
+def _meta_operands(rows: int = 2):
+    hidden = torch.empty((rows, GLM52_LM_HEAD_HIDDEN_SIZE), dtype=torch.bfloat16, device="meta", requires_grad=True)
+    weight = torch.empty(
+        (GLM52_LM_HEAD_LOCAL_VOCAB_SIZE, GLM52_LM_HEAD_HIDDEN_SIZE),
+        dtype=torch.bfloat16,
+        device="meta",
+    )
+    lora_A = torch.empty((1, GLM52_LM_HEAD_HIDDEN_SIZE), dtype=torch.float32, device="meta", requires_grad=True)
+    lora_B = torch.empty(
+        (GLM52_LM_HEAD_LOCAL_VOCAB_SIZE, 1),
+        dtype=torch.float32,
+        device="meta",
+        requires_grad=True,
+    )
+    token_ids = torch.empty((rows,), dtype=torch.int64, device="meta")
+    return hidden, weight, lora_A, lora_B, token_ids
+
+
+def test_official_tp16_shards_match_sglang_padding_and_rank_order() -> None:
+    shards = [glm52_lm_head_shard(rank) for rank in range(GLM52_LM_HEAD_TP_SIZE)]
+
+    assert GLM52_LM_HEAD_PADDED_VOCAB_SIZE == GLM52_LM_HEAD_VOCAB_SIZE
+    assert GLM52_LM_HEAD_VOCAB_SIZE // GLM52_LM_HEAD_TP_SIZE == GLM52_LM_HEAD_LOCAL_VOCAB_SIZE
+    assert [shard.vocab_start for shard in shards] == [rank * 9_680 for rank in range(16)]
+    assert [shard.vocab_end for shard in shards] == [(rank + 1) * 9_680 for rank in range(16)]
+    assert all(shard.padding_rows == 0 for shard in shards)
+    assert shards[0].vocab_start == 0
+    assert shards[-1].vocab_end == 154_880
+
+    with pytest.raises(TypeError, match="must be an integer"):
+        glm52_lm_head_shard(True)
+    with pytest.raises(ValueError, match=r"\[0, 15\]"):
+        glm52_lm_head_shard(16)
+
+
+def test_component_fails_closed_on_shard_ranges() -> None:
+    component = _component(7)
+    shard = glm52_lm_head_shard(7)
+
+    assert component.contract_version == GLM52_EXACT_TP16_LM_HEAD_CONTRACT_VERSION
+    assert component.shard == shard
+    assert not tuple(component.parameters())
+    assert component.state_dict() == {}
+    assert "vocab=[67760,77440)" in repr(component)
+
+    with pytest.raises(ValueError, match="shard range/order mismatch"):
+        Glm52ExactTP16LmHeadSelectedLogprob(
+            tp_rank=7,
+            vocab_start=shard.vocab_start + 1,
+            vocab_end=shard.vocab_end,
+            padded_vocab_start=shard.padded_vocab_start,
+            padded_vocab_end=shard.padded_vocab_end,
+        )
+    with pytest.raises(TypeError, match="vocab_start must be an integer"):
+        Glm52ExactTP16LmHeadSelectedLogprob(
+            tp_rank=7,
+            vocab_start=float(shard.vocab_start),
+            vocab_end=shard.vocab_end,
+            padded_vocab_start=shard.padded_vocab_start,
+            padded_vocab_end=shard.padded_vocab_end,
+        )
+
+
+def test_operand_contract_is_official_local_bf16_rank_one_and_stride_exact() -> None:
+    component = _component()
+    operands = _meta_operands()
+    component._validate_operands(*operands, require_cuda=False)
+
+    hidden, weight, lora_A, lora_B, token_ids = operands
+    with pytest.raises(TypeError, match="factor masters must be FP32"):
+        component._validate_operands(
+            hidden,
+            weight,
+            lora_A.to(torch.bfloat16),
+            lora_B,
+            token_ids,
+            require_cuda=False,
+        )
+    with pytest.raises(ValueError, match="local_lora_B shape"):
+        component._validate_operands(
+            hidden,
+            weight,
+            lora_A,
+            torch.empty((GLM52_LM_HEAD_LOCAL_VOCAB_SIZE - 1, 1), device="meta", requires_grad=True),
+            token_ids,
+            require_cuda=False,
+        )
+    with pytest.raises(ValueError, match="sampler-contiguous stride"):
+        component._validate_operands(
+            hidden,
+            torch.empty_strided(
+                (GLM52_LM_HEAD_LOCAL_VOCAB_SIZE, GLM52_LM_HEAD_HIDDEN_SIZE),
+                (1, GLM52_LM_HEAD_LOCAL_VOCAB_SIZE),
+                dtype=torch.bfloat16,
+                device="meta",
+            ),
+            lora_A,
+            lora_B,
+            token_ids,
+            require_cuda=False,
+        )
+    with pytest.raises(RuntimeError, match="token IDs must be in"):
+        component._validate_operands(
+            hidden,
+            weight,
+            lora_A,
+            lora_B,
+            torch.tensor([0, GLM52_LM_HEAD_VOCAB_SIZE], dtype=torch.int64),
+            require_cuda=False,
+        )
+    with pytest.raises(RuntimeError, match="base weight must remain frozen"):
+        component._validate_operands(
+            hidden,
+            weight.requires_grad_(True),
+            lora_A,
+            lora_B,
+            token_ids,
+            require_cuda=False,
+        )
+
+
+def test_cpu_rejection_happens_before_sglang_import_or_group_use() -> None:
+    before = {name for name in sys.modules if name == "sglang" or name.startswith("sglang.")}
+    component = _component()
+    hidden, weight, lora_A, lora_B, token_ids = _meta_operands()
+
+    with pytest.raises(RuntimeError, match="requires CUDA"):
+        component(hidden, weight, lora_A, lora_B, token_ids)
+
+    after = {name for name in sys.modules if name == "sglang" or name.startswith("sglang.")}
+    assert after == before
+
+
+def test_rank_order_vocab_reshape_is_byte_exact_and_has_identity_token_mapping() -> None:
+    rows = 2
+    local = GLM52_LM_HEAD_LOCAL_VOCAB_SIZE
+    row_values = torch.arange(rows * local, dtype=torch.float32).reshape(rows, local)
+    shards = torch.stack([row_values + rank * 1_000_000 for rank in range(GLM52_LM_HEAD_TP_SIZE)])
+
+    gathered = _rank_order_vocab_from_stacked(
+        shards,
+        expected_world_size=GLM52_LM_HEAD_TP_SIZE,
+        expected_local_vocab_size=local,
+    )
+    expected = torch.cat([shards[rank] for rank in range(GLM52_LM_HEAD_TP_SIZE)], dim=-1)
+
+    assert torch.equal(gathered.view(torch.uint8), expected.view(torch.uint8))
+    for rank in (0, 1, 7, 15):
+        start = rank * local
+        assert torch.equal(gathered[:, start : start + local], shards[rank])
+
+    with pytest.raises(ValueError, match="collective rank order"):
+        _rank_order_vocab_from_stacked(
+            shards.transpose(1, 2).contiguous().transpose(1, 2),
+            expected_world_size=GLM52_LM_HEAD_TP_SIZE,
+            expected_local_vocab_size=local,
+        )
+
+
+def test_effective_factor_views_are_the_live_bf16_bytes() -> None:
+    component = _component(5)
+    lora_A = torch.arange(GLM52_LM_HEAD_HIDDEN_SIZE, dtype=torch.float32).sub_(101).div_(257).unsqueeze(0)
+    lora_B = torch.arange(GLM52_LM_HEAD_LOCAL_VOCAB_SIZE, dtype=torch.float32).sub_(503).div_(997).unsqueeze(1)
+    master_A = lora_A.clone()
+    master_B = lora_B.clone()
+
+    effective_A, effective_B = component.effective_factor_views(lora_A, lora_B)
+
+    assert torch.equal(effective_A.view(torch.uint8), master_A.to(torch.bfloat16).view(torch.uint8))
+    assert torch.equal(effective_B.view(torch.uint8), master_B.to(torch.bfloat16).view(torch.uint8))
+    assert torch.equal(lora_A, master_A)
+    assert torch.equal(lora_B, master_B)
+
+
+def test_local_fp32_surrogate_vjp_matches_standalone_qlora_reference() -> None:
+    hidden = torch.arange(24, dtype=torch.float32).reshape(3, 8).sub_(7).div_(19).to(torch.bfloat16)
+    weight = torch.arange(56, dtype=torch.float32).reshape(7, 8).sub_(23).div_(37).to(torch.bfloat16)
+    effective_A = torch.arange(8, dtype=torch.float32).sub_(3).div_(11).reshape(1, 8).to(torch.bfloat16)
+    effective_B = torch.arange(7, dtype=torch.float32).sub_(2).div_(13).reshape(7, 1).to(torch.bfloat16)
+    grad_logits = torch.arange(21, dtype=torch.float32).reshape(3, 7).sub_(8).div_(17)
+
+    grad_hidden, grad_A, grad_B = _local_qlora_surrogate_vjp(
+        hidden,
+        weight,
+        effective_A,
+        effective_B,
+        grad_logits,
+        needs_input_grad=(True, True, True),
+    )
+
+    base_hidden = hidden.detach().clone().requires_grad_(True)
+    F.linear(base_hidden, weight).backward(grad_logits.to(torch.bfloat16))
+    lora_hidden = hidden.float().detach().requires_grad_(True)
+    reference_A = effective_A.float().detach().requires_grad_(True)
+    reference_B = effective_B.float().detach().requires_grad_(True)
+    F.linear(F.linear(lora_hidden, reference_A), reference_B).backward(grad_logits)
+
+    assert grad_hidden.dtype is torch.float32
+    assert grad_A.dtype is torch.float32
+    assert grad_B.dtype is torch.float32
+    assert torch.equal(grad_hidden, base_hidden.grad.float() + lora_hidden.grad)
+    assert torch.equal(grad_A, reference_A.grad)
+    assert torch.equal(grad_B, reference_B.grad)
+
+
+def test_custom_boundary_is_grad_enabled_and_saves_effective_factor_bytes() -> None:
+    captures = {}
+
+    class FakeComponent:
+        @staticmethod
+        def _exact_forward_value(hidden, weight, effective_A, effective_B, token_ids):
+            captures["A"] = effective_A.clone()
+            captures["B"] = effective_B.clone()
+            return hidden.float().sum(dim=-1) + weight.float().sum() * 0.0 + token_ids.float() * 0.0
+
+        @staticmethod
+        def _surrogate_vjp(hidden, weight, effective_A, effective_B, token_ids, grad_logprob, *, needs_input_grad):
+            del weight, effective_A, effective_B, token_ids, needs_input_grad
+            return grad_logprob.unsqueeze(-1).expand_as(hidden).float(), torch.ones(1, 3), torch.ones(5, 1)
+
+    hidden = torch.arange(6, dtype=torch.float32).reshape(2, 3).to(torch.bfloat16).requires_grad_(True)
+    weight = torch.zeros(5, 3, dtype=torch.bfloat16)
+    lora_A = torch.tensor([[0.1001, -0.2002, 0.3003]], requires_grad=True)
+    lora_B = torch.tensor([[0.1101], [-0.2202], [0.3303], [-0.4404], [0.5505]], requires_grad=True)
+    token_ids = torch.tensor([0, 4], dtype=torch.int64)
+
+    logprob = _Glm52ExactTP16LmHeadFunction.apply(hidden, weight, lora_A, lora_B, token_ids, FakeComponent())
+    assert logprob.requires_grad
+    assert torch.equal(captures["A"], lora_A.detach().to(torch.bfloat16))
+    assert torch.equal(captures["B"], lora_B.detach().to(torch.bfloat16))
+
+    logprob.sum().backward()
+    assert torch.equal(hidden.grad, torch.ones_like(hidden))
+    assert torch.equal(lora_A.grad, torch.ones_like(lora_A))
+    assert torch.equal(lora_B.grad, torch.ones_like(lora_B))
+
+
+def test_tp_group_validation_rejects_size_order_rank_and_backend(monkeypatch) -> None:
+    component = _component(3)
+    group = object()
+    component.bind_tp_group(group)
+    state = {
+        "world": 16,
+        "group_rank": 3,
+        "global_rank": 3,
+        "ranks": list(range(16)),
+        "backend": "nccl",
+    }
+    monkeypatch.setattr(lm_head_impl.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(lm_head_impl.dist, "get_world_size", lambda _group: state["world"])
+    monkeypatch.setattr(
+        lm_head_impl.dist,
+        "get_rank",
+        lambda requested_group=None: state["global_rank"] if requested_group is None else state["group_rank"],
+    )
+    monkeypatch.setattr(lm_head_impl.dist, "get_process_group_ranks", lambda _group: state["ranks"])
+    monkeypatch.setattr(lm_head_impl.dist, "get_backend", lambda _group: state["backend"])
+
+    assert component._validate_tp_group() is group
+
+    state["world"] = 8
+    with pytest.raises(RuntimeError, match="requires TP16"):
+        component._validate_tp_group()
+    state["world"] = 16
+    state["ranks"] = [1, 0, *range(2, 16)]
+    with pytest.raises(RuntimeError, match="gather order"):
+        component._validate_tp_group()
+    state["ranks"] = list(range(16))
+    state["group_rank"] = 4
+    with pytest.raises(RuntimeError, match="shard/group rank mismatch"):
+        component._validate_tp_group()
+    state["group_rank"] = 3
+    state["backend"] = "gloo"
+    with pytest.raises(RuntimeError, match="must use NCCL"):
+        component._validate_tp_group()
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires Hopper CUDA")
+def test_official_local_shard_literal_v2_bytes_tail_and_surrogate_gradients() -> None:
+    pytest.importorskip("sglang")
+    if torch.cuda.get_device_capability()[0] != 9:
+        pytest.skip("the qualified GLM-5.2 exact LM-head component requires Hopper")
+
+    from sglang.kernels.ops.gemm.sgemm_lora_a import sgemm_lora_a_fwd
+    from sglang.kernels.ops.gemm.sgemm_lora_b import sgemm_lora_b_fwd
+    from sglang.srt.batch_invariant_ops import (
+        head_v2_full_logits_with_lse,
+        head_v2_selected_logprob_from_logits,
+    )
+    from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
+
+    for rank in range(GLM52_LM_HEAD_TP_SIZE):
+        expected = glm52_lm_head_shard(rank)
+        actual = VocabParallelEmbedding._get_indices(
+            GLM52_LM_HEAD_PADDED_VOCAB_SIZE,
+            GLM52_LM_HEAD_PADDED_VOCAB_SIZE,
+            GLM52_LM_HEAD_VOCAB_SIZE,
+            GLM52_LM_HEAD_VOCAB_SIZE,
+            rank,
+            GLM52_LM_HEAD_TP_SIZE,
+        )
+        assert (
+            actual.org_vocab_start_index,
+            actual.org_vocab_end_index,
+            actual.padded_org_vocab_start_index,
+            actual.padded_org_vocab_end_index,
+            actual.num_org_vocab_padding,
+        ) == (
+            expected.vocab_start,
+            expected.vocab_end,
+            expected.padded_vocab_start,
+            expected.padded_vocab_end,
+            0,
+        )
+
+    device = torch.device("cuda")
+    component = _component(0).to(device)
+    rows = 2
+    torch.manual_seed(20260807)
+    hidden = torch.empty((rows, GLM52_LM_HEAD_HIDDEN_SIZE), dtype=torch.bfloat16, device=device).uniform_(-0.125, 0.125)
+    local_weight = torch.empty(
+        (GLM52_LM_HEAD_LOCAL_VOCAB_SIZE, GLM52_LM_HEAD_HIDDEN_SIZE),
+        dtype=torch.bfloat16,
+        device=device,
+    ).uniform_(-0.0625, 0.0625)
+    lora_A = (
+        torch.arange(GLM52_LM_HEAD_HIDDEN_SIZE, dtype=torch.float32, device=device)
+        .sub_(3_071)
+        .div_(16_384)
+        .reshape(1, GLM52_LM_HEAD_HIDDEN_SIZE)
+        .requires_grad_(True)
+    )
+    lora_B = (
+        torch.arange(GLM52_LM_HEAD_LOCAL_VOCAB_SIZE, dtype=torch.float32, device=device)
+        .sub_(4_839)
+        .div_(32_768)
+        .reshape(GLM52_LM_HEAD_LOCAL_VOCAB_SIZE, 1)
+        .requires_grad_(True)
+    )
+    hidden_bytes = hidden.view(torch.uint8).clone()
+    weight_bytes = local_weight.view(torch.uint8).clone()
+    A_bytes = lora_A.view(torch.uint8).clone()
+    B_bytes = lora_B.view(torch.uint8).clone()
+    effective_A, effective_B = component.effective_factor_views(lora_A, lora_B)
+
+    batch_info = lm_head_impl._single_adapter_lm_head_batch_info(device.index, rows)
+    direct_base, _direct_lse = head_v2_full_logits_with_lse(hidden, local_weight)
+    direct_a = sgemm_lora_a_fwd(hidden, effective_A.unsqueeze(0), batch_info)
+    direct_delta = sgemm_lora_b_fwd(direct_a, effective_B.unsqueeze(0), batch_info)
+    expected_local = sgemm_lora_b_fwd(
+        direct_a,
+        effective_B.unsqueeze(0),
+        batch_info,
+        base_output=direct_base.clone(),
+    )
+    actual_local = component._exact_local_logits(hidden, local_weight, effective_A, effective_B)
+    warm_local = component._exact_local_logits(hidden, local_weight, effective_A, effective_B)
+
+    assert direct_base.dtype is torch.float32
+    assert direct_a.dtype is torch.bfloat16
+    assert direct_delta.dtype is torch.bfloat16
+    assert torch.equal(expected_local.view(torch.uint8), (direct_base + direct_delta.float()).view(torch.uint8))
+    assert torch.equal(actual_local.view(torch.uint8), expected_local.view(torch.uint8))
+    assert torch.equal(warm_local.view(torch.uint8), actual_local.view(torch.uint8))
+    assert torch.equal(hidden.view(torch.uint8), hidden_bytes)
+    assert torch.equal(local_weight.view(torch.uint8), weight_bytes)
+    assert torch.equal(lora_A.view(torch.uint8), A_bytes)
+    assert torch.equal(lora_B.view(torch.uint8), B_bytes)
+    assert torch.equal(effective_A.view(torch.uint8), lora_A.detach().to(torch.bfloat16).view(torch.uint8))
+    assert torch.equal(effective_B.view(torch.uint8), lora_B.detach().to(torch.bfloat16).view(torch.uint8))
+
+    stacked = torch.stack(
+        [actual_local + torch.tensor(rank / 128, dtype=torch.float32, device=device) for rank in range(16)]
+    )
+    gathered = _rank_order_vocab_from_stacked(
+        stacked,
+        expected_world_size=16,
+        expected_local_vocab_size=GLM52_LM_HEAD_LOCAL_VOCAB_SIZE,
+    )
+    expected_gathered = torch.cat([stacked[rank] for rank in range(16)], dim=-1)
+    assert torch.equal(gathered.view(torch.uint8), expected_gathered.view(torch.uint8))
+
+    token_ids = torch.tensor([0, GLM52_LM_HEAD_VOCAB_SIZE - 1], dtype=torch.int64, device=device)
+    actual_logprob = component._selected_logprob_from_gathered(gathered, token_ids)
+    expected_logprob, _, _ = head_v2_selected_logprob_from_logits(gathered, token_ids, temperature=None)
+    assert torch.equal(actual_logprob.view(torch.uint8), expected_logprob.view(torch.uint8))
+
+    grad_local_logits = (
+        torch.arange(rows * GLM52_LM_HEAD_LOCAL_VOCAB_SIZE, dtype=torch.float32, device=device)
+        .remainder_(127)
+        .sub_(63)
+        .div_(64)
+        .reshape(rows, GLM52_LM_HEAD_LOCAL_VOCAB_SIZE)
+    )
+    grad_hidden, grad_A, grad_B = _local_qlora_surrogate_vjp(
+        hidden,
+        local_weight,
+        effective_A,
+        effective_B,
+        grad_local_logits,
+        needs_input_grad=(True, True, True),
+    )
+    base_hidden = hidden.detach().clone().requires_grad_(True)
+    F.linear(base_hidden, local_weight).backward(grad_local_logits.to(torch.bfloat16))
+    lora_hidden = hidden.float().detach().requires_grad_(True)
+    reference_A = effective_A.float().detach().requires_grad_(True)
+    reference_B = effective_B.float().detach().requires_grad_(True)
+    F.linear(F.linear(lora_hidden, reference_A), reference_B).backward(grad_local_logits)
+
+    assert grad_hidden.dtype is grad_A.dtype is grad_B.dtype is torch.float32
+    assert torch.equal(grad_hidden, base_hidden.grad.float() + lora_hidden.grad)
+    assert torch.equal(grad_A, reference_A.grad)
+    assert torch.equal(grad_B, reference_B.grad)

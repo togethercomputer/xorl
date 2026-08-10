@@ -47,11 +47,9 @@ PATTERNS = {
     "authoring-assistant attribution": re.compile(r"(?i)\b(?:claude|anthropic|copilot)\b"),
 }
 
-# The first three state the patterns, so they necessarily contain them. ``.gitignore``
-# names the assistant's own files so they stay untracked, which is the opposite of a
-# leak: removing the entries would risk committing them.
+# The pattern definitions necessarily contain the forbidden strings. ``.gitignore``
+# names authoring-tool files so they stay untracked, which is the opposite of a leak.
 EXEMPT = {
-    "P4_UPSTREAM_MANIFEST.md",
     "tests/test_no_internal_references.py",
     "src/xorl/sim/calibration_packs.py",
     "tests/test_example_assets.py",

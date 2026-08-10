@@ -14,6 +14,8 @@ from functools import wraps
 import torch
 import torch.nn as nn
 
+from xorl.models.exact_contract import glm52_exact_forward_enabled
+
 
 try:
     from flash_attn.layers.rotary import apply_rotary_emb as _flash_apply_rotary_emb
@@ -460,8 +462,7 @@ class RotaryEmbedding(nn.Module):
         self._set_inv_freq_fp32(self._cpu_fp32_inv_freq())
         self._sglang_default_cache = None
         self._use_sglang_default_cache = bool(getattr(config, "_rope_native", False) and self.rope_type == "default")
-        if self._use_sglang_default_cache:
-            self._sglang_default_cache = self._build_sglang_default_cache(self.max_seq_len_cached)
+        self._class_b = bool(getattr(config, "_rope_class_b", False) or glm52_exact_forward_enabled(config))
 
     def _cpu_fp32_inv_freq(self) -> torch.Tensor:
         """Frequency table computed on CPU in fp32 — the provenance serving's cos/sin cache is built with."""
@@ -500,29 +501,51 @@ class RotaryEmbedding(nn.Module):
         )
         return float(base), int(head_dim * partial_rotary_factor)
 
-    def _build_sglang_default_cache(self, seq_len: int) -> torch.Tensor:
+    def _build_sglang_default_cache(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        # Table provenance is architecture-specific, matching each family's
+        # certified serving program. GLM-5.2 computes inverse frequencies on
+        # CPU in fp32, transfers them to the execution device, then builds the
+        # position outer product and cos/sin on that device. The Qwen3.5-family
+        # program evaluates the whole table on CPU and moves the finished fp32
+        # values (host/device transfers are bit-exact). The split is
+        # load-bearing: CUDA cos/sin differ from CPU libm by up to one fp32
+        # ulp, and a table built on the wrong device seeds a position-onset
+        # trainer/sampler logprob mismatch.
         base, dim = self._default_rope_base_and_dim()
         inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        if glm52_exact_forward_enabled(self.config):
+            inv_freq = inv_freq.to(device=device)
+            positions = torch.arange(seq_len, dtype=torch.float32, device=device)
+            freqs = torch.einsum("i,j->ij", positions, inv_freq)
+            return torch.cat((freqs.cos(), freqs.sin()), dim=-1)
         positions = torch.arange(seq_len, dtype=torch.float32)
         freqs = torch.einsum("i,j->ij", positions, inv_freq)
-        return torch.cat((freqs.cos(), freqs.sin()), dim=-1)
+        return torch.cat((freqs.cos(), freqs.sin()), dim=-1).to(device=device)
 
-    def _ensure_sglang_default_cache(self, needed_max_pos: int) -> None:
-        if self._sglang_default_cache is None or needed_max_pos >= self._sglang_default_cache.shape[0]:
-            self._sglang_default_cache = self._build_sglang_default_cache(needed_max_pos + 1)
+    def _ensure_sglang_default_cache(self, needed_max_pos: int, device: torch.device) -> None:
+        if (
+            self._sglang_default_cache is None
+            or self._sglang_default_cache.device != device
+            or needed_max_pos >= self._sglang_default_cache.shape[0]
+        ):
+            # SGLang materializes the configured default-cache capacity at
+            # construction.  Match both its execution device and table shape;
+            # this also keeps the admitted run out of the cache-growth path.
+            cache_len = max(self.max_seq_len_cached, needed_max_pos + 1)
+            self._sglang_default_cache = self._build_sglang_default_cache(cache_len, device)
 
     @torch.no_grad()
     @dynamic_rope_update
     def forward(self, x, position_ids):
         if self._use_sglang_default_cache:
             needed_max_pos = int(position_ids.max().item())
-            self._ensure_sglang_default_cache(needed_max_pos)
-            flat_positions = position_ids.reshape(-1).to(device="cpu", dtype=torch.long)
+            self._ensure_sglang_default_cache(needed_max_pos, x.device)
+            flat_positions = position_ids.reshape(-1).to(device=x.device, dtype=torch.long)
             cos_sin = self._sglang_default_cache.index_select(0, flat_positions)
             cos_half, sin_half = cos_sin.chunk(2, dim=-1)
             cos = torch.cat((cos_half, cos_half), dim=-1).view(*position_ids.shape, -1)
             sin = torch.cat((sin_half, sin_half), dim=-1).view(*position_ids.shape, -1)
-            out_dtype = torch.float32 if _rope_class_b else x.dtype
+            out_dtype = torch.float32 if self._class_b else x.dtype
             return cos.to(device=x.device, dtype=out_dtype), sin.to(device=x.device, dtype=out_dtype)
 
         inv_freq = self._resolve_inv_freq(x.device)
@@ -538,7 +561,7 @@ class RotaryEmbedding(nn.Module):
 
         # Class B feeds cos/sin straight into an fp32 kernel cache; a bf16 round here
         # would put the result back in Class A.
-        out_dtype = torch.float32 if _rope_class_b else x.dtype
+        out_dtype = torch.float32 if self._class_b else x.dtype
         return cos.to(dtype=out_dtype), sin.to(dtype=out_dtype)
 
 
@@ -554,22 +577,12 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
-def _note_class_a(where: str) -> None:
-    """Record a Class-A rope call so partial Class-B engagement is visible, not inferred."""
-    if not _rope_class_b:
-        return
-    from xorl.ops.rope_class_b import note_rope_engagement  # noqa: PLC0415
-
-    note_rope_engagement("class_a", where)
-
-
 def _naive_apply_rotary_pos_emb(q, k, cos, sin):
     """Naive RoPE application (pure PyTorch, no fused kernel).
 
     All tensors use [B, S, H, D] layout. cos/sin are [B, S, D].
     Handles partial rotary automatically when cos/sin dim < head_dim.
     """
-    _note_class_a("_naive_apply_rotary_pos_emb")
     cos = cos.unsqueeze(2)
     sin = sin.unsqueeze(2)
     rotary_dim = cos.shape[-1]

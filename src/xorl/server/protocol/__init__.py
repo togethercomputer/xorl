@@ -35,6 +35,7 @@ from xorl.server.protocol.api_orchestrator import (  # noqa: F401
 )
 from xorl.server.protocol.operations import (  # noqa: F401
     AbortData,
+    AbortGradientEpochData,
     AdapterStateData,
     EmptyData,
     KillSessionData,

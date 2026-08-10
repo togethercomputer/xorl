@@ -1,5 +1,7 @@
 """MoE operations: scatter, gather, histogram, and index computation."""
 
+import os
+
 import torch
 import triton
 import triton.language as tl
@@ -8,6 +10,34 @@ from .triton_utils.memory import (
     load_with_pred_1d,
     store_with_pred_1d,
 )
+
+
+def _deterministic_scatter_enabled() -> bool:
+    """Deterministic scatter is the default: build the token->slot permutation with
+    a stable sort instead of relaxed atomics, so `moe_index_compute` returns the
+    same permutation on every run (required for bit-reproducible training).
+    Escape hatch: XORL_MOE_DETERMINISTIC_SCATTER=0 restores the atomics kernel."""
+    value = os.environ.get("XORL_MOE_DETERMINISTIC_SCATTER")
+    if value is None:
+        return True
+    return value.strip().lower() not in {"0", "false", "no", "off", ""}
+
+
+def _moe_index_compute_deterministic(experts_for_tokens: torch.Tensor) -> torch.Tensor:
+    """Run-invariant replacement for `_moe_index_compute_kernel`.
+
+    A stable argsort of the flattened expert ids yields slots where expert
+    regions appear in expert-id order (the same `[cumsum[e-1], cumsum[e])`
+    boundaries the atomic kernel fills) and rows within an expert appear in
+    flattened token order. Unlike the relaxed-atomics kernel, whose
+    intra-expert order depends on CTA scheduling and differs per run, this is
+    the same permutation every call.
+    """
+    flat = experts_for_tokens.reshape(-1)
+    order = torch.argsort(flat, stable=True)  # order[slot] = flattened (token, k) position
+    indices = torch.empty_like(flat, dtype=torch.int64)
+    indices.scatter_(0, order, torch.arange(flat.numel(), device=flat.device, dtype=torch.int64))
+    return indices.view(experts_for_tokens.shape)
 
 
 @triton.heuristics(values={"BLOCK_ALIGNED": lambda args: args["num_elts"] % args["BLOCK_SIZE"] == 0})
@@ -382,6 +412,9 @@ def moe_index_compute(experts_for_tokens: torch.Tensor, expert_histogram_cumsum:
     assert experts_for_tokens.device == expert_histogram_cumsum.device, (
         f"experts_for_tokens.device = {experts_for_tokens.device}, expert_histogram_cumsum.device = {expert_histogram_cumsum.device}"
     )
+
+    if _deterministic_scatter_enabled():
+        return _moe_index_compute_deterministic(experts_for_tokens)
 
     BLOCK_SIZE = 128  # Faster than 1024, not sure why. May be better occupancy?
 

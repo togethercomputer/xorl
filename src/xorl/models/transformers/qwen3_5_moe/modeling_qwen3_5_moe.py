@@ -1,7 +1,8 @@
 from functools import partial
-from typing import Callable, Optional, Tuple, Unpack
+from typing import Callable, Literal, Optional, Tuple, Unpack
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from xorl.distributed.parallel_state import get_parallel_state
@@ -14,11 +15,16 @@ from xorl.models.checkpoint_handlers.buffers import (
 )
 from xorl.models.layers import ACT2FN, RotaryEmbedding
 from xorl.models.layers.attention import AttentionKwargs, update_causal_mask
-from xorl.models.layers.attention.backend import get_attention_fn
+from xorl.models.layers.attention.backend import ATTENTION_FUNCTIONS
+from xorl.models.layers.attention.backend.eager import eager_attention_forward
 from xorl.models.layers.moe import MoEBlock
+from xorl.models.layers.moe.ep_native_combine import validate_qwen35_native_ep_combine_size
 from xorl.models.layers.normalization import (
     compiled_zero_centered_rms_norm,
     eager_zero_centered_rms_norm,
+    fast_zero_centered_batch_invariant_residual_rms_norm,
+    fast_zero_centered_batch_invariant_rms_norm,
+    fast_zero_centered_families_v2_rms_norm,
     get_rmsnorm_mode,
     native_zero_centered_rms_norm,
     native_zero_centered_rms_norm_without_batch_invariant,
@@ -32,6 +38,7 @@ from xorl.models.transformers.qwen3_5_shared import (
     LINEAR_ATTENTION_RING_UNSUPPORTED_MESSAGE,
     QWEN3_5_CHECKPOINT_CONVERSION_MAPPING,
     QWEN3_5_CHECKPOINT_SKIP_KEY_PATTERNS,
+    _apply_qwen35_gdn_exact,
     has_linear_attention_layers,
     qwen3_5_apply_rotary_pos_emb,
 )
@@ -45,13 +52,19 @@ logger = logging.get_logger(__name__)
 
 
 def _adapt_qwen3_5_moe_config(config):
+    exact_contract = bool(getattr(config, "_qwen35_exact_contract", False))
+    rmsnorm_family = getattr(config, "_qwen35_rmsnorm_family", "v1")
     if hasattr(config, "text_config"):
-        return Qwen3_5MoeConfig.from_hf_config(config)
-    if isinstance(config, Qwen3_5MoeConfig):
-        return config
-    if getattr(config, "model_type", None) in {"qwen3_5_moe", "qwen3_5_moe_text"}:
-        return Qwen3_5MoeConfig.from_hf_config(config)
-    return config
+        adapted = Qwen3_5MoeConfig.from_hf_config(config)
+    elif isinstance(config, Qwen3_5MoeConfig):
+        adapted = config
+    elif getattr(config, "model_type", None) in {"qwen3_5_moe", "qwen3_5_moe_text"}:
+        adapted = Qwen3_5MoeConfig.from_hf_config(config)
+    else:
+        adapted = config
+    adapted._qwen35_exact_contract = exact_contract
+    adapted._qwen35_rmsnorm_family = rmsnorm_family
+    return adapted
 
 
 def _raise_if_ring_fla_unsupported(config: Qwen3_5MoeConfig, ps) -> None:
@@ -68,7 +81,7 @@ class Qwen3_5MoeMLP(nn.Module):
         self.gate_up_proj = nn.Linear(self.hidden_size, 2 * self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
-        self._use_fused_silu = config.hidden_act == "silu"
+        self._use_fused_silu = config.hidden_act == "silu" and not getattr(config, "_activation_native", False)
 
     def unfuse_for_tp(self):
         device = self.gate_up_proj.weight.device
@@ -90,9 +103,21 @@ class Qwen3_5MoeMLP(nn.Module):
 
 
 class Qwen3_5MoeRMSNorm(nn.Module):
-    def __init__(self, dim: int, eps: float = 1e-6):
+    def __init__(
+        self,
+        dim: int,
+        eps: float = 1e-6,
+        exact_contract: bool = False,
+        rmsnorm_family: Literal["v1", "v2"] = "v1",
+    ):
         super().__init__()
+        if rmsnorm_family not in ("v1", "v2"):
+            raise ValueError(f"Unsupported Qwen3.5 MoE RMSNorm family: {rmsnorm_family!r}")
+        if rmsnorm_family == "v2" and not exact_contract:
+            raise RuntimeError("Qwen families-v2 RMSNorm is admitted only in the exact training lane.")
         self.eps = eps
+        self.exact_contract = exact_contract
+        self.rmsnorm_family = rmsnorm_family
         self.weight = nn.Parameter(torch.zeros(dim))
         self.mode = get_rmsnorm_mode()
 
@@ -103,6 +128,25 @@ class Qwen3_5MoeRMSNorm(nn.Module):
         prenorm: bool = False,
         force_sglang_residual: bool = False,
     ):
+        if self.exact_contract and self.rmsnorm_family == "v2":
+            if self.mode != "sglang_fused":
+                raise RuntimeError(
+                    f"The Qwen families-v2 RMSNorm program requires rmsnorm_mode='sglang_fused'; got {self.mode!r}."
+                )
+            if residual is None:
+                out = fast_zero_centered_families_v2_rms_norm(x, self.weight, self.eps)
+                residual_out = None
+            else:
+                out, residual_out = fast_zero_centered_families_v2_rms_norm(
+                    x,
+                    self.weight,
+                    self.eps,
+                    residual=residual,
+                )
+            if residual_out is not None and prenorm:
+                return out, residual_out
+            return out
+
         residual_out: Optional[torch.Tensor] = None
         norm_input = x
         if residual is not None:
@@ -115,9 +159,23 @@ class Qwen3_5MoeRMSNorm(nn.Module):
             out = native_zero_centered_rms_norm(norm_input, self.weight, self.eps)
         elif self.mode == "compile":
             out = compiled_zero_centered_rms_norm(norm_input, self.weight, self.eps)
-        elif self.mode == "sglang":
+        elif self.mode in ("sglang", "sglang_fused"):
+            # Norm-seed contract (§14) family split, ported from qwen3_moe:
+            # residual-tree norms (layer>0 input / post-attn / final) are family-2,
+            # no-residual norms (qk-norm / layer-0 input) are family-1.
             if residual_out is not None or force_sglang_residual:
-                out = native_zero_centered_rms_norm_without_batch_invariant(norm_input, self.weight, self.eps)
+                if self.exact_contract:
+                    # Pair with the BI-ops sampler's
+                    # eager-with-BI-mean composition (F.rms_norm is 1 ulp off at
+                    # rare boundary values).
+                    out = fast_zero_centered_batch_invariant_residual_rms_norm(norm_input, self.weight, self.eps)
+                else:
+                    out = native_zero_centered_rms_norm_without_batch_invariant(norm_input, self.weight, self.eps)
+            elif self.mode == "sglang_fused" and self.exact_contract:
+                # Exact Qwen family-1 must bit-match the aten::rms_norm
+                # interpose kernel, with real gradients. Selection is owned by
+                # this model instance rather than process-global wrapper state.
+                out = fast_zero_centered_batch_invariant_rms_norm(norm_input, self.weight, self.eps)
             else:
                 out = native_zero_centered_rms_norm(norm_input, self.weight, self.eps)
         else:
@@ -152,9 +210,20 @@ class Qwen3_5MoeAttention(nn.Module):
         self.o_proj = nn.Linear(
             config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
         )
-        self.q_norm = Qwen3_5MoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = Qwen3_5MoeRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        exact_contract = bool(getattr(config, "_qwen35_exact_contract", False))
+        rmsnorm_family = getattr(config, "_qwen35_rmsnorm_family", "v1")
+        self.q_norm = Qwen3_5MoeRMSNorm(
+            self.head_dim, eps=config.rms_norm_eps, exact_contract=exact_contract, rmsnorm_family=rmsnorm_family
+        )
+        self.k_norm = Qwen3_5MoeRMSNorm(
+            self.head_dim, eps=config.rms_norm_eps, exact_contract=exact_contract, rmsnorm_family=rmsnorm_family
+        )
         self._attn_gate: torch.Tensor | None = None
+
+    def _capture_diagnostic_component(self, name: str, value: torch.Tensor) -> None:
+        capture = self.__dict__.get("_diagnostic_capture_component")
+        if callable(capture):
+            capture(name, value)
 
     def _project_qkv(
         self,
@@ -164,20 +233,37 @@ class Qwen3_5MoeAttention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        query_states, gate = torch.chunk(
-            self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2), 2, dim=-1
-        )
+        self._capture_diagnostic_component("attention_input", hidden_states)
+        qkv = self.q_proj(hidden_states).view(*input_shape, -1, self.head_dim * 2)
+        self._capture_diagnostic_component("qkv", qkv)
+        query_states, gate = torch.chunk(qkv, 2, dim=-1)
         self._attn_gate = gate.reshape(*input_shape, -1)
 
+        self._capture_diagnostic_component("q_pre_qk_norm", query_states)
         query_states = self.q_norm(query_states.view(hidden_shape))
-        key_states = self.k_norm(self.k_proj(hidden_states).view(hidden_shape))
+        self._capture_diagnostic_component("q_post_qk_norm", query_states)
+        key_states = self.k_proj(hidden_states).view(hidden_shape)
+        self._capture_diagnostic_component("k_pre_qk_norm", key_states)
+        key_states = self.k_norm(key_states)
+        self._capture_diagnostic_component("k_post_qk_norm", key_states)
         value_states = self.v_proj(hidden_states).view(hidden_shape)
+        self._capture_diagnostic_component("v", value_states)
 
         cos, sin = position_embeddings
-        # `mrope_interleaved` controls T/H/W frequency mixing in cos/sin
-        # construction upstream, not the q/k rotation convention. q/k always
-        # use the standard half-rotate convention (HF/SGLang).
-        query_states, key_states = qwen3_5_apply_rotary_pos_emb(query_states, key_states, cos, sin)
+        self._capture_diagnostic_component("rope_cos", cos)
+        self._capture_diagnostic_component("rope_sin", sin)
+        query_states, key_states = qwen3_5_apply_rotary_pos_emb(
+            query_states,
+            key_states,
+            cos,
+            sin,
+            class_b=bool(getattr(self.config, "_rope_class_b", False)),
+        )
+        if getattr(self.config, "_attention_cast_bf16", False):
+            query_states = query_states.to(torch.bfloat16)
+            key_states = key_states.to(torch.bfloat16)
+        self._capture_diagnostic_component("q", query_states)
+        self._capture_diagnostic_component("k", key_states)
         return query_states, key_states, value_states
 
     def _project_output(self, attn_output: torch.Tensor) -> torch.Tensor:
@@ -185,12 +271,17 @@ class Qwen3_5MoeAttention(nn.Module):
         self._attn_gate = None
         if gate is None:
             raise RuntimeError("Qwen3.5 MoE attention gate was not initialized before output projection.")
+        self._capture_diagnostic_component("attention_gate", gate)
+        self._capture_diagnostic_component("attn_output", attn_output)
         attn_output = attn_output.reshape(*attn_output.shape[:-2], -1).contiguous()
         attn_output = attn_output * torch.sigmoid(gate)
-        return self.o_proj(attn_output)
+        self._capture_diagnostic_component("attn_output_gated", attn_output)
+        output = self.o_proj(attn_output)
+        self._capture_diagnostic_component("o_proj_output", output)
+        return output
 
     def _get_attention_fn(self) -> Callable:
-        return get_attention_fn(self.config._attn_implementation)
+        return ATTENTION_FUNCTIONS.get(self.config._attn_implementation, eager_attention_forward)
 
     def _attention_kwargs(self) -> dict:
         return dict(
@@ -219,7 +310,7 @@ class Qwen3_5MoeAttention(nn.Module):
 
 
 class Qwen3_5MoeSparseMoeBlock(MoEBlock):
-    def __init__(self, config, moe_implementation="triton"):
+    def __init__(self, config, moe_implementation="triton", layer_idx: int | None = None):
         super().__init__(
             hidden_size=config.hidden_size,
             num_experts=config.num_experts,
@@ -229,12 +320,17 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
             norm_topk_prob=config.norm_topk_prob,
             moe_implementation=moe_implementation,
             train_router=getattr(config, "train_router", False),
+            activation_native=getattr(config, "_activation_native", False),
+            exact_batch_invariant_router=bool(getattr(config, "_qwen35_exact_contract", False)),
         )
         self.config = config
+        self.layer_idx = layer_idx
+        self._native_ep_combine = bool(getattr(config, "_qwen35_exact_contract", False))
         self.experts.ep_dispatch = getattr(config, "_ep_dispatch", "alltoall")
         self.experts.deepep_buffer_size_gb = getattr(config, "_deepep_buffer_size_gb", 2.0)
         self.experts.deepep_num_sms = getattr(config, "_deepep_num_sms", 20)
         self.experts.deepep_async_combine = getattr(config, "_deepep_async_combine", False)
+        self.experts.alltoall_combine_hidden_chunk_size = getattr(config, "_alltoall_combine_hidden_chunk_size", 0)
         self.shared_expert = Qwen3_5MoeMLP(config, intermediate_size=config.shared_expert_intermediate_size)
         self.shared_expert_gate = nn.Linear(config.hidden_size, 1, bias=False)
 
@@ -245,12 +341,134 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
         out = torch.sigmoid(self.shared_expert_gate(flat)) * out
         return out.view_as(hidden_states)
 
+    def _ep_combine_native(
+        self,
+        hidden_states: torch.Tensor,
+        routing_weights: torch.Tensor,
+        selected_experts: torch.Tensor,
+    ) -> torch.Tensor:
+        """Native-EP ordered combine for the trainer's real EP group.
+
+        Every rank gathers the full token batch (backward: reduce-scatter sum),
+        computes ITS routed partial through the masked serving-kernel Function
+        on the LOCAL expert slice + ITS shared-expert TP slice (trainable BI
+        GEMMs, torch-native bf16 silu*mul, sigmoid gate) added in bf16 — exactly
+        serving's per-rank partial — then partials are exchanged RAW
+        (all-to-all, never NCCL-summed) and each rank chain-sums its own tokens'
+        n partials in serving rank order (n-1) -> 0. Forward bits match the
+        serving engine; backward uses stock numerics throughout
+        (cuBLAS shared-expert grads, grouped-GEMM expert grads, NCCL grad
+        reductions)."""
+        from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
+        from xorl.models.layers.moe.ep_native_combine import (  # noqa: PLC0415
+            exchange_and_chain_sum,
+            gather_ids_for_ep_combine,
+            gather_tokens_for_ep_combine,
+            max_rows_for_ep_combine,
+            sglang_fused_gate_sigmoid_mul_add,
+        )
+        from xorl.ops.batch_invariant_ops import _BatchInvariantTrunkLinearFn  # noqa: PLC0415
+
+        ps = get_parallel_state()
+        if not ps.ep_enabled:
+            raise RuntimeError("Qwen3.5-MoE exact ordered combine requires trainer EP mirroring the serving EP size")
+        if not hasattr(self.shared_expert, "gate_up_proj"):
+            raise NotImplementedError("Qwen3.5-MoE exact ordered combine requires the fused shared-expert gate_up_proj")
+        ep_size, ep_rank, ep_group = ps.ep_size, ps.ep_rank, ps.ep_group
+        validate_qwen35_native_ep_combine_size(ep_size)
+        inter = self.shared_expert.intermediate_size
+        if inter % ep_size != 0:
+            raise ValueError(
+                f"Qwen3.5-MoE exact ordered combine: shared_expert intermediate_size={inter} "
+                f"not divisible by ep_size={ep_size}"
+            )
+        e_local = int(self.experts.gate_up_proj.shape[0])
+        if e_local * ep_size != self.experts.num_experts:
+            raise RuntimeError(
+                f"Qwen3.5-MoE exact ordered combine: local expert slice {e_local} x ep_size {ep_size} "
+                f"!= num_experts {self.experts.num_experts} (trainer EP must mirror serving EP)"
+            )
+
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        flat = hidden_states.reshape(-1, hidden_dim)
+        routing_flat = routing_weights.reshape(flat.shape[0], -1)
+        selected_flat = selected_experts.reshape(flat.shape[0], -1)
+
+        # 1. full token batch on every rank (serving's DP-attention gather)
+        # Packed DP slices can have different local row counts, so negotiate one
+        # equal-count collective shape and discard this rank's padding after the
+        # ordered combine. BI kernels make those extra rows forward-independent.
+        padded_rows = max_rows_for_ep_combine(flat.shape[0], flat.device, ep_group)
+        gathered = gather_tokens_for_ep_combine(flat, ep_group, padded_rows)
+        gathered_routing = gather_tokens_for_ep_combine(routing_flat, ep_group, padded_rows)
+        gathered_ids = gather_ids_for_ep_combine(selected_flat, ep_group, padded_rows)
+        self._capture_diagnostic_component("moe_native_gathered_input", gathered)
+        self._capture_diagnostic_component("moe_native_gathered_routing", gathered_routing)
+        self._capture_diagnostic_component("moe_native_gathered_ids", gathered_ids)
+
+        # 2. this rank's partial: routed (masked serving kernel on the local
+        #    slice) + shared-expert TP slice, added in bf16 (serving semantics)
+        lo = ep_rank * e_local
+        local_ids = torch.where(
+            (gathered_ids >= lo) & (gathered_ids < lo + e_local),
+            gathered_ids - lo,
+            gathered_ids.new_full((), -1),
+        ).to(torch.int32)
+        self._capture_diagnostic_component("moe_native_local_ids", local_ids)
+        # Enter through Module.__call__ so the experts FSDP unit materializes
+        # its BF16 compute parameters before invoking the serving kernel.
+        routed = self.experts(
+            gathered,
+            gathered_routing,
+            sglang_ep_native_local_ids=local_ids,
+        ).to(torch.bfloat16)
+        self._capture_diagnostic_component("moe_native_routed", routed)
+
+        w_gu = self.shared_expert.gate_up_proj.weight  # [2I, H], gate rows first
+        w_down = self.shared_expert.down_proj.weight  # [H, I]
+        shard = inter // ep_size
+        lo_s = ep_rank * shard
+        # Retain the decomposed gate only when operand diagnostics request it.
+        # The local partial itself uses serving's fused reduction and rounding.
+        if callable(self.__dict__.get("_diagnostic_capture_component")):
+            gate_value = torch.sigmoid(
+                _BatchInvariantTrunkLinearFn.apply(gathered, self.shared_expert_gate.weight, None)
+            )
+            self._capture_diagnostic_component("moe_native_shared_gate_value", gate_value)
+        w_slice = torch.cat((w_gu[lo_s : lo_s + shard], w_gu[inter + lo_s : inter + lo_s + shard]), dim=0)
+        gate_up = _BatchInvariantTrunkLinearFn.apply(gathered, w_slice, None)
+        self._capture_diagnostic_component("moe_native_shared_gate_up", gate_up)
+        gate, up = gate_up.chunk(2, dim=-1)
+        act = F.silu(gate) * up  # torch-native bf16 (serving's BI-ops lane; NOT the fused kernel)
+        self._capture_diagnostic_component("moe_native_shared_act", act)
+        down = _BatchInvariantTrunkLinearFn.apply(act, w_down[:, lo_s : lo_s + shard].contiguous(), None)
+        self._capture_diagnostic_component("moe_native_shared_down", down)
+        partial = sglang_fused_gate_sigmoid_mul_add(
+            gathered,
+            self.shared_expert_gate.weight.squeeze(0),
+            down,
+            routed,
+        )
+        self._capture_diagnostic_component("moe_native_local_partial", partial)
+
+        # 3./4. raw exchange + serving-order chain sum (autograd reverses the exchange)
+        out = exchange_and_chain_sum(partial, ep_group, ep_size)
+        self._capture_diagnostic_component("moe_native_combined", out)
+        return out[: flat.shape[0]].reshape(batch_size, sequence_length, hidden_dim)
+
     def forward_experts_only(self, hidden_states, routing_weights, selected_experts):
         """Sparse experts + shared expert with pre-computed routing."""
+        if self._native_ep_combine:
+            return self._ep_combine_native(hidden_states, routing_weights, selected_experts)
         expert_output = super().forward_experts_only(hidden_states, routing_weights, selected_experts)
         return expert_output + self._shared_expert(hidden_states)
 
     def forward(self, hidden_states: torch.Tensor):
+        if self._native_ep_combine:
+            batch_size, sequence_length, hidden_dim = hidden_states.shape
+            routing_weights, selected_experts, router_logits = self.route(hidden_states.view(-1, hidden_dim))
+            out = self._ep_combine_native(hidden_states, routing_weights, selected_experts)
+            return out, router_logits
         expert_output, router_logits = super().forward(hidden_states)
         return expert_output + self._shared_expert(hidden_states), router_logits
 
@@ -284,17 +502,30 @@ class Qwen3_5MoeDecoderLayer(MoEGradientCheckpointingLayer):
                 conv_size=config.linear_conv_kernel_dim,
                 layer_idx=layer_idx,
                 norm_eps=config.rms_norm_eps,
+                exact_contract=bool(getattr(config, "_qwen35_exact_contract", False)),
             )
         else:
             self.self_attn = Qwen3_5MoeAttention(config, layer_idx)
 
-        self.input_layernorm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        exact_contract = bool(getattr(config, "_qwen35_exact_contract", False))
+        rmsnorm_family = getattr(config, "_qwen35_rmsnorm_family", "v1")
+        self.input_layernorm = Qwen3_5MoeRMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            exact_contract=exact_contract,
+            rmsnorm_family=rmsnorm_family,
+        )
+        self.post_attention_layernorm = Qwen3_5MoeRMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            exact_contract=exact_contract,
+            rmsnorm_family=rmsnorm_family,
+        )
         if (layer_idx not in config.mlp_only_layers) and (
             config.num_experts > 0 and (layer_idx + 1) % config.decoder_sparse_step == 0
         ):
             moe_implementation = getattr(config, "_moe_implementation", "triton")
-            self.mlp = QWEN3_5_MOE_CLASSES[moe_implementation](config)
+            self.mlp = QWEN3_5_MOE_CLASSES[moe_implementation](config, layer_idx=layer_idx)
         else:
             self.mlp = Qwen3_5MoeMLP(config, intermediate_size=config.intermediate_size)
 
@@ -311,28 +542,29 @@ class Qwen3_5MoeDecoderLayer(MoEGradientCheckpointingLayer):
         residual = hidden_states
         hidden_states = self.input_layernorm(
             hidden_states,
-            force_sglang_residual=self.layer_idx > 0 and self.input_layernorm.mode == "sglang",
+            force_sglang_residual=self.layer_idx > 0 and self.input_layernorm.mode in ("sglang", "sglang_fused"),
         )
 
         if self.linear_attn is not None:
-            linear_kwargs = {}
-            if kwargs.get("cu_seq_lens_q") is not None:
-                linear_kwargs["cu_seqlens"] = kwargs.get("cu_seq_lens_q")
+            cu_seqlens = kwargs.get("cu_seq_lens_q")
             cp_context = build_linear_attention_cp_context(
-                kwargs.get("cu_seq_lens_q"),
+                cu_seqlens,
                 conv1d_kernel_size=self.linear_attn.conv_size if self.linear_attn.use_short_conv else None,
             )
-            if cp_context is not None:
-                linear_kwargs["cp_context"] = cp_context
             linear_mask = attention_mask if attention_mask is not None and attention_mask.dim() == 2 else None
             if cp_context is not None:
                 linear_mask = None
+            # Pass cu_seqlens/cp_context as EXPLICIT kwargs (not a **dict splat) so torch.compile/dynamo can
+            # trace through this call. The `**linear_kwargs` splat here was a CALL_FUNCTION_EX graph break at
+            # the GatedDeltaNet boundary that fragmented the compiled graph. GatedDeltaNet.forward reads both
+            # via kwargs.get() (None-safe), so explicit None is identical to the old conditional omission.
             hidden_states, _, _ = self.linear_attn(
                 hidden_states=hidden_states,
                 attention_mask=linear_mask,
                 past_key_values=past_key_values,
                 use_cache=False,
-                **linear_kwargs,
+                cu_seqlens=cu_seqlens,
+                cp_context=cp_context,
             )
         else:
             hidden_states, _ = self.self_attn(
@@ -416,7 +648,7 @@ class Qwen3_5MoePreTrainedModel(XorlPreTrainedModel):
         head_dim = getattr(self.config, "head_dim", self.config.hidden_size // self.config.num_attention_heads)
         skip_expert_loading = False
         if not is_prequantized:
-            from xorl.qlora.modules.moe_experts import QLoRAMoeExperts
+            from xorl.qlora.modules.moe_experts import QLoRAMoeExperts  # noqa: PLC0415
 
             skip_expert_loading = any(
                 isinstance(module, QLoRAMoeExperts) and not getattr(module, "_weights_loaded", False)
@@ -450,7 +682,12 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
         self.layers = nn.ModuleList(
             [Qwen3_5MoeDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = Qwen3_5MoeRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = Qwen3_5MoeRMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            exact_contract=bool(getattr(config, "_qwen35_exact_contract", False)),
+            rmsnorm_family=getattr(config, "_qwen35_rmsnorm_family", "v1"),
+        )
         self.rotary_emb = RotaryEmbedding(config=config)
         self.gradient_checkpointing = False
         self.post_init()
@@ -476,6 +713,9 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_router_logits = (
             output_router_logits if output_router_logits is not None else self.config.output_router_logits
+        )
+        output_hidden_states = (
+            output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
 
         if self.embed_tokens is not None:
@@ -520,6 +760,13 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
 
         all_self_attns = () if output_attentions else None
         all_router_logits = () if output_router_logits else None
+        # Per-layer residual-stream hiddens for all-layer OPRD (post-decoder-layer,
+        # pre-final-norm). Student and teacher use the SAME convention here, so they
+        # align 1:1 per layer; KL still uses the post-norm last_hidden_state below.
+        # NB: we append the OUTPUT of each decoder layer (index i == layer i output,
+        # 40 entries total) — NOT the standard-HF embedding+inputs convention — so the
+        # OPRD layer-index resolution in model_runner indexes hidden_states[i] directly.
+        all_hidden_states = () if output_hidden_states else None
         for decoder_layer in self.layers:
             if decoder_layer is None:
                 continue
@@ -557,6 +804,8 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
                     **kwargs,
                 )
             hidden_states = layer_outputs[0]
+            if output_hidden_states:
+                all_hidden_states += (hidden_states,)
             if output_attentions:
                 # _moe_forward does not produce attention weights; use None placeholder.
                 all_self_attns += (None,)
@@ -566,10 +815,13 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
         if self.norm is not None:
             hidden_states = self.norm(
                 hidden_states,
-                force_sglang_residual=getattr(self.norm, "mode", None) == "sglang",
+                force_sglang_residual=getattr(self.norm, "mode", None) in ("sglang", "sglang_fused"),
             )
         return MoeModelOutput(
-            last_hidden_state=hidden_states, attentions=all_self_attns, router_logits=all_router_logits
+            last_hidden_state=hidden_states,
+            attentions=all_self_attns,
+            router_logits=all_router_logits,
+            hidden_states=all_hidden_states,
         )
 
 
@@ -591,6 +843,9 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel):
 
     def unfuse_for_tp(self):
         parallelize.unfuse_for_tp(self)
+
+    def _apply_qwen35_gdn_exact(self) -> dict[str, int]:
+        return _apply_qwen35_gdn_exact(self)
 
     def get_input_embeddings(self):
         return self.model.embed_tokens
@@ -636,7 +891,11 @@ class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel):
             output_router_logits=output_router_logits,
             **kwargs,
         )
-        return MoeCausalLMOutput(last_hidden_state=outputs.last_hidden_state, router_logits=outputs.router_logits)
+        return MoeCausalLMOutput(
+            last_hidden_state=outputs.last_hidden_state,
+            router_logits=outputs.router_logits,
+            hidden_states=outputs.hidden_states,
+        )
 
 
 class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoeForCausalLM):

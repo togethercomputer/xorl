@@ -391,7 +391,7 @@ def _bi_fused_per_token_ce_checked(
     """Guarded entry for ``ce_mode='bi_fused'`` (the batch-invariant lm-head
     contract). The contract IS the fp32-class lm-head computation, so it
     requires ``lm_head_fp32`` semantics without materializing the fp32 weight."""
-    from xorl.ops.loss.bi_fused_lm_head import bi_fused_per_token_ce  # noqa: PLC0415
+    from xorl.ops.loss.bi_fused_lm_head import bi_fused_per_token_ce
 
     if z_loss_enabled:
         raise NotImplementedError("ce_mode='bi_fused' does not support softmax_auxiliary_loss")
@@ -434,27 +434,6 @@ def _quack_linear_per_token_cross_entropy(
     )
 
 
-def _bi_fused_per_token_ce_checked(
-    hidden_states_flat: torch.Tensor,
-    weight: torch.Tensor,
-    labels_flat: torch.Tensor,
-    ignore_index: int,
-    lm_head_fp32: bool,
-    z_loss_enabled: bool,
-) -> torch.Tensor:
-    """Guarded entry for the shared batch-invariant LM-head contract."""
-    from xorl.ops.loss.bi_fused_lm_head import bi_fused_per_token_ce  # noqa: PLC0415
-
-    if z_loss_enabled:
-        raise NotImplementedError("ce_mode='bi_fused' does not support softmax_auxiliary_loss")
-    if not lm_head_fp32:
-        raise NotImplementedError(
-            "ce_mode='bi_fused' implements the fp32-class lm-head contract; set lm_head_fp32: true"
-        )
-    local_weight = weight.to_local() if hasattr(weight, "to_local") else weight
-    return bi_fused_per_token_ce(hidden_states_flat, local_weight, labels_flat, ignore_index)
-
-
 def causallm_loss_function(
     hidden_states: torch.Tensor,
     weight: torch.Tensor,
@@ -486,8 +465,7 @@ def causallm_loss_function(
                 already next-token aligned (labels[i] is the target for hidden_states[i]).
         ignore_index: Index to ignore in loss computation (default: -100)
         return_per_token: If True, return per-token logprobs and losses (default: False)
-        ce_mode: Cross-entropy mode - "compiled" (default), "eager", or
-            "bi_fused" for the train/serve bitwise contract.
+        ce_mode: Cross-entropy mode - "compiled" (default) or "eager"
         num_chunks: Number of chunks for compiled mode (default: 8).
         tp_group: TP process group for vocab-parallel cross-entropy (default: None).
         loss_reducer: Optional ``(values, mask) -> scalar``. When supplied, the
@@ -522,15 +500,6 @@ def causallm_loss_function(
     hidden_states_flat = hidden_states.view(-1, hidden_states.size(-1))
     valid_mask = labels_flat != ignore_index
 
-    logprob_temperature = float(logprob_temperature)
-    if logprob_temperature <= 0.0:
-        raise ValueError(f"logprob_temperature must be > 0, got {logprob_temperature}")
-    if ce_mode == "bi_fused":
-        if tp_group is not None:
-            raise NotImplementedError("ce_mode='bi_fused' does not support tensor parallelism yet")
-        if logprob_temperature != 1.0:
-            raise NotImplementedError("ce_mode='bi_fused' does not support logprob_temperature != 1.0 yet")
-
     if loss_reducer is None:
         loss_reducer = TokenPartial(scale=valid_mask.sum().float())
 
@@ -538,11 +507,36 @@ def causallm_loss_function(
     logprob_temperature = float(logprob_temperature)
     if logprob_temperature <= 0.0:
         raise ValueError(f"logprob_temperature must be > 0, got {logprob_temperature}")
+    exact_lm_head = bool(lm_head is not None and getattr(lm_head, "_glm52_exact_tp16_lm_head", False))
     if ce_mode == "bi_fused":
-        if tp_group is not None:
+        if tp_group is not None and not exact_lm_head:
             raise NotImplementedError("ce_mode='bi_fused' does not support tensor parallelism yet")
-        if lm_head is not None and not lm_head_fp32:
+        if lm_head is not None and not lm_head_fp32 and not exact_lm_head:
             raise NotImplementedError("ce_mode='bi_fused' does not support FP8 lm_head modules")
+    if exact_lm_head:
+        if z_loss_coef > 0.0:
+            raise NotImplementedError("The exact GLM-5.2 active-LoRA lm head does not support Z-loss")
+        per_token_ce = compute_per_token_ce(
+            hidden_states_flat,
+            weight,
+            labels_flat,
+            ignore_index,
+            ce_mode,
+            num_chunks,
+            tp_group=tp_group,
+            use_compile=use_compile,
+            lm_head_fp32=lm_head_fp32,
+            lm_head=lm_head,
+            logprob_temperature=logprob_temperature,
+        )
+        loss = loss_reducer(per_token_ce, mask_flat)
+        if return_per_token:
+            return LossOutput(
+                loss=loss,
+                per_token_logprobs=-per_token_ce.detach().view(original_shape),
+                per_token_loss=per_token_ce.view(original_shape),
+            )
+        return LossOutput(loss=loss)
     if logprob_temperature != 1.0:
         if z_loss_coef > 0.0:
             raise NotImplementedError("logprob_temperature is not supported with softmax_auxiliary_loss")

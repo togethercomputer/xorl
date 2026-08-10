@@ -18,6 +18,7 @@ from xorl.ops.batch_invariant_ops import (
     is_batch_invariant_mode_enabled,
     is_batch_invariant_op_enabled,
     is_trunk_linear_contract_enabled,
+    mean_dim,
     set_batch_invariant_mode,
 )
 from xorl.ops.bi_families_v2 import families_v2_enabled, rms_norm_v2
@@ -152,11 +153,10 @@ class _FusedSglangResidualRMSNorm(torch.autograd.Function):
 
 
 class _FamiliesV2RMSNorm(torch.autograd.Function):
-    """families-v2 no-residual norm: one v2 tree for every norm site class.
-
-    Forward is the vendored explicit-pairwise-tree kernel. Backward is the
-    closed-form RMSNorm gradient, as in every batch-invariant norm wrapper here
-    — the contract governs forward bits, and gradients do not enter it."""
+    """families-v2 no-residual norm (one v2 tree for ALL site classes — the
+    N6 family unification). Forward = the vendored explicit-pairwise-tree
+    kernel; backward = the closed-form RMSNorm gradient (stock-numerics
+    class, like every BI norm wrapper — the contract governs forward bits)."""
 
     @staticmethod
     def forward(ctx, hidden_states, weight, variance_epsilon):
@@ -173,8 +173,8 @@ class _FamiliesV2RMSNorm(torch.autograd.Function):
 
 
 class _FamiliesV2ResidualRMSNorm(torch.autograd.Function):
-    """families-v2 fused residual-add norm: one launch. The residual add keeps
-    v1 semantics exactly; only the variance tree is redefined."""
+    """families-v2 fused residual-add norm (family-2': ONE launch; residual
+    add semantics identical to v1, variance tree redefined)."""
 
     @staticmethod
     def forward(ctx, hidden_states, residual, weight, variance_epsilon):
@@ -203,8 +203,67 @@ class _FamiliesV2ResidualRMSNorm(torch.autograd.Function):
         )
 
 
+class _FamiliesV2ZeroCenteredRMSNorm(torch.autograd.Function):
+    """Differentiable Qwen/Gemma epilogue over the families-v2 tree."""
+
+    @staticmethod
+    def forward(ctx, hidden_states, weight, variance_epsilon):
+        out = rms_norm_v2(hidden_states, weight, variance_epsilon, zero_centered=True)
+        ctx.save_for_backward(hidden_states, weight)
+        ctx.variance_epsilon = variance_epsilon
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        hidden_states, weight = ctx.saved_tensors
+        effective_weight = 1.0 + weight.float()
+        grad_normed, grad_weight = fused_rms_norm_backward(
+            hidden_states,
+            effective_weight,
+            ctx.variance_epsilon,
+            grad_output,
+        )
+        return grad_normed.to(hidden_states.dtype), grad_weight.to(weight.dtype), None
+
+
+class _FamiliesV2ZeroCenteredResidualRMSNorm(torch.autograd.Function):
+    """Fused BF16 residual add plus the Qwen/Gemma families-v2 epilogue."""
+
+    @staticmethod
+    def forward(ctx, hidden_states, residual, weight, variance_epsilon):
+        out, residual_out = rms_norm_v2(
+            hidden_states,
+            weight,
+            variance_epsilon,
+            residual=residual,
+            zero_centered=True,
+        )
+        ctx.save_for_backward(residual_out, weight)
+        ctx.variance_epsilon = variance_epsilon
+        ctx.input_dtype = hidden_states.dtype
+        ctx.residual_dtype = residual.dtype
+        return out, residual_out
+
+    @staticmethod
+    def backward(ctx, grad_output, grad_residual_out):
+        residual_out, weight = ctx.saved_tensors
+        effective_weight = 1.0 + weight.float()
+        grad_total, grad_weight = fused_rms_norm_backward(
+            residual_out,
+            effective_weight,
+            ctx.variance_epsilon,
+            grad_output,
+            grad_residual_out=grad_residual_out,
+        )
+        return (
+            grad_total.to(ctx.input_dtype),
+            grad_total.to(ctx.residual_dtype),
+            grad_weight.to(weight.dtype),
+            None,
+        )
+
+
 def _families_v2_norm_eligible(hidden_states: torch.Tensor) -> bool:
-    """families-v2 covers the bf16 CUDA contract dtype; anything else keeps v1."""
     return families_v2_enabled() and hidden_states.is_cuda and hidden_states.dtype == torch.bfloat16
 
 
@@ -215,6 +274,58 @@ def _families_v2_rms_norm(hidden_states: torch.Tensor, weight: torch.Tensor, var
         x2d = x2d.contiguous()
     out = _FamiliesV2RMSNorm.apply(x2d, weight, variance_epsilon)
     return out.reshape(orig_shape)
+
+
+def fast_zero_centered_families_v2_rms_norm(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    variance_epsilon: float,
+    *,
+    residual: Optional[torch.Tensor] = None,
+) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    """Run the exact Qwen families-v2 RMSNorm program without fallback.
+
+    The program is deliberately fail-loud: it is defined only for the BF16
+    CUDA contract used by exact Qwen3.5/3.6.  Production v1 callers never reach
+    this function.
+    """
+
+    if not hidden_states.is_cuda or hidden_states.dtype != torch.bfloat16:
+        raise RuntimeError(
+            "The Qwen families-v2 RMSNorm program requires CUDA BF16 input; "
+            f"got device={hidden_states.device}, dtype={hidden_states.dtype}."
+        )
+    if hidden_states.shape[-1] != weight.numel():
+        raise RuntimeError(
+            "The Qwen families-v2 RMSNorm program requires one weight per hidden feature; "
+            f"got hidden={hidden_states.shape[-1]}, weight={weight.numel()}."
+        )
+
+    original_shape = hidden_states.shape
+    hidden_2d = hidden_states.reshape(-1, original_shape[-1])
+    if hidden_2d.stride(-1) != 1:
+        hidden_2d = hidden_2d.contiguous()
+
+    if residual is None:
+        out = _FamiliesV2ZeroCenteredRMSNorm.apply(hidden_2d, weight, variance_epsilon)
+        return out.reshape(original_shape)
+
+    if residual.shape != hidden_states.shape or residual.dtype != torch.bfloat16 or not residual.is_cuda:
+        raise RuntimeError(
+            "The Qwen families-v2 residual RMSNorm program requires a CUDA BF16 residual "
+            f"matching the input shape; got shape={tuple(residual.shape)}, dtype={residual.dtype}, "
+            f"device={residual.device}."
+        )
+    residual_2d = residual.reshape(-1, original_shape[-1])
+    if residual_2d.stride(-1) != 1:
+        residual_2d = residual_2d.contiguous()
+    out, residual_out = _FamiliesV2ZeroCenteredResidualRMSNorm.apply(
+        hidden_2d,
+        residual_2d,
+        weight,
+        variance_epsilon,
+    )
+    return out.reshape(original_shape), residual_out.reshape(original_shape)
 
 
 def fast_sglang_rms_norm(
@@ -279,12 +390,9 @@ def _get_sglang_jit_norm():
     global _SGLANG_JIT_NORM
     if _SGLANG_JIT_NORM is None:
         try:
-            sglang_jit_norm = importlib.import_module("sglang.jit_kernel.norm")
+            sglang_jit_norm = importlib.import_module("sglang.kernels.ops.layernorm.norm")
         except Exception as exc:
-            raise RuntimeError(
-                "rmsnorm_mode='sglang_jit' requires sglang.jit_kernel.norm on PYTHONPATH "
-                "(for example via SGLANG_REPO=/path/to/sglang/python)."
-            ) from exc
+            raise RuntimeError("rmsnorm_mode='sglang_jit' requires the installed SGLang JIT norm module.") from exc
         _SGLANG_JIT_NORM = sglang_jit_norm
     return _SGLANG_JIT_NORM
 
@@ -295,10 +403,7 @@ def _get_sglang_kernel_norm():
         try:
             _SGLANG_KERNEL_NORM = importlib.import_module("sgl_kernel")
         except Exception as exc:
-            raise RuntimeError(
-                "rmsnorm_mode='sglang_kernel' requires sgl_kernel on PYTHONPATH "
-                "(for example via an SGLang-capable xorl diagnostic venv)."
-            ) from exc
+            raise RuntimeError("rmsnorm_mode='sglang_kernel' requires an ABI-compatible installed sgl_kernel.") from exc
     return _SGLANG_KERNEL_NORM
 
 
@@ -454,13 +559,56 @@ def fast_zero_centered_batch_invariant_rms_norm(
     return output.type_as(hidden_states)
 
 
+class _BIEagerMeanRMSNorm(torch.autograd.Function):
+    """Family-2 (residual-tree) contract Function: eager fp32 RMSNorm with the
+    batch-invariant ``mean_dim`` kernel for the variance reduction.
+
+    Serving under ``SGLANG_BATCH_INVARIANT_OPS=all`` routes residual-tree
+    GemmaRMSNorms through ``forward_native`` whose ``.mean(-1)`` hits the
+    interposed ``mean_batch_invariant`` — an eager composition with the BI mean,
+    which is NOT the family-1 fused kernel (1-ulp splits on rare boundary
+    values) and NOT stock ``F.rms_norm``. This Function reproduces that
+    composition bit-for-bit; backward reuses the closed-form RMSNorm gradient
+    (gradients do not enter the forward K3)."""
+
+    @staticmethod
+    def forward(ctx, hidden_states, weight, variance_epsilon):
+        variance = mean_dim(hidden_states * hidden_states, dim=-1, keepdim=True)
+        out = hidden_states * torch.rsqrt(variance + variance_epsilon) * weight
+        ctx.save_for_backward(hidden_states, weight)
+        ctx.variance_epsilon = variance_epsilon
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        hidden_states, weight = ctx.saved_tensors
+        grad_normed, grad_weight = fused_rms_norm_backward(hidden_states, weight, ctx.variance_epsilon, grad_output)
+        return grad_normed.to(hidden_states.dtype), grad_weight.to(weight.dtype), None
+
+
+def fast_zero_centered_batch_invariant_residual_rms_norm(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    variance_epsilon: float,
+) -> torch.Tensor:
+    """Family-2 term of the exact Qwen3.5 norm-seed contract:
+    residual-tree zero-centered norms pair with the BI-ops sampler's
+    ``forward_native``-with-BI-mean composition (see :class:`_BIEagerMeanRMSNorm`).
+    The bf16 residual add stays OUTSIDE (both engines add in bf16 eagerly).
+    Falls back to the native path off CUDA."""
+    if not hidden_states.is_cuda:
+        return native_zero_centered_rms_norm(hidden_states, weight, variance_epsilon)
+    output = _BIEagerMeanRMSNorm.apply(hidden_states.float(), 1.0 + weight.float(), variance_epsilon)
+    return output.type_as(hidden_states)
+
+
 _WARNED_UNDECLARED_FAMILY: set[tuple[str, bool]] = set()
 
 
 def _check_undeclared_family(mode: RMSNormMode, residual_present: bool) -> None:
     """Loud tripwire for the norm-seed hazard: an RMSNorm call in a serving-parity
     mode under batch-invariant mode without a declared kernel family reaches a
-    family implicitly (the silent-flip class). Warns once per
+    family implicitly (the 2026-07-04 incident class). Warns once per
     (mode, call-shape); raises when XORL_RMSNORM_REQUIRE_FAMILY is set."""
     implicit = "serving_residual_tree (fused)" if residual_present else "serving_no_residual (aten interpose)"
     message = (
@@ -606,6 +754,13 @@ class RMSNorm(nn.Module):
             elif residual is not None:
                 # Diagnostic bf16 recast path: residual already added above.
                 out = fast_sglang_rms_norm(norm_input, self.weight, self.variance_epsilon)
+            elif family == RMS_NORM_FAMILY_NO_RESIDUAL:
+                # A declared serving no-residual site is already an explicit
+                # numerical contract.  Do not make its kernel selection depend
+                # on the unrelated BF16 trunk-linear wrapper: GLM-5.2 keeps its
+                # projections in native FP8, but its q_a/kv_a norms must still
+                # execute the same v2 reduction as serving.
+                out = fast_batch_invariant_rms_norm(norm_input, self.weight, self.variance_epsilon)
             elif is_trunk_linear_contract_enabled():
                 # Trunk contract lane: no-residual norms (qk-norm) must bit-match
                 # serving's family-1 batch-invariant kernel, with real gradients.

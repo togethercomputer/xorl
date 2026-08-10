@@ -34,7 +34,10 @@ class _FakeAdapterState:
         self.global_forward_backward_step = 11
         self.lr = 2e-5
         self.optimizer = _FakeOptimizer()
-        self.lora_params = {"adapter.weight.lora_A": nn.Parameter(torch.ones(1, 1))}
+        self.local_params = {"adapter.weight.lora_A": nn.Parameter(torch.ones(1, 1))}
+        self.tensor_layouts = {}
+        self.layout_fingerprint = "f" * 64
+        self.gradient_ownership_plan = None
         self.session_spec = {
             "lora_config": {
                 "lora_rank": 4,
@@ -51,6 +54,10 @@ class _FakeAdapterState:
             },
         }
 
+    @property
+    def lora_params(self):
+        return self.local_params
+
 
 class _FakeAdapterManager:
     def __init__(self):
@@ -66,6 +73,12 @@ class _FakeAdapterManager:
 
     def get_adapter_session_spec(self, model_id: str):
         return self.adapters[model_id].session_spec
+
+    def validate_weight_publication(self, model_id: str) -> None:
+        assert model_id in self.adapters
+
+    def validate_strict_checkpoint_publication(self, model_id: str) -> None:
+        assert model_id in self.adapters
 
     def switch_adapter(self, model_id: str, auto_register: bool = False) -> bool:
         return model_id in self.adapters
@@ -91,6 +104,10 @@ class _DummyLoRAModel(nn.Module):
         self.model.layers = nn.ModuleList([nn.Module()])
         self.model.layers[0].self_attn = nn.Module()
         self.model.layers[0].self_attn.o_proj = _DummyLoRALayer(max_rank=max_rank)
+
+
+class _ExactActiveLoRAComponent(nn.Module):
+    _glm52_exact_active_lora_component = True
 
 
 def _build_checkpoint_manager() -> CheckpointManager:
@@ -176,6 +193,34 @@ def test_save_adapter_state_raises_before_barrier_when_rank0_write_fails(monkeyp
         manager.save_adapter_state("policy-a", path=str(tmp_path / "adapter-save"), save_optimizer=True)
 
 
+def test_exact_active_lora_rejects_full_snapshot_paths_before_downstream_work(monkeypatch, tmp_path):
+    manager = object.__new__(CheckpointManager)
+    manager.model = nn.Sequential(_ExactActiveLoRAComponent())
+
+    monkeypatch.setattr(
+        _MODULE,
+        "get_parallel_state",
+        lambda: (_ for _ in ()).throw(AssertionError("parallel-state resolution must not run")),
+    )
+    monkeypatch.setattr(
+        _MODULE,
+        "ckpt_to_state_dict",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("checkpoint conversion must not run")),
+    )
+
+    with pytest.raises(RuntimeError, match="factor-only adapter publication"):
+        manager.save_full_weights(str(tmp_path / "full"))
+    with pytest.raises(RuntimeError, match="factor-only adapter publication"):
+        manager.save_weights_for_sampler(str(tmp_path / "checkpoint"), str(tmp_path / "sampler"))
+
+
+def test_factor_only_snapshot_guard_leaves_ordinary_models_unrestricted():
+    manager = object.__new__(CheckpointManager)
+    manager.model = nn.Linear(2, 2)
+
+    manager._require_factor_only_exact_active_lora("ordinary save")
+
+
 def test_save_adapter_state_requests_dtype_preserving_lora_checkpoint(monkeypatch, tmp_path):
     manager = _build_checkpoint_manager()
     captured = {}
@@ -232,15 +277,11 @@ def test_moe_lora_save_uses_collective_gather_even_with_adapter_manager(monkeypa
         "lora_alpha": 16,
         "lora_target_modules": ["gate_proj", "up_proj", "down_proj"],
     }
-    manager._gather_adapter_lora_params = lambda model_id: (_ for _ in ()).throw(
-        AssertionError("fast adapter-manager gather should not run for MoE LoRA")
-    )
-
     collective_state = {
         "model.layers.0.mlp.experts.gate_proj_lora_A": torch.arange(64, dtype=torch.float32).reshape(1, 8, 8),
         "model.layers.0.mlp.experts.gate_proj_lora_B": torch.arange(128, dtype=torch.float32).reshape(1, 8, 16),
     }
-    monkeypatch.setattr(_MODULE, "get_lora_state_dict", lambda model: collective_state)
+    manager._gather_adapter_lora_params = lambda model_id: collective_state
 
     captured = {}
 
@@ -281,12 +322,8 @@ def test_moe_lora_save_uses_resolved_target_modules_for_detection(monkeypatch, t
     }
     manager.lora_target_modules = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
     manager.lora_alpha_value = 16
-    manager._gather_adapter_lora_params = lambda model_id: (_ for _ in ()).throw(
-        AssertionError("fast adapter-manager gather should not run for resolved MoE LoRA targets")
-    )
-
     collective_state = {"model.layers.0.mlp.experts.gate_proj_lora_A": torch.ones(1, 8, 4)}
-    monkeypatch.setattr(_MODULE, "get_lora_state_dict", lambda model: collective_state)
+    manager._gather_adapter_lora_params = lambda model_id: collective_state
 
     captured = {}
 
@@ -334,3 +371,29 @@ def test_lora_save_forwards_export_format(monkeypatch, tmp_path):
     manager._save_lora_weights(str(tmp_path / "sglang-export"), "default")
 
     assert captured["lora_export_format"] == "sglang_shared_outer"
+
+
+def test_adapter_training_artifacts_include_strict_target_manifest(tmp_path):
+    manager = _build_checkpoint_manager()
+    manifest = {
+        "schema_version": 1,
+        "config_rank": 4,
+        "config_alpha": 16.0,
+        "target_modules": ["o_proj"],
+        "expected_modules": [{"pattern": "model.layers.*.self_attn.o_proj", "count": 1, "rank": 4}],
+        "allow_unlisted": False,
+        "source_lora_key_fingerprint": "a" * 64,
+        "source_lora_shape_fingerprint": "b" * 64,
+    }
+    manager.lora_config["lora_target_manifest"] = manifest
+
+    manager._write_adapter_training_artifacts(
+        str(tmp_path),
+        "policy-a",
+        manager._adapter_manager.get_adapter_state("policy-a"),
+        save_optimizer=True,
+    )
+
+    metadata = json.loads((tmp_path / "metadata.json").read_text())
+    assert metadata["optimizer_format"] == "sharded_v3"
+    assert json.loads((tmp_path / "lora_target_manifest.json").read_text()) == manifest

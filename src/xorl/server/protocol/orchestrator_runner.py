@@ -59,6 +59,7 @@ class MessageType(str, Enum):
     FORWARD = "forward"
     FORWARD_BACKWARD = "forward_backward"
     OPTIM_STEP = "optim_step"
+    ABORT_GRADIENT_EPOCH = "abort_gradient_epoch"
     SAVE_STATE = "save_state"
     SAVE_LORA_ONLY = "save_lora_only"
     LOAD_STATE = "load_state"
@@ -73,9 +74,6 @@ class MessageType(str, Enum):
     LOAD_ADAPTER_STATE = "load_adapter_state"
     GET_ADAPTER_INFO = "get_adapter_info"
     KILL_SESSION = "kill_session"
-    START_ZORL_GENERATION = "start_zorl_generation"
-    APPLY_ZORL_REWARDS = "apply_zorl_rewards"
-    ABORT_ZORL_GENERATION = "abort_zorl_generation"
     SHUTDOWN = "shutdown"
     SAVE_FULL_WEIGHTS = "save_full_weights"
 

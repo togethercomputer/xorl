@@ -232,6 +232,44 @@ def test_sync_sp_gradients_reduces_every_grad_by_default(monkeypatch):
     assert all(group == "sp-group" for _, _, group in reduced)
 
 
+def test_explicit_syncs_exclude_parameters_owned_by_adapter_finalization(monkeypatch):
+    first = nn.Parameter(torch.ones(2))
+    second = nn.Parameter(torch.ones(2))
+    first.grad = torch.tensor([1.0, 2.0])
+    second.grad = torch.tensor([3.0, 4.0])
+    model = nn.Module()
+    model.register_parameter("first", first)
+    model.register_parameter("second", second)
+    reduced = []
+    monkeypatch.setattr(
+        training_utils_module.dist,
+        "all_reduce",
+        lambda tensor, op, group: reduced.append((tensor.clone(), group)),
+    )
+
+    sync_sp_gradients(
+        model,
+        sp_grad_sync_group="sp-group",
+        excluded_parameter_ids=frozenset({id(first)}),
+    )
+
+    assert len(reduced) == 1
+    assert torch.equal(reduced[0][0], second.grad)
+    assert reduced[0][1] == "sp-group"
+
+    model._xorl_fsdp_sharded_lm_head_loss = True
+    reduced.clear()
+    monkeypatch.setattr(training_utils_module.dist, "get_world_size", lambda group: 2)
+    sync_lm_head_tp_gradient(
+        model,
+        lm_head_tp_replica_group="output-group",
+        excluded_parameter_ids=frozenset({id(second)}),
+    )
+    assert len(reduced) == 1
+    assert torch.equal(reduced[0][0], first.grad)
+    assert reduced[0][1] == "output-group"
+
+
 def test_sync_sp_gradients_skips_dtensor_grads_when_requested(monkeypatch):
     reduced = []
 

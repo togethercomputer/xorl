@@ -40,7 +40,13 @@ from xorl.lora.utils import (
     inject_lora_into_model_with_moe,
     save_lora_checkpoint,
 )
-from xorl.models import build_foundation_model, build_tokenizer, save_model_assets, save_model_weights
+from xorl.models import (
+    build_foundation_model,
+    build_tokenizer,
+    resolve_cross_entropy_mode,
+    save_model_assets,
+    save_model_weights,
+)
 from xorl.models.checkpoint_handlers.buffers import get_prequantized_exclude_modules
 from xorl.models.layers.moe.aux_loss import LoadBalancingBuffer, global_load_balancing_loss_func
 from xorl.models.layers.moe.routing_replay import RoutingReplay, set_replay_stage
@@ -49,6 +55,7 @@ from xorl.models.transformers.deepseek_v3.support import (
     freeze_deepseek_v3_router_parameters,
     validate_deepseek_v3_training_mode,
 )
+from xorl.models.transformers.glm5.index_share import IndexShareMode
 from xorl.models.transformers.glm5.support import validate_glm5_training_mode
 from xorl.optim import build_lr_scheduler, build_optimizer
 from xorl.qlora import (
@@ -685,6 +692,7 @@ class Trainer:
             weights_path=args.model.model_path,
             torch_dtype=model_dtype,
             attn_implementation=args.model.attn_implementation,
+            non_glm_attn_default="flash_attention_3",
             moe_implementation=args.model.moe_implementation,
             moe_routing_weights_before_down=args.model.moe_routing_weights_before_down,
             ep_dispatch=args.model.ep_dispatch,
@@ -697,6 +705,7 @@ class Trainer:
             lm_head_fp32=args.model.lm_head_fp32,
             alltoall_combine_hidden_chunk_size=args.model.alltoall_combine_hidden_chunk_size,
             rmsnorm_mode=args.model.rmsnorm_mode,
+            qwen35_rmsnorm_family=args.model.qwen35_rmsnorm_family,
             activation_native=args.model.activation_native,
             rope_native=args.model.rope_native,
             rope_class_b=args.model.rope_class_b,
@@ -704,9 +713,30 @@ class Trainer:
             sparse_mla_enabled=args.model.sparse_mla_enabled,
             sparse_mla_backend=args.model.sparse_mla_backend,
             flash_attention_deterministic=args.model.flash_attention_deterministic,
+            block_fp8_qlora_training=getattr(args.lora, "block_fp8_qlora_training", False),
+            lora_rank=args.lora.lora_rank,
+            lora_alpha=args.lora.lora_alpha,
             init_device=args.train.init_device,
         )
         self.model_config = self.model.config
+        numerical_program = self.model_config._resolved_numerical_program
+        args.model.attn_implementation = numerical_program["attn_implementation"]
+        args.model.router_fp32 = numerical_program["router_fp32"]
+        args.model.lm_head_fp32 = numerical_program["lm_head_fp32"]
+        args.model.rmsnorm_mode = numerical_program["rmsnorm_mode"]
+        args.model.qwen35_rmsnorm_family = numerical_program["qwen35_rmsnorm_family"]
+        args.model.activation_native = numerical_program["activation_native"]
+        args.model.rope_native = numerical_program["rope_native"]
+        args.model.rope_class_b = numerical_program["rope_class_b"]
+        args.model.attention_cast_bf16 = numerical_program["attention_cast_bf16"]
+        args.model.sparse_mla_enabled = numerical_program["sparse_mla_enabled"]
+        args.model.sparse_mla_backend = numerical_program["sparse_mla_backend"]
+        args.train.ce_mode = resolve_cross_entropy_mode(self.model_config, args.train.ce_mode)
+        self._causallm_loss_params["ce_mode"] = args.train.ce_mode
+        if args.train.ce_mode != "quack_linear":
+            self._causallm_loss_params["lm_head_fp32"] = args.model.lm_head_fp32
+        else:
+            self._causallm_loss_params.pop("lm_head_fp32", None)
         # Normalize _no_split_modules to list — some HF models (e.g. GPT-OSS) define it as a set
         if isinstance(getattr(self.model, "_no_split_modules", None), set):
             self.model._no_split_modules = list(self.model._no_split_modules)
@@ -721,6 +751,12 @@ class Trainer:
             enable_qlora=args.lora.enable_qlora,
             freeze_router=args.model.freeze_router,
             merge_qkv=args.model.merge_qkv,
+            block_fp8_qlora_training=getattr(args.lora, "block_fp8_qlora_training", False),
+            quant_format=getattr(args.lora, "quant_format", "nvfp4"),
+            quant_group_size=getattr(args.lora, "quant_group_size", 16),
+            moe_implementation=args.model.moe_implementation,
+            ep_dispatch=args.model.ep_dispatch,
+            moe_hybrid_shared_lora=getattr(args.lora, "moe_hybrid_shared_lora", False),
         )
         helper.print_device_mem_info("VRAM usage after building model")
 
@@ -825,16 +861,6 @@ class Trainer:
             enable_mixed_precision=args.train.enable_mixed_precision,
         )
 
-        if os.environ.get("XORL_BI_TRUNK_LINEAR", "0") == "1":
-            from xorl.ops.batch_invariant_ops import wrap_trunk_linears_batch_invariant  # noqa: PLC0415
-
-            wrapped = wrap_trunk_linears_batch_invariant(self.model)
-            pattern = ", ".join(f"{name}x{count}" for name, count in sorted(wrapped.items()))
-            logger.info_rank0(
-                f"XORL_BI_TRUNK_LINEAR=1: wrapped {sum(wrapped.values())} trunk linears "
-                f"(fwd batch-invariant, bwd cuBLAS; qk-norm on the family-1 BI kernel): {pattern}"
-            )
-
         # Save pre-hook before parallelization (some models register optimizer hooks)
         self._optimizer_pre_hook_fn = getattr(self.model, "get_optimizer_pre_hook", None)
 
@@ -868,19 +894,35 @@ class Trainer:
                 f"target={args.lora.quant_format} — will dequantize and re-quantize"
             )
 
-        inject_qlora_into_model(
-            self.model,
-            r=args.lora.lora_rank,
-            lora_alpha=args.lora.lora_alpha,
-            quant_format=args.lora.quant_format,
-            quant_group_size=args.lora.quant_group_size,
-            target_modules=args.lora.lora_target_modules,
-            checkpoint_quant_format=self.checkpoint_quant_format,
-            merge_qkv=args.model.merge_qkv,
-            exclude_modules=self.exclude_modules,
-            enable_aqn=args.lora.enable_aqn,
-            aqn_alpha=args.lora.aqn_alpha,
-        )
+        if getattr(args.lora, "block_fp8_qlora_training", False):
+            if args.lora.lora_target_modules is not None:
+                raise ValueError("GLM-5.2 block-FP8 QLoRA uses its complete deterministic target set")
+            if args.lora.exclude_modules is not None:
+                raise ValueError("GLM-5.2 block-FP8 QLoRA derives checkpoint exclusions and rejects user overrides")
+            if args.lora.enable_aqn:
+                raise ValueError("GLM-5.2 block-FP8 QLoRA does not admit Adaptive Quantization Noise")
+            from xorl.models.transformers.glm5.qlora import prepare_glm52_block_fp8_qlora  # noqa: PLC0415
+
+            self.glm52_adapter_inventory = prepare_glm52_block_fp8_qlora(
+                self.model,
+                self.model_config,
+                adapter_rank=args.lora.lora_rank,
+                adapter_alpha=args.lora.lora_alpha,
+            )
+        else:
+            inject_qlora_into_model(
+                self.model,
+                r=args.lora.lora_rank,
+                lora_alpha=args.lora.lora_alpha,
+                quant_format=args.lora.quant_format,
+                quant_group_size=args.lora.quant_group_size,
+                target_modules=args.lora.lora_target_modules,
+                checkpoint_quant_format=self.checkpoint_quant_format,
+                merge_qkv=args.model.merge_qkv,
+                exclude_modules=self.exclude_modules,
+                enable_aqn=args.lora.enable_aqn,
+                aqn_alpha=args.lora.aqn_alpha,
+            )
         if self.exclude_modules:
             self.model._qlora_exclude_modules = self.exclude_modules
         helper.print_device_mem_info("VRAM usage after QLoRA injection")
@@ -898,6 +940,7 @@ class Trainer:
                 lora_alpha=args.lora.lora_alpha,
                 target_modules=args.lora.lora_target_modules,
                 moe_hybrid_shared_lora=args.lora.moe_hybrid_shared_lora,
+                target_manifest=args.lora.lora_target_manifest,
             )
         else:
             inject_lora_into_model(
@@ -905,6 +948,7 @@ class Trainer:
                 r=args.lora.lora_rank,
                 lora_alpha=args.lora.lora_alpha,
                 target_modules=args.lora.lora_target_modules,
+                target_manifest=args.lora.lora_target_manifest,
             )
         helper.print_device_mem_info("VRAM usage after LoRA injection")
 
@@ -990,6 +1034,13 @@ class Trainer:
                 frozen += part_frozen
             if frozen > 0:
                 logger.info_rank0(f"Froze {frozen} MoE router (gate) parameters")
+
+        if getattr(self.ps, "lm_head_tp_size", 1) > 1:
+            sync_lm_head_tp_parameters(
+                self.model,
+                self.ps.lm_head_tp_replica_group,
+                self.ps.lm_head_tp_group,
+            )
 
     def _all_model_parts(self) -> List[torch.nn.Module]:
         """All local model chunks: PP virtual stages own several, else just self.model."""
@@ -1138,7 +1189,11 @@ class Trainer:
                 pass
         self.Checkpointer.load(args.train.load_checkpoint_path, state)
         if getattr(self.ps, "lm_head_tp_size", 1) > 1:
-            sync_lm_head_tp_parameters(self.model, self.ps.lm_head_tp_replica_group)
+            sync_lm_head_tp_parameters(
+                self.model,
+                self.ps.lm_head_tp_replica_group,
+                self.ps.lm_head_tp_group,
+            )
 
         extra = state.get("extra_state", {})
         self.state.global_step = extra.get("global_step", 0)
@@ -1761,12 +1816,25 @@ class Trainer:
             self._log_step_exception_diagnostics(phase_times, step_start, exc)
             raise
         finally:
+            self._release_index_share_contexts()
             self._current_step_phase_times = None
             self._current_step_memory_stats = None
 
     # ===================================================================
     # train_step helpers
     # ===================================================================
+
+    @staticmethod
+    def _index_share_forward_kwargs(model, mode: IndexShareMode) -> Dict[str, IndexShareMode]:
+        if callable(getattr(model, "release_index_share_context", None)):
+            return {"index_share_mode": mode}
+        return {}
+
+    def _release_index_share_contexts(self) -> None:
+        for model_part in self._all_model_parts():
+            release = getattr(model_part, "release_index_share_context", None)
+            if callable(release):
+                release()
 
     def _scan_nonfinite_grads(self) -> None:
         """Debug helper (XORL_DEBUG_NONFINITE_GRAD_SCAN=1): after backward, log
@@ -1861,6 +1929,18 @@ class Trainer:
         micro_batches: List[Dict[str, Any]],
         global_valid_tokens: torch.Tensor,
     ) -> float:
+        try:
+            return self._forward_backward_impl(micro_batches, global_valid_tokens)
+        finally:
+            # A successful backward releases per micro-batch below. This outer
+            # boundary owns loss/setup failures after a successful forward.
+            self._release_index_share_contexts()
+
+    def _forward_backward_impl(
+        self,
+        micro_batches: List[Dict[str, Any]],
+        global_valid_tokens: torch.Tensor,
+    ) -> float:
         """Standard gradient accumulation loop (non-PP)."""
         total_loss = 0.0
 
@@ -1910,7 +1990,15 @@ class Trainer:
                 def _do_model_forward(micro_batch=micro_batch):
                     self._per_component_timer.set_mode("fwd")
                     try:
-                        return self.model(**micro_batch, use_cache=False, output_hidden_states=False)
+                        return self.model(
+                            **micro_batch,
+                            use_cache=False,
+                            output_hidden_states=False,
+                            **self._index_share_forward_kwargs(
+                                self.model,
+                                IndexShareMode.TRAINING_WITH_BACKWARD,
+                            ),
+                        )
                     finally:
                         self._per_component_timer.set_mode("idle")
 
@@ -1989,6 +2077,7 @@ class Trainer:
                         if _env_flag("XORL_TRAINER_MEMORY_TRACE"):
                             _trainer_memory_trace("after ga_loss.backward")
                     finally:
+                        self._release_index_share_contexts()
                         self._per_component_timer.set_mode("idle")
 
                 self._time_step_phase("backward", _do_backward)

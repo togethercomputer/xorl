@@ -7,6 +7,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from xorl.models.exact_contract import glm52_exact_forward_enabled
+
 from .experts import MoEExperts, moe_sglang_fused_experts_enabled
 from .router import TopKRouter, balanced_synthetic_routing
 from .routing_replay import RoutingReplay, get_replay_stage
@@ -25,19 +27,21 @@ def _moe_fp64_accum_enabled() -> bool:
     return os.environ.get(_MOE_FP64_ACCUM_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
-_MOE_BI_ROUTER_ENV = "XORL_MOE_BI_ROUTER"
+def _moe_bi_router_enabled(config=None) -> bool:
+    """Whether this caller owns the exact batch-invariant router contract.
 
+    Canonical GLM-5.2 makes the contract structural: its model declaration is
+    sufficient and does not depend on a launch-time environment switch.
 
-def _moe_bi_router_enabled() -> bool:
-    """K3 router contract: route the gate/router matmul through the shared
+    Route the gate/router matmul through the shared
     batch-invariant router GEMM (``ops.batch_invariant_ops.bi_router_gemm``),
-    vendored bit-for-bit into SGLang. Opt-in; never a training default.
+    vendored bit-for-bit into SGLang.
 
     Live training routes independently of serving (no routing replay), so the
     fp32 router-GEMM reduction-order tail can flip top-k expert selection on
     razor-edge tokens. This pins the router logits identically cross-engine.
     """
-    return os.environ.get(_MOE_BI_ROUTER_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
+    return glm52_exact_forward_enabled(config)
 
 
 class _BIRouterGemm(torch.autograd.Function):
@@ -136,6 +140,7 @@ class MoEBlock(nn.Module):
         record_routing_weights: bool = True,
         activation_native: bool = False,
         swiglu_limit: float = 0.0,
+        exact_batch_invariant_router: bool = False,
     ):
         super().__init__()
         self.num_experts = num_experts
@@ -151,7 +156,13 @@ class MoEBlock(nn.Module):
         self.gate = nn.Linear(hidden_size, num_experts, bias=False)
 
         # Stateless routing logic (softmax + topk + renorm)
-        self.router = TopKRouter(num_experts, top_k, norm_topk_prob)
+        self.router = TopKRouter(
+            num_experts,
+            top_k,
+            norm_topk_prob,
+            exact_batch_invariant=exact_batch_invariant_router,
+        )
+        self._exact_batch_invariant_router = exact_batch_invariant_router
 
         # Expert weights + backend dispatch
         self.experts = MoEExperts(
@@ -288,15 +299,16 @@ class MoEBlock(nn.Module):
         Guards raise loudly on configs the contract has not verified: an fp8
         gate, a gate bias, or non-bf16 hidden/weight (the bf16-upcast exactness
         argument requires bf16 inputs). Returns fp32 logits ``[N, num_experts]``
-        bit-identical to SGLang's ``SGLANG_BI_ROUTER=1`` path.
+        bit-identical to SGLang's batch-invariant router path.
         """
+        contract_name = "batch-invariant MoE router"
         if hasattr(self.gate, "fp8_block_size"):
-            raise NotImplementedError(f"{_MOE_BI_ROUTER_ENV} does not support an fp8 gate")
+            raise NotImplementedError(f"{contract_name} does not support an fp8 gate")
         if getattr(self.gate, "bias", None) is not None:
-            raise NotImplementedError(f"{_MOE_BI_ROUTER_ENV} does not support a gate bias")
+            raise NotImplementedError(f"{contract_name} does not support a gate bias")
         if hidden_states.dtype != torch.bfloat16 or self.gate.weight.dtype != torch.bfloat16:
             raise NotImplementedError(
-                f"{_MOE_BI_ROUTER_ENV} requires bf16 hidden states and gate weight; got "
+                f"{contract_name} requires bf16 hidden states and gate weight; got "
                 f"hidden={hidden_states.dtype}, weight={self.gate.weight.dtype}"
             )
         return _BIRouterGemm.apply(hidden_states, self.gate.weight)
@@ -323,7 +335,7 @@ class MoEBlock(nn.Module):
             and getattr(self.config, "_router_fp32", False)
             or _router_fp32_layers_enabled(getattr(self, "layer_idx", None))
         )
-        if _moe_bi_router_enabled():
+        if self._exact_batch_invariant_router or _moe_bi_router_enabled(getattr(self, "config", None)):
             router_logits = self._bi_router_logits(hidden_states)
         elif router_fp32 and not hasattr(self.gate, "fp8_block_size"):
             router_logits = F.linear(hidden_states.float(), self.gate.weight.float())

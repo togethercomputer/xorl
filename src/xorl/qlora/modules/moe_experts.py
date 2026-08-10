@@ -23,6 +23,7 @@ the original MoeBlock.
 """
 
 import math
+from dataclasses import replace
 from typing import Optional
 
 import safetensors.torch
@@ -31,6 +32,15 @@ import torch.nn as nn
 from torch import Tensor
 from transformers.utils import cached_file
 
+from xorl.distributed.gradient_reduction import GradientReductionDomain
+from xorl.lora.expert_adapter_contract import (
+    EXPERT_PROJECTION_ROLES,
+    ExpertAdapterFactorOwnership,
+    ExpertAdapterGradientContract,
+    gated_expert_factor_ownership,
+    gated_expert_factor_shapes,
+    validate_gated_silu_expert_adapter_semantics,
+)
 from xorl.lora.modules.base import LoraModule
 from xorl.ops.group_gemm.kernel.lora_utils import compute_lora_scaling
 from xorl.ops.quantize import (
@@ -54,6 +64,51 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
     Uses (G, K, N) weight format and backend registry for compute.
     """
 
+    @property
+    def adapter_gradient_producer_family(self) -> str:
+        """Return the fixed producer selected by this execution plan."""
+
+        return "module_managed" if self.moe_implementation == "eager" else "fused_managed"
+
+    @property
+    def expert_adapter_gradient_contract(self) -> ExpertAdapterGradientContract:
+        """Declare generic quantized expert execution and factor ownership."""
+
+        from xorl.models.layers.moe.backend import expert_adapter_backend_contract  # noqa: PLC0415
+
+        try:
+            validate_gated_silu_expert_adapter_semantics(self)
+        except NotImplementedError as error:
+            raise ValueError(str(error)) from error
+        roles = tuple(self.target_modules)
+        backend = expert_adapter_backend_contract(self.moe_implementation)
+        if self.moe_implementation == "eager":
+            # The eager wrapper is called one expert at a time and has not
+            # been certified through the quantized EP dispatch boundary.
+            # Keep local eager useful for debugging, but fail closed for EP.
+            backend = replace(backend, supports_ep=False, supported_dispatch_methods=())
+        return ExpertAdapterGradientContract(
+            backend=backend,
+            factor_layout="gkn_gate_up_down",
+            projection_roles=roles,
+            factor_ownership=gated_expert_factor_ownership(roles, hybrid_shared=self.hybrid_shared),
+            factor_shapes=gated_expert_factor_shapes(
+                roles,
+                num_experts=self.num_experts,
+                hidden_size=self.hidden_size,
+                intermediate_size=self.intermediate_size,
+                rank=self.r,
+                hybrid_shared=self.hybrid_shared,
+            ),
+            supported_quantized_base_formats=("block_fp8", "nf4", "nvfp4"),
+            quantized_base_format=self.quant_format,
+            # _skip_fsdp factors are intentionally unsupported when they are
+            # replicated across an eFSDP dimension. torch_parallelize enforces
+            # the same boundary before execution.
+            supports_efsdp_replication=False,
+            guard_fields=(("expert_hybrid_shared", self.hybrid_shared),),
+        )
+
     def __init__(
         self,
         num_local_experts: int,
@@ -65,6 +120,7 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
         quant_format: str = "nvfp4",
         quant_group_size: int = 16,
         act_fn: Optional[nn.Module] = None,
+        hidden_act: str | None = None,
         expert_offset: int = 0,
         device: Optional[torch.device] = None,
         moe_implementation: str = "triton",
@@ -75,6 +131,7 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
         deepep_num_sms: int = 20,
         deepep_async_combine: bool = False,
         alltoall_combine_hidden_chunk_size: int = 0,
+        target_modules: Optional[list[str]] = None,
     ):
         super().__init__()
         self.num_local_experts = num_local_experts
@@ -90,10 +147,44 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
         self.quant_format = quant_format
         self.quant_group_size = quant_group_size
         self.act_fn = act_fn or nn.SiLU()
+        if hidden_act is None:
+            hidden_act = (
+                "silu"
+                if act_fn is None or isinstance(act_fn, nn.SiLU) or type(act_fn).__name__ == "SiLUActivation"
+                else f"custom:{type(act_fn).__qualname__}"
+            )
+        self.hidden_act = hidden_act
+        self.gated = True
+        self.swiglu_limit = 0.0
+        self.gate_up_bias = None
+        self.down_bias = None
         self.expert_offset = expert_offset
         self.moe_implementation = moe_implementation
         self.hybrid_shared = hybrid_shared
+        selected_targets = tuple(("gate_proj", "up_proj", "down_proj") if target_modules is None else target_modules)
+        unsupported_targets = set(selected_targets) - EXPERT_PROJECTION_ROLES
+        if not selected_targets or len(set(selected_targets)) != len(selected_targets) or unsupported_targets:
+            raise ValueError(
+                "QLoRA expert target_modules must be a non-empty subset of "
+                f"{sorted(EXPERT_PROJECTION_ROLES)}; got {list(selected_targets)!r}"
+            )
+        self.target_modules = selected_targets
         self.use_rslora = use_rslora
+        from xorl.models.layers.moe.backend import ep_lora_gradient_reduction_domain  # noqa: PLC0415
+
+        self._ep_gradient_reduction_domain = ep_lora_gradient_reduction_domain(moe_implementation)
+        factor_ownership = gated_expert_factor_ownership(
+            self.target_modules,
+            hybrid_shared=self.hybrid_shared,
+        )
+        self._ep_gradient_reduction_by_parameter = {
+            name: (
+                self._ep_gradient_reduction_domain
+                if ownership is ExpertAdapterFactorOwnership.EP_REPLICATED
+                else GradientReductionDomain.NONE
+            )
+            for name, ownership in factor_ownership
+        }
 
         # EP dispatch settings
         self.ep_dispatch = ep_dispatch
@@ -178,20 +269,34 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
         A: [A_experts, in_features, r]
         B: [B_experts, r, out_features]
         """
-        setattr(
-            self,
-            f"{name}_lora_A",
-            nn.Parameter(torch.empty(A_experts, in_features, r, dtype=torch.float32, device=device)),
-        )
-        setattr(
-            self,
-            f"{name}_lora_B",
-            nn.Parameter(torch.empty(B_experts, r, out_features, dtype=torch.float32, device=device)),
-        )
+        if name in self.target_modules:
+            setattr(
+                self,
+                f"{name}_lora_A",
+                nn.Parameter(torch.empty(A_experts, in_features, r, dtype=torch.float32, device=device)),
+            )
+            setattr(
+                self,
+                f"{name}_lora_B",
+                nn.Parameter(torch.empty(B_experts, r, out_features, dtype=torch.float32, device=device)),
+            )
+        else:
+            local_A_experts = 1 if A_experts == 1 else self.num_local_experts
+            local_B_experts = 1 if B_experts == 1 else self.num_local_experts
+            self.register_buffer(
+                f"{name}_lora_A",
+                torch.zeros(local_A_experts, in_features, r, dtype=torch.float32, device=device),
+                persistent=False,
+            )
+            self.register_buffer(
+                f"{name}_lora_B",
+                torch.zeros(local_B_experts, r, out_features, dtype=torch.float32, device=device),
+                persistent=False,
+            )
 
     def reset_lora_parameters(self):
         """Initialize LoRA weights: kaiming_uniform for A, zeros for B."""
-        for proj in ("gate_proj", "up_proj", "down_proj"):
+        for proj in self.target_modules:
             lora_A = getattr(self, f"{proj}_lora_A")
             lora_B = getattr(self, f"{proj}_lora_B")
             for i in range(lora_A.shape[0]):
@@ -256,6 +361,7 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
         num_local_experts: Optional[int] = None,
         expert_offset: int = 0,
         hybrid_shared: bool = True,
+        target_modules: Optional[list[str]] = None,
         use_rslora: bool = False,
         **kwargs,
     ) -> "QLoRAMoeExperts":
@@ -264,6 +370,7 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
         Inherits EP settings (moe_implementation, ep_dispatch, deepep_*) from source.
         Source weights are in (G,K,N) format [num_experts, in_features, out_features].
         """
+        validate_gated_silu_expert_adapter_semantics(module)
         gate = module.gate_proj  # [num_experts, hidden, intermediate] (G,K,N)
         total_experts = gate.shape[0]
 
@@ -273,6 +380,7 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
         hidden_size = getattr(module, "hidden_dim", gate.shape[1])
         intermediate_size = getattr(module, "intermediate_size", gate.shape[2])
         act_fn = getattr(module, "act_fn", None)
+        hidden_act = getattr(module, "hidden_act", "silu")
         moe_implementation = getattr(module, "moe_implementation", "triton")
         ep_dispatch = getattr(module, "ep_dispatch", "alltoall")
 
@@ -287,6 +395,12 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
         else:
             subcls = cls
 
+        required_group_size = {"nvfp4": 16, "block_fp8": 128, "nf4": 64}[quant_format]
+        if quant_group_size != required_group_size:
+            raise ValueError(
+                f"Expert {quant_format} QLoRA requires quant_group_size={required_group_size}; got {quant_group_size}"
+            )
+
         qlora = subcls(
             num_local_experts=num_local_experts,
             num_experts=total_experts,
@@ -295,10 +409,12 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
             r=r,
             lora_alpha=lora_alpha,
             act_fn=act_fn,
+            hidden_act=hidden_act,
             expert_offset=expert_offset,
             device=gate.device,
             moe_implementation=moe_implementation,
             hybrid_shared=hybrid_shared,
+            target_modules=target_modules,
             use_rslora=use_rslora,
             ep_dispatch=ep_dispatch,
             deepep_buffer_size_gb=getattr(module, "deepep_buffer_size_gb", 2.0),
@@ -516,7 +632,12 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
         Uses the same dispatch/combine as MoEExperts._ep_forward() but routes
         to the LoRA-aware EP compute registry.
         """
-        from xorl.models.layers.moe.backend import EP_COMBINE, EP_DISPATCH, EP_EXPERT_COMPUTE_LORA  # noqa: PLC0415
+        from xorl.models.layers.moe.backend import (  # noqa: PLC0415
+            EP_COMBINE,
+            EP_DISPATCH,
+            EP_EXPERT_COMPUTE_LORA,
+            zero_token_lora_output,
+        )
 
         if self.moe_implementation not in EP_EXPERT_COMPUTE_LORA:
             raise ValueError(
@@ -541,20 +662,32 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
         gate_proj_lora_A, gate_proj_lora_B = self._active_lora_views("gate_proj")
         up_proj_lora_A, up_proj_lora_B = self._active_lora_views("up_proj")
         down_proj_lora_A, down_proj_lora_B = self._active_lora_views("down_proj")
-        expert_output = compute_fn(
-            permute_tokens,
-            cumsum,
-            self.gate_proj.to(compute_dtype),
-            self.up_proj.to(compute_dtype),
-            self.down_proj.to(compute_dtype),
-            gate_proj_lora_A,
-            gate_proj_lora_B,
-            up_proj_lora_A,
-            up_proj_lora_B,
-            down_proj_lora_A,
-            down_proj_lora_B,
-            self._active_scaling(),
-        )
+        if permute_tokens.shape[0] == 0:
+            expert_output = zero_token_lora_output(
+                permute_tokens,
+                self.hidden_size,
+                gate_proj_lora_A,
+                gate_proj_lora_B,
+                up_proj_lora_A,
+                up_proj_lora_B,
+                down_proj_lora_A,
+                down_proj_lora_B,
+            )
+        else:
+            expert_output = compute_fn(
+                permute_tokens,
+                cumsum,
+                self.gate_proj.to(compute_dtype),
+                self.up_proj.to(compute_dtype),
+                self.down_proj.to(compute_dtype),
+                gate_proj_lora_A,
+                gate_proj_lora_B,
+                up_proj_lora_A,
+                up_proj_lora_B,
+                down_proj_lora_A,
+                down_proj_lora_B,
+                self._active_scaling(),
+            )
 
         expert_scores = getattr(ctx, "expert_scores", getattr(ctx, "permuted_scores", None))
         if expert_scores is not None:
@@ -662,6 +795,7 @@ class QLoRAMoeExperts(LoraModule, nn.Module):
             f"r={self.active_r}, max_r={self.r}, quant_format={self.quant_format}, "
             f"moe_implementation={self.moe_implementation}, "
             f"hybrid_shared={self.hybrid_shared}, "
+            f"target_modules={list(self.target_modules)}, "
             f"ep_dispatch={self.ep_dispatch}"
         )
 
@@ -683,10 +817,12 @@ class NvFP4QLoRAMoeExperts(QLoRAMoeExperts):
         r: int = 16,
         lora_alpha: int = 16,
         act_fn: Optional[nn.Module] = None,
+        hidden_act: str | None = None,
         expert_offset: int = 0,
         device: Optional[torch.device] = None,
         moe_implementation: str = "triton",
         hybrid_shared: bool = True,
+        target_modules: Optional[list[str]] = None,
         use_rslora: bool = False,
         ep_dispatch: str = "alltoall",
         deepep_buffer_size_gb: float = 2.0,
@@ -704,10 +840,12 @@ class NvFP4QLoRAMoeExperts(QLoRAMoeExperts):
             quant_format="nvfp4",
             quant_group_size=16,
             act_fn=act_fn,
+            hidden_act=hidden_act,
             expert_offset=expert_offset,
             device=device,
             moe_implementation=moe_implementation,
             hybrid_shared=hybrid_shared,
+            target_modules=target_modules,
             use_rslora=use_rslora,
             ep_dispatch=ep_dispatch,
             deepep_buffer_size_gb=deepep_buffer_size_gb,
@@ -887,10 +1025,12 @@ class BlockFP8QLoRAMoeExperts(QLoRAMoeExperts):
         r: int = 16,
         lora_alpha: int = 16,
         act_fn: Optional[nn.Module] = None,
+        hidden_act: str | None = None,
         expert_offset: int = 0,
         device: Optional[torch.device] = None,
         moe_implementation: str = "triton",
         hybrid_shared: bool = True,
+        target_modules: Optional[list[str]] = None,
         use_rslora: bool = False,
         ep_dispatch: str = "alltoall",
         deepep_buffer_size_gb: float = 2.0,
@@ -908,10 +1048,12 @@ class BlockFP8QLoRAMoeExperts(QLoRAMoeExperts):
             quant_format="block_fp8",
             quant_group_size=128,
             act_fn=act_fn,
+            hidden_act=hidden_act,
             expert_offset=expert_offset,
             device=device,
             moe_implementation=moe_implementation,
             hybrid_shared=hybrid_shared,
+            target_modules=target_modules,
             use_rslora=use_rslora,
             ep_dispatch=ep_dispatch,
             deepep_buffer_size_gb=deepep_buffer_size_gb,
@@ -1022,10 +1164,12 @@ class NF4QLoRAMoeExperts(QLoRAMoeExperts):
         r: int = 16,
         lora_alpha: int = 16,
         act_fn: Optional[nn.Module] = None,
+        hidden_act: str | None = None,
         expert_offset: int = 0,
         device: Optional[torch.device] = None,
         moe_implementation: str = "triton",
         hybrid_shared: bool = True,
+        target_modules: Optional[list[str]] = None,
         use_rslora: bool = False,
         ep_dispatch: str = "alltoall",
         deepep_buffer_size_gb: float = 2.0,
@@ -1043,10 +1187,12 @@ class NF4QLoRAMoeExperts(QLoRAMoeExperts):
             quant_format="nf4",
             quant_group_size=64,
             act_fn=act_fn,
+            hidden_act=hidden_act,
             expert_offset=expert_offset,
             device=device,
             moe_implementation=moe_implementation,
             hybrid_shared=hybrid_shared,
+            target_modules=target_modules,
             use_rslora=use_rslora,
             ep_dispatch=ep_dispatch,
             deepep_buffer_size_gb=deepep_buffer_size_gb,

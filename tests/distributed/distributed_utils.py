@@ -102,10 +102,12 @@ def run_distributed_script(
             env=env,
         )
     except subprocess.TimeoutExpired as e:
+        stdout = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else e.stdout
+        stderr = e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes) else e.stderr
         return DistributedTestResult(
             exit_code=-1,
-            stdout=e.stdout or "",
-            stderr=e.stderr or f"Timeout after {timeout}s",
+            stdout=stdout or "",
+            stderr=stderr or f"Timeout after {timeout}s",
         )
 
     return DistributedTestResult(

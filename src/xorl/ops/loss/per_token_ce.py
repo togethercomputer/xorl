@@ -88,8 +88,9 @@ def compute_per_token_ce(
         num_chunks: Number of chunks for compiled mode
         tp_group: TP process group for vocab-parallel cross-entropy (default: None)
         use_compile: Whether to use torch.compile in vocab_parallel_cross_entropy
-        lm_head: Optional module to call for the logits matmul. Used by FP8
-            training so ``FP8Linear.forward`` is not bypassed by raw-weight CE.
+        lm_head: Optional module that owns the loss projection. Used by FP8
+            training so ``FP8Linear.forward`` is not bypassed by raw-weight CE,
+            and by the internal GLM-5.2 exact active-LoRA selected-logprob op.
         lm_head_fp32: Compute the lm_head logits in FP32. This takes PRECEDENCE
             over ``lm_head`` — when set, the FP8 lm_head module is bypassed and
             logits are computed in FP32 from the (master) ``weight``, so an FP8
@@ -102,13 +103,34 @@ def compute_per_token_ce(
     Returns:
         per_token_ce: Per-token cross-entropy loss, shape (BT,)
     """
+    logprob_temperature = _normalize_logprob_temperature(logprob_temperature)
+
+    # The complete GLM-5.2 active-LoRA lane owns the selected-logprob value and
+    # its hybrid VJP. Route before the generic lm_head_fp32/module precedence:
+    # the exact op intentionally consumes BF16 hidden/base operands while
+    # producing FP32 logits and logprobs.
+    if lm_head is not None and getattr(lm_head, "_glm52_exact_tp16_lm_head", False):
+        from xorl.models.transformers.glm5.exact_lm_head_qlora import (  # noqa: PLC0415
+            glm52_exact_lm_head_per_token_ce,
+        )
+
+        return glm52_exact_lm_head_per_token_ce(
+            hidden_states_flat,
+            weight,
+            labels_flat,
+            lm_head=lm_head,
+            ignore_index=ignore_index,
+            ce_mode=ce_mode,
+            lm_head_fp32=lm_head_fp32,
+            logprob_temperature=logprob_temperature,
+            tp_group=tp_group,
+        )
+
     # ``lm_head_fp32`` takes precedence over the FP8 lm_head module: an FP32
     # lm_head means the projection must NOT be FP8-quantized, so route to the
     # raw-weight FP32 path below rather than calling ``FP8Linear.forward``. The
     # passed ``weight`` is the master (non-quantized) lm_head weight.
     use_lm_head_module = lm_head is not None and not lm_head_fp32
-    logprob_temperature = _normalize_logprob_temperature(logprob_temperature)
-
     # ``fused_quack`` is an explicit opt-in that fuses the selected-token logprob
     # via chunked cuBLAS matmul + a fused CuTeDSL cross-entropy reduction
     # (chunk-sized logits, scalar TP reductions); it serves TP and non-TP cases.
@@ -125,6 +147,30 @@ def compute_per_token_ce(
             labels_flat,
             tp_group=tp_group,
             ignore_index=ignore_index,
+        )
+
+    # ``bi_fused`` is the K3 lm-head contract (vendored identically in SGLang).
+    # Hidden states stay bf16 and temperature scales the logits IN-KERNEL —
+    # matching serving's temp-scaled input logprobs bitwise, unlike the
+    # scale-hidden-pre-GEMM convention used by the other modes.
+    if ce_mode == "bi_fused":
+        from xorl.ops.loss.bi_fused_lm_head import bi_fused_per_token_ce  # noqa: PLC0415
+
+        if tp_group is not None:
+            raise NotImplementedError("ce_mode='bi_fused' does not support tensor parallelism yet")
+        if use_lm_head_module:
+            raise NotImplementedError("ce_mode='bi_fused' does not support FP8 lm_head modules")
+        if not lm_head_fp32:
+            raise NotImplementedError(
+                "ce_mode='bi_fused' implements the fp32-class lm-head contract; set lm_head_fp32: true"
+            )
+        local_weight = weight.to_local() if hasattr(weight, "to_local") else weight
+        return bi_fused_per_token_ce(
+            hidden_states_flat,
+            local_weight,
+            labels_flat,
+            ignore_index,
+            temperature=logprob_temperature,
         )
 
     if tp_group is not None:

@@ -8,6 +8,24 @@ import torch.nn as nn
 from xorl.server.runner.model_runner import ModelRunner
 
 
+def _fake_model_config() -> SimpleNamespace:
+    return SimpleNamespace(
+        model_type="tiny",
+        _resolved_numerical_program={
+            "attn_implementation": "eager",
+            "router_fp32": False,
+            "lm_head_fp32": False,
+            "rmsnorm_mode": "eager",
+            "activation_native": False,
+            "rope_native": False,
+            "rope_class_b": False,
+            "attention_cast_bf16": False,
+            "sparse_mla_enabled": False,
+            "sparse_mla_backend": None,
+        },
+    )
+
+
 def test_model_runner_defaults_fp8_training_to_fail_fast_fallback(monkeypatch):
     captured = {}
 
@@ -15,7 +33,7 @@ def test_model_runner_defaults_fp8_training_to_fail_fast_fallback(monkeypatch):
         captured.update(kwargs)
         return SimpleNamespace(
             model=nn.Linear(1, 1),
-            model_config=object(),
+            model_config=_fake_model_config(),
             pp_enabled=False,
             pp_stages=None,
             model_parts=None,
@@ -40,6 +58,7 @@ def test_model_runner_defaults_fp8_training_to_fail_fast_fallback(monkeypatch):
         "enable_mixed_precision": False,
         "init_device": "cpu",
     }
+    runner.ce_mode = None
     runner.lora_config = {}
 
     ModelRunner._initialize_model(runner)
@@ -55,7 +74,7 @@ def test_model_runner_threads_qarl_config_to_model_builder(monkeypatch):
         captured.update(kwargs)
         return SimpleNamespace(
             model=nn.Linear(1, 1),
-            model_config=object(),
+            model_config=_fake_model_config(),
             pp_enabled=False,
             pp_stages=None,
             model_parts=None,
@@ -87,6 +106,7 @@ def test_model_runner_threads_qarl_config_to_model_builder(monkeypatch):
         "enable_mixed_precision": False,
         "init_device": "cpu",
     }
+    runner.ce_mode = None
     runner.lora_config = {}
 
     ModelRunner._initialize_model(runner)
@@ -101,6 +121,71 @@ def test_model_runner_threads_qarl_config_to_model_builder(monkeypatch):
     assert captured["qarl_exclude_modules"] == ["lm_head"]
 
 
+def test_model_runner_threads_glm52_block_fp8_qlora_mode(monkeypatch):
+    captured = {}
+
+    def fake_build_training_model(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(
+            model=nn.Linear(1, 1),
+            model_config=_fake_model_config(),
+            pp_enabled=False,
+            pp_stages=None,
+            model_parts=None,
+            has_first_stage=True,
+            has_last_stage=True,
+            optimizer_pre_hook_fn=None,
+            is_prequantized=True,
+            checkpoint_quant_format="block_fp8",
+            exclude_modules=set(),
+        )
+
+    monkeypatch.setattr("xorl.server.runner.model_runner.build_training_model", fake_build_training_model)
+
+    runner = object.__new__(ModelRunner)
+    runner.rank = 0
+    runner.model_config = {
+        "model_path": "zai-org/GLM-5.2-FP8",
+        "config_path": "zai-org/GLM-5.2-FP8",
+        "moe_implementation": "triton",
+        "ep_dispatch": "deepep",
+    }
+    runner.train_config = {
+        "enable_mixed_precision": False,
+        "freeze_router": True,
+        "init_device": "cpu",
+    }
+    runner.ce_mode = None
+    runner.lora_config = {
+        "enable_lora": True,
+        "enable_qlora": True,
+        "block_fp8_qlora_training": True,
+        "quant_format": "block_fp8",
+        "quant_group_size": 128,
+        "moe_hybrid_shared_lora": True,
+    }
+
+    ModelRunner._initialize_model(runner)
+
+    assert captured["enable_qlora"] is True
+    assert captured["block_fp8_qlora_training"] is True
+    assert captured["lora_target_modules"] is None
+    assert captured["quant_format"] == "block_fp8"
+    assert captured["quant_group_size"] == 128
+    assert captured["moe_hybrid_shared_lora"] is True
+    assert set(runner.lora_target_modules) == {
+        "down_proj",
+        "gate_proj",
+        "kv_a_proj_with_mqa",
+        "kv_b_proj",
+        "lm_head",
+        "o_proj",
+        "q_a_proj",
+        "q_b_proj",
+        "up_proj",
+    }
+
+
 def test_model_runner_threads_sharded_lm_head_loss_to_model_builder(monkeypatch):
     captured = {}
 
@@ -108,7 +193,7 @@ def test_model_runner_threads_sharded_lm_head_loss_to_model_builder(monkeypatch)
         captured.update(kwargs)
         return SimpleNamespace(
             model=nn.Linear(1, 1),
-            model_config=object(),
+            model_config=_fake_model_config(),
             pp_enabled=False,
             pp_stages=None,
             model_parts=None,
@@ -133,6 +218,7 @@ def test_model_runner_threads_sharded_lm_head_loss_to_model_builder(monkeypatch)
         "enable_mixed_precision": False,
         "init_device": "cpu",
     }
+    runner.ce_mode = None
     runner.lora_config = {}
 
     ModelRunner._initialize_model(runner)

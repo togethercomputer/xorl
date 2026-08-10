@@ -43,6 +43,7 @@ import yaml
 from xorl.fp8_training.config_compat import extract_nemo_fp8_cfg, validate_external_fp8_runtime_config
 from xorl.server.api_server.server import APIServer
 from xorl.server.orchestrator.orchestrator import Orchestrator
+from xorl.server.removed_config import reject_removed_configuration_fields
 from xorl.server.server_arguments import ServerArguments
 from xorl.server.session_spec import build_default_session_spec
 from xorl.server.utils.network import read_address_file
@@ -432,6 +433,7 @@ def load_server_arguments(config_path: str, overrides: Optional[Dict[str, any]] 
     if not config:
         raise ValueError(f"Empty config file: {config_path}")
 
+    reject_removed_configuration_fields(config, context=f"server config {config_path!r}")
     validate_external_fp8_runtime_config(config, context=config_path)
     nemo_fp8_cfg = extract_nemo_fp8_cfg(config)
 
@@ -460,20 +462,6 @@ def load_server_arguments(config_path: str, overrides: Optional[Dict[str, any]] 
                 flat_config["qlora_exclude_modules"] = v
             else:
                 flat_config[k] = v
-
-        # zorl.* keys use a prefixed flat representation in ServerArguments
-        _zorl_key_map = {
-            "enabled": "enable_zorl",
-            "b_sigma": "zorl_b_sigma",
-            "num_perturbation_pairs": "zorl_num_perturbation_pairs",
-            "a_refresh_interval": "zorl_a_refresh_interval",
-            "antithetic_sampling": "zorl_antithetic_sampling",
-            "a_init": "zorl_a_init",
-            "seed": "zorl_seed",
-        }
-        for nested_key, flat_key in _zorl_key_map.items():
-            if nested_key in config.get("zorl", {}):
-                flat_config[flat_key] = config["zorl"][nested_key]
 
         # data.* — only a few fields are relevant for the server
         data_config = config.get("data", {})
@@ -523,6 +511,7 @@ def load_server_arguments(config_path: str, overrides: Optional[Dict[str, any]] 
 
     # Apply CLI overrides on top of YAML config
     if overrides:
+        reject_removed_configuration_fields(overrides, context="server CLI overrides")
         for key, value in overrides.items():
             if key in valid_fields:
                 filtered_config[key] = value
@@ -822,7 +811,6 @@ class Launcher:
                     base_model=self.base_model or self.server_args.model_path,
                     train_config=config_dict.get("train", {}),
                     lora_config=self.server_lora_config,
-                    zorl_config=config_dict.get("zorl", {}),
                 )
                 logger.info(
                     "Using default multi-adapter session spec: "
@@ -1554,6 +1542,7 @@ def validate_server_overrides(server_overrides: Dict[str, any]) -> None:
     silently used), and required a hand-maintained "launcher-only key" set
     that had to be kept in sync with the schema by reviewers.
     """
+    reject_removed_configuration_fields(server_overrides, context="--server.* CLI overrides")
     valid_fields = {f.name for f in fields(ServerArguments)}
     unknown = sorted(k for k in server_overrides if k not in valid_fields)
     if unknown:

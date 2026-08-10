@@ -36,6 +36,59 @@ from xorl.server.api_server.api_types import (
 pytestmark = [pytest.mark.cpu, pytest.mark.server]
 
 
+@pytest.mark.parametrize(
+    ("request_type", "payload", "field_path", "migration"),
+    (
+        (
+            CreateModelRequest,
+            {
+                "base_model": "Qwen/Qwen3-8B",
+                "zorl_config": {"enabled": True},
+            },
+            "zorl_config",
+            "ZORL was removed",
+        ),
+        (
+            CreateModelRequest,
+            {
+                "base_model": "Qwen/Qwen3-8B",
+                "lora_config": {"rank": 8, "adapter_gradient_ownership_mode": "legacy"},
+            },
+            "lora_config.adapter_gradient_ownership_mode",
+            "authoritative-only",
+        ),
+        (
+            CreateSessionRequest,
+            {
+                "lora_config": {"rank": 8, "zorl_seed": 123},
+            },
+            "lora_config.zorl_seed",
+            "ZORL was removed",
+        ),
+    ),
+)
+def test_session_api_requests_reject_removed_configuration(request_type, payload, field_path, migration):
+    with pytest.raises(ValidationError) as exc_info:
+        request_type.model_validate(payload)
+
+    message = str(exc_info.value)
+    assert field_path in message
+    assert migration in message
+
+
+def test_session_api_requests_preserve_unrelated_unknown_field_behavior():
+    request = CreateModelRequest.model_validate(
+        {
+            "base_model": "Qwen/Qwen3-8B",
+            "rolling_client_metadata": {"version": 2},
+            "lora_config": {"rank": 8, "future_lora_hint": True},
+        }
+    )
+
+    assert request.lora_config is not None
+    assert request.lora_config.model_extra == {"future_lora_hint": True}
+
+
 class TestDatumAndForwardBackward:
     """Test Datum, DatumInput, ForwardBackwardRequest and ForwardBackwardResponse."""
 

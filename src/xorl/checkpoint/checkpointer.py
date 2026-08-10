@@ -73,6 +73,37 @@ def _compile_agnostic_spec_info(spec_info):
     return normalized_spec_info
 
 
+_EP_CHECKPOINT_MESH_DIM_NAMES = ("ep", "ep_fsdp")
+
+
+def _get_ep_checkpoint_mesh(device_mesh: DeviceMesh) -> DeviceMesh:
+    """Select the rank-local EP x expert-FSDP mesh used by DCP.
+
+    Pipeline parallelism adds a parent ``_pp_ep`` dimension so that each PP
+    stage owns independent EP process groups. That parent dimension is a
+    replication/ownership dimension for checkpointing, not another sharding
+    dimension of an expert tensor. Select the two checkpoint dimensions by
+    name so both the legacy 2-D mesh and a PP-scoped parent mesh have the same
+    DCP tensor layout.
+    """
+    mesh_dim_names = tuple(device_mesh.mesh_dim_names or ())
+    invalid_names = [name for name in _EP_CHECKPOINT_MESH_DIM_NAMES if mesh_dim_names.count(name) != 1]
+    if invalid_names:
+        raise RuntimeError(
+            "EP checkpoint mesh must contain exactly one 'ep' and one 'ep_fsdp' dimension; "
+            f"got mesh_dim_names={mesh_dim_names}"
+        )
+
+    checkpoint_mesh = device_mesh[_EP_CHECKPOINT_MESH_DIM_NAMES]
+    checkpoint_mesh_dim_names = tuple(checkpoint_mesh.mesh_dim_names or ())
+    if checkpoint_mesh_dim_names != _EP_CHECKPOINT_MESH_DIM_NAMES:
+        raise RuntimeError(
+            "EP checkpoint mesh selection returned an unexpected layout; "
+            f"expected mesh_dim_names={_EP_CHECKPOINT_MESH_DIM_NAMES}, got {checkpoint_mesh_dim_names}"
+        )
+    return checkpoint_mesh
+
+
 def _restore_ep_dim(origin_tensor: torch.Tensor, device_mesh: DeviceMesh):
     """Restore the EP dim so that DCP records the true global (EP+FSDP) size.
 
@@ -86,15 +117,16 @@ def _restore_ep_dim(origin_tensor: torch.Tensor, device_mesh: DeviceMesh):
 
     Args:
         origin_tensor: The (FSDP-sharded) expert tensor or its optimizer-state buffer.
-        device_mesh: The 2-D ``["ep", "ep_fsdp"]`` device mesh.
+        device_mesh: A named mesh containing the ``"ep"`` and ``"ep_fsdp"``
+            dimensions. It may also contain a PP ownership dimension.
     """
-    assert device_mesh.ndim == 2, f"global_mesh.ndim must be 2, got {device_mesh.ndim}"
-    ep_mesh = device_mesh["ep"]
+    checkpoint_mesh = _get_ep_checkpoint_mesh(device_mesh)
+    ep_mesh = checkpoint_mesh["ep"]
 
     if origin_tensor.__class__.__name__ == "DTensor":
         # EP+FSDP2
         dtensor = DTensor.from_local(
-            origin_tensor._local_tensor, device_mesh=device_mesh, placements=[Shard(0), Shard(1)]
+            origin_tensor._local_tensor, device_mesh=checkpoint_mesh, placements=[Shard(0), Shard(1)]
         )
     elif origin_tensor.__class__.__name__ == "Tensor":
         # If there is no FSDP
@@ -110,8 +142,8 @@ def _drop_ep_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh):
     DTensor back to the FSDP-only layout (or a plain local tensor when there is
     no FSDP) that the live model/optimizer expects.
     """
-    assert device_mesh.ndim == 2, f"global_mesh.ndim must be 2, got {device_mesh.ndim}"
-    ep_fsdp_mesh = device_mesh["ep_fsdp"]
+    checkpoint_mesh = _get_ep_checkpoint_mesh(device_mesh)
+    ep_fsdp_mesh = checkpoint_mesh["ep_fsdp"]
 
     if len(loaded_tensor.placements) == 2:
         tensor_to_put = DTensor.from_local(loaded_tensor._local_tensor, device_mesh=ep_fsdp_mesh, placements=[Shard(1)])
@@ -139,6 +171,20 @@ def _merged_model_state_dict(model) -> Dict[str, Any]:
     return merged
 
 
+def _glm52_exact_base_dcp_projection(model):
+    """Return the narrow exact-GLM base-DCP adapter when the model needs it."""
+
+    from xorl.models.exact_contract import contains_glm52_exact_active_lora_component  # noqa: PLC0415
+
+    if not any(contains_glm52_exact_active_lora_component(part) for part in _as_model_parts(model)):
+        return None
+
+    from xorl.models.transformers.glm5.exact_dcp import Glm52ExactBaseDcpLoadProjection  # noqa: PLC0415
+
+    projection = Glm52ExactBaseDcpLoadProjection(model)
+    return projection if projection.enabled else None
+
+
 def _get_model_param_keys(model) -> List[str]:
     """Get sorted list of parameter keys from a model (or PP virtual-stage parts)."""
     return sorted(
@@ -164,21 +210,39 @@ def _get_model_persistent_buffer_keys(model) -> List[str]:
     return sorted(buffer_keys)
 
 
+def _get_checkpoint_model_keys(model, process_group=None) -> tuple[List[str], List[str], bool]:
+    """Return the checkpoint key contract, unioned across pipeline stages when needed."""
+    param_keys = _get_model_param_keys(model)
+    buffer_keys = _get_model_persistent_buffer_keys(model)
+    if not get_parallel_state().pp_enabled:
+        return param_keys, buffer_keys, False
+
+    if not dist.is_initialized():
+        raise RuntimeError("Pipeline-parallel checkpoint key validation requires torch.distributed initialization")
+
+    gathered_keys: List[Any] = [None] * dist.get_world_size(group=process_group)
+    dist.all_gather_object(
+        gathered_keys,
+        (param_keys, buffer_keys),
+        group=process_group,
+    )
+    param_keys = sorted({key for rank_params, _ in gathered_keys for key in rank_params})
+    buffer_keys = sorted({key for _, rank_buffers in gathered_keys for key in rank_buffers})
+    return param_keys, buffer_keys, True
+
+
 def _save_checkpoint_metadata(
     checkpoint_dir: str,
     model: torch.nn.Module,
     has_lora: bool = False,
     save_lora_only: bool = False,
+    process_group=None,
 ) -> None:
     """
-    Save checkpoint metadata to a JSON file.
-    Only rank 0 writes the metadata file.
+    Save checkpoint metadata to a JSON file. All pipeline ranks contribute
+    their stage-local keys; only global rank 0 writes the metadata file.
     """
-    if dist.get_rank() != 0:
-        return
-
-    param_keys = _get_model_param_keys(model)
-    buffer_keys = _get_model_persistent_buffer_keys(model)
+    param_keys, buffer_keys, pipeline_key_union = _get_checkpoint_model_keys(model, process_group=process_group)
     lora_keys = [k for k in param_keys if "lora" in k.lower()]
 
     if save_lora_only:
@@ -192,9 +256,13 @@ def _save_checkpoint_metadata(
         "has_lora": has_lora or len(lora_keys) > 0,
         "num_lora_parameters": len(lora_keys),
         "save_lora_only": save_lora_only,
+        "pipeline_parallel_key_union": pipeline_key_union,
         "parameter_keys": param_keys,
         "buffer_keys": buffer_keys,
     }
+
+    if dist.get_rank() != 0:
+        return
 
     metadata_path = os.path.join(checkpoint_dir, _CHECKPOINT_METADATA_FILE)
     with open(metadata_path, "w") as f:
@@ -209,6 +277,7 @@ def _validate_checkpoint_compatibility(
     checkpoint_dir: str,
     model: torch.nn.Module,
     strict: bool = True,
+    process_group=None,
 ) -> Dict[str, Any]:
     """
     Validate that a checkpoint is compatible with the current model.
@@ -217,6 +286,7 @@ def _validate_checkpoint_compatibility(
         checkpoint_dir: Path to checkpoint directory
         model: Current model to validate against
         strict: If True, raise error on mismatch. If False, return info about mismatches.
+        process_group: Group spanning every pipeline stage when PP is enabled.
 
     Returns:
         Dictionary with validation results including missing/unexpected keys
@@ -237,11 +307,23 @@ def _validate_checkpoint_compatibility(
         ckpt_metadata = json.load(f)
 
     ckpt_keys = set(ckpt_metadata.get("parameter_keys", []))
-    model_keys = set(_get_model_param_keys(model))
+    ckpt_lora_only = ckpt_metadata.get("save_lora_only", False)
+    model_param_keys, model_persistent_buffer_keys, pipeline_key_union = _get_checkpoint_model_keys(
+        model, process_group=process_group
+    )
+    base_dcp_projection = None
+    if ckpt_metadata.get("has_lora") is False and not ckpt_lora_only:
+        base_dcp_projection = _glm52_exact_base_dcp_projection(model)
+        if base_dcp_projection is not None:
+            model_param_keys, model_persistent_buffer_keys = base_dcp_projection.project_key_contract(
+                model_param_keys,
+                model_persistent_buffer_keys,
+            )
+    model_keys = set(model_param_keys)
     ckpt_buffer_keys_raw = ckpt_metadata.get("buffer_keys")
     buffers_validated = isinstance(ckpt_buffer_keys_raw, list)
     ckpt_buffer_keys = set(ckpt_buffer_keys_raw) if buffers_validated else set()
-    model_buffer_keys = set(_get_model_persistent_buffer_keys(model)) if buffers_validated else set()
+    model_buffer_keys = set(model_persistent_buffer_keys) if buffers_validated else set()
 
     # Keys in model but not in checkpoint (e.g., LoRA params added after checkpoint was saved)
     missing_in_ckpt = model_keys - ckpt_keys
@@ -249,9 +331,6 @@ def _validate_checkpoint_compatibility(
     unexpected_in_ckpt = ckpt_keys - model_keys
     missing_buffers_in_ckpt = model_buffer_keys - ckpt_buffer_keys
     unexpected_buffers_in_ckpt = ckpt_buffer_keys - model_buffer_keys
-
-    # Check if checkpoint was saved with save_lora_only
-    ckpt_lora_only = ckpt_metadata.get("save_lora_only", False)
 
     # Check if mismatch is LoRA-related
     missing_lora_keys = [k for k in missing_in_ckpt if "lora" in k.lower()]
@@ -262,6 +341,10 @@ def _validate_checkpoint_compatibility(
         "checkpoint_has_lora": ckpt_metadata.get("has_lora", False),
         "checkpoint_lora_only": ckpt_lora_only,
         "model_has_lora": any("lora" in k.lower() for k in model_keys),
+        "glm52_exact_base_dcp_projection": base_dcp_projection is not None,
+        "pipeline_parallel_key_union": pipeline_key_union,
+        "model_parameter_count": len(model_keys),
+        "model_buffer_count": len(model_buffer_keys),
         "missing_in_checkpoint": list(missing_in_ckpt),
         "unexpected_in_checkpoint": list(unexpected_in_ckpt),
         "buffers_validated": buffers_validated,
@@ -342,10 +425,20 @@ class ModelState(Stateful):
                                Used when merge_lora_interval == 0 (base weights unchanged).
     """
 
-    def __init__(self, model, exclude_keys: Optional[Set[str]] = None, save_lora_only: bool = False):
+    def __init__(
+        self,
+        model,
+        exclude_keys: Optional[Set[str]] = None,
+        save_lora_only: bool = False,
+        project_glm52_exact_base_dcp: bool = False,
+    ):
         self.model = model
         self.exclude_keys = exclude_keys or set()
         self.save_lora_only = save_lora_only
+        self.base_dcp_projection = _glm52_exact_base_dcp_projection(model) if project_glm52_exact_base_dcp else None
+        if project_glm52_exact_base_dcp and self.base_dcp_projection is None:
+            raise RuntimeError("Exact GLM base-DCP projection was requested for a model without projected state")
+        self._base_dcp_model_state = None
 
         # Determine whether this is EP+FSDP2 case
         # If so, we need to restore EP-dim before saving to DCP
@@ -375,6 +468,10 @@ class ModelState(Stateful):
         if self.save_lora_only:
             model_state_dict = {k: v for k, v in model_state_dict.items() if "lora_" in k}
             logger.info_rank0(f"LoRA-only save: keeping {len(model_state_dict)} LoRA parameters")
+
+        if self.base_dcp_projection is not None:
+            self._base_dcp_model_state = model_state_dict
+            model_state_dict = self.base_dcp_projection.project_state(model_state_dict)
 
         return model_state_dict
 
@@ -435,6 +532,14 @@ class ModelState(Stateful):
         """
 
         model_state_dict = state_dict
+        if self.base_dcp_projection is not None:
+            if self._base_dcp_model_state is None:
+                raise RuntimeError("Exact GLM base-DCP state was loaded before its target state was projected")
+            model_state_dict = self.base_dcp_projection.restore_state(
+                projected_state=state_dict,
+                model_state=self._base_dcp_model_state,
+            )
+            self._base_dcp_model_state = None
         if self.should_ep_aware:
             model_state_dict = self.get_state_dict_without_ep_dim(model_state_dict)
 
@@ -475,12 +580,6 @@ class ModelState(Stateful):
         ep_fqn2spec_info = self.ep_fqn2spec_info
         assert ep_fqn2spec_info is not None, "if fqn2spec_info is None it should not be patch"
 
-        ep_mesh = self.parallel_state.ep_fsdp_device_mesh["ep"]
-        assert ep_mesh is not None
-
-        global_device_mesh = self.parallel_state.ep_fsdp_device_mesh
-        assert global_device_mesh.ndim == 2
-
         keys = list(state_dict.keys())
         for name in sorted(keys):
             if name in ep_fqn2spec_info and isinstance(ep_fqn2spec_info[name].placement, Shard):
@@ -494,12 +593,6 @@ class ModelState(Stateful):
     def get_state_dict_without_ep_dim(self, state_dict):
         fqn2spec_info = self.ep_fqn2spec_info
         assert fqn2spec_info is not None, "if fqn2spec_info is None it should not be patch"
-
-        ep_mesh = self.parallel_state.ep_fsdp_device_mesh["ep"]
-        assert ep_mesh is not None
-
-        global_device_mesh = self.parallel_state.ep_fsdp_device_mesh
-        assert global_device_mesh.ndim == 2
 
         keys = list(state_dict.keys())
         for name in sorted(keys):
@@ -721,6 +814,12 @@ class DistributedCheckpointer(CheckpointerBase):
         return cls._sync_process_group
 
     @classmethod
+    def _get_metadata_process_group(cls, process_group=None):
+        if not get_parallel_state().pp_enabled:
+            return None
+        return process_group if process_group is not None else cls._get_sync_process_group()
+
+    @classmethod
     def save(
         cls,
         path: str,
@@ -815,7 +914,13 @@ class DistributedCheckpointer(CheckpointerBase):
         torch.cuda.synchronize()
 
         # Save checkpoint metadata for compatibility validation
-        _save_checkpoint_metadata(checkpoint_dir, state["model"], save_lora_only=save_lora_only)
+        metadata_process_group = cls._get_metadata_process_group()
+        _save_checkpoint_metadata(
+            checkpoint_dir,
+            state["model"],
+            save_lora_only=save_lora_only,
+            process_group=metadata_process_group,
+        )
 
         logger.info_rank0(f"Saved checkpoint to {checkpoint_dir}")
 
@@ -857,6 +962,7 @@ class DistributedCheckpointer(CheckpointerBase):
         # distributed DCP planning entirely (each rank reads its shards from the
         # shared checkpoint dir), sidestepping the collective.
         load_no_dist = _env_flag("XORL_DCP_LOAD_NO_DIST")
+        metadata_process_group = cls._get_metadata_process_group(process_group)
         if load_no_dist:
             logger.info_rank0(
                 "Loading DCP checkpoint with no_dist=True; distributed DCP planning collectives are disabled."
@@ -866,7 +972,12 @@ class DistributedCheckpointer(CheckpointerBase):
             process_group = cls._get_sync_process_group()
 
         # Validate checkpoint compatibility before loading
-        validation_result = _validate_checkpoint_compatibility(checkpoint_dir, state["model"], strict=strict)
+        validation_result = _validate_checkpoint_compatibility(
+            checkpoint_dir,
+            state["model"],
+            strict=strict,
+            process_group=metadata_process_group,
+        )
 
         # Determine keys to exclude from loading (e.g., LoRA params not in checkpoint)
         exclude_keys: Set[str] = set()
@@ -885,7 +996,13 @@ class DistributedCheckpointer(CheckpointerBase):
             exclude_keys = {k for k in all_model_keys if "lora_" not in k}
             logger.info_rank0(f"LoRA-only checkpoint: excluding {len(exclude_keys)} non-LoRA keys from load")
 
-        load_state = {"model": ModelState(state["model"], exclude_keys=exclude_keys)}
+        load_state = {
+            "model": ModelState(
+                state["model"],
+                exclude_keys=exclude_keys,
+                project_glm52_exact_base_dcp=validation_result.get("glm52_exact_base_dcp_projection", False),
+            )
+        }
         has_optimizer_state = False
         optimizer_load_keys: Optional[Set[str]] = None
         if "optimizer" in state and state["optimizer"] is not None:
@@ -916,6 +1033,22 @@ class DistributedCheckpointer(CheckpointerBase):
         # metadata-less base DCP is loaded into a LoRA-injected model. Mirror
         # this API's ``strict=False`` at DCP planner time as well.
         load_planner = DefaultLoadPlanner(allow_partial_load=not strict)
+
+        # Native block-FP8 packed bytes and FP32 scales must be rejected from
+        # DCP metadata before the loader can numerically cast them.  Use the
+        # ModelState view here: unlike live EP-local parameters, it restores
+        # the global expert dimension and therefore matches DCP metadata.
+        expected_model_state = load_state["model"].state_dict()
+        if any("packed_weight_f32" in name or name.endswith("weight_scale_inv") for name in expected_model_state):
+            from xorl.ops.block_fp8_native import validate_native_fp8_dcp_checkpoint  # noqa: PLC0415
+
+            validate_native_fp8_dcp_checkpoint(
+                checkpoint_dir,
+                expected_model_state,
+                state_prefix="model.",
+            )
+            logger.info_rank0("Native block-FP8 DCP metadata preflight passed.")
+        del expected_model_state
 
         dcp.load(
             state_dict=load_state,

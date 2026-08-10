@@ -5,7 +5,6 @@ so that every feature (QLoRA, TP, DeepEP, …) is supported in both paths
 without reimplementation.
 """
 
-import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional, Set
 
@@ -18,7 +17,7 @@ from xorl.lora import freeze_base_parameters
 from xorl.lora.utils import inject_lora_into_model, inject_lora_into_model_with_moe
 from xorl.models import build_foundation_model
 from xorl.models.checkpoint_handlers.buffers import get_prequantized_exclude_modules
-from xorl.models.layers.rope import set_rope_class_b, set_rope_native
+from xorl.models.exact_contract import glm52_exact_active_lora_enabled, glm52_exact_forward_enabled
 from xorl.models.transformers.deepseek_v3.support import (
     freeze_deepseek_v3_router_parameters,
     validate_deepseek_v3_training_mode,
@@ -56,6 +55,7 @@ class TrainingModelResult:
     is_prequantized: bool = False
     checkpoint_quant_format: Optional[str] = None
     exclude_modules: Set[str] = field(default_factory=set)
+    glm52_adapter_inventory: Any = None
 
 
 def resolve_training_model_dtype(
@@ -112,7 +112,8 @@ def build_training_model(
     config_path: str,
     weights_path: str,
     torch_dtype: str = "bfloat16",
-    attn_implementation: str = "flash_attention_3",
+    attn_implementation: Optional[str] = None,
+    non_glm_attn_default: str = "flash_attention_3",
     moe_implementation: Optional[str] = None,
     moe_routing_weights_before_down: bool | str = "auto",
     ep_dispatch: str = "alltoall",
@@ -129,9 +130,11 @@ def build_training_model(
     lora_rank: int = 32,
     lora_alpha: int = 16,
     lora_target_modules: Optional[List[str]] = None,
+    lora_target_manifest: Optional[dict[str, Any] | str] = None,
     moe_hybrid_shared_lora: bool = False,
     # --- QLoRA ---
     enable_qlora: bool = False,
+    block_fp8_qlora_training: bool = False,
     quant_format: str = "nvfp4",
     quant_group_size: int = 16,
     qlora_exclude_modules: Optional[List[str]] = None,
@@ -186,16 +189,18 @@ def build_training_model(
     # --- Training flags ---
     freeze_router: bool = False,
     # --- SGLang numerical alignment ---
-    router_fp32: bool = True,
-    lm_head_fp32: bool = True,
-    rmsnorm_mode: str = "native",
+    router_fp32: Optional[bool] = None,
+    lm_head_fp32: Optional[bool] = None,
+    rmsnorm_mode: Optional[str] = None,
+    qwen35_rmsnorm_family: Optional[str] = None,
     activation_native: bool = False,
-    rope_native: bool = False,
-    rope_class_b: bool = False,
+    rope_native: Optional[bool] = None,
+    rope_class_b: Optional[bool] = None,
     attention_cast_bf16: bool = False,
-    sparse_mla_enabled: bool = False,
-    sparse_mla_backend: str = "auto",
+    sparse_mla_enabled: Optional[bool] = None,
+    sparse_mla_backend: Optional[str] = None,
     flash_attention_deterministic: bool = False,
+    server_training: bool = False,
 ) -> TrainingModelResult:
     """Build, inject LoRA/QLoRA, and parallelize a training model.
 
@@ -206,7 +211,7 @@ def build_training_model(
         2. Unfuse QKV (for TP)
         3. QLoRA or LoRA injection
         4. LoRA + mixed-precision: upcast trainable params to fp32
-        5. XORL_BI_TRUNK_LINEAR trunk wrap (pre-FSDP2) + save optimizer pre-hook
+        5. Exact model-program setup (pre-FSDP2) + save optimizer pre-hook
         6. build_parallelize_model()
         7. Deferred QLoRA quantization
         8. Freeze base params (LoRA/QLoRA) + optional router freeze
@@ -215,16 +220,13 @@ def build_training_model(
     Returns a :class:`TrainingModelResult` with model, config, PP state, etc.
     """
 
-    if rope_class_b and not rope_native:
+    if rope_class_b is True and rope_native is False:
         raise ValueError(
-            "rope_class_b=True requires rope_native=True: the certified Class-B contract "
-            "uses the CPU-built SGLang-layout cos/sin cache selected by rope_native."
+            "rope_class_b=True requires rope_native=True: the Class-B contract uses "
+            "the CPU-built serving-layout cos/sin cache selected by rope_native"
         )
-    # These selectors are process globals, so every build must set both values
-    # explicitly. Otherwise a Class-B build can leak into the next model built
-    # by the same worker even when that model's config requests Class A.
-    set_rope_native(bool(rope_native))
-    set_rope_class_b(bool(rope_class_b))
+    if block_fp8_qlora_training and (not enable_lora or not enable_qlora):
+        raise ValueError("block_fp8_qlora_training=True requires enable_lora=True and enable_qlora=True")
 
     # ------------------------------------------------------------------
     # 1. Build foundation model
@@ -235,6 +237,7 @@ def build_training_model(
         weights_path=weights_path,
         torch_dtype=torch_dtype,
         attn_implementation=attn_implementation,
+        non_glm_attn_default=non_glm_attn_default,
         moe_implementation=moe_implementation,
         moe_routing_weights_before_down=moe_routing_weights_before_down,
         ep_dispatch=ep_dispatch,
@@ -247,19 +250,25 @@ def build_training_model(
         router_fp32=router_fp32,
         lm_head_fp32=lm_head_fp32,
         rmsnorm_mode=rmsnorm_mode,
+        qwen35_rmsnorm_family=qwen35_rmsnorm_family,
         activation_native=activation_native,
         rope_native=rope_native,
+        rope_class_b=rope_class_b,
         attention_cast_bf16=attention_cast_bf16,
         sparse_mla_enabled=sparse_mla_enabled,
         sparse_mla_backend=sparse_mla_backend,
         flash_attention_deterministic=flash_attention_deterministic,
+        server_training=server_training,
+        block_fp8_qlora_training=block_fp8_qlora_training,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
         init_device=init_device,
     )
 
     # Set module-level flags for rope and activation
-    if rope_native:
+    if getattr(model.config, "_rope_native", False):
         logger.info_rank0("Using native RoPE (flash_attn fused kernel disabled)")
-    if rope_class_b:
+    if getattr(model.config, "_rope_class_b", False):
         logger.info_rank0(
             "Using compiled Class-B RoPE fp32-chain numerics aligned with SGLang's stock fused CUDA kernel"
         )
@@ -277,6 +286,12 @@ def build_training_model(
         enable_qlora=enable_qlora,
         freeze_router=freeze_router,
         merge_qkv=merge_qkv,
+        block_fp8_qlora_training=block_fp8_qlora_training,
+        quant_format=quant_format,
+        quant_group_size=quant_group_size,
+        moe_implementation=moe_implementation,
+        ep_dispatch=ep_dispatch,
+        moe_hybrid_shared_lora=moe_hybrid_shared_lora,
     )
     helper.print_device_mem_info("VRAM usage after building model")
 
@@ -377,6 +392,7 @@ def build_training_model(
             quant_group_size=quant_group_size,
             merge_qkv=merge_qkv,
             qlora_exclude_modules=qlora_exclude_modules,
+            block_fp8_qlora_training=block_fp8_qlora_training,
         )
     elif enable_lora:
         _inject_lora(
@@ -384,6 +400,7 @@ def build_training_model(
             lora_rank=lora_rank,
             lora_alpha=lora_alpha,
             lora_target_modules=lora_target_modules,
+            lora_target_manifest=lora_target_manifest,
             moe_hybrid_shared_lora=moe_hybrid_shared_lora,
         )
 
@@ -398,18 +415,23 @@ def build_training_model(
     )
 
     # ------------------------------------------------------------------
-    # 5. Scoped batch-invariant trunk-linear contract (must precede FSDP2)
+    # 5. Exact model contract / legacy scoped trunk contract (must precede FSDP2)
     # ------------------------------------------------------------------
-    if os.environ.get("XORL_BI_TRUNK_LINEAR", "0") == "1":
-        from xorl.ops.batch_invariant_ops import wrap_trunk_linears_batch_invariant  # noqa: PLC0415
+    from xorl.ops.bi_families_v2 import _select_nonexact_families  # noqa: PLC0415
 
-        wrapped = wrap_trunk_linears_batch_invariant(model)
+    _select_nonexact_families()
+    if glm52_exact_forward_enabled(model.config):
+        from xorl.ops.bi_families_v2 import _select_glm52_families_v2  # noqa: PLC0415
+
+        _select_glm52_families_v2()
+
+    apply_exact_qwen = getattr(model, "_apply_qwen35_gdn_exact", None)
+    if server_training and callable(apply_exact_qwen):
+        wrapped = apply_exact_qwen()
         pattern = ", ".join(f"{name}x{count}" for name, count in sorted(wrapped.items()))
         logger.info_rank0(
-            f"XORL_BI_TRUNK_LINEAR=1: wrapped {sum(wrapped.values())} trunk linears "
-            f"(fwd batch-invariant, bwd cuBLAS; qk-norm on the family-1 BI kernel): {pattern}"
+            f"Exact Qwen3.5-family trainer path: wrapped {sum(wrapped.values())} trunk linears; {pattern}"
         )
-
     # ------------------------------------------------------------------
     # 5b. Save optimizer pre-hook (some models register hooks)
     # ------------------------------------------------------------------
@@ -529,6 +551,7 @@ def build_training_model(
         is_prequantized=is_prequantized,
         checkpoint_quant_format=checkpoint_quant_format,
         exclude_modules=exclude_modules,
+        glm52_adapter_inventory=getattr(model, "_glm52_adapter_inventory", None),
     )
 
 
@@ -548,6 +571,7 @@ def _inject_qlora(
     quant_group_size: int,
     merge_qkv: bool,
     qlora_exclude_modules: Optional[List[str]],
+    block_fp8_qlora_training: bool = False,
 ) -> tuple:
     """QLoRA injection with pre-quantized checkpoint detection.
 
@@ -602,17 +626,31 @@ def _inject_qlora(
                 f"not supported — use a checkpoint that matches the target format."
             )
 
-    inject_qlora_into_model(
-        model,
-        r=lora_rank,
-        lora_alpha=lora_alpha,
-        quant_format=quant_format,
-        quant_group_size=quant_group_size,
-        target_modules=lora_target_modules,
-        checkpoint_quant_format=checkpoint_quant_format,
-        merge_qkv=merge_qkv,
-        exclude_modules=exclude_modules,
-    )
+    if block_fp8_qlora_training:
+        if lora_target_modules is not None:
+            raise ValueError("GLM-5.2 block-FP8 QLoRA uses its complete deterministic target set")
+        if qlora_exclude_modules is not None:
+            raise ValueError("GLM-5.2 block-FP8 QLoRA derives checkpoint exclusions and rejects user overrides")
+        from xorl.models.transformers.glm5.qlora import prepare_glm52_block_fp8_qlora  # noqa: PLC0415
+
+        prepare_glm52_block_fp8_qlora(
+            model,
+            model.config,
+            adapter_rank=lora_rank,
+            adapter_alpha=lora_alpha,
+        )
+    else:
+        inject_qlora_into_model(
+            model,
+            r=lora_rank,
+            lora_alpha=lora_alpha,
+            quant_format=quant_format,
+            quant_group_size=quant_group_size,
+            target_modules=lora_target_modules,
+            checkpoint_quant_format=checkpoint_quant_format,
+            merge_qkv=merge_qkv,
+            exclude_modules=exclude_modules,
+        )
     if exclude_modules:
         model._qlora_exclude_modules = exclude_modules
     helper.print_device_mem_info("VRAM usage after QLoRA injection")
@@ -626,6 +664,7 @@ def _inject_lora(
     lora_rank: int,
     lora_alpha: int,
     lora_target_modules: Optional[List[str]],
+    lora_target_manifest: Optional[dict[str, Any] | str] = None,
     moe_hybrid_shared_lora: bool = False,
 ) -> None:
     """Plain LoRA injection (dense + optional MoE-aware)."""
@@ -639,6 +678,7 @@ def _inject_lora(
             lora_alpha=lora_alpha,
             target_modules=lora_target_modules,
             moe_hybrid_shared_lora=moe_hybrid_shared_lora,
+            target_manifest=lora_target_manifest,
         )
     else:
         inject_lora_into_model(
@@ -646,6 +686,7 @@ def _inject_lora(
             r=lora_rank,
             lora_alpha=lora_alpha,
             target_modules=lora_target_modules,
+            target_manifest=lora_target_manifest,
         )
 
     helper.print_device_mem_info("VRAM usage after LoRA injection")
@@ -663,6 +704,20 @@ def _deferred_qlora_quantize(
     2. NF4 linear: bf16 weight already loaded by FSDP → quantize in-place
     3. NF4 MoE: load bf16 experts from checkpoint → quantize
     """
+
+    if load_weights_mode == "skip":
+        if not glm52_exact_active_lora_enabled(getattr(model, "config", None)):
+            raise ValueError(
+                "load_weights_mode='skip' only bypasses deferred QLoRA loading for the complete "
+                "GLM-5.2 exact active-LoRA model; its base weights must be restored from DCP"
+            )
+        removed = _deregister_qlora_weights_from_fsdp(model, param_names=("packed_weight_f32",))
+        torch.cuda.empty_cache()
+        logger.info(
+            "Deferred HF QLoRA loading skipped for DCP restore; "
+            f"deregistered {removed} packed_weight_f32 params from FSDP2"
+        )
+        return
 
     # 1. Pre-quantized linear/MoE loading (nvfp4/block_fp8)
     needs_prequant_linear = any(

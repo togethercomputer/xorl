@@ -248,7 +248,9 @@ class TextSequenceShardCollator(DataCollator):
         rl_field_dtypes = {
             "target_tokens": torch.long,
             "logprobs": torch.float,
+            "old_logprobs": torch.float,
             "advantages": torch.float,
+            "ref_logprobs": torch.float,
             "rollout_logprobs": torch.float,
             "teacher_ids": torch.long,
             "teacher_cache_indices": torch.long,

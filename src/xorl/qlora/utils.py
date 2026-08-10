@@ -9,13 +9,12 @@ import logging
 import math
 import math as _math
 import os
-from concurrent.futures import ThreadPoolExecutor
 from typing import Collection, List, Optional, Tuple
 
-import safetensors.torch
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from safetensors import safe_open
 from safetensors.torch import save_file
 from torch.distributed._tensor import DTensor
 from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, cached_file
@@ -268,6 +267,7 @@ def inject_qlora_into_model(
             num_local_experts=num_local_experts,
             expert_offset=expert_offset,
             hybrid_shared=True,
+            target_modules=[target for target in target_modules if target in _moe_proj_names],
         )
 
         experts_fqn = name + ".experts" if not name.endswith(".experts") else name
@@ -387,8 +387,8 @@ def maybe_load_and_quantize_moe_qlora(
     Args:
         model: Model with QLoRAMoeExperts modules.
         weights_path: Path to HF model directory with bf16 weights.
-        load_mode: "grouped" or "all_ranks". Deferred QLoRA loading uses
-            rank-0 fanout for "grouped" as the compatibility fallback.
+        load_mode: "grouped" or "all_ranks". Grouped loading reads each
+            EP-local expert tensor once per EP-FSDP fanout group.
 
     Returns:
         Number of MoE modules loaded.
@@ -416,27 +416,28 @@ def maybe_load_and_quantize_moe_qlora(
             "MoE expert loading requires model.safetensors.index.json."
         )
 
-    use_broadcast = (
-        load_mode == "grouped" and dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
-    )
-    if use_broadcast:
-        needed_shards = sorted(set(weight_map.values()))
-        logger.info(
-            f"Broadcasting {len(needed_shards)} shard files from rank 0 "
-            f"(rank={dist.get_rank()}, world={dist.get_world_size()})"
-        )
-        shard_cache = _broadcast_shard_cache(needed_shards, weights_path)
-    else:
-        shard_cache = {}
+    use_grouped = load_mode == "grouped" and dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+    expert_group, expert_src = _get_deferred_grouped_load_context("expert") if use_grouped else (None, None)
 
     moe_count = 0
     for module in model.modules():
         if isinstance(module, QLoRAMoeExperts) and not module._weights_loaded:
-            module.load_and_quantize_weights(
+            requested_keys = _prequantized_module_keys(module, weight_map)
+            shard_cache = _load_selected_shard_cache(
+                requested_keys,
+                weight_map,
                 weights_path,
-                weight_map=weight_map,
-                shard_cache=shard_cache,
+                group=expert_group,
+                src=expert_src,
             )
+            try:
+                module.load_and_quantize_weights(
+                    weights_path,
+                    weight_map=weight_map,
+                    shard_cache=shard_cache,
+                )
+            finally:
+                shard_cache.release()
             # Materialize LoRA params from meta device to GPU
 
             for name, param in module.named_parameters():
@@ -478,10 +479,11 @@ def maybe_load_and_quantize_moe_qlora(
                     setattr(module, name, materialized)
             moe_count += 1
 
-    shard_cache.clear()
-
     if moe_count > 0:
-        logger.info(f"Loaded and quantized {moe_count} MoE expert modules from bf16 checkpoint")
+        logger.info(
+            f"Loaded and quantized {moe_count} MoE expert modules from bf16 checkpoint "
+            "with module-scoped selected-key caches"
+        )
     return moe_count
 
 
@@ -573,81 +575,173 @@ def detect_prequantized_block_fp8(weights_path: str) -> bool:
     return detect_prequantized_block_fp8_checkpoint(weights_path)
 
 
-def _broadcast_shard_cache(
-    needed_shards: List[str],
-    weights_path: str,
-) -> dict:
-    """Rank 0 reads safetensors shard files and broadcasts tensors to all ranks.
+class _RetainedShardCache(dict):
+    """A module-scoped shard cache whose consumer ``clear()`` calls are deferred.
 
-    Uses NCCL broadcast via GPU for speed (~50 GB/s NVLink), with background
-    prefetching of the next shard file from disk while the current one is
-    being broadcast (overlaps disk I/O with network).
-
-    Returns:
-        shard_cache: dict mapping shard filename → {tensor_name: tensor (CPU)}
+    MoE loaders clear a shared cache between projections to bound ordinary
+    all-ranks loading. A selected cache already contains only one module's
+    tensors, so clearing it mid-load would force the remaining projections to
+    bulk-read their shards again. The caller owns the lifetime and calls
+    :meth:`release` as soon as the module has consumed every selected tensor.
     """
 
-    rank = dist.get_rank()
-    device = torch.device("cuda")
-    shard_cache = {}
+    def clear(self) -> None:
+        """Keep selected tensors alive until the current module finishes."""
 
-    def _read_shard(shard_file):
-        shard_path = cached_file(weights_path, shard_file)
-        return safetensors.torch.load_file(shard_path, device="cpu")
+    def release(self) -> None:
+        """Release every tensor selected for the completed module."""
+        super().clear()
 
-    # Background thread for prefetching next shard from disk on rank 0
-    executor = ThreadPoolExecutor(max_workers=1) if rank == 0 else None
-    prefetch_future = None
 
-    for i, shard_file in enumerate(needed_shards):
-        # Rank 0: get current shard (from prefetch or direct read)
-        if rank == 0:
-            if prefetch_future is not None:
-                shard_data = prefetch_future.result()
-            else:
-                shard_data = _read_shard(shard_file)
-            # Prefetch next shard while broadcasting current one
-            if i + 1 < len(needed_shards):
-                prefetch_future = executor.submit(_read_shard, needed_shards[i + 1])
-            else:
-                prefetch_future = None
-            meta = [(name, list(t.shape), str(t.dtype)) for name, t in shard_data.items()]
+def _prequantized_module_keys(module: nn.Module, weight_map: dict) -> tuple[str, ...]:
+    """Return the exact checkpoint keys consumed by one deferred QLoRA module."""
+
+    source_fqn = getattr(module, "_source_fqn", None)
+    if not source_fqn:
+        raise RuntimeError(f"{type(module).__name__} has no checkpoint source FQN")
+
+    if isinstance(module, QLoRALinear):
+        source_format = module._source_quant_format or module.quant_format
+        if source_format == "block_fp8":
+            suffixes = ("weight", "weight_scale_inv")
+        elif source_format == "nvfp4":
+            suffixes = ("weight", "weight_scale", "weight_scale_2")
         else:
-            shard_data = None
-            meta = None
+            raise RuntimeError(f"Unsupported pre-quantized QLoRA source format: {source_format!r}")
 
-        # Broadcast metadata (one call per shard — list of (name, shape, dtype))
-        meta = [meta]
-        dist.broadcast_object_list(meta, src=0)
-        meta = meta[0]
+        if module._merge_sources is None:
+            prefixes = (source_fqn,)
+        else:
+            prefixes = tuple(f"{source_fqn}.{source}" for source in module._merge_sources)
+        requested = tuple(f"{prefix}.{suffix}" for prefix in prefixes for suffix in suffixes)
+    elif isinstance(module, QLoRAMoeExperts):
+        first_prefix = f"{source_fqn}.{module.expert_offset}.gate_proj"
+        if f"{first_prefix}.weight_scale_inv" in weight_map:
+            suffixes = ("weight", "weight_scale_inv")
+        elif f"{first_prefix}.weight_scale" in weight_map:
+            suffixes = ("weight", "weight_scale", "weight_scale_2")
+        else:
+            # NF4 consumes ordinary BF16 weights and quantizes them on the fly.
+            suffixes = ("weight",)
 
-        # Broadcast each tensor via GPU (NCCL), then move to CPU
-        shard_dict = {}
-        for name, shape, dtype_str in meta:
-            dtype = getattr(torch, dtype_str.replace("torch.", ""))
-            if rank == 0:
-                cpu_tensor = shard_data[name].contiguous()
-                gpu_tensor = cpu_tensor.pin_memory().to(device, non_blocking=True)
-            else:
-                gpu_tensor = torch.empty(shape, dtype=dtype, device=device)
+        requested = tuple(
+            f"{source_fqn}.{expert_idx}.{projection}.{suffix}"
+            for projection in ("gate_proj", "up_proj", "down_proj")
+            for expert_idx in range(module.expert_offset, module.expert_offset + module.num_local_experts)
+            for suffix in suffixes
+        )
+    else:
+        raise TypeError(f"Unsupported deferred QLoRA module: {type(module).__name__}")
 
-            dist.broadcast(gpu_tensor, src=0)
-            shard_dict[name] = gpu_tensor.cpu()
-            del gpu_tensor
+    if len(requested) != len(set(requested)):
+        raise RuntimeError(f"Deferred QLoRA key plan for {source_fqn} contains duplicate checkpoint keys")
+    missing = [key for key in requested if key not in weight_map]
+    if missing:
+        sample = ", ".join(missing[:4])
+        raise RuntimeError(f"Checkpoint index is missing {len(missing)} QLoRA tensor(s), including: {sample}")
+    return requested
 
-        shard_cache[shard_file] = shard_dict
-        if rank == 0:
-            del shard_data
 
-        # Free GPU memory between shards
-        torch.cuda.empty_cache()
-        if rank == 0:
-            logger.info(f"Broadcast shard {i + 1}/{len(needed_shards)}: {shard_file} ({len(shard_dict)} tensors)")
+def _read_selected_shard_cache(
+    requested_keys: tuple[str, ...],
+    weight_map: dict,
+    weights_path: str,
+) -> _RetainedShardCache:
+    """Read only ``requested_keys`` from safetensors, never whole shard files."""
 
-    if executor is not None:
-        executor.shutdown(wait=False)
+    keys_by_shard: dict[str, list[str]] = {}
+    for key in requested_keys:
+        shard_file = weight_map[key]
+        keys_by_shard.setdefault(shard_file, []).append(key)
+
+    shard_cache = _RetainedShardCache()
+    for shard_file, shard_keys in keys_by_shard.items():
+        shard_path = cached_file(weights_path, shard_file)
+        if shard_path is None:
+            raise RuntimeError(f"Could not resolve checkpoint shard {shard_file} from {weights_path}")
+        with safe_open(shard_path, framework="pt", device="cpu") as handle:
+            shard_cache[shard_file] = {key: handle.get_tensor(key) for key in shard_keys}
+    return shard_cache
+
+
+def _load_selected_shard_cache(
+    requested_keys: tuple[str, ...],
+    weight_map: dict,
+    weights_path: str,
+    *,
+    group=None,
+    src: Optional[int] = None,
+) -> _RetainedShardCache:
+    """Load one module's selected tensors locally or fan them out in ``group``.
+
+    ``group=None, src=None`` is the all-ranks/size-one path. A grouped caller
+    supplies both a process group and its global source rank; only that source
+    reads storage and tensors are broadcast through the group's NCCL backend.
+    """
+
+    if (group is None) != (src is None):
+        raise ValueError("group and src must either both be set or both be None")
+    if group is None:
+        return _read_selected_shard_cache(requested_keys, weight_map, weights_path)
+    if not dist.is_available() or not dist.is_initialized():
+        raise RuntimeError("Grouped deferred QLoRA loading requires initialized torch.distributed")
+
+    from xorl.models.module_utils import _broadcast_object_list  # noqa: PLC0415
+
+    rank = dist.get_rank()
+    is_source = rank == src
+    if is_source:
+        shard_cache = _read_selected_shard_cache(requested_keys, weight_map, weights_path)
+        metadata = [
+            (shard_file, key, tuple(tensor.shape), str(tensor.dtype))
+            for shard_file, shard_tensors in shard_cache.items()
+            for key, tensor in shard_tensors.items()
+        ]
+    else:
+        shard_cache = _RetainedShardCache()
+        metadata = None
+
+    metadata_box = [metadata]
+    _broadcast_object_list(metadata_box, src=src, group=group)
+    metadata = metadata_box[0]
+    device = torch.device("cuda", torch.cuda.current_device())
+
+    for shard_file, key, shape, dtype_str in metadata:
+        dtype = getattr(torch, dtype_str.removeprefix("torch."))
+        if is_source:
+            cpu_tensor = shard_cache[shard_file][key].contiguous()
+            gpu_tensor = cpu_tensor.pin_memory().to(device, non_blocking=True)
+        else:
+            gpu_tensor = torch.empty(shape, dtype=dtype, device=device)
+
+        dist.broadcast(gpu_tensor, src=src, group=group)
+        if not is_source:
+            shard_cache.setdefault(shard_file, {})[key] = gpu_tensor.cpu()
+        del gpu_tensor
 
     return shard_cache
+
+
+def _get_deferred_grouped_load_context(load_family: str):
+    """Return the existing dense or EP-FSDP load subgroup and global source."""
+
+    from xorl.models.module_utils import (  # noqa: PLC0415
+        _get_grouped_dense_weight_load_group,
+        _get_grouped_weight_load_group,
+    )
+
+    parallel_state = get_parallel_state()
+    if load_family == "expert" and parallel_state.ep_enabled:
+        group = _get_grouped_weight_load_group(parallel_state)
+    else:
+        group = _get_grouped_dense_weight_load_group()
+    if group is None:
+        return None, None
+
+    ranks = dist.get_process_group_ranks(group)
+    if len(ranks) <= 1:
+        return None, None
+    return group, ranks[0]
 
 
 def maybe_load_prequantized_qlora(model: nn.Module, weights_path: str, load_mode: str = "grouped") -> int:
@@ -659,15 +753,16 @@ def maybe_load_prequantized_qlora(model: nn.Module, weights_path: str, load_mode
 
     Also handles QLoRAMoeExperts (auto-detected internally via weight_map probing).
 
-    When distributed is initialized, grouped mode uses rank-0 fanout to avoid
-    redundant disk reads across ranks (~6-8× faster for large models). The main
-    checkpoint handler performs true grouped fanout when QLoRA weights are
-    loaded inline; this deferred path keeps rank-0 fanout as the compatibility
-    fallback.
+    Deferred loading is bounded to one module's selected checkpoint tensors at
+    a time. In grouped mode, dense/shared tensors use the existing node-local
+    fanout group and routed experts use their EP-FSDP group. This avoids both
+    redundant reads and a second whole-checkpoint CPU residency.
 
     Args:
         model: Model with QLoRALinear/QLoRAMoeExperts modules
         weights_path: Path to HF model directory
+        load_mode: ``"grouped"`` for subgroup fanout or ``"all_ranks"`` for
+            independent selected-key reads.
 
     Returns:
         Number of modules loaded.
@@ -691,20 +786,12 @@ def maybe_load_prequantized_qlora(model: nn.Module, weights_path: str, load_mode
         )
 
     # Loading mode:
-    # "grouped" (default): use rank-0 fanout in this deferred QLoRA path.
-    # "all_ranks": every rank reads from disk independently. Best for local SSDs.
-    use_broadcast = (
-        load_mode == "grouped" and dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
-    )
-    if use_broadcast:
-        needed_shards = sorted(set(weight_map.values()))
-        logger.info(
-            f"Broadcasting {len(needed_shards)} shard files from rank 0 "
-            f"(rank={dist.get_rank()}, world={dist.get_world_size()})"
-        )
-        shard_cache = _broadcast_shard_cache(needed_shards, weights_path)
-    else:
-        shard_cache = {}
+    # "grouped" (default): dense tensors use the existing node-local fanout
+    # group and expert tensors use their EP-FSDP fanout group.
+    # "all_ranks": every rank reads its selected tensors independently.
+    use_grouped = load_mode == "grouped" and dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+    dense_group, dense_src = _get_deferred_grouped_load_context("dense") if use_grouped else (None, None)
+    expert_group, expert_src = _get_deferred_grouped_load_context("expert") if use_grouped else (None, None)
 
     # Load QLoRALinear modules (attention, dense MLP)
     # Skip modules already loaded inline via QLoRAWeightBuffer
@@ -713,14 +800,38 @@ def maybe_load_prequantized_qlora(model: nn.Module, weights_path: str, load_mode
         if isinstance(module, QLoRALinear) and module._is_prequantized:
             if module._inline_loaded:
                 continue  # loaded via checkpoint handler
-            module.load_prequantized_weights(weight_map, shard_cache, weights_path)
+            requested_keys = _prequantized_module_keys(module, weight_map)
+            shard_cache = _load_selected_shard_cache(
+                requested_keys,
+                weight_map,
+                weights_path,
+                group=dense_group,
+                src=dense_src,
+            )
+            try:
+                module.load_prequantized_weights(weight_map, shard_cache, weights_path)
+            finally:
+                shard_cache.release()
             linear_count += 1
+            if linear_count % 50 == 0 and (not dist.is_initialized() or dist.get_rank() == 0):
+                logger.info(f"Loaded {linear_count} deferred QLoRALinear modules with bounded selected-key caches")
 
     # Load QLoRAMoeExperts (auto-detects prequant via weight_map probing)
     moe_count = 0
     for module in model.modules():
         if isinstance(module, QLoRAMoeExperts) and not module._weights_loaded:
-            module.load_and_quantize_weights(weights_path, weight_map=weight_map, shard_cache=shard_cache)
+            requested_keys = _prequantized_module_keys(module, weight_map)
+            shard_cache = _load_selected_shard_cache(
+                requested_keys,
+                weight_map,
+                weights_path,
+                group=expert_group,
+                src=expert_src,
+            )
+            try:
+                module.load_and_quantize_weights(weights_path, weight_map=weight_map, shard_cache=shard_cache)
+            finally:
+                shard_cache.release()
             # Materialize LoRA params from meta device to GPU.
             # With EP, params are DTensors (Shard/Replicate) — must preserve placement.
             # For Replicate DTensors, all ranks must have identical values.
@@ -766,9 +877,6 @@ def maybe_load_prequantized_qlora(model: nn.Module, weights_path: str, load_mode
                     setattr(module, name, materialized)
             moe_count += 1
 
-    # Free shard cache
-    shard_cache.clear()
-
     total = linear_count + moe_count
     if total > 0:
         # Deregister packed_weight_f32 from FSDP2 to prevent mixed-precision
@@ -780,7 +888,7 @@ def maybe_load_prequantized_qlora(model: nn.Module, weights_path: str, load_mode
         torch.cuda.empty_cache()
         logger.info(
             f"Loaded pre-quantized weights: {linear_count} QLoRALinear + "
-            f"{moe_count} QLoRAMoeExperts modules (direct from checkpoint), "
+            f"{moe_count} QLoRAMoeExperts modules (module-scoped selected-key loading), "
             f"deregistered {removed} packed_weight_f32 params from FSDP2"
         )
 

@@ -633,6 +633,55 @@ def test_parse_args_fp8_training_defaults_to_fail_fast_fallback(tmp_path, monkey
     assert args.train.fp8_training_allow_bf16_fallback is False
 
 
+def test_parse_args_accepts_glm52_block_fp8_qlora_mode(tmp_path, monkeypatch):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {
+                    "model_path": "zai-org/GLM-5.2-FP8",
+                    "moe_implementation": "triton",
+                    "ep_dispatch": "deepep",
+                    "freeze_router": True,
+                    "merge_qkv": True,
+                },
+                "data": {
+                    "datasets": [{"path": "dummy", "type": "tokenized"}],
+                },
+                "train": {
+                    "init_device": "meta",
+                    "output_dir": str(tmp_path / "outputs"),
+                    "use_wandb": False,
+                },
+                "lora": {
+                    "enable_lora": True,
+                    "enable_qlora": True,
+                    "block_fp8_qlora_training": True,
+                    "quant_format": "block_fp8",
+                    "quant_group_size": 128,
+                    "moe_hybrid_shared_lora": True,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "1")
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setattr(sys, "argv", ["train.py", str(config_path)])
+
+    args = parse_args(Arguments)
+
+    assert args.lora.block_fp8_qlora_training is True
+    assert args.lora.enable_lora is True
+    assert args.lora.enable_qlora is True
+    assert args.lora.quant_format == "block_fp8"
+    assert args.lora.quant_group_size == 128
+    assert args.lora.moe_hybrid_shared_lora is True
+
+
 def test_parse_args_accepts_qarl_quant_cfg_from_yaml(tmp_path, monkeypatch):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(

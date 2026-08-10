@@ -33,9 +33,8 @@ from xorl.ops.bi_gemm_configs import baseline_mm_config, lookup_mm_config
 # that equality — SGLang sends every contiguous bf16 N>=16 mm to DeepGEMM while
 # the trainer ran pure Triton — so routing the trainer the same way cannot move
 # cross-engine bits, and it is markedly faster at trainer token counts.
-# Requires Hopper+ and an importable deep_gemm; kill switch:
-# XORL_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM=0 (SGLANG_ prefix honored too).
-# Detection is lazy (first mm) so importing this module never initializes CUDA.
+# Requires Hopper+ and an importable deep_gemm. Detection is lazy (first mm),
+# so importing this module never initializes CUDA.
 _DEEPGEMM_READY: bool | None = None
 
 
@@ -75,28 +74,12 @@ def _launch_with_config_fallback(launch, dtype, M, N, K, out_itemsize=None):
         launch(baseline_mm_config(dtype))
 
 
-def get_bool_env_var(name: str, default: str = "false") -> bool:
-    value = os.getenv(name, default)
-    return value.lower() in ("true", "1")
-
-
-def calc_diff(x: torch.Tensor, y: torch.Tensor) -> float:
-    x, y = x.double(), y.double()
-    denominator = (x * x + y * y).sum()
-    sim = 2 * (x * y).sum() / denominator
-    return 1 - sim
-
-
 # -----------------------------------------------------------------------------
 
 
-_ENABLE_MM_DEEPGEMM = get_bool_env_var(
-    "XORL_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM",
-    os.getenv("SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM", "1"),
-)
-# If true, allows to fallback to batch variant gemm when the shape cannot be run in DeepGEMM
-_ENABLE_MM_FALLBACK_VARIANT = get_bool_env_var("SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT", "0")
-_ENABLE_MM_COMPARISON_TEST = get_bool_env_var("SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_COMPARISON_TEST")
+# Exact-model activation always uses the admitted production route. Ambient
+# process variables cannot substitute comparison or order-variant fallbacks.
+_ENABLE_MM_DEEPGEMM = True
 
 __all__ = [
     "set_batch_invariant_mode",
@@ -111,6 +94,8 @@ __all__ = [
     "fused_rms_norm_backward",
     "wrap_trunk_linears_batch_invariant",
     "is_trunk_linear_contract_enabled",
+    "batch_invariant_trunk_linear",
+    "bi_bf16_fp32_linear",
     "set_trunk_linear_contract",
     "RMSNormFamily",
     "RMS_NORM_FAMILY_NO_RESIDUAL",
@@ -357,27 +342,11 @@ def matmul_persistent(a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | Non
         and N >= MIN_DEEPGEMM_DIM
         and _deepgemm_ready()
     ):
-        if _ENABLE_MM_COMPARISON_TEST:
-            out_triton = _matmul_persistent_triton(a=a, b=b, bias=bias)
-            out_deepgemm = _matmul_persistent_deepgemm(a=a, b=b, bias=bias)
-            if out_deepgemm is not None:
-                diff = calc_diff(out_triton, out_deepgemm)
-                assert diff < 0.0001, f"{diff=} {out_triton=} {out_deepgemm=}"
-                return out_deepgemm
-            # DeepGEMM failed, use Triton result
-            return out_triton
-
         result = _matmul_persistent_deepgemm(a=a, b=b, bias=bias)
         if result is not None:
             return result
         # DeepGEMM failed (e.g. dimensions too small for TMA descriptors),
         # fall through to batch-invariant Triton persistent kernel
-
-    if _ENABLE_MM_FALLBACK_VARIANT:
-        out = torch.einsum("ik,kj->ij", a, b)
-        if bias is not None:
-            out += bias
-        return out
 
     return _matmul_persistent_triton(a=a, b=b, bias=bias)
 
@@ -1685,7 +1654,7 @@ def bi_lm_head_selected_logprob(
 # num_experts is small (a single BLOCK_SIZE_N tile for the common E <= 128), so
 # the whole GEMM is one persistent launch. The config below is part of the
 # contract; changing any constant changes the bits.
-# Enable via XORL_MOE_BI_ROUTER=1 (xorl) / SGLANG_BI_ROUTER=1 (sglang).
+# Exact model programs call this kernel directly on both trainer and sampler.
 # Forward-only; the trainer wraps it in an autograd.Function with a closed-form
 # (order-insensitive) backward — gradients do not enter the forward K3.
 # --------------------------------------------------------------------------- #
@@ -1766,6 +1735,50 @@ def bi_router_gemm(hidden: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         **_BI_ROUTER_GEMM_CONFIG,
     )
     return logits
+
+
+class _BIBf16Fp32LinearFn(torch.autograd.Function):
+    """Trainable wrapper for the shared BF16-input, FP32-output GEMM.
+
+    The pinned forward reduction enters the trainer-sampler numerical
+    contract. The ordinary linear backward does not enter K3, so it may use
+    the native matmul reduction while still propagating gradients to both
+    operands.
+    """
+
+    @staticmethod
+    def forward(ctx, input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        ctx.save_for_backward(input, weight)
+        input_2d = input.reshape(-1, input.shape[-1])
+        output = bi_router_gemm(input_2d, weight)
+        return output.reshape(*input.shape[:-1], weight.shape[0])
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        input, weight = ctx.saved_tensors
+        grad_output_2d = grad_output.reshape(-1, grad_output.shape[-1]).float()
+        input_2d = input.reshape(-1, input.shape[-1])
+        grad_input = grad_weight = None
+        if ctx.needs_input_grad[0]:
+            grad_input = (grad_output_2d @ weight.float()).to(input.dtype).reshape_as(input)
+        if ctx.needs_input_grad[1]:
+            grad_weight = (grad_output_2d.t() @ input_2d.float()).to(weight.dtype)
+        return grad_input, grad_weight
+
+
+def bi_bf16_fp32_linear(input: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    """Apply the batch-invariant BF16-input, FP32-output linear contract.
+
+    This is the differentiable form of :func:`bi_router_gemm`. It is suitable
+    for small-output projections whose serving counterpart uses DeepGEMM's
+    ``bf16_gemm_nt`` FP32 output, including GLM-5.2's indexer head weights.
+    """
+
+    if input.ndim < 2 or weight.ndim != 2:
+        raise ValueError(f"expected input.ndim >= 2 and weight.ndim == 2, got {input.shape=} and {weight.shape=}")
+    if input.shape[-1] != weight.shape[-1]:
+        raise ValueError(f"input/weight contraction mismatch: {input.shape[-1]} != {weight.shape[-1]}")
+    return _BIBf16Fp32LinearFn.apply(input, weight)
 
 
 def bi_router_topk_weights(
@@ -1984,6 +1997,15 @@ class _BatchInvariantTrunkLinearFn(torch.autograd.Function):
         return grad_input, grad_weight, grad_bias
 
 
+def batch_invariant_trunk_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run the public trunk-linear contract on an explicitly folded weight."""
+    return _BatchInvariantTrunkLinearFn.apply(input, weight, bias)
+
+
 def wrap_trunk_linears_batch_invariant(
     model: torch.nn.Module, names: Tuple[str, ...] = _TRUNK_LINEAR_NAMES
 ) -> Dict[str, int]:
@@ -2032,7 +2054,7 @@ def wrap_trunk_linears_batch_invariant(
             continue
         if ".experts." in f".{module_name}.":
             continue
-        if type(module) is LoraLinear and lora_merged_forward_enabled():
+        if type(module) is LoraLinear and lora_merged_forward_enabled(module):
             # Merged-forward contract lane: the adapted linear serves and trains
             # through the folded weight, so the trunk contract composes.
             if module.weight.dtype not in (torch.bfloat16, torch.float32):
@@ -2050,8 +2072,8 @@ def wrap_trunk_linears_batch_invariant(
         if isinstance(module, LoraModule):
             raise NotImplementedError(
                 f"XORL_BI_TRUNK_LINEAR: {module_name} is adapter-wrapped ({type(module).__qualname__}); "
-                "the trunk contract composes with LoRA only under XORL_LORA_MERGED_FORWARD=1 "
-                "(plain LoraLinear) — set the merged-forward flag or exclude the adapter."
+                "the canonical merged-LoRA trunk contract composes only with a plain LoraLinear whose "
+                "model-owned exact_merged_forward property is true — enable it on that module or exclude the adapter."
             )
         if type(module) is not torch.nn.Linear:
             raise NotImplementedError(

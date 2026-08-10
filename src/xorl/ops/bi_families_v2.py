@@ -1,11 +1,10 @@
 # Families v2 — the redefined frozen reduction trees for the batch-invariance
 # contract (hidden-dim RMSNorm, qk-norm, and the final projection).
 #
-# VENDORED BYTE-IDENTICAL into the trainer (xorl/ops/) and the serving engine
-# (sglang/srt/batch_invariant_ops/). Both suites pin the same sha256 of this
-# file, so neither copy can be edited without the other. Self-contained: torch
-# + triton only, no engine imports, so the same bytes run under either engine
-# and any venv.
+# The trainer and serving engine carry equivalent implementations because they
+# must evaluate the same reduction trees. This module remains self-contained
+# (torch + triton only), and cross-engine agreement is established by the
+# behavior-logprob replay rather than source-file identity.
 #
 # Rule A: every bit-relevant reduction is written explicitly — an
 # adjacent-pairwise balanced binary tree within a block (tl.split + one add
@@ -14,11 +13,9 @@
 # in index order. tl.sum over >2 elements is banned in bit-relevant positions.
 # Rule B: golden-value gates pin the bits under both engines' venvs.
 #
-# These trees are DEFAULT ON inside an engaged contract lane; stock lanes never
-# reach them. XORL_FAMILIES_V2=0 or SGLANG_FAMILIES_V2=0 is the rollback kill
-# switch, and it applies to BOTH engines at once: the trainer and the sampler
-# must evaluate the same tree, so a mixed setting is invalid. Rolling back
-# selects the v1 kernels, which stay available.
+# These trees are DEFAULT ON inside an engaged contract lane. The exact
+# Qwen3.5-family model setup selects the already-certified v1 family directly;
+# callers do not coordinate the selection with an environment variable.
 #
 # Migration: v1 and v2 are two different trees, and both hold the trainer and
 # the sampler bitwise equal — that is the contract, and v2 satisfies it. The
@@ -34,14 +31,36 @@ import triton.language as tl
 from triton.runtime.errors import OutOfResources
 
 
-def families_v2_enabled() -> bool:
-    """True unless the kill switch is set — families v2 is default on.
+_EXACT_FAMILIES_VERSION: str | None = None
 
-    Set XORL_FAMILIES_V2=0 or SGLANG_FAMILIES_V2=0 to roll back to the v1
-    trees. Call sites gate on the contract lane as well, so stock lanes never
-    see these trees. Both engines must agree: a mixed setting puts the trainer
-    and the sampler on different trees, which the contract does not allow.
+
+def _select_qwen35_families_v1() -> None:
+    """Pin exact Qwen's fused LM-head loss to its qualified v1 program."""
+    global _EXACT_FAMILIES_VERSION
+    _EXACT_FAMILIES_VERSION = "v1"
+
+
+def _select_glm52_families_v2() -> None:
+    """Pin the GLM-5.2 process to its certified v2 reduction trees."""
+    global _EXACT_FAMILIES_VERSION
+    _EXACT_FAMILIES_VERSION = "v2"
+
+
+def _select_nonexact_families() -> None:
+    """Restore the pre-existing family selection for an ordinary model."""
+    global _EXACT_FAMILIES_VERSION
+    _EXACT_FAMILIES_VERSION = None
+
+
+def families_v2_enabled() -> bool:
+    """Return the selected reduction family for the current process.
+
+    Exact model programs select their family structurally and ignore the
+    legacy rollback variables.  Without an exact model selection, preserve the
+    pre-existing non-exact behavior for compatibility.
     """
+    if _EXACT_FAMILIES_VERSION is not None:
+        return _EXACT_FAMILIES_VERSION == "v2"
     return not any(os.getenv(v, "1").lower() in _V2_OFF for v in FAMILIES_V2_ENV_VARS)
 
 
@@ -122,9 +141,7 @@ def _rms_norm_v2_kernel(
         mask = cols < n_cols
         x = tl.load(x_ptr + row * stride_x + cols, mask=mask, other=0.0).to(tl.float32)
         if HAS_RESIDUAL:
-            r = tl.load(res_ptr + row * stride_res + cols, mask=mask, other=0.0).to(
-                tl.float32
-            )
+            r = tl.load(res_ptr + row * stride_res + cols, mask=mask, other=0.0).to(tl.float32)
             s = _rtne_bf16(x + r)  # v1 semantic kept: add rounds to input dtype
             tl.store(
                 res_out_ptr + row * stride_res_out + cols,
@@ -143,22 +160,16 @@ def _rms_norm_v2_kernel(
         cols = c * BLOCK_H + tl.arange(0, BLOCK_H)
         mask = cols < n_cols
         if HAS_RESIDUAL:
-            s = tl.load(
-                res_out_ptr + row * stride_res_out + cols, mask=mask, other=0.0
-            ).to(
+            s = tl.load(res_out_ptr + row * stride_res_out + cols, mask=mask, other=0.0).to(
                 tl.float32
             )  # the rounded sum: bit-identical to what was squared
         else:
-            s = tl.load(x_ptr + row * stride_x + cols, mask=mask, other=0.0).to(
-                tl.float32
-            )
+            s = tl.load(x_ptr + row * stride_x + cols, mask=mask, other=0.0).to(tl.float32)
         w = tl.load(w_ptr + cols, mask=mask, other=0.0).to(tl.float32)
         if ZERO_CENTERED:
             w = 1.0 + w
         y = s * inv_rms * w
-        tl.store(
-            out_ptr + row * stride_out + cols, y.to(out_ptr.dtype.element_ty), mask=mask
-        )
+        tl.store(out_ptr + row * stride_out + cols, y.to(out_ptr.dtype.element_ty), mask=mask)
 
 
 QK_V2_ROWS_PER_PROG = 16  # head-rows per program (perf-only, NOT bit-relevant)
@@ -231,10 +242,6 @@ def rms_norm_v2(
     assert x.dtype == torch.bfloat16, "families v2 is bf16-only (contract dtype)"
     assert weight.ndim == 1 and weight.shape[0] == x.shape[1]
     assert x.is_cuda
-    if zero_centered:
-        assert (
-            residual is None
-        ), "zero-centered exists in no-residual form only (v1 rule kept)"
     rows, H = x.shape
     weight = weight.contiguous()
     if residual is not None:
@@ -264,7 +271,7 @@ def _rms_norm_v2_fused(x, weight, eps, residual, zero_centered):
             res_out.stride(0),
             eps,
             HAS_RESIDUAL=True,
-            ZERO_CENTERED=False,
+            ZERO_CENTERED=zero_centered,
             BLOCK_H=V2_NORM_BLOCK_H,
         )
         return out, res_out
@@ -455,18 +462,10 @@ def _head_v2_gemm_stats_kernel(
                 offs_k = ki * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K).to(tl.int64)
             else:
                 offs_k = ki * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
-            a_ptrs = a_ptr + (
-                offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak
-            )
-            b_ptrs = b_ptr + (
-                offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn
-            )
-            a = tl.load(
-                a_ptrs, mask=offs_k_for_mask[None, :] < K - ki * BLOCK_SIZE_K, other=0.0
-            )
-            b = tl.load(
-                b_ptrs, mask=offs_k_for_mask[:, None] < K - ki * BLOCK_SIZE_K, other=0.0
-            )
+            a_ptrs = a_ptr + (offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak)
+            b_ptrs = b_ptr + (offs_k[:, None] * stride_bk + offs_bn[None, :] * stride_bn)
+            a = tl.load(a_ptrs, mask=offs_k_for_mask[None, :] < K - ki * BLOCK_SIZE_K, other=0.0)
+            b = tl.load(b_ptrs, mask=offs_k_for_mask[:, None] < K - ki * BLOCK_SIZE_K, other=0.0)
             accumulator = tl.dot(a, b, accumulator)
 
         offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
@@ -502,9 +501,7 @@ def _head_v2_gemm_stats_kernel(
             toks = tl.load(tok_ptr + offs_cm, mask=row_mask, other=-1)
             tok_here = (toks >= start_n) & (toks < start_n + BLOCK_SIZE_N) & row_mask
             # -inf-padded max gather: exactly one lane matches, sign of zero preserved
-            sel = tl.max(
-                tl.where(offs_cn[None, :] == toks[:, None], x_stats, neg_inf), axis=1
-            )
+            sel = tl.max(tl.where(offs_cn[None, :] == toks[:, None], x_stats, neg_inf), axis=1)
             tl.store(sel_ptr + offs_cm, sel, mask=tok_here)
 
 
@@ -548,9 +545,7 @@ def _head_v2_launch(hidden, weight_t, logits, m_buf, l_buf, sel, toks, temp):
     NUM_SMS = torch.cuda.get_device_properties(hidden.device).multi_processor_count
     a_large = hidden.numel() > 2**31
     b_large = weight_t.numel() > 2**31
-    c_large = logits is not None and (
-        logits.shape[0] * logits.stride(0) + logits.shape[1] * logits.stride(1) > 2**31
-    )
+    c_large = logits is not None and (logits.shape[0] * logits.stride(0) + logits.shape[1] * logits.stride(1) > 2**31)
     launch = _HEAD_V2_FALLBACK
     for bound, cfg in _HEAD_V2_LAUNCH:
         if bound is None or M <= bound:
@@ -606,11 +601,7 @@ def _head_v2_launch(hidden, weight_t, logits, m_buf, l_buf, sel, toks, temp):
 def _head_v2_merge(m_buf, l_buf, sel):
     M, n_tiles = m_buf.shape
     lse = torch.empty((M,), dtype=torch.float32, device=m_buf.device)
-    lp = (
-        torch.empty((M,), dtype=torch.float32, device=m_buf.device)
-        if sel is not None
-        else None
-    )
+    lp = torch.empty((M,), dtype=torch.float32, device=m_buf.device) if sel is not None else None
     _head_v2_lse_merge_kernel[(M,)](
         m_buf,
         l_buf,
@@ -628,9 +619,9 @@ def _head_v2_merge(m_buf, l_buf, sel):
 
 def _head_v2_check_inputs(hidden, weight, token_ids, temperature):
     assert hidden.ndim == 2 and weight.ndim == 2 and hidden.shape[1] == weight.shape[1]
-    assert (
-        hidden.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
-    ), "the head contract takes bf16 hidden/weight (fp32 upcast is exact inside the GEMM)"
+    assert hidden.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16, (
+        "the head contract takes bf16 hidden/weight (fp32 upcast is exact inside the GEMM)"
+    )
     assert hidden.is_cuda
     hidden = hidden.contiguous()
     M = hidden.shape[0]
@@ -638,11 +629,7 @@ def _head_v2_check_inputs(hidden, weight, token_ids, temperature):
         token_ids = token_ids.contiguous().to(device=hidden.device, dtype=torch.int64)
         assert token_ids.shape == (M,)
     if temperature is not None:
-        temperature = (
-            temperature.reshape(-1)
-            .to(device=hidden.device, dtype=torch.float32)
-            .contiguous()
-        )
+        temperature = temperature.reshape(-1).to(device=hidden.device, dtype=torch.float32).contiguous()
         assert temperature.shape == (M,)
         torch._assert_async((temperature > 0).all(), "temperature must be > 0")
     return hidden, token_ids, temperature
@@ -658,9 +645,7 @@ def head_v2_selected_logprob(
     logits are NEVER materialized — per-tile stats + selected gather in the
     GEMM epilogue, one merge launch. Returns ``(logprob, lse, selected)``,
     all ``[N]`` fp32 (temperature-scaled when given), like v1."""
-    hidden, token_ids, temperature = _head_v2_check_inputs(
-        hidden, weight, token_ids, temperature
-    )
+    hidden, token_ids, temperature = _head_v2_check_inputs(hidden, weight, token_ids, temperature)
     M = hidden.shape[0]
     V = weight.shape[0]
     n_tiles = triton.cdiv(V, HEAD_V2_STATS_TILE_N)
@@ -762,11 +747,7 @@ def head_v2_selected_logprob_from_logits(
     token_ids = token_ids.contiguous().to(device=logits.device, dtype=torch.int64)
     assert token_ids.shape == (M,)
     if temperature is not None:
-        temperature = (
-            temperature.reshape(-1)
-            .to(device=logits.device, dtype=torch.float32)
-            .contiguous()
-        )
+        temperature = temperature.reshape(-1).to(device=logits.device, dtype=torch.float32).contiguous()
         assert temperature.shape == (M,)
         torch._assert_async((temperature > 0).all(), "temperature must be > 0")
     n_tiles = triton.cdiv(V, HEAD_V2_STATS_TILE_N)
@@ -848,9 +829,7 @@ def _rms_norm_v2_partials_kernel(
     mask = cols < n_cols
     x = tl.load(x_ptr + row * stride_x + cols, mask=mask, other=0.0).to(tl.float32)
     if HAS_RESIDUAL:
-        r = tl.load(res_ptr + row * stride_res + cols, mask=mask, other=0.0).to(
-            tl.float32
-        )
+        r = tl.load(res_ptr + row * stride_res + cols, mask=mask, other=0.0).to(tl.float32)
         s = _rtne_bf16(x + r)
         tl.store(
             res_out_ptr + row * stride_res_out + cols,
@@ -911,9 +890,7 @@ def _rms_norm_v2_normalize_kernel(
         w = 1.0 + w
     inv_rms = tl.load(invrms_ptr + row)
     y = s * inv_rms * w
-    tl.store(
-        out_ptr + row * stride_out + cols, y.to(out_ptr.dtype.element_ty), mask=mask
-    )
+    tl.store(out_ptr + row * stride_out + cols, y.to(out_ptr.dtype.element_ty), mask=mask)
 
 
 def _rms_norm_v2_split(x, weight, eps, residual, zero_centered):

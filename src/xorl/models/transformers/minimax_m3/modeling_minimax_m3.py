@@ -396,7 +396,13 @@ class MiniMaxM3Attention(nn.Module):
         query_states = self.q_norm(query_states)
         key_states = self.k_norm(key_states)
         cos, sin = position_embeddings
-        return qwen3_5_apply_rotary_pos_emb(query_states, key_states, cos, sin) + (value_states,)
+        return qwen3_5_apply_rotary_pos_emb(
+            query_states,
+            key_states,
+            cos,
+            sin,
+            class_b=bool(getattr(self.config, "_rope_class_b", False)),
+        ) + (value_states,)
 
     def _project_index_qk(
         self,
@@ -413,7 +419,13 @@ class MiniMaxM3Attention(nn.Module):
         index_query = self.index_q_norm(index_query)
         index_key = self.index_k_norm(index_key)
         cos, sin = position_embeddings
-        return qwen3_5_apply_rotary_pos_emb(index_query, index_key, cos, sin)
+        return qwen3_5_apply_rotary_pos_emb(
+            index_query,
+            index_key,
+            cos,
+            sin,
+            class_b=bool(getattr(self.config, "_rope_class_b", False)),
+        )
 
     def _project_output(self, attn_output: torch.Tensor) -> torch.Tensor:
         attn_output = attn_output.reshape(*attn_output.shape[:-2], -1).contiguous()

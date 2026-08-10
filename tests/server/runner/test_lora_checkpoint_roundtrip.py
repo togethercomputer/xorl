@@ -17,6 +17,7 @@ from xorl.lora.utils import (
 )
 from xorl.models.layers.moe import MoEExpertsLoRA, MoELoRAConfig
 from xorl.optim import AnyPrecisionAdamW
+from xorl.qlora.modules.moe_experts import NF4QLoRAMoeExperts
 
 
 pytestmark = [pytest.mark.cpu, pytest.mark.server]
@@ -40,7 +41,7 @@ class _TinyAttention(nn.Module):
 
 
 class _TinyLayer(nn.Module):
-    def __init__(self, r: int = 2, lora_alpha: int = 4):
+    def __init__(self, r: int = 2, lora_alpha: int = 4, hybrid_shared: bool = True):
         super().__init__()
         self.self_attn = _TinyAttention(r=r, lora_alpha=lora_alpha)
         self.mlp = nn.Module()
@@ -49,20 +50,45 @@ class _TinyLayer(nn.Module):
             hidden_dim=8,
             intermediate_size=16,
             moe_implementation="eager",
-            lora_config=MoELoRAConfig(r=r, lora_alpha=lora_alpha, hybrid_shared=True),
+            lora_config=MoELoRAConfig(r=r, lora_alpha=lora_alpha, hybrid_shared=hybrid_shared),
         )
 
 
 class _TinyInnerModel(nn.Module):
-    def __init__(self, r: int = 2, lora_alpha: int = 4):
+    def __init__(self, r: int = 2, lora_alpha: int = 4, hybrid_shared: bool = True):
         super().__init__()
-        self.layers = nn.ModuleList([_TinyLayer(r=r, lora_alpha=lora_alpha)])
+        self.layers = nn.ModuleList([_TinyLayer(r=r, lora_alpha=lora_alpha, hybrid_shared=hybrid_shared)])
 
 
 class _TinyMoELoraModel(nn.Module):
+    def __init__(self, r: int = 2, lora_alpha: int = 4, hybrid_shared: bool = True):
+        super().__init__()
+        self.model = _TinyInnerModel(r=r, lora_alpha=lora_alpha, hybrid_shared=hybrid_shared)
+
+
+class _TinyQLoRALayer(nn.Module):
     def __init__(self, r: int = 2, lora_alpha: int = 4):
         super().__init__()
-        self.model = _TinyInnerModel(r=r, lora_alpha=lora_alpha)
+        self.mlp = nn.Module()
+        self.mlp.experts = NF4QLoRAMoeExperts(
+            num_local_experts=4,
+            num_experts=4,
+            hidden_size=64,
+            intermediate_size=64,
+            r=r,
+            lora_alpha=lora_alpha,
+            device=torch.device("cpu"),
+            moe_implementation="quack",
+            hybrid_shared=True,
+            target_modules=["gate_proj", "down_proj"],
+        )
+
+
+class _TinyExpertQLoRAModel(nn.Module):
+    def __init__(self, r: int = 2, lora_alpha: int = 4):
+        super().__init__()
+        self.model = nn.Module()
+        self.model.layers = nn.ModuleList([_TinyQLoRALayer(r=r, lora_alpha=lora_alpha)])
 
 
 def _iter_lora_parameters(module: nn.Module):
@@ -347,6 +373,69 @@ def test_adapter_manager_load_adapter_state_roundtrip_supports_hybrid_shared(tmp
 
     assert result["model_id"] == "adapter-1"
     assert set(actual) == set(expected)
+    for name, expected_tensor in expected.items():
+        assert torch.equal(actual[name], expected_tensor), name
+
+
+def test_adapter_manager_load_adapter_state_roundtrip_supports_all_owner_experts(tmp_path):
+    source = _TinyMoELoraModel(hybrid_shared=False)
+    _assign_distinct_lora_values(source)
+    checkpoint_dir = tmp_path / "all-owner-checkpoint"
+    save_lora_checkpoint(
+        model=source,
+        save_path=str(checkpoint_dir),
+        target_modules=_TARGET_MODULES,
+        r=2,
+        lora_alpha=4,
+        moe_hybrid_shared_lora=False,
+    )
+
+    manager = LoRAAdapterManager(
+        model=_TinyMoELoraModel(hybrid_shared=False),
+        device=torch.device("cpu"),
+        checkpoint_dir=str(tmp_path / "adapters"),
+        auto_save_on_eviction=False,
+        lora_config={"moe_hybrid_shared_lora": False},
+    )
+    result = manager.load_adapter_state(
+        model_id="all-owner",
+        path=str(checkpoint_dir),
+        load_optimizer=False,
+        lr=1e-4,
+    )
+
+    actual = {
+        name: parameter.detach().cpu().clone()
+        for name, parameter in manager.get_adapter_state("all-owner").lora_params.items()
+    }
+    expected = _expected_saved_lora_state(source)
+    assert result["model_id"] == "all-owner"
+    assert set(actual) == set(expected)
+    for name, expected_tensor in expected.items():
+        assert torch.equal(actual[name], expected_tensor), name
+
+
+def test_quantized_expert_projection_subset_checkpoint_roundtrip(tmp_path):
+    source = _TinyExpertQLoRAModel()
+    _assign_distinct_lora_values(source)
+    checkpoint_dir = tmp_path / "quantized-expert-checkpoint"
+
+    save_lora_checkpoint(
+        model=source,
+        save_path=str(checkpoint_dir),
+        target_modules=["gate_proj", "down_proj"],
+        r=2,
+        lora_alpha=4,
+        moe_hybrid_shared_lora=True,
+    )
+
+    loaded = _TinyExpertQLoRAModel()
+    load_lora_checkpoint(loaded, str(checkpoint_dir), strict=True)
+
+    expected = _expected_saved_lora_state(source)
+    actual = _actual_lora_state(loaded)
+    assert set(actual) == set(expected)
+    assert all("up_proj_lora" not in name for name in actual)
     for name, expected_tensor in expected.items():
         assert torch.equal(actual[name], expected_tensor), name
 
