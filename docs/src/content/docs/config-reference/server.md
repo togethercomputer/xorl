@@ -98,7 +98,8 @@ These stored defaults are resolved after the model architecture is known. Ordina
 | `load_weights_mode` | `grouped` | Weight loading mode: `grouped` (default, with rank-0 fallback), `all_ranks`, or `skip`. |
 | `ce_mode` | `null` (resolved) | Ordinary models resolve to `compiled`; current exact Qwen3.5/GLM-5.2 programs resolve to `bi_fused`. Explicit modes also include `eager`, `quack_linear`, and `fused_quack`, subject to loss/topology checks. |
 | `enable_fp8_training` | `false` | Experimental full-weight block-FP8 compute. Mutually exclusive with LoRA/QLoRA and QARL. |
-| `enable_qarl` | `false` | Experimental dense full-weight E4M3 fake-quant training. Mutually exclusive with LoRA/QLoRA and full-weight FP8 training. |
+| `enable_qarl` | `false` | Experimental dynamic fake-quant training with full-precision masters and STE gradients. E4M3 applies to dense `nn.Linear` modules; NVFP4 also supports MoE expert containers. Mutually exclusive with LoRA/QLoRA and full-weight FP8 training. |
+| `qarl_quant_cfg` | `null` | QARL alias or dictionary. `null`/`FP8_DEFAULT_CFG` resolves to dynamic E4M3 W8A8 with `[128, 128]` weight blocks. `nvfp4` resolves to dynamic, weight-only W4 with `group_size: 16`; set `activation: true` for W4A4. NVFP4 covers dense linears and MoE expert containers, while E4M3 is dense-only. |
 
 ---
 
@@ -198,5 +199,5 @@ ZMQ communication between the launcher, workers, and API server.
 
 | Field | Default | Description |
 |---|---|---|
-| `sync_inference_method` | `nccl_broadcast` | Method for pushing updated weights to the inference endpoint after each step. Supported values: `nccl_broadcast` (SGLang `update_weights_from_distributed`), `p2p` (Mooncake RDMA writes), and experimental `sparse_delta` (packed sparse files via SGLang `update_weights_from_sparse_delta`). |
+| `sync_inference_method` | `nccl_broadcast` | Method for pushing updated weights to the inference endpoint after each step. The pinned xorl-sglang revision supports `nccl_broadcast` (two-phase distributed receive) and `p2p` (Mooncake RDMA writes). XoRL also accepts `sparse_delta`, but that mode is not usable with the pinned receiver because `/update_weights_from_sparse_delta` is absent. |
 | `receiver_kv_cache_dtype` | `null` | Expected receiver KV-cache dtype: `auto`, `fp8`, or `fp8_e4m3`. Validates registered endpoint metadata; it does not configure SGLang itself. |

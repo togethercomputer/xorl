@@ -178,8 +178,8 @@ Each entry in `datasets` (or `test_datasets`) is a dict:
 | `ce_mode` | `null` (resolved) | Ordinary models resolve to `compiled`; current exact Qwen3.5/GLM-5.2 programs resolve to `bi_fused`. Explicit modes also include `eager`, `quack_linear`, and `fused_quack`, subject to loss/topology checks. |
 | `ce_num_chunks` | `8` | Number of token chunks for chunked/compiled cross-entropy. |
 | `enable_fp8_training` | `false` | Experimental full-weight block-FP8 compute with BF16/FP32 master parameters. Mutually exclusive with QARL. |
-| `enable_qarl` | `false` | Experimental dense full-weight E4M3 fake-quant training with STE gradients. Mutually exclusive with full-weight FP8 training. |
-| `qarl_quant_cfg` | `null` | QARL format alias or configuration; initial support accepts `FP8_DEFAULT_CFG`, `fp8`, or an admitted E4M3 dictionary. |
+| `enable_qarl` | `false` | Experimental dynamic fake-quant training with full-precision masters and STE gradients. E4M3 applies to dense `nn.Linear` modules; NVFP4 also supports MoE expert containers. Mutually exclusive with full-weight FP8 training. |
+| `qarl_quant_cfg` | `null` | QARL alias or dictionary. `null`/`FP8_DEFAULT_CFG` resolves to dynamic E4M3 W8A8 with `[128, 128]` weight blocks. `nvfp4` resolves to `{format: nvfp4, weight: true, activation: false, dynamic: true, group_size: 16}` (weight-only W4); set `activation: true` for W4A4. NVFP4 covers dense linears and MoE expert containers, while E4M3 is dense-only. |
 | `init_device` | `cuda` | Device for weight initialization: `cpu` (rank 0 only), `cuda`, `meta` (required for FSDP2), `npu`. |
 | `load_weights_mode` | `grouped` | `grouped`: one reader per node for dense/shared weights plus one reader per EP-FSDP group for expert weights, with rank-0 fallback when grouped fanout groups are unavailable. `all_ranks`: every rank reads from disk. `skip`: skip HuggingFace weight loading and materialize model weights from `load_checkpoint_path` (DCP). |
 | `enable_full_determinism` | `false` | Full determinism mode. Requires `allow_cuda_launch_blocking: true`. Degrades performance. |

@@ -3,7 +3,7 @@ title: "Backend: nccl_broadcast"
 ---
 
 
-`nccl_broadcast` is the default weight transport backend. It uses a dedicated NCCL process group to broadcast model weights from training rank 0 to all inference TP workers. XoRL also provides `p2p` and experimental `sparse_delta` transports; see the [weight-sync overview](/xorl/server-training/weight-sync/overview/) for their support boundaries.
+`nccl_broadcast` is the default weight transport backend. It uses a dedicated NCCL process group to broadcast model weights from training rank 0 to all inference TP workers. The pinned receiver also supports the `p2p` transport. XoRL's training-side `sparse_delta` sender is not usable with that receiver; see the [weight-sync overview](/xorl/server-training/weight-sync/overview/) for the support boundary.
 
 ## Architecture
 
@@ -116,7 +116,7 @@ The backend temporarily unsets `TORCHELASTIC_USE_AGENT_STORE` during group init.
 | No direct PP transfer | `supports_direct_pp_transfer = False`; PP followers ship CPU buffers to rank 0. |
 | Sequential buckets | Buckets are sent one at a time; no pipelining across buckets. |
 
-The P2P backend can lift the EP restriction when its direct-EP mode is enabled. `sparse_delta` and the default NCCL backend remain rank-0 transports. All backends declare these capabilities through `WeightTransportBackend` rather than through a global weight-sync guarantee.
+The P2P backend can lift the EP restriction when its direct-EP mode is enabled. The default NCCL backend remains a rank-0 transport. The unavailable training-side sparse-delta sender is also rank-0 based. Backends declare these capabilities through `WeightTransportBackend` rather than through a global weight-sync guarantee.
 
 ## Backend Interface
 

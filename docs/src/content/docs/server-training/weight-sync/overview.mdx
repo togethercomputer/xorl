@@ -18,9 +18,11 @@ Inference GPUs (xorl-sglang)
 |---|---|---|---|
 | `nccl_broadcast` | Default | Training rank 0 broadcasts prepared buckets to inference TP workers | No |
 | `p2p` | Supported when Mooncake/RDMA prerequisites are installed on both sides | One-sided P2P writes into registered receiver parameter memory | Optional, when direct-EP mode is enabled |
-| `sparse_delta` | Experimental | Rank 0 writes packed sparse-delta files consumed by the receiver | No |
+| `sparse_delta` | **Not supported by the pinned xorl-sglang revision** | The training-side sender expects `/update_weights_from_sparse_delta`, which the pinned receiver does not provide | N/A |
 
-The diagram below shows the default `nccl_broadcast` path. Its dedicated NCCL group is initialized and destroyed within each sync operation; that lifecycle is not a contract shared by the P2P or sparse-delta backends.
+Do not select `sync_inference_method: sparse_delta` with the checked-in submodules: the request will reach a missing receiver route. Treat the backend as unavailable until xorl-sglang includes and validates the matching receiver module and HTTP endpoint.
+
+The diagram below shows the default `nccl_broadcast` path. Its dedicated NCCL group is initialized and destroyed within each sync operation; that lifecycle is not a contract shared by the P2P backend.
 
 <svg viewBox="0 0 700 180" style="max-width:700px;width:100%;margin:1.5rem 0" font-family="sans-serif">
   <defs>
@@ -124,7 +126,7 @@ POST /sync_inference_weights          # shorthand alias
   "master_port": 0,
   "group_name": "sync_group_0",
   "buffer_size_mb": 512,
-  "pause_mode": "in_place",
+  "pause_mode": "retract",
   "flush_cache": false,
   "cache_invalidation_mode": "auto"
 }
@@ -136,9 +138,11 @@ POST /sync_inference_weights          # shorthand alias
 | `master_port` | `0` | Rendezvous port; `0` selects an ephemeral port. The xorl-client helper defaults to `29600` |
 | `group_name` | `"weight_sync_group"` | Group name used by transports that require a process group |
 | `buffer_size_mb` | `1024` | Transfer bucket size; reduce it if sync preparation exceeds memory |
-| `pause_mode` | `"in_place"` | `in_place`, `retract`, or `abort`; in-place operation requires `flush_cache=false` |
+| `pause_mode` | `"in_place"` | `in_place`, `retract`, or `abort`. Use `retract` whenever cache invalidation may flush; `in_place` is safe only when the resolved invalidation mode is `none` and `flush_cache=false` |
 | `flush_cache` | `false` | Explicitly request receiver KV/prefix-cache invalidation |
-| `cache_invalidation_mode` | `"auto"` | `auto` flushes for the currently detected FP8-weight/FP8-KV combination; `flush` always flushes; `none` relies on receiver versioning |
+| `cache_invalidation_mode` | `"auto"` | `auto` flushes for the currently detected FP8-weight/FP8-KV combination; `flush` always flushes; `none` relies on receiver versioning. Pair `auto` or `flush` with `pause_mode: "retract"` |
+
+The REST defaults are shown above, but the combination must be chosen as a unit. For an FP8-weight sync to an FP8-KV endpoint, `auto` resolves to a flush; retaining the running batch with `in_place` then makes the receiver reject the flush. Use `retract` with `auto`/`flush`, or use both `in_place` and `cache_invalidation_mode: "none"` when preserving in-flight requests and relying on versioned cache handling.
 
 The sync is synchronous from the caller's perspective — the endpoint returns once all inference servers have received the weights.
 
@@ -219,7 +223,7 @@ requests.post(f"{inference_url}/wake_up")
 The sync handler (`server/weight_sync/handler.py`) proceeds in order:
 
 1. **Health check**: Verify all inference endpoints are reachable
-2. **Backend init**: Initialize the configured NCCL, P2P, or sparse-delta transport
+2. **Backend init**: Initialize the configured NCCL or P2P transport
 3. **Per-module transfer** (sequential across PP stages if PP > 1):
    - FSDP2 all-gather to reconstruct full parameter on rank 0
    - QLoRA dequantize + LoRA merge
@@ -233,7 +237,7 @@ For ordinary PP-sharded training, each stage's parameters are prepared in sequen
 
 ### EP Support
 
-The default NCCL backend gathers expert material to rank 0 before transfer. The P2P backend can send from multiple EP ranks only when direct-EP mode is enabled and its sender/receiver topology checks pass. The experimental sparse-delta backend remains rank-0 based.
+The default NCCL backend gathers expert material to rank 0 before transfer. The P2P backend can send from multiple EP ranks only when direct-EP mode is enabled and its sender/receiver topology checks pass. The training-side sparse-delta sender is rank-0 based but is not usable with the pinned xorl-sglang receiver.
 
 ## Source
 

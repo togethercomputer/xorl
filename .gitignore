@@ -22,6 +22,7 @@ local/*
 # Environments
 .env
 .venv
+.venv-sglang
 env/
 venv/
 ENV/

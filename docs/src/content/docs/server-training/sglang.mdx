@@ -10,13 +10,13 @@ title: "Inference: xorl-sglang"
 
 The XoRL RL integration requires the following capabilities from its pinned inference engine:
 
-1. **Weight updates from training** — the training server must push new weights to the inference server after policy updates using the selected NCCL, P2P, or sparse-delta transport.
+1. **Weight updates from training** — the training server must push new weights to the inference server after policy updates using the selected NCCL or P2P transport. The pinned revision does not contain a sparse-delta receiver.
 
 2. **Decision-time per-token logprob export** — RL losses require the log probability from the distribution that selected each retained token, returned alongside the completion.
 
 3. **MoE routing data export (R3)** — supported MoE paths can export expert choices so the trainer can run a route-conditioned recomputation. Reusing routes does not by itself prove logprob parity or gradient correctness.
 
-4. **Numerical-program controls** — xorl-sglang exposes controls used to align trainer and sampler arithmetic (`router_fp32`, `lm_head_fp32`, RMSNorm/RoPE behavior, and related paths). Matching flag names is only configuration; exactness remains revision-, model-, topology-, and trace-specific evidence.
+4. **Numerical-program controls** — for admitted architectures, `--rl-on-policy-target xorl` resolves the router, LM head, RMSNorm/RoPE, attention, and related arithmetic as one model-specific program. The target name is configuration; exactness remains revision-, model-, topology-, and trace-specific evidence.
 
 ---
 
@@ -26,30 +26,29 @@ The pinned xorl-sglang `main` branch carries the XoRL integration. The exact dif
 
 ### 1. Weight Update Endpoints and Protocol
 
-xorl-sglang adds HTTP endpoints for NCCL weight synchronization as well as receiver support used by the P2P and sparse-delta transports. Representative NCCL endpoints include:
+xorl-sglang exposes a shared two-phase receiver for NCCL broadcast and Mooncake P2P. The pinned HTTP surface is:
 
 | Endpoint | Description |
 |---|---|
 | `POST /init_weights_update_group` | Join an NCCL process group for weight sync. Forces eager NCCL communicator creation with `device_id` and `NCCL_CUMEM_ENABLE=0` to match xorl's training side. |
 | `POST /update_weights_from_distributed` | Receive broadcasted weight tensors via NCCL `dist.broadcast`. Called per weight bucket. |
-| `POST /prepare_weights_update` | Phase 1 of two-phase protocol: starts background recv threads ready to receive NCCL broadcasts. |
-| `POST /complete_weights_update` | Phase 2: waits for recv threads to complete and applies the received weights. |
-| `POST /receive_weights` | Single-call weight receive via NCCL broadcast (pause/broadcast/resume protocol). |
-| `POST /receive_weights_ep_scatter` | Receive expert weights from multiple EP training ranks via NCCL P2P scatter. Receives directly into `param.data` slices (zero-copy). |
-| `POST /list_weights` | List all weight names/shapes — used to verify weight name mapping between training and inference. |
+| `POST /prepare_weights_update` | Phase 1: for NCCL, arms background receive threads; for `transport: "p2p"`, returns registered Mooncake tensor locators and receiver-engine metadata. |
+| `POST /complete_weights_update` | Phase 2: applies a prepared NCCL receive or finalizes a P2P session, then performs the requested cache/version post-processing. |
 | `POST /destroy_weights_update_group` | Tear down the NCCL group after sync completes. |
 
 Key implementation details:
 - **Eager NCCL init**: Both sides must use `device_id` to force eager communicator creation. Without this, sglang uses lazy init and xorl's rank 0 hangs waiting for peers.
 - **Two-phase protocol**: `prepare_weights_update` starts background recv threads, then `complete_weights_update` applies them after the training-side broadcast finishes. This avoids blocking the scheduler.
-- **EP scatter**: For MoE models with expert parallelism, each EP training rank sends its local experts directly into the corresponding slice of `param.data` via P2P ops — no intermediate buffers.
-- **Health check bypass**: During weight updates, the `/health` endpoint returns 200 immediately instead of running a test generation, avoiding timeouts during NCCL operations.
+- **P2P receiver**: With `transport: "p2p"`, the same endpoints expose registered parameter locations so Mooncake can write directly into receiver memory. Direct-EP use remains subject to the training-side topology and receiver mapping checks.
+- **Health check bypass**: By default, `/health` returns 200 without running a test generation; `/health_generate` exercises generation when an active check is required. This avoids control-plane timeouts while NCCL operations are in flight.
+
+The pinned revision does **not** expose `/receive_weights`, `/receive_weights_ep_scatter`, `/list_weights`, or `/update_weights_from_sparse_delta`. Do not build integrations against those routes for this checkout.
 
 The training server's `nccl_broadcast` backend drives these calls — see [Backend: nccl_broadcast](/xorl/server-training/weight-sync/nccl-broadcast/) for the full protocol.
 
 ### 2. MoE Routing Data Export (R3)
 
-Modified files: `routed_experts_capturer.py`, `qwen3_moe.py`, `qwen2_moe.py`, `io_struct.py`, `detokenizer_manager.py`, `scheduler_output_processor_mixin.py`
+Routing capture is implemented by the state capturer, scheduler output, and tokenizer response paths in the pinned submodule.
 
 For MoE models, xorl-sglang records which experts each token was routed to during generation and returns this alongside completions:
 
@@ -61,50 +60,30 @@ routed_experts = completions[i].meta_info["routed_experts"]
 
 The training server can decode and replay these routing decisions so the route-conditioned trainer computation uses the exported expert assignments. That controls a discrete selection surface; it is not independent evidence that the trainer and sampler logprobs, expert arithmetic, gradients, or updated weights agree.
 
-**Expert routing weights export** (`--enable-return-expert-logits`): In addition to expert indices, xorl-sglang can also capture and return `topk_weights` (the softmax routing probabilities). The `RoutedExpertsCapturer` allocates a separate `topk_weights_buffer` in float32 to record these per layer.
-
-**Format:** xorl-sglang encodes routing data as base64 int32 arrays with shape metadata to minimize transfer overhead:
+**Format:** xorl-sglang encodes routing indices as raw base64 `int32` bytes to minimize transfer overhead:
 ```json
 {
-  "routed_experts": "<base64_encoded_int32_array>",
-  "routed_expert_meta": {"shape": [512, 28, 2], "dtype": "int32"}
+  "routed_experts": "<base64_encoded_int32_array>"
 }
 ```
 
-The `RoutingReplayHandler` in xorl decodes and distributes this data across context-parallel and packing dimensions automatically.
+The payload does not include routing weights or separate shape metadata. XoRL's `RoutingReplayHandler` decodes it and infers the shape from the retained-token count, MoE layer count, and model top-k before distributing it across context-parallel and packing dimensions.
 
 ### 3. Numerical Alignment
 
-Modified files: `qwen3_moe.py`, `qwen3.py`, `qwen2_moe.py`, `qwen2.py`, `layernorm.py`, `server_args.py`
+Exact on-policy work requires the trainer's retained-token logprob bytes to agree with the decision-time sampler bytes for the tested revision pair. In the pinned xorl-sglang revision, admitted Qwen3.5-family and GLM-5.2 programs are architecture-owned: `--rl-on-policy-target xorl` derives and validates their precision, topology, attention, routing, cache, graph, and sampling settings.
 
-Exact on-policy work requires the trainer's retained-token logprob bytes to agree with the decision-time sampler bytes for the tested revision pair. xorl-sglang provides controls used by supported numerical programs:
-
-- **`--enable-fp32-router`**: MoE router gate computation in FP32. In `Qwen3MoeSparseMoeBlock`, when `rl_on_policy_target` is set, the router uses `F.linear` in float32 with explicit `F.softmax` + `torch.topk` instead of the fused TopK kernel.
-- **`--enable-fp32-lm-head`**: LM head logits in FP32 (already upstream, but used together with the router flag).
-- **RMSNorm alignment**: When `rl_on_policy_target` is set, Q/K norms use `cast_x_before_out_mul=True` and `fp32_residual=False` to match xorl's training-side norm behavior.
-- **Fused kernel bypass**: Disables `fused_qk_norm_rope` and `fused_kv_buffer` when `rl_on_policy_target` is set, since fused kernels can produce slightly different numerics.
-
-Configure both sides identically:
-
-```yaml
-# xorl server config (server_config.yaml)
-router_fp32: true
-lm_head_fp32: true
-rmsnorm_mode: compile
-activation_native: false
-rope_native: false
-attention_cast_bf16: false
-```
+`--enable-fp32-lm-head` remains a public generic control. Router precision for the admitted exact MoE programs is resolved internally; the pinned parser has no `--enable-fp32-router` option. It also has no `--enable-return-expert-logits` option.
 
 ```bash
 # xorl-sglang launch
 python -m sglang.launch_server \
-    --model-path Qwen/Qwen3-8B \
-    --enable-fp32-router \
-    --enable-fp32-lm-head \
+    --model-path <supported-model> \
     --rl-on-policy-target xorl \
     --port 30000
 ```
+
+The resolver rejects incompatible options for an admitted architecture rather than silently selecting a different program. A successful launch is still not a parity certificate; validate the intended revision pair and workload with decision-time logprob artifacts.
 
 ### 4. Batch-Invariant Mode
 
@@ -120,7 +99,7 @@ Two additional fixes on top of the upstream merge:
 
 ### KV Cache Flush on Weight Update
 
-After a weight sync, xorl-sglang flushes its KV cache. The training server sends `flush_cache=True` on the last weight bucket to trigger this. Without flushing, cached key/value tensors from the old policy weights would be reused with new weights, producing incorrect logits.
+Cache invalidation follows the sync request. `cache_invalidation_mode: auto` resolves to a flush for FP8 weight sync into an FP8-KV endpoint; `flush` always requests one, and `none` relies on receiver versioning. A flush must be paired with `pause_mode: retract` so no running batch is retained. Use `pause_mode: in_place` only with `cache_invalidation_mode: none` and `flush_cache: false`. See the [weight-sync overview](/xorl/server-training/weight-sync/overview/) for the valid combinations.
 
 ---
 
@@ -132,11 +111,12 @@ xorl-sglang is included as a git submodule under `submodules/xorl-sglang`. If yo
 pip install -e "submodules/xorl-sglang/python[all]"
 ```
 
-Or use `pyproject.sglang.toml` to install xorl, xorl-client, and xorl-sglang together (pins PyTorch to 2.9.1):
+Or use `pyproject.sglang.toml` to install xorl, xorl-client, and xorl-sglang together with the pinned PyTorch 2.11/Transformers 5.12/FlashAttention 4 stack:
 
 ```bash
 cp pyproject.sglang.toml pyproject.toml
-uv sync          # or: pip install -e .
+UV_PROJECT_ENVIRONMENT=.venv-sglang uv sync
+source .venv-sglang/bin/activate
 ```
 
 See the [installation guide](/xorl/getting-started/installation/#install-submodules) for full details.
@@ -150,7 +130,6 @@ python -m sglang.launch_server \
     --model-path Qwen/Qwen3-8B-FP8 \
     --port 30000 \
     --rl-on-policy-target xorl \
-    --enable-fp32-router \
     --enable-fp32-lm-head \
     --mem-fraction-static 0.88
 ```
@@ -163,7 +142,6 @@ CUDA_VISIBLE_DEVICES=4,5 python -m sglang.launch_server \
     --port 30000 \
     --tp-size 2 \
     --rl-on-policy-target xorl \
-    --enable-fp32-router \
     --enable-fp32-lm-head \
     --mem-fraction-static 0.88
 ```
@@ -177,7 +155,6 @@ python -m sglang.launch_server \
     --host 0.0.0.0 \
     --tp-size 4 \
     --rl-on-policy-target xorl \
-    --enable-fp32-router \
     --enable-fp32-lm-head \
     --mem-fraction-static 0.88
 ```
@@ -186,11 +163,10 @@ python -m sglang.launch_server \
 
 | Flag | Description |
 |---|---|
-| `--rl-on-policy-target xorl` | Enable xorl weight sync endpoints and routing capture. Use `xorl-batch-invariant` for batch-invariant mode. |
-| `--enable-fp32-router` | MoE router gate in FP32 (must match training config `router_fp32: true`) |
-| `--enable-fp32-lm-head` | LM head logits in FP32 (must match training config `lm_head_fp32: true`) |
+| `--rl-on-policy-target xorl` | Select deterministic inference and the architecture-owned XoRL numerical program when the model has one. Weight-sync endpoints are independent of this flag. Use `xorl-batch-invariant` for the generic batch-invariant target. |
+| `--enable-fp32-lm-head` | Request FP32 LM-head logits on generic paths; admitted architecture-owned programs resolve their required head precision automatically. |
 | `--enable-return-routed-experts` | Return expert routing indices in response metadata (for R3) |
-| `--enable-return-expert-logits` | Return expert routing weights alongside indices |
+| `--enable-rdma-weight-updates` | Initialize the Mooncake receiver used by XoRL's P2P weight-sync backend. |
 | `--tp-size N` | Tensor parallelism across N GPUs |
 | `--mem-fraction-static 0.88` | Fraction of GPU memory for KV cache (leave headroom for weight sync buffers) |
 
@@ -265,10 +241,10 @@ xorl-sglang tracks upstream SGLang and periodically rebases. Integration work is
 
 | Area | Files modified | Nature of change |
 |---|---|---|
-| Weight sync protocol | Model runner, scheduler update mixins, tokenizer communication, HTTP server, and RDMA/sparse receiver paths | NCCL, P2P, and sparse-delta receive/update surfaces |
-| Routing data export | `routed_experts_capturer.py`, `io_struct.py`, `detokenizer_manager.py`, `scheduler_output_processor_mixin.py` | Additions to existing generation path |
-| Numerical alignment | `qwen3_moe.py`, `qwen3.py`, `qwen2_moe.py`, `qwen2.py`, `layernorm.py` | Conditional paths gated on `rl_on_policy_target` |
-| CLI args | `server_args.py` | New flags: `--enable-fp32-router`, `--enable-return-expert-logits`, `--enable-rdma-weight-updates`, `--rl-on-policy-target xorl` |
+| Weight sync protocol | Weight updater, tokenizer control, HTTP server, and P2P receiver paths | Two-phase NCCL and Mooncake P2P receive/update surfaces; no sparse-delta receiver |
+| Routing data export | State capturer and tokenizer response paths | Base64 `int32` routed-expert indices; no routing-weight export |
+| Numerical alignment | Architecture-specific model, kernel, and server-argument resolvers | Fail-closed programs selected by `--rl-on-policy-target xorl` |
+| CLI args | `server_args.py` | Current public controls include `--rl-on-policy-target`, `--enable-fp32-lm-head`, `--enable-return-routed-experts`, and `--enable-rdma-weight-updates` |
 | Bug fixes | `schedule_batch.py`, `scheduler.py` | Prefill-only slot leak fix |
 
 Use the submodule commit pinned by the XoRL checkout. Do not infer compatibility from an unpinned xorl-sglang or upstream SGLang branch; if a needed feature is absent from the pinned revision, file an issue in the xorl-sglang repository.
@@ -277,6 +253,6 @@ Use the submodule commit pinned by the XoRL checkout. Do not infer compatibility
 
 | Repo | Description |
 |---|---|
-| [`togethercomputer/xorl-sglang`](https://github.com/togethercomputer/xorl-sglang) | xorl's SGLang fork — weight update API, R3 export, numerical alignment |
+| [`togethercomputer/xorl-sglang`](https://github.com/togethercomputer/xorl-sglang) | xorl's SGLang fork — NCCL/P2P weight-update API, R3 route export, and architecture-owned numerical programs |
 | [`src/xorl/server/weight_sync/backends/nccl_broadcast.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/server/weight_sync/backends/nccl_broadcast.py) | Training-side NCCL broadcast implementation that drives the SGLang weight update endpoints |
 | [`src/xorl/server/runner/utils/routing_replay_handler.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/server/runner/utils/routing_replay_handler.py) | Decodes R3 routing data from SGLang and distributes it across SP/packing dimensions |

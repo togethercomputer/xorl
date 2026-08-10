@@ -374,8 +374,9 @@ class ServerArguments:
         default=False,
         metadata={
             "help": (
-                "Enable experimental dense full-weight QARL fake quantization. Initial support uses dynamic "
-                "E4M3 fake quantization with full-precision master parameters and STE gradients."
+                "Enable experimental full-weight QARL fake quantization with full-precision master parameters "
+                "and STE gradients. E4M3 supports dense nn.Linear modules; NVFP4 also supports MoE expert "
+                "containers."
             )
         },
     )
@@ -383,8 +384,9 @@ class ServerArguments:
         default=None,
         metadata={
             "help": (
-                "QARL quantization config or alias. Initial support accepts null, 'FP8_DEFAULT_CFG', 'fp8', "
-                "or a dict with format/quant_method=e4m3/fp8_e4m3 plus optional weight/activation booleans."
+                "QARL quantization config or alias. Accepts null, 'FP8_DEFAULT_CFG', 'fp8', 'fp8_e4m3', "
+                "'e4m3', or 'nvfp4', plus dictionaries for those formats. NVFP4 defaults to weight-only, "
+                "dynamic group-size-16 fake quantization."
             )
         },
     )
@@ -406,7 +408,12 @@ class ServerArguments:
     )
     qarl_target_modules: Optional[List[str]] = field(
         default=None,
-        metadata={"help": "Optional short nn.Linear module names to wrap with QARL fake quantization."},
+        metadata={
+            "help": (
+                "Optional short names, FQNs, or globs to wrap with QARL fake quantization. NVFP4 targets may "
+                "also match MoE expert containers."
+            )
+        },
     )
     qarl_exclude_modules: Optional[List[str]] = field(
         default=None,
@@ -1145,7 +1152,8 @@ class ServerArguments:
             "'nccl_broadcast' (rank-0 broadcast via SGLang update_weights_from_distributed); "
             "'p2p' (RDMA one-sided writes via Mooncake TransferEngine into SGLang's "
             "registered param memory; requires --enable-rdma-weight-updates on the SGLang side); "
-            "'sparse_delta' (experimental packed sparse files via SGLang update_weights_from_sparse_delta)"
+            "'sparse_delta' is accepted by XoRL but unavailable with the pinned xorl-sglang "
+            "revision because its update_weights_from_sparse_delta receiver is absent"
         },
     )
     receiver_kv_cache_dtype: Optional[Literal["auto", "fp8", "fp8_e4m3"]] = field(

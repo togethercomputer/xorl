@@ -14,7 +14,7 @@ XoRL ships two deliberately different dependency profiles:
 | Profile | Manifest | PyTorch / CUDA runtime | Triton | Attention stack | Use it for |
 |---|---|---|---|---|---|
 | Default | `pyproject.toml` | 2.12.1 / CUDA 13.2 | 3.7.1 | FlashAttention 4 (`4.0.0b19`) | Local training and the XoRL training server |
-| Combined xorl-sglang | `pyproject.sglang.toml` | 2.9.1 / CUDA 12.9 | 3.5.1 | FlashAttention 3 plus FlashAttention CuTe | A single environment that also runs the pinned xorl-sglang submodule |
+| Combined xorl-sglang | `pyproject.sglang.toml` | 2.11.0 / CUDA 13 | 3.6.0 | FlashAttention 4 (`4.0.0b19`) | A single environment that also runs the pinned xorl-sglang submodule |
 
 These profiles are not interchangeable. Use the manifest that matches the process you intend to run rather than upgrading or mixing their pinned Torch, Triton, or attention packages independently.
 
@@ -70,8 +70,8 @@ Do not install xorl-sglang into the default PyTorch 2.12 environment. To install
 **uv:**
 ```bash
 cp pyproject.sglang.toml pyproject.toml
-uv sync
-source .venv/bin/activate
+UV_PROJECT_ENVIRONMENT=.venv-sglang uv sync
+source .venv-sglang/bin/activate
 ```
 
 **conda:**
@@ -79,10 +79,10 @@ source .venv/bin/activate
 conda create -n xorl-sglang python=3.12
 conda activate xorl-sglang
 cp pyproject.sglang.toml pyproject.toml
-pip install -e .
+pip install -e . -e "submodules/xorl-sglang/python[all]"
 ```
 
-> **Note:** Copying the alternate manifest replaces the tracked `pyproject.toml`. Do this in a clean checkout and restore that file before committing unrelated changes. The version table above is the source of truth for the two profiles.
+> **Note:** Copying the alternate manifest replaces the tracked `pyproject.toml`, and `uv sync` regenerates the tracked `uv.lock`. Do this in a clean checkout and restore both files before committing unrelated changes. The separate `.venv-sglang` keeps this profile isolated from the default `.venv`. The version table above is the source of truth for the two profiles.
 
 > These submodules are only needed for **server training / online RL**. If you are only running local SFT or pretraining, you can skip this step.
 
@@ -100,8 +100,7 @@ For the combined xorl-sglang profile:
 
 ```bash
 python -c "import torch, triton, xorl, sglang; print(torch.__version__, triton.__version__)"
-python -c "import flash_attn_interface; print('FlashAttention 3 ok')"
-python -c "from flash_attn.cute import flash_attn_func; print('FlashAttention CuTe ok')"
+python -c "from flash_attn.cute import flash_attn_func; print('FlashAttention 4 ok')"
 ```
 
 ## DeepEP Install (Optional)
