@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -51,10 +53,14 @@ from xorl.server.api_server.api_types import (
     UntypedAPIFuture,
     WeightsInfoRequest,
     WeightsInfoResponse,
+    ZORLAbortGenerationRequest,
+    ZORLApplyRewardsRequest,
+    ZORLStartGenerationRequest,
 )
 from xorl.server.api_server.utils import validate_model_id
 from xorl.server.protocol.api_orchestrator import OrchestratorRequest
 from xorl.server.protocol.operations import KillSessionData, RegisterSessionData
+from xorl.server.security import resolve_path_within, validate_identifier
 from xorl.server.session_spec import (
     load_session_spec_from_checkpoint,
     normalize_session_spec,
@@ -82,6 +88,22 @@ def _first_output_result(output: Any) -> Dict[str, Any]:
     return output.outputs or {}
 
 
+def _canon_base_model(model: Optional[str]) -> Optional[str]:
+    """Canonicalize a base-model reference for identity comparison.
+
+    An HF cache path (".../models--ORG--NAME/snapshots/HASH") and the bare repo
+    id ("ORG/NAME") name the same base model. Normalize so the LoRA create_model
+    handshake doesn't reject HF-name (client) vs resolved-path (server) —
+    full-weight runs never hit this (they use the default session).
+    """
+    if not model:
+        return model
+    match = re.search(r"models--([^/]+?)--(.+?)/snapshots/", model)
+    if match:
+        return f"{match.group(1)}/{match.group(2)}"
+    return model
+
+
 async def _register_runtime_session(
     server,
     *,
@@ -89,9 +111,10 @@ async def _register_runtime_session(
     base_model: str,
     raw_lora_config: Optional[Dict[str, Any]],
     raw_optimizer_config: Optional[Dict[str, Any]],
+    raw_zorl_config: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Normalize and register a session runtime spec with workers and API state."""
-    if server.base_model is not None and base_model != server.base_model:
+    if server.base_model is not None and _canon_base_model(base_model) != _canon_base_model(server.base_model):
         raise ValueError(
             f"create_model base_model must match the server base model. "
             f"requested={base_model!r}, server={server.base_model!r}"
@@ -102,7 +125,7 @@ async def _register_runtime_session(
             raise ValueError(
                 "Full-weight server multi-tenancy is not supported yet. Use the reserved model_id='default' session."
             )
-        if raw_lora_config or raw_optimizer_config:
+        if raw_lora_config or raw_optimizer_config or raw_zorl_config:
             raise ValueError("Per-session LoRA or optimizer overrides are not supported in full-weight server mode.")
         normalized_spec = {
             "base_model": base_model,
@@ -114,6 +137,7 @@ async def _register_runtime_session(
             base_model=base_model,
             raw_lora_config=raw_lora_config,
             raw_optimizer_config=raw_optimizer_config,
+            raw_zorl_config=raw_zorl_config,
             default_rank=server.default_session_spec["lora_config"]["lora_rank"],
             default_alpha=server.default_session_spec["lora_config"]["lora_alpha"],
             max_lora_rank=server.max_lora_rank or server.default_session_spec["lora_config"]["lora_rank"],
@@ -123,6 +147,7 @@ async def _register_runtime_session(
             default_optimizer_dtype=server.default_session_spec["optimizer_config"]["optimizer_dtype"],
             default_optimizer_kwargs=server.default_session_spec["optimizer_config"].get("optimizer_kwargs", {}),
             server_lora_config=server.server_lora_config,
+            default_zorl_config=server.default_session_spec.get("zorl_config"),
             default_betas=tuple(server.default_session_spec["optimizer_config"].get("betas") or (0.9, 0.95)),
             default_eps=float(server.default_session_spec["optimizer_config"].get("eps") or 1e-8),
         )
@@ -248,6 +273,48 @@ async def optim_step_endpoint(request: OptimStepRequest, server=Depends(require_
     the OptimStepResponse result.
     """
     return await server.submit_optim_step_async(request)
+
+
+@router.post(
+    "/api/v1/zorl/start_generation",
+    response_model=UntypedAPIFuture,
+    responses={
+        500: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
+    },
+    tags=["ZORL"],
+)
+async def start_zorl_generation_endpoint(request: ZORLStartGenerationRequest, server=Depends(require_api_server)):
+    """Plan and export one ZORL generation (two-phase pattern)."""
+    return await server.submit_start_zorl_generation_async(request)
+
+
+@router.post(
+    "/api/v1/zorl/apply_rewards",
+    response_model=UntypedAPIFuture,
+    responses={
+        500: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
+    },
+    tags=["ZORL"],
+)
+async def apply_zorl_rewards_endpoint(request: ZORLApplyRewardsRequest, server=Depends(require_api_server)):
+    """Apply externally aggregated rewards for the active ZORL generation (two-phase pattern)."""
+    return await server.submit_apply_zorl_rewards_async(request)
+
+
+@router.post(
+    "/api/v1/zorl/abort_generation",
+    response_model=UntypedAPIFuture,
+    responses={
+        500: {"model": ErrorResponse},
+        503: {"model": ErrorResponse},
+    },
+    tags=["ZORL"],
+)
+async def abort_zorl_generation_endpoint(request: ZORLAbortGenerationRequest, server=Depends(require_api_server)):
+    """Abort the active ZORL generation without updating the parent adapter (two-phase pattern)."""
+    return await server.submit_abort_zorl_generation_async(request)
 
 
 @router.post(
@@ -402,35 +469,43 @@ async def weights_info_endpoint(request: WeightsInfoRequest, server=Depends(requ
         )
     checkpoint_model_id = validate_model_id(checkpoint_model_id)
 
-    weights_dir = os.path.abspath(os.path.join(server.output_dir, "weights", checkpoint_model_id))
-    checkpoint_path = os.path.abspath(os.path.join(weights_dir, checkpoint_name))
     try:
-        if os.path.commonpath([checkpoint_path, weights_dir]) != weights_dir:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid checkpoint path in xorl_path: {xorl_path}",
-            )
+        checkpoint_name = validate_identifier(checkpoint_name, name="checkpoint_name")
+        weights_dir = Path(server.output_dir) / "weights" / checkpoint_model_id
+        checkpoint_path = resolve_path_within(
+            weights_dir,
+            checkpoint_name,
+            must_exist=True,
+            reject_symlinks=True,
+        )
     except ValueError:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Invalid checkpoint path in xorl_path: {xorl_path}",
-        )
-    if not os.path.exists(checkpoint_path):
+        ) from None
+    except FileNotFoundError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Checkpoint not found: {xorl_path}",
-        )
+        ) from None
+    try:
+        checkpoint_path.relative_to(weights_dir.resolve())
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid checkpoint path in xorl_path: {xorl_path}"
+        ) from None
 
     try:
         session_spec = load_session_spec_from_checkpoint(
-            checkpoint_path,
+            str(checkpoint_path),
             fallback_base_model=server.base_model,
             fallback_session_spec=server.model_configs.get(checkpoint_model_id) or server.default_session_spec,
         )
     except Exception as e:
+        logger.exception("Failed to read checkpoint metadata for %s", xorl_path)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to read checkpoint metadata from {xorl_path}: {e}",
+            detail="Failed to read checkpoint metadata; see server logs for the request ID",
         ) from e
 
     return WeightsInfoResponse(**session_spec)
@@ -496,6 +571,7 @@ async def create_model_endpoint(request: CreateModelRequest, server=Depends(requ
             base_model=req.base_model,
             raw_lora_config=_dump_optional_config(req.lora_config),
             raw_optimizer_config=_dump_optional_config(req.optimizer_config),
+            raw_zorl_config=_dump_optional_config(req.zorl_config),
         )
 
         logger.info(f"Registered model_id: {req.model_id} with session_spec: {normalized_spec}")

@@ -83,11 +83,12 @@ These flags align the training model's numerics with the inference engine (SGLan
 | `enable_full_shard` | `true` | FSDP2 full parameter sharding (ZeRO-3). |
 | `enable_activation_offload` | `false` | Offload activations to CPU. |
 | `enable_compile` | `false` | `torch.compile` for forward pass. |
+| `compile_dynamic_shapes` | `false` | Pass `dynamic=True` to `torch.compile`; keep disabled unless a workload has benchmarked a dynamic-shape win. |
 | `enable_reentrant` | `false` | Use reentrant gradient checkpointing. |
 | `enable_forward_prefetch` | `false` | FSDP forward prefetch. |
 | `init_device` | `meta` | Model initialization device: `cpu`, `meta`, `cuda`. |
 | `load_weights_mode` | `grouped` | Weight loading mode: `grouped` (default, with rank-0 fallback), `all_ranks`, or `skip`. |
-| `ce_mode` | `compiled` | Cross-entropy implementation: `compiled` (recommended, `torch.compile`) or `eager` (may OOM at 32K+ seq len). |
+| `ce_mode` | `compiled` | Cross-entropy implementation: `compiled` (recommended, `torch.compile`), `quack_linear` (scalar loss only; incompatible with `return_per_token: true`), or `eager` (may OOM at 32K+ seq len). |
 
 ---
 
@@ -97,6 +98,7 @@ These flags align the training model's numerics with the inference engine (SGLan
 |---|---|---|
 | `optimizer` | `adamw` | Optimizer: `adamw`, `anyprecision_adamw`, `sgd`, `signsgd`, `muon`. |
 | `optimizer_dtype` | `bf16` | Dtype for optimizer states: `fp32` or `bf16`. BF16 halves optimizer memory. |
+| `muon_fallback_optimizer` | `adamw` | Optimizer used for parameters excluded from Muon. Use `sgd` for a state-free fallback in memory-constrained no-momentum Muon runs. |
 | `muon_lr` | `0.02` | Learning rate for Muon matrix parameter groups. Only used when `optimizer: muon`. |
 | `muon_momentum` | `0.95` | Muon momentum coefficient. |
 | `muon_nesterov` | `true` | Use Nesterov momentum in Muon. |
@@ -186,4 +188,4 @@ ZMQ communication between the launcher, workers, and API server.
 
 | Field | Default | Description |
 |---|---|---|
-| `sync_inference_method` | `nccl_broadcast` | Method for pushing updated weights to the inference endpoint after each step. Currently only `nccl_broadcast` is supported (uses SGLang `update_weights_from_distributed`). |
+| `sync_inference_method` | `nccl_broadcast` | Method for pushing updated weights to the inference endpoint after each step. Supported values: `nccl_broadcast` (SGLang `update_weights_from_distributed`), `p2p` (Mooncake RDMA writes), and experimental `sparse_delta` (packed sparse files via SGLang `update_weights_from_sparse_delta`). |

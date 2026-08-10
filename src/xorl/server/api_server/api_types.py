@@ -4,9 +4,10 @@ API Request/Response Types for REST API.
 Pydantic type definitions for FastAPI endpoints in the unified API server.
 """
 
+import math
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_serializer, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
 
 
 def _map_session_id_to_model_id(data: Any) -> Any:
@@ -90,6 +91,26 @@ class Datum(BaseModel):
 
         def convert_value(v: InputType) -> List[Union[int, float, str]]:
             if isinstance(v, TensorData):
+                # Rank>=2 TensorData: re-nest the flattened data per shape. The engine
+                # datum pipeline (orchestrator packer / collators) expects sequence
+                # fields as nested per-token rows (e.g. client-provided
+                # teacher_hidden_states [seq_len, hidden]). Returning flat data drops
+                # the shape: the packer then sees len != seq_len, misclassifies the
+                # field as scalar metadata, and silently keeps only the last sample's
+                # values. Rank-0/1 behavior is unchanged.
+                if v.shape is not None and len(v.shape) > 1:
+                    expected = 1
+                    for dim in v.shape:
+                        expected *= dim
+                    if expected == len(v.data) and expected > 0:
+
+                        def nest(flat: List[Any], dims: List[int]) -> List[Any]:
+                            if len(dims) == 1:
+                                return flat
+                            step = len(flat) // dims[0]
+                            return [nest(flat[i * step : (i + 1) * step], dims[1:]) for i in range(dims[0])]
+
+                        return nest(v.data, list(v.shape))
                 return v.data
             return v
 
@@ -154,6 +175,10 @@ class LossFnOutput(BaseModel):
     logprobs: Optional[TensorData] = Field(default=None, description="Per-token log probabilities")
     elementwise_loss: Optional[TensorData] = Field(default=None, description="Per-token cross entropy loss")
     k3: Optional[float] = Field(default=None, description="Per-sample K3 KL divergence estimate")
+    token_diagnostics: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Optional per-token diagnostic payload, e.g. target rank and top-k logprobs",
+    )
 
     @field_serializer("loss")
     def _serialize_loss_as_tensor_data(self, v, _info):
@@ -221,6 +246,44 @@ class OptimizerConfigRequest(BaseModel):
     optimizer_kwargs: Optional[Dict[str, Any]] = Field(default=None, description="Optimizer-specific kwargs")
 
 
+class ZORLConfigRequest(BaseModel):
+    """Per-session ZORL overrides accepted by create_model."""
+
+    model_config = ConfigDict(extra="allow")
+
+    enabled: Optional[bool] = Field(default=None, description="Enable ZORL for this session")
+    b_sigma: Optional[float] = Field(default=None, description="Perturbation scale applied to LoRA-B")
+    num_perturbation_pairs: Optional[int] = Field(
+        default=None,
+        description="Number of perturbation seeds per generation before antithetic expansion",
+    )
+    a_refresh_interval: Optional[int] = Field(
+        default=None,
+        description="Generations between fresh LoRA-A family refreshes (0 disables refresh)",
+    )
+    antithetic_sampling: Optional[bool] = Field(
+        default=None,
+        description="Whether each perturbation seed emits both positive and negative LoRA-B candidates",
+    )
+    a_init: Optional[Literal["gaussian_jl"]] = Field(
+        default=None,
+        description="Initialization scheme used for fresh LoRA-A families",
+    )
+    seed: Optional[int] = Field(default=None, description="Optional base RNG seed for family and perturbation planning")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_aliases(cls, data):
+        if isinstance(data, dict):
+            if "sigma" in data and "b_sigma" not in data:
+                data["b_sigma"] = data["sigma"]
+            if "refresh_interval" in data and "a_refresh_interval" not in data:
+                data["a_refresh_interval"] = data["refresh_interval"]
+            if "num_pairs" in data and "num_perturbation_pairs" not in data:
+                data["num_perturbation_pairs"] = data["num_pairs"]
+        return data
+
+
 class LoRARuntimeConfig(BaseModel):
     """Normalized LoRA runtime config returned by the API."""
 
@@ -238,6 +301,27 @@ class OptimizerRuntimeConfig(BaseModel):
     betas: Optional[List[float]] = Field(default=None, description="Adam-family beta coefficients")
     eps: Optional[float] = Field(default=None, description="Adam-family epsilon")
     optimizer_kwargs: Dict[str, Any] = Field(default_factory=dict, description="Optimizer-specific kwargs")
+
+
+class ZORLRuntimeConfig(BaseModel):
+    """Normalized ZORL runtime config returned by the API."""
+
+    enabled: bool = Field(default=True, description="Whether ZORL is enabled for the session")
+    b_sigma: float = Field(..., description="Perturbation scale applied to LoRA-B")
+    num_perturbation_pairs: int = Field(
+        ...,
+        description="Number of perturbation seeds per generation before antithetic expansion",
+    )
+    a_refresh_interval: int = Field(
+        ...,
+        description="Generations between fresh LoRA-A family refreshes (0 disables refresh)",
+    )
+    antithetic_sampling: bool = Field(
+        ...,
+        description="Whether each perturbation seed emits both positive and negative LoRA-B candidates",
+    )
+    a_init: Literal["gaussian_jl"] = Field(..., description="Initialization scheme used for fresh LoRA-A families")
+    seed: Optional[int] = Field(default=None, description="Optional base RNG seed for family and perturbation planning")
 
 
 # ============================================================================
@@ -367,6 +451,182 @@ class OptimStepResponse(BaseModel):
 # ============================================================================
 
 
+class ZORLGenerationMaterialization(BaseModel):
+    """Local candidate materialization policy for sharded ZORL populations."""
+
+    mode: Literal["all", "pair_shard", "pair_range"] = Field(
+        default="all",
+        description="Whether this worker exports every pair, modulo-assigned pairs, or a contiguous pair range",
+    )
+    shard_index: Optional[int] = Field(default=None, description="Shard index for pair_shard materialization")
+    num_shards: Optional[int] = Field(default=None, description="Total shards for pair_shard materialization")
+    pair_start: Optional[int] = Field(default=None, description="Inclusive pair index start for pair_range")
+    pair_end: Optional[int] = Field(default=None, description="Exclusive pair index end for pair_range")
+
+
+class ZORLStartGenerationRequest(BaseModel):
+    """API request for planning and exporting one ZORL generation."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    model_id: str = Field(
+        default="default", description="Model identifier (must be created via /api/v1/create_model first)"
+    )
+    preload_sampling: bool = Field(
+        default=False,
+        description="If true, eagerly load all generated candidate adapters on registered inference endpoints",
+    )
+    num_pairs: Optional[int] = Field(
+        default=None,
+        description="Optional per-generation override for global perturbation-pair count",
+    )
+    materialization: Optional[ZORLGenerationMaterialization] = Field(
+        default=None,
+        description="Optional local materialization policy for sharded population scoring",
+    )
+    owner_url: Optional[str] = Field(
+        default=None,
+        description="Optional URL that owns locally materialized candidate adapters",
+    )
+
+
+class ZORLCandidateInfo(BaseModel):
+    """Metadata for one exported ZORL candidate adapter."""
+
+    candidate_id: str = Field(..., description="Stable candidate identifier within the generation")
+    perturbation_index: int = Field(..., description="Perturbation pair index for this candidate")
+    direction: Literal["positive", "negative"] = Field(..., description="Whether the perturbation is +eps or -eps")
+    model_path: str = Field(..., description="Xorl URI for the exported candidate adapter")
+    lora_name: str = Field(..., description="Relative LoRA name used by inference backends")
+    owner_url: Optional[str] = Field(default=None, description="Inference URL that owns this candidate adapter")
+
+
+class ZORLStartGenerationResponse(BaseModel):
+    """API response for starting a ZORL generation."""
+
+    model_id: str = Field(..., description="Model identifier")
+    generation_id: str = Field(..., description="Stable generation identifier")
+    generation_index: int = Field(..., description="Generation index before the next update")
+    family_id: str = Field(..., description="Active LoRA-A family identifier")
+    family_refreshed: bool = Field(..., description="Whether this generation started a fresh LoRA-A family")
+    b_sigma: float = Field(..., description="Perturbation scale applied to LoRA-B")
+    num_pairs: int = Field(..., description="Number of perturbation seeds in this generation")
+    global_num_pairs: Optional[int] = Field(
+        default=None,
+        description="Global perturbation-pair count when candidate materialization is sharded",
+    )
+    global_population: Optional[int] = Field(
+        default=None,
+        description="Global candidate count before local materialization",
+    )
+    shard_index: Optional[int] = Field(default=None, description="Shard index that produced this response")
+    num_shards: Optional[int] = Field(default=None, description="Total shard count used by this response")
+    local_num_pairs: Optional[int] = Field(default=None, description="Number of local perturbation pairs exported")
+    sampling_ready: bool = Field(
+        default=False,
+        description="Whether all generated candidate adapters were preloaded onto registered inference endpoints",
+    )
+    candidates: List[ZORLCandidateInfo] = Field(..., description="Exported candidate adapters for this generation")
+
+
+class ZORLCandidateReward(BaseModel):
+    """Aggregated reward signal for one ZORL candidate adapter."""
+
+    candidate_id: str = Field(..., description="Candidate identifier from start_generation")
+    reward_mean: float = Field(..., description="Mean reward aggregated over all rollouts for the candidate")
+    num_rollouts: Optional[int] = Field(default=None, description="Optional rollout count used to compute reward_mean")
+
+    @field_validator("reward_mean")
+    @classmethod
+    def _reward_mean_must_be_finite(cls, value: float) -> float:
+        # NaN/Inf would propagate through apply_zorl_rewards into the LoRA-B
+        # update, silently corrupting the parent adapter. Reject at the API
+        # boundary so a degenerate candidate can't poison the next step.
+        if not math.isfinite(value):
+            raise ValueError(f"reward_mean must be finite, got {value!r}")
+        return value
+
+
+class ZORLApplyRewardsRequest(BaseModel):
+    """API request for applying externally aggregated ZORL rewards."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    model_id: str = Field(
+        default="default", description="Model identifier (must be created via /api/v1/create_model first)"
+    )
+    generation_id: str = Field(..., description="Generation identifier returned by start_generation")
+    learning_rate: Optional[float] = Field(
+        default=None, description="Optional override for the parent LoRA optimizer LR"
+    )
+    candidate_rewards: List[ZORLCandidateReward] = Field(
+        default_factory=list,
+        description="Per-candidate mean rewards for the completed generation",
+    )
+    sync_after_apply: bool = Field(
+        default=False,
+        description=(
+            "If true, push the updated weights to all registered inference endpoints after the apply "
+            "via the same machinery as /api/v1/sync_inference_weights. Intended for "
+            "perturbation_mode='fresh_ab', where the update is folded into the BASE weights and the "
+            "served base on replicas becomes stale. Sync failures do not fail the apply (the trainer "
+            "update has already been committed); inspect the response 'sync' field."
+        ),
+    )
+    sync_quantization: Optional[Union[str, Dict[str, Any]]] = Field(
+        default=None,
+        description=(
+            "Optional weight-sync quantization passthrough for sync_after_apply. Either an HF "
+            "quantization_config dict (e.g. {'quant_method': 'fp8', 'weight_block_size': [128, 128]}) "
+            "or the shorthand string 'fp8'. When omitted, the sync uses the server default set via "
+            "set_sync_quantization or auto-detected from the registered endpoints."
+        ),
+    )
+
+
+class ZORLApplyRewardsResponse(BaseModel):
+    """API response for applying a ZORL update."""
+
+    model_id: str = Field(..., description="Model identifier")
+    generation_id: str = Field(..., description="Generation identifier that was applied")
+    applied: bool = Field(..., description="Whether the update was applied successfully")
+    used_pairs: int = Field(..., description="Number of perturbation pairs used for the update")
+    dropped_pairs: int = Field(..., description="Number of perturbation pairs ignored during validation")
+    family_id: str = Field(..., description="LoRA-A family identifier used by the applied generation")
+    next_generation_index: int = Field(
+        ..., description="Generation index that will be used on the next start_generation"
+    )
+    deleted_candidates: int = Field(default=0, description="How many exported candidate directories were deleted")
+    metrics: Dict[str, Any] = Field(..., description="Update metrics (reward stats, update norm, LR, etc.)")
+    sync: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=(
+            "Post-apply inference weight-sync summary (only when sync_after_apply was requested). "
+            "Contains at least 'success' and 'message'; a failed sync does NOT unwind the applied update."
+        ),
+    )
+
+
+class ZORLAbortGenerationRequest(BaseModel):
+    """API request for aborting an active ZORL generation without updating the parent adapter."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    model_id: str = Field(
+        default="default", description="Model identifier (must be created via /api/v1/create_model first)"
+    )
+    generation_id: str = Field(..., description="Generation identifier returned by start_generation")
+
+
+class ZORLAbortGenerationResponse(BaseModel):
+    """API response for aborting an active ZORL generation."""
+
+    success: bool = Field(..., description="Whether the generation abort completed successfully")
+    model_id: str = Field(..., description="Model identifier")
+    generation_id: str = Field(..., description="Aborted generation identifier")
+    deleted_candidates: int = Field(default=0, description="How many exported candidate directories were deleted")
+
+
 # ============================================================================
 # Weights Management
 # ============================================================================
@@ -457,6 +717,9 @@ class WeightsInfoResponse(BaseModel):
     optimizer_config: Optional[OptimizerRuntimeConfig] = Field(
         default=None, description="Normalized optimizer runtime config for LoRA checkpoints"
     )
+    zorl_config: Optional[ZORLRuntimeConfig] = Field(
+        default=None, description="Normalized ZORL runtime config for ZORL-enabled LoRA checkpoints"
+    )
 
     @model_validator(mode="after")
     def _mirror_lora_rank(self):
@@ -477,6 +740,7 @@ class CreateModelRequest(BaseModel):
     optimizer_config: Optional[OptimizerConfigRequest] = Field(
         default=None, description="Per-session optimizer configuration"
     )
+    zorl_config: Optional[ZORLConfigRequest] = Field(default=None, description="Per-session ZORL configuration")
 
     @model_validator(mode="before")
     @classmethod
@@ -806,9 +1070,21 @@ class InferenceEndpointServerInfo(BaseModel):
     )
     quantization_config: Optional[Dict[str, Any]] = Field(
         default=None,
-        description="Full HF quantization_config dict auto-detected from model's config.json",
+        description="Sync-compatible HF quantization_config dict auto-detected from model's config.json",
     )
     dtype: Optional[str] = Field(default=None, description="Model dtype (e.g., 'auto', 'bfloat16')")
+    kv_cache_dtype: Optional[str] = Field(default=None, description="KV-cache dtype reported by the inference server")
+    fp8_kv_cache_enabled: Optional[bool] = Field(
+        default=None, description="Whether the registered SGLang endpoint reports FP8 KV cache"
+    )
+    fp8_kv_cache_requires_postprocess: Optional[bool] = Field(
+        default=None,
+        description="Whether the endpoint needs a postprocess hook after weight updates when FP8 KV cache is enabled",
+    )
+    fp8_kv_cache_static_scales: Optional[bool] = Field(
+        default=None, description="Whether the endpoint reports static FP8 KV-cache scale state"
+    )
+    cache_epoch: Optional[Any] = Field(default=None, description="Receiver cache epoch/version, if reported")
     enable_lora: Optional[bool] = Field(default=None, description="Whether LoRA is enabled")
     max_lora_rank: Optional[int] = Field(default=None, description="Maximum LoRA rank supported")
     version: Optional[str] = Field(default=None, description="SGLang version")
@@ -824,6 +1100,14 @@ class InferenceEndpoint(BaseModel):
     )
     world_size: int = Field(default=1, description="Number of workers at this endpoint")
     healthy: bool = Field(default=True, description="Whether the endpoint is healthy")
+    pool: str = Field(
+        default="default",
+        description=(
+            "Endpoint pool tag. Syncs can be restricted to a subset of pools via "
+            "SyncInferenceWeightsRequest.pools (e.g. a dedicated 'eval' pool synced "
+            "only at eval steps so background evals read frozen weights)."
+        ),
+    )
     server_info: Optional[InferenceEndpointServerInfo] = Field(
         default=None, description="Server info from the inference endpoint"
     )
@@ -839,6 +1123,17 @@ class AddInferenceEndpointRequest(BaseModel):
         description="Port number of the inference worker endpoint. Defaults to port when omitted.",
     )
     world_size: int = Field(default=1, description="Number of workers at this endpoint")
+    pool: str = Field(
+        default="default",
+        description="Endpoint pool tag (see InferenceEndpoint.pool). Defaults to the training pool.",
+    )
+    receiver_kv_cache_dtype: Optional[Literal["auto", "fp8", "fp8_e4m3"]] = Field(
+        default=None,
+        description=(
+            "Optional expected SGLang KV-cache dtype for this endpoint. "
+            "Use fp8/fp8_e4m3 to require receiver /server_info to report FP8 KV cache."
+        ),
+    )
     # Auto-sync configuration
     sync_weights: bool = Field(
         default=False, description="Whether to automatically sync weights to this endpoint after adding"
@@ -890,6 +1185,13 @@ class RemoveInferenceEndpointResponse(BaseModel):
 class SyncInferenceWeightsRequest(BaseModel):
     """API request for synchronizing full model weights to inference endpoints."""
 
+    model_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional training model/session ID whose current weights should be synced. "
+            "In LoRA/QLoRA server mode this selects the adapter to materialize before extracting merged weights."
+        ),
+    )
     master_address: str = Field(
         default="", description="Master address for NCCL rendezvous (training server address). Auto-detected if empty."
     )
@@ -898,9 +1200,20 @@ class SyncInferenceWeightsRequest(BaseModel):
     buffer_size_mb: int = Field(default=1024, description="Size of each transfer bucket in MB (to avoid OOM)")
     flush_cache: bool = Field(
         default=False,
-        description="Whether to flush inference KV cache after weight sync. "
-        "Usually not needed: the radix cache is keyed on token sequences, "
-        "so stale KV entries from previous weights are evicted naturally.",
+        description=(
+            "Whether to flush inference KV/prefix cache after weight sync. "
+            "Set this for online weight updates when later requests may reuse prefixes scored under older weights; "
+            "token-keyed radix caches are not weight-version aware unless the receiver adds a separate invalidation "
+            "contract."
+        ),
+    )
+    cache_invalidation_mode: Literal["auto", "flush", "none"] = Field(
+        default="auto",
+        description=(
+            "How XoRL should handle inference KV/prefix cache invalidation for this sync. "
+            "'auto' flushes when registered endpoint metadata reports FP8 KV cache and FP8 weight sync is active; "
+            "'flush' always flushes; 'none' relies on receiver-side versioning and does not add an automatic flush."
+        ),
     )
     pause_mode: Literal["retract", "abort", "in_place"] = Field(
         default="in_place",
@@ -918,6 +1231,15 @@ class SyncInferenceWeightsRequest(BaseModel):
         description="HF quantization_config dict for weight sync. "
         "If None, uses the default set via set_sync_quantization or auto-detected from endpoint.",
     )
+    pools: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Restrict this sync to endpoints whose pool tag is in this list. None (default) "
+            "syncs every registered endpoint (backward compatible). Use ['default'] for the "
+            "per-step training-sampler sync and ['eval'] to refresh a dedicated eval pool "
+            "only at eval steps."
+        ),
+    )
 
 
 class EndpointSyncResult(BaseModel):
@@ -927,6 +1249,13 @@ class EndpointSyncResult(BaseModel):
     port: int = Field(..., description="Endpoint port")
     success: bool = Field(..., description="Whether sync succeeded")
     message: str = Field(default="", description="Status or error message")
+    cache_epoch: Optional[Any] = Field(default=None, description="Receiver cache epoch/version after sync, if reported")
+    fp8_kv_cache_postprocess_ran: Optional[bool] = Field(
+        default=None, description="Whether receiver reported running FP8 KV-cache postprocess"
+    )
+    fp8_kv_cache_static_scales_updated: Optional[bool] = Field(
+        default=None, description="Whether receiver reported updating static FP8 KV-cache scales"
+    )
 
 
 class SyncInferenceWeightsResponse(BaseModel):
@@ -946,6 +1275,20 @@ class SyncInferenceWeightsResponse(BaseModel):
         default_factory=list,
         description="Optional per-rank P2P transport timing summaries for tail-latency diagnosis",
     )
+    cache_invalidation_mode: Literal["auto", "flush", "none"] = Field(
+        default="auto", description="Requested cache invalidation mode for this sync"
+    )
+    flush_cache: bool = Field(default=False, description="Effective flush_cache value forwarded to the trainer")
+    fp8_kv_cache_enabled: bool = Field(
+        default=False, description="Whether any registered endpoint reported FP8 KV cache for this sync"
+    )
+    fp8_kv_cache_postprocess_requested: bool = Field(
+        default=False, description="Whether XoRL requested receiver postprocess for FP8 KV-cache/static-scale refresh"
+    )
+    fp8_kv_cache_static_scales: bool = Field(
+        default=False, description="Whether any registered endpoint reported static FP8 KV-cache scale state"
+    )
+    cache_epoch: Optional[Any] = Field(default=None, description="Receiver cache epoch/version after sync, if reported")
     endpoints_synced: List[EndpointSyncResult] = Field(
         default_factory=list, description="Sync results for each endpoint"
     )
@@ -968,7 +1311,7 @@ class SetSyncQuantizationRequest(BaseModel):
         description="HF quantization_config dict. Must contain 'quant_method' (e.g. 'fp8'). "
         "Optional fields: 'weight_block_size' (default [128, 128]), "
         "'modules_to_not_convert' (list of module name prefixes to skip), "
-        "'fmt' (e.g. 'e4m3'), 'activation_scheme'. "
+        "'fmt' (must be 'e4m3' for online FP8 sync), 'activation_scheme'. "
         "Set to null for bf16 (no quantization).",
     )
 

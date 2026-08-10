@@ -57,7 +57,8 @@ class _FakeTrainer:
         return {"success": True}
 
 
-def test_handle_save_state_requires_real_checkpoint_for_nonresident_adapter(tmp_path):
+def test_handle_save_state_requires_real_checkpoint_for_nonresident_adapter(tmp_path, monkeypatch):
+    monkeypatch.setenv("XORL_SERVER_ARTIFACT_ROOT", str(tmp_path))
     dispatcher = object.__new__(RunnerDispatcher)
     dispatcher.rank = 0
     dispatcher.trainer = _FakeTrainer()
@@ -85,7 +86,8 @@ def test_handle_save_state_requires_real_checkpoint_for_nonresident_adapter(tmp_
     assert dispatcher.trainer.save_state_calls == [(str(tmp_path / "checkpoint"), True, "policy-a")]
 
 
-def test_handle_save_lora_only_requires_real_checkpoint_for_nonresident_adapter(tmp_path):
+def test_handle_save_lora_only_requires_real_checkpoint_for_nonresident_adapter(tmp_path, monkeypatch):
+    monkeypatch.setenv("XORL_SERVER_ARTIFACT_ROOT", str(tmp_path))
     dispatcher = object.__new__(RunnerDispatcher)
     dispatcher.rank = 0
     dispatcher.trainer = _FakeTrainer()

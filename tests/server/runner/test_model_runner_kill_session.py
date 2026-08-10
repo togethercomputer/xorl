@@ -74,3 +74,10 @@ def test_kill_session_reuses_existing_evicted_checkpoint_for_nonresident_lora_se
     assert "policy-a" not in runner._lora_session_specs
     assert "policy-a" not in runner._accumulated_valid_tokens
     assert runner._adapter_manager.removed == []
+
+
+def test_kill_session_rejects_path_like_model_id(tmp_path):
+    runner = _build_runner(tmp_path, has_adapter=False)
+
+    with pytest.raises(ValueError, match="model_id"):
+        runner.kill_session("../../outside", save_checkpoint=True)

@@ -9,7 +9,7 @@ parameters like batch size, epochs, and optimizer settings.
 
 import sys
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import torch
 import yaml
@@ -65,10 +65,10 @@ class ServerArguments:
     tokenizer_path: Optional[str] = field(default=None, metadata={"help": "Path to tokenizer. Defaults to config_path"})
 
     attn_implementation: Optional[Literal["eager", "sdpa", "native", "flash_attention_3", "flash_attention_4"]] = field(
-        default="flash_attention_3",
+        default="flash_attention_4",
         metadata={
             "help": "Attention implementation. 'native': PyTorch SDPA+cuDNN (no deps, Hopper+Blackwell). "
-            "'flash_attention_3': FA3 (Hopper). 'flash_attention_4': FA4 CUTE (Hopper+Blackwell)."
+            "'flash_attention_3': FA3 (Hopper). 'flash_attention_4': FA4 CUTE (Hopper+Blackwell, default)."
         },
     )
 
@@ -76,6 +76,18 @@ class ServerArguments:
         default=None,
         metadata={
             "help": "MoE implementation. 'triton' uses Triton group GEMM kernels, 'native' uses torch._grouped_mm, 'quack' uses quack kernels."
+        },
+    )
+
+    moe_routing_weights_before_down: Union[bool, str] = field(
+        default="auto",
+        metadata={
+            "help": "Fold routing weights into the down-GEMM input instead of scaling its output "
+            "(triton EP expert backend only). Same math, different bf16 rounding point; cheaper "
+            "backward when router gradients are needed (train_router=True). 'auto' (default) enables "
+            "it only for train_router=true + alltoall dispatch with the XORL_MOE_SGLANG_FUSED_EXPERTS "
+            "parity opt-in inactive; explicit true/false override the regime check. Keep false for "
+            "K3/parity lanes anchored on the historical reduction tree."
         },
     )
 
@@ -114,6 +126,14 @@ class ServerArguments:
         default=False, metadata={"help": "Enable async combine for DeepEP (overlap combine with next layer's compute)."}
     )
 
+    alltoall_combine_hidden_chunk_size: int = field(
+        default=0,
+        metadata={
+            "help": "Hidden-dimension chunk size for alltoall EP combine. 0 disables chunking. "
+            "Useful for long-context MoE runs where the full combine tensor is a memory peak."
+        },
+    )
+
     # SGLang numerical alignment flags
     router_fp32: bool = field(
         default=True, metadata={"help": "Upcast MoE router gate computation to float32 for numerical stability."}
@@ -123,13 +143,20 @@ class ServerArguments:
         default=True, metadata={"help": "Upcast LM head logits computation to float32 for numerical stability."}
     )
 
-    rmsnorm_mode: Literal["eager", "native", "compile"] = field(
-        default="native",
-        metadata={
-            "help": "RMSNorm implementation mode. 'native' uses torch.nn.functional.rms_norm "
-            "and is the default. 'compile' runs that native path through torch.compile. "
-            "'eager' uses the plain eager implementation."
-        },
+    rmsnorm_mode: Literal["eager", "native", "compile", "sglang", "sglang_fused", "sglang_jit", "sglang_kernel"] = (
+        field(
+            default="native",
+            metadata={
+                "help": "RMSNorm implementation mode. 'native' uses torch.nn.functional.rms_norm "
+                "and is the default. 'compile' runs that native path through torch.compile. "
+                "'eager' uses the plain eager implementation. 'sglang' uses native RMSNorm for "
+                "no-residual calls and SGLang's native residual RMSNorm reduction order. "
+                "'sglang_fused' matches 'sglang' bit-for-bit but replaces its eager residual-style "
+                "norms with fused batch-invariant Triton kernels (faster training, K3 preserved). "
+                "'sglang_jit' uses SGLang's JIT CUDA RMSNorm kernels for forward parity diagnostics. "
+                "'sglang_kernel' uses SGLang's production sgl_kernel RMSNorm kernels for diagnostics."
+            },
+        )
     )
 
     activation_native: bool = field(
@@ -176,7 +203,43 @@ class ServerArguments:
     pipeline_parallel_size: int = field(default=1, metadata={"help": "Pipeline parallelism size. 1 = disabled."})
 
     pipeline_parallel_schedule: str = field(
-        default="1F1B", metadata={"help": "Pipeline parallelism schedule: '1F1B' or 'GPipe'."}
+        default="1F1B",
+        metadata={
+            "help": (
+                "Pipeline parallelism schedule: '1F1B', 'GPipe' (one stage per rank), "
+                "'Interleaved1F1B', 'InterleavedZeroBubble' (pipeline_parallel_virtual_stages >= 2), "
+                "'ZBVZeroBubble', 'DualPipeV' (exactly 2 virtual stages per rank)."
+            )
+        },
+    )
+    pipeline_parallel_virtual_stages: int = field(
+        default=1,
+        metadata={"help": "Model chunks (virtual stages) per PP rank. 1 for GPipe/1F1B."},
+    )
+    pipeline_parallel_input_weight: int = field(
+        default=1,
+        metadata={"help": "Layer-equivalent cost of the embedding on stage 0 for stage balancing."},
+    )
+    pipeline_parallel_output_weight: int = field(
+        default=1,
+        metadata={"help": "Layer-equivalent cost of norm+lm_head(+CE) on the last stage for stage balancing."},
+    )
+    pipeline_parallel_num_layers_in_first_stage: Optional[int] = field(
+        default=None,
+        metadata={"help": "Explicit decoder-layer count for the first PP stage (overrides input_weight balancing)."},
+    )
+    pipeline_parallel_num_layers_in_last_stage: Optional[int] = field(
+        default=None,
+        metadata={"help": "Explicit decoder-layer count for the last PP stage (overrides output_weight balancing)."},
+    )
+    pp_seq_len_bucket_size: int = field(
+        default=1024,
+        metadata={
+            "help": (
+                "With pp_variable_seq_lengths, round the negotiated per-step seq_len up to a multiple of this "
+                "bucket so the schedule/P2P-buffer cache stays bounded. 0 caches one schedule per exact seq_len."
+            )
+        },
     )
     pp_variable_seq_lengths: bool = field(
         default=True,
@@ -189,13 +252,54 @@ class ServerArguments:
             )
         },
     )
+    defer_grad_sync_in_accumulation: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "HSDP only. During one server forward_backward request, defer the cross-replicate "
+                "FSDP all-reduce until the last packed micro-batch. Reduce-scatter still runs for "
+                "each micro-batch, so gradients remain sharded. No-op unless "
+                "data_parallel_replicate_size>1 and the request contains multiple micro-batches."
+            )
+        },
+    )
 
     tensor_parallel_size: int = field(default=1, metadata={"help": "Tensor parallelism size"})
+
+    lm_head_tensor_parallel_size: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Vocabulary tensor-parallel degree for only the LM head/loss. "
+                "Unlike tensor_parallel_size, this does not shard decoder layers or enter the main topology equation."
+            )
+        },
+    )
 
     ringattn_parallel_size: int = field(default=1, metadata={"help": "Ring attention parallel size"})
 
     cp_fsdp_mode: str = field(
         default="all", metadata={"help": "Sequence parallel FSDP mode: 'all', 'ulysses_only', 'ring_only', 'none'"}
+    )
+
+    fsdp_sharded_lm_head_loss: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Keep lm_head as a separate FSDP unit and compute cross-entropy against its local FSDP shard "
+                "using vocab-parallel CE over the FSDP group."
+            )
+        },
+    )
+
+    fsdp_sharded_lm_head_loss_num_chunks: int = field(
+        default=8,
+        metadata={
+            "help": (
+                "Number of local sequence chunks to use for fsdp_sharded_lm_head_loss. Higher values reduce "
+                "peak hidden/logit/all-reduce footprint at the cost of more small loss-kernel launches."
+            )
+        },
     )
 
     basic_modules: Optional[List[str]] = field(
@@ -216,7 +320,227 @@ class ServerArguments:
 
     enable_mixed_precision: bool = field(default=True, metadata={"help": "Enable mixed precision training"})
 
+    skip_param_upcast: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Skip the generic fp32 parameter upcast before parallelization. Useful for memory-constrained "
+                "TP/FSDP server bringup when bf16 serving-weight numerics are desired."
+            )
+        },
+    )
+
+    enable_fp8_training: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable experimental full-weight block-FP8 compute training. Master parameters remain BF16/FP32 "
+                "for optimizer/checkpoint compatibility."
+            )
+        },
+    )
+    enable_qarl: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable experimental dense full-weight QARL fake quantization. Initial support uses dynamic "
+                "E4M3 fake quantization with full-precision master parameters and STE gradients."
+            )
+        },
+    )
+    qarl_quant_cfg: Optional[Union[str, Dict[str, Any]]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "QARL quantization config or alias. Initial support accepts null, 'FP8_DEFAULT_CFG', 'fp8', "
+                "or a dict with format/quant_method=e4m3/fp8_e4m3 plus optional weight/activation booleans."
+            )
+        },
+    )
+    qarl_calib_data: Optional[str] = field(
+        default=None,
+        metadata={"help": "Reserved path for future static QARL calibration data. Dynamic QARL leaves this unset."},
+    )
+    qarl_calib_size: int = field(
+        default=0,
+        metadata={"help": "Reserved sample count for future static QARL calibration. Dynamic QARL uses 0."},
+    )
+    qarl_quant_sequence_length: Optional[int] = field(
+        default=None,
+        metadata={"help": "Reserved sequence length for future static QARL calibration."},
+    )
+    qarl_sync_format: Literal["fp8"] = field(
+        default="fp8",
+        metadata={"help": "Target rollout/export sync format for QARL. Initial support is 'fp8' only."},
+    )
+    qarl_target_modules: Optional[List[str]] = field(
+        default=None,
+        metadata={"help": "Optional short nn.Linear module names to wrap with QARL fake quantization."},
+    )
+    qarl_exclude_modules: Optional[List[str]] = field(
+        default=None,
+        metadata={"help": "Optional short names, FQNs, or globs to keep out of QARL fake quantization."},
+    )
+    fp8_cfg: Optional[Dict[str, Any]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional compatibility alias for NeMo-style FP8 configs. Supported values are "
+                "{enabled: true, fp8: e4m3, fp8_recipe: blockwise, fp8_param: false}; "
+                "TransformerEngine-only recipes are rejected."
+            )
+        },
+    )
+
+    fp8_training_num_first_layers_bf16: int = field(
+        default=0,
+        metadata={"help": "Number of initial decoder layers to keep in BF16 when FP8 training is enabled."},
+    )
+    fp8_training_num_last_layers_bf16: int = field(
+        default=0,
+        metadata={"help": "Number of final decoder layers to keep in BF16 when FP8 training is enabled."},
+    )
+    fp8_training_allow_blackwell: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Allow native XoRL FP8 training on Blackwell/GB200. Defaults to false; BF16 training plus FP8 "
+                "sync/generation is the default policy until a native FP8 recipe is validated on that hardware."
+            )
+        },
+    )
+    fp8_training_blackwell_validation_artifact: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Required path or identifier for the validation artifact when enabling native FP8 training "
+                "on Blackwell with fp8_training_allow_blackwell=true."
+            )
+        },
+    )
+
+    fp8_training_block_size: int = field(default=128, metadata={"help": "Block size for FP8 training quantization"})
+
+    fp8_training_backward: Literal["bf16", "fp8"] = field(
+        default="fp8",
+        metadata={"help": "Backward compute mode for FP8 training linear layers"},
+    )
+
+    fp8_training_smoothquant_alpha: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional SmoothQuant alpha for dense FP8 training matmuls. When set in [0, 1], activation and "
+                "weight columns are dynamically balanced before FP8 quantization."
+            )
+        },
+    )
+    fp8_training_lm_head_smoothquant_alpha: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional SmoothQuant alpha override for an FP8 lm_head. "
+                "If unset, fp8_training_smoothquant_alpha is used."
+            )
+        },
+    )
+
+    fp8_training_activation_amax_scale: float = field(
+        default=1.0,
+        metadata={
+            "help": (
+                "Multiplier applied to dense FP8 activation block absmax before deriving scales. "
+                "Values below 1.0 clip activation outliers; values above 1.0 add headroom."
+            )
+        },
+    )
+
+    fp8_training_weight_amax_scale: float = field(
+        default=1.0,
+        metadata={
+            "help": (
+                "Multiplier applied to dense FP8 weight block absmax before deriving scales. "
+                "Values below 1.0 clip weight outliers; values above 1.0 add headroom."
+            )
+        },
+    )
+    fp8_training_correction_mode: Literal["none", "activation", "activation2", "weight", "first_order", "full"] = field(
+        default="none",
+        metadata={
+            "help": (
+                "Optional dense FP8 residual-correction mode. 'none' uses one FP8 GEMM, while activation, "
+                "activation2, weight, first_order, and full add extra FP8 GEMMs for quantization residuals."
+            )
+        },
+    )
+    fp8_training_module_overrides: Optional[Dict[str, Dict[str, Any]]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional FQN/short-name glob pattern overrides for dense FP8Linear recipes. "
+                "Supported per-pattern keys are block_size, backward_mode, smoothquant_alpha, "
+                "activation_amax_scale, weight_amax_scale, and correction_mode."
+            )
+        },
+    )
+
+    fp8_training_moe_grouped_backend: Literal["triton_grouped", "block_loop", "deep_gemm", "scalar_quack"] = field(
+        default="triton_grouped",
+        metadata={
+            "help": (
+                "Grouped GEMM backend for FP8 MoE expert compute. 'triton_grouped' is the default grouped "
+                "block-FP8 same-NK and same-MN path; 'block_loop', 'deep_gemm', and 'scalar_quack' are opt-in "
+                "alternatives."
+            )
+        },
+    )
+
+    fp8_training_target_modules: Optional[List[str]] = field(
+        default=None,
+        metadata={"help": "Optional short nn.Linear module names to replace for FP8 training"},
+    )
+
+    fp8_training_exclude_modules: Optional[List[str]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional short names, FQNs, or glob patterns to keep out of FP8 training compute. If unset, "
+                "every matched dense Linear uses FP8 compute, including router gates and output heads."
+            )
+        },
+    )
+
+    fp8_training_allow_bf16_fallback: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Allow FP8 training layers to fall back to regular F.linear when FP8 kernels cannot run. "
+                "Defaults to false so full-weight FP8 server runs fail fast instead of silently using BF16."
+            )
+        },
+    )
+
+    fsdp_reduce_dtype: Literal["fp32", "bf16"] = field(
+        default="fp32",
+        metadata={
+            "help": (
+                "FSDP2 gradient reduce-scatter buffer dtype. 'fp32' keeps the existing behavior; "
+                "'bf16' lowers reduce-scatter memory and bandwidth."
+            )
+        },
+    )
+
     enable_gradient_checkpointing: bool = field(default=True, metadata={"help": "Enable gradient checkpointing"})
+
+    gradient_checkpointing_method: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Gradient checkpointing strategy. One of: recompute_full_layer, "
+                "recompute_before_dispatch, no_recompute. None uses model defaults."
+            )
+        },
+    )
 
     enable_full_shard: bool = field(default=True, metadata={"help": "Enable full parameter sharding (FSDP)"})
 
@@ -232,7 +556,23 @@ class ServerArguments:
         },
     )
 
+    activation_offload_prefetch_count: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "If >0, opt into the stream-overlapped ActivationOffloader and prefetch this many "
+                "CPU-resident activations ahead of backward consumption. Default 0 keeps the legacy "
+                "`custom_save_on_cpu` path. Mirrors `TrainingArguments.activation_offload_prefetch_count` "
+                "for ModelRunner-driven servers."
+            )
+        },
+    )
+
     enable_compile: bool = field(default=False, metadata={"help": "Enable torch.compile for model forward pass"})
+    compile_dynamic_shapes: bool = field(
+        default=False,
+        metadata={"help": "Pass dynamic=True to torch.compile. Default keeps torch.compile's standard shape behavior."},
+    )
 
     enable_reentrant: bool = field(
         default=False, metadata={"help": "Use reentrant gradient checkpointing (default: non-reentrant)"}
@@ -240,6 +580,16 @@ class ServerArguments:
 
     enable_forward_prefetch: bool = field(
         default=False, metadata={"help": "Enable FSDP forward prefetch for overlapping compute and communication"}
+    )
+
+    enable_backward_prefetch: Optional[bool] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Enable FSDP backward prefetch. Defaults to enable_forward_prefetch for compatibility; "
+                "set explicitly to evaluate forward/backward prefetch independently."
+            )
+        },
     )
 
     reshard_after_forward: bool = field(
@@ -258,7 +608,19 @@ class ServerArguments:
     ce_mode: CrossEntropyMode = field(
         default="compiled",
         metadata={
-            "help": "Cross-entropy implementation: 'compiled' (RECOMMENDED, torch.compile) or 'eager' (baseline, may OOM at 32K)"
+            "help": "Cross-entropy implementation: 'bi_fused' (RECOMMENDED for server RL: batch-invariant "
+            "K3 lm-head contract, fp32-class; needs tp=1, no z-loss, bf16 hidden/weight, lm_head_fp32), "
+            "'compiled' (torch.compile), 'quack_linear' (Quack scalar loss; return_per_token uses fused "
+            "selected-logprob CE), 'fused_quack', or 'eager' (baseline, may OOM at 32K)"
+        },
+    )
+
+    use_shared_prefix: bool = field(
+        default=False,
+        metadata={
+            "help": "Shared-prefix attention: when RL rollouts sample multiple responses per shared "
+            "prompt, dedup the prompt in the policy-update forward (compute its KV once). Auto-detects "
+            "shared-prefix groups from the packed micro-batch; off => standard attention."
         },
     )
 
@@ -283,6 +645,23 @@ class ServerArguments:
     weight_decay: float = field(
         default=0.01,
         metadata={"help": "Default weight decay for the server's implicit/default training session."},
+    )
+
+    adam_betas: Optional[List[float]] = field(
+        default=None,
+        metadata={
+            "help": "Adam-family (beta1, beta2) for the server's default optimizer, e.g. [0.9, 0.999]. "
+            "None keeps build_optimizer's default (0.9, 0.95). Client optim_step AdamParams "
+            "betas override these per step."
+        },
+    )
+
+    adam_eps: Optional[float] = field(
+        default=None,
+        metadata={
+            "help": "Adam-family epsilon for the server's default optimizer. "
+            "None keeps build_optimizer's default (1e-8)."
+        },
     )
 
     optimizer_dtype: Literal["fp32", "bf16"] = field(
@@ -368,6 +747,13 @@ class ServerArguments:
             "Lower values reduce peak optimizer scratch memory at the cost of more launches."
         },
     )
+    muon_fallback_optimizer: Literal["adamw", "sgd"] = field(
+        default="adamw",
+        metadata={
+            "help": "Optimizer used for parameters excluded from Muon. "
+            "'adamw' preserves the default mixed Muon/AdamW behavior; 'sgd' uses state-free fallback updates."
+        },
+    )
     muon_grad_dtype: Optional[Literal["fp32", "bf16"]] = field(
         default=None,
         metadata={
@@ -423,6 +809,59 @@ class ServerArguments:
         },
     )
 
+    r3_payload_transport: Literal["inline", "mooncake", "filesystem"] = field(
+        default="inline",
+        metadata={
+            "help": (
+                "Transport for large R3 routed_experts/routing-weight side payloads. 'inline' keeps the default "
+                "worker command broadcast behavior. 'mooncake' writes raw tensor bytes to Mooncake and broadcasts "
+                "metadata refs. 'filesystem' is an explicit fallback/debug path, not recommended for normal runs."
+            )
+        },
+    )
+
+    r3_payload_dir: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Shared directory for the explicit filesystem R3 payload fallback. Only valid when "
+                "r3_payload_transport='filesystem'."
+            )
+        },
+    )
+
+    r3_payload_keep: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Retain externalized R3 payloads after a request completes. Intended only for replay/debugging; "
+                "default cleanup removes Mooncake keys or filesystem fallback files."
+            )
+        },
+    )
+
+    r3_payload_namespace_prefix: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional Mooncake key namespace prefix for R3 side payloads. Only valid when "
+                "r3_payload_transport='mooncake'. Defaults to xorl/r3."
+            )
+        },
+    )
+
+    externalize_r3_payloads: bool = field(
+        default=False,
+        metadata={
+            "help": ("Deprecated alias for r3_payload_transport='mooncake'. Kept only for PR-426 compatibility.")
+        },
+    )
+
+    keep_r3_payloads: bool = field(
+        default=False,
+        metadata={"help": "Deprecated alias for r3_payload_keep."},
+    )
+
     storage_limit: str = field(
         default="10TB",
         metadata={
@@ -438,6 +877,14 @@ class ServerArguments:
     )
 
     load_checkpoint_path: str = field(default="", metadata={"help": "Path to checkpoint to load"})
+    load_optimizer: bool = field(
+        default=True,
+        metadata={
+            "help": "When resuming from load_checkpoint_path, also load optimizer state. Set False for a "
+            "weights-only resume (optimizer re-initialized fresh) — required to resume across a different "
+            "expert_parallel_size, since legacy optimizer state may not be reshardable."
+        },
+    )
 
     ckpt_manager: Optional[Literal["torch", "dcp"]] = field(default="dcp", metadata={"help": "Checkpoint manager type"})
 
@@ -503,6 +950,42 @@ class ServerArguments:
 
     enable_packing: bool = field(
         default=True, metadata={"help": "Enable sample packing to combine multiple samples into one sequence"}
+    )
+
+    pad_to_multiple_of: int = field(
+        default=128,
+        metadata={
+            "help": (
+                "Pad server-packed sequences to a multiple of this value. Increase this to bucket "
+                "ragged packed-row shapes for compiled or shape-sensitive attention paths."
+            )
+        },
+    )
+
+    sample_packing_strategy: str = field(
+        default="sequential",
+        metadata={
+            "help": (
+                "Bin-packing strategy for training micro-batches: 'sequential' (greedy first-fit, "
+                "default, unchanged behavior), 'best_fit' (best-fit-decreasing; fuller rows / fewer "
+                "rows for the same pack length), or 'balanced_dp' (longest-processing-time partition "
+                "into N=k*dp_size balanced rows so the dispatcher needs zero dummy batches). "
+                "'balanced_dp' only improves throughput when the batch is large enough to keep rows "
+                "near the GEMM knee (~16k tokens/rank)."
+            )
+        },
+    )
+
+    sample_packing_on_oversized: str = field(
+        default="error",
+        metadata={
+            "help": (
+                "How to handle a sample longer than sample_packing_sequence_len: 'error' (default; "
+                "fail loud so a misconfigured pack length never silently drops training data), "
+                "'skip' (drop with a warning; legacy behavior), or 'truncate' (clip the sample and "
+                "its token-aligned fields to the pack length)."
+            )
+        },
     )
 
     # ========================================================================
@@ -575,25 +1058,80 @@ class ServerArguments:
     )
 
     # ========================================================================
+    # ZORL Configuration
+    # ========================================================================
+
+    enable_zorl: bool = field(
+        default=False,
+        metadata={"help": "Enable zeroth-order LoRA search metadata and session defaults for server training."},
+    )
+
+    zorl_b_sigma: float = field(
+        default=0.01,
+        metadata={"help": "Perturbation scale applied to LoRA-B when planning ZORL candidates."},
+    )
+
+    zorl_num_perturbation_pairs: int = field(
+        default=8,
+        metadata={"help": "Number of perturbation seeds per ZORL generation before antithetic expansion."},
+    )
+
+    zorl_a_refresh_interval: int = field(
+        default=16,
+        metadata={"help": "Generations between fresh LoRA-A family refreshes. 0 disables auto-refresh."},
+    )
+
+    zorl_antithetic_sampling: bool = field(
+        default=True,
+        metadata={"help": "Emit both positive and negative LoRA-B perturbations for each ZORL seed."},
+    )
+
+    zorl_a_init: Literal["gaussian_jl"] = field(
+        default="gaussian_jl",
+        metadata={"help": "Initialization scheme used for fresh ZORL LoRA-A families."},
+    )
+
+    zorl_seed: Optional[int] = field(
+        default=None,
+        metadata={"help": "Optional base RNG seed for ZORL family refresh and perturbation planning."},
+    )
+
+    # ========================================================================
     # MoE Training Configuration
     # ========================================================================
 
-    freeze_router: bool = field(default=True, metadata={"help": "Freeze MoE router weights during training"})
+    freeze_router: bool = field(
+        default=True,
+        metadata={
+            "help": "Freeze MoE router weights during training. Defaults to True here: the RL server "
+            "freezes the router so rollout-time expert routing stays consistent for replay. The local "
+            "training surface (arguments.py) intentionally defaults to False — pretraining/SFT trains "
+            "the router. The opposite defaults are deliberate."
+        },
+    )
 
     # ========================================================================
     # Inference Weight Sync Configuration
     # ========================================================================
 
-    sync_inference_method: Literal["nccl_broadcast", "nccl_simple", "p2p"] = field(
+    sync_inference_method: Literal["nccl_broadcast", "p2p", "sparse_delta"] = field(
         default="nccl_broadcast",
         metadata={
             "help": "Method for syncing weights to inference endpoints: "
-            "'nccl_broadcast' (rank-0 broadcast via SGLang update_weights_from_distributed, "
-            "interleaved with the FSDP unshard loop); "
-            "'nccl_simple' (two-phase: stage all params to CPU during the FSDP loop, then "
-            "broadcast in chunks — FSDP and weight-sync NCCL communicators never interleave); "
+            "'nccl_broadcast' (rank-0 broadcast via SGLang update_weights_from_distributed); "
             "'p2p' (RDMA one-sided writes via Mooncake TransferEngine into SGLang's "
-            "registered param memory; requires --enable-rdma-weight-updates on the SGLang side)"
+            "registered param memory; requires --enable-rdma-weight-updates on the SGLang side); "
+            "'sparse_delta' (experimental packed sparse files via SGLang update_weights_from_sparse_delta)"
+        },
+    )
+    receiver_kv_cache_dtype: Optional[Literal["auto", "fp8", "fp8_e4m3"]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Expected KV-cache dtype for registered SGLang receivers. XoRL does not launch SGLang; "
+                "set --kv-cache-dtype on the receiver and use this field to validate /server_info metadata. "
+                "Use 'fp8' or 'fp8_e4m3' to require an FP8 KV cache."
+            )
         },
     )
 
@@ -629,6 +1167,77 @@ class ServerArguments:
 
     def __post_init__(self):
         """Validate and set defaults."""
+        from xorl.fp8_training.config_compat import normalize_fp8_training_config  # noqa: PLC0415
+        from xorl.qarl import normalize_qarl_quant_cfg, qarl_unsupported_scope_reason  # noqa: PLC0415
+        from xorl.server.orchestrator.packing import ON_OVERSIZED_MODES, PACKING_STRATEGIES  # noqa: PLC0415
+
+        if self.sample_packing_strategy not in PACKING_STRATEGIES:
+            raise ValueError(
+                f"sample_packing_strategy must be one of {PACKING_STRATEGIES}, got {self.sample_packing_strategy!r}"
+            )
+        if self.sample_packing_on_oversized not in ON_OVERSIZED_MODES:
+            raise ValueError(
+                f"sample_packing_on_oversized must be one of {ON_OVERSIZED_MODES}, "
+                f"got {self.sample_packing_on_oversized!r}"
+            )
+        if self.pad_to_multiple_of < 1:
+            raise ValueError(f"pad_to_multiple_of must be >= 1, got {self.pad_to_multiple_of}")
+        if self.externalize_r3_payloads:
+            if self.r3_payload_transport not in {"inline", "mooncake"}:
+                raise ValueError(
+                    "externalize_r3_payloads=True is a deprecated alias for "
+                    "r3_payload_transport='mooncake' and cannot be combined with filesystem transport"
+                )
+            self.r3_payload_transport = "mooncake"
+        if self.keep_r3_payloads:
+            self.r3_payload_keep = True
+        if self.r3_payload_transport == "inline":
+            if self.r3_payload_dir:
+                raise ValueError("r3_payload_dir requires r3_payload_transport='filesystem'")
+            if self.r3_payload_keep:
+                raise ValueError("r3_payload_keep requires r3_payload_transport != 'inline'")
+            if self.r3_payload_namespace_prefix:
+                raise ValueError("r3_payload_namespace_prefix requires r3_payload_transport='mooncake'")
+        elif self.r3_payload_transport == "mooncake":
+            if self.r3_payload_dir:
+                raise ValueError("r3_payload_dir is only valid with r3_payload_transport='filesystem'")
+        elif self.r3_payload_transport == "filesystem":
+            if self.r3_payload_namespace_prefix:
+                raise ValueError("r3_payload_namespace_prefix is only valid with r3_payload_transport='mooncake'")
+        else:
+            raise ValueError(
+                f"r3_payload_transport must be one of: inline, mooncake, filesystem; got {self.r3_payload_transport!r}"
+            )
+
+        normalized_fp8_config = normalize_fp8_training_config(vars(self), context="server.train")
+        self.enable_fp8_training = bool(normalized_fp8_config.get("enable_fp8_training", self.enable_fp8_training))
+        if self.enable_qarl and self.enable_fp8_training:
+            raise ValueError(
+                "enable_qarl cannot be combined with enable_fp8_training; choose one low-precision train path"
+            )
+        if self.enable_fp8_training and (self.enable_lora or self.enable_qlora):
+            raise ValueError("enable_fp8_training is a full-weight mode and cannot be combined with LoRA or QLoRA")
+        if self.enable_qarl and (self.enable_lora or self.enable_qlora):
+            raise ValueError("enable_qarl is a full-weight mode and cannot be combined with LoRA or QLoRA")
+        if self.enable_qarl:
+            if self.qarl_calib_size < 0:
+                raise ValueError("qarl_calib_size must be non-negative")
+            if self.qarl_quant_sequence_length is not None and self.qarl_quant_sequence_length <= 0:
+                raise ValueError("qarl_quant_sequence_length must be positive when set")
+            if self.qarl_calib_data is None and (self.qarl_calib_size or self.qarl_quant_sequence_length is not None):
+                raise ValueError("qarl_calib_size and qarl_quant_sequence_length require qarl_calib_data")
+            self.qarl_quant_cfg = normalize_qarl_quant_cfg(self.qarl_quant_cfg)
+            unsupported_reason = qarl_unsupported_scope_reason(
+                model_config=self.foundation,
+                config_path=self.config_path or self.model_path,
+                module_names=[
+                    *(self.qarl_target_modules or []),
+                    *(self.qarl_exclude_modules or []),
+                ],
+            )
+            if unsupported_reason is not None:
+                raise ValueError(unsupported_reason)
+
         # Set default paths
         if self.config_path is None:
             self.config_path = self.model_path
@@ -660,6 +1269,20 @@ class ServerArguments:
                 "pipeline_parallel_size > 1 is not supported with multi-adapter LoRA server training. "
                 "Adapter coordination currently assumes identical local LoRA layouts on every rank."
             )
+        if self.pipeline_parallel_size > 1:
+            # Deferred import keeps server_arguments import-light (pulls in torch).
+            from xorl.distributed.pipeline_parallel import validate_pp_schedule_config  # noqa: PLC0415
+
+            # Server microbatch counts are per-request; validate schedule/virtual-stage
+            # compatibility only (n_microbatches = num_stages always passes count checks).
+            validate_pp_schedule_config(
+                self.pipeline_parallel_schedule,
+                self.pipeline_parallel_virtual_stages,
+                self.pipeline_parallel_size * self.pipeline_parallel_virtual_stages,
+                self.pipeline_parallel_size,
+            )
+        elif self.pipeline_parallel_virtual_stages != 1:
+            raise ValueError("pipeline_parallel_virtual_stages requires pipeline_parallel_size > 1.")
         if self.enable_lora and self.merge_lora_interval > 0:
             raise ValueError("merge_lora_interval is not supported with multi-adapter LoRA server training")
         if self.max_lora_rank is None:
@@ -680,6 +1303,18 @@ class ServerArguments:
                 "load_checkpoint_path to materialize parameters from a DCP checkpoint. "
                 "Set load_checkpoint_path or choose a different load_weights_mode."
             )
+        if self.enable_zorl and not self.enable_lora:
+            raise ValueError("enable_zorl requires enable_lora=True")
+        if self.receiver_kv_cache_dtype is not None:
+            receiver_kv_cache_dtype = str(self.receiver_kv_cache_dtype).strip().lower()
+            if receiver_kv_cache_dtype in {"", "none", "null"}:
+                self.receiver_kv_cache_dtype = None
+            elif receiver_kv_cache_dtype not in {"auto", "fp8", "fp8_e4m3"}:
+                raise ValueError(
+                    f"receiver_kv_cache_dtype must be one of: auto, fp8, fp8_e4m3; got {self.receiver_kv_cache_dtype!r}"
+                )
+            else:
+                self.receiver_kv_cache_dtype = receiver_kv_cache_dtype
 
     def to_config_dict(self) -> Dict[str, Any]:
         """
@@ -696,12 +1331,14 @@ class ServerArguments:
                 "tokenizer_path": self.tokenizer_path,
                 "attn_implementation": self.attn_implementation,
                 "moe_implementation": self.moe_implementation,
+                "moe_routing_weights_before_down": self.moe_routing_weights_before_down,
                 "ep_dispatch": self.ep_dispatch,
                 "train_router": self.train_router,
                 "record_routing_weights": self.record_routing_weights,
                 "deepep_buffer_size_gb": self.deepep_buffer_size_gb,
                 "deepep_num_sms": self.deepep_num_sms,
                 "deepep_async_combine": self.deepep_async_combine,
+                "alltoall_combine_hidden_chunk_size": self.alltoall_combine_hidden_chunk_size,
                 "foundation": self.foundation,
                 "encoders": self.encoders,
                 "basic_modules": self.basic_modules,
@@ -716,6 +1353,10 @@ class ServerArguments:
             },
             "train": {
                 "output_dir": self.output_dir,
+                "r3_payload_transport": self.r3_payload_transport,
+                "r3_payload_dir": self.r3_payload_dir,
+                "r3_payload_keep": self.r3_payload_keep,
+                "r3_payload_namespace_prefix": self.r3_payload_namespace_prefix,
                 "seed": self.seed,
                 "enable_full_determinism": self.enable_full_determinism,
                 "data_parallel_mode": self.data_parallel_mode,
@@ -724,23 +1365,61 @@ class ServerArguments:
                 "data_parallel_replicate_size": self.data_parallel_replicate_size,
                 "data_parallel_shard_size": self.data_parallel_shard_size,
                 "tensor_parallel_size": self.tensor_parallel_size,
+                "lm_head_tensor_parallel_size": self.lm_head_tensor_parallel_size,
                 "ringattn_parallel_size": self.ringattn_parallel_size,
                 "cp_fsdp_mode": self.cp_fsdp_mode,
+                "fsdp_sharded_lm_head_loss": self.fsdp_sharded_lm_head_loss,
+                "fsdp_sharded_lm_head_loss_num_chunks": self.fsdp_sharded_lm_head_loss_num_chunks,
                 "enable_mixed_precision": self.enable_mixed_precision,
+                "skip_param_upcast": self.skip_param_upcast,
+                "enable_fp8_training": self.enable_fp8_training,
+                "enable_qarl": self.enable_qarl,
+                "qarl_quant_cfg": self.qarl_quant_cfg,
+                "qarl_calib_data": self.qarl_calib_data,
+                "qarl_calib_size": self.qarl_calib_size,
+                "qarl_quant_sequence_length": self.qarl_quant_sequence_length,
+                "qarl_sync_format": self.qarl_sync_format,
+                "qarl_target_modules": self.qarl_target_modules,
+                "qarl_exclude_modules": self.qarl_exclude_modules,
+                "fp8_cfg": self.fp8_cfg,
+                "fp8_training_num_first_layers_bf16": self.fp8_training_num_first_layers_bf16,
+                "fp8_training_num_last_layers_bf16": self.fp8_training_num_last_layers_bf16,
+                "fp8_training_allow_blackwell": self.fp8_training_allow_blackwell,
+                "fp8_training_blackwell_validation_artifact": self.fp8_training_blackwell_validation_artifact,
+                "fp8_training_block_size": self.fp8_training_block_size,
+                "fp8_training_backward": self.fp8_training_backward,
+                "fp8_training_smoothquant_alpha": self.fp8_training_smoothquant_alpha,
+                "fp8_training_lm_head_smoothquant_alpha": self.fp8_training_lm_head_smoothquant_alpha,
+                "fp8_training_activation_amax_scale": self.fp8_training_activation_amax_scale,
+                "fp8_training_weight_amax_scale": self.fp8_training_weight_amax_scale,
+                "fp8_training_correction_mode": self.fp8_training_correction_mode,
+                "fp8_training_module_overrides": self.fp8_training_module_overrides,
+                "fp8_training_moe_grouped_backend": self.fp8_training_moe_grouped_backend,
+                "fp8_training_target_modules": self.fp8_training_target_modules,
+                "fp8_training_exclude_modules": self.fp8_training_exclude_modules,
+                "fp8_training_allow_bf16_fallback": self.fp8_training_allow_bf16_fallback,
+                "fsdp_reduce_dtype": self.fsdp_reduce_dtype,
                 "enable_gradient_checkpointing": self.enable_gradient_checkpointing,
+                "gradient_checkpointing_method": self.gradient_checkpointing_method,
                 "enable_full_shard": self.enable_full_shard,
                 "enable_activation_offload": self.enable_activation_offload,
                 "activation_gpu_limit": self.activation_gpu_limit,
+                "activation_offload_prefetch_count": self.activation_offload_prefetch_count,
                 "enable_compile": self.enable_compile,
+                "compile_dynamic_shapes": self.compile_dynamic_shapes,
                 "enable_reentrant": self.enable_reentrant,
                 "enable_forward_prefetch": self.enable_forward_prefetch,
+                "enable_backward_prefetch": self.enable_backward_prefetch,
                 "reshard_after_forward": self.reshard_after_forward,
                 "load_weights_mode": self.load_weights_mode,
                 "init_device": self.init_device,
                 "ce_mode": self.ce_mode,
+                "use_shared_prefix": self.use_shared_prefix,
                 "optimizer": self.optimizer,
                 "lr": self.lr,
                 "weight_decay": self.weight_decay,
+                "adam_betas": self.adam_betas,
+                "adam_eps": self.adam_eps,
                 "optimizer_dtype": self.optimizer_dtype,
                 "cautious_weight_decay": self.cautious_weight_decay,
                 "muon_lr": self.muon_lr,
@@ -753,6 +1432,7 @@ class ServerArguments:
                 "muon_gram_ns_num_restarts": self.muon_gram_ns_num_restarts,
                 "muon_gram_ns_restart_iterations": self.muon_gram_ns_restart_iterations,
                 "muon_grouped_gram_ns_fp32_byte_limit": self.muon_grouped_gram_ns_fp32_byte_limit,
+                "muon_fallback_optimizer": self.muon_fallback_optimizer,
                 "muon_grad_dtype": self.muon_grad_dtype,
                 "muon_update_dtype": self.muon_update_dtype,
                 "muon_force_momentum_path": self.muon_force_momentum_path,
@@ -760,6 +1440,7 @@ class ServerArguments:
                 "moe_grad_reduce_mode": self.moe_grad_reduce_mode,
                 "optimizer_kwargs": self.optimizer_kwargs,
                 "load_checkpoint_path": self.load_checkpoint_path,
+                "load_optimizer": self.load_optimizer,
                 "ckpt_manager": self.ckpt_manager,
                 "enable_self_test": self.enable_self_test,
                 "skip_initial_checkpoint": self.skip_initial_checkpoint,
@@ -768,9 +1449,18 @@ class ServerArguments:
                 "freeze_router": self.freeze_router,
                 "pipeline_parallel_size": self.pipeline_parallel_size,
                 "pipeline_parallel_schedule": self.pipeline_parallel_schedule,
+                "pipeline_parallel_virtual_stages": self.pipeline_parallel_virtual_stages,
+                "pipeline_parallel_input_weight": self.pipeline_parallel_input_weight,
+                "pipeline_parallel_output_weight": self.pipeline_parallel_output_weight,
+                "pipeline_parallel_num_layers_in_first_stage": self.pipeline_parallel_num_layers_in_first_stage,
+                "pipeline_parallel_num_layers_in_last_stage": self.pipeline_parallel_num_layers_in_last_stage,
+                "pp_seq_len_bucket_size": self.pp_seq_len_bucket_size,
                 "pp_variable_seq_lengths": self.pp_variable_seq_lengths,
+                "defer_grad_sync_in_accumulation": self.defer_grad_sync_in_accumulation,
+                "pad_to_multiple_of": self.pad_to_multiple_of,
                 "log_level": self.log_level,
                 "sync_inference_method": self.sync_inference_method,
+                "receiver_kv_cache_dtype": self.receiver_kv_cache_dtype,
             },
             "data": {
                 # Empty data section - data comes from client at runtime
@@ -790,6 +1480,15 @@ class ServerArguments:
                 "merge_lora_interval": self.merge_lora_interval,
                 "reset_optimizer_on_merge": self.reset_optimizer_on_merge,
                 "adapter_state_load_mode": self.adapter_state_load_mode,
+            },
+            "zorl": {
+                "enabled": self.enable_zorl,
+                "b_sigma": self.zorl_b_sigma,
+                "num_perturbation_pairs": self.zorl_num_perturbation_pairs,
+                "a_refresh_interval": self.zorl_a_refresh_interval,
+                "antithetic_sampling": self.zorl_antithetic_sampling,
+                "a_init": self.zorl_a_init,
+                "seed": self.zorl_seed,
             },
         }
         return config
