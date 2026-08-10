@@ -16,6 +16,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from safetensors.torch import load_file, save_file
 from torch.distributed._tensor import DTensor, Replicate, Shard
+from torch.distributed.tensor import distribute_tensor
 
 from xorl.lora.mapping import can_apply_lora, get_lora_class_for_module
 from xorl.lora.modules import LoraLinear
@@ -32,6 +33,28 @@ DEFAULT_TARGET_MODULES = {
     "mistral": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
     "gemma": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
     "deepseek_v3": [
+        "q_a_proj",
+        "q_b_proj",
+        "kv_a_proj_with_mqa",
+        "kv_b_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    ],
+    # The GLM-5 DSA indexer's wq_b/wk/weights_proj are intentionally
+    # excluded; they're tiny and sparse-MLA expects them unwrapped.
+    "glm_moe_dsa": [
+        "q_a_proj",
+        "q_b_proj",
+        "kv_a_proj_with_mqa",
+        "kv_b_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    ],
+    "xorl_glm5": [
         "q_a_proj",
         "q_b_proj",
         "kv_a_proj_with_mqa",
@@ -473,10 +496,8 @@ def load_lora_state_dict(
     Returns:
         Tuple of (missing_keys, unexpected_keys)
     """
-    model_state = model.state_dict()
-
-    # Find LoRA keys in model
-    model_lora_keys = {k for k in model_state.keys() if "lora_A" in k or "lora_B" in k}
+    lora_params = {name: param for name, param in model.named_parameters() if "lora_A" in name or "lora_B" in name}
+    model_lora_keys = set(lora_params)
 
     # Check for missing/unexpected
     missing_keys = []
@@ -495,10 +516,55 @@ def load_lora_state_dict(
             f"Error loading LoRA state dict.\nMissing keys: {missing_keys}\nUnexpected keys: {unexpected_keys}"
         )
 
-    # Load matching keys
-    for key in state_dict.keys():
-        if key in model_lora_keys:
-            model_state[key].copy_(state_dict[key])
+    fqn2spec_info = getattr(model, "_fqn2spec_info", None)
+
+    def _get_spec_info(name: str):
+        if fqn2spec_info is None:
+            return None
+        clean_name = name.replace("_fsdp_wrapped_module.", "").replace("_orig_mod.", "")
+        return fqn2spec_info.get(clean_name) or fqn2spec_info.get(name)
+
+    def _slice_ep_tensor_if_needed(name: str, tensor: torch.Tensor, param: torch.Tensor) -> torch.Tensor:
+        spec_info = _get_spec_info(name)
+        if spec_info is None or not isinstance(spec_info.placement, Shard):
+            return tensor
+
+        shard_dim = spec_info.placement.dim
+        target_shape = tuple(param.shape)
+        local_size = target_shape[shard_dim]
+        if tensor.shape[shard_dim] == local_size:
+            return tensor
+
+        ep_size = spec_info.ep_mesh.size()
+        if tensor.shape[shard_dim] != local_size * ep_size:
+            raise RuntimeError(
+                f"LoRA tensor for {name} has incompatible EP shape {tuple(tensor.shape)}; "
+                f"expected local {target_shape} or full dim {local_size * ep_size} on axis {shard_dim}"
+            )
+
+        try:
+            ep_rank = spec_info.ep_mesh.get_local_rank()
+        except Exception:
+            from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
+
+            ep_rank = get_parallel_state().ep_rank
+        return tensor.narrow(shard_dim, ep_rank * local_size, local_size).contiguous()
+
+    # Load matching keys. DTensor parameters need a DTensor source with the
+    # same mesh/placements; copying a regular Tensor into them raises mixed
+    # Tensor/DTensor dispatch errors.
+    with torch.no_grad():
+        for key, tensor in state_dict.items():
+            if key not in model_lora_keys:
+                continue
+            param = lora_params[key]
+            tensor = _slice_ep_tensor_if_needed(key, tensor, param)
+            if isinstance(param, DTensor):
+                tensor = tensor.to(device=param.device, dtype=param.dtype)
+                dtensor = distribute_tensor(tensor, device_mesh=param.device_mesh, placements=param.placements)
+                param.copy_(dtensor)
+            else:
+                param.copy_(tensor.to(device=param.device, dtype=param.dtype))
 
     logger.info(f"Loaded {len(state_dict) - len(unexpected_keys)} LoRA parameters")
 
@@ -1170,9 +1236,7 @@ def inject_lora_into_model_with_moe(
         r: LoRA rank
         lora_alpha: LoRA alpha for scaling
         target_modules: List of module names to target. If None, falls back to
-                       the architecture default in DEFAULT_TARGET_MODULES (e.g.
-                       q_a_proj/q_b_proj/kv_a_proj_with_mqa/kv_b_proj/o_proj
-                       for DeepSeek-V3 / Kimi).
+                       the architecture default in DEFAULT_TARGET_MODULES.
         moe_hybrid_shared_lora: If True, use hybrid sharing (lora_A shared for gate/up, lora_B shared for down)
 
     Returns:
@@ -1193,10 +1257,9 @@ def inject_lora_into_model_with_moe(
     # Partition target_modules into expert MLP projections (handled by the
     # group-GEMM MoE path) and dense linears (attention plus per-layer dense
     # MLPs, handled by inject_lora_into_model). Anything that isn't an expert
-    # name is treated as a dense target so this function inherits new
-    # architectures (DeepSeek-V3 / Kimi MLA: q_a_proj, q_b_proj,
-    # kv_a_proj_with_mqa, kv_b_proj) from DEFAULT_TARGET_MODULES rather than
-    # silently dropping them via a Llama/Qwen-shaped allowlist.
+    # name is treated as a dense target so MLA projections such as
+    # q_a_proj/q_b_proj/kv_a_proj_with_mqa/kv_b_proj are not silently
+    # dropped by a Llama/Qwen-shaped allowlist.
     expert_modules = [m for m in target_modules if m in ("gate_proj", "up_proj", "down_proj")]
     attention_modules = [m for m in target_modules if m not in expert_modules]
 

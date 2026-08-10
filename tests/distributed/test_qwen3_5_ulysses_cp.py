@@ -21,10 +21,10 @@ THIS_DIR = Path(__file__).resolve().parent
 if str(THIS_DIR) not in sys.path:
     sys.path.insert(0, str(THIS_DIR))
 
-from distributed_utils import run_distributed_script, skip_if_gpu_count_less_than
+from distributed_utils import run_distributed_script, skip_if_gpu_count_less_than  # noqa: E402
 
 
-pytestmark = [pytest.mark.distributed]
+pytestmark = [pytest.mark.distributed, pytest.mark.gpu]
 
 
 def _build_tiny_qwen35_config(*, layer_types: list[str]) -> Qwen3_5Config:

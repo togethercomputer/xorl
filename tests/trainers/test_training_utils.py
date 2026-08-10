@@ -9,8 +9,11 @@ from xorl.data.constants import IGNORE_INDEX
 from xorl.trainers.training_utils import (
     clip_gradients,
     count_active_microbatches,
+    count_valid_tokens,
     get_distsign_grad_scale_factor,
     get_effective_grad_clip_value,
+    sync_lm_head_tp_gradient,
+    sync_lm_head_tp_parameters,
     sync_sp_gradients,
 )
 
@@ -51,6 +54,17 @@ def test_get_effective_grad_clip_value_skips_clipping_for_distsignsgd():
     assert torch.equal(model.weight.grad, torch.ones_like(model.weight.grad))
 
 
+@pytest.mark.parametrize("max_grad_norm", [0.0, -1.0])
+def test_clip_gradients_disabled_when_nonpositive(max_grad_norm):
+    model = TinyModule()
+    model.weight.grad = torch.ones_like(model.weight)
+
+    grad_norm = clip_gradients(model, max_grad_norm)
+
+    assert grad_norm == 0.0
+    assert torch.equal(model.weight.grad, torch.ones_like(model.weight.grad))
+
+
 def test_get_distsign_grad_scale_factor_returns_mean_vote_scale():
     assert get_distsign_grad_scale_factor(8) == pytest.approx(0.125)
 
@@ -60,18 +74,93 @@ def test_get_distsign_grad_scale_factor_is_noop_without_active_voters():
     assert get_distsign_grad_scale_factor(-1) == pytest.approx(1.0)
 
 
+def test_count_valid_tokens_uses_metadata_reduce(monkeypatch):
+    reduce_calls = []
+
+    def fake_all_reduce_metadata_tensor(tensor, op, group=None, device=None):
+        reduce_calls.append((tensor.clone(), op, group, device))
+        return torch.tensor(9, dtype=torch.int64, device=device)
+
+    monkeypatch.setattr(training_utils_module, "all_reduce_metadata_tensor", fake_all_reduce_metadata_tensor)
+
+    micro_batches = [
+        {"labels": torch.tensor([1, 2, IGNORE_INDEX])},
+        {"target_tokens": torch.tensor([3, IGNORE_INDEX, 4])},
+    ]
+
+    reduced = count_valid_tokens(micro_batches, group="dp")
+
+    assert reduced.item() == 9
+    assert len(reduce_calls) == 1
+    tensor, op, group, device = reduce_calls[0]
+    assert tensor.device.type == "cpu"
+    assert tensor.item() == 4
+    assert op == torch.distributed.ReduceOp.SUM
+    assert group == "dp"
+    assert device == training_utils_module.get_device_type()
+
+
+def test_count_valid_tokens_prefers_target_tokens(monkeypatch):
+    reduce_calls = []
+
+    def fake_all_reduce_metadata_tensor(tensor, op, group=None, device=None):
+        reduce_calls.append(tensor.clone())
+        return tensor
+
+    monkeypatch.setattr(training_utils_module, "all_reduce_metadata_tensor", fake_all_reduce_metadata_tensor)
+
+    micro_batches = [
+        {
+            "labels": torch.tensor([1, 2, IGNORE_INDEX, IGNORE_INDEX]),
+            "target_tokens": torch.tensor([1, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX]),
+        },
+    ]
+
+    reduced = count_valid_tokens(micro_batches)
+
+    assert reduced.item() == 1
+    assert reduce_calls[0].item() == 1
+
+
+def test_count_active_microbatches_prefers_target_tokens(monkeypatch):
+    reduce_calls = []
+
+    def fake_all_reduce_metadata_tensor(tensor, op, group=None, device=None):
+        reduce_calls.append(tensor.clone())
+        return tensor
+
+    monkeypatch.setattr(training_utils_module, "all_reduce_metadata_tensor", fake_all_reduce_metadata_tensor)
+
+    micro_batches = [
+        {
+            "labels": torch.tensor([1, 2, IGNORE_INDEX]),
+            "target_tokens": torch.tensor([IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX]),
+        },
+        {
+            "labels": torch.tensor([IGNORE_INDEX, IGNORE_INDEX]),
+            "target_tokens": torch.tensor([3, IGNORE_INDEX]),
+        },
+    ]
+
+    active_microbatches, active_voter_total = count_active_microbatches(micro_batches)
+
+    assert active_microbatches == 1
+    assert active_voter_total == 1
+    assert reduce_calls[0].tolist() == [0, 1]
+
+
 def test_count_active_microbatches_batches_reduce_and_returns_voter_total(monkeypatch):
     reduce_calls = []
 
-    def fake_all_reduce(tensor, op, group=None):
+    def fake_all_reduce_metadata_tensor(tensor, op, group=None, device=None):
         # Simulate a 4-rank DP group where rank counts (per-mb voter totals) are:
         #   mb0: 4 voters, mb1: 0 voters, mb2: 2 voters
         # Local tensor here is the rank-0 contribution; SUM across the group
         # would yield the per-mb voter counts above.
-        reduce_calls.append((tensor.clone(), op, group))
-        tensor.copy_(torch.tensor([4, 0, 2], dtype=torch.int64))
+        reduce_calls.append((tensor.clone(), op, group, device))
+        return torch.tensor([4, 0, 2], dtype=torch.int64, device=device)
 
-    monkeypatch.setattr(training_utils_module.dist, "all_reduce", fake_all_reduce)
+    monkeypatch.setattr(training_utils_module, "all_reduce_metadata_tensor", fake_all_reduce_metadata_tensor)
 
     micro_batches = [
         {"labels": torch.tensor([1, 2, 3])},
@@ -83,15 +172,38 @@ def test_count_active_microbatches_batches_reduce_and_returns_voter_total(monkey
 
     # Exactly one reduce, regardless of microbatch count.
     assert len(reduce_calls) == 1
-    _, op, group = reduce_calls[0]
+    tensor, op, group, device = reduce_calls[0]
+    assert tensor.device.type == "cpu"
     assert op == torch.distributed.ReduceOp.SUM
     assert group == "dp"
+    assert device == "cpu"
     assert active_microbatches == 2  # mbs with at least one voter
     assert active_voter_total == 6  # 4 + 0 + 2
 
 
 def test_count_active_microbatches_is_empty_input_safe():
     assert count_active_microbatches([]) == (0, 0)
+
+
+def test_pp_chunked_ce_matches_eager_loss_and_grad(monkeypatch):
+    monkeypatch.setenv("XORL_PP_CE_CHUNK_TOKENS", "2")
+    labels = torch.tensor([[1, 2, IGNORE_INDEX], [3, 4, 0]])
+    pred = torch.randn(2, 3, 5, dtype=torch.bfloat16).requires_grad_()
+    ref_pred = pred.detach().clone().requires_grad_()
+
+    chunked_loss = training_utils_module.make_pp_loss_fn("eager")(pred, labels)
+    ref_loss = torch.nn.functional.cross_entropy(
+        ref_pred.flatten(0, 1).float(),
+        labels.flatten(0, 1),
+        ignore_index=IGNORE_INDEX,
+        reduction="sum",
+    )
+
+    chunked_loss.backward()
+    ref_loss.backward()
+
+    torch.testing.assert_close(chunked_loss, ref_loss)
+    torch.testing.assert_close(pred.grad, ref_pred.grad)
 
 
 def test_sync_sp_gradients_reduces_every_grad_by_default(monkeypatch):
@@ -151,3 +263,43 @@ def test_sync_sp_gradients_skips_dtensor_grads_when_requested(monkeypatch):
     assert torch.equal(tensor, torch.tensor([3.0, 4.0]))
     assert op == torch.distributed.ReduceOp.SUM
     assert group == "sp-group"
+
+
+def test_sync_lm_head_tp_gradient_skips_single_rank_replica_group(monkeypatch):
+    lm_head = nn.Linear(2, 3, bias=False)
+    lm_head._xorl_fsdp_sharded_lm_head_loss = True
+    lm_head.weight.grad = torch.ones_like(lm_head.weight)
+    model = nn.Sequential(lm_head)
+
+    monkeypatch.setattr(training_utils_module.dist, "get_world_size", lambda group: 1)
+
+    def fake_all_reduce(*_args, **_kwargs):
+        raise AssertionError("size-1 lm-head replica group should not all-reduce")
+
+    monkeypatch.setattr(training_utils_module.dist, "all_reduce", fake_all_reduce)
+
+    sync_lm_head_tp_gradient(model, lm_head_tp_replica_group="lm-head-replica")
+
+
+def test_sync_lm_head_tp_parameters_broadcasts_marked_module(monkeypatch):
+    lm_head = nn.Linear(2, 3, bias=False)
+    lm_head._xorl_fsdp_sharded_lm_head_loss = True
+    unmarked = nn.Linear(2, 3, bias=False)
+    model = nn.Sequential(lm_head, unmarked)
+    broadcasts = []
+
+    monkeypatch.setattr(training_utils_module.dist, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(training_utils_module.dist, "get_global_rank", lambda group, group_rank: 7)
+
+    def fake_broadcast(tensor, src, group):
+        broadcasts.append((tensor.clone(), src, group))
+
+    monkeypatch.setattr(training_utils_module.dist, "broadcast", fake_broadcast)
+
+    sync_lm_head_tp_parameters(model, lm_head_tp_replica_group="lm-head-replica")
+
+    assert len(broadcasts) == 1
+    tensor, src, group = broadcasts[0]
+    assert torch.equal(tensor, lm_head.weight)
+    assert src == 7
+    assert group == "lm-head-replica"

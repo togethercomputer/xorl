@@ -128,6 +128,8 @@ Each entry in `datasets` (or `test_datasets`) is a dict:
 |---|---|---|
 | `optimizer` | `adamw` | Optimizer: `adamw`, `anyprecision_adamw`, `sgd`, `signsgd`, `muon`. |
 | `optimizer_dtype` | `bf16` | Dtype for optimizer states in `anyprecision_adamw` and `muon`: `fp32` or `bf16`. BF16 halves optimizer memory. |
+| `muon_grouped_gram_ns_fp32_byte_limit` | `536870912` | Maximum fp32 scratch bytes per grouped Muon Gram Newton-Schulz batch before chunking. Lower values reduce peak optimizer scratch memory at the cost of more launches. |
+| `muon_fallback_optimizer` | `adamw` | Optimizer used for parameters excluded from Muon. Use `sgd` for a state-free fallback in memory-constrained no-momentum Muon smoke tests. |
 | `lr` | `5e-5` | Peak learning rate. |
 | `lr_min` | `1e-7` | Minimum learning rate at the end of decay. |
 | `lr_start` | `0.0` | Initial learning rate at the start of warmup. |
@@ -137,13 +139,12 @@ Each entry in `datasets` (or `test_datasets`) is a dict:
 | `weight_decay` | `0.0` | L2 regularization (AdamW weight decay). |
 | `no_decay_modules` | `[]` | Module name substrings to exclude from weight decay (e.g., `[norm]`). |
 | `no_decay_params` | `[]` | Parameter name substrings to exclude from weight decay (e.g., `[bias]`). |
-| `max_grad_norm` | `1.0` | Gradient clipping threshold. |
+| `max_grad_norm` | `1.0` | Gradient clipping threshold. Set to `0` or lower to skip clipping and norm collection. |
 | `muon_lr` | `0.02` | Learning rate for Muon matrix parameter groups. Only used when `optimizer: muon`. |
 | `muon_momentum` | `0.95` | Muon momentum coefficient. |
 | `muon_nesterov` | `true` | Use Nesterov momentum in Muon. |
 | `muon_ns_steps` | `5` | Newton-Schulz iterations for Muon orthogonalization. |
 | `muon_adjust_lr_fn` | `null` | Muon LR scaling: `original` (scale by sqrt(max(1,A/B))), `match_rms_adamw` (lets Muon reuse AdamW LR/WD). |
-
 ### Batch sizing
 
 | Field | Default | Description |
@@ -158,18 +159,23 @@ Each entry in `datasets` (or `test_datasets`) is a dict:
 | Field | Default | Description |
 |---|---|---|
 | `enable_mixed_precision` | `true` | BF16 mixed-precision training. |
+| `skip_param_upcast` | `false` | Skip the generic full-model fp32 parameter upcast before FSDP wrapping. This keeps checkpoint-native BF16 parameters for lower-memory full-weight runs. |
 | `enable_gradient_checkpointing` | `true` | Enable activation recomputation to reduce memory. |
 | `gradient_checkpointing_method` | `recompute_full_layer` | What to recompute in backward. Valid values: `recompute_full_layer` (recompute entire decoder layer, most memory-efficient), `recompute_before_dispatch` (recompute attn+router, keep dispatch+expert+combine, +25-34% throughput), `no_recompute` (no recomputation, max throughput, highest memory). See [gradient checkpointing guide](/xorl/training/local_training#gradient-checkpointing). |
 | `enable_reentrant` | `false` | Use reentrant gradient checkpointing. Default (non-reentrant) is generally preferred. |
 | `enable_full_shard` | `true` | FSDP2 full parameter sharding (ZeRO-3). Set `false` for ZeRO-2. |
-| `enable_forward_prefetch` | `true` | Prefetch next FSDP unit's parameters during forward pass. |
+| `enable_forward_prefetch` | `true` | Prefetch next FSDP unit's parameters during forward pass. Also controls manual EP/module prefetch setup when required by the model. |
 | `enable_activation_offload` | `false` | Offload activations to CPU during forward pass. |
 | `activation_gpu_limit` | `0.0` | GB of activations to keep on GPU when offloading. `0.0` = offload all. |
 | `enable_compile` | `false` | `torch.compile` for model forward pass. |
+| `compile_dynamic_shapes` | `false` | Pass `dynamic=True` to `torch.compile`; keep disabled unless a workload has benchmarked a dynamic-shape win. |
+| `ce_mode` | `compiled` | Cross-entropy implementation: `compiled` (`torch.compile` + auto-chunker), `quack_linear` (Quack chunked linear+CE scalar loss; non-PP local trainer only), or `eager` (materializes logits). |
+| `ce_num_chunks` | `8` | Number of token chunks for chunked/compiled cross-entropy. |
 | `init_device` | `cuda` | Device for weight initialization: `cpu` (rank 0 only), `cuda`, `meta` (required for FSDP2), `npu`. |
 | `load_weights_mode` | `grouped` | `grouped`: one reader per node for dense/shared weights plus one reader per EP-FSDP group for expert weights, with rank-0 fallback when grouped fanout groups are unavailable. `all_ranks`: every rank reads from disk. `skip`: skip HuggingFace weight loading and materialize model weights from `load_checkpoint_path` (DCP). |
 | `enable_full_determinism` | `false` | Full determinism mode. Requires `allow_cuda_launch_blocking: true`. Degrades performance. |
 | `allow_cuda_launch_blocking` | `false` | Allow `CUDA_LAUNCH_BLOCKING=1`. Off by default to prevent accidental performance degradation. |
+| `prewarm_cuda_blas` | `false` | Run a tiny checkpointed CUDA linear backward during startup to initialize cuBLAS handles before memory-heavy training begins. Useful for near-capacity recompute workloads. |
 | `empty_cache_steps` | `500` | Call `torch.cuda.empty_cache()` every N steps. |
 | `gc_steps` | `500` | Call `gc.collect()` every N steps. Python GC is disabled between calls. |
 

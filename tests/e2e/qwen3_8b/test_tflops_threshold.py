@@ -104,7 +104,7 @@ def _run_tflops_benchmark(num_gpus: int, dp_shard_size: int, tmp_path: str):
         # Warmup
         for _ in range(NUM_WARMUP):
             training_client.forward_backward(data, loss_fn="causallm_loss").result()
-            training_client.optim_step(learning_rate=1e-4).result()
+            training_client.optim_step({"learning_rate": 1e-4}).result()
 
         # Measured steps
         step_times = []
@@ -112,7 +112,7 @@ def _run_tflops_benchmark(num_gpus: int, dp_shard_size: int, tmp_path: str):
         for step in range(NUM_STEPS):
             t0 = time.perf_counter()
             fwd_bwd = training_client.forward_backward(data, loss_fn="causallm_loss")
-            optim = training_client.optim_step(learning_rate=1e-4)
+            optim = training_client.optim_step({"learning_rate": 1e-4})
             result = fwd_bwd.result()
             optim.result()
             t1 = time.perf_counter()
