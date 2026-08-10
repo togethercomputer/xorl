@@ -32,11 +32,23 @@ import math
 from typing import Optional, Tuple
 
 import torch
-from flash_attn_interface import (
-    _flash_attn_backward,
-    flash_attn_func,
-    flash_attn_varlen_func,
-)
+
+
+try:
+    from flash_attn_interface import (
+        _flash_attn_backward,
+        flash_attn_func,
+        flash_attn_varlen_func,
+    )
+
+    FA3_AVAILABLE = True
+    _FA3_IMPORT_ERROR = None
+except ImportError as exc:
+    FA3_AVAILABLE = False
+    _FA3_IMPORT_ERROR = exc
+    _flash_attn_backward = None
+    flash_attn_func = None
+    flash_attn_varlen_func = None
 
 
 def _fa3_forward(
@@ -55,6 +67,8 @@ def _fa3_forward(
     deterministic,
     return_attn_probs,
 ):
+    if not FA3_AVAILABLE:
+        raise ImportError("GPT-OSS FA3 sink attention requires flash_attn_interface") from _FA3_IMPORT_ERROR
     common = dict(
         softmax_scale=softmax_scale,
         causal=causal,
@@ -98,6 +112,8 @@ def _fa3_backward(
     softcap,
     deterministic,
 ):
+    if not FA3_AVAILABLE:
+        raise ImportError("GPT-OSS FA3 sink attention requires flash_attn_interface") from _FA3_IMPORT_ERROR
     kwargs = dict(
         dq=dq,
         dk=dk,

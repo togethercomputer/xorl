@@ -17,7 +17,14 @@ from .moe import (
     MoELoRAConfig,
     TopKRouter,
 )
-from .normalization import RMSNorm, get_rmsnorm_mode, set_rmsnorm_mode
+from .normalization import (
+    RMS_NORM_FAMILY_NO_RESIDUAL,
+    RMS_NORM_FAMILY_RESIDUAL_TREE,
+    RMSNorm,
+    RMSNormFamily,
+    get_rmsnorm_mode,
+    set_rmsnorm_mode,
+)
 from .rope import (
     ROPE_INIT_FUNCTIONS,
     RotaryEmbedding,
@@ -41,6 +48,9 @@ __all__ = [
     "MoELoRAConfig",
     "TopKRouter",
     "RMSNorm",
+    "RMSNormFamily",
+    "RMS_NORM_FAMILY_NO_RESIDUAL",
+    "RMS_NORM_FAMILY_RESIDUAL_TREE",
     "get_rmsnorm_mode",
     "ROPE_INIT_FUNCTIONS",
     "RotaryEmbedding",

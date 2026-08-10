@@ -18,7 +18,7 @@ from xorl.lora import freeze_base_parameters
 from xorl.lora.utils import inject_lora_into_model, inject_lora_into_model_with_moe
 from xorl.models import build_foundation_model
 from xorl.models.checkpoint_handlers.buffers import get_prequantized_exclude_modules
-from xorl.models.layers.rope import set_rope_native
+from xorl.models.layers.rope import set_rope_class_b, set_rope_native
 from xorl.models.transformers.deepseek_v3.support import (
     freeze_deepseek_v3_router_parameters,
     validate_deepseek_v3_training_mode,
@@ -191,6 +191,7 @@ def build_training_model(
     rmsnorm_mode: str = "native",
     activation_native: bool = False,
     rope_native: bool = False,
+    rope_class_b: bool = False,
     attention_cast_bf16: bool = False,
     sparse_mla_enabled: bool = False,
     sparse_mla_backend: str = "auto",
@@ -213,6 +214,17 @@ def build_training_model(
 
     Returns a :class:`TrainingModelResult` with model, config, PP state, etc.
     """
+
+    if rope_class_b and not rope_native:
+        raise ValueError(
+            "rope_class_b=True requires rope_native=True: the certified Class-B contract "
+            "uses the CPU-built SGLang-layout cos/sin cache selected by rope_native."
+        )
+    # These selectors are process globals, so every build must set both values
+    # explicitly. Otherwise a Class-B build can leak into the next model built
+    # by the same worker even when that model's config requests Class A.
+    set_rope_native(bool(rope_native))
+    set_rope_class_b(bool(rope_class_b))
 
     # ------------------------------------------------------------------
     # 1. Build foundation model
@@ -246,8 +258,11 @@ def build_training_model(
 
     # Set module-level flags for rope and activation
     if rope_native:
-        set_rope_native(True)
         logger.info_rank0("Using native RoPE (flash_attn fused kernel disabled)")
+    if rope_class_b:
+        logger.info_rank0(
+            "Using compiled Class-B RoPE fp32-chain numerics aligned with SGLang's stock fused CUDA kernel"
+        )
     if activation_native:
         logger.info_rank0("Using native SiLU activation (fused Triton kernel disabled)")
     model_config = model.config

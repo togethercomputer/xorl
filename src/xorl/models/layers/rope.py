@@ -7,6 +7,7 @@ removed in transformers >= 5.0 -- this local copy keeps it available.
 
 import logging
 import math
+import os
 import warnings
 from functools import wraps
 
@@ -62,12 +63,14 @@ def dynamic_rope_update(rope_forward):
                 )
             self.register_buffer(f"{prefix}inv_freq", long_inv_freq, persistent=False)
             setattr(self, f"{prefix}long_inv_freq", long_inv_freq)
+            self._set_inv_freq_fp32(long_inv_freq)
         else:
             # This .to() is needed if the model has been moved to a device after being initialized (because
             # the buffer is automatically moved, but not the original copy)
             original_inv_freq = original_inv_freq.to(device)
             self.register_buffer(f"{prefix}inv_freq", original_inv_freq, persistent=False)
             setattr(self, f"{prefix}original_inv_freq", original_inv_freq)
+            self._set_inv_freq_fp32(original_inv_freq)
 
     def dynamic_frequency_update(self, position_ids, device, layer_type=None):
         """
@@ -98,6 +101,7 @@ def dynamic_rope_update(rope_forward):
             # TODO joao: may break with compilation
             self.register_buffer(f"{prefix}inv_freq", inv_freq, persistent=False)
             setattr(self, f"{layer_type}_max_seq_len_cached", seq_len)
+            self._set_inv_freq_fp32(inv_freq)
 
         if seq_len < self.original_max_seq_len and max_seq_len_cached > self.original_max_seq_len:  # reset
             # This .to() is needed if the model has been moved to a device after being initialized (because
@@ -106,6 +110,7 @@ def dynamic_rope_update(rope_forward):
             self.register_buffer(f"{prefix}inv_freq", original_inv_freq, persistent=False)
             setattr(self, f"{prefix}original_inv_freq", original_inv_freq)
             setattr(self, f"{layer_type}_max_seq_len_cached", self.original_max_seq_len)
+            self._set_inv_freq_fp32(original_inv_freq)
 
     @wraps(rope_forward)
     def wrapper(self, x, position_ids, layer_type=None):
@@ -145,18 +150,19 @@ def _compute_default_rope_parameters(
     else:
         base = None
 
+    if base is None and hasattr(config, "rope_scaling") and config.rope_scaling is not None:
+        base = config.rope_scaling.get("rope_theta", None)
+    if base is None and hasattr(config, "rope_theta") and config.rope_theta is not None:
+        base = config.rope_theta
     if base is None:
-        if hasattr(config, "rope_theta") and config.rope_theta is not None:
-            base = config.rope_theta
-        elif hasattr(config, "rope_scaling") and config.rope_scaling is not None:
-            base = config.rope_scaling.get("rope_theta", 10000.0)
-        else:
-            base = 10000.0
+        base = 10000.0
 
     partial_rotary_factor = rope_parameters_dict.get(
         "partial_rotary_factor",
         getattr(config, "partial_rotary_factor", 1.0),
     )
+    if partial_rotary_factor is None:
+        partial_rotary_factor = 1.0
     head_dim = getattr(config, "head_dim", None) or (config.hidden_size // config.num_attention_heads)
     dim = int(head_dim * partial_rotary_factor)
 
@@ -444,11 +450,83 @@ class RotaryEmbedding(nn.Module):
         inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.original_inv_freq = self.inv_freq
+        # The loader's model-wide `.to(torch_dtype)` downcasts the inv_freq buffer, and a
+        # bf16 frequency table corrupts cos/sin from position 1. Keep a cast-immune fp32 CPU-computed
+        # table (a plain attribute, invisible to `nn.Module._apply`) and read that in forward(). CPU
+        # provenance is what serving builds its cache from, so the zero-K3 contract keeps holding.
+        # Unconditional and registry-wide: the buffer is cast in every bf16-built lane, not only the
+        # rope_native ones, and every rope type reads it.
+        self._inv_freq_fp32: torch.Tensor | None = None
+        self._set_inv_freq_fp32(self._cpu_fp32_inv_freq())
+        self._sglang_default_cache = None
+        self._use_sglang_default_cache = bool(getattr(config, "_rope_native", False) and self.rope_type == "default")
+        if self._use_sglang_default_cache:
+            self._sglang_default_cache = self._build_sglang_default_cache(self.max_seq_len_cached)
+
+    def _cpu_fp32_inv_freq(self) -> torch.Tensor:
+        """Frequency table computed on CPU in fp32 — the provenance serving's cos/sin cache is built with."""
+        with torch.device("cpu"):
+            inv_freq, _ = self.rope_init_fn(self.config, "cpu")
+        return inv_freq.float()
+
+    def _set_inv_freq_fp32(self, inv_freq: torch.Tensor) -> None:
+        self._inv_freq_fp32 = inv_freq.float()
+
+    def _resolve_inv_freq(self, device: torch.device) -> torch.Tensor:
+        if self._inv_freq_fp32 is None:
+            return self.inv_freq
+        if self._inv_freq_fp32.device != device:
+            self._inv_freq_fp32 = self._inv_freq_fp32.to(device)
+        return self._inv_freq_fp32
+
+    def _default_rope_base_and_dim(self) -> tuple[float, int]:
+        rope_parameters_dict = getattr(self.config, "rope_parameters", None) or {}
+        base = rope_parameters_dict.get("rope_theta") if rope_parameters_dict else None
+        if base is None and getattr(self.config, "rope_scaling", None) is not None:
+            base = self.config.rope_scaling.get("rope_theta")
+        if base is None:
+            base = getattr(self.config, "rope_theta", None)
+        if base is None:
+            base = 10000.0
+
+        partial_rotary_factor = rope_parameters_dict.get(
+            "partial_rotary_factor",
+            getattr(self.config, "partial_rotary_factor", 1.0),
+        )
+        if partial_rotary_factor is None:
+            partial_rotary_factor = 1.0
+        head_dim = getattr(self.config, "head_dim", None) or (
+            self.config.hidden_size // self.config.num_attention_heads
+        )
+        return float(base), int(head_dim * partial_rotary_factor)
+
+    def _build_sglang_default_cache(self, seq_len: int) -> torch.Tensor:
+        base, dim = self._default_rope_base_and_dim()
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        positions = torch.arange(seq_len, dtype=torch.float32)
+        freqs = torch.einsum("i,j->ij", positions, inv_freq)
+        return torch.cat((freqs.cos(), freqs.sin()), dim=-1)
+
+    def _ensure_sglang_default_cache(self, needed_max_pos: int) -> None:
+        if self._sglang_default_cache is None or needed_max_pos >= self._sglang_default_cache.shape[0]:
+            self._sglang_default_cache = self._build_sglang_default_cache(needed_max_pos + 1)
 
     @torch.no_grad()
     @dynamic_rope_update
     def forward(self, x, position_ids):
-        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        if self._use_sglang_default_cache:
+            needed_max_pos = int(position_ids.max().item())
+            self._ensure_sglang_default_cache(needed_max_pos)
+            flat_positions = position_ids.reshape(-1).to(device="cpu", dtype=torch.long)
+            cos_sin = self._sglang_default_cache.index_select(0, flat_positions)
+            cos_half, sin_half = cos_sin.chunk(2, dim=-1)
+            cos = torch.cat((cos_half, cos_half), dim=-1).view(*position_ids.shape, -1)
+            sin = torch.cat((sin_half, sin_half), dim=-1).view(*position_ids.shape, -1)
+            out_dtype = torch.float32 if _rope_class_b else x.dtype
+            return cos.to(device=x.device, dtype=out_dtype), sin.to(device=x.device, dtype=out_dtype)
+
+        inv_freq = self._resolve_inv_freq(x.device)
+        inv_freq_expanded = inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
         position_ids_expanded = position_ids[:, None, :].float()
 
         device_type = x.device.type if isinstance(x.device.type, str) and x.device.type != "mps" else "cpu"
@@ -458,7 +536,10 @@ class RotaryEmbedding(nn.Module):
             cos = emb.cos() * self.attention_scaling
             sin = emb.sin() * self.attention_scaling
 
-        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+        # Class B feeds cos/sin straight into an fp32 kernel cache; a bf16 round here
+        # would put the result back in Class A.
+        out_dtype = torch.float32 if _rope_class_b else x.dtype
+        return cos.to(dtype=out_dtype), sin.to(dtype=out_dtype)
 
 
 # ---------------------------------------------------------------------------
@@ -473,12 +554,22 @@ def rotate_half(x):
     return torch.cat((-x2, x1), dim=-1)
 
 
+def _note_class_a(where: str) -> None:
+    """Record a Class-A rope call so partial Class-B engagement is visible, not inferred."""
+    if not _rope_class_b:
+        return
+    from xorl.ops.rope_class_b import note_rope_engagement  # noqa: PLC0415
+
+    note_rope_engagement("class_a", where)
+
+
 def _naive_apply_rotary_pos_emb(q, k, cos, sin):
     """Naive RoPE application (pure PyTorch, no fused kernel).
 
     All tensors use [B, S, H, D] layout. cos/sin are [B, S, D].
     Handles partial rotary automatically when cos/sin dim < head_dim.
     """
+    _note_class_a("_naive_apply_rotary_pos_emb")
     cos = cos.unsqueeze(2)
     sin = sin.unsqueeze(2)
     rotary_dim = cos.shape[-1]
@@ -502,7 +593,44 @@ def set_rope_native(enabled: bool):
     _rope_native = enabled
 
 
-def apply_rotary_pos_emb(q, k, cos, sin):
+# ---------------------------------------------------------------------------
+# Class-B RoPE numerics: a compiled fp32 chain aligned with SGLang's stock fused
+# CUDA kernel, with an explicit adjoint
+# ---------------------------------------------------------------------------
+#
+# Two RoPE numerics classes exist across the trainer/sampler pair:
+#   Class A -- per-op bf16 rounding (8 rounding points). ``_naive_apply_rotary_pos_emb``,
+#              SGLang eager ``apply_rotary_emb`` and the ``bi_fused_native`` triton
+#              kernel all agree bitwise here.
+#   Class B -- one fp32 chain with a single final round. SGLang's ``torch.compile``
+#              RoPE path and its stock fused CUDA kernel agree bitwise here.
+#
+# Class B needs fp32 cos/sin: the kernel reads an fp32 ``[max_pos, rotary_dim]`` cache
+# (cos in the first half of each row, sin in the second). Rounding cos/sin to bf16
+# first would land back in Class A, so the Class-B lane keeps the table in fp32 all
+# the way to the kernel.
+
+_rope_class_b = os.environ.get("XORL_ROPE_CLASS_B") == "1"
+
+
+def set_rope_class_b(enabled: bool) -> None:
+    """Select compiled fp32-chain numerics aligned with SGLang's stock fused CUDA kernel."""
+    global _rope_class_b
+    _rope_class_b = enabled
+
+
+def rope_class_b_enabled() -> bool:
+    return _rope_class_b
+
+
+def stock_fused_apply_rotary_pos_emb(q, k, cos, sin, *, interleaved: bool = False, doubled: bool = True):
+    """Class-B RoPE application backed by the compiled expression in ``xorl.ops.rope_class_b``."""
+    from xorl.ops.rope_class_b import class_b_apply_rotary_pos_emb  # noqa: PLC0415
+
+    return class_b_apply_rotary_pos_emb(q, k, cos, sin, interleaved=interleaved, doubled=doubled)
+
+
+def apply_rotary_pos_emb(q, k, cos, sin, *, force_native: bool = False):
     """Applies Rotary Position Embedding to the query and key tensors.
 
     Uses flash_attn's fused CUDA kernel when available for better performance
@@ -517,7 +645,10 @@ def apply_rotary_pos_emb(q, k, cos, sin):
         cos: The cosine part from RotaryEmbedding, shape [batch, seq_len, head_dim].
         sin: The sine part from RotaryEmbedding, shape [batch, seq_len, head_dim].
     """
-    if _flash_apply_rotary_emb is not None and q.is_cuda and not _rope_native:
+    if _rope_class_b and q.is_cuda:
+        return stock_fused_apply_rotary_pos_emb(q, k, cos, sin)
+
+    if _flash_apply_rotary_emb is not None and q.is_cuda and not (_rope_native or force_native):
         # flash_attn expects x: [B, S, H, D], cos/sin: [S, D//2]
         # Our cos/sin are [B, S, D] with doubled freqs — take first batch, first half
         half_dim = cos.shape[-1] // 2
@@ -564,6 +695,9 @@ __all__ = [
     "RotaryEmbedding",
     "apply_rotary_pos_emb",
     "dynamic_rope_update",
+    "rope_class_b_enabled",
     "rope_config_validation",
     "rotate_half",
+    "set_rope_class_b",
+    "stock_fused_apply_rotary_pos_emb",
 ]

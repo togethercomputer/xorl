@@ -65,6 +65,14 @@ class CrossEntropy(ReductionBase):
                 return
         self.cluster_n = max_cluster
 
+    def _clamp_cluster_n(self, vecsize: int):
+        # An all-OOB last column tile reduces max to -inf and the cluster combine NaNs every row.
+        while self.cluster_n > 1:
+            _, tiler_mn, _ = self._get_tiled_copy(vecsize=vecsize)
+            if (self.cluster_n - 1) * tiler_mn[1] < self.N:
+                return
+            self.cluster_n //= 2
+
     @cute.jit
     def __call__(
         self,
@@ -87,6 +95,7 @@ class CrossEntropy(ReductionBase):
         if const_expr(mdX is not None):
             largest_dtype_width = const_expr(max(largest_dtype_width, mdX.element_type.width))
         vecsize = math.gcd(self.N, 128 // largest_dtype_width)
+        self._clamp_cluster_n(vecsize)
         tiled_copy, tiler_mn, threads_per_row = self._get_tiled_copy(vecsize=vecsize)
         num_threads = tiled_copy.size
         self.kernel(

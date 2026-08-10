@@ -4,6 +4,7 @@ Attention backend registry and common types.
 Provides:
 - AttentionKwargs: generic typed dict for attention kwargs
 - ATTENTION_FUNCTIONS: maps implementation name -> attention forward callable
+- get_attention_fn: registry lookup that raises on an unavailable flash backend
 - CAUSAL_MASK_FUNCTIONS: maps implementation name -> mask preparation callable
 - update_causal_mask: thin dispatcher over CAUSAL_MASK_FUNCTIONS
 - is_flash_attention / FLASH_ATTENTION_IMPLEMENTATIONS: flash-family detection
@@ -76,7 +77,7 @@ try:
 
     # flash_attention_forward selects FA3/FA4 (and the sgl_kernel parity path)
     # internally, so register the flash_attention_2/3 keys whenever ANY flash
-    # build is importable. Gating them on FA3_AVAILABLE alone made
+    # build is importable. Gating them on FA3_AVAILABLE alone makes
     # attn_implementation=flash_attention_3 silently fall back to eager
     # attention in FA4-only environments (MultiHeadAttention dispatches via
     # ATTENTION_FUNCTIONS.get(impl, eager_attention_forward)).
@@ -89,6 +90,31 @@ try:
 except ImportError:
     FA3_AVAILABLE = False
     FA4_AVAILABLE = False
+
+
+def get_attention_fn(attn_implementation: str) -> Callable:
+    """Resolve *attn_implementation* to its registered attention callable.
+
+    A flash implementation missing from the registry is one whose build failed
+    to import. Dispatching it to eager would run a numerically different
+    attention with no error, so raise and name what is missing.
+    """
+    attention_fn = ATTENTION_FUNCTIONS.get(attn_implementation)
+    if attention_fn is not None:
+        return attention_fn
+    if attn_implementation in FLASH_ATTENTION_IMPLEMENTATIONS:
+        needed = (
+            "flash_attn.cute (FA4)"
+            if attn_implementation == "flash_attention_4"
+            else "flash_attn_interface (FA3) or flash_attn.cute (FA4)"
+        )
+        raise ImportError(
+            f"attn_implementation={attn_implementation!r} requested but no flash-attention build "
+            f"provides it (FA3 available: {FA3_AVAILABLE}, FA4 available: {FA4_AVAILABLE}). "
+            f"Install {needed}, or choose one of the registered implementations: "
+            f"{sorted(ATTENTION_FUNCTIONS)}."
+        )
+    return eager_attention_forward
 
 
 # ------------------------------------------------------------------ #
@@ -140,6 +166,10 @@ def update_causal_mask(
     """
     prepare_fn = CAUSAL_MASK_FUNCTIONS.get(attn_implementation)
     if prepare_fn is None and attn_implementation in FLASH_ATTENTION_IMPLEMENTATIONS:
+        # A flash implementation with no registered mask function is one that
+        # failed to import. get_attention_fn raises for it, so this only serves
+        # callers that build a mask without running attention; give them the
+        # mask eager expects rather than the raw padding mask.
         prepare_fn = eager_prepare_causal_mask
     if prepare_fn is not None:
         return prepare_fn(

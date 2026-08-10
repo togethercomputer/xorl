@@ -11,7 +11,13 @@ from xorl.models.checkpoint_handlers.buffers import (
     detect_prequantized_checkpoint,
     get_prequantized_exclude_modules,
 )
-from xorl.models.layers import ACT2FN, RMSNorm, RotaryEmbedding
+from xorl.models.layers import (
+    ACT2FN,
+    RMS_NORM_FAMILY_NO_RESIDUAL,
+    RMS_NORM_FAMILY_RESIDUAL_TREE,
+    RMSNorm,
+    RotaryEmbedding,
+)
 from xorl.models.layers.attention import (
     AttentionKwargs,
     MultiHeadAttention,
@@ -77,11 +83,20 @@ class Qwen3Attention(MultiHeadAttention):
 class Qwen3DecoderLayer(GradientCheckpointingLayer):
     def __init__(self, config: Qwen3Config, layer_idx: int):
         super().__init__()
+        self.layer_idx = layer_idx
         self.hidden_size = config.hidden_size
         self.self_attn = Qwen3Attention(config=config, layer_idx=layer_idx)
         self.mlp = Qwen3MLP(config)
-        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # Family contract: layer-0 input norm is a no-residual site; every other
+        # norm sits on the serving residual tree (pre-summed at layer>0).
+        self.input_layernorm = RMSNorm(
+            config.hidden_size,
+            eps=config.rms_norm_eps,
+            family=RMS_NORM_FAMILY_RESIDUAL_TREE if layer_idx > 0 else RMS_NORM_FAMILY_NO_RESIDUAL,
+        )
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps, family=RMS_NORM_FAMILY_RESIDUAL_TREE
+        )
         if config.sliding_window and not is_flash_attention(
             config._attn_implementation
         ):  # diff with Llama is this warning
@@ -194,7 +209,7 @@ class Qwen3Model(Qwen3PreTrainedModel):
         self.layers = nn.ModuleList(
             [Qwen3DecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, family=RMS_NORM_FAMILY_RESIDUAL_TREE)
         self.rotary_emb = RotaryEmbedding(config=config)
 
         self.gradient_checkpointing = False
@@ -288,10 +303,10 @@ class Qwen3Model(Qwen3PreTrainedModel):
                 all_self_attns += (layer_outputs[1],)
 
         # PP support: norm may be None on non-last stages
-        hidden_states = self.norm(hidden_states) if self.norm is not None else hidden_states
+        if self.norm is not None:
+            hidden_states = self.norm(hidden_states)
         if output_hidden_states:
             all_hidden_states += (hidden_states,)
-
         return BaseModelOutput(
             last_hidden_state=hidden_states,
             hidden_states=all_hidden_states,

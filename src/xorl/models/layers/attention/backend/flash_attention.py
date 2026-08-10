@@ -13,8 +13,8 @@ import torch
 from .....utils import logging
 
 
-# FA3 import. Some CUDA 13 / FA4 environments do not ship
-# flash_attn_interface, but they can still use the CUTE FA4 path below.
+# FA3 import. Some CUDA 13 / FA4 environments do not ship flash_attn_interface,
+# but they can still use the CUTE FA4 path below.
 try:
     from flash_attn_interface import flash_attn_func, flash_attn_varlen_func, flash_attn_with_kvcache
 
@@ -36,12 +36,13 @@ except ImportError:
     fa4_flash_attn_func = None
     fa4_flash_attn_varlen_func = None
 
-# sgl_kernel FA3 import — the EXACT flash-attention build SGLang serves with. K3
-# localization proved xorl's `flash_attn_interface` FA3 and SGLang's
-# `sgl_kernel.flash_attn` FA3 are different compilations that produce different
-# bf16 attention-core output for identical Q/K/V (~4.88e-4 at layer 0), which
-# accumulates over all layers. Routing xorl's packed prefill through this exact
-# kernel is the train/serve attention-parity path for zero-K3.
+# sgl_kernel FA3 import -- the exact flash-attention build SGLang serves with.
+# It is a different compilation of FA3 from xorl's `flash_attn_interface`, so
+# routing packed prefill through it removes the build from the variables in a
+# train/serve mismatch hunt. Opt-in, not a parity requirement: the divergence
+# once attributed to the build difference was root-caused to RoPE, and given
+# matching post-RoPE q/k the attention core reproduces the serving engine's
+# output. See docs/k3/ATTENTION_CONTRACT.md.
 try:
     from sgl_kernel.flash_attn import flash_attn_with_kvcache as sgl_flash_attn_with_kvcache
 
@@ -53,10 +54,11 @@ except ImportError:
 # Environment variable to disable FA4 even when available
 XORL_DISABLE_FA4 = os.environ.get("XORL_DISABLE_FA4", "0") == "1"
 XORL_FLASH_ATTN_DETERMINISTIC = os.environ.get("XORL_FLASH_ATTN_DETERMINISTIC", "0") == "1"
+# Route packed prefill self-attention through FA3's paged KV-cache entry point
+# on a page-size-1 cache with ``num_splits=1`` -- the entry point and fixed
+# KV-axis reduction order the serving engine uses.
 XORL_FLASH_ATTN_PAGED_KVCACHE = os.environ.get("XORL_FLASH_ATTN_PAGED_KVCACHE", "0") == "1"
-# Route packed prefill self-attention through SGLang's exact sgl_kernel FA3
-# `flash_attn_with_kvcache` (page_size=1, num_splits=1) for bit-parity with the
-# serving attention core. Opt-in K3 zero-KLD parity path.
+# Same route, but through SGLang's exact ``sgl_kernel`` FA3 build.
 XORL_FLASH_ATTN_SGL_KERNEL = os.environ.get("XORL_FLASH_ATTN_SGL_KERNEL", "0") == "1"
 XORL_FLASH_ATTN_DIAGNOSTIC_DECODE_KVCACHE = os.environ.get("XORL_FLASH_ATTN_DIAGNOSTIC_DECODE_KVCACHE", "0") == "1"
 
@@ -81,15 +83,52 @@ def _flash_attention_causal_flag(
 ) -> bool:
     causal = module_causal
     if diagnostic_decode_cache and causal and query.shape[1] == 1 and key.shape[1] > query.shape[1]:
-        # In the diagnostic KV-cache scorer, a one-token decode query is already
-        # at the end of ``key``. Some FA3 stacks apply the ordinary top-left
-        # causal mask for q_len=1,k_len>1, which lets the query attend only to
-        # key row 0 and catastrophically mis-scores later decode rows. The
-        # diagnostic path scores one decode token at a time, so disabling the
-        # local causal mask gives the intended "attend to the whole prefix"
-        # semantics without changing normal full-sequence training forwards.
+        # A one-token decode query is already at the end of ``key``. Disabling
+        # the local top-left causal mask lets it attend to the whole prefix.
         causal = False
     return causal
+
+
+def _check_self_attention_kvcache_inputs(
+    kernel: str,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seq_lens_q: torch.Tensor,
+    cu_seq_lens_k: torch.Tensor,
+    max_length_q: int,
+    max_length_k: int,
+) -> None:
+    """Reject shapes the page-size-1 KV-cache route cannot represent.
+
+    A silent fallback would break the bitwise contract these routes exist to
+    hold, so an unsupported shape raises instead.
+    """
+    if not torch.equal(cu_seq_lens_q, cu_seq_lens_k):
+        raise ValueError(f"{kernel} parity path only supports self-attention cu_seqlens_q == cu_seqlens_k")
+    if q.shape[0] != k.shape[0] or k.shape[0] != v.shape[0]:
+        raise ValueError(f"{kernel} parity path expects q/k/v to cover the same packed token span")
+    if max_length_q != max_length_k:
+        raise ValueError(f"{kernel} parity path expects max_length_q == max_length_k")
+
+
+def _build_page_size_1_metadata(
+    device: torch.device,
+    cu_seq_lens_k: torch.Tensor,
+    max_length_k: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Build the (page_table, cache_seqlens) pair for a page-size-1 KV cache.
+
+    Every token occupies its own page, which is the layout the serving engine
+    uses. Table rows past a sequence's length are clamped to page 0; they are
+    never read because ``cache_seqlens`` bounds the reduction.
+    """
+    lengths = (cu_seq_lens_k[1:] - cu_seq_lens_k[:-1]).to(torch.int32)
+    starts = cu_seq_lens_k[:-1].unsqueeze(1).to(torch.int32)
+    offsets = torch.arange(max_length_k, device=device, dtype=torch.int32).unsqueeze(0)
+    page_table = starts + offsets
+    page_table = torch.where(offsets < lengths.unsqueeze(1), page_table, torch.zeros_like(page_table))
+    return page_table, lengths
 
 
 def _flash_attn_varlen_with_paged_kvcache(
@@ -107,30 +146,27 @@ def _flash_attn_varlen_with_paged_kvcache(
 ) -> torch.Tensor:
     """Run packed self-attention through FA3's paged KV-cache entry point.
 
-    This is an opt-in train/serve parity path for the K3 zero-KLD work. SGLang's
-    deterministic FA3 prefill stores K/V into a page-size-1 cache and calls
-    flash_attn_with_kvcache with page_table/cache_seqlens metadata. xorl's
-    packed trainer path normally calls flash_attn_varlen_func directly. The env
-    gate lets us measure the exact SGLang-style entry point in xorl without
-    changing default training behavior.
+    The serving engine's deterministic FA3 prefill stores K/V into a
+    page-size-1 cache and calls ``flash_attn_with_kvcache`` with
+    page_table/cache_seqlens metadata and ``num_splits=1``. xorl's packed
+    trainer path otherwise calls ``flash_attn_varlen_func`` directly. Both
+    reduce the KV axis in one piece -- ``num_splits`` defaults to 1 on the
+    varlen entry point and only the ``*_with_kvcache`` family defaults to 0,
+    where a shape-dependent heuristic picks the split count -- so this route
+    aligns the entry point, and pins the split count that entry point would
+    otherwise choose.
     """
     if flash_attn_with_kvcache is None:
         raise ImportError("XORL_FLASH_ATTN_PAGED_KVCACHE requires flash_attn_interface / FA3")
-    if not torch.equal(cu_seq_lens_q, cu_seq_lens_k):
-        raise ValueError("paged-kvcache FA3 parity path only supports self-attention cu_seqlens_q == cu_seqlens_k")
-    if q.shape[0] != k.shape[0] or k.shape[0] != v.shape[0]:
-        raise ValueError("paged-kvcache FA3 parity path expects q/k/v to cover the same packed token span")
-    if max_length_q != max_length_k:
-        raise ValueError("paged-kvcache FA3 parity path expects max_length_q == max_length_k")
+    _check_self_attention_kvcache_inputs(
+        "paged-kvcache FA3", q, k, v, cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k
+    )
 
     cu_seq_lens_q = cu_seq_lens_q.to(device=q.device, dtype=torch.int32)
     cu_seq_lens_k = cu_seq_lens_k.to(device=q.device, dtype=torch.int32)
-    lengths = (cu_seq_lens_k[1:] - cu_seq_lens_k[:-1]).to(torch.int32)
-    starts = cu_seq_lens_k[:-1].unsqueeze(1).to(torch.int32)
-    offsets = torch.arange(max_length_k, device=q.device, dtype=torch.int32).unsqueeze(0)
-    page_table = starts + offsets
-    page_table = torch.where(offsets < lengths.unsqueeze(1), page_table, torch.zeros_like(page_table))
+    page_table, lengths = _build_page_size_1_metadata(q.device, cu_seq_lens_k, max_length_k)
 
+    # page-size-1 KV cache: each token occupies its own page.
     k_cache = k.contiguous().view(-1, 1, k.shape[-2], k.shape[-1])
     v_cache = v.contiguous().view(-1, 1, v.shape[-2], v.shape[-1])
     return flash_attn_with_kvcache(
@@ -166,31 +202,23 @@ def _flash_attn_varlen_with_sgl_kernel(
     """Run packed self-attention through SGLang's exact sgl_kernel FA3 kernel.
 
     SGLang serves with ``sgl_kernel.flash_attn.flash_attn_with_kvcache`` on a
-    page-size-1 KV cache with ``num_splits=1``. xorl's default packed trainer path
-    calls ``flash_attn_interface.flash_attn_varlen_func`` — a DIFFERENT FA3 build
-    whose attention-core output differs in the last bf16 bits for identical Q/K/V.
-    This env-gated path calls the identical serving kernel so the attention core is
-    bit-for-bit reproducible across train/serve, collapsing the cross-engine K3
-    tail at its source. Default training behavior is unchanged.
+    page-size-1 KV cache with ``num_splits=1``. xorl's default packed trainer
+    path calls ``flash_attn_interface.flash_attn_varlen_func`` -- the same
+    algorithm, a different entry point, and a different compilation of it. This
+    route calls the identical serving kernel, so neither the entry point nor the
+    build is a variable when a train/serve mismatch is being localized.
     """
     if sgl_flash_attn_with_kvcache is None:
         raise ImportError("XORL_FLASH_ATTN_SGL_KERNEL requires sgl_kernel.flash_attn / FA3")
-    if not torch.equal(cu_seq_lens_q, cu_seq_lens_k):
-        raise ValueError("sgl_kernel FA3 parity path only supports self-attention cu_seqlens_q == cu_seqlens_k")
-    if q.shape[0] != k.shape[0] or k.shape[0] != v.shape[0]:
-        raise ValueError("sgl_kernel FA3 parity path expects q/k/v to cover the same packed token span")
-    if max_length_q != max_length_k:
-        raise ValueError("sgl_kernel FA3 parity path expects max_length_q == max_length_k")
+    _check_self_attention_kvcache_inputs(
+        "sgl_kernel FA3", q, k, v, cu_seq_lens_q, cu_seq_lens_k, max_length_q, max_length_k
+    )
 
     cu_seq_lens_q = cu_seq_lens_q.to(device=q.device, dtype=torch.int32)
     cu_seq_lens_k = cu_seq_lens_k.to(device=q.device, dtype=torch.int32)
-    lengths = (cu_seq_lens_k[1:] - cu_seq_lens_k[:-1]).to(torch.int32)
-    starts = cu_seq_lens_k[:-1].unsqueeze(1).to(torch.int32)
-    offsets = torch.arange(max_length_k, device=q.device, dtype=torch.int32).unsqueeze(0)
-    page_table = starts + offsets
-    page_table = torch.where(offsets < lengths.unsqueeze(1), page_table, torch.zeros_like(page_table))
+    page_table, lengths = _build_page_size_1_metadata(q.device, cu_seq_lens_k, max_length_k)
 
-    # page-size-1 KV cache: each token occupies its own page (matches SGLang serving).
+    # page-size-1 KV cache: each token occupies its own page (matches serving).
     k_cache = k.contiguous().view(-1, 1, k.shape[-2], k.shape[-1])
     v_cache = v.contiguous().view(-1, 1, v.shape[-2], v.shape[-1])
     return sgl_flash_attn_with_kvcache(
@@ -322,18 +350,16 @@ def flash_attention_forward(
         diagnostic_decode_cache=diagnostic_decode_cache,
     )
 
-    # SGLang FA3 attention-core parity path (opt-in K3 zero-KLD). Takes priority over
-    # the FA3/FA4 selection so xorl's packed prefill uses SGLang's exact sgl_kernel FA3
-    # kernel (page_size=1, num_splits=1) regardless of which flash-attn build xorl would
-    # otherwise pick. This makes the attention core bit-reproducible across train/serve,
-    # which K3 localization showed is the sole seed of the cross-engine logprob tail.
-    # Only the varlen (packed) path is covered; other shapes fall through to FA3/FA4.
+    # sgl_kernel FA3 attention-core parity path. It takes priority over the
+    # FA3/FA4 selection so xorl's packed prefill uses the serving kernel
+    # (page_size=1, num_splits=1) regardless of which flash-attn build xorl
+    # would otherwise pick. Only the varlen (packed) and single-sequence
+    # batched shapes are covered; anything else falls through to FA3/FA4.
     _sgl_cu_q = kwargs.get("cu_seq_lens_q", None)
     _sgl_cu_k = kwargs.get("cu_seq_lens_k", None)
-    # Engage for the packed-varlen case (cu_seqlens supplied) OR the single-sequence
-    # batched case (B=1): a causal forward over the whole [1, S] span is equivalent to
-    # one varlen sequence of length S (padding rows are future-masked and discarded),
-    # so we synthesize cu_seqlens=[0, S] and route through the same sgl_kernel FA3.
+    # A causal forward over a whole [1, S] span is equivalent to one varlen
+    # sequence of length S (padding rows are future-masked and discarded), so
+    # for B=1 we synthesize cu_seqlens=[0, S] and route through the same kernel.
     _sgl_batched_ok = _sgl_cu_q is None and _sgl_cu_k is None and query.dim() == 4 and query.size(0) == 1
     if XORL_FLASH_ATTN_SGL_KERNEL and ((_sgl_cu_q is not None and _sgl_cu_k is not None) or _sgl_batched_ok):
         if sliding_window is not None:
@@ -411,6 +437,7 @@ def flash_attention_forward(
                 causal=causal,
                 window_size=window_size,
                 softcap=softcap if softcap is not None else 0.0,
+                num_splits=1,
                 deterministic=deterministic,
             )
             # Restore batch dimension
@@ -426,6 +453,7 @@ def flash_attention_forward(
                 causal=causal,
                 window_size=window_size,
                 softcap=softcap if softcap is not None else 0.0,
+                num_splits=1,
                 deterministic=deterministic,
             )
     else:
@@ -457,21 +485,7 @@ def flash_attention_forward(
             k_varlen = key.squeeze(0) if key.size(0) == 1 else key.reshape(-1, key.size(-2), key.size(-1))
             v_varlen = value.squeeze(0) if value.size(0) == 1 else value.reshape(-1, value.size(-2), value.size(-1))
 
-            if XORL_FLASH_ATTN_SGL_KERNEL:
-                attn_output = _flash_attn_varlen_with_sgl_kernel(
-                    q_varlen,
-                    k_varlen,
-                    v_varlen,
-                    cu_seq_lens_q,
-                    cu_seq_lens_k,
-                    max_length_q,
-                    max_length_k,
-                    scaling,
-                    causal,
-                    window_size_fa3,
-                    softcap,
-                )
-            elif XORL_FLASH_ATTN_PAGED_KVCACHE:
+            if XORL_FLASH_ATTN_PAGED_KVCACHE:
                 attn_output = _flash_attn_varlen_with_paged_kvcache(
                     q_varlen,
                     k_varlen,

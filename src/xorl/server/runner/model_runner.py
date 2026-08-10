@@ -487,12 +487,6 @@ class ModelRunner:
         # Disable TF32 and BF16 reduced-precision accumulation for
         # consistent numerics across parallelism strategies.
         helper.enable_high_precision_for_bf16()
-
-        # Optional: route aten::{mm,addmm,bmm,_log_softmax,mean.dim,rms_norm,mm.dtype}
-        # through the same batch-invariant Triton kernels SGLang uses, so the linear
-        # layers, router gate matmul, lm_head, RMSNorm and (for the eager MoE
-        # backend) the per-expert torch.matmul GEMMs match SGLang's reduction order
-        # bit-for-bit. Gated, default-off; forward-path correctness experiment.
         if os.environ.get("XORL_BATCH_INVARIANT_MATMUL", "0") == "1":
             from xorl.ops.batch_invariant_ops import (  # noqa: PLC0415
                 enable_batch_invariant_mode,
@@ -1603,6 +1597,7 @@ class ModelRunner:
             rmsnorm_mode=self.model_config.get("rmsnorm_mode", "native"),
             activation_native=self.model_config.get("activation_native", False),
             rope_native=self.model_config.get("rope_native", False),
+            rope_class_b=self.model_config.get("rope_class_b", False),
             attention_cast_bf16=self.model_config.get("attention_cast_bf16", False),
             sparse_mla_enabled=self.model_config.get("sparse_mla_enabled", False),
             sparse_mla_backend=self.model_config.get("sparse_mla_backend", "auto"),

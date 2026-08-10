@@ -10,8 +10,7 @@ from xorl.distributed.sequence_parallel.strategy import get_cp_strategy
 from xorl.models.base import XorlPreTrainedModel
 from xorl.models.layers import ACT2FN, RMSNorm, RotaryEmbedding
 from xorl.models.layers.attention import is_flash_attention, update_causal_mask
-from xorl.models.layers.attention.backend import ATTENTION_FUNCTIONS
-from xorl.models.layers.attention.backend.eager import eager_attention_forward
+from xorl.models.layers.attention.backend import get_attention_fn
 from xorl.models.layers.moe import MoEBlock
 from xorl.models.layers.moe.routing_replay import get_replay_stage
 from xorl.models.outputs import MoeCausalLMOutput, MoeModelOutput
@@ -166,7 +165,7 @@ class DeepseekV3Attention(nn.Module):
         return self.o_proj(attn_output)
 
     def _get_attention_fn(self):
-        return ATTENTION_FUNCTIONS.get(self.config._attn_implementation, eager_attention_forward)
+        return get_attention_fn(self.config._attn_implementation)
 
     def _attention_kwargs(self):
         return {

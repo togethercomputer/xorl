@@ -79,10 +79,25 @@ def _set_sum_gradient_divide_factor(fsdp_module: FSDPModule) -> None:
         fsdp_module.set_gradient_divide_factor(1.0)
 
 
-def _bf16_mixed_precision_policy(reduce_dtype: torch.dtype = torch.float32):
+def _bf16_mixed_precision_policy(
+    reduce_dtype: torch.dtype = torch.float32,
+    *,
+    cast_forward_inputs: bool = True,
+):
     return MixedPrecisionPolicy(
         param_dtype=torch.bfloat16,
         reduce_dtype=reduce_dtype,
+        cast_forward_inputs=cast_forward_inputs,
+    )
+
+
+def _decoder_bf16_mixed_precision_policy(reduce_dtype: torch.dtype = torch.float32):
+    """Preserve the fp32 RoPE table when the Class-B contract is active."""
+    from xorl.models.layers.rope import rope_class_b_enabled  # noqa: PLC0415
+
+    return _bf16_mixed_precision_policy(
+        reduce_dtype=reduce_dtype,
+        cast_forward_inputs=not rope_class_b_enabled(),
     )
 
 
@@ -361,6 +376,12 @@ def parallelize_model_fsdp2(
         reduce_dtype = _resolve_fsdp_reduce_dtype(fsdp_reduce_dtype)
         mp_policy = _bf16_mixed_precision_policy(reduce_dtype=reduce_dtype)
         fsdp_kwargs["mp_policy"] = mp_policy
+        decoder_mp_policy = _decoder_bf16_mixed_precision_policy(reduce_dtype=reduce_dtype)
+        if not decoder_mp_policy.cast_forward_inputs:
+            logger.info_rank0(
+                "Class-B RoPE FSDP transport engaged: decoder cast_forward_inputs=False "
+                "(preserving the fp32 cos/sin table)"
+            )
 
     if hasattr(model, "get_ignore_modules_in_mixed_precision"):
         modules_to_ignore_in_mixed_precision = model.get_ignore_modules_in_mixed_precision()
@@ -440,6 +461,8 @@ def parallelize_model_fsdp2(
         # If experts_mod has _skip_fsdp, exclude its params from the parent FSDP unit
         # (each EP rank has different local expert LoRA params — they should not be all-gathered globally)
         layer_fsdp_kwargs = dict(fsdp_kwargs)
+        if enable_mixed_precision:
+            layer_fsdp_kwargs["mp_policy"] = decoder_mp_policy
         if parallel_state.ep_enabled and experts_mod is not None and getattr(experts_mod, "_skip_fsdp", False):
             # _skip_fsdp params are excluded from FSDP, so they receive no automatic
             # gradient all-reduce across eFSDP replicas.  When ep_fsdp_size > 1 the

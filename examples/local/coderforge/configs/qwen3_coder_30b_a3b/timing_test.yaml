@@ -17,6 +17,7 @@ data:
   pad_to_multiple_of: 4096
 
 train:
+  ce_mode: quack_linear  # long-context throughput: fused linear+CE, ~2x lower loss peak mem; escape hatch: compiled
   output_dir: outputs/timing_test_30b
   data_parallel_mode: fsdp2
   ulysses_parallel_size: 8

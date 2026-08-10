@@ -166,6 +166,12 @@ class ServerArguments:
     rope_native: bool = field(
         default=False, metadata={"help": "Use naive RoPE implementation instead of flash_attn fused kernel."}
     )
+    rope_class_b: bool = field(
+        default=False,
+        metadata={
+            "help": "Use compiled Class-B RoPE fp32-chain numerics aligned with SGLang's stock fused CUDA kernel."
+        },
+    )
 
     attention_cast_bf16: bool = field(
         default=False, metadata={"help": "Explicitly cast Q/K to bfloat16 after RoPE for SGLang alignment."}
@@ -1348,6 +1354,7 @@ class ServerArguments:
                 "rmsnorm_mode": self.rmsnorm_mode,
                 "activation_native": self.activation_native,
                 "rope_native": self.rope_native,
+                "rope_class_b": self.rope_class_b,
                 "attention_cast_bf16": self.attention_cast_bf16,
                 "flash_attention_deterministic": self.flash_attention_deterministic,
             },

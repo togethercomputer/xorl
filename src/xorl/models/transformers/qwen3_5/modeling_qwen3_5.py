@@ -17,8 +17,7 @@ from xorl.models.layers.attention import (
     is_flash_attention,
     update_causal_mask,
 )
-from xorl.models.layers.attention.backend import ATTENTION_FUNCTIONS
-from xorl.models.layers.attention.backend.eager import eager_attention_forward
+from xorl.models.layers.attention.backend import get_attention_fn
 from xorl.models.layers.normalization import (
     compiled_zero_centered_rms_norm,
     eager_zero_centered_rms_norm,
@@ -185,7 +184,7 @@ class Qwen3_5Attention(nn.Module):
         return self.o_proj(attn_output)
 
     def _get_attention_fn(self) -> Callable:
-        return ATTENTION_FUNCTIONS.get(self.config._attn_implementation, eager_attention_forward)
+        return get_attention_fn(self.config._attn_implementation)
 
     def _attention_kwargs(self) -> dict:
         return dict(

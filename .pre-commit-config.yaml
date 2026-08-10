@@ -25,6 +25,11 @@ repos:
       - id: ruff
         args: [--fix-only]
       - id: ruff-format
+        # bi_families_v2.py is vendored byte-identical into the serving engine
+        # and both copies are sha256-gated, so it carries that engine's
+        # formatting (black, 88 columns). Reformatting it here at 120 would
+        # break the byte-equality the contract depends on. Lint still runs.
+        exclude: ^src/xorl/ops/bi_families_v2\.py$
   - repo: https://github.com/codespell-project/codespell
     rev: v2.4.1
     hooks:
