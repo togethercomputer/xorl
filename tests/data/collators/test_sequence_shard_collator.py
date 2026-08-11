@@ -89,6 +89,37 @@ class TestCollatorCall:
         assert packed_result["labels"][0, 4] == IGNORE_INDEX
 
     @patch("xorl.data.collators.sequence_shard_collator.get_parallel_state")
+    def test_shift_check_skips_supervised_packed_document_tails(self, mock_parallel_state):
+        """A target at a packed tail must not be compared with the next document's first input."""
+        mock_parallel_state.return_value = _make_mock_ps(cp_size=8, cp_rank=0)
+        collator = TextSequenceShardCollator(pad_token_id=0)
+        result = collator(
+            {
+                "input_ids": torch.tensor([[10, 11, 20, 21, 30, 31, 40, 41]]),
+                "attention_mask": torch.ones(1, 8, dtype=torch.long),
+                "labels": torch.tensor(
+                    [[IGNORE_INDEX, 91, IGNORE_INDEX, 92, IGNORE_INDEX, 93, IGNORE_INDEX, 94]]
+                ),
+                "position_ids": torch.tensor([[0, 1, 0, 1, 0, 1, 0, 1]]),
+            }
+        )
+        assert result["input_ids"].shape == (1, 1)
+
+    @patch("xorl.data.collators.sequence_shard_collator.get_parallel_state")
+    def test_shift_check_still_rejects_same_document_mismatch(self, mock_parallel_state):
+        mock_parallel_state.return_value = _make_mock_ps(cp_size=1, cp_rank=0)
+        collator = TextSequenceShardCollator(pad_token_id=0)
+        with pytest.raises(AssertionError, match="first comparable non-ignore label"):
+            collator(
+                {
+                    "input_ids": torch.tensor([[1, 2, 3]]),
+                    "attention_mask": torch.ones(1, 3, dtype=torch.long),
+                    "labels": torch.tensor([[99, IGNORE_INDEX, IGNORE_INDEX]]),
+                    "position_ids": torch.tensor([[0, 1, 2]]),
+                }
+            )
+
+    @patch("xorl.data.collators.sequence_shard_collator.get_parallel_state")
     def test_sp_splitting_padding_and_flash_attn_kwargs(self, mock_parallel_state):
         """Covers SP padding to multiple, splitting across ranks, flash attention kwargs,
         attention_mask/position_ids preservation, and padding values."""

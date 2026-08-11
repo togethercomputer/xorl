@@ -245,8 +245,8 @@ class TestConvContractGuards:
     def test_forward_routes_through_contract_when_armed(self, monkeypatch):
         calls = []
 
-        def fake_contract(q_in, k_in, v_in, *convs, cu_seqlens=None):
-            calls.append(cu_seqlens)
+        def fake_contract(q_in, k_in, v_in, *convs, cu_seqlens=None, cp_context=None):
+            calls.append((cu_seqlens, cp_context))
             return F.silu(q_in), F.silu(k_in), F.silu(v_in)
 
         def fake_chunk(**kwargs):
@@ -269,11 +269,44 @@ class TestConvContractGuards:
         with pytest.raises(RuntimeError, match="prefill only"):
             layer(torch.randn(1, 128, 256), use_cache=True)
 
-    def test_cp_context_raises(self):
+    def test_exact_cp_reconstructs_full_sequence_before_contract(self, monkeypatch):
+        calls = []
+
+        def fake_contract(q_in, k_in, v_in, *convs, cu_seqlens=None, cp_context=None):
+            calls.append((cu_seqlens, cp_context))
+            return F.silu(q_in), F.silu(k_in), F.silu(v_in)
+
+        def fake_chunk(**kwargs):
+            return kwargs["v"], None
+
+        def fake_gating(A_log, a, b, dt_bias):
+            return -A_log.float().exp() * F.softplus(a + dt_bias), torch.sigmoid(b)
+
+        monkeypatch.setattr(gated_deltanet, "causal_conv1d_qkv_contract", fake_contract)
+        monkeypatch.setattr(gated_deltanet, "bi_fused_gdn_gating", fake_gating)
+        monkeypatch.setattr(gated_deltanet, "chunk_gated_delta_rule", fake_chunk)
+        monkeypatch.setattr(
+            gated_deltanet,
+            "all_gather_along_dim",
+            lambda x, *, dim, group: torch.cat((x, x), dim=dim),
+        )
+        monkeypatch.setattr(
+            gated_deltanet,
+            "scatter_along_dim",
+            lambda x, *, dim, group: x.narrow(dim, 0, x.shape[dim] // 2),
+        )
         layer = _tiny_gdn(exact_contract=True)
-        cp_context = SimpleNamespace(cu_seqlens=torch.tensor([0, 8]), group=object(), is_first_rank=True)
-        with pytest.raises(RuntimeError, match="does not support CP"):
-            layer(torch.randn(1, 8, 256), cp_context=cp_context)
+        local_cu = torch.tensor([0, 8])
+        global_cu = torch.tensor([0, 8, 16])
+        cp_context = SimpleNamespace(
+            cu_seqlens=local_cu,
+            global_cu_seqlens=global_cu,
+            group=object(),
+            is_first_rank=True,
+        )
+        output, _, _ = layer(torch.randn(1, 8, 256), cp_context=cp_context)
+        assert output.shape == (1, 8, 256)
+        assert calls == [(global_cu, None)]
 
     def test_no_short_conv_raises(self):
         layer = _tiny_gdn(use_short_conv=False, exact_contract=True)
