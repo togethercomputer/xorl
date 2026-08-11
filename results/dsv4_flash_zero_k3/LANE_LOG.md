@@ -63,6 +63,25 @@ Notes:
   are individually clean, so suspicion moves to embeddings/mHC pre-mix,
   attention (C0 window / compressor), indexer, or the EP combine order.
 
+## Base-ruler divergence burn-down (2026-08-11, in trunk order)
+
+| # | Component | Root cause | Fix | Verified |
+| --- | --- | --- | --- | --- |
+| 1 | Router gate GEMM | Trainer ran cuBLAS bf16-widen; sampler's deterministic contract interposes torch.mm to the BI persistent Triton GEMM | Call matmul_persistent directly in route() | Router logits byte-equal |
+| 2 | Replay row population | 1-datum replay cloned to all 8 DP ranks; serving idle ranks contribute zero rows; fused_marlin_moe is row-count sensitive | Dummy ranks declare num_samples=0 (decode-cache scorer) | Gathered rows 80→10 |
+| 3 | RoPE tables | named_buffers() dedup + to_empty zeroed the lru-shared freqs_cis on layers 1,3-42 | rebuild_shared_freqs_cis post-load hook (43→126 tables incl. compressor/indexer) | L1 attention byte-equal |
+| 4 | EP combine order | Serving pins NCCL_ALGO=allreduce:tree = bf16 chain [1..7,0]; trainer used Qwen's [7..0] | chain_order param on exchange_variable_and_chain_sum | L0/L1 MoE + next-layer inputs byte-equal |
+| 5 | Compressor APE | Loader "un-hotfixed" a table the checkpoint ships in natural layout | Removed 3 _undo_ape_hotfix applications | L2 attention byte-equal (live-probe stage proof) |
+| 6 | Compressor kv_score GEMM | Same interposed-mm class as #1, inside _serving_compressed_kv | matmul_persistent + widen | L2 attn core byte-equal vs TP8 boundary dump |
+| 7 | Standalone q_norm | BI rms_norm vs sgl_kernel rmsnorm: 1-ulp at rounding boundaries | Exact lane calls rms_norm_batch_invariant | L4 q_post byte-equal |
+| 8 | L4 attention residual | UNDER ISOLATION (0.0156 absmax, 1331/40960; independent of #7) | — | — |
+
+Decode-semantics replay: decisions are replayed as full prefixes keeping only
+the decision position (no KV carry needed: cache bytes are position-local,
+Marlin pads to the 48-row qualified geometry). k3_max trajectory:
+244310 → 0.057 → 0.032 → 0.089 (fixes interact; byte equality is the only
+meaningful acceptance).
+
 ## RCA progress (base ruler)
 
 - **Stage 1 byte-clean**: trainer `model.layers.0.layer_input` [1,10,4,4096]
