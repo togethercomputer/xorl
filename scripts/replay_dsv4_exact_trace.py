@@ -158,7 +158,10 @@ def main() -> int:
     labels = [IGNORE_INDEX] * (len(prompt_ids) - 1) + output_ids
     if len(input_ids) != len(labels):
         raise AssertionError("next-token replay alignment is inconsistent")
-    loss_fn_params = json.loads(args.loss_fn_params_json) if args.loss_fn_params_json else None
+    params_json = args.loss_fn_params_json
+    if params_json and params_json.startswith("@"):
+        params_json = Path(params_json[1:]).read_text()
+    loss_fn_params = json.loads(params_json) if params_json else None
 
     trainer_buffers = []
     for repetition in range(args.repetitions):

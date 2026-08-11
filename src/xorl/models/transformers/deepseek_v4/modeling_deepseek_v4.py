@@ -1524,6 +1524,11 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
         self.gradient_checkpointing = False
         self.post_init()
 
+    def _capture_diagnostic_component(self, name: str, value: torch.Tensor) -> None:
+        capture = self.__dict__.get("_diagnostic_capture_component")
+        if callable(capture):
+            capture(name, value)
+
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -1661,7 +1666,9 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
                 h4d = layer_outputs
 
         h3d = self.hc_util.block_head(h4d, self.hc_head_fn, self.hc_head_scale, self.hc_head_base)
+        self._capture_diagnostic_component("hc_head_output", h3d)
         h3d = self.norm(h3d)
+        self._capture_diagnostic_component("final_norm", h3d)
         if exact_compute_token_count < packed_sequence_length:
             h3d = F.pad(h3d, (0, 0, 0, packed_sequence_length - exact_compute_token_count))
         return MoeModelOutput(
