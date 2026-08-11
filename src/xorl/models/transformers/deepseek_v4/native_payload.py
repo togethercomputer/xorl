@@ -18,7 +18,6 @@ from torch import nn
 
 
 DSV4_NATIVE_PAYLOAD_CONTRACT_VERSION = "dsv4_flash_native_payload_v1"
-DSV4_MARLIN_MIN_QUALIFIED_ROWS = 48
 _DIAGNOSTIC_SINGLE_ADAPTER_BATCH_INFOS = {}
 
 
@@ -794,26 +793,6 @@ def _dsv4_moe_lora_info(
     )
 
 
-def _pad_dsv4_marlin_rows(
-    hidden_states: torch.Tensor,
-    routing_weights: torch.Tensor,
-    local_ids: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Pad small routed batches to the repeatability-qualified Marlin geometry."""
-
-    rows = hidden_states.shape[0]
-    if routing_weights.shape[0] != rows or local_ids.shape[0] != rows:
-        raise ValueError("DSV4 Marlin row operands must have the same leading dimension")
-    if rows >= DSV4_MARLIN_MIN_QUALIFIED_ROWS:
-        return hidden_states, routing_weights, local_ids
-    padding = DSV4_MARLIN_MIN_QUALIFIED_ROWS - rows
-    return (
-        torch.cat((hidden_states, hidden_states.new_zeros(padding, hidden_states.shape[1])), dim=0),
-        torch.cat((routing_weights, routing_weights.new_zeros(padding, routing_weights.shape[1])), dim=0),
-        torch.cat((local_ids, local_ids.new_full((padding, local_ids.shape[1]), -1)), dim=0),
-    )
-
-
 def _dsv4_native_mxfp4_forward(
     hidden_states: torch.Tensor,
     routing_weights: torch.Tensor,
@@ -856,11 +835,16 @@ def _dsv4_native_mxfp4_forward(
         torch.full_like(local_ids, -1),
     ).to(torch.int32)
     logical_rows = hidden_states.shape[0]
-    run_hidden_states, run_routing_weights, run_local_ids = _pad_dsv4_marlin_rows(
-        hidden_states.contiguous(),
-        routing_weights.contiguous(),
-        local_ids.contiguous(),
-    )
+    # No row padding: the trainer must launch exactly the serving runner's M
+    # per gathered segment. Serving decode launches M=1; the retired pad to
+    # DSV4_MARLIN_MIN_QUALIFIED_ROWS made the trainer's live row ride an
+    # M=10 chunk (1 live + 9 masked) whose Marlin bytes diverge from the
+    # serving M=1 launch value-dependently (first seen at decision 39 of the
+    # campaign-2 64-decision base ruler). Stability for every M <= 10 launch
+    # is owned by the shared chunked-Marlin program.
+    run_hidden_states = hidden_states.contiguous()
+    run_routing_weights = routing_weights.contiguous()
+    run_local_ids = local_ids.contiguous()
     expert_map = torch.full((256,), -1, dtype=torch.int32, device=hidden_states.device)
     expert_map[local_start : local_start + local_experts] = torch.arange(
         local_experts, dtype=torch.int32, device=hidden_states.device
