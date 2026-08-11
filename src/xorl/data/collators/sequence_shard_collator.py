@@ -177,19 +177,24 @@ class TextSequenceShardCollator(DataCollator):
             f"Got input_ids: {input_ids.shape}, position_ids: {position_ids.shape}"
         )
 
-        # Sanity check: verify the first non-ignore label matches shifted input_ids
-        # This ensures data is properly shifted without being too strict about all positions
-        # (chat data may have labels[i] != input_ids[i+1] at turn boundaries)
+        # Sanity check: verify the first comparable non-ignore label matches
+        # shifted input_ids. A supervised token at the tail of one packed
+        # document has no same-document input_ids[i+1]: the next packed token
+        # belongs to a different document and position_ids resets to zero.
+        # Skip those boundaries while retaining the fail-closed check wherever
+        # a same-document successor is present.
         valid_mask = labels != IGNORE_INDEX
-        if valid_mask.any():
-            # Find first non-ignore position
-            first_valid_idx = valid_mask.nonzero(as_tuple=True)[1][0].item()
-            if first_valid_idx < labels.shape[1] - 1:  # Ensure we can check i+1
-                first_label = labels[0, first_valid_idx].item()
-                next_input = input_ids[0, first_valid_idx + 1].item()
+        if labels.shape[1] > 1:
+            same_document_successor = position_ids[:, 1:] == position_ids[:, :-1] + 1
+            comparable = valid_mask[:, :-1] & same_document_successor
+            if comparable.any():
+                batch_idx, first_valid_idx = comparable.nonzero(as_tuple=False)[0].tolist()
+                first_label = labels[batch_idx, first_valid_idx].item()
+                next_input = input_ids[batch_idx, first_valid_idx + 1].item()
                 assert first_label == next_input, (
-                    f"Data shift check failed: first non-ignore label should equal next input_id. "
-                    f"labels[{first_valid_idx}]={first_label}, input_ids[{first_valid_idx + 1}]={next_input}. "
+                    f"Data shift check failed: first comparable non-ignore label should equal next input_id. "
+                    f"labels[{batch_idx}, {first_valid_idx}]={first_label}, "
+                    f"input_ids[{batch_idx}, {first_valid_idx + 1}]={next_input}. "
                     f"This suggests data is not properly shifted."
                 )
 
