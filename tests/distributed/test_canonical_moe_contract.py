@@ -8,6 +8,7 @@ import torch.distributed as dist
 from distributed_utils import run_distributed_script
 
 from xorl.distributed.canonical_moe import (
+    CANONICAL_MOE_DENSE_MAX_CHUNK_ROWS,
     CANONICAL_MOE_FOLD_VERSION,
     CANONICAL_MOE_REDUCE_VERSION,
     CanonicalMoEGraphMetadata,
@@ -16,6 +17,7 @@ from xorl.distributed.canonical_moe import (
     OutputDistribution,
     ParallelPlan,
     ParallelRole,
+    _resolve_transport_chunk_rows,
     canonical_moe_fold_v1,
     canonical_moe_reduce_cp_sharded_v3,
     canonical_moe_reduce_packed_ep16_v2,
@@ -27,6 +29,15 @@ from xorl.distributed.parallel_state import init_ep_mesh_matrix
 
 
 pytestmark = [pytest.mark.distributed]
+
+
+@pytest.mark.cpu
+def test_dense_transport_default_bounds_dp_owned_capacity_without_a_selector():
+    assert CANONICAL_MOE_DENSE_MAX_CHUNK_ROWS == 4096
+    assert _resolve_transport_chunk_rows(66544, None, CanonicalMoETransport.DENSE_V1) == 4096
+    assert _resolve_transport_chunk_rows(128, None, CanonicalMoETransport.DENSE_V1) == 128
+    assert _resolve_transport_chunk_rows(66544, 2048, CanonicalMoETransport.DENSE_V1) == 2048
+    assert _resolve_transport_chunk_rows(66544, None, CanonicalMoETransport.PACKED_EP16_V2) == 66544
 
 
 def _explicit_tree(partials: torch.Tensor) -> torch.Tensor:
