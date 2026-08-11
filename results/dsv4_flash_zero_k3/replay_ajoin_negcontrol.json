@@ -1,6 +1,6 @@
 {
   "schema": "dsv4-exact-trainer-replay-v1",
-  "created_at_unix": 1786456041.8262267,
+  "created_at_unix": 1786460136.109308,
   "trace": "/home/apanda/xorl-oss-dsv4-flash-lora-zero-k3-20260810/results/dsv4_flash_zero_k3/trace_ajoin_perturbed_4dec.json",
   "trace_label": "perturbed-control",
   "model_id": "nonzero",
@@ -9,72 +9,72 @@
   "trainer_repetitions": 2,
   "trainer_denominator_byte_equal": true,
   "trainer_repetition_sha256": [
-    "d92416259c43d67d3b028f7cf94cecda170b1b15868b0d2d92f6a0cb149d16d1",
-    "d92416259c43d67d3b028f7cf94cecda170b1b15868b0d2d92f6a0cb149d16d1"
+    "dab1254db5ad2f587eb1cef877a950332814358f02d66443daa41801718921f2",
+    "dab1254db5ad2f587eb1cef877a950332814358f02d66443daa41801718921f2"
   ],
   "trainer_repetition_selected_logprobs": [
     [
-      -4.34375,
-      -3.125,
-      -0.01953125,
-      -2.84375
+      -3.71875,
+      -2.875,
+      -0.018798828125,
+      -2.921875
     ],
     [
-      -4.34375,
-      -3.125,
-      -0.01953125,
-      -2.84375
+      -3.71875,
+      -2.875,
+      -0.018798828125,
+      -2.921875
     ]
   ],
-  "trainer_selected_logprobs_b64": "AACLwAAASMAAAKC8AAA2wA==",
+  "trainer_selected_logprobs_b64": "AABuwAAAOMAAAJq8AAA7wA==",
   "trainer_selected_logprobs": [
-    -4.34375,
-    -3.125,
-    -0.01953125,
-    -2.84375
+    -3.71875,
+    -2.875,
+    -0.018798828125,
+    -2.921875
   ],
   "decode_comparison": {
     "byte_equal": false,
     "reference_sha256": "017eb9a38bf0dc7347527f0f0b2ea79850ae5b1905e91fed4117f6762b78eed4",
-    "trainer_sha256": "d92416259c43d67d3b028f7cf94cecda170b1b15868b0d2d92f6a0cb149d16d1",
+    "trainer_sha256": "dab1254db5ad2f587eb1cef877a950332814358f02d66443daa41801718921f2",
     "first_difference": {
       "decision": 0,
       "reference": -3.890625,
-      "trainer": -4.34375,
+      "trainer": -3.71875,
       "reference_bits_hex": "c0790000",
-      "trainer_bits_hex": "c08b0000"
+      "trainer_bits_hex": "c06e0000"
     },
     "k3": [
-      0.12009582682725295,
-      0.05433794117379631,
-      7.453613171115592e-07,
-      0.0029738132162049347
+      0.013959427143382275,
+      0.001994458917859321,
+      1.1922869447289486e-07,
+      0.0
     ],
-    "k3_mean": 0.04435208164464283,
-    "k3_max": 0.12009582682725295
+    "k3_mean": 0.003988501322484017,
+    "k3_max": 0.013959427143382275
   },
   "teacher_forced_comparison": {
     "byte_equal": false,
     "reference_sha256": "3eb182b55487b52bd27e24f34c4997bef09579f96002b2fea8560ee7aa8ac642",
-    "trainer_sha256": "d92416259c43d67d3b028f7cf94cecda170b1b15868b0d2d92f6a0cb149d16d1",
+    "trainer_sha256": "dab1254db5ad2f587eb1cef877a950332814358f02d66443daa41801718921f2",
     "first_difference": {
       "decision": 0,
       "reference": -3.582271099090576,
-      "trainer": -4.34375,
+      "trainer": -3.71875,
       "reference_bits_hex": "c06543ee",
-      "trainer_bits_hex": "c08b0000"
+      "trainer_bits_hex": "c06e0000"
     },
     "k3": [
-      0.37996195775082153,
-      0.0012632462713002557,
-      9.499575779337022e-07,
-      0.024256673850103327
+      0.009751792185992203,
+      0.01875856049380431,
+      2.2268311075102076e-06,
+      0.010781036435847824
     ],
-    "k3_mean": 0.10137070695745076,
-    "k3_max": 0.37996195775082153
+    "k3_mean": 0.009823403986687962,
+    "k3_max": 0.01875856049380431
   },
   "source": {
-    "repo_head": "fc767666935021fe2262b6083bb27a7665518769",
-    "repo_diff_sha256": "4bbafb7ef575227963ab4a4dcf652e1e598e0ad2ecc7c77e292b930af109f704"
+    "repo_head": "8f7ca1fa7e57e7d50c5315c46c6ac1436c5cd140",
+    "repo_diff_sha256": "39ebc915c9abcee6a203b0c7dddd26a403afd881353eac053e4117589e247727"
   }
 }

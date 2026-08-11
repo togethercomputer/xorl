@@ -939,20 +939,23 @@ class _Dsv4NativeMxfp4RoutedFunction(torch.autograd.Function):
         down_a,
         down_b,
         experts,
+        lora_live,
     ):
+        factors = (gate_a, gate_b, up_a, up_b, down_a, down_b)
+        # Serving applies the per-expert LoRA banks only on the rank whose
+        # scheduler owns the lora-bearing rows; every other rank's EP partial
+        # runs the Marlin base program (exact-zero LoRA delta, byte-equal to
+        # the pure base path).
+        effective = factors if lora_live else tuple(torch.zeros_like(f) for f in factors)
         output, local_ids = _dsv4_native_mxfp4_forward(
             hidden_states,
             routing_weights,
             selected_experts,
-            gate_a,
-            gate_b,
-            up_a,
-            up_b,
-            down_a,
-            down_b,
+            *effective,
             experts,
         )
         ctx.experts = experts
+        ctx.lora_live = lora_live
         ctx.save_for_backward(
             hidden_states.detach(),
             routing_weights.detach(),
@@ -984,12 +987,17 @@ class _Dsv4NativeMxfp4RoutedFunction(torch.autograd.Function):
             down_b,
         ) = ctx.saved_tensors
         payload = ctx.experts.native_mxfp4_payload
+        lora_live = ctx.lora_live
         need_x, need_r = ctx.needs_input_grad[:2]
         factor_needs = ctx.needs_input_grad[3:9]
         grad_x = torch.zeros_like(hidden_states) if need_x else None
         grad_r = torch.zeros_like(routing_weights) if need_r else None
         masters = (gate_a, gate_b, up_a, up_b, down_a, down_b)
         factor_grads = [torch.zeros_like(master) if needed else None for master, needed in zip(masters, factor_needs)]
+        # When serving skips this rank's LoRA partial, the value is constant
+        # in the factors: differentiate the zero-factor program for x/r and
+        # keep the exact-zero factor gradients initialized above.
+        factor_targets = factor_needs if lora_live else (False,) * 6
 
         with torch.enable_grad():
             for expert_idx in range(payload.w13_weight.shape[0]):
@@ -1000,8 +1008,10 @@ class _Dsv4NativeMxfp4RoutedFunction(torch.autograd.Function):
                 x = hidden_states[token_ids].detach().requires_grad_(need_x)
                 weight = routing_weights[token_ids, slot_ids].detach().requires_grad_(need_r)
                 effective = [
-                    master[expert_idx].detach().to(torch.bfloat16).requires_grad_(needed)
-                    for master, needed in zip(masters, factor_needs)
+                    (master[expert_idx].detach() if lora_live else torch.zeros_like(master[expert_idx]))
+                    .to(torch.bfloat16)
+                    .requires_grad_(needed)
+                    for master, needed in zip(masters, factor_targets)
                 ]
                 w13 = _dequantize_mxfp4_packed_int8(
                     payload.w13_weight[expert_idx],
@@ -1030,7 +1040,7 @@ class _Dsv4NativeMxfp4RoutedFunction(torch.autograd.Function):
                 if need_r:
                     targets.append(weight)
                     target_roles.append(("r", None))
-                for factor_idx, (factor, needed) in enumerate(zip(effective, factor_needs)):
+                for factor_idx, (factor, needed) in enumerate(zip(effective, factor_targets)):
                     if needed:
                         targets.append(factor)
                         target_roles.append(("factor", factor_idx))
@@ -1053,6 +1063,7 @@ class _Dsv4NativeMxfp4RoutedFunction(torch.autograd.Function):
             None,
             *factor_grads,
             None,
+            None,
         )
 
 
@@ -1061,8 +1072,17 @@ def dsv4_native_mxfp4_routed_partial(
     routing_weights: torch.Tensor,
     selected_experts: torch.Tensor,
     experts,
+    *,
+    lora_live: bool = True,
 ) -> torch.Tensor:
-    """Literal local MXFP4-Marlin routed partial with trainable rank-one LoRA."""
+    """Literal local MXFP4-Marlin routed partial with trainable rank-one LoRA.
+
+    ``lora_live`` mirrors SGLang's ``lora_active`` gate: a serving rank whose
+    scheduler holds no lora-bearing rows runs the Marlin base program for its
+    EP partial even on gathered tokens.  The exact lane pins every request to
+    DP rank 0, so only that rank's partial carries the per-expert bank delta
+    (byte-verified against per-rank serving dumps).
+    """
 
     if (experts.active_r, experts.active_lora_alpha, experts._active_scaling()) != (
         1,
@@ -1079,6 +1099,7 @@ def dsv4_native_mxfp4_routed_partial(
         selected_experts,
         *factors,
         experts,
+        lora_live,
     )
 
 
@@ -1285,15 +1306,17 @@ class _Dsv4NativeSharedTpFunction(torch.autograd.Function):
         tp_rank,
         tp_size,
         diagnostic_capture,
+        lora_live,
     ):
+        factors = (gate_a, gate_b, up_a, up_b, down_a, down_b)
+        # Serving applies active-LoRA factors only on the rank whose scheduler
+        # owns the lora-bearing rows; the other ranks' TP partials run the
+        # base program with an exact-zero LoRA delta (additive identity, so
+        # the bytes equal the pure base path).
+        effective = factors if lora_live else tuple(torch.zeros_like(f) for f in factors)
         output = _dsv4_native_shared_tp_forward(
             input,
-            gate_a,
-            gate_b,
-            up_a,
-            up_b,
-            down_a,
-            down_b,
+            *effective,
             module,
             tp_rank,
             tp_size,
@@ -1302,6 +1325,7 @@ class _Dsv4NativeSharedTpFunction(torch.autograd.Function):
         ctx.module = module
         ctx.tp_rank = tp_rank
         ctx.tp_size = tp_size
+        ctx.lora_live = lora_live
         ctx.save_for_backward(
             input.detach(),
             gate_a,
@@ -1317,15 +1341,22 @@ class _Dsv4NativeSharedTpFunction(torch.autograd.Function):
     def backward(ctx, grad_output):
         input, *masters = ctx.saved_tensors
         module = ctx.module
+        lora_live = ctx.lora_live
         width = module.intermediate_size // ctx.tp_size
         start, end = ctx.tp_rank * width, (ctx.tp_rank + 1) * width
         need_x = ctx.needs_input_grad[0]
         factor_needs = ctx.needs_input_grad[1:7]
+        # When serving skips this rank's LoRA partial, the value is constant in
+        # the factors: differentiate the zero-factor program for grad_x and
+        # return exact-zero factor gradients.
+        factor_targets = factor_needs if lora_live else (False,) * 6
         with torch.enable_grad():
             x = input.detach().requires_grad_(need_x)
             effective = [
-                master.detach().to(torch.bfloat16).requires_grad_(needed)
-                for master, needed in zip(masters, factor_needs)
+                (master.detach() if lora_live else torch.zeros_like(master))
+                .to(torch.bfloat16)
+                .requires_grad_(needed)
+                for master, needed in zip(masters, factor_targets)
             ]
             gate_weight = _dequantize_native_block_fp8(module.gate_proj.native_base_payload)[start:end]
             up_weight = _dequantize_native_block_fp8(module.up_proj.native_base_payload)[start:end]
@@ -1342,7 +1373,7 @@ class _Dsv4NativeSharedTpFunction(torch.autograd.Function):
             if need_x:
                 targets.append(x)
                 target_indices.append(0)
-            for idx, (factor, needed) in enumerate(zip(effective, factor_needs), start=1):
+            for idx, (factor, needed) in enumerate(zip(effective, factor_targets), start=1):
                 if needed:
                     targets.append(factor)
                     target_indices.append(idx)
@@ -1356,7 +1387,11 @@ class _Dsv4NativeSharedTpFunction(torch.autograd.Function):
         for index, grad in zip(target_indices, computed):
             target = input if index == 0 else masters[index - 1]
             grads[index] = grad.to(target.dtype)
-        return (*grads, None, None, None, None)
+        if not lora_live:
+            for idx, needed in enumerate(factor_needs, start=1):
+                if needed:
+                    grads[idx] = torch.zeros_like(masters[idx - 1])
+        return (*grads, None, None, None, None, None)
 
 
 def dsv4_native_shared_expert_tp_partial(
@@ -1366,8 +1401,16 @@ def dsv4_native_shared_expert_tp_partial(
     tp_rank: int,
     tp_size: int,
     diagnostic_capture=None,
+    lora_live: bool = True,
 ) -> torch.Tensor:
-    """Serving-value shared-expert TP slice, before the ordered rank sum."""
+    """Serving-value shared-expert TP slice, before the ordered rank sum.
+
+    ``lora_live`` mirrors SGLang's ``BaseLayerWithLoRA.lora_active`` gate: a
+    serving rank whose scheduler holds no lora-bearing rows computes its TP
+    partial through the pure base path even for EP-gathered tokens.  The exact
+    lane pins every request to DP rank 0, so only that rank's partial carries
+    the adapter delta (byte-verified against per-rank serving dumps).
+    """
 
     projections = (module.gate_proj, module.up_proj, module.down_proj)
     for projection in projections:
@@ -1389,6 +1432,7 @@ def dsv4_native_shared_expert_tp_partial(
         tp_rank,
         tp_size,
         diagnostic_capture,
+        lora_live,
     )
 
 

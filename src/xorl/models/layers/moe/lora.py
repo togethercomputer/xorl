@@ -697,6 +697,7 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         expert_idx: int = None,
         sglang_ep_native_local_ids: torch.Tensor = None,
         dsv4_exact_native: bool = False,
+        dsv4_exact_lora_live: bool = True,
     ) -> torch.Tensor:
         """Forward pass with LoRA.
 
@@ -715,6 +716,7 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
                 routing_weights,
                 selected_experts,
                 self,
+                lora_live=dsv4_exact_lora_live,
             )
 
         if sglang_ep_native_local_ids is not None:
