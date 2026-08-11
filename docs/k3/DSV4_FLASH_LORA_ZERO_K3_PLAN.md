@@ -205,3 +205,52 @@ The shortest evidence-producing slice is:
 
 That result decides which new DSV4 surface needs repair first without spending
 time on optimizer or scale-out work before the forward contract is real.
+
+## Qualification record (2026-08-11) — LANE CLOSED, K3 = 0
+
+All definition-of-done gates hold on the frozen WORLD8 lane (pod on
+research-common-h100-001; snapshot 60d8d707; torch-2.11 combined env at
+`submodules/xorl-sglang/.venv`; full continuity record with launch recipes and
+the divergence burn-down in `results/dsv4_flash_zero_k3/LANE_LOG.md`):
+
+1. **Base ruler**: 4-decision decode replay byte-equal at every retained
+   decision (K3 = [0.0, 0.0, 0.0, 0.0]); sampler denominators byte-stable
+   across three repetitions and across a server restart and a host change.
+2. **Adapter A join**: all-zero factors are a byte-level serving no-op and
+   replay byte-equal; the deterministic distinguishable factors across all
+   948 tensors replay byte-equal (K3 = 0 x4); the single perturbed-factor
+   negative control (one routed lora_B, +2^-9) is detected at decision 0 in
+   both directions.
+3. **Training gate**: finite loss (2.4731) over the ruler decisions, adapter
+   gradient ownership validated for every admitted factor, one real AdamW
+   step; post-step forward diverges from the pre-step trace while remaining
+   byte-repeatable.
+4. **Adapter B join**: post-step factors exported as BF16 dsv4_expert_banks
+   views, loaded by the sampler, fresh capture byte-stable x3; 4-decision
+   replay byte-equal (K3 = 0 x4).
+5. **Promotion replay**: fresh 64-decision prefix, byte equality at every
+   retained decision, **K3 exactly 0.0 at all 64**.
+6. **Endpoint throughput (measured, correctness-first configuration)**:
+   ~4.8 decode tok/s with the active adapter, ~5.7 tok/s base (single
+   request, eager, deterministic contract, no CUDA graphs). Runtime
+   expansion (batching, radix, graphs, longer contexts, other topologies)
+   remains behind separate exactness gates.
+7. **Fail-closed behavior** exercised throughout: fused-WQA/WKV env drift,
+   base-only trainer requests, FP32 factor exports, non-BF16 adapter
+   tensors, foreign checkpoint paths/symlinks, and mismatched base_model
+   strings all raise instead of degrading.
+
+Nine byte-level root causes were repaired to close the ruler (see the
+burn-down table in the lane log): the batch-invariant router GEMM interpose,
+replay row population, deduplicated shared RoPE buffers, the NCCL-tree EP
+combine order, the compressor APE layout, the compressor kv-score GEMM
+interpose, the batch-invariant standalone q-norm, CPU-vs-CUDA rope-table
+provenance, and M=1 decode segments over carried serving cache state.
+
+Lane decision to revisit upstream: serving gates adapter LoRA per scheduler
+batch, so DP-attention idle ranks compute base-only expert partials for
+EP-gathered tokens; under the pinned routed_dp_rank=0 contract only rank 0's
+expert shard and shared slice carry the adapter, and the trainer mirrors this
+(exact-zero gradients for the unreachable factors). An upstream gather-aware
+LoRA liveness fix would restore the full 948-factor surface and requires
+requalification of the A/B joins.
