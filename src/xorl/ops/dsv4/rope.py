@@ -21,6 +21,14 @@ def precompute_freqs_cis(dim, seqlen, original_seq_len, base, factor, beta_fast,
     When ``original_seq_len > 0``, applies YaRN factor rescaling interpolated by a
     linear ramp between ``beta_fast`` and ``beta_slow``. Otherwise the base
     frequencies are used verbatim.
+
+    Device note: the pinned SGLang server constructs the model (and therefore
+    this table, via the identical function body) under its CUDA default-device
+    context, so ``torch.polar``'s sin/cos round with CUDA intrinsics. A CPU
+    (libm) build differs by one fp32 ulp on ~15% of components, which flips
+    BF16 rope outputs whose products land on rounding boundaries (layer-4 q,
+    position 8: third divergence of the 2026-08-11 base ruler). Build on CUDA
+    whenever available so the trainer's table is byte-identical to serving.
     """
 
     def find_correction_dim(num_rotations, dim, base, max_seq_len):
@@ -38,15 +46,17 @@ def precompute_freqs_cis(dim, seqlen, original_seq_len, base, factor, beta_fast,
         ramp_func = torch.clamp(linear_func, 0, 1)
         return ramp_func
 
-    freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
-    if original_seq_len > 0:
-        low, high = find_correction_range(beta_fast, beta_slow, dim, base, original_seq_len)
-        smooth = 1 - linear_ramp_factor(low, high, dim // 2)
-        freqs = freqs / factor * (1 - smooth) + freqs * smooth
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    with torch.device(device):
+        freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        if original_seq_len > 0:
+            low, high = find_correction_range(beta_fast, beta_slow, dim, base, original_seq_len)
+            smooth = 1 - linear_ramp_factor(low, high, dim // 2)
+            freqs = freqs / factor * (1 - smooth) + freqs * smooth
 
-    t = torch.arange(seqlen)
-    freqs = torch.outer(t, freqs)
-    freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+        t = torch.arange(seqlen)
+        freqs = torch.outer(t, freqs)
+        freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
     return freqs_cis
 
 
@@ -58,6 +68,11 @@ def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor, inverse: bool = F
     the conjugate rotation is applied (used for the indexer's inverse rope).
     """
     y = x
+    if freqs_cis.device != x.device:
+        # The shared table is built on CUDA for serving byte-parity (see
+        # precompute_freqs_cis); CPU callers (tests, CPU paths) get a
+        # byte-preserving copy.
+        freqs_cis = freqs_cis.to(x.device)
     x = torch.view_as_complex(x.float().unflatten(-1, (-1, 2)))
     if inverse:
         freqs_cis = freqs_cis.conj()
