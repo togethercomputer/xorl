@@ -804,7 +804,8 @@ def head_v2_selected_logprob_from_logits(
 # The no-residual fused specialization currently spills on Hopper, so it always
 # uses the split form (see _v2_norm_use_split for the measured boundary).
 
-V2_NORM_SPLIT_MIN_TILES = 10  # fewest tiles at which the split realization ever wins
+V2_NORM_SPLIT_MIN_TILES = 10  # no-residual crossover on non-Hopper devices
+V2_NORM_RESIDUAL_SPLIT_MIN_TILES = 13  # keeps all shipped hidden sizes (at most 12 tiles) fused
 
 
 def _v2_norm_use_split(
@@ -829,7 +830,8 @@ def _v2_norm_use_split(
     """
     if is_hopper and not has_residual:
         return True
-    return n_tiles >= V2_NORM_SPLIT_MIN_TILES and rows <= n_tiles
+    min_tiles = V2_NORM_RESIDUAL_SPLIT_MIN_TILES if has_residual else V2_NORM_SPLIT_MIN_TILES
+    return n_tiles >= min_tiles and rows <= n_tiles
 
 
 @triton.jit
