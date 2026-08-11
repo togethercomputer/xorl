@@ -1,0 +1,192 @@
+{
+  "schema": "dsv4-exact-selected-logprob-trace-v1",
+  "created_at_unix": 1786462823.6559174,
+  "label": "b1-trained-4dec",
+  "adapter": "trained",
+  "model_path": "/shared/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/60d8d70770c6776ff598c94bb586a859a38244f1",
+  "model_revision": "60d8d70770c6776ff598c94bb586a859a38244f1",
+  "source": {
+    "repo_head": "682f826ed500542be8588fe7fc674a56c6d97a10",
+    "sglang_head": "92adccf5d12e57c0908963f73a2f9d7d7cd202c2",
+    "sglang_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "contract": {
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": -1,
+    "min_p": 0.0,
+    "sampling_seed": 20260810,
+    "decisions": 4,
+    "repetitions": 3,
+    "wire_dtype": "float32_le",
+    "routed_dp_rank": 0
+  },
+  "denominator_byte_equal": true,
+  "captures": [
+    {
+      "repetition": 0,
+      "generation_dp_rank": 0,
+      "teacher_forced_dp_rank": 0,
+      "prompt_ids": [
+        65106,
+        3939,
+        6319,
+        29568,
+        2496,
+        13287,
+        295,
+        12775,
+        34788,
+        16
+      ],
+      "output_ids": [
+        2143,
+        20,
+        16,
+        36745
+      ],
+      "full_ids": [
+        65106,
+        3939,
+        6319,
+        29568,
+        2496,
+        13287,
+        295,
+        12775,
+        34788,
+        16,
+        2143,
+        20,
+        16,
+        36745
+      ],
+      "decode_selected_logprobs_b64": "AADyvwAAKcAAAH28AAAYwA==",
+      "decode_selected_logprobs_sha256": "863b52c0f7a7c3748a6933c30b9beae7fd4cf525d2ddc658be15d07381fc09e8",
+      "teacher_forced_selected_logprobs_b64": "9TX8v2V9EcC2DSC8vRUVwA==",
+      "teacher_forced_selected_logprobs_sha256": "e2291a384e98d82ac7500e7ae86f29bf1cbfeff2bdbe3f97e634575a211c58c0",
+      "decode_selected_logprobs": [
+        -1.890625,
+        -2.640625,
+        -0.01544189453125,
+        -2.375
+      ],
+      "teacher_forced_selected_logprobs": [
+        -1.970396637916565,
+        -2.2732784748077393,
+        -0.0097688939422369,
+        -2.3294517993927
+      ]
+    },
+    {
+      "repetition": 1,
+      "generation_dp_rank": 0,
+      "teacher_forced_dp_rank": 0,
+      "prompt_ids": [
+        65106,
+        3939,
+        6319,
+        29568,
+        2496,
+        13287,
+        295,
+        12775,
+        34788,
+        16
+      ],
+      "output_ids": [
+        2143,
+        20,
+        16,
+        36745
+      ],
+      "full_ids": [
+        65106,
+        3939,
+        6319,
+        29568,
+        2496,
+        13287,
+        295,
+        12775,
+        34788,
+        16,
+        2143,
+        20,
+        16,
+        36745
+      ],
+      "decode_selected_logprobs_b64": "AADyvwAAKcAAAH28AAAYwA==",
+      "decode_selected_logprobs_sha256": "863b52c0f7a7c3748a6933c30b9beae7fd4cf525d2ddc658be15d07381fc09e8",
+      "teacher_forced_selected_logprobs_b64": "9TX8v2V9EcC2DSC8vRUVwA==",
+      "teacher_forced_selected_logprobs_sha256": "e2291a384e98d82ac7500e7ae86f29bf1cbfeff2bdbe3f97e634575a211c58c0",
+      "decode_selected_logprobs": [
+        -1.890625,
+        -2.640625,
+        -0.01544189453125,
+        -2.375
+      ],
+      "teacher_forced_selected_logprobs": [
+        -1.970396637916565,
+        -2.2732784748077393,
+        -0.0097688939422369,
+        -2.3294517993927
+      ]
+    },
+    {
+      "repetition": 2,
+      "generation_dp_rank": 0,
+      "teacher_forced_dp_rank": 0,
+      "prompt_ids": [
+        65106,
+        3939,
+        6319,
+        29568,
+        2496,
+        13287,
+        295,
+        12775,
+        34788,
+        16
+      ],
+      "output_ids": [
+        2143,
+        20,
+        16,
+        36745
+      ],
+      "full_ids": [
+        65106,
+        3939,
+        6319,
+        29568,
+        2496,
+        13287,
+        295,
+        12775,
+        34788,
+        16,
+        2143,
+        20,
+        16,
+        36745
+      ],
+      "decode_selected_logprobs_b64": "AADyvwAAKcAAAH28AAAYwA==",
+      "decode_selected_logprobs_sha256": "863b52c0f7a7c3748a6933c30b9beae7fd4cf525d2ddc658be15d07381fc09e8",
+      "teacher_forced_selected_logprobs_b64": "9TX8v2V9EcC2DSC8vRUVwA==",
+      "teacher_forced_selected_logprobs_sha256": "e2291a384e98d82ac7500e7ae86f29bf1cbfeff2bdbe3f97e634575a211c58c0",
+      "decode_selected_logprobs": [
+        -1.890625,
+        -2.640625,
+        -0.01544189453125,
+        -2.375
+      ],
+      "teacher_forced_selected_logprobs": [
+        -1.970396637916565,
+        -2.2732784748077393,
+        -0.0097688939422369,
+        -2.3294517993927
+      ]
+    }
+  ]
+}
