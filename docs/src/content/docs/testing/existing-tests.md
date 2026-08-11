@@ -13,8 +13,8 @@ The test suite is organized by product surface. This page intentionally lists di
 | `tests/e2e/` | Small-model end-to-end training under torchrun | `qwen3_8b/test_lora.py`, `qwen3_30b/test_server_moe.py` |
 | `tests/experiments/` | Training simulator behavior | `test_training_sim.py` |
 | `tests/fp8_training/` | Full-weight FP8 configuration, linears, and MoE | `test_config_compat.py`, `test_fp8_moe.py` |
-| `tests/models/` | Registry, model loading, attention, batch invariance, architecture guards | `test_deepseek_v3_registry.py`, `test_batch_invariance_dense.py` |
-| `tests/ops/` | Losses, quantization, DSV4, MoE, attention, and kernels | `test_nf4.py`, `dsv4/test_v4_tilelang_sparse_mla.py` |
+| `tests/models/` | Registry, model loading, attention, batch invariance, architecture guards | `test_dsv4_exact_contract.py`, `test_dsv4_native_combine.py` |
+| `tests/ops/` | Losses, quantization, DSV4, MoE, attention, and kernels | `test_sgl_kernel_smoke.py`, `dsv4/test_compressor.py` |
 | `tests/optim/` | AdamW/Muon/DistSignSGD and scheduler behavior | `test_muon.py`, `test_distsignsgd.py` |
 | `tests/qarl/` | Calibration and fake-quant paths | `test_calibration.py`, `test_fake_quant.py` |
 | `tests/qlora/` | QLoRA detection, loading, adapters, and kernels | `test_detect_prequantized.py`, `test_qlora.py` |

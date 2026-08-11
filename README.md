@@ -134,6 +134,8 @@ See the [quick start guide](https://togethercomputer.github.io/xorl/getting-star
 | Qwen3-MoE | Mixture-of-Experts | `Qwen/Qwen3-30B-A3B`, `Qwen/Qwen3-235B-A22B`, ... |
 | Qwen3.5 | Dense | `Qwen/Qwen3.5-7B`, ... |
 | Qwen3.5-MoE | Mixture-of-Experts | `Qwen/Qwen3.5-35B-A3B`, `Qwen/Qwen3.5-397B-A17B`, ... |
+| GLM-5 | Mixture-of-Experts | `zai-org/GLM-5.2-FP8` |
+| DeepSeek V4 | Hybrid-attention MoE | `deepseek-ai/DeepSeek-V4-Flash` |
 
 Models are loaded directly from HuggingFace checkpoints — no preprocessing needed. See the [supported models](https://togethercomputer.github.io/xorl/models/) page for details.
 

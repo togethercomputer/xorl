@@ -44,17 +44,17 @@ python -m xorl.server.launcher --mode auto --config config.yaml \
 
 ### Numerical alignment flags
 
-These stored defaults are resolved after the model architecture is known. Ordinary models use the values noted below; exact Qwen3.5-family and canonical GLM-5.2 programs select and validate their required numerical paths. These settings are prerequisites for parity, not a K3 certificate by themselves.
+These stored defaults are resolved after the model architecture is known. Ordinary models use the values noted below; exact dense Qwen3, Qwen3.5-family, GLM-5.2, and DSV4-Flash programs select and validate architecture-owned numerical paths. These settings are prerequisites for parity, not a K3 certificate by themselves.
 
 | Field | Default | Description |
 |---|---|---|
-| `router_fp32` | `null` (resolves `true`) | Upcast MoE router gate logits to float32. |
-| `lm_head_fp32` | `null` (resolves `true`) | Upcast LM-head logits to float32. |
-| `rmsnorm_mode` | `null` (resolved) | Ordinary models resolve to `native`; exact Qwen3.5-family and canonical GLM-5.2 programs require `sglang_fused`. Other explicit diagnostic modes are also accepted by the argument type. |
-| `activation_native` | `false` (resolved) | Use native SiLU instead of the fused Triton kernel. Exact Qwen3.5-family programs resolve this to `true`. |
-| `rope_native` | `null` (resolved) | Ordinary models resolve to `false`; exact Qwen3.5-family and canonical GLM-5.2 programs resolve to `true`. |
-| `rope_class_b` | `null` (resolved) | Select the compiled Class-B RoPE FP32-chain path. It is enabled for exact Qwen3.5-family and canonical GLM-5.2 programs. |
-| `attention_cast_bf16` | `false` (resolved) | Explicitly cast Q/K to BF16 after RoPE. Exact Qwen3.5-family programs resolve this to `true`. |
+| `router_fp32` | `null` (resolves `true`) | Upcast MoE router gate logits to float32. Exact DSV4-Flash requires its native non-upcast router program instead. |
+| `lm_head_fp32` | `null` (resolves `true`) | Upcast LM-head logits to float32. Exact DSV4-Flash requires its native distributed head program instead. |
+| `rmsnorm_mode` | `null` (resolved) | Ordinary models and exact DSV4-Flash resolve to `native`; exact dense Qwen3, Qwen3.5-family, and GLM-5.2 programs require `sglang_fused`. Other explicit diagnostic modes are also accepted by the argument type. |
+| `activation_native` | `false` (resolved) | Use native SiLU instead of the fused Triton kernel. Exact Qwen3.5-family programs resolve this to `true`; the other exact programs retain their architecture-owned fused arithmetic. |
+| `rope_native` | `null` (resolved) | Ordinary models and exact DSV4-Flash resolve to `false`; exact dense Qwen3, Qwen3.5-family, and GLM-5.2 programs resolve to `true`. |
+| `rope_class_b` | `null` (resolved) | Select the compiled Class-B RoPE FP32-chain path. It is enabled for exact dense Qwen3, Qwen3.5-family, and GLM-5.2 programs; DSV4 owns a separate RoPE program. |
+| `attention_cast_bf16` | `false` (resolved) | Explicitly cast Q/K to BF16 after RoPE. Exact Qwen3.5-family programs resolve this to `true`; dense Qwen3, GLM-5.2, and DSV4-Flash exact programs require `false`. |
 | `qwen35_rmsnorm_family` | `null` (resolved) | Exact Qwen3.5/3.6 programs require the qualified `v2` arithmetic; other architectures reject an override. |
 | `sparse_mla_enabled` | `null` (resolved) | Canonical GLM-5.2 enables the sparse-MLA path; ordinary models resolve to `false`. |
 | `sparse_mla_backend` | `auto` (resolved) | Canonical GLM-5.2 requires `flashmla`; other models preserve the selected backend. |
@@ -96,7 +96,7 @@ These stored defaults are resolved after the model architecture is known. Ordina
 | `enable_forward_prefetch` | `false` | FSDP forward prefetch. |
 | `init_device` | `meta` | Model initialization device: `cpu`, `meta`, `cuda`. |
 | `load_weights_mode` | `grouped` | Weight loading mode: `grouped` (default, with rank-0 fallback), `all_ranks`, or `skip`. |
-| `ce_mode` | `null` (resolved) | Ordinary models resolve to `compiled`; current exact Qwen3.5/GLM-5.2 programs resolve to `bi_fused`. Explicit modes also include `eager`, `quack_linear`, and `fused_quack`, subject to loss/topology checks. |
+| `ce_mode` | `null` (resolved) | Ordinary models and exact DSV4-Flash resolve to `compiled`; exact dense Qwen3, Qwen3.5-family, and GLM-5.2 programs resolve to `bi_fused`. Explicit modes also include `eager`, `quack_linear`, and `fused_quack`, subject to loss/topology checks. |
 | `enable_fp8_training` | `false` | Experimental full-weight block-FP8 compute. Mutually exclusive with LoRA/QLoRA and QARL. |
 | `enable_qarl` | `false` | Experimental dynamic fake-quant training with full-precision masters and STE gradients. E4M3 applies to dense `nn.Linear` modules; NVFP4 also supports MoE expert containers. Mutually exclusive with LoRA/QLoRA and full-weight FP8 training. |
 | `qarl_quant_cfg` | `null` | QARL alias or dictionary. `null`/`FP8_DEFAULT_CFG` resolves to dynamic E4M3 W8A8 with `[128, 128]` weight blocks. `nvfp4` resolves to dynamic, weight-only W4 with `group_size: 16`; set `activation: true` for W4A4. NVFP4 covers dense linears and MoE expert containers, while E4M3 is dense-only. |

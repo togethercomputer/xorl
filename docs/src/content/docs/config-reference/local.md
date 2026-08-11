@@ -32,7 +32,7 @@ torchrun --nproc_per_node=8 -m xorl.cli.train config.yaml \
 | `model_path` | `null` | HF Hub ID or local path to pre-trained weights. If `null`, model is randomly initialized. |
 | `config_path` | same as `model_path` | Path to model config. Useful when config and weights are in separate locations. |
 | `tokenizer_path` | same as `config_path` | Path to tokenizer. |
-| `attn_implementation` | `null` (resolved) | Attention backend: `eager`, `sdpa`, `native` (PyTorch SDPA+cuDNN, no deps, Hopper+Blackwell), `flash_attention_3` (FA3, Hopper), or `flash_attention_4` (FA4 CUTE, Hopper+Blackwell). An omitted value resolves to FA3 for ordinary local-training models and to the required FA4 path for exact Qwen3.5-family and canonical GLM-5.2 programs. |
+| `attn_implementation` | `null` (resolved) | Attention backend: `eager`, `sdpa`, `native` (PyTorch SDPA+cuDNN, no deps, Hopper+Blackwell), `flash_attention_3` (FA3, Hopper), or `flash_attention_4` (FA4 CUTE, Hopper+Blackwell). An omitted value resolves to FA3 for ordinary local-training models; architecture-owned exact server-training programs require FA4. |
 | `moe_implementation` | `null` | MoE kernel: `null` (auto), `eager`, `triton` (Triton group GEMM), `native` (torch._grouped_mm), `quack`. |
 | `ep_dispatch` | `alltoall` | Expert-parallel dispatch: `alltoall` or `deepep` (GPU-resident dispatch using intra-node fabric and, when configured, NVSHMEM/RDMA across nodes). |
 | `deepep_buffer_size_gb` | `2.0` | DeepEP NVLink buffer size per GPU in GB. Only active when `ep_dispatch: deepep`. |
@@ -175,7 +175,7 @@ Each entry in `datasets` (or `test_datasets`) is a dict:
 | `activation_gpu_limit` | `0.0` | GB of activations to keep on GPU when offloading. `0.0` = offload all. |
 | `enable_compile` | `false` | `torch.compile` for model forward pass. |
 | `compile_dynamic_shapes` | `false` | Pass `dynamic=True` to `torch.compile`; keep disabled unless a workload has benchmarked a dynamic-shape win. |
-| `ce_mode` | `null` (resolved) | Ordinary models resolve to `compiled`; current exact Qwen3.5/GLM-5.2 programs resolve to `bi_fused`. Explicit modes also include `eager`, `quack_linear`, and `fused_quack`, subject to loss/topology checks. |
+| `ce_mode` | `null` (resolved) | Ordinary models and exact DSV4-Flash resolve to `compiled`; exact dense Qwen3, Qwen3.5-family, and GLM-5.2 programs resolve to `bi_fused`. Explicit modes also include `eager`, `quack_linear`, and `fused_quack`, subject to loss/topology checks. |
 | `ce_num_chunks` | `8` | Number of token chunks for chunked/compiled cross-entropy. |
 | `enable_fp8_training` | `false` | Experimental full-weight block-FP8 compute with BF16/FP32 master parameters. Mutually exclusive with QARL. |
 | `enable_qarl` | `false` | Experimental dynamic fake-quant training with full-precision masters and STE gradients. E4M3 applies to dense `nn.Linear` modules; NVFP4 also supports MoE expert containers. Mutually exclusive with full-weight FP8 training. |

@@ -71,7 +71,9 @@ The payload does not include routing weights or separate shape metadata. XoRL's 
 
 ### 3. Numerical Alignment
 
-Exact on-policy work requires the trainer's retained-token logprob bytes to agree with the decision-time sampler bytes for the tested revision pair. In the pinned xorl-sglang revision, admitted Qwen3.5-family and GLM-5.2 programs are architecture-owned: `--rl-on-policy-target xorl` derives and validates their precision, topology, attention, routing, cache, graph, and sampling settings.
+Exact on-policy work requires the trainer's retained-token logprob bytes to agree with the decision-time sampler bytes for the tested revision pair. In the pinned xorl-sglang revision, admitted dense Qwen3, Qwen3.5-family, GLM-5.2, and DSV4-Flash programs are architecture-owned: `--rl-on-policy-target xorl` derives and validates their precision, topology, attention, routing, cache, graph, and sampling settings.
+
+Reduction order is also architecture-owned. The canonical Qwen/GLM MoE program uses its balanced adjacent-pair fold, while DSV4-Flash retains the pinned NCCL contributor chain `(1, 2, 3, 4, 5, 6, 7, 0)`. Substituting one for the other changes BF16 association and requires a fresh cross-engine qualification; it is not a merge-time refactor.
 
 `--enable-fp32-lm-head` remains a public generic control. Router precision for the admitted exact MoE programs is resolved internally; the pinned parser has no `--enable-fp32-router` option. It also has no `--enable-return-expert-logits` option.
 
