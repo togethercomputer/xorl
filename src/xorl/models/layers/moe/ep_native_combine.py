@@ -243,12 +243,18 @@ def exchange_variable_and_chain_sum(
     group,
     row_counts: tuple[int, ...],
     local_rank: int,
+    chain_order: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     """Variable-row equivalent of :func:`exchange_and_chain_sum`.
 
     ``partial`` contains every rank's live rows in destination-rank order.
     Raw all-to-all returns this destination's rows from each source rank; the
     final BF16 chain retains the serving contributor order.
+
+    ``chain_order`` is the serving-captured contributor sequence (first entry
+    is the accumulator seed, the rest are added left-associatively in order).
+    Default is the Qwen3.5-captured reverse-rank chain [N-1 .. 0]; the DSV4
+    exact lane passes the NCCL-tree-captured order [1, 2, .., N-1, 0].
     """
 
     from xorl.distributed.moe.comm import _AllToAll  # noqa: PLC0415
@@ -256,6 +262,10 @@ def exchange_variable_and_chain_sum(
     ep_size = len(row_counts)
     if not 0 <= local_rank < ep_size:
         raise ValueError(f"EP local rank {local_rank} is outside [0, {ep_size})")
+    if chain_order is None:
+        chain_order = tuple(range(ep_size - 1, -1, -1))
+    if sorted(chain_order) != list(range(ep_size)):
+        raise ValueError(f"chain_order {chain_order!r} must be a permutation of range({ep_size})")
     total_rows = sum(row_counts)
     if partial.shape[0] != total_rows:
         raise ValueError(f"Partial rows {partial.shape[0]} do not match live row total {total_rows}")
@@ -268,7 +278,8 @@ def exchange_variable_and_chain_sum(
     )
     if local_rows == 0:
         return exchanged[:0]
-    acc = exchanged[(ep_size - 1) * local_rows : ep_size * local_rows]
-    for source_rank in range(ep_size - 2, -1, -1):
+    seed = chain_order[0]
+    acc = exchanged[seed * local_rows : (seed + 1) * local_rows]
+    for source_rank in chain_order[1:]:
         acc = acc + exchanged[source_rank * local_rows : (source_rank + 1) * local_rows]
     return acc
