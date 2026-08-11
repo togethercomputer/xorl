@@ -92,18 +92,18 @@ def resolve_canonical_moe_transport(
     graph_mode: bool,
     consumer_sharded_output: bool,
 ) -> CanonicalMoETransport:
-    """Resolve the public transport mode against the actual execution geometry.
+    """Resolve the internal transport mode against the actual execution geometry.
 
-    ``auto`` promotes only the fully admitted consumer-sharded EP16/CP16
-    trainer shape. Every other admitted canonical shape retains the dense
-    executable oracle. Explicit optimized modes never silently fall back.
+    ``auto`` selects only transports with full-model byte-parity evidence.
+    Every other admitted canonical shape retains the dense executable oracle.
+    Explicit optimized modes never silently fall back.
 
     The exact GLM-5.2 path resolves internally (there is no user-facing
     transport knob): the admitted eager EP16/CP16 consumer-sharded geometry
-    serves ``cp_sharded_v3`` — the transport with the strongest certified
-    performance evidence (a direct 64/64 zero-K3 replay and the faster
-    measured trainer forward) — and every other admitted canonical shape
-    retains the dense executable oracle.
+    serves ``packed_ep16_v2``, whose 64-decision regression anchor is byte
+    exact. ``cp_sharded_v3`` remains explicit-only until it independently
+    passes that anchor. Every other admitted canonical shape retains the dense
+    executable oracle.
     """
 
     try:
@@ -119,7 +119,13 @@ def resolve_canonical_moe_transport(
         consumer_sharded_output=consumer_sharded_output,
     )
     if mode is CanonicalMoETransport.AUTO:
-        return CanonicalMoETransport.CP_SHARDED_V3 if not cp_v3_reasons else CanonicalMoETransport.DENSE_V1
+        packed_admitted = (
+            plan.role is ParallelRole.TRAINER
+            and plan.cp_size == 16
+            and plan.ep_size == 16
+            and not graph_mode
+        )
+        return CanonicalMoETransport.PACKED_EP16_V2 if packed_admitted else CanonicalMoETransport.DENSE_V1
     if mode is CanonicalMoETransport.CP_SHARDED_V3 and cp_v3_reasons:
         raise ValueError("cp_sharded_v3 requires " + ", ".join(cp_v3_reasons))
     if mode is CanonicalMoETransport.PACKED_EP16_V2:

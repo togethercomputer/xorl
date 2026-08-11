@@ -99,7 +99,7 @@ def test_graph_metadata_has_deterministic_padding_and_capacity_guard():
 
 
 @pytest.mark.cpu
-def test_transport_auto_promotes_only_admitted_cp_sharded_geometry():
+def test_transport_auto_selects_only_regression_qualified_packed_geometry():
     ep16 = ParallelPlan.glm52_trainer(world_size=16, pp_size=1, dp_size=1, contributor_count=16)
     assert (
         resolve_canonical_moe_transport(
@@ -110,7 +110,7 @@ def test_transport_auto_promotes_only_admitted_cp_sharded_geometry():
             graph_mode=False,
             consumer_sharded_output=True,
         )
-        is CanonicalMoETransport.CP_SHARDED_V3
+        is CanonicalMoETransport.PACKED_EP16_V2
     )
 
     dp_ep16 = ParallelPlan.glm52_trainer(
@@ -158,11 +158,11 @@ def test_transport_auto_promotes_only_admitted_cp_sharded_geometry():
 
 
 @pytest.mark.cpu
-def test_internal_resolution_serves_cp_sharded_v3_on_the_admitted_geometry():
+def test_internal_resolution_serves_packed_ep16_v2_on_the_admitted_geometry():
     """The exact GLM path has no public transport knob: internal resolution
-    serves cp_sharded_v3 on the admitted eager EP16/CP16 consumer-sharded
-    geometry (the transport with the strongest certified performance
-    evidence) and the dense executable oracle elsewhere."""
+    serves packed_ep16_v2 on the admitted eager EP16/CP16 geometry because it
+    passed the full-model byte-parity regression anchor, and the dense
+    executable oracle elsewhere."""
     ep16 = ParallelPlan.glm52_trainer(world_size=16, pp_size=1, dp_size=1, contributor_count=16)
     assert (
         resolve_canonical_moe_transport(
@@ -173,7 +173,7 @@ def test_internal_resolution_serves_cp_sharded_v3_on_the_admitted_geometry():
             graph_mode=False,
             consumer_sharded_output=True,
         )
-        is CanonicalMoETransport.CP_SHARDED_V3
+        is CanonicalMoETransport.PACKED_EP16_V2
     )
     ep8 = ParallelPlan.primitive(8)
     assert (
