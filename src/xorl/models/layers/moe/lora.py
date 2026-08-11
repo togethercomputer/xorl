@@ -134,7 +134,13 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
                 hybrid_shared=self.lora_config.hybrid_shared,
             ),
             supports_efsdp_replication=True,
-            guard_fields=(("expert_hybrid_shared", self.lora_config.hybrid_shared),),
+            guard_fields=(
+                ("expert_hybrid_shared", self.lora_config.hybrid_shared),
+                ("expert_lora_semantics", getattr(self, "expert_lora_semantics", "generic_unclamped")),
+                # Ownership guards admit only canonical scalar wire types.
+                # Hex preserves the configured binary64 value exactly.
+                ("expert_swiglu_limit_hex", self.swiglu_limit.hex()),
+            ),
         )
 
     def __init__(
@@ -690,6 +696,7 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         selected_experts: torch.Tensor = None,
         expert_idx: int = None,
         sglang_ep_native_local_ids: torch.Tensor = None,
+        dsv4_exact_native: bool = False,
     ) -> torch.Tensor:
         """Forward pass with LoRA.
 
@@ -697,6 +704,18 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         For all implementations: checks EP first, falls back to local path.
         """
         from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
+
+        if dsv4_exact_native:
+            from xorl.models.transformers.deepseek_v4.native_payload import (  # noqa: PLC0415
+                dsv4_native_mxfp4_routed_partial,
+            )
+
+            return dsv4_native_mxfp4_routed_partial(
+                hidden_states,
+                routing_weights,
+                selected_experts,
+                self,
+            )
 
         if sglang_ep_native_local_ids is not None:
             return self.sglang_ep_native_routed_partial(
@@ -950,6 +969,14 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         lora_experts.deepep_async_combine = getattr(module, "deepep_async_combine", False)
         lora_experts.alltoall_combine_hidden_chunk_size = getattr(module, "alltoall_combine_hidden_chunk_size", 0)
         lora_experts.swiglu_limit = float(getattr(module, "swiglu_limit", 0.0))
+        if hasattr(module, "expert_lora_semantics"):
+            lora_experts.expert_lora_semantics = module.expert_lora_semantics
+        if hasattr(module, "native_mxfp4_payload"):
+            lora_experts.add_module(
+                "native_mxfp4_payload",
+                module.native_mxfp4_payload,
+            )
+            lora_experts.fsdp_requires_full_precision = True
 
         base_weight = base_gate_up if base_gate_up is not None else module.gate_proj
         lora_experts = lora_experts.to(
@@ -1009,6 +1036,14 @@ def inject_lora_into_experts(
     lora_experts.deepep_async_combine = getattr(block.experts, "deepep_async_combine", False)
     lora_experts.alltoall_combine_hidden_chunk_size = getattr(block.experts, "alltoall_combine_hidden_chunk_size", 0)
     lora_experts.swiglu_limit = float(getattr(block.experts, "swiglu_limit", 0.0))
+    if hasattr(block.experts, "expert_lora_semantics"):
+        lora_experts.expert_lora_semantics = block.experts.expert_lora_semantics
+    if hasattr(block.experts, "native_mxfp4_payload"):
+        lora_experts.add_module(
+            "native_mxfp4_payload",
+            block.experts.native_mxfp4_payload,
+        )
+        lora_experts.fsdp_requires_full_precision = True
 
     base_weight = gate_up_proj if gate_up_proj is not None else block.experts.gate_proj
     lora_experts = lora_experts.to(

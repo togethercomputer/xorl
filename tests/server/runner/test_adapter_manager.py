@@ -640,6 +640,144 @@ def test_direct_dtensor_capture_returns_completed_tensor_without_replacing_grad(
     torch.testing.assert_close(completed, torch.tensor([3.0]))
 
 
+def test_layout_identity_allows_fsdp2_dtensor_replacement_with_identical_static_contract(monkeypatch):
+    class _Shard:
+        dim = 0
+
+    class _Mesh:
+        mesh_dim_names = ("fsdp",)
+
+    class _FakeDTensor:
+        def __init__(self, local):
+            self._local = local
+            self.device_mesh = _Mesh()
+            self.placements = (_Shard(),)
+            self.shape = (4, 2)
+            self.dtype = local.dtype
+
+        def to_local(self):
+            return self._local
+
+    class _FakeParameter:
+        def __init__(self, data):
+            self.data = data
+
+    original = _FakeParameter(_FakeDTensor(torch.zeros(2, 2)))
+    replacement = _FakeParameter(_FakeDTensor(torch.zeros(2, 2)))
+    manager = LoRAAdapterManager.__new__(LoRAAdapterManager)
+    manager.model = SimpleNamespace(named_parameters=lambda: (("layer.lora_A", replacement),))
+    manager._model_param_ids = {"layer.lora_A": id(original)}
+    layout = SimpleNamespace(
+        dtype=torch.float32,
+        substrate_shape=(4, 2),
+        local_substrate_shape=(2, 2),
+        placement_signature=("dtensor", ("fsdp",), ("_Shard:0",), False),
+        is_ep_owned=False,
+    )
+    state = SimpleNamespace(tensor_layouts={"layer.lora_A": layout})
+    monkeypatch.setattr(adapter_manager_module, "_HAS_DTENSOR", True)
+    monkeypatch.setattr(adapter_manager_module, "DTensor", _FakeDTensor)
+    monkeypatch.setattr(adapter_manager_module, "nn", SimpleNamespace(Parameter=_FakeParameter))
+
+    manager._validate_model_layout_identity(state)
+
+
+def test_layout_identity_rejects_dtensor_replacement_with_changed_placement(monkeypatch):
+    class _Replicate:
+        pass
+
+    class _Mesh:
+        mesh_dim_names = ("fsdp",)
+
+    class _FakeDTensor:
+        shape = (4, 2)
+        dtype = torch.float32
+        device_mesh = _Mesh()
+        placements = (_Replicate(),)
+
+        def to_local(self):
+            return torch.zeros(2, 2)
+
+    original = _FakeDTensor()
+    replacement = _FakeDTensor()
+    manager = LoRAAdapterManager.__new__(LoRAAdapterManager)
+    manager.model = SimpleNamespace(named_parameters=lambda: (("layer.lora_A", replacement),))
+    manager._model_param_ids = {"layer.lora_A": id(original)}
+    layout = SimpleNamespace(
+        dtype=torch.float32,
+        substrate_shape=(4, 2),
+        local_substrate_shape=(2, 2),
+        placement_signature=("dtensor", ("fsdp",), ("Shard:0",), False),
+        is_ep_owned=False,
+    )
+    state = SimpleNamespace(tensor_layouts={"layer.lora_A": layout})
+    monkeypatch.setattr(adapter_manager_module, "_HAS_DTENSOR", True)
+    monkeypatch.setattr(adapter_manager_module, "DTensor", _FakeDTensor)
+
+    with pytest.raises(RuntimeError, match="placement changed"):
+        manager._validate_model_layout_identity(state)
+
+
+def test_layout_identity_allows_fsdp2_dtensor_to_local_materialization() -> None:
+    original = nn.Parameter(torch.zeros(2, 2))
+    replacement = nn.Parameter(torch.zeros(2, 2))
+    manager = LoRAAdapterManager.__new__(LoRAAdapterManager)
+    manager.model = SimpleNamespace(named_parameters=lambda: (("layer.lora_A", replacement),))
+    manager._model_param_ids = {"layer.lora_A": id(original)}
+    layout = SimpleNamespace(
+        dtype=torch.float32,
+        local_substrate_shape=(2, 2),
+        placement_signature=("dtensor", ("fsdp",), ("Shard:0",), False),
+        is_ep_owned=False,
+    )
+    state = SimpleNamespace(tensor_layouts={"layer.lora_A": layout})
+
+    manager._validate_model_layout_identity(state)
+
+
+def test_layout_identity_rejects_ordinary_local_parameter_replacement() -> None:
+    original = nn.Parameter(torch.zeros(2, 2))
+    replacement = nn.Parameter(torch.zeros(2, 2))
+    manager = LoRAAdapterManager.__new__(LoRAAdapterManager)
+    manager.model = SimpleNamespace(named_parameters=lambda: (("layer.lora_A", replacement),))
+    manager._model_param_ids = {"layer.lora_A": id(original)}
+    layout = SimpleNamespace(
+        dtype=torch.float32,
+        local_substrate_shape=(2, 2),
+        placement_signature=("local", False),
+        is_ep_owned=False,
+    )
+    state = SimpleNamespace(tensor_layouts={"layer.lora_A": layout})
+
+    with pytest.raises(RuntimeError, match="identity changed"):
+        manager._validate_model_layout_identity(state)
+
+
+def test_layout_identity_allows_owned_fsdp_bf16_compute_view_with_fp32_master() -> None:
+    original = nn.Parameter(torch.zeros(2, 2, dtype=torch.float32))
+    replacement = nn.Parameter(torch.zeros(2, 2, dtype=torch.bfloat16))
+    manager = LoRAAdapterManager.__new__(LoRAAdapterManager)
+    manager.model = SimpleNamespace(named_parameters=lambda: (("layer.lora_A", replacement),))
+    manager._model_param_ids = {"layer.lora_A": id(original)}
+    manager._model_param_fsdp_managed = {"layer.lora_A": True}
+    layout = SimpleNamespace(
+        dtype=torch.float32,
+        local_substrate_shape=(2, 2),
+        placement_signature=("dtensor", ("fsdp",), ("Shard:0",), False),
+        is_ep_owned=False,
+    )
+    state = SimpleNamespace(
+        tensor_layouts={"layer.lora_A": layout},
+        local_params={"layer.lora_A": nn.Parameter(torch.zeros(2, 2, dtype=torch.float32))},
+    )
+
+    manager._validate_model_layout_identity(state)
+
+    manager._model_param_fsdp_managed["layer.lora_A"] = False
+    with pytest.raises(RuntimeError, match="dtype changed"):
+        manager._validate_model_layout_identity(state)
+
+
 def test_capture_commit_prevalidation_cannot_partially_mutate_numerators(tmp_path):
     manager = _build_manager(tmp_path)
     manager.register_adapter("policy-atomic-stage", lr=0.1, initialize_fresh=True)

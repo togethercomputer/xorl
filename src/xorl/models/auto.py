@@ -24,6 +24,13 @@ from .layers.rope import set_rope_class_b, set_rope_native
 from .loader import ModelLoader, get_loader
 from .transformers.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 from .transformers.deepseek_v3.support import validate_deepseek_v3_router_settings
+from .transformers.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+from .transformers.deepseek_v4.exact_contract import (
+    is_dsv4_flash_config,
+    validate_dsv4_flash_adapter_program,
+    validate_dsv4_flash_official_geometry,
+    validate_dsv4_flash_training_topology,
+)
 from .transformers.glm4_moe.configuration_glm4_moe import Glm4MoeConfig
 from .transformers.glm5.configuration_glm5 import Glm5Config
 from .transformers.glm5.exact_lora_contract import glm52_exact_lora_scaling
@@ -129,6 +136,9 @@ def _load_local_xorl_config(
 
     if model_type in {"deepseek_v3", "kimi_k2", "kimi_k25"}:
         return DeepseekV3Config.from_hf_config(_namespace_from_dict(config_dict))
+
+    if model_type == "deepseek_v4":
+        return DeepseekV4Config.from_hf_config(_namespace_from_dict(config_dict))
 
     if model_type == "nemotron_h":
         return NemotronHConfig.from_hf_config(_namespace_from_dict(config_dict))
@@ -421,6 +431,10 @@ def _validate_exact_qwen35_dense_capabilities(config: PretrainedConfig) -> list[
     return mismatches
 
 
+def _is_exact_dsv4_flash(config: PretrainedConfig) -> bool:
+    return bool(getattr(config, "_dsv4_flash_exact_mode", False))
+
+
 def _validate_exact_qwen35_model_scope(config: PretrainedConfig) -> None:
     if not _is_exact_qwen35(config):
         return
@@ -680,6 +694,46 @@ def resolve_model_numerical_program(
             sparse_mla_backend="auto",
         )
 
+    if _is_exact_dsv4_flash(config):
+        requirements = {
+            "attn_implementation": (attn_implementation, "flash_attention_4"),
+            "router_fp32": (router_fp32, False),
+            "lm_head_fp32": (lm_head_fp32, False),
+            "rmsnorm_mode": (rmsnorm_mode, "native"),
+            "activation_native": (activation_native, False),
+            "attention_cast_bf16": (attention_cast_bf16, False),
+            "sparse_mla_enabled": (sparse_mla_enabled, False),
+        }
+        incompatible = [
+            f"{name}={requested!r} (requires {required!r})"
+            for name, (requested, required) in requirements.items()
+            if requested is not None and requested != required
+        ]
+        if qwen35_rmsnorm_family is not None:
+            incompatible.append(
+                f"qwen35_rmsnorm_family={qwen35_rmsnorm_family!r} (unsupported for DSV4-Flash)"
+            )
+        if sparse_mla_backend not in (None, "auto"):
+            incompatible.append(f"sparse_mla_backend={sparse_mla_backend!r} (requires 'auto')")
+        if incompatible:
+            raise ValueError(
+                "The DSV4-Flash exact RCA lane rejects incompatible numerical overrides: "
+                + ", ".join(incompatible)
+            )
+        return ResolvedModelNumericalProgram(
+            attn_implementation="flash_attention_4",
+            router_fp32=False,
+            lm_head_fp32=False,
+            rmsnorm_mode="native",
+            qwen35_rmsnorm_family=None,
+            activation_native=False,
+            rope_native=False,
+            rope_class_b=False,
+            attention_cast_bf16=False,
+            sparse_mla_enabled=False,
+            sparse_mla_backend="auto",
+        )
+
     if not _is_exact_glm52(config):
         if qwen35_rmsnorm_family is not None:
             raise ValueError(
@@ -741,6 +795,13 @@ def resolve_model_numerical_program(
 def resolve_cross_entropy_mode(config: PretrainedConfig, ce_mode: Optional[str]) -> str:
     """Resolve the loss-side member of the canonical numerical program."""
 
+    if _is_exact_dsv4_flash(config):
+        if ce_mode not in (None, "compiled"):
+            raise ValueError(
+                "Exact DeepSeek-V4-Flash server training requires ce_mode='compiled'; "
+                f"received {ce_mode!r}"
+            )
+        return "compiled"
     if _is_exact_qwen35(config):
         if ce_mode not in (None, "bi_fused"):
             raise ValueError(f"Exact Qwen3.5-family server training requires ce_mode='bi_fused'; received {ce_mode!r}")
@@ -789,9 +850,11 @@ def build_foundation_model(
     sparse_mla_backend: Optional[str] = None,
     flash_attention_deterministic: bool = False,
     server_training: bool = False,
+    enable_lora: bool = False,
     block_fp8_qlora_training: bool = False,
     lora_rank: Optional[int] = None,
     lora_alpha: Optional[int] = None,
+    lora_target_modules: Optional[list[str]] = None,
     init_device: Literal["cpu", "cuda", "npu", "meta"] = "cuda",
     config_kwargs: Optional[Dict[str, Any]] = None,
 ) -> nn.Module:
@@ -839,6 +902,41 @@ def build_foundation_model(
         and getattr(config, "model_type", None) == "qwen3"
         and "Qwen3ForCausalLM" in _get_architectures(config)
     )
+    dsv4_flash_exact = bool(server_training and is_dsv4_flash_config(config))
+    config._dsv4_flash_exact_mode = dsv4_flash_exact
+    config._dsv4_flash_exact_active_lora = bool(dsv4_flash_exact and enable_lora)
+    if dsv4_flash_exact:
+        validate_dsv4_flash_official_geometry(config)
+        if not enable_lora:
+            # The exact TP8 selected-logprob head exists only as the injected
+            # LoRA head class; without it a base-only trainer would silently
+            # pair an exact trunk with a non-exact head. The admitted lane is
+            # active-LoRA only; base-ruler replays load certified all-zero
+            # factors instead of dropping the adapter.
+            raise ValueError(
+                "Exact DeepSeek-V4-Flash server training admits only the active-LoRA "
+                "lane (enable_lora=true with the complete rank-1/alpha-1 adapter); "
+                "for base-ruler replays load the certified all-zero adapter."
+            )
+        if lora_rank is None or lora_alpha is None:
+            raise ValueError("DSV4-Flash exact active-LoRA construction requires explicit rank and alpha")
+        validate_dsv4_flash_adapter_program(
+            adapter_rank=lora_rank,
+            adapter_alpha=lora_alpha,
+            target_modules=lora_target_modules,
+        )
+        incompatible = []
+        if moe_implementation not in (None, "triton"):
+            incompatible.append(f"moe_implementation={moe_implementation!r} (requires 'triton')")
+        if ep_dispatch != "alltoall":
+            incompatible.append(f"ep_dispatch={ep_dispatch!r} (requires 'alltoall')")
+        if deepep_async_combine:
+            incompatible.append("deepep_async_combine=True (requires False)")
+        if incompatible:
+            raise ValueError(
+                "The DSV4-Flash exact RCA lane rejects incompatible trainer runtime choices: "
+                + ", ".join(incompatible)
+            )
     _validate_exact_qwen35_model_scope(config)
     _validate_exact_qwen3_dense_model_scope(config)
     _validate_exact_qwen35_moe_program(
@@ -964,6 +1062,8 @@ def build_foundation_model(
 
     ps = get_parallel_state()
     _validate_exact_qwen35_topology(config, ps)
+    if dsv4_flash_exact:
+        validate_dsv4_flash_training_topology(ps)
     if isinstance(config, Glm5Config) and config.num_hidden_layers == 78:
         if glm52_exact_active_lora_enabled(config):
             topology = (

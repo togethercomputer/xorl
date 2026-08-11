@@ -507,7 +507,13 @@ def causallm_loss_function(
     logprob_temperature = float(logprob_temperature)
     if logprob_temperature <= 0.0:
         raise ValueError(f"logprob_temperature must be > 0, got {logprob_temperature}")
-    exact_lm_head = bool(lm_head is not None and getattr(lm_head, "_glm52_exact_tp16_lm_head", False))
+    exact_lm_head = bool(
+        lm_head is not None
+        and (
+            getattr(lm_head, "_glm52_exact_tp16_lm_head", False)
+            or getattr(lm_head, "_dsv4_exact_tp8_lm_head", False)
+        )
+    )
     if ce_mode == "bi_fused":
         if tp_group is not None and not exact_lm_head:
             raise NotImplementedError("ce_mode='bi_fused' does not support tensor parallelism yet")

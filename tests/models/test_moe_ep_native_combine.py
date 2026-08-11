@@ -6,6 +6,8 @@ import torch
 from xorl.models.layers.moe.ep_native_combine import (
     QWEN35_NATIVE_EP_COMBINE_SIZES,
     exchange_and_canonical_fold,
+    compact_rank_padded_rows,
+    exchange_variable_and_chain_sum,
     gather_ids_for_ep_combine,
     gather_tokens_for_ep_combine,
     max_rows_for_ep_combine,
@@ -198,6 +200,29 @@ def test_max_rows_for_ep_combine(monkeypatch):
 
     monkeypatch.setattr(combine.dist, "all_reduce", fake_max)
     assert max_rows_for_ep_combine(6016, torch.device("cpu"), group=None) == 8192
+
+
+def test_compact_rank_padded_rows_retains_only_live_prefixes():
+    gathered = torch.arange(12).reshape(6, 2)
+    compact = compact_rank_padded_rows(gathered, padded_rows=2, row_counts=(2, 0, 1))
+    assert torch.equal(compact, torch.stack((gathered[0], gathered[1], gathered[4])))
+
+
+def test_variable_exchange_preserves_source_rank_chain(monkeypatch):
+    import xorl.distributed.moe.comm as comm  # noqa: PLC0415
+
+    partial = torch.arange(6, dtype=torch.bfloat16).reshape(3, 2)
+
+    def fake_apply(group, value, output_splits, input_splits):
+        assert group == "group"
+        assert value is partial
+        assert output_splits == [2, 2, 2]
+        assert input_splits == [2, 0, 1]
+        return torch.cat((value[:2], value[:2] + 10, value[:2] + 20), dim=0)
+
+    monkeypatch.setattr(comm._AllToAll, "apply", fake_apply)
+    result = exchange_variable_and_chain_sum(partial, "group", (2, 0, 1), local_rank=0)
+    assert torch.equal(result, (partial[:2] + 20) + (partial[:2] + 10) + partial[:2])
 
 
 def test_serving_fused_gate_forward_preserves_trainer_gradients(monkeypatch):

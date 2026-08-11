@@ -1078,7 +1078,7 @@ class ServerArguments:
     lora_export_format: str = field(
         default="peft",
         metadata={
-            "help": "On-disk layout for MoE LoRA export. 'peft' (default) writes per-expert keys in PEFT orientation. 'sglang_shared_outer' writes stacked 3D tensors under experts.w{1,2,3} in SGLang's shared_outer format (requires moe_hybrid_shared_lora=True)."
+            "help": "On-disk layout for MoE LoRA export. 'peft' (default) writes per-expert keys in PEFT orientation. 'sglang_shared_outer' writes stacked 3D tensors under experts.w{1,2,3} in SGLang's shared_outer format (requires moe_hybrid_shared_lora=True). 'dsv4_expert_banks' writes the complete exact DSV4-Flash stacked expert banks (requires its exact active-LoRA contract)."
         },
     )
 

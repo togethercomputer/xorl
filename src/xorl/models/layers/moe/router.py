@@ -128,6 +128,7 @@ class TopKRouter(nn.Module):
         topk_method: str | None = None,
         routed_scaling_factor: float | None = None,
         exact_batch_invariant: bool = False,
+        exact_sqrtsoftplus_serving: bool = False,
     ):
         super().__init__()
         if scoring_func not in ("softmax", "sqrtsoftplus"):
@@ -151,6 +152,7 @@ class TopKRouter(nn.Module):
         self.topk_method = topk_method
         self.routed_scaling_factor = routed_scaling_factor
         self._exact_batch_invariant = exact_batch_invariant
+        self._exact_sqrtsoftplus_serving = exact_sqrtsoftplus_serving
         # Exact model programs are structural and must not be redirected by
         # process-wide diagnostic environment variables.
         self.synthetic_routing_mode = None if exact_batch_invariant else _synthetic_routing_mode()
@@ -291,14 +293,37 @@ class TopKRouter(nn.Module):
                 scores_for_routing = scores + expert_bias
             else:
                 scores_for_routing = scores
-            selected_experts = _topk_indices_with_policy(scores_for_routing, self.top_k, self.topk_policy)
+            if self._exact_sqrtsoftplus_serving and self.topk_policy == "default":
+                # SGLang's DSV4 biased_topk_impl requests ``sorted=False``.
+                # Expert slot order is observable because Marlin reduces the
+                # six routed contributions in slot order.
+                selected_experts = torch.topk(
+                    scores_for_routing,
+                    self.top_k,
+                    dim=-1,
+                    sorted=False,
+                ).indices
+            else:
+                selected_experts = _topk_indices_with_policy(
+                    scores_for_routing, self.top_k, self.topk_policy
+                )
 
         routing_weights = torch.gather(scores, dim=1, index=selected_experts)
         # V4 paths always renormalize.
-        routing_weights = routing_weights / (routing_weights.sum(dim=-1, keepdim=True) + 1e-20)
+        if self._exact_sqrtsoftplus_serving:
+            denominator = routing_weights.sum(
+                dim=-1, keepdim=True, dtype=torch.float32
+            )
+            routing_weights = routing_weights / (denominator + 1e-20)
+        else:
+            routing_weights = routing_weights / (
+                routing_weights.sum(dim=-1, keepdim=True) + 1e-20
+            )
         if self.routed_scaling_factor is not None:
             routing_weights = routing_weights * self.routed_scaling_factor
-        routing_weights = routing_weights.to(input_dtype)
+        routing_weights = routing_weights.to(
+            torch.float32 if self._exact_sqrtsoftplus_serving else input_dtype
+        )
         return routing_weights, selected_experts
 
     @classmethod

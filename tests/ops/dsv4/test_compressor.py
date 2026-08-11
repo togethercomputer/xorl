@@ -6,6 +6,7 @@ import pytest
 import torch
 
 from xorl.ops.dsv4.compressor import DeepSeekV4Compressor
+from xorl.ops.dsv4.exact_attention import _legacy_compressor_state_pages
 from xorl.ops.dsv4.rope import precompute_freqs_cis
 
 
@@ -18,6 +19,13 @@ class _FakeCPGroup:
 
     def rank(self):
         return 1
+
+
+def test_exact_legacy_c4_state_reserves_both_overlap_ring_pages():
+    assert _legacy_compressor_state_pages(4) == 2
+    assert _legacy_compressor_state_pages(128) == 1
+    with pytest.raises(ValueError, match="Unsupported DSV4 compression ratio"):
+        _legacy_compressor_state_pages(8)
 
 
 def _compressor_config(max_position_embeddings=768):

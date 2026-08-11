@@ -142,10 +142,8 @@ def test_softmax_topk_logits_policy_selects_from_logits_and_gathers_softmax(monk
 
 def test_invalid_softmax_topk_diagnostic_policy_raises(monkeypatch):
     monkeypatch.setenv("XORL_MOE_ROUTER_TOPK_POLICY", "surprise")
-    router = TopKRouter(num_experts=4, top_k=2)
-
     with pytest.raises(ValueError, match="XORL_MOE_ROUTER_TOPK_POLICY"):
-        router(torch.randn(2, 4), input_dtype=torch.float32)
+        TopKRouter(num_experts=4, top_k=2)
 
 
 def test_router_fp32_layers_selector(monkeypatch):
@@ -237,6 +235,49 @@ def test_sqrtsoftplus_noaux_requires_bias():
     router = TopKRouter(num_experts=4, top_k=2, scoring_func="sqrtsoftplus", topk_method="noaux_tc")
     with pytest.raises(AssertionError, match="noaux_tc requires expert_bias"):
         router(torch.randn(3, 4), input_dtype=torch.float32)
+
+
+def test_exact_sqrtsoftplus_matches_serving_slot_and_dtype_contract(monkeypatch):
+    logits = torch.tensor(
+        [[-2.0, 0.5, 1.0, 3.0]], dtype=torch.bfloat16
+    )
+    bias = torch.zeros(4, dtype=torch.float32)
+    real_topk = torch.topk
+    sorted_arguments = []
+
+    def capture_topk(input, k, dim=None, largest=True, sorted=True, *, out=None):
+        sorted_arguments.append(sorted)
+        return real_topk(
+            input,
+            k,
+            dim=dim,
+            largest=largest,
+            sorted=sorted,
+            out=out,
+        )
+
+    monkeypatch.setattr(torch, "topk", capture_topk)
+    router = TopKRouter(
+        num_experts=4,
+        top_k=2,
+        scoring_func="sqrtsoftplus",
+        topk_method="noaux_tc",
+        exact_sqrtsoftplus_serving=True,
+    )
+    weights, experts = router(
+        logits,
+        input_dtype=torch.bfloat16,
+        expert_bias=bias,
+    )
+
+    scores = F.softplus(logits.float()).sqrt().to(torch.bfloat16)
+    expected = scores.gather(1, experts)
+    expected = expected / (
+        expected.sum(dim=-1, keepdim=True, dtype=torch.float32) + 1e-20
+    )
+    assert sorted_arguments == [False]
+    assert weights.dtype is torch.float32
+    torch.testing.assert_close(weights, expected)
 
 
 # ---------------------------------------------------------------------------

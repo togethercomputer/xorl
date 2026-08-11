@@ -117,6 +117,12 @@ _OPTIMIZER_STATE_METADATA_KEY = "xorl_optimizer_state_v1"
 _OPTIMIZER_STATE_MAX_DEPTH = 64
 
 
+def _parameter_layout_tensor(param: Any) -> Any:
+    """Return the tensor carrying a Parameter's static layout metadata."""
+
+    return param.data if isinstance(param, nn.Parameter) else param
+
+
 def _first_restore_contract_difference(checkpoint: Any, live: Any, path: str = "contract") -> Optional[str]:
     """Return the first named field difference in two JSON-shaped contracts."""
 
@@ -699,27 +705,41 @@ class LoRAAdapterManager:
             ],
         ] = {}
         self._model_param_ids: Dict[str, int] = {}
+        self._model_param_fsdp_managed: Dict[str, bool] = {}
         self._adapter_registration_ordinals: Dict[str, int] = {}
         exact_lm_head_a_ids = {
             id(module.lora_A)
             for module in self.model.modules()
-            if getattr(module, "_glm52_exact_tp16_lm_head", False) and getattr(module, "lora_A", None) is not None
+            if (
+                getattr(module, "_glm52_exact_tp16_lm_head", False)
+                or getattr(module, "_dsv4_exact_tp8_lm_head", False)
+            )
+            and getattr(module, "lora_A", None) is not None
         }
         self._exact_lm_head_replicated_param_names: set[str] = set()
 
         # Cache the list of LoRA parameter names for efficient lookups
         self._lora_param_names: List[str] = []
         self._lora_param_metadata: Dict[str, Dict[str, Any]] = {}
+        named_modules = dict(self.model.named_modules())
         for name, param in self.model.named_parameters():
             if "lora_A" in name or "lora_B" in name:
                 self._lora_param_names.append(name)
-                param_shape = tuple(param.shape if _HAS_DTENSOR and isinstance(param, DTensor) else param.data.shape)
+                layout_tensor = _parameter_layout_tensor(param)
+                param_shape = tuple(layout_tensor.shape)
                 self._model_param_ids[name] = id(param)
+                owner_parts = name.rsplit(".", 1)[0].split(".")
+                owner_paths = [".".join(owner_parts[:index]) for index in range(len(owner_parts), -1, -1)]
+                self._model_param_fsdp_managed[name] = any(
+                    callable(getattr(named_modules.get(path), "unshard", None))
+                    and callable(getattr(named_modules.get(path), "reshard", None))
+                    for path in owner_paths
+                )
                 if id(param) in exact_lm_head_a_ids:
                     self._exact_lm_head_replicated_param_names.add(name)
                 self._lora_param_metadata[name] = {
                     "shape": param_shape,
-                    "dtype": param.dtype if _HAS_DTENSOR and isinstance(param, DTensor) else param.data.dtype,
+                    "dtype": layout_tensor.dtype,
                     "rank_dim": self._infer_lora_rank_dim(name, param_shape),
                 }
         self._pipeline_parallel_size = int(
@@ -955,17 +975,53 @@ class LoRAAdapterManager:
             raise AdapterGradientOwnershipError("Adapter gradient ownership plan differs across ranks")
 
     def _validate_model_layout_identity(self, state: AdapterState) -> None:
-        """Fail closed if FSDP/EP replaced or moved a parameter after discovery."""
+        """Fail closed if FSDP/EP replaced or moved a parameter after discovery.
+
+        FSDP2 may replace a DTensor ``Parameter`` object during a legal lazy
+        unshard/reshard transition.  Object identity is therefore authoritative
+        for ordinary parameters, while DTensor replacements must preserve the
+        complete static layout contract discovered at registration time.
+        """
 
         current = {name: param for name, param in self.model.named_parameters() if name in self._model_param_ids}
         if set(current) != set(self._model_param_ids):
             raise RuntimeError("Trainable LoRA parameter set changed after adapter layout discovery")
         for name, expected_id in self._model_param_ids.items():
             param = current[name]
-            if id(param) != expected_id:
-                raise RuntimeError(f"LoRA parameter identity changed after layout discovery: {name}")
+            raw = _parameter_layout_tensor(param)
             layout = state.tensor_layouts[name]
-            raw = param.data if isinstance(param, nn.Parameter) else param
+            layout_was_dtensor = bool(
+                layout.placement_signature and layout.placement_signature[0] == "dtensor"
+            )
+            if id(param) != expected_id:
+                if not layout_was_dtensor:
+                    raise RuntimeError(f"LoRA parameter identity changed after layout discovery: {name}")
+            if raw.dtype != layout.dtype:
+                legal_compute_view = (
+                    layout_was_dtensor
+                    and self._model_param_fsdp_managed.get(name, False)
+                    and layout.dtype is torch.float32
+                    and raw.dtype is torch.bfloat16
+                )
+                master = state.local_params.get(name)
+                if not legal_compute_view or master is None or master.dtype is not layout.dtype:
+                    raise RuntimeError(
+                        f"LoRA parameter dtype changed after layout discovery for {name}: "
+                        f"compute={raw.dtype}, layout={layout.dtype}, "
+                        f"master={None if master is None else master.dtype}"
+                    )
+            if _HAS_DTENSOR and isinstance(raw, DTensor):
+                mesh_names = tuple(getattr(raw.device_mesh, "mesh_dim_names", ()) or ())
+                placements = tuple(
+                    type(placement).__name__ + ":" + str(getattr(placement, "dim", ""))
+                    for placement in raw.placements
+                )
+                placement_signature = ("dtensor", mesh_names, placements, layout.is_ep_owned)
+                if placement_signature != layout.placement_signature:
+                    raise RuntimeError(
+                        f"LoRA parameter placement changed after layout discovery for {name}: "
+                        f"{placement_signature!r} != {layout.placement_signature!r}"
+                    )
             local = wait_for_local_tensor(raw.to_local() if _HAS_DTENSOR and isinstance(raw, DTensor) else raw)
             if tuple(local.shape) != layout.local_substrate_shape:
                 raise RuntimeError(
@@ -982,9 +1038,15 @@ class LoRAAdapterManager:
             raise RuntimeError("Exact GLM-5.2 adapter coherence requires initialized torch.distributed")
         from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
 
-        group = get_parallel_state().lm_head_tp_group
-        if group is None or torch.distributed.get_world_size(group) != 16:
-            raise RuntimeError("Exact GLM-5.2 adapter coherence requires the WORLD16 lm-head TP group")
+        parallel_state = get_parallel_state()
+        group = parallel_state.lm_head_tp_group
+        exact_dsv4 = bool(getattr(getattr(self.model, "config", None), "_dsv4_flash_exact_mode", False))
+        expected_world = 8 if exact_dsv4 else 16
+        model_label = "DSV4-Flash" if exact_dsv4 else "GLM-5.2"
+        if group is None or torch.distributed.get_world_size(group) != expected_world:
+            raise RuntimeError(
+                f"Exact {model_label} adapter coherence requires the WORLD{expected_world} lm-head TP group"
+            )
 
         def _assert_equal(label: str, value: torch.Tensor) -> None:
             # AdamW stores ``step`` as a scalar tensor.  Flatten before the
@@ -1001,7 +1063,9 @@ class LoRAAdapterManager:
             torch.distributed.all_reduce(minimum, op=torch.distributed.ReduceOp.MIN, group=group)
             torch.distributed.all_reduce(maximum, op=torch.distributed.ReduceOp.MAX, group=group)
             if not torch.equal(minimum, maximum):
-                raise RuntimeError(f"Exact GLM-5.2 replicated adapter state diverged across TP16: {label}")
+                raise RuntimeError(
+                    f"Exact {model_label} replicated adapter state diverged across TP{expected_world}: {label}"
+                )
 
         for name in sorted(self._exact_lm_head_replicated_param_names):
             parameter = state.local_params[name]
@@ -1478,6 +1542,13 @@ class LoRAAdapterManager:
         checkpoint_target_modules = adapter_config.get("target_modules")
         if checkpoint_target_modules is not None:
             actual_target_modules = sorted(str(module) for module in checkpoint_target_modules)
+            if adapter_config.get("_sglang_lora_format") == "dsv4_expert_banks":
+                # SGLang disambiguates the physical query-B target with its
+                # parent path; XoRL's logical runtime inventory names it wq_b.
+                actual_target_modules = sorted(
+                    "wq_b" if module == "self_attn.wq_b" else module
+                    for module in actual_target_modules
+                )
             expected_target_modules = self._expected_target_modules()
             if actual_target_modules != expected_target_modules:
                 raise ValueError(

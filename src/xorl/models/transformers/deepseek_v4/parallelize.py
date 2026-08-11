@@ -59,5 +59,9 @@ def get_ep_plan():
         "model.layers.*.mlp.experts.up_proj_lora_B": Shard(0),
         "model.layers.*.mlp.experts.down_proj_lora_A": Shard(0),
         "model.layers.*.mlp.experts.down_proj_lora_B": Shard(0),
+        "model.layers.*.mlp.experts.native_mxfp4_payload.packed_w13_weight_f32": Shard(0),
+        "model.layers.*.mlp.experts.native_mxfp4_payload.packed_w2_weight_f32": Shard(0),
+        "model.layers.*.mlp.experts.native_mxfp4_payload.packed_w13_scale_f32": Shard(0),
+        "model.layers.*.mlp.experts.native_mxfp4_payload.packed_w2_scale_f32": Shard(0),
     }
     return ParallelPlan(ep_plan=ep_plan)

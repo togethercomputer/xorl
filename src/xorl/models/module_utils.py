@@ -2802,7 +2802,9 @@ def save_model_assets(output_dir: Union[str, "os.PathLike"], model_assets: Seque
 
 def get_lm_head_weight(lm_head: nn.Module, *, fsdp_sharded_loss: bool = False) -> torch.Tensor:
     """Get lm_head weight, merging LoRA delta if applicable."""
-    if getattr(lm_head, "_glm52_exact_tp16_lm_head", False):
+    if getattr(lm_head, "_glm52_exact_tp16_lm_head", False) or getattr(
+        lm_head, "_dsv4_exact_tp8_lm_head", False
+    ):
         if lora_merged_forward_enabled(lm_head):
             raise RuntimeError("The exact GLM-5.2 lm head rejects merged-forward mode")
         return lm_head.weight
@@ -2838,7 +2840,10 @@ def compute_loss(
     """
     fn_name = loss_fn_name or "causallm_loss"
     loss_fn = get_loss_function(fn_name)
-    exact_lm_head = bool(getattr(lm_head, "_glm52_exact_tp16_lm_head", False))
+    exact_lm_head = bool(
+        getattr(lm_head, "_glm52_exact_tp16_lm_head", False)
+        or getattr(lm_head, "_dsv4_exact_tp8_lm_head", False)
+    )
     fsdp_sharded_loss = bool(getattr(lm_head, "_xorl_fsdp_sharded_lm_head_loss", False)) and not exact_lm_head
     if fsdp_sharded_loss and fn_name not in {"causallm_loss", "cross_entropy"}:
         raise NotImplementedError(f"fsdp_sharded_lm_head_loss is not supported for loss function {fn_name!r}.")

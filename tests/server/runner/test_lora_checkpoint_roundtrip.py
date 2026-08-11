@@ -11,6 +11,7 @@ from xorl.lora.modules.linear import LoraLinear
 from xorl.lora.utils import (
     LoraTensorShardSpec,
     convert_peft_lora_state_dict,
+    dsv4_expert_bank_export_key_and_tensor,
     get_lora_state_dict,
     load_lora_checkpoint,
     save_lora_checkpoint,
@@ -336,6 +337,100 @@ def test_save_lora_checkpoint_sglang_shared_outer_requires_hybrid_shared(tmp_pat
             moe_hybrid_shared_lora=False,
             lora_export_format="sglang_shared_outer",
         )
+
+
+@pytest.mark.parametrize(
+    ("name", "expected_key"),
+    [
+        (
+            "model.layers.2.mlp.experts.gate_proj_lora_A",
+            "base_model.model.model.layers.2.mlp.experts.w1.lora_A.weight",
+        ),
+        (
+            "model.layers.2.mlp.experts.up_proj_lora_B",
+            "base_model.model.model.layers.2.mlp.experts.w3.lora_B.weight",
+        ),
+        (
+            "model.layers.2.mlp.experts.down_proj_lora_A",
+            "base_model.model.model.layers.2.mlp.experts.w2.lora_A.weight",
+        ),
+    ],
+)
+def test_dsv4_expert_bank_export_maps_routed_banks_in_sglang_orientation(name, expected_key):
+    source = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
+
+    key, exported = dsv4_expert_bank_export_key_and_tensor(name, source)
+
+    assert key == expected_key
+    assert exported.is_contiguous()
+    assert torch.equal(exported, source.transpose(-2, -1))
+
+
+def test_dsv4_expert_bank_export_maps_dense_and_lm_head_keys():
+    tensor = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+
+    dense_key, dense = dsv4_expert_bank_export_key_and_tensor(
+        "model.layers.2.self_attn.wq_a.lora_A", tensor
+    )
+    head_key, head = dsv4_expert_bank_export_key_and_tensor("lm_head.lora_B", tensor)
+
+    assert dense_key == "base_model.model.model.layers.2.self_attn.wq_a.lora_A.weight"
+    assert head_key == "base_model.model.lm_head.lora_embedding_B"
+    assert dense is tensor
+    assert head is tensor
+
+
+def test_save_lora_checkpoint_dsv4_expert_banks_fails_without_exact_inventory(tmp_path):
+    source = _TinyMoELoraModel(hybrid_shared=False)
+
+    with pytest.raises(ValueError, match="bound exact DSV4-Flash active-LoRA model"):
+        save_lora_checkpoint(
+            model=source,
+            save_path=str(tmp_path / "checkpoint"),
+            target_modules=_TARGET_MODULES,
+            r=2,
+            lora_alpha=4,
+            lora_export_format="dsv4_expert_banks",
+        )
+
+
+def test_adapter_manager_accepts_dsv4_physical_wq_b_target_alias(tmp_path):
+    checkpoint = tmp_path / "adapter"
+    checkpoint.mkdir()
+    (checkpoint / "adapter_config.json").write_text(
+        json.dumps(
+            {
+                "_sglang_lora_format": "dsv4_expert_banks",
+                "moe_hybrid_shared_lora": False,
+                "target_modules": [
+                    "down_proj",
+                    "gate_proj",
+                    "lm_head",
+                    "self_attn.wq_b",
+                    "up_proj",
+                    "wkv",
+                    "wo_a",
+                    "wo_b",
+                    "wq_a",
+                ],
+            }
+        )
+    )
+    manager = LoRAAdapterManager.__new__(LoRAAdapterManager)
+    manager._lora_param_names = [
+        "model.layers.0.mlp.experts.down_proj_lora_A",
+        "model.layers.0.mlp.experts.gate_proj_lora_A",
+        "lm_head.lora_A",
+        "model.layers.0.self_attn.wq_b.lora_A",
+        "model.layers.0.mlp.experts.up_proj_lora_A",
+        "model.layers.0.self_attn.wkv.lora_A",
+        "model.layers.0.self_attn.wo_a.lora_A",
+        "model.layers.0.self_attn.wo_b.lora_A",
+        "model.layers.0.self_attn.wq_a.lora_A",
+    ]
+    manager.lora_config = {"moe_hybrid_shared_lora": False}
+
+    manager._validate_checkpoint_adapter_config(str(checkpoint))
 
 
 def test_adapter_manager_load_adapter_state_roundtrip_supports_hybrid_shared(tmp_path):
