@@ -96,10 +96,13 @@ def _lora_info(*, tokens: int, experts: int, hidden: int, intermediate: int, non
     down_a = torch.zeros((1, experts, 1, intermediate), dtype=torch.bfloat16, device=device)
     down_b = torch.zeros((1, experts, hidden, 1), dtype=torch.bfloat16, device=device)
     if nonzero:
-        gate_a[0, 0].fill_(1 / 64)
-        gate_b[0, 0].fill_(1 / 64)
-        down_a[0, 0].fill_(1 / 64)
-        down_b[0, 0].fill_(1 / 64)
+        # Fill every expert's factors so distinguishability holds under any
+        # captured real routing (a single-expert fill can land on an expert
+        # the routing never selects, e.g. rank-local expert 0).
+        gate_a[0].fill_(1 / 64)
+        gate_b[0].fill_(1 / 64)
+        down_a[0].fill_(1 / 64)
+        down_b[0].fill_(1 / 64)
     return LoRAInfo(
         gate_up_lora_a_weights=gate_a,
         gate_up_lora_b_weights=gate_b,
@@ -125,6 +128,7 @@ def qualify(
     force_block_size_m: int | None = None,
     selected_experts_path: Path | None = None,
     ep_rank: int = 0,
+    repeats: int = 2,
 ) -> dict:
     from sglang.srt.layers.moe.fused_moe_triton.fused_marlin_moe import fused_marlin_moe
     from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
@@ -328,6 +332,28 @@ def qualify(
     equal = torch.equal(base.view(torch.uint8), zero.view(torch.uint8))
     base_repeat_equal = torch.equal(base.view(torch.uint8), base_repeat.view(torch.uint8))
     zero_repeat_equal = torch.equal(zero.view(torch.uint8), zero_repeat.view(torch.uint8))
+    repeat_flips = 0
+    for _ in range(max(0, repeats - 2)):
+        again = fused_marlin_moe(
+            hidden_states=x,
+            w1=w13,
+            w2=w2,
+            w1_scale=s13,
+            w2_scale=s2,
+            gating_output=router_logits,
+            topk_weights=topk_weights,
+            topk_ids=topk_ids,
+            num_bits=4,
+            is_k_full=True,
+            inplace=False,
+            routed_scaling_factor=1.5,
+            clamp_limit=10.0,
+            expert_map=expert_map,
+            global_num_experts=global_num_experts,
+        )
+        if not torch.equal(base.view(torch.uint8), again.view(torch.uint8)):
+            repeat_flips += 1
+    base_repeat_equal = base_repeat_equal and repeat_flips == 0
     changed = not torch.equal(zero.view(torch.uint8), nonzero.view(torch.uint8))
     result = {
         "device": torch.cuda.get_device_name(),
@@ -345,6 +371,8 @@ def qualify(
         "selected_experts_path": (str(selected_experts_path) if selected_experts_path is not None else None),
         "ep_rank": ep_rank,
         "force_block_size_m": force_block_size_m,
+        "repeats": repeats,
+        "repeat_flips": repeat_flips,
         "base_zero_byte_equal": equal,
         "base_repeat_byte_equal": base_repeat_equal,
         "zero_repeat_byte_equal": zero_repeat_equal,
@@ -389,6 +417,7 @@ def main() -> None:
     parser.add_argument("--force-block-size-m", type=int)
     parser.add_argument("--selected-experts-path", type=Path)
     parser.add_argument("--ep-rank", type=int, default=0)
+    parser.add_argument("--repeats", type=int, default=2)
     args = parser.parse_args()
     if args.tokens <= 0:
         parser.error("--tokens must be positive")
@@ -405,6 +434,7 @@ def main() -> None:
         force_block_size_m=args.force_block_size_m,
         selected_experts_path=args.selected_experts_path,
         ep_rank=args.ep_rank,
+        repeats=args.repeats,
     )
     rendered = json.dumps(result, indent=2, sort_keys=True) + "\n"
     print(rendered, end="")
