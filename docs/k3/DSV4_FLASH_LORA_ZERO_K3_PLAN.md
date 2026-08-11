@@ -254,3 +254,36 @@ expert shard and shared slice carry the adapter, and the trainer mirrors this
 (exact-zero gradients for the unreachable factors). An upstream gather-aware
 LoRA liveness fix would restore the full 948-factor surface and requires
 requalification of the A/B joins.
+
+## Qualification record (2026-08-11, campaign 2) — CANONICAL FOLD UNIFICATION, K3 = 0
+
+DSV4 was deliberately migrated off the NCCL-tree contributor-order
+reproduction onto the same canonical adjacent-pair BF16 fold as the
+Qwen/GLM exact lanes (`canonical_moe_fold_v1`): serving routes its
+post-experts combine through the gated canonical all-reduce (the
+reduce_scatterv fast path falls back in exact mode, as Qwen's does), and
+the trainer folds its variable-row exchanged partials with the shared
+primitive. Bytes changed, so the full ladder was requalified on the
+integration heads (parent/submodule `dsv4-canonical-unify`):
+
+1. **Base ruler**: serving self-repeatable ×3 at 4 and 64 decisions; the
+   engagement witness holds (decode bytes changed vs campaign 1); trainer
+   replays byte-equal at 4 AND 64 decisions (K3 = 0.0 × 64).
+2. **A join**: zero adapter byte-matches base on the wire and replays
+   byte-equal; nonzero adapter replays byte-equal; the perturbed negative
+   control correctly diverges.
+3. **Training gate**: forward_backward + optim_step on the nonzero
+   session; the post-step replay of the pre-step trace correctly diverges.
+4. **B join / promotion**: the saved `dsv4_expert_banks` adapter serves;
+   b1 (4-dec) and b2 (64-dec) captures are self-repeatable ×3 and their
+   trainer replays are byte-equal — **K3 exactly 0.0 at the 64-decision
+   promotion replay**, k3_max = 0.0. Decode throughput 5.5 tok/s.
+
+Three additional root causes were burned down during requalification, all
+latent value-luck in campaign 1 (see the campaign-2 sections of the lane
+log): the off-path exact combine gate (the real serving combine was the
+layer-level pynccl reduce_scatterv), Marlin multi-block-expert
+completion-order instability (fixed by 10-token chunking of the pinned
+exact geometry in both engines; the trainer row-pad to 48 is retired), and
+the ATen-vs-batch-invariant log_softmax bf16 rounding split at boundary
+values (the exact head's forward value now uses the serving BI kernel).

@@ -246,3 +246,81 @@ witness holds. Teacher-forced prefill however is run-to-run nondeterministic:
   luck, not coverage — the latent race predates this campaign on both
   sides (trainer marlin is exposed at training M too; replay comparisons
   are M=1 and unaffected).
+
+RESOLVED (submodule ce9209949): workspace caps refuted (uncapping locks +
+c_tmp on both pipelines left 56/198 offline flips and 4 serving streams);
+per-expert row histogram at the failing routing showed rank-1 expert 68
+rows and rank-3 expert 66 rows > the pinned 64-row block — multi-block
+experts are the race. Fix: under the pinned DSV4 exact geometry, chunk
+Marlin token batches to 10 tokens (floor(64/topk-6)) so no expert can
+span blocks: in fused_marlin_moe (trainer + direct callers) and in
+MoeRunner.run with per-chunk LoRAInfo slicing (serving runner path).
+Verification:
+- Isolated (`campaign2/marlin_l40_rank{1,3}_chunked.json`): 0 flips in
+  300 repeats on both hot ranks; fused == runner bytes; LoRA delta
+  distinguishable (qualifier now fills all experts' factors — a captured
+  routing may never select rank-local expert 0).
+- Serving: lengths 14/44/72/74 stable ×20; base 4dec AND 64dec captures
+  self-repeatable ×3 (decode + TF). Decode shas UNCHANGED from the
+  pre-chunk canonical-fold captures (4dec d80e1cc7, 64dec 86e56cd5) —
+  the 10-token prompt prefill and M=1 decode never chunk, so the frozen
+  decode denominators carry; TF bytes at length 74 are the new
+  deterministic chunked stream (73f991d339fe ×3).
+Campaign-2 base denominators are FROZEN on these traces.
+
+### Campaign 2 root cause #3: log_softmax kernel pair (ATen vs batch-invariant)
+
+After the marlin fix, the 64-decision base ruler still mismatched at ONE
+decision (39): one bf16 ulp (ba580000 vs ba590000), trainer-deterministic.
+Localization: paired decision-39 dumps (serving Pass file matched by
+position+token; trainer `.occurrenceNNNNN` components incl. new model-tail
+captures `hc_head_output`/`final_norm` under pseudo-layer -1) proved the
+ENTIRE trunk byte-equal through final_norm; offline tail A/B from the
+byte-equal hidden reproduced the trainer wire under every GEMM program
+(per-shard/full, M=1/8, fp32-accum, matmul_persistent). The split: serving's
+deterministic mode interposes log_softmax with the batch-invariant Triton
+kernel; ATen's and the BI kernel's BF16 outputs differ on this row at
+exactly one entry — the f64 truth (-0.00082594) sits 5.5e-8 past the bf16
+rounding boundary (ATen rounds correctly; the wire contract follows
+serving). Campaign 1 never sampled a boundary value — the pair was
+value-lucky, latent since the lane began.
+Fix (parent 41bd2c54a): the DSV4 exact head's forward VALUE now uses the
+serving BI log_softmax; the surrogate VJP keeps FP32 reference math.
+
+### Campaign 2 qualification ladder (all on the unified program)
+
+- Base ruler: 4-dec AND 64-dec replays byte_equal TRUE (K3 = 0.0 x 64),
+  trainer self-repeatable x2, serving self-repeatable x3.
+- A join: zero-adapter replay TRUE (and zero == base bytes on the wire);
+  nonzero replay TRUE; negative control (nonzero session vs perturbed
+  trace) correctly FALSE.
+- Training gate: forward_backward + optim_step OK on the nonzero session;
+  post-step replay of the pre-step trace correctly FALSE (weights moved).
+- B join: adapter saved (dsv4_expert_banks, cleaned of optimizer shards to
+  campaign2/adapter_trained), trained sampler captures b1 (4-dec) and b2
+  (64-dec) self-repeatable x3; decode throughput 5.5 tok/s.
+- Promotion: b1 (4-dec) byte_equal TRUE and b2 (64-dec) byte_equal TRUE
+  with k3_max = 0.0 — K3 EXACTLY 0.0 x 64 with the trained adapter.
+
+## CAMPAIGN 2 CLOSED 2026-08-11 — DSV4 unified onto the canonical fold
+
+Heads: parent `dsv4-canonical-unify` (fold switch 1adc5db7c + qualifier
+444f0245d + pad removal facace929 + BI log_softmax head 41bd2c54a),
+submodule `dsv4-canonical-unify` (serving surface c143ddc50 + canonical
+combine routing 6c0fe1ddd + marlin chunking ce9209949). Pod dsv4-flash on
+node research-common-h100-071 (node 001 pod was deleted mid-campaign).
+Three root causes burned down (all latent value-luck from campaign 1):
+1. the exact serving combine was never the MoE-internal all_reduce
+   (should_use_dp_reduce_scatterv kept the layer-level pynccl
+   reduce_scatterv on-path; only Qwen fell back) — fixed by adding
+   dsv4_flash_exact_mode to the exact fallback, with a one-shot
+   engagement log;
+2. Marlin multi-block experts (>64 routed rows) reduce across row blocks
+   in completion order — fixed by chunking exact-geometry token batches to
+   10 tokens in both engines' shared primitives (trainer row-pad to 48
+   retired to mirror serving M exactly);
+3. the ATen vs batch-invariant log_softmax kernel pair disagrees by one
+   bf16 ulp on rounding-boundary rows — fixed by scoring the exact head's
+   forward value with the serving BI kernel.
+Decode throughput 5.5 tok/s (campaign-1-comparable). All campaign-2
+evidence under `campaign2/`; campaign-1 artifacts frozen.
