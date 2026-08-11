@@ -8,5 +8,5 @@ exec submodules/xorl-sglang/.venv/bin/python scripts/capture_dsv4_exact_trace.py
   --model-path "$SNAP" \
   --label base-ruler-64dec \
   --decisions 64 \
-  --repetitions 2 \
+  --repetitions 3 \
   --output results/dsv4_flash_zero_k3/trace_base_64dec.json

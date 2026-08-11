@@ -1,0 +1,32 @@
+{
+  "base_repeat_byte_equal": true,
+  "base_sha256": "93c31e4ed3d889b27e83e04157ded069a5bf9dce91fae174ff50f08739880555",
+  "base_zero_byte_equal": true,
+  "capability": [
+    9,
+    0
+  ],
+  "device": "NVIDIA H100 80GB HBM3",
+  "ep": false,
+  "ep_rank": 0,
+  "finite": {
+    "base": true,
+    "nonzero": true,
+    "zero": true
+  },
+  "force_block_size_m": null,
+  "hot_experts": 0,
+  "nonzero_distinguishable": true,
+  "nonzero_sha256": "47f4b81b29347cb63bde352b1981ff7385f0b298e96e8241ae64d1d07ba709d7",
+  "selected_experts_path": null,
+  "shape": {
+    "global_experts": 32,
+    "hidden": 4096,
+    "intermediate": 2048,
+    "local_experts": 32,
+    "tokens": 74,
+    "top_k": 6
+  },
+  "zero_repeat_byte_equal": true,
+  "zero_sha256": "93c31e4ed3d889b27e83e04157ded069a5bf9dce91fae174ff50f08739880555"
+}
