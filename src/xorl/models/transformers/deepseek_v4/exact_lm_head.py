@@ -364,7 +364,18 @@ class Dsv4ExactTP8LmHeadSelectedLogprob(nn.Module):
     ) -> Tensor:
         local_logits = self._exact_local_logits(hidden, local_weight, effective_a, effective_b)
         full_logits = _rank_order_vocab_all_gather(local_logits, self._validate_tp_group())
-        logprobs = F.log_softmax(full_logits, dim=-1)
+        # Serving computes decode logprobs through the batch-invariant Triton
+        # log_softmax (deterministic-mode interposition), whose BF16 rounding
+        # differs from ATen's kernel on boundary values (first seen as a
+        # one-bf16-ulp flip at decision 39 of the campaign-2 64-decision base
+        # ruler; the f64 truth sits 5.5e-8 past the rounding boundary). The
+        # forward VALUE must come from the serving kernel; the surrogate VJP
+        # keeps its FP32 reference math.
+        from sglang.srt.batch_invariant_ops.batch_invariant_ops import (  # noqa: PLC0415
+            log_softmax as _bi_log_softmax,
+        )
+
+        logprobs = _bi_log_softmax(full_logits, dim=-1)
         return logprobs.gather(1, token_ids.unsqueeze(1)).squeeze(1).contiguous()
 
     def _surrogate_vjp(

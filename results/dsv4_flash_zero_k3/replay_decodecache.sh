@@ -5,7 +5,8 @@ cd "$REPO"
 TRACE="${1:-results/dsv4_flash_zero_k3/trace_base_4dec.json}"
 OUT="${2:-results/dsv4_flash_zero_k3/replay_base_4dec_decodecache.json}"
 MODEL_ID="${3:-ruler}"
-PARAMS="${4:-{\"diagnostic_decode_cache\": true}}"
+DEFAULT_PARAMS='{"diagnostic_decode_cache": true}'
+PARAMS="${4:-$DEFAULT_PARAMS}"
 exec submodules/xorl-sglang/.venv/bin/python scripts/replay_dsv4_exact_trace.py \
   --url http://127.0.0.1:6000 \
   --trace "$TRACE" \

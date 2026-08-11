@@ -2266,6 +2266,8 @@ class ModelRunner:
             "gdn_beta": 70,
             "gdn_scan_out": 71,
             "gdn_normed": 72,
+            "hc_head_output": 95,
+            "final_norm": 96,
         }
 
         layer_output_overrides = self._load_diagnostic_layer_output_overrides()
@@ -2514,6 +2516,14 @@ class ModelRunner:
                     restore_handle = _AttributeRestoreHandle(mlp, "_shared_expert")
                     setattr(mlp, "_shared_expert", wrapped_shared_expert)
                     handles.append(restore_handle)
+
+        # Model-level tail components (post-layer stream reduction + final
+        # norm) recorded under pseudo-layer -1 when the model exposes the
+        # capture seam (DSV4 exact tail localization).
+        if hasattr(type(model), "_capture_diagnostic_component"):
+            restore_handle = _AttributeRestoreHandle(model, "_diagnostic_capture_component")
+            model._diagnostic_capture_component = lambda name, value: capture(-1, name, value)
+            handles.append(restore_handle)
 
         return captures, handles
 
