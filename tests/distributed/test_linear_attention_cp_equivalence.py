@@ -114,6 +114,7 @@ def _run_cp_equivalence() -> None:
     )
     assert cp_context is not None
     assert cp_context.cu_seqlens is not None
+    assert cp_context.global_cu_seqlens is cu_seqlens
 
     reference_output, _, _ = reference_layer(
         hidden_states=reference_input,
@@ -139,18 +140,8 @@ def _run_cp_equivalence() -> None:
     gathered_cp_input_grad = _gather_sequence_shards(cp_input.grad.detach())
 
     if rank == 0:
-        torch.testing.assert_close(
-            gathered_cp_output.float(),
-            reference_output.detach().float(),
-            atol=2e-2,
-            rtol=2e-2,
-        )
-        torch.testing.assert_close(
-            gathered_cp_input_grad.float(),
-            reference_input.grad.detach().float(),
-            atol=2e-2,
-            rtol=2e-2,
-        )
+        torch.testing.assert_close(gathered_cp_output, reference_output.detach(), atol=0, rtol=0)
+        torch.testing.assert_close(gathered_cp_input_grad, reference_input.grad.detach(), atol=0, rtol=0)
         print("linear-attention CP equivalence passed")
 
 

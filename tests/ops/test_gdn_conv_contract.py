@@ -269,7 +269,7 @@ class TestConvContractGuards:
         with pytest.raises(RuntimeError, match="prefill only"):
             layer(torch.randn(1, 128, 256), use_cache=True)
 
-    def test_cp_context_routes_through_contract(self, monkeypatch):
+    def test_exact_cp_reconstructs_full_sequence_before_contract(self, monkeypatch):
         calls = []
 
         def fake_contract(q_in, k_in, v_in, *convs, cu_seqlens=None, cp_context=None):
@@ -285,11 +285,28 @@ class TestConvContractGuards:
         monkeypatch.setattr(gated_deltanet, "causal_conv1d_qkv_contract", fake_contract)
         monkeypatch.setattr(gated_deltanet, "bi_fused_gdn_gating", fake_gating)
         monkeypatch.setattr(gated_deltanet, "chunk_gated_delta_rule", fake_chunk)
+        monkeypatch.setattr(
+            gated_deltanet,
+            "all_gather_along_dim",
+            lambda x, *, dim, group: torch.cat((x, x), dim=dim),
+        )
+        monkeypatch.setattr(
+            gated_deltanet,
+            "scatter_along_dim",
+            lambda x, *, dim, group: x.narrow(dim, 0, x.shape[dim] // 2),
+        )
         layer = _tiny_gdn(exact_contract=True)
         local_cu = torch.tensor([0, 8])
-        cp_context = SimpleNamespace(cu_seqlens=local_cu, group=object(), is_first_rank=True)
-        layer(torch.randn(1, 8, 256), cp_context=cp_context)
-        assert calls == [(local_cu, cp_context)]
+        global_cu = torch.tensor([0, 8, 16])
+        cp_context = SimpleNamespace(
+            cu_seqlens=local_cu,
+            global_cu_seqlens=global_cu,
+            group=object(),
+            is_first_rank=True,
+        )
+        output, _, _ = layer(torch.randn(1, 8, 256), cp_context=cp_context)
+        assert output.shape == (1, 8, 256)
+        assert calls == [(global_cu, None)]
 
     def test_no_short_conv_raises(self):
         layer = _tiny_gdn(use_short_conv=False, exact_contract=True)
