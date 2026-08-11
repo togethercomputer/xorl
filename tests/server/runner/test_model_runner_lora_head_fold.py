@@ -101,6 +101,11 @@ def _assert_runner_lora_target_source_precedence(tmp_path):
             {"train_attn": True, "train_mlp": False, "train_unembed": True},
             ["q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj", "lm_head"],
         ),
+        (
+            "qwen3_5_moe",
+            {"train_attn": True, "train_mlp": True, "train_unembed": False},
+            ["q_proj", "k_proj", "v_proj", "g_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        ),
     ):
         assert make_runner(model_type, config)._resolve_lora_target_modules() == expected
 

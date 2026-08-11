@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 
 from xorl.fp8_training import enrich_sync_quantization_with_fp8_bf16_islands
+from xorl.lora.fold import canonical_lora_fold_linear
 from xorl.lora.modules.delta_linear import LoraDeltaLinear
 from xorl.lora.modules.linear import LoraLinear
 from xorl.qarl import inject_qarl_into_model, qarl_sync_quantization_config
@@ -365,6 +366,7 @@ def _assert_fp8_adapter_merge_policy(monkeypatch):
     _assert_fp8_uses_merged_qlora_moe_experts(monkeypatch)
     _assert_runtime_rank_moe_lora_buffer_scaling()
     _assert_sync_extraction_folds_fused_gdn_lora_into_separate_base_projections()
+    _assert_sync_extraction_folds_qwen_shared_expert_gate_up_adapters()
 
 
 def _assert_fp8_uses_merged_qlora_weight(monkeypatch):
@@ -1211,6 +1213,43 @@ def _assert_sync_extraction_folds_fused_gdn_lora_into_separate_base_projections(
         torch.testing.assert_close(
             extracted[f"model.layers.0.linear_attn.{projection}.weight"], expected, rtol=0.0, atol=0.0
         )
+
+
+def _assert_sync_extraction_folds_qwen_shared_expert_gate_up_adapters():
+    class Layer(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.mlp = nn.Module()
+            self.mlp.shared_expert = nn.Module()
+            shared = self.mlp.shared_expert
+            shared.gate_up_proj = nn.Linear(4, 6, bias=False, dtype=torch.bfloat16)
+            shared.gate_proj = LoraDeltaLinear(4, 3, r=2, lora_alpha=2)
+            shared.up_proj = LoraDeltaLinear(4, 3, r=2, lora_alpha=2)
+
+    class FakeDTensor:
+        pass
+
+    layer = Layer()
+    shared = layer.mlp.shared_expert
+    with torch.no_grad():
+        shared.gate_up_proj.weight.copy_(torch.arange(24, dtype=torch.float32).reshape(6, 4).to(torch.bfloat16))
+        for offset, adapter in enumerate((shared.gate_proj, shared.up_proj), start=1):
+            adapter.lora_A.copy_(torch.arange(1, 9, dtype=torch.float32).reshape(2, 4) * offset)
+            adapter.lora_B.copy_(torch.arange(1, 7, dtype=torch.float32).reshape(3, 2) / offset)
+            adapter.exact_merged_forward = True
+
+    gate_base, up_base = shared.gate_up_proj.weight.chunk(2, dim=0)
+    expected = torch.cat(
+        (
+            canonical_lora_fold_linear(gate_base, shared.gate_proj.lora_A, shared.gate_proj.lora_B, 1.0),
+            canonical_lora_fold_linear(up_base, shared.up_proj.lora_A, shared.up_proj.lora_B, 1.0),
+        ),
+        dim=0,
+    )
+    extracted = dict(WeightSyncHandler._extract_params_for_sync(layer, "model.layers.0", FakeDTensor))
+    weight_name = "model.layers.0.mlp.shared_expert.gate_up_proj.weight"
+    assert set(extracted) == {weight_name}
+    assert torch.equal(extracted[weight_name], expected)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")

@@ -31,7 +31,10 @@ logger = logging.getLogger(__name__)
 # Default target modules for common model architectures
 DEFAULT_TARGET_MODULES = {
     "llama": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-    "qwen": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    # Qwen3.5/3.6 GDN calls its z projection ``g_proj`` in the trainer.  Keep
+    # q/k/v/z as four independent adapters rather than implicitly collapsing
+    # them into in_proj_qkvz.
+    "qwen": ["q_proj", "k_proj", "v_proj", "g_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
     "mistral": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
     "gemma": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
     "deepseek_v3": [
@@ -271,6 +274,72 @@ def _inject_fused_gdn_delta_lora(
     return injected
 
 
+def _inject_qwen_shared_expert_gate_up_lora(
+    model: nn.Module,
+    *,
+    r: int,
+    lora_alpha: int,
+    target_modules: List[str],
+    target_manifest: Optional[dict],
+) -> int:
+    """Attach independent gate/up factors to Qwen's fused shared expert.
+
+    Qwen keeps the base gate and up matrices in one ``gate_up_proj`` tensor so
+    the contracted forward can issue one GEMM.  The logical projection topology
+    nevertheless owns two rank-r adapters. Delta-only children preserve both properties: distinct
+    gate/up A and B factors, with no duplicate base parameter.
+    """
+    requested = tuple(name for name in ("gate_proj", "up_proj") if name in target_modules)
+    if not requested:
+        return 0
+    if len(requested) != 2:
+        raise ValueError(
+            f"Qwen fused shared experts require gate_proj and up_proj LoRA targets together; received {list(requested)}"
+        )
+
+    from xorl.lora.modules.delta_linear import LoraDeltaLinear  # noqa: PLC0415
+
+    injected = 0
+    for module_path, module in list(model.named_modules()):
+        if not module_path.endswith(".mlp.shared_expert"):
+            continue
+        gate_up_proj = getattr(module, "gate_up_proj", None)
+        intermediate_size = getattr(module, "intermediate_size", None)
+        if not isinstance(gate_up_proj, nn.Linear) or intermediate_size is None:
+            continue
+        intermediate_size = int(intermediate_size)
+        if gate_up_proj.out_features != 2 * intermediate_size:
+            raise ValueError(
+                f"{module_path}: fused shared-expert gate_up_proj has {gate_up_proj.out_features} outputs, "
+                f"expected {2 * intermediate_size}"
+            )
+        allowed = tuple(
+            projection
+            for projection in requested
+            if _manifest_allows_module_path(f"{module_path}.{projection}", target_manifest)
+        )
+        if allowed and len(allowed) != 2:
+            raise ValueError(
+                f"{module_path}: strict LoRA target manifest must select both shared-expert gate_proj and up_proj"
+            )
+        for projection in allowed:
+            path = f"{module_path}.{projection}"
+            if hasattr(module, projection):
+                raise ValueError(f"{path} already exists before Qwen shared-expert LoRA injection")
+            module.add_module(
+                projection,
+                LoraDeltaLinear(
+                    gate_up_proj.in_features,
+                    intermediate_size,
+                    r=r,
+                    lora_alpha=lora_alpha,
+                    device=gate_up_proj.weight.device,
+                ),
+            )
+            injected += 1
+    return injected
+
+
 def inject_lora_into_model(
     model: nn.Module,
     r: int = 16,
@@ -331,12 +400,19 @@ def inject_lora_into_model(
         target_modules=target_modules,
         target_manifest=loaded_manifest,
     )
+    qwen_shared_count = _inject_qwen_shared_expert_gate_up_lora(
+        model,
+        r=r,
+        lora_alpha=lora_alpha,
+        target_modules=target_modules,
+        target_manifest=loaded_manifest,
+    )
 
     # Find all matching modules
     target_paths = _find_target_modules(model, target_modules)
     target_paths = [path for path in target_paths if _manifest_allows_module_path(path, loaded_manifest)]
 
-    if not target_paths and fused_gdn_count == 0:
+    if not target_paths and fused_gdn_count == 0 and qwen_shared_count == 0:
         raise ValueError(
             f"No modules found matching target_modules={target_modules}. "
             f"Please check that the model has modules with these names. "
@@ -345,7 +421,8 @@ def inject_lora_into_model(
 
     logger.info(
         f"Injecting LoRA into {len(target_paths)} base modules and "
-        f"{fused_gdn_count} fused-GDN delta modules with r={r}, alpha={lora_alpha}"
+        f"{fused_gdn_count} fused-GDN delta modules and {qwen_shared_count} "
+        f"Qwen shared-expert gate/up delta modules with r={r}, alpha={lora_alpha}"
     )
 
     # Replace each target module
@@ -375,7 +452,7 @@ def inject_lora_into_model(
         logger.debug(f"Replaced {target_path} with {lora_cls.__name__}")
 
     # Check if any modules were actually replaced
-    if replaced_count == 0 and fused_gdn_count == 0:
+    if replaced_count == 0 and fused_gdn_count == 0 and qwen_shared_count == 0:
         skipped_info = ", ".join([f"{path} ({typ})" for path, typ in skipped_modules[:5]])
         if len(skipped_modules) > 5:
             skipped_info += f"... and {len(skipped_modules) - 5} more"
@@ -393,7 +470,8 @@ def inject_lora_into_model(
         )
 
     logger.info(
-        f"Successfully injected LoRA into {replaced_count} base modules and {fused_gdn_count} fused-GDN delta modules"
+        f"Successfully injected LoRA into {replaced_count} base modules, {fused_gdn_count} "
+        f"fused-GDN delta modules, and {qwen_shared_count} Qwen shared-expert gate/up delta modules"
     )
     if loaded_manifest is not None and not _defer_manifest_validation:
         validated = validate_lora_target_manifest(model, loaded_manifest)
