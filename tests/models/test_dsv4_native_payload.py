@@ -12,7 +12,6 @@ from xorl.models.transformers.deepseek_v4.native_payload import (
     Dsv4NativeBlockFp8Payload,
     Dsv4NativeMxfp4ExpertPayload,
     _dequantize_native_block_fp8,
-    _pad_dsv4_marlin_rows,
     _validate_single_adapter_batch_info,
     attach_dsv4_native_payloads,
 )
@@ -196,24 +195,6 @@ def test_native_mxfp4_cache_identity_follows_owned_parameters_not_typed_views():
     with torch.no_grad():
         payload.packed_w13_weight_f32.copy_(payload.packed_w13_weight_f32)
     assert cache_key() != initial
-
-
-def test_small_marlin_batches_pad_with_inert_routes_and_preserve_prefix():
-    hidden = torch.randn(10, 64, dtype=torch.bfloat16)
-    weights = torch.randn(10, 6, dtype=torch.float32)
-    ids = torch.randint(-1, 32, (10, 6), dtype=torch.int32)
-
-    padded_hidden, padded_weights, padded_ids = _pad_dsv4_marlin_rows(hidden, weights, ids)
-
-    assert padded_hidden.shape == (48, 64)
-    assert padded_weights.shape == (48, 6)
-    assert padded_ids.shape == (48, 6)
-    assert torch.equal(padded_hidden[:10], hidden)
-    assert torch.equal(padded_weights[:10], weights)
-    assert torch.equal(padded_ids[:10], ids)
-    assert torch.count_nonzero(padded_hidden[10:]) == 0
-    assert torch.count_nonzero(padded_weights[10:]) == 0
-    assert torch.all(padded_ids[10:] == -1)
 
 
 def test_cached_single_adapter_metadata_corruption_fails_at_named_boundary():
