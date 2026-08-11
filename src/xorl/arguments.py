@@ -1832,6 +1832,17 @@ class LoRAArguments:
             "and validates exact runtime module counts/ranks before training."
         },
     )
+    unfuse_for_lora: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Split fused qkv_proj / gate_up_proj before LoRA injection so q/k/v and "
+                "gate/up can be adapted. Without this they are stored fused, match no "
+                "target name, and train unadapted. Costs base-forward throughput: the "
+                "fused GEMMs split, and the MLP loses its fused SiLU-and-mul kernel."
+            )
+        },
+    )
     save_lora_only: bool = field(
         default=False,
         metadata={"help": "Only save LoRA weights (not full model) in HF checkpoints"},

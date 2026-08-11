@@ -68,6 +68,7 @@ from xorl.qlora import (
 )
 from xorl.qlora.utils import _deregister_qlora_weights_from_fsdp
 from xorl.trainers.model_builder import (
+    maybe_unfuse_projections,
     maybe_upcast_trainable_adapter_params,
     resolve_training_model_dtype,
     should_skip_generic_param_upcast,
@@ -760,8 +761,11 @@ class Trainer:
         )
         helper.print_device_mem_info("VRAM usage after building model")
 
-        # Unfuse QKV for tensor parallelism
-        if not args.model.merge_qkv:
+        # Unfuse projections — for LoRA coverage, or QKV-only for tensor parallelism.
+        # Both must precede LoRA injection below and the weight load in _parallelize.
+        maybe_unfuse_projections(self.model, enabled=args.lora.unfuse_for_lora)
+
+        if not args.model.merge_qkv and not args.lora.unfuse_for_lora:
             for layer in self.model.model.layers:
                 if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "unfuse_for_tp"):
                     layer.self_attn.unfuse_for_tp()

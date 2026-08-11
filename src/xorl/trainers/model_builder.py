@@ -106,6 +106,38 @@ def maybe_upcast_trainable_adapter_params(
     logger.info_rank0("Upcast trainable LoRA params to float32")
 
 
+def maybe_unfuse_projections(model: nn.Module, *, enabled: bool) -> None:
+    """Split fused ``qkv_proj`` / ``gate_up_proj`` into per-projection modules.
+
+    LoRA selects modules by name, so a projection stored fused is invisible to it:
+    ``q_proj`` / ``gate_proj`` and friends match nothing and are skipped with a
+    warning, leaving those weights adapted by nothing. Unfusing first turns them
+    into real modules, and as a side effect leaves every parameter name matching
+    the HuggingFace checkpoint, so weights load with no merge buffer.
+
+    Reuses the tensor-parallel entry point, which does exactly this work; the
+    ``for_tp`` name predates its use here. Setting ``config.base_model_tp_plan``
+    on the way through is inert when TP is off — it is read only while building a
+    TP plan, and every affected config class already holds the identical plan.
+
+    Must run **before** LoRA injection and before weights are loaded:
+    ``unfuse_for_tp`` allocates fresh ``nn.Linear``s without copying from the
+    fused weight, so the checkpoint is what fills them.
+    """
+    if not enabled:
+        return
+
+    if not hasattr(model, "unfuse_for_tp"):
+        raise NotImplementedError(
+            f"{type(model).__name__} cannot unfuse its projections, so LoRA would silently "
+            "skip any fused target. Implement unfuse_for_tp() on the architecture, or drop "
+            "the fused projections from the target list."
+        )
+
+    model.unfuse_for_tp()
+    logger.info_rank0("Unfused qkv_proj / gate_up_proj so LoRA can adapt them")
+
+
 def build_training_model(
     *,
     # --- Model ---
@@ -132,6 +164,7 @@ def build_training_model(
     lora_target_modules: Optional[List[str]] = None,
     lora_target_manifest: Optional[dict[str, Any] | str] = None,
     moe_hybrid_shared_lora: bool = False,
+    unfuse_for_lora: bool = False,
     # --- QLoRA ---
     enable_qlora: bool = False,
     block_fp8_qlora_training: bool = False,
@@ -208,7 +241,7 @@ def build_training_model(
     the server ModelRunner.  The steps mirror the original Trainer lifecycle::
 
         1. build_foundation_model()
-        2. Unfuse QKV (for TP)
+        2. Unfuse projections (QKV for TP, or both for LoRA)
         3. QLoRA or LoRA injection
         4. LoRA + mixed-precision: upcast trainable params to fp32
         5. Exact model-program setup (pre-FSDP2) + save optimizer pre-hook
@@ -296,9 +329,14 @@ def build_training_model(
     helper.print_device_mem_info("VRAM usage after building model")
 
     # ------------------------------------------------------------------
-    # 2. Unfuse QKV if merge_qkv=False (needed for TP)
+    # 2. Unfuse projections — for LoRA coverage, or QKV-only for TP
     # ------------------------------------------------------------------
-    if not merge_qkv:
+    # Ordering matters: both forms must precede LoRA injection (step 3) and weight
+    # loading (inside step 6), because unfusing allocates fresh Linears without
+    # copying from the fused weight.
+    maybe_unfuse_projections(model, enabled=unfuse_for_lora)
+
+    if not merge_qkv and not unfuse_for_lora:
         for layer in model.model.layers:
             if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "unfuse_for_tp"):
                 layer.self_attn.unfuse_for_tp()

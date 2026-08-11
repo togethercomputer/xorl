@@ -31,14 +31,22 @@ def unfuse_for_tp(model):
 
     For ALL layers: splits ``qkv_proj`` -> ``q_proj / k_proj / v_proj`` in attention.
     For DENSE layers only: splits ``gate_up_proj`` -> ``gate_proj / up_proj`` in MLP.
-    MoE layers (``MoEBlock``) are left untouched - their expert weights
-    are not TP-sharded.
+    A ``MoEBlock``'s routed experts are left untouched - their weights are not
+    TP-sharded - but the block's shared expert is a plain dense MLP with its own
+    fused ``gate_up_proj``, so it unfuses like any other, mirroring how
+    ``glm4_moe`` handles ``shared_experts``. Leaving it fused would strand it:
+    ``get_checkpoint_handler`` passes ``skip_gate_up_merge`` for the whole model,
+    so nothing would merge its gate/up halves at load.
     """
     for layer in model.model.layers:
         if getattr(layer, "self_attn", None) is not None and hasattr(layer.self_attn, "unfuse_for_tp"):
             layer.self_attn.unfuse_for_tp()
-        # Only unfuse dense MLP layers, not MoE blocks
-        if not isinstance(layer.mlp, MoEBlock):
+        # Only the routed experts of an MoE block stay fused; its shared expert does not.
+        if isinstance(layer.mlp, MoEBlock):
+            shared_expert = getattr(layer.mlp, "shared_expert", None)
+            if shared_expert is not None and hasattr(shared_expert, "unfuse_for_tp"):
+                shared_expert.unfuse_for_tp()
+        else:
             layer.mlp.unfuse_for_tp()
     model._unfused_for_tp = True
     # Override HF config's TP plan (may contain incompatible styles like

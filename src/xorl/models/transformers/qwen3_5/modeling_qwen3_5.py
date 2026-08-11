@@ -411,10 +411,12 @@ class Qwen3_5PreTrainedModel(XorlPreTrainedModel):
             module.original_inv_freq = module.inv_freq
 
     def get_checkpoint_handler(self, **kwargs):
-        # When unfused for TP, checkpoint keys (q_proj, k_proj, v_proj, gate_proj,
-        # up_proj) already match the model's parameter names - no merging needed.
-        if getattr(self, "_unfused_for_tp", False):
-            return None
+        # When unfused, gate_proj/up_proj checkpoint keys already match the model's
+        # parameter names, so the gate/up merge is skipped. The handler must still be
+        # returned: it also remaps the GatedDeltaNet projections, which are packed on
+        # disk whether or not the MLP is fused. Returning None here would silently
+        # mis-load every linear-attention layer.
+        unfused = getattr(self, "_unfused_for_tp", False)
 
         weights_path = kwargs.get("weights_path", None)
         is_prequantized = detect_prequantized_checkpoint(weights_path)
@@ -435,6 +437,7 @@ class Qwen3_5PreTrainedModel(XorlPreTrainedModel):
             linear_key_dim=self.config.linear_num_key_heads * self.config.linear_key_head_dim,
             linear_value_dim=self.config.linear_num_value_heads * self.config.linear_value_head_dim,
             skip_qkv_merge=True,
+            skip_gate_up_merge=unfused,
             is_prequantized=is_prequantized,
             exclude_modules=exclude_modules,
         )

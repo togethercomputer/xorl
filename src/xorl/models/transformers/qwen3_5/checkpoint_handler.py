@@ -34,6 +34,13 @@ class Qwen3_5CheckpointHandler(CheckpointHandler):
     weight_scale_2, input_scale, weight_scale_inv) and linear projection
     ``.weight`` keys are skipped - they are loaded directly by QLoRA modules.
     Bias keys still flow through the normal merge buffers.
+
+    Unfused handling:
+    - When ``skip_qkv_merge=True``, QKV keys pass through unmerged.
+    - When ``skip_gate_up_merge=True``, gate/up keys pass through unmerged
+      (MLP layers have separate gate_proj/up_proj after unfusing).
+    Linear-attention remapping runs regardless of either flag: the GatedDeltaNet
+    projections are packed on disk independently of how the MLP is stored.
     """
 
     def __init__(
@@ -44,10 +51,11 @@ class Qwen3_5CheckpointHandler(CheckpointHandler):
         linear_key_dim: int,
         linear_value_dim: int,
         skip_qkv_merge: bool = False,
+        skip_gate_up_merge: bool = False,
         is_prequantized: bool = False,
         exclude_modules: Optional[Set[str]] = None,
     ):
-        self._gate_up_buffer = GateUpMergeBuffer()
+        self._gate_up_buffer = None if skip_gate_up_merge else GateUpMergeBuffer()
         self._qkv_buffer = None if skip_qkv_merge else QKVMergeBuffer()
         self._q_dim = num_attention_heads * head_dim
         self._kv_dim = num_key_value_heads * head_dim
@@ -140,24 +148,26 @@ class Qwen3_5CheckpointHandler(CheckpointHandler):
                 if self._qkv_buffer.is_qkv_key(key):
                     return []
 
-        # Gate/up merge
-        if self._is_prequantized and key.endswith(".weight"):
-            # Packed uint8 gate/up weights - skip standard merging
-            if self._gate_up_buffer.is_gate_up_key(key):
-                return []
-        else:
-            merge_result = self._gate_up_buffer.add(key, tensor)
-            if merge_result is not None:
-                return [merge_result]
-            if self._gate_up_buffer.is_gate_up_key(key):
-                return []
+        # Gate/up merge (skipped when the model carries separate gate/up projections)
+        if self._gate_up_buffer is not None:
+            if self._is_prequantized and key.endswith(".weight"):
+                # Packed uint8 gate/up weights - skip standard merging
+                if self._gate_up_buffer.is_gate_up_key(key):
+                    return []
+            else:
+                merge_result = self._gate_up_buffer.add(key, tensor)
+                if merge_result is not None:
+                    return [merge_result]
+                if self._gate_up_buffer.is_gate_up_key(key):
+                    return []
 
         return [(key, tensor)]
 
     def on_load_complete(self) -> List[Tuple[str, torch.Tensor]]:
-        pending_gu = self._gate_up_buffer.get_pending()
-        if pending_gu:
-            warnings.warn(f"Incomplete gate/up merge pairs after loading: {pending_gu}")
+        if self._gate_up_buffer is not None:
+            pending_gu = self._gate_up_buffer.get_pending()
+            if pending_gu:
+                warnings.warn(f"Incomplete gate/up merge pairs after loading: {pending_gu}")
         if self._qkv_buffer is not None:
             pending_qkv = self._qkv_buffer.get_pending()
             if pending_qkv:
