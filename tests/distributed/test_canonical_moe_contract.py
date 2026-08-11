@@ -69,9 +69,7 @@ def test_reference_is_the_adjacent_bf16_tree(contributors: int):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("contributors", [8, 16])
 def test_shared_fold_replays_in_cuda_graph(contributors: int):
-    partials = torch.randn(
-        (contributors, 64, 32), device="cuda", dtype=torch.bfloat16
-    )
+    partials = torch.randn((contributors, 64, 32), device="cuda", dtype=torch.bfloat16)
     canonical_moe_fold_v1(partials)
     torch.cuda.synchronize()
 
@@ -113,6 +111,25 @@ def test_transport_auto_promotes_only_admitted_cp_sharded_geometry():
             consumer_sharded_output=True,
         )
         is CanonicalMoETransport.CP_SHARDED_V3
+    )
+
+    dp_ep16 = ParallelPlan.glm52_trainer(
+        world_size=16,
+        pp_size=1,
+        dp_size=16,
+        contributor_count=16,
+        cp_size=1,
+    )
+    assert (
+        resolve_canonical_moe_transport(
+            "auto",
+            plan=dp_ep16,
+            capacity=16 * 4224,
+            local_rows=4224,
+            graph_mode=False,
+            consumer_sharded_output=True,
+        )
+        is CanonicalMoETransport.DENSE_V1
     )
 
     ep8 = ParallelPlan.primitive(8)
@@ -257,6 +274,15 @@ def test_exact_parallel_plans_hash_launcher_spelling_and_fail_closed():
     assert trainer.combine_groups == (tuple(range(16)),)
     assert all(trainer.logical_ordinal(physical_rank) == physical_rank for physical_rank in range(16))
     assert trainer.contract_version == CANONICAL_MOE_REDUCE_VERSION
+
+    dp_trainer = ParallelPlan.glm52_trainer(dp_size=16, contributor_count=16, cp_size=1)
+    assert dp_trainer.contributor_count == 16
+    assert dp_trainer.cp_size == 1
+    assert dp_trainer.ep_size == 16
+    assert dp_trainer.combine_groups == trainer.combine_groups
+    assert dp_trainer.logical_ordinals_by_group == trainer.logical_ordinals_by_group
+    assert dp_trainer.cp_ep_aliases == ()
+    assert dp_trainer.digest != trainer.digest
 
     for kwargs in (
         {"world_size": 16, "dp_size": 2, "contributor_count": 8},

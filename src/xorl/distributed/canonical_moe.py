@@ -170,23 +170,27 @@ class ParallelPlan:
 
     @property
     def contributor_count(self) -> int:
-        return self.cp_size
+        # Contributors are expert shards, not attention/row-placement shards.
+        # CP16 happens to alias EP16 in the original admitted trainer topology,
+        # but DP-attention keeps CP1 while retaining the same sixteen expert
+        # contributors and the same arithmetic tree.
+        return self.ep_size
 
     def validate(self) -> None:
         if self.contract_version != CANONICAL_MOE_REDUCE_VERSION:
             raise ValueError(f"Unsupported canonical MoE contract version: {self.contract_version}")
         if self.world_size <= 0:
             raise ValueError("world_size must be positive")
-        if self.cp_size not in (2, 4, 8, 16):
+        if self.ep_size not in (2, 4, 8, 16):
             raise ValueError("canonical_moe_reduce_v1 admits contributor counts 2, 4, 8, or 16")
         if len(self.combine_groups) != len(self.logical_ordinals_by_group):
             raise ValueError("combine_groups and logical_ordinals_by_group must have equal lengths")
 
         seen_physical: set[int] = set()
-        expected_ordinals = tuple(range(self.cp_size))
+        expected_ordinals = tuple(range(self.contributor_count))
         for group, ordinals in zip(self.combine_groups, self.logical_ordinals_by_group, strict=True):
-            if len(group) != self.cp_size:
-                raise ValueError(f"Every combine group must contain exactly {self.cp_size} ranks")
+            if len(group) != self.contributor_count:
+                raise ValueError(f"Every combine group must contain exactly {self.contributor_count} ranks")
             if len(set(group)) != len(group):
                 raise ValueError(f"Combine group contains duplicate physical ranks: {group}")
             if tuple(sorted(ordinals)) != expected_ordinals:
@@ -200,8 +204,14 @@ class ParallelPlan:
 
         if seen_physical != set(range(self.world_size)):
             raise ValueError("Combine groups must partition every physical global rank exactly once")
-        if tuple(sorted(self.cp_ep_aliases)) != tuple((rank, rank) for rank in range(self.cp_size)):
-            raise ValueError("Version 1 requires an explicit identity CP/EP alias map")
+        expected_cp_ep_aliases = (
+            tuple((rank, rank) for rank in range(self.cp_size)) if self.cp_size == self.ep_size else ()
+        )
+        if tuple(sorted(self.cp_ep_aliases)) != expected_cp_ep_aliases:
+            raise ValueError(
+                "Version 1 requires an explicit identity CP/EP alias map only when the row-placement and "
+                "expert axes alias"
+            )
 
         expected_start = 0
         for start, end in self.pipeline_layer_ranges:
@@ -221,7 +231,13 @@ class ParallelPlan:
                 self.ep_size,
                 self.effective_dense_tp,
             )
-            admitted = {(16, 1, 1, 1, 16, 16, 1): ((0, 78),)}
+            admitted = {
+                # CP-owned rows: CP16 aliases EP16.
+                (16, 1, 1, 1, 16, 16, 1): ((0, 78),),
+                # DP-owned rows: CP1 is independent of the EP16 contributor
+                # group.  The contributor fold is deliberately unchanged.
+                (16, 1, 1, 16, 1, 16, 1): ((0, 78),),
+            }
             expected_ranges = admitted.get(actual)
             if expected_ranges is None:
                 raise ValueError(
@@ -233,11 +249,13 @@ class ParallelPlan:
                     f"got {self.pipeline_layer_ranges}"
                 )
             expected_groups = tuple(
-                tuple(range(group_start, group_start + self.cp_size))
-                for group_start in range(0, self.world_size, self.cp_size)
+                tuple(range(group_start, group_start + self.contributor_count))
+                for group_start in range(0, self.world_size, self.contributor_count)
             )
             if self.combine_groups != expected_groups:
-                raise ValueError("GLM-5.2 trainer combine groups must be contiguous groups of cp_size physical ranks")
+                raise ValueError(
+                    "GLM-5.2 trainer combine groups must be contiguous groups of contributor physical ranks"
+                )
             if self.logical_ordinals_by_group != (expected_ordinals,) * len(expected_groups):
                 raise ValueError("GLM-5.2 trainer requires identity logical contributor ordinals in every group")
             if self.launcher_tp_size is not None:
@@ -279,7 +297,10 @@ class ParallelPlan:
         pp_size: int = 1,
         dp_size: int = 1,
         contributor_count: int = 16,
+        cp_size: int | None = None,
     ) -> ParallelPlan:
+        if cp_size is None:
+            cp_size = contributor_count
         identity = tuple(range(contributor_count))
         combine_groups = tuple(
             tuple(range(start, start + contributor_count)) for start in range(0, world_size, contributor_count)
@@ -291,13 +312,13 @@ class ParallelPlan:
             pp_size=pp_size,
             tp_size=1,
             dp_size=dp_size,
-            cp_size=contributor_count,
+            cp_size=cp_size,
             ep_size=contributor_count,
             effective_dense_tp=1,
             combine_groups=combine_groups,
             logical_ordinals_by_group=(identity,) * len(combine_groups),
             pipeline_layer_ranges=pipeline_layer_ranges,
-            cp_ep_aliases=tuple((rank, rank) for rank in identity),
+            cp_ep_aliases=tuple((rank, rank) for rank in range(cp_size)) if cp_size == contributor_count else (),
         )
 
     @classmethod
