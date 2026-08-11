@@ -988,7 +988,18 @@ class DeepseekV4MoE(MoEBlock):
         )
         validate_lora_metadata("routed/shared join")
         self._capture_diagnostic_component("moe_native_local_partial", local_partial)
-        combined = exchange_variable_and_chain_sum(local_partial, ep_group, row_counts, ep_rank)
+        # The DSV4 serving contract pins NCCL_ALGO=allreduce:tree; the tree's
+        # bitwise result over EP8 is a left-associative BF16 chain in
+        # contributor order [1, 2, .., 7, 0] (captured 2026-08-11; rank-0
+        # dump matched 40919/40960 columns with only expert-partial ulps
+        # remaining). Qwen3.5's default reverse-rank chain does not match.
+        combined = exchange_variable_and_chain_sum(
+            local_partial,
+            ep_group,
+            row_counts,
+            ep_rank,
+            chain_order=(*range(1, ep_size), 0),
+        )
         validate_lora_metadata("EP exchange/combine")
         self._capture_diagnostic_component("moe_native_combined", combined)
         if combined.shape[0] != live_token_count:

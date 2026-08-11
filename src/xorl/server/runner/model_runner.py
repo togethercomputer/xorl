@@ -5510,7 +5510,23 @@ class ModelRunner:
 
         first_valid = int(bounds[0].item())
         last_valid = -int(bounds[1].item())
-        segments = [(0, first_valid + 1), *((pos, pos + 1) for pos in range(first_valid + 1, last_valid + 1))]
+        dsv4_exact_prefix_replay = bool(
+            getattr(getattr(self.model, "config", None), "_dsv4_flash_exact_mode", False)
+        )
+        if dsv4_exact_prefix_replay:
+            # The DSV4 exact model carries no incremental KV state; its exact
+            # attention recomputes decode-time cache bytes per position from
+            # the full prefix. Each decision therefore replays the whole
+            # prefix and keeps only the final position's hidden state, which
+            # reproduces the serving decode batch content (per-token cache
+            # bytes are position-local and Marlin batches pad to the same
+            # qualified geometry).
+            segments = [
+                (0, first_valid + 1),
+                *((0, pos + 1) for pos in range(first_valid + 1, last_valid + 1)),
+            ]
+        else:
+            segments = [(0, first_valid + 1), *((pos, pos + 1) for pos in range(first_valid + 1, last_valid + 1))]
 
         past_key_values = []
         decode_cache_segments = []
@@ -5522,7 +5538,7 @@ class ModelRunner:
             self.model.eval()
         self._clear_diagnostic_decode_cache(self.model)
         try:
-            for start, end in segments:
+            for segment_index, (start, end) in enumerate(segments):
                 segment_input_ids = input_ids[:, start:end]
                 segment_attention_mask = torch.ones(
                     input_ids.shape[0],
@@ -5572,7 +5588,13 @@ class ModelRunner:
                         input_ids.shape[1],
                         outputs.last_hidden_state.shape[-1],
                     )
-                hidden_states[:, start:end, :] = outputs.last_hidden_state
+                if dsv4_exact_prefix_replay and segment_index > 0:
+                    # Prefix-replay decision segments keep only the decision
+                    # position; earlier positions stay owned by the segments
+                    # that scored them.
+                    hidden_states[:, end - 1 : end, :] = outputs.last_hidden_state[:, -1:, :]
+                else:
+                    hidden_states[:, start:end, :] = outputs.last_hidden_state
                 if diagnostic_hidden_states:
                     segment_hidden_states = getattr(outputs, "hidden_states", None)
                     if segment_hidden_states is None and isinstance(outputs, dict):
