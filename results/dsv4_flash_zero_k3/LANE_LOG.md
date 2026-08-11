@@ -162,3 +162,87 @@ Design (verified against pr16/pr44 sources):
 - Requalification (pod dsv4-flash, node 001): re-freeze base denominators
   (bytes CHANGE vs campaign 1), then A join + negative control, training
   gate, B join, 64-decision promotion, throughput. All drivers in this dir.
+
+### Campaign 2 execution record
+
+- Integration heads: parent `dsv4-canonical-unify` 1adc5db7c ("Fold DSV4 EP
+  partials with the shared canonical BF16 tree", on top of the pr44 merge
+  fb6352e25; only merge conflict was the submodule gitlink — auto.py and
+  lora/utils.py merged per the reconciliation notes, audited); submodule
+  `dsv4-canonical-unify` b1945bf0d ("Route the DSV4 exact post-experts
+  combine through the canonical fold", pr16 renamed the primitive to
+  `tensor_model_parallel_canonical_moe_all_reduce`; rewired + stale chain
+  docstring fixed).
+- Unit gates: 37 passed (dsv4_native_combine + canonical_moe_contract +
+  moe_ep_native_combine) and 42 passed (dsv4_moe/lora/exact_contract/
+  native_payload) in the combined env. New test
+  `test_canonical_fold_diverges_from_the_retired_nccl_chain` is the
+  byte-divergence witness (fold 2.015625 vs chain 2.0 on half-ulp ties).
+- Fold-engagement witness at system level: campaign2 base trace must DIFFER
+  from campaign-1 `trace_base_4dec.json` (same prompts, same seeds) — if
+  bytes match, the serving gate did not engage.
+- Evidence dir: `campaign2/` (campaign-1 files stay frozen).
+  Wrappers: `campaign2_launch_base.sh`, `campaign2_capture.sh`
+  (label/decisions/output as args).
+
+### Campaign 2 root cause #1: the gated MoE-internal combine was off-path
+
+First recapture (pod dsv4-flash v1 on node 001, heads 1adc5db7c/b1945bf0d):
+campaign-2 base decode sha == campaign-1 sha (`d7ca8fd6…`) — bytes did NOT
+change, and the new one-shot engagement log in `_post_experts_all_reduce`
+never fired. Localization: for the DSV4 topology (a2a none + dp-attn +
+attn_dp==tp==moe_ep==8), `should_use_dp_reduce_scatterv()` returns True, so
+`should_skip_post_experts_all_reduce()` skips the MoE-internal combine and
+the REAL combine is the layer-level `get_tp_group().reduce_scatterv`
+(pynccl) in `models/deepseek_v4.py` — only the Qwen3.5 exact contract fell
+back to the all-reduce + dp_scatter path. Consequences:
+- The campaign-1 sampler-side ordered-combine patch was inert for THIS
+  reason (not because "NCCL tree was already deterministic" — that
+  conclusion is corrected here).
+- The captured `[1..7,0]` contributor chain is the pynccl reduce path's
+  order as observed for DP-rank-0 rows (the exact lane pins decisions to DP
+  rank 0, so only rank-0 rows were ever byte-validated).
+- Fix (in 6c0fe1ddd): `dsv4_flash_exact_mode` joins the exact fallback in
+  `should_use_dp_reduce_scatterv()`; the combine then runs the MoE-internal
+  gated canonical fold + the layer's non-reducing `dp_scatter` — the same
+  call site and byte program as the Qwen/GLM exact lanes, uniform across
+  destination DP ranks (the fold order no longer depends on the destination
+  rank, unlike reduce_scatterv).
+- Also seen on the first recapture: teacher-forced rep-1 suffix divergence
+  from decision 11 at 64 decisions (decode bytes were rep-equal; reps 0/2
+  matched campaign-1 TF bytes). Not yet root-caused; re-check after the
+  fold engages — suspect allocation-layout or timing sensitivity on the
+  pr16 base prefill.
+
+### Campaign 2 root cause #2 (in progress): marlin prefill byte instability
+
+After the fold engaged (pod dsv4-flash v2 on node 071, submodule 6c0fe1ddd):
+decode bytes rep-equal ×3 at 4 AND 64 decisions, and CHANGED vs campaign 1
+(4dec sha 7665ae54→d80e1cc7, 64dec d7ca8fd6→86e56cd5) — the engagement
+witness holds. Teacher-forced prefill however is run-to-run nondeterministic:
+- TF-only probe (`campaign2_tf_probe.py`, no interleaved decodes): 3 distinct
+  byte streams over 12 identical requests at full length 74.
+- Length sweep ×8-10 reps: stable at 14/18/24/34/44/48/52/56/60/64/65/68/
+  69/70/71/73; UNSTABLE at 72 (8/2) and 74 (5/5) — routing-content
+  dependent, not a monotonic threshold.
+- First-divergence dump (dump-mode server, 6 passes at L=74, comparator
+  `campaign2_compare_passes.py`): first divergent tensor is
+  `model.layers.40.mlp` OUTPUT — ONE element, row 36 — while mlp INPUT,
+  `gate`, `topk`, and `shared_experts` are byte-identical on ALL 8 ranks.
+  By elimination the flip originates in one rank's routed MXFP4 MARLIN
+  partial (the only un-dumped fold input).
+- Campaign 1 had already pinned marlin's row block to 64 for the DSV4 exact
+  geometry (`select_marlin_moe_block_size_m`, M=48 discriminator: blocks
+  8/16/32 diverge). The residual instability at specific lengths is
+  consistent with the LOCK-WORKSPACE/fp32-reduce-buffer CAP: both
+  `fused_marlin_moe`'s int lock workspace and `moe_wna16_marlin`'s c_tmp
+  are capped at sms*4 slots while the kernel's `locks_off` walks the
+  absolute slice space (`c_cur_offset = locks_off * c_size`) — slice
+  aliasing turns the barrier-sequenced reduce into completion-order
+  dependence. Experiment: `SGLANG_MARLIN_FULL_WORKSPACE=1` removes both
+  caps; probing L=74/72 ×20 and L=44 (bytes must stay IDENTICAL to the
+  capped run's stable sha, else the sizing change altered the byte program).
+- NOTE: campaign 1's TF stability at the same lengths was routing-content
+  luck, not coverage — the latent race predates this campaign on both
+  sides (trainer marlin is exposed at training M too; replay comparisons
+  are M=1 and unaffected).
