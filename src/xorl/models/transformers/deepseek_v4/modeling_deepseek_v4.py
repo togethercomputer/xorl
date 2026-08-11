@@ -339,7 +339,28 @@ class DeepSeekV4Attention(nn.Module):
         validate_lora_metadata("entry")
         self._capture_diagnostic_component("attention_input", x)
         bsz, seqlen_local, _ = x.size()
-        freqs_cis = get_freqs_cis_for_cp(self.freqs_cis, seqlen_local, self.cp_size, self.cp_group)
+        # Decode-cache carry: the exact scorer replays serving decode steps as
+        # M=1 segments over carried per-layer serving state. The model forward
+        # stamps the segment's absolute position offset on this module
+        # (``_dsv4_decode_carry_offset``); the carried caches live on
+        # ``_dsv4_decode_state`` until the scorer clears them.
+        carry_offset = self.__dict__.get("_dsv4_decode_carry_offset") if self._exact_attention else None
+        carry_state = None
+        if carry_offset is not None:
+            if self.cp_size != 1 or bsz != 1:
+                raise RuntimeError(
+                    "DSV4 exact decode-cache carry admits one request without context parallelism"
+                )
+            carry_state = self.__dict__.get("_dsv4_decode_state")
+            if carry_state is None:
+                from xorl.ops.dsv4.exact_attention import Dsv4DecodeCarryState  # noqa: PLC0415
+
+                carry_state = Dsv4DecodeCarryState()
+                self._dsv4_decode_state = carry_state
+            # Absolute positions index the full RoPE table directly.
+            freqs_cis = self.freqs_cis
+        else:
+            freqs_cis = get_freqs_cis_for_cp(self.freqs_cis, seqlen_local, self.cp_size, self.cp_group)
         win = self.window_size
         ratio = self.compress_ratio
         rd = self.rope_head_dim
@@ -369,7 +390,7 @@ class DeepSeekV4Attention(nn.Module):
         if self._exact_attention:
             from xorl.ops.dsv4.exact_attention import exact_q_norm_rope  # noqa: PLC0415
 
-            q = exact_q_norm_rope(q, freqs_cis, self.eps)
+            q = exact_q_norm_rope(q, freqs_cis, self.eps, position_offset=carry_offset or 0)
         else:
             q_dtype = q.dtype
             q = q.float()
@@ -402,6 +423,8 @@ class DeepSeekV4Attention(nn.Module):
                     freqs_cis,
                     self.eps,
                     self.softmax_scale,
+                    carry_state=carry_state,
+                    position_offset=carry_offset or 0,
                 )
             else:
                 from xorl.ops.dsv4.exact_attention import exact_compressed_attention  # noqa: PLC0415
@@ -420,6 +443,8 @@ class DeepSeekV4Attention(nn.Module):
                     self.eps,
                     self.softmax_scale,
                     ratio,
+                    carry_state=carry_state,
+                    position_offset=carry_offset or 0,
                 )
             kv_vanilla = None
         else:
@@ -489,7 +514,7 @@ class DeepSeekV4Attention(nn.Module):
         if self._exact_attention:
             from xorl.ops.dsv4.exact_attention import exact_inverse_rope  # noqa: PLC0415
 
-            o = exact_inverse_rope(o, freqs_cis)
+            o = exact_inverse_rope(o, freqs_cis, position_offset=carry_offset or 0)
         else:
             apply_rotary_emb(o[..., -rd:], freqs_cis, inverse=True)
         validate_lora_metadata("inverse RoPE")
@@ -1481,6 +1506,17 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
         Returns:
             ``[batch, seqlen, hidden_size]``.
         """
+        decode_cache_carry = False
+        carry_position_offset = 0
+        if getattr(self.config, "_dsv4_flash_exact_mode", False):
+            decode_cache_carry = bool(kwargs.pop("decode_cache_carry", False))
+            if decode_cache_carry:
+                # The decode-cache scorer passes absolute position_ids
+                # (torch.arange(start, end)); the segment offset selects the
+                # carried serving state to append to.
+                if position_ids is None:
+                    raise ValueError("DSV4 decode-cache carry requires absolute position_ids")
+                carry_position_offset = int(position_ids.reshape(-1)[0].item())
         del attention_mask, position_ids
         if inputs_embeds is None:
             if input_ids is None:
@@ -1538,6 +1574,16 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
             h3d = h3d[:, :exact_compute_token_count]
             if input_ids is not None:
                 input_ids = input_ids[:, :exact_compute_token_count]
+            # Stamp (or clear) the per-layer decode-carry offset before the
+            # layer loop so every attention module replays this segment against
+            # its carried serving state. Clearing on non-carry forwards keeps a
+            # stale offset from leaking out of an aborted diagnostic run.
+            for layer in self.layers:
+                attention = layer.self_attn
+                if decode_cache_carry:
+                    attention._dsv4_decode_carry_offset = carry_position_offset
+                elif "_dsv4_decode_carry_offset" in attention.__dict__:
+                    del attention.__dict__["_dsv4_decode_carry_offset"]
         del kwargs
 
         output_router_logits = (
