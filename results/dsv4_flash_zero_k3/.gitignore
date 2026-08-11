@@ -6,3 +6,4 @@ adapter_nonzero/
 adapter_nonzero_perturbed/
 trainer_output/
 *.log
+adapter_trained/
