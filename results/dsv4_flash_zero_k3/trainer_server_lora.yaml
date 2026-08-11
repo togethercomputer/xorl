@@ -17,7 +17,7 @@ ulysses_parallel_size: 1
 lm_head_tensor_parallel_size: 8
 
 enable_mixed_precision: true
-enable_gradient_checkpointing: true
+enable_gradient_checkpointing: false
 enable_full_shard: true
 init_device: meta
 

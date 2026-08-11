@@ -1157,7 +1157,17 @@ class _ExactHybridAttention(torch.autograd.Function):
                 (q, kv_input, x),
                 grad_output,
                 create_graph=False,
+                # Short sequences can leave the compressed stream empty (e.g.
+                # C128 with no complete block), making x genuinely unused;
+                # its exact gradient is zero.
+                allow_unused=True,
             )
+            if grad_q is None:
+                grad_q = torch.zeros_like(q)
+            if grad_kv is None:
+                grad_kv = torch.zeros_like(kv_input)
+            if grad_x is None:
+                grad_x = torch.zeros_like(x)
         return (
             grad_q,
             grad_kv,
