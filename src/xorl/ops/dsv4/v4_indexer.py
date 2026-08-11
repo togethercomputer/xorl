@@ -107,6 +107,8 @@ class V4Indexer(nn.Module):
         rope_base = config.compress_rope_theta if self.compress_ratio else config.rope_theta
         freqs_cis = wrapped_precompute_freqs_cis(config, rope_head_dim=self.rope_head_dim, base=rope_base)
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
+        # Shared lru_cache table: rebuilt post-load; see DeepseekV4PreTrainedModel.
+        self._freqs_cis_rebuild_args = (rope_base, False, self.rope_head_dim)
 
     def forward(self, x: torch.Tensor, qr: torch.Tensor) -> torch.Tensor:
         """Forward pass.

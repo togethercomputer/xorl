@@ -149,10 +149,12 @@ def _serving_compressed_kv(
         CompressorPrefillPlan,
         compress_forward,
         compress_norm_rope_store,
-        linear_bf16_fp32,
     )
     from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (  # noqa: PLC0415
         dequantize_k_cache_paged,
+    )
+    from sglang.srt.batch_invariant_ops.batch_invariant_ops import (  # noqa: PLC0415
+        matmul_persistent,
     )
 
     if x.shape[0] != 1 or x.shape[-1] != 4096 or ratio not in (4, 128):
@@ -166,8 +168,17 @@ def _serving_compressed_kv(
 
     x_flat = x.contiguous().view(sequence_length, 4096)
     fused_weight = torch.cat((wkv_weight, wgate_weight), dim=0).to(torch.bfloat16).contiguous()
-    kv_score = linear_bf16_fp32(x_flat, fused_weight)
-    _validate_dsv4_lora_metadata(x, where=f"C{ratio} compressor linear_bf16_fp32")
+    # The pinned sampler computes kv_score via linear_bf16_fp32 ->
+    # torch.mm(x, w.t(), out_dtype=fp32), but under its deterministic contract
+    # torch.mm is patched to the batch-invariant persistent Triton GEMM:
+    # matmul_persistent(x, w.t().contiguous()).to(fp32) — a BF16-output kernel
+    # widened to FP32. Call that kernel directly (same treatment as the exact
+    # MoE router in modeling_deepseek_v4.py). A cuBLAS BF16 GEMM differs by one
+    # BF16 ulp on rounding-boundary scores, which perturbs the softmax pooling
+    # of every compressed KV row (second divergence of the 2026-08-11 base
+    # ruler, after the ape-layout fix).
+    kv_score = matmul_persistent(x_flat, fused_weight.t().contiguous()).to(torch.float32)
+    _validate_dsv4_lora_metadata(x, where=f"C{ratio} compressor kv_score GEMM")
     coff = 2 if ratio == 4 else 1
     if tuple(kv_score.shape) != (sequence_length, 2 * coff * 512):
         raise RuntimeError(f"Unexpected DSV4 compressor projection shape {tuple(kv_score.shape)}")

@@ -1,6 +1,6 @@
 {
   "schema": "dsv4-exact-trainer-replay-v1",
-  "created_at_unix": 1786446772.0678596,
+  "created_at_unix": 1786449227.4007983,
   "trace": "/home/apanda/xorl-oss-dsv4-flash-lora-zero-k3-20260810/results/dsv4_flash_zero_k3/trace_base_4dec.json",
   "trace_label": "base-ruler-4dec",
   "model_id": "ruler",
@@ -9,72 +9,72 @@
   "trainer_repetitions": 2,
   "trainer_denominator_byte_equal": true,
   "trainer_repetition_sha256": [
-    "9ec3d067a46d4a418e93d46647d3b645bfeec76a4468d666a86bbb78281f287f",
-    "9ec3d067a46d4a418e93d46647d3b645bfeec76a4468d666a86bbb78281f287f"
+    "164d3e55db23b35a724e6b799c51c606b4acf9b547e11823f11580d687271772",
+    "164d3e55db23b35a724e6b799c51c606b4acf9b547e11823f11580d687271772"
   ],
   "trainer_repetition_selected_logprobs": [
     [
-      -3.5625,
-      -3.0,
-      -0.018310546875,
+      -3.3125,
+      -3.171875,
+      -0.0228271484375,
       -2.96875
     ],
     [
-      -3.5625,
-      -3.0,
-      -0.018310546875,
+      -3.3125,
+      -3.171875,
+      -0.0228271484375,
       -2.96875
     ]
   ],
-  "trainer_selected_logprobs_b64": "AABkwAAAQMAAAJa8AAA+wA==",
+  "trainer_selected_logprobs_b64": "AABUwAAAS8AAALu8AAA+wA==",
   "trainer_selected_logprobs": [
-    -3.5625,
-    -3.0,
-    -0.018310546875,
+    -3.3125,
+    -3.171875,
+    -0.0228271484375,
     -2.96875
   ],
   "decode_comparison": {
     "byte_equal": false,
     "reference_sha256": "7665ae54f7b2c075463ab452ec85b2e4e34ec4fa7dd5f34046c7724d406b4f7e",
-    "trainer_sha256": "9ec3d067a46d4a418e93d46647d3b645bfeec76a4468d666a86bbb78281f287f",
+    "trainer_sha256": "164d3e55db23b35a724e6b799c51c606b4acf9b547e11823f11580d687271772",
     "first_difference": {
       "decision": 0,
       "reference": -3.765625,
-      "trainer": -3.5625,
+      "trainer": -3.3125,
       "reference_bits_hex": "c0710000",
-      "trainer_bits_hex": "c0640000"
+      "trainer_bits_hex": "c0540000"
     },
     "k3": [
-      0.01930121302233978,
-      0.032351596070820055,
-      6.258550932169982e-06,
+      0.08876367382605199,
+      0.004260361380034272,
+      4.769924164538253e-07,
       0.008148453066826322
     ],
-    "k3_mean": 0.014951880177729582,
-    "k3_max": 0.032351596070820055
+    "k3_mean": 0.02529324131633226,
+    "k3_max": 0.08876367382605199
   },
   "teacher_forced_comparison": {
     "byte_equal": false,
     "reference_sha256": "92ffe356938b9582e146d132a434e6030827f87b2c7cec4693bb0767e488f6ea",
-    "trainer_sha256": "9ec3d067a46d4a418e93d46647d3b645bfeec76a4468d666a86bbb78281f287f",
+    "trainer_sha256": "164d3e55db23b35a724e6b799c51c606b4acf9b547e11823f11580d687271772",
     "first_difference": {
       "decision": 0,
       "reference": -3.557795524597168,
-      "trainer": -3.5625,
+      "trainer": -3.3125,
       "reference_bits_hex": "c063b2ec",
-      "trainer_bits_hex": "c0640000"
+      "trainer_bits_hex": "c0540000"
     },
     "k3": [
-      1.1083418147928015e-05,
-      0.02707295972091517,
-      3.586564027990846e-07,
+      0.027768788570971203,
+      0.0024075676365518106,
+      1.4408914011942997e-05,
       0.021564726673551027
     ],
-    "k3_mean": 0.01216228211725423,
-    "k3_max": 0.02707295972091517
+    "k3_mean": 0.012938872948771496,
+    "k3_max": 0.027768788570971203
   },
   "source": {
-    "repo_head": "fe29cb8f2aab1f326aa6df42557d13c103287d9f",
-    "repo_diff_sha256": "da4eb65c2cdff133691394116887b558d66c6e74fc8b86715fc5617cad826eb4"
+    "repo_head": "d1009c840eb780ceb4aeb9d4d7413039c3455088",
+    "repo_diff_sha256": "2596d1a25b0bcea7ebef9b78df4cfae7b9eba62e79dcb01a5375556096aae04d"
   }
 }
