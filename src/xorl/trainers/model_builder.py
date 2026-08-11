@@ -110,8 +110,8 @@ def maybe_unfuse_projections(
     model: nn.Module,
     *,
     unfuse_for_lora: bool,
-    enable_lora: bool = False,
-    enable_qlora: bool = False,
+    enable_lora: bool,
+    enable_qlora: bool,
 ) -> None:
     """Split fused ``qkv_proj`` / ``gate_up_proj`` into per-projection modules.
 
@@ -127,7 +127,9 @@ def maybe_unfuse_projections(
 
     Args:
         model: Model to unfuse, in place.
-        unfuse_for_lora: Whether to unfuse at all. False is a no-op.
+        unfuse_for_lora: Whether to unfuse at all. False is a no-op. Defaults off
+            wherever it is plumbed: weight sync canonicalizes trainer parameters to
+            the fused names, so serving an unfused model needs its own verification.
         enable_lora: Whether plain LoRA is enabled for this run.
         enable_qlora: Whether QLoRA is enabled for this run.
 
@@ -196,10 +198,6 @@ def build_training_model(
     lora_target_modules: Optional[List[str]] = None,
     lora_target_manifest: Optional[dict[str, Any] | str] = None,
     moe_hybrid_shared_lora: bool = False,
-    # Consumed by out-of-repo callers of this builder (the RL trainer) as well as
-    # `lora.unfuse_for_lora` on the offline Trainer. The inference-server ModelRunner
-    # deliberately does not pass it: weight sync canonicalizes trainer parameters to
-    # the fused names, so serving an unfused trainer model needs its own verification.
     unfuse_for_lora: bool = False,
     # --- QLoRA ---
     enable_qlora: bool = False,

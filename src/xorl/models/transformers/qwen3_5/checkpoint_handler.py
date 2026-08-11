@@ -136,7 +136,7 @@ class Qwen3_5CheckpointHandler(CheckpointHandler):
         if linear_attn_results is not None:
             return linear_attn_results
 
-        # QKV merge (skipped when unfused for TP)
+        # QKV merge (always skipped here: Qwen3_5 attention stores q/k/v separately)
         if self._qkv_buffer is not None:
             if self._is_prequantized and key.endswith(".weight"):
                 if self._qkv_buffer.is_qkv_key(key):

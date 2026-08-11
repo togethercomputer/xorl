@@ -232,7 +232,7 @@ Each entry in `datasets` (or `test_datasets`) is a dict:
 | `lora_rank` | `16` | LoRA rank (`r`). |
 | `lora_alpha` | `16` | LoRA scaling factor (`alpha`). Effective scale = `alpha / rank`. |
 | `lora_target_modules` | `null` | Module names to inject LoRA into. `null` = default linear projections for the architecture. |
-| `unfuse_for_lora` | `false` | Split fused `qkv_proj`/`gate_up_proj` before LoRA injection so `q/k/v` and `gate/up` can be adapted at all. Requires `enable_lora`; rejected with `enable_qlora`. Costs ~1.4% step time. See [LoRA](/adapters/lora/#fused-projections). |
+| `unfuse_for_lora` | `false` | Split fused `qkv_proj`/`gate_up_proj` before LoRA injection so `q/k/v` and `gate/up` can be adapted at all. Requires `enable_lora`; rejected with `enable_qlora`. Costs ~1.4% step time to unfuse (Qwen3-14B, 8xH100); the newly-reachable targets cost more to train. See [LoRA](/adapters/lora/#fused-projections). |
 | `save_lora_only` | `false` | Only save LoRA adapter weights in HF checkpoints (not the full model). |
 | `enable_qlora` | `false` | Quantize base weights and train LoRA on top. Implies `enable_lora: true`. |
 | `quant_format` | `nvfp4` | Quantization format: `nvfp4` (4-bit, Hopper+), `block_fp8` (8-bit blocks), `nf4` (4-bit normal float). |

@@ -31,6 +31,12 @@ class Llama3CheckpointHandler(CheckpointHandler):
     When ``is_prequantized=True`` and a model is provided, quantized weights are
     loaded inline via QLoRAWeightBuffer (single-pass I/O). When model is not
     provided, falls back to skipping quantized keys (deferred loading).
+
+    Unfused handling:
+    - When ``skip_qkv_merge=True``, QKV keys pass through unmerged
+      (model has separate q_proj/k_proj/v_proj after unfusing).
+    - When ``skip_gate_up_merge=True``, gate/up keys pass through unmerged
+      (model has separate gate_proj/up_proj after unfusing).
     """
 
     def __init__(

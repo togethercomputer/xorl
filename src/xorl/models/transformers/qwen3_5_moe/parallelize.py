@@ -37,7 +37,6 @@ def unfuse_for_tp(model):
     for layer in model.model.layers:
         if getattr(layer, "self_attn", None) is not None and hasattr(layer.self_attn, "unfuse_for_tp"):
             layer.self_attn.unfuse_for_tp()
-        # Only the routed experts of an MoE block stay fused; its shared expert does not.
         if isinstance(layer.mlp, MoEBlock):
             layer.mlp.shared_expert.unfuse_for_tp()
         else:

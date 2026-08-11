@@ -111,8 +111,10 @@ lora:
 Most architectures store the input-side projections fused — attention as a single
 `qkv_proj`, the dense MLP as a single `gate_up_proj`. Because LoRA selects modules by
 name, `q_proj` / `gate_proj` and friends match **nothing** on those models: they are
-skipped (with a warning) and train unadapted, leaving only `o_proj` and `down_proj`
-covered. Two ways to reach them.
+skipped and train unadapted, leaving only `o_proj` and `down_proj` covered. Injection
+warns about targets that matched no module, but that check is name-level — on MoE
+models the routed experts satisfy `gate_proj`/`up_proj` for the whole model, so a bare
+shared expert alongside them stays silent. Two ways to reach them.
 
 **Target the fused names.** Adapts each fused module as one target, at no throughput
 cost. One `lora_A` is shared across the halves, so this is a more constrained

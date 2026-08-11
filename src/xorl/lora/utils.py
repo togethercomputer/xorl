@@ -169,7 +169,7 @@ def _find_target_modules(
         List of full module paths that match (in top-down order)
     """
     matched_paths = []
-    replaced_prefixes = set()  # Track replaced module paths to skip their children
+    replaced_prefixes: Set[str] = set()  # Track replaced module paths to skip their children
     matched_targets: Set[str] = set()
 
     for name, module in model.named_modules():
@@ -195,23 +195,28 @@ def _find_target_modules(
         # This handles MoE experts where user specifies "gate_proj" but the
         # actual module to replace is "experts" which contains gate_proj weights
         module_attrs = set(dir(module))
-        indirect = {target for target in target_modules if target in module_attrs}
-        if indirect:
+        indirect_matches = {target for target in target_modules if target in module_attrs}
+        if indirect_matches:
             matched_paths.append(name)
             replaced_prefixes.add(name)
-            matched_targets |= indirect
+            matched_targets |= indirect_matches
             continue
 
     # A requested target that matched nothing trains unadapted. Injection only raises
     # when *nothing* matched, so a 2-of-7 match is otherwise indistinguishable from
     # success. The usual cause is the architecture storing that projection fused
     # (qkv_proj / gate_up_proj), which no split target name can reach.
+    #
+    # This is a name-level check and matches one module anywhere: MoEExperts exposes
+    # gate_proj/up_proj as properties, so routed experts satisfy those names for the
+    # whole model and a bare shared expert alongside them stays silent here. Verify
+    # coverage by full module path when that distinction matters.
     unmatched = sorted(set(target_modules) - matched_targets)
     if unmatched:
         logger.warning(
             f"LoRA targets matched no module and will train unadapted: {unmatched} "
             f"(adapted: {sorted(matched_targets)}). If this architecture stores them fused, "
-            f"either enable unfuse_for_lora or target the fused names directly."
+            "either enable unfuse_for_lora or target the fused names directly."
         )
 
     return matched_paths

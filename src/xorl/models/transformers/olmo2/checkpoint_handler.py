@@ -31,6 +31,12 @@ class Olmo2CheckpointHandler(CheckpointHandler):
     OLMo-2 layer norm names (``post_attention_layernorm``,
     ``post_feedforward_layernorm``) already match the model's parameter
     names, so no key remapping is needed for them.
+
+    Unfused handling:
+    - When ``skip_qkv_merge=True``, QKV keys pass through unmerged
+      (model has separate q_proj/k_proj/v_proj after unfusing).
+    - When ``skip_gate_up_merge=True``, gate/up keys pass through unmerged
+      (model has separate gate_proj/up_proj after unfusing).
     """
 
     def __init__(

@@ -1,9 +1,8 @@
 """Unfusing ``qkv_proj`` / ``gate_up_proj``: checkpoint handlers and the MoE shared expert.
 
 The load-time contract when a model is unfused is narrow: the checkpoint handler stops
-merging the projections the model no longer fuses, and keeps doing everything else. The
-dense handlers used to express this by returning no handler at all, which on Qwen3.5 also
-switched off the GatedDeltaNet remapping.
+merging the projections the model no longer fuses, and keeps doing everything else --
+pre-quantized loading paths, and on Qwen3.5 the GatedDeltaNet ``in_proj_qkv`` remapping.
 """
 
 import warnings

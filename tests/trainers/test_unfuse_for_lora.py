@@ -43,14 +43,14 @@ class TestMaybeUnfuseProjections:
     def test_noop_when_disabled(self):
         model = _Unfusable()
 
-        maybe_unfuse_projections(model, unfuse_for_lora=False, enable_lora=True)
+        maybe_unfuse_projections(model, unfuse_for_lora=False, enable_lora=True, enable_qlora=False)
 
         assert model.calls == []
 
     def test_unfuses_when_enabled(self):
         model = _Unfusable()
 
-        maybe_unfuse_projections(model, unfuse_for_lora=True, enable_lora=True)
+        maybe_unfuse_projections(model, unfuse_for_lora=True, enable_lora=True, enable_qlora=False)
 
         assert model.calls == ["unfuse"]
 
@@ -58,21 +58,21 @@ class TestMaybeUnfuseProjections:
         """QLoRA targets the fused names, so unfusing would leave q/k/v and gate/up
         both unquantized and unadapted while injection still reports success."""
         with pytest.raises(ValueError, match="not supported with QLoRA"):
-            maybe_unfuse_projections(_Unfusable(), unfuse_for_lora=True, enable_qlora=True)
+            maybe_unfuse_projections(_Unfusable(), unfuse_for_lora=True, enable_lora=True, enable_qlora=True)
 
     def test_rejects_unfusing_without_lora(self):
         """Splitting the GEMMs buys nothing if no adapter is going to use the names."""
         with pytest.raises(ValueError, match="requires enable_lora"):
-            maybe_unfuse_projections(_Unfusable(), unfuse_for_lora=True, enable_lora=False)
+            maybe_unfuse_projections(_Unfusable(), unfuse_for_lora=True, enable_lora=False, enable_qlora=False)
 
     def test_raises_rather_than_silently_skipping(self):
         """A silent skip is the exact failure mode this work exists to remove: the
         targets would train unadapted while the config claims otherwise."""
         with pytest.raises(NotImplementedError, match="cannot unfuse"):
-            maybe_unfuse_projections(_NotUnfusable(), unfuse_for_lora=True, enable_lora=True)
+            maybe_unfuse_projections(_NotUnfusable(), unfuse_for_lora=True, enable_lora=True, enable_qlora=False)
 
     def test_unsupported_architecture_is_fine_while_disabled(self):
-        maybe_unfuse_projections(_NotUnfusable(), unfuse_for_lora=False, enable_lora=True)
+        maybe_unfuse_projections(_NotUnfusable(), unfuse_for_lora=False, enable_lora=True, enable_qlora=False)
 
 
 def _patch_builder(monkeypatch, model, calls):
@@ -122,10 +122,10 @@ class TestBuildTrainingModelOrdering:
 
         assert calls == ["inject", "parallelize"]
 
-    def test_merge_qkv_false_does_not_double_unfuse(self, monkeypatch):
-        """``merge_qkv=False`` unfuses attention per-layer. Running it after a full
-        unfuse would raise AttributeError, since unfuse_for_tp reads the fused weight
-        before deleting it."""
+    def test_merge_qkv_false_yields_to_unfuse_for_lora(self, monkeypatch):
+        """With both set, only the full unfuse runs. ``merge_qkv=False`` unfuses
+        attention per-layer, and running that after a full unfuse would raise
+        AttributeError, since unfuse_for_tp reads the fused weight before deleting it."""
         calls = []
         _patch_builder(monkeypatch, _Unfusable(calls), calls)
 
@@ -141,7 +141,7 @@ class TestTrainerOrdering:
     @staticmethod
     def _trainer(monkeypatch, calls, model):
         monkeypatch.setattr("xorl.trainers.trainer.build_foundation_model", lambda **kwargs: model)
-        monkeypatch.setattr("xorl.trainers.trainer.helper.print_device_mem_info", lambda *a, **k: None)
+        monkeypatch.setattr("xorl.trainers.trainer.helper.print_device_mem_info", lambda *args, **kwargs: None)
         monkeypatch.setattr(
             "xorl.trainers.trainer.maybe_upcast_trainable_adapter_params",
             lambda *args, **kwargs: None,
@@ -180,6 +180,16 @@ class TestTrainerOrdering:
     def test_unfuse_precedes_lora_injection(self, monkeypatch):
         calls = []
         trainer = self._trainer(monkeypatch, calls, _Unfusable(calls))
+
+        trainer._build_model()
+
+        assert calls == ["unfuse", "inject"]
+
+    def test_merge_qkv_false_yields_to_unfuse_for_lora(self, monkeypatch):
+        """The live path carries its own copy of the guard clause."""
+        calls = []
+        trainer = self._trainer(monkeypatch, calls, _Unfusable(calls))
+        trainer.args.model.merge_qkv = False
 
         trainer._build_model()
 
