@@ -135,3 +135,30 @@ ten consecutive quiet minutes before claiming, then runs sampler-up → capture
 - `src/xorl/models/auto.py`: DSV4 exact server training without enable_lora
   now raises (a base-only trainer would silently pair an exact trunk with a
   non-exact LM head; base rulers use the certified all-zero adapter).
+
+## CAMPAIGN 2 (2026-08-11, in progress): unify DSV4 onto canonical_moe_fold_v1
+
+Decision: migrate DSV4 off the NCCL-tree-order reproduction onto the
+Qwen/GLM canonical adjacent-pair BF16 fold (deliberate byte change -> FULL
+requalification required; previous certificates void for the new heads).
+
+Design (verified against pr16/pr44 sources):
+- Serving: on the #16-stacked base, tensor_model_parallel_ordered_all_reduce
+  == all_gather + canonical_moe_fold_v1 (identity contributor order = TP rank
+  order). Re-instate the DSV4-gated _post_experts_all_reduce helper in
+  DeepseekV2MoE (the previously reverted 477e28110 shape) on that base.
+- Trainer: in dsv4_native_combine, replace the [1..7,0] chain with
+  xorl.distributed.canonical_moe.canonical_moe_fold_v1 (pr44) over the
+  exchanged per-source-rank blocks stacked in rank order (identity logical
+  ordinals; variable-row per destination preserved around the fold).
+- Integration branches (scratch; official restack owned by another agent):
+  submodule `dsv4-canonical-unify` from pr16 head + cherry-picked DSV4
+  surface + new serving commit; parent `dsv4-canonical-unify` from my branch
+  + merge of pr44 + new trainer commit. Known conflict resolutions per
+  reconciliation notes: http_server.py = union (health/model-override + FP32
+  raw-logprob wire); auto.py = keep #43 Qwen capability resolution AND DSV4
+  fail-closed registration; lora/utils.py = single-writer export AND
+  948-factor dsv4_expert_banks export.
+- Requalification (pod dsv4-flash, node 001): re-freeze base denominators
+  (bytes CHANGE vs campaign 1), then A join + negative control, training
+  gate, B join, 64-decision promotion, throughput. All drivers in this dir.
