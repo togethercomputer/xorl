@@ -30,9 +30,7 @@ class FLACPContext:
             group=self.group,
             cu_seqlens=self.cu_seqlens.clone() if self.cu_seqlens is not None else None,
             cu_seqlens_cpu=self.cu_seqlens_cpu.clone() if self.cu_seqlens_cpu is not None else None,
-            global_cu_seqlens=(
-                self.global_cu_seqlens.clone() if self.global_cu_seqlens is not None else None
-            ),
+            global_cu_seqlens=(self.global_cu_seqlens.clone() if self.global_cu_seqlens is not None else None),
             global_cu_seqlens_cpu=(
                 self.global_cu_seqlens_cpu.clone() if self.global_cu_seqlens_cpu is not None else None
             ),
