@@ -81,8 +81,8 @@ def _assert_qwen2_unfuse_for_tp_matches_hf_parameter_layout():
     assert not hasattr(layer.mlp, "gate_up_proj")
     assert hasattr(layer.mlp, "gate_proj")
     assert hasattr(layer.mlp, "up_proj")
-    # Unfused: the handler is returned with both merges disabled; everything else it
-    # does (pre-quantized paths, key remapping) stays active.
+    # Unfused: the handler is returned with both merges disabled; its pre-quantized
+    # loading paths stay active.
     handler = model.get_checkpoint_handler()
     assert handler is not None
     # HF's already-split keys pass straight through to matching parameters.

@@ -56,7 +56,8 @@ class TestMaybeUnfuseProjections:
 
     def test_rejects_qlora(self):
         """QLoRA targets the fused names, so unfusing would leave q/k/v and gate/up
-        both unquantized and unadapted while injection still reports success."""
+        both unquantized and unadapted while injection still reports success.
+        """
         with pytest.raises(ValueError, match="not supported with QLoRA"):
             maybe_unfuse_projections(_Unfusable(), unfuse_for_lora=True, enable_lora=True, enable_qlora=True)
 
@@ -67,7 +68,8 @@ class TestMaybeUnfuseProjections:
 
     def test_raises_rather_than_silently_skipping(self):
         """A silent skip is the exact failure mode this work exists to remove: the
-        targets would train unadapted while the config claims otherwise."""
+        targets would train unadapted while the config claims otherwise.
+        """
         with pytest.raises(NotImplementedError, match="cannot unfuse"):
             maybe_unfuse_projections(_NotUnfusable(), unfuse_for_lora=True, enable_lora=True, enable_qlora=False)
 
@@ -114,7 +116,8 @@ class TestBuildTrainingModelOrdering:
 
     def test_not_unfused_by_default(self, monkeypatch):
         """Opt-in only: the inference-server ModelRunner shares this builder and must
-        keep its fused layout, which weight sync canonicalizes against."""
+        keep its fused layout, which weight sync canonicalizes against.
+        """
         calls = []
         _patch_builder(monkeypatch, _Unfusable(calls), calls)
 
@@ -125,7 +128,8 @@ class TestBuildTrainingModelOrdering:
     def test_merge_qkv_false_yields_to_unfuse_for_lora(self, monkeypatch):
         """With both set, only the full unfuse runs. ``merge_qkv=False`` unfuses
         attention per-layer, and running that after a full unfuse would raise
-        AttributeError, since unfuse_for_tp reads the fused weight before deleting it."""
+        AttributeError, since unfuse_for_tp reads the fused weight before deleting it.
+        """
         calls = []
         _patch_builder(monkeypatch, _Unfusable(calls), calls)
 
@@ -135,8 +139,9 @@ class TestBuildTrainingModelOrdering:
 
 
 class TestTrainerOrdering:
-    """`Trainer._build_model` does not go through `build_training_model`; it carries its
-    own copy of the unfuse -> inject -> parallelize sequence."""
+    """``Trainer._build_model`` does not go through ``build_training_model``; it carries
+    its own copy of the unfuse -> inject -> parallelize sequence.
+    """
 
     @staticmethod
     def _trainer(monkeypatch, calls, model):

@@ -167,6 +167,15 @@ def _find_target_modules(
 
     Returns:
         List of full module paths that match (in top-down order)
+
+    Warns:
+        When a requested target matched no module, since it will train unadapted.
+        The check is name-level and satisfied by a single module anywhere, so a
+        target that some modules carry and others lack does not warn -- notably
+        ``MoEExperts`` exposes ``gate_proj``/``up_proj`` as properties, so routed
+        experts satisfy those names for the whole model even when a shared expert
+        beside them is left bare. Verify coverage by full module path when that
+        distinction matters.
     """
     matched_paths = []
     replaced_prefixes: Set[str] = set()  # Track replaced module paths to skip their children
@@ -202,15 +211,9 @@ def _find_target_modules(
             matched_targets |= indirect_matches
             continue
 
-    # A requested target that matched nothing trains unadapted. Injection only raises
-    # when *nothing* matched, so a 2-of-7 match is otherwise indistinguishable from
-    # success. The usual cause is the architecture storing that projection fused
-    # (qkv_proj / gate_up_proj), which no split target name can reach.
-    #
-    # This is a name-level check and matches one module anywhere: MoEExperts exposes
-    # gate_proj/up_proj as properties, so routed experts satisfy those names for the
-    # whole model and a bare shared expert alongside them stays silent here. Verify
-    # coverage by full module path when that distinction matters.
+    # Injection only raises when *nothing* matched, so a 2-of-7 match is otherwise
+    # indistinguishable from success. The usual cause is the architecture storing that
+    # projection fused (qkv_proj / gate_up_proj), which no split name can reach.
     unmatched = sorted(set(target_modules) - matched_targets)
     if unmatched:
         logger.warning(
