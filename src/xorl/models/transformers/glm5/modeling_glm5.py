@@ -74,7 +74,10 @@ from xorl.utils import logging
 
 logger = logging.get_logger(__name__)
 GLM52_LOCAL_PARTIAL_POLICY = "glm52_routed_final_scaled_then_shared_ep_slice_bf16_v2"
-_GLM52_CANONICAL_TRAINER_TOPOLOGIES = ((16, 1, 1, 1),)
+_GLM52_CANONICAL_TRAINER_TOPOLOGIES = (
+    (16, 1, 1, 1),
+    (16, 1, 1, 16),
+)
 
 
 def _glm52_serving_grouped_topk(
@@ -1014,8 +1017,8 @@ class Glm5MoEBlock(MoEBlock):
         )
 
         ps = get_parallel_state()
-        if not ps.ep_enabled or ps.ep_size != 16 or ps.cp_size != 16:
-            raise RuntimeError("GLM-5.2 exact trainer path requires aliased EP16/CP16")
+        if not ps.ep_enabled or ps.ep_size != 16 or ps.cp_size not in (1, 16):
+            raise RuntimeError("GLM-5.2 exact trainer path requires EP16 with CP16 or DP-owned CP1 rows")
         admitted = _GLM52_CANONICAL_TRAINER_TOPOLOGIES
         topology = (dist.get_world_size(), ps.pp_size, ps.tp_size, ps.dp_size)
         if topology not in admitted:
@@ -1023,19 +1026,28 @@ class Glm5MoEBlock(MoEBlock):
                 f"GLM-5.2 canonical MoE trainer path does not admit WORLD/PP/TP/DP={topology}; "
                 f"admitted topologies are {admitted}"
             )
-        if ps.ringattn_size != 1 or ps.ulysses_size != 16:
-            raise RuntimeError("GLM-5.2 canonical MoE trainer path requires Ring1 and Ulysses equal to EP")
+        expected_ulysses = 16 if ps.cp_size == 16 else 1
+        if ps.ringattn_size != 1 or ps.ulysses_size != expected_ulysses:
+            raise RuntimeError(
+                "GLM-5.2 canonical MoE trainer path requires Ring1 and Ulysses16 for CP-owned rows or "
+                "Ulysses1 for DP-owned rows"
+            )
         if ps.dp_replicate_size != 1 or ps.dp_shard_size != ps.dp_size or ps.cp_fsdp_mode != "all":
             raise RuntimeError(
                 "GLM-5.2 canonical trainer path requires DP-replicate1, fully sharded DP, and cp_fsdp_mode=all"
             )
-        if ps.ep_group is None or ps.ulysses_group is None:
-            raise RuntimeError("GLM-5.2 canonical MoE requires the stage-local CP and EP process groups to alias")
+        if ps.ep_group is None:
+            raise RuntimeError("GLM-5.2 canonical MoE requires a stage-local EP16 contributor group")
         get_group_ranks = getattr(dist, "get_process_group_ranks", None)
-        if get_group_ranks is not None and tuple(get_group_ranks(ps.ep_group)) != tuple(
-            get_group_ranks(ps.ulysses_group)
-        ):
-            raise RuntimeError("GLM-5.2 canonical MoE requires identical stage-local CP and EP rank membership")
+        if ps.cp_size == 16:
+            if ps.ulysses_group is None:
+                raise RuntimeError("GLM-5.2 CP-owned rows require a stage-local Ulysses16 group")
+            if get_group_ranks is not None and tuple(get_group_ranks(ps.ep_group)) != tuple(
+                get_group_ranks(ps.ulysses_group)
+            ):
+                raise RuntimeError("GLM-5.2 CP-owned rows require identical stage-local CP and EP rank membership")
+        elif ps.ulysses_group is not None:
+            raise RuntimeError("GLM-5.2 DP-owned rows require CP1 without a Ulysses process group")
         if self.experts.ep_dispatch == "deepep":
             raise RuntimeError("GLM-5.2 canonical MoE canonical path does not support DeepEP")
         if hidden_states.dtype is not torch.bfloat16:
@@ -1116,6 +1128,7 @@ class Glm5MoEBlock(MoEBlock):
             pp_size=ps.pp_size,
             dp_size=ps.dp_size,
             contributor_count=ps.ep_size,
+            cp_size=ps.cp_size,
         )
         resolved_transport = resolve_canonical_moe_transport(
             self.canonical_moe_transport,
@@ -1159,7 +1172,6 @@ class Glm5MoEBlock(MoEBlock):
                 group=group,
                 output_distribution=OutputDistribution.REPLICATED_CANONICAL,
                 physical_global_rank=dist.get_rank(),
-                chunk_rows=int(getattr(self.config, "_glm52_canonical_moe_chunk_rows", capacity)),
                 graph_mode=False,
             )
         if resolved_transport is CanonicalMoETransport.CP_SHARDED_V3:

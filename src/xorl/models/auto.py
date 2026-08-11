@@ -388,6 +388,7 @@ def _validate_exact_qwen35_topology(config: PretrainedConfig, parallel_state: An
     admitted = (
         (
             (8, 8, 1, 8, 1, 1, 8, 1, 1, 1),
+            (8, 1, 1, 1, 1, 1, 8, 8, 1, 8),
             (16, 16, 2, 8, 1, 1, 8, 1, 1, 1),
         )
         if _is_qwen35_moe(config)
@@ -874,12 +875,22 @@ def build_foundation_model(
                 ps.ep_size,
                 ps.cp_size,
             )
-            certified = (16, 1, 1, 1, 16, 16)
+            certified = (
+                (16, 1, 1, 1, 16, 16),
+                (16, 1, 1, 16, 16, 1),
+            )
             lm_head_tp_size = getattr(ps, "lm_head_tp_size", 1)
-            if topology != certified or ps.ringattn_size != 1 or ps.ulysses_size != 16 or lm_head_tp_size != 16:
+            expected_ulysses = 16 if ps.cp_size == 16 else 1
+            if (
+                topology not in certified
+                or ps.ringattn_size != 1
+                or ps.ulysses_size != expected_ulysses
+                or lm_head_tp_size != 16
+            ):
                 raise ValueError(
                     "The GLM-5.2 exact active-LoRA path is certified only for "
-                    f"WORLD/PP/TP/DP/EP/CP={certified} with Ring1/Ulysses16/lm-head-TP16; got {topology} "
+                    f"WORLD/PP/TP/DP/EP/CP={certified} with Ring1, topology-matched Ulysses, and "
+                    f"lm-head-TP16; got {topology} "
                     f"with Ring{ps.ringattn_size}/Ulysses{ps.ulysses_size}/lm-head-TP{lm_head_tp_size}"
                 )
             config._glm52_pipeline_layer_ranges = ((0, 78),)
@@ -892,11 +903,15 @@ def build_foundation_model(
                 ps.ep_size,
                 ps.cp_size,
             )
-            certified = (16, 1, 1, 1, 16, 16)
-            if topology != certified or ps.ringattn_size != 1 or ps.ulysses_size != 16:
+            certified = (
+                (16, 1, 1, 1, 16, 16),
+                (16, 1, 1, 16, 16, 1),
+            )
+            expected_ulysses = 16 if ps.cp_size == 16 else 1
+            if topology not in certified or ps.ringattn_size != 1 or ps.ulysses_size != expected_ulysses:
                 raise ValueError(
                     "The GLM-5.2 exact server-training path is certified only for "
-                    f"WORLD/PP/TP/DP/EP/CP={certified} with Ring1/Ulysses16; got {topology} "
+                    f"WORLD/PP/TP/DP/EP/CP={certified} with Ring1 and topology-matched Ulysses; got {topology} "
                     f"with Ring{ps.ringattn_size}/Ulysses{ps.ulysses_size}"
                 )
             config._glm52_pipeline_layer_ranges = ((0, 78),)

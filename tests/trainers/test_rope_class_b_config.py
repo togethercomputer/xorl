@@ -28,11 +28,16 @@ pytestmark = pytest.mark.cpu
 
 def _exact_glm52_config() -> Glm5Config:
     indexer_types = ["full" if layer_idx < 3 or (layer_idx - 2) % 4 == 0 else "shared" for layer_idx in range(78)]
-    return Glm5Config(
+    config = Glm5Config(
         indexer_types=indexer_types,
         mlp_layer_types=["dense"] * 3 + ["sparse"] * 75,
         index_topk_freq=4,
     )
+    # ``build_foundation_model`` selects this internal scoring contract after
+    # validating the official GLM-5.2 geometry.  These resolver tests operate
+    # directly on the config, so model the same reachable post-builder state.
+    config._glm52_exact_contract = True
+    return config
 
 
 def _exact_qwen35_dense_config() -> Qwen3_5Config:
@@ -428,6 +433,22 @@ def test_exact_qwen35_moe_admits_world8_ep8_topology():
             dp_size=8,
             dp_replicate_size=1,
             dp_shard_size=8,
+        ),
+    )
+
+
+def test_exact_qwen35_moe_admits_world8_ep8_ulysses8_topology():
+    config = _exact_qwen35_moe_config()
+    config._qwen35_exact_contract = True
+    _validate_exact_qwen35_topology(
+        config,
+        _qwen35_topology(
+            world_size=8,
+            dp_size=1,
+            dp_replicate_size=1,
+            dp_shard_size=1,
+            cp_size=8,
+            ulysses_size=8,
         ),
     )
 

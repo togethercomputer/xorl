@@ -8,6 +8,8 @@ import torch.distributed as dist
 from distributed_utils import run_distributed_script
 
 from xorl.distributed.canonical_moe import (
+    CANONICAL_MOE_DENSE_MAX_CHUNK_ROWS,
+    CANONICAL_MOE_FOLD_VERSION,
     CANONICAL_MOE_REDUCE_VERSION,
     CanonicalMoEGraphMetadata,
     CanonicalMoETransport,
@@ -15,6 +17,8 @@ from xorl.distributed.canonical_moe import (
     OutputDistribution,
     ParallelPlan,
     ParallelRole,
+    _resolve_transport_chunk_rows,
+    canonical_moe_fold_v1,
     canonical_moe_reduce_cp_sharded_v3,
     canonical_moe_reduce_packed_ep16_v2,
     canonical_moe_reduce_reference,
@@ -27,6 +31,15 @@ from xorl.distributed.parallel_state import init_ep_mesh_matrix
 pytestmark = [pytest.mark.distributed]
 
 
+@pytest.mark.cpu
+def test_dense_transport_default_bounds_dp_owned_capacity_without_a_selector():
+    assert CANONICAL_MOE_DENSE_MAX_CHUNK_ROWS == 4096
+    assert _resolve_transport_chunk_rows(66544, None, CanonicalMoETransport.DENSE_V1) == 4096
+    assert _resolve_transport_chunk_rows(128, None, CanonicalMoETransport.DENSE_V1) == 128
+    assert _resolve_transport_chunk_rows(66544, 2048, CanonicalMoETransport.DENSE_V1) == 2048
+    assert _resolve_transport_chunk_rows(66544, None, CanonicalMoETransport.PACKED_EP16_V2) == 66544
+
+
 def _explicit_tree(partials: torch.Tensor) -> torch.Tensor:
     current = [partials[index] for index in range(partials.shape[0])]
     while len(current) > 1:
@@ -37,6 +50,7 @@ def _explicit_tree(partials: torch.Tensor) -> torch.Tensor:
 @pytest.mark.cpu
 @pytest.mark.parametrize("contributors", [2, 4, 8, 16])
 def test_reference_is_the_adjacent_bf16_tree(contributors: int):
+    assert CANONICAL_MOE_FOLD_VERSION == "canonical_moe_fold_v1"
     rows = contributors + 2
     values = torch.zeros((contributors, rows, 3), dtype=torch.bfloat16)
     adversarial = torch.tensor(
@@ -59,6 +73,26 @@ def test_reference_is_the_adjacent_bf16_tree(contributors: int):
     expected = _explicit_tree(padded)
     expected[~metadata.valid_mask] = 0
     assert torch.equal(result, expected)
+    assert torch.equal(canonical_moe_fold_v1(padded), _explicit_tree(padded))
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("contributors", [8, 16])
+def test_shared_fold_replays_in_cuda_graph(contributors: int):
+    partials = torch.randn((contributors, 64, 32), device="cuda", dtype=torch.bfloat16)
+    canonical_moe_fold_v1(partials)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        folded = canonical_moe_fold_v1(partials)
+    first = folded.clone()
+    partials[0].add_(8.0)
+    graph.replay()
+
+    assert not torch.equal(first, folded)
+    assert torch.equal(folded, _explicit_tree(partials))
 
 
 @pytest.mark.cpu
@@ -76,7 +110,7 @@ def test_graph_metadata_has_deterministic_padding_and_capacity_guard():
 
 
 @pytest.mark.cpu
-def test_transport_auto_promotes_only_admitted_cp_sharded_geometry():
+def test_transport_auto_selects_only_regression_qualified_packed_geometry():
     ep16 = ParallelPlan.glm52_trainer(world_size=16, pp_size=1, dp_size=1, contributor_count=16)
     assert (
         resolve_canonical_moe_transport(
@@ -87,7 +121,26 @@ def test_transport_auto_promotes_only_admitted_cp_sharded_geometry():
             graph_mode=False,
             consumer_sharded_output=True,
         )
-        is CanonicalMoETransport.CP_SHARDED_V3
+        is CanonicalMoETransport.PACKED_EP16_V2
+    )
+
+    dp_ep16 = ParallelPlan.glm52_trainer(
+        world_size=16,
+        pp_size=1,
+        dp_size=16,
+        contributor_count=16,
+        cp_size=1,
+    )
+    assert (
+        resolve_canonical_moe_transport(
+            "auto",
+            plan=dp_ep16,
+            capacity=16 * 4224,
+            local_rows=4224,
+            graph_mode=False,
+            consumer_sharded_output=True,
+        )
+        is CanonicalMoETransport.DENSE_V1
     )
 
     ep8 = ParallelPlan.primitive(8)
@@ -116,11 +169,11 @@ def test_transport_auto_promotes_only_admitted_cp_sharded_geometry():
 
 
 @pytest.mark.cpu
-def test_internal_resolution_serves_cp_sharded_v3_on_the_admitted_geometry():
+def test_internal_resolution_serves_packed_ep16_v2_on_the_admitted_geometry():
     """The exact GLM path has no public transport knob: internal resolution
-    serves cp_sharded_v3 on the admitted eager EP16/CP16 consumer-sharded
-    geometry (the transport with the strongest certified performance
-    evidence) and the dense executable oracle elsewhere."""
+    serves packed_ep16_v2 on the admitted eager EP16/CP16 geometry because it
+    passed the full-model byte-parity regression anchor, and the dense
+    executable oracle elsewhere."""
     ep16 = ParallelPlan.glm52_trainer(world_size=16, pp_size=1, dp_size=1, contributor_count=16)
     assert (
         resolve_canonical_moe_transport(
@@ -131,7 +184,7 @@ def test_internal_resolution_serves_cp_sharded_v3_on_the_admitted_geometry():
             graph_mode=False,
             consumer_sharded_output=True,
         )
-        is CanonicalMoETransport.CP_SHARDED_V3
+        is CanonicalMoETransport.PACKED_EP16_V2
     )
     ep8 = ParallelPlan.primitive(8)
     assert (
@@ -232,6 +285,15 @@ def test_exact_parallel_plans_hash_launcher_spelling_and_fail_closed():
     assert trainer.combine_groups == (tuple(range(16)),)
     assert all(trainer.logical_ordinal(physical_rank) == physical_rank for physical_rank in range(16))
     assert trainer.contract_version == CANONICAL_MOE_REDUCE_VERSION
+
+    dp_trainer = ParallelPlan.glm52_trainer(dp_size=16, contributor_count=16, cp_size=1)
+    assert dp_trainer.contributor_count == 16
+    assert dp_trainer.cp_size == 1
+    assert dp_trainer.ep_size == 16
+    assert dp_trainer.combine_groups == trainer.combine_groups
+    assert dp_trainer.logical_ordinals_by_group == trainer.logical_ordinals_by_group
+    assert dp_trainer.cp_ep_aliases == ()
+    assert dp_trainer.digest != trainer.digest
 
     for kwargs in (
         {"world_size": 16, "dp_size": 2, "contributor_count": 8},

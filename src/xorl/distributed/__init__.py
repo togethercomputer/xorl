@@ -1,5 +1,6 @@
 from .canonical_moe import (
     CANONICAL_MOE_CP_SHARDED_TRANSPORT_VERSION,
+    CANONICAL_MOE_FOLD_VERSION,
     CANONICAL_MOE_PACKED_EP16_TRANSPORT_VERSION,
     CANONICAL_MOE_REDUCE_VERSION,
     CanonicalMoEGraphMetadata,
@@ -10,6 +11,7 @@ from .canonical_moe import (
     LocalMoEContribution,
     OutputDistribution,
     ParallelRole,
+    canonical_moe_fold_v1,
     canonical_moe_reduce_cp_sharded_v3,
     canonical_moe_reduce_packed_ep16_v2,
     canonical_moe_reduce_reference,

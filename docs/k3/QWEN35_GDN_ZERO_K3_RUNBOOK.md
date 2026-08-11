@@ -11,7 +11,9 @@ program in server training. Users do not assemble it from component flags.
 The resolver selects Class-B RoPE, RMSNorm-v2, exact GDN state handling,
 batch-invariant trunk and head programs, and the qualified attention program.
 The MoE model additionally selects deterministic routing, the serving-value
-expert forward, and the ordered EP8 combine.
+expert forward, and `canonical_moe_fold_v1`: logical contributor order followed
+by a BF16-rounded adjacent-pair tree. Raw EP8 transport does not perform the
+addition.
 
 On serving, `--rl-on-policy-target xorl` activates the paired program. The
 loader rejects incompatible topology, precision, attention, routing, cache,
@@ -30,3 +32,9 @@ replay of the retained token IDs and decision-time FP32 log-probability bytes.
 Every retained byte must match and K3 must be exactly zero. A model or runtime
 revision is not qualified solely because it descends from an earlier passing
 revision.
+
+Changing the contributor fold is a new numerical program. Checkpoints remain
+compatible, but rollout denominators from the former descending-chain program
+must not be replayed against this program. Sampler and trainer revisions must
+switch together between rollout generations, after draining old trajectories
+and flushing captured graphs and caches.

@@ -626,7 +626,7 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         routing_flat: torch.Tensor,
         local_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """LoRA-aware local partial for the native EP ordered-combine lane.
+        """LoRA-aware local partial for the native EP canonical-combine lane.
 
         The native combine enters through ``Module.__call__`` so FSDP
         materializes this rank's expert slice. Fold the active LoRA factors

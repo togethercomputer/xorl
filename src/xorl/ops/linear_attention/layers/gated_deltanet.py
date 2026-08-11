@@ -30,6 +30,7 @@ from xorl.ops.linear_attention.modules.bi_contract import (
     bi_fused_gdn_gating,
     gdn_contract,
 )
+from xorl.ops.linear_attention.ops.cp import all_gather_along_dim, scatter_along_dim
 from xorl.ops.linear_attention.ops.gated_delta_rule import (
     chunk_gated_delta_rule,
     fused_recurrent_gated_delta_rule,
@@ -274,6 +275,28 @@ class GatedDeltaNet(nn.Module):
                 )
             if mode != "chunk":
                 raise ValueError("Ulysses native FLA CP currently supports chunk mode only.")
+            if _is_gdn_contract_enabled():
+                if cp_context.group is None or cp_context.global_cu_seqlens is None:
+                    raise ValueError("Exact Qwen3.5 GDN CP requires the Ulysses group and global cu_seqlens metadata.")
+                # Native FLA CP is mathematically equivalent but changes the chunk/state
+                # association at shard boundaries.  The exact trainer-serving contract
+                # instead reconstructs the original packed sequence, executes precisely
+                # the same unsharded GDN program qualified by the DP lane, and returns
+                # this rank's contiguous sequence shard.  The paired autograd collectives
+                # reconstruct the full upstream gradient on every rank before slicing the
+                # local input gradient, so cross-shard recurrence dependencies are kept.
+                full_hidden_states = all_gather_along_dim(hidden_states, dim=1, group=cp_context.group)
+                full_output, _, past_key_values = self._forward_impl(
+                    full_hidden_states,
+                    attention_mask=None,
+                    past_key_values=past_key_values,
+                    use_cache=use_cache,
+                    output_attentions=False,
+                    cu_seqlens=cp_context.global_cu_seqlens,
+                    cp_context=None,
+                )
+                local_output = scatter_along_dim(full_output, dim=1, group=cp_context.group)
+                return local_output, None, past_key_values
             cu_seqlens = cp_context.cu_seqlens
         elif attention_mask is not None:
             indices, cu_seqlens, _ = get_unpad_data(attention_mask[:, -q_len:])
@@ -324,8 +347,6 @@ class GatedDeltaNet(nn.Module):
             raise RuntimeError("Exact Qwen3.5 GDN requires short convolution")
 
         if self.use_short_conv and _is_gdn_contract_enabled():
-            if cp_context is not None:
-                raise RuntimeError("Exact Qwen3.5 GDN does not support CP yet (conv prefix exchange)")
             if use_cache or last_state is not None:
                 raise RuntimeError(
                     "Exact Qwen3.5 trainer GDN supports packed prefill only, not recurrent cache updates"
@@ -338,6 +359,7 @@ class GatedDeltaNet(nn.Module):
                 self.k_conv1d,
                 self.v_conv1d,
                 cu_seqlens=cu_seqlens,
+                cp_context=cp_context,
             )
             conv_state_q = conv_state_k = conv_state_v = None
         elif self.use_short_conv:
