@@ -61,8 +61,7 @@ def contains_dsv4_exact_active_lora_component(module: object | None) -> bool:
     if not callable(iter_modules):
         return False
     return any(
-        bool(getattr(candidate, "_dsv4_flash_exact_active_lora_component", False))
-        for candidate in iter_modules()
+        bool(getattr(candidate, "_dsv4_flash_exact_active_lora_component", False)) for candidate in iter_modules()
     )
 
 

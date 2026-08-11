@@ -42,9 +42,7 @@ def main() -> None:
     result = {
         "rows": args.rows,
         "ids_byte_equal": torch.equal(ids.view(torch.uint8), expected_ids.view(torch.uint8)),
-        "weights_byte_equal": torch.equal(
-            weights.view(torch.uint8), expected_weights.view(torch.uint8)
-        ),
+        "weights_byte_equal": torch.equal(weights.view(torch.uint8), expected_weights.view(torch.uint8)),
         "max_weight_abs_diff": float((weights - expected_weights).abs().max()),
     }
     print(json.dumps(result, sort_keys=True))

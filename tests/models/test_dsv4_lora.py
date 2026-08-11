@@ -176,10 +176,7 @@ def test_moe_expert_lora_inject_freezes_base_and_adds_adapters():
         assert isinstance(layer.mlp.experts, MoEExpertsLoRA), (
             f"layer {layer.layer_id} experts not LoRA: {type(layer.mlp.experts).__name__}"
         )
-        assert (
-            layer.mlp.experts.expert_lora_semantics
-            == "dsv4_gate_only_clamped_swiglu_v1"
-        )
+        assert layer.mlp.experts.expert_lora_semantics == "dsv4_gate_only_clamped_swiglu_v1"
         assert layer.mlp.experts.swiglu_limit == 10.0
         # Base experts weights frozen; LoRA params trainable.
         assert layer.mlp.experts.gate_up_proj.requires_grad is False

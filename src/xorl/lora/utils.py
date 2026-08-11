@@ -113,10 +113,7 @@ def dsv4_expert_bank_export_key_and_tensor(
     if match is not None:
         prefix, projection, factor = match.groups()
         slot = _PROJ_TO_SGLANG_W[projection]
-        key = (
-            f"{_PEFT_BASE_MODEL_PREFIX}{prefix}.mlp.experts.{slot}."
-            f"lora_{factor}.weight"
-        )
+        key = f"{_PEFT_BASE_MODEL_PREFIX}{prefix}.mlp.experts.{slot}.lora_{factor}.weight"
         return key, tensor.transpose(-2, -1).contiguous()
 
     if "lm_head.lora_A" in name:
@@ -1045,8 +1042,7 @@ def save_lora_checkpoint(
         )
     if lora_export_format == "dsv4_expert_banks" and moe_hybrid_shared_lora:
         raise ValueError(
-            "lora_export_format='dsv4_expert_banks' requires per-expert A/B "
-            "factors (moe_hybrid_shared_lora=False)"
+            "lora_export_format='dsv4_expert_banks' requires per-expert A/B factors (moe_hybrid_shared_lora=False)"
         )
 
     os.makedirs(save_path, exist_ok=True)
@@ -1065,10 +1061,7 @@ def save_lora_checkpoint(
         inventory = getattr(model, "_dsv4_adapter_inventory", None)
         config = getattr(model, "config", None)
         if not getattr(config, "_dsv4_flash_exact_active_lora", False) or inventory is None:
-            raise ValueError(
-                "dsv4_expert_banks export requires a bound exact DSV4-Flash "
-                "active-LoRA model"
-            )
+            raise ValueError("dsv4_expert_banks export requires a bound exact DSV4-Flash active-LoRA model")
         expected = {factor.name: factor for factor in inventory.factors}
         missing = sorted(set(expected) - set(lora_state_dict))
         extra = sorted(set(lora_state_dict) - set(expected))
@@ -1083,9 +1076,7 @@ def save_lora_checkpoint(
             if tuple(lora_state_dict[name].shape) != spec.shape
         ]
         if mismatched:
-            raise ValueError(
-                "dsv4_expert_banks factor shape mismatch: " + ", ".join(mismatched[:8])
-            )
+            raise ValueError("dsv4_expert_banks factor shape mismatch: " + ", ".join(mismatched[:8]))
 
     def _prepare_lora_tensor(tensor: torch.Tensor) -> torch.Tensor:
         tensor = tensor.detach().cpu().contiguous()

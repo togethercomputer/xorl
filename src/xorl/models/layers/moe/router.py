@@ -304,26 +304,18 @@ class TopKRouter(nn.Module):
                     sorted=False,
                 ).indices
             else:
-                selected_experts = _topk_indices_with_policy(
-                    scores_for_routing, self.top_k, self.topk_policy
-                )
+                selected_experts = _topk_indices_with_policy(scores_for_routing, self.top_k, self.topk_policy)
 
         routing_weights = torch.gather(scores, dim=1, index=selected_experts)
         # V4 paths always renormalize.
         if self._exact_sqrtsoftplus_serving:
-            denominator = routing_weights.sum(
-                dim=-1, keepdim=True, dtype=torch.float32
-            )
+            denominator = routing_weights.sum(dim=-1, keepdim=True, dtype=torch.float32)
             routing_weights = routing_weights / (denominator + 1e-20)
         else:
-            routing_weights = routing_weights / (
-                routing_weights.sum(dim=-1, keepdim=True) + 1e-20
-            )
+            routing_weights = routing_weights / (routing_weights.sum(dim=-1, keepdim=True) + 1e-20)
         if self.routed_scaling_factor is not None:
             routing_weights = routing_weights * self.routed_scaling_factor
-        routing_weights = routing_weights.to(
-            torch.float32 if self._exact_sqrtsoftplus_serving else input_dtype
-        )
+        routing_weights = routing_weights.to(torch.float32 if self._exact_sqrtsoftplus_serving else input_dtype)
         return routing_weights, selected_experts
 
     @classmethod

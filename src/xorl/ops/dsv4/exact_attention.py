@@ -18,12 +18,8 @@ def _validate_dsv4_lora_metadata(tensor: Tensor, *, where: str) -> None:
     _validate_all_single_adapter_batch_infos(tensor.device.index, where=where)
 
 
-def _positions(
-    batch_size: int, sequence_length: int, device: torch.device, offset: int = 0
-) -> Tensor:
-    return torch.arange(
-        offset, offset + sequence_length, dtype=torch.int64, device=device
-    ).repeat(batch_size)
+def _positions(batch_size: int, sequence_length: int, device: torch.device, offset: int = 0) -> Tensor:
+    return torch.arange(offset, offset + sequence_length, dtype=torch.int64, device=device).repeat(batch_size)
 
 
 # Serving's SWA KV pool pages tokens in blocks of the sliding window (the
@@ -66,9 +62,7 @@ def _flashmla_page_bytes(page_size: int) -> int:
     return ((584 * page_size + 575) // 576) * 576
 
 
-def _ensure_paged_kvcache(
-    cache: Tensor | None, num_slots: int, page_size: int, device: torch.device
-) -> Tensor:
+def _ensure_paged_kvcache(cache: Tensor | None, num_slots: int, page_size: int, device: torch.device) -> Tensor:
     """Grow (never shrink) a paged FlashMLA FP8 cache to hold ``num_slots``.
 
     Pages are zero-filled like serving's pool allocation (``create_buffer``
@@ -100,9 +94,7 @@ def _window_indices_for_positions(positions: Tensor) -> Tensor:
 def _paged_cache_kernel_view(cache: Tensor, page_size: int) -> Tensor:
     """View a paged FP8 cache the way serving hands it to the decode kernel."""
 
-    return cache[:, : page_size * _SERVING_SLOT_BYTES].view(
-        cache.shape[0], page_size, 1, _SERVING_SLOT_BYTES
-    )
+    return cache[:, : page_size * _SERVING_SLOT_BYTES].view(cache.shape[0], page_size, 1, _SERVING_SLOT_BYTES)
 
 
 def _serving_decode_attention(
@@ -202,9 +194,7 @@ def _store_raw_kv_carry(
         )
     total_tokens = position_offset + sequence_length
     page_size = _SERVING_SWA_PAGE_SIZE
-    carry_state.kvcache = _ensure_paged_kvcache(
-        carry_state.kvcache, total_tokens, page_size, kv_input.device
-    )
+    carry_state.kvcache = _ensure_paged_kvcache(carry_state.kvcache, total_tokens, page_size, kv_input.device)
     positions = _positions(1, sequence_length, kv_input.device, offset=position_offset)
     fused_k_norm_rope_flashmla(
         kv=kv_input.contiguous().view(-1, kv_input.shape[-1]),
@@ -264,9 +254,7 @@ class _ExactQNormRope(torch.autograd.Function):
         return grad_q, None, None, None
 
 
-def exact_q_norm_rope(
-    q_input: Tensor, freqs_cis: Tensor, eps: float, position_offset: int = 0
-) -> Tensor:
+def exact_q_norm_rope(q_input: Tensor, freqs_cis: Tensor, eps: float, position_offset: int = 0) -> Tensor:
     """Run SGLang's literal fused Q RMSNorm+RoPE kernel with a trainer VJP."""
 
     batch_size, sequence_length = q_input.shape[:2]
@@ -394,9 +382,7 @@ def _serving_compressed_decode_step(
     )
 
     if x.shape[0] != 1 or x.shape[1] != 1 or x.shape[-1] != 4096 or ratio not in (4, 128):
-        raise RuntimeError(
-            "DSV4 exact compressor decode step admits one official hidden-size token"
-        )
+        raise RuntimeError("DSV4 exact compressor decode step admits one official hidden-size token")
     if carry_state.compressor_state is None:
         raise RuntimeError("DSV4 exact compressor decode step requires a seeded carry state")
     seq_len = carry_state.num_tokens
@@ -449,9 +435,9 @@ def _serving_compressed_decode_step(
     if carry_state.num_compressed == 0:
         return x.new_empty((0, 512))
     compressed_locs = torch.arange(carry_state.num_compressed, dtype=torch.int32, device=x.device)
-    output = dequantize_k_cache_paged(
-        carry_state.compressed_kvcache, compressed_locs, page_size
-    ).view(carry_state.num_compressed, 512)
+    output = dequantize_k_cache_paged(carry_state.compressed_kvcache, compressed_locs, page_size).view(
+        carry_state.num_compressed, 512
+    )
     _validate_dsv4_lora_metadata(x, where=f"C{ratio} compressor decode cache dequantize")
     return output
 
@@ -479,9 +465,7 @@ def _serving_compressed_kv(
     )
 
     if x.shape[0] != 1 or x.shape[-1] != 4096 or ratio not in (4, 128):
-        raise RuntimeError(
-            "DSV4 exact compressor admits one official hidden-size request and ratio 4 or 128"
-        )
+        raise RuntimeError("DSV4 exact compressor admits one official hidden-size request and ratio 4 or 128")
     sequence_length = x.shape[1]
     num_compressed = sequence_length // ratio
     if num_compressed == 0 and carry_state is None:
@@ -527,9 +511,7 @@ def _serving_compressed_kv(
     )
     _validate_dsv4_lora_metadata(x, where=f"C{ratio} compressor compress_forward")
     if compressed.shape[0] != num_compressed:
-        raise RuntimeError(
-            f"DSV4 compressor emitted {compressed.shape[0]} rows for {sequence_length=} {ratio=}"
-        )
+        raise RuntimeError(f"DSV4 compressor emitted {compressed.shape[0]} rows for {sequence_length=} {ratio=}")
 
     page_size = 256 // ratio
     if carry_state is not None:
@@ -576,21 +558,16 @@ def _hybrid_prefill_indices(sequence_length: int, ratio: int, device: torch.devi
         compressed_length = (position + 1) // ratio
         swa_length = min(position + 1, 128)
         if compressed_length:
-            indices[position, :compressed_length] = torch.arange(
-                compressed_length, dtype=torch.int32, device=device
-            )
+            indices[position, :compressed_length] = torch.arange(compressed_length, dtype=torch.int32, device=device)
         swa_start = position - swa_length + 1
-        indices[position, compressed_length : compressed_length + swa_length] = (
-            compressed_capacity
-            + torch.arange(swa_start, position + 1, dtype=torch.int32, device=device)
+        indices[position, compressed_length : compressed_length + swa_length] = compressed_capacity + torch.arange(
+            swa_start, position + 1, dtype=torch.int32, device=device
         )
         lengths[position] = compressed_length + swa_length
     return indices, lengths, compressed_capacity
 
 
-def _hybrid_indices_for_positions(
-    positions: Tensor, ratio: int, compressed_capacity: int
-) -> tuple[Tensor, Tensor]:
+def _hybrid_indices_for_positions(positions: Tensor, ratio: int, compressed_capacity: int) -> tuple[Tensor, Tensor]:
     """Serving hybrid ordering (complete compressed blocks, then the SWA window)
     for one query row per absolute position.
 
@@ -617,17 +594,12 @@ def _hybrid_indices_for_positions(
                 f"(indexer top-k); got {compressed_length} at position {position}"
             )
         if compressed_length + swa_length > width:
-            raise RuntimeError(
-                f"DSV4 exact hybrid index row overflow at position {position} for ratio {ratio}"
-            )
+            raise RuntimeError(f"DSV4 exact hybrid index row overflow at position {position} for ratio {ratio}")
         if compressed_length:
-            indices[row, :compressed_length] = torch.arange(
-                compressed_length, dtype=torch.int32, device=device
-            )
+            indices[row, :compressed_length] = torch.arange(compressed_length, dtype=torch.int32, device=device)
         swa_start = position - swa_length + 1
-        indices[row, compressed_length : compressed_length + swa_length] = (
-            compressed_capacity
-            + torch.arange(swa_start, position + 1, dtype=torch.int32, device=device)
+        indices[row, compressed_length : compressed_length + swa_length] = compressed_capacity + torch.arange(
+            swa_start, position + 1, dtype=torch.int32, device=device
         )
         lengths[row] = compressed_length + swa_length
     return indices, lengths
@@ -707,12 +679,8 @@ class _ExactC0Attention(torch.autograd.Function):
             # this segment's K entries to the carried FP8 cache and attend from
             # the segment's absolute positions over every carried row.
             if position_offset > 0 and q.shape[1] != 1:
-                raise RuntimeError(
-                    "DSV4 exact C0 decode-cache carry admits M=1 decode segments"
-                )
-            kv = _store_raw_kv_carry(
-                kv_input, kv_norm_weight, freqs_cis, eps, carry_state, position_offset
-            )
+                raise RuntimeError("DSV4 exact C0 decode-cache carry admits M=1 decode segments")
+            kv = _store_raw_kv_carry(kv_input, kv_norm_weight, freqs_cis, eps, carry_state, position_offset)
             sequence_length = q.shape[1]
             positions = _positions(1, sequence_length, q.device, offset=position_offset)
             if position_offset > 0:
@@ -742,9 +710,7 @@ class _ExactC0Attention(torch.autograd.Function):
             # Carried prefix rows are serving cache constants; only this
             # segment's Q/KV rows are differentiable.
             prefix = kv[:position_offset].detach()
-            ctx.save_for_backward(
-                q, kv_input, kv_norm_weight, attn_sink, freqs_cis, positions, prefix
-            )
+            ctx.save_for_backward(q, kv_input, kv_norm_weight, attn_sink, freqs_cis, positions, prefix)
             ctx.eps = eps
             ctx.softmax_scale = softmax_scale
             ctx.carry_offset = position_offset
@@ -898,9 +864,7 @@ class _ExactHybridAttention(torch.autograd.Function):
         position_offset: int = 0,
     ) -> Tensor:
         if q.shape[0] != 1 or q.shape[1] > 128:
-            raise RuntimeError(
-                "DSV4 exact compressed attention currently admits one request with at most 128 tokens"
-            )
+            raise RuntimeError("DSV4 exact compressed attention currently admits one request with at most 128 tokens")
         if q.dtype != torch.bfloat16 or kv_input.dtype != torch.bfloat16 or x.dtype != torch.bfloat16:
             raise RuntimeError("DSV4 exact compressed attention requires BF16 activations")
         if ratio not in (4, 128):
@@ -912,12 +876,8 @@ class _ExactHybridAttention(torch.autograd.Function):
         _validate_dsv4_lora_metadata(q, where=f"C{ratio} hybrid attention entry")
         if carry_state is not None:
             if position_offset > 0 and sequence_length != 1:
-                raise RuntimeError(
-                    "DSV4 exact compressed decode-cache carry admits M=1 decode segments"
-                )
-            vanilla = _store_raw_kv_carry(
-                kv_input, kv_norm_weight, freqs_cis, eps, carry_state, position_offset
-            )
+                raise RuntimeError("DSV4 exact compressed decode-cache carry admits M=1 decode segments")
+            vanilla = _store_raw_kv_carry(kv_input, kv_norm_weight, freqs_cis, eps, carry_state, position_offset)
             total_tokens = carry_state.num_tokens
             if position_offset == 0:
                 compressed = _serving_compressed_kv(
@@ -945,8 +905,7 @@ class _ExactHybridAttention(torch.autograd.Function):
                 )
             if carry_state.num_compressed != total_tokens // ratio:
                 raise RuntimeError(
-                    "DSV4 exact compressed carry lost a block: "
-                    f"{carry_state.num_compressed} != {total_tokens // ratio}"
+                    f"DSV4 exact compressed carry lost a block: {carry_state.num_compressed} != {total_tokens // ratio}"
                 )
             _validate_dsv4_lora_metadata(q, where=f"C{ratio} hybrid KV assembly")
             compressed_capacity = max(total_tokens // ratio, 1)
@@ -954,9 +913,7 @@ class _ExactHybridAttention(torch.autograd.Function):
             indices, lengths = _hybrid_indices_for_positions(positions, ratio, compressed_capacity)
         else:
             if position_offset != 0:
-                raise RuntimeError(
-                    "DSV4 exact compressed attention requires a carry state for offset segments"
-                )
+                raise RuntimeError("DSV4 exact compressed attention requires a carry state for offset segments")
             vanilla = _native_swa_kv(kv_input, kv_norm_weight, freqs_cis, eps)[0]
             compressed = _serving_compressed_kv(
                 x,
@@ -969,9 +926,7 @@ class _ExactHybridAttention(torch.autograd.Function):
                 ratio,
             )
             _validate_dsv4_lora_metadata(q, where=f"C{ratio} hybrid KV assembly")
-            indices, lengths, compressed_capacity = _hybrid_prefill_indices(
-                sequence_length, ratio, q.device
-            )
+            indices, lengths, compressed_capacity = _hybrid_prefill_indices(sequence_length, ratio, q.device)
         if compressed.shape[0] < compressed_capacity:
             compressed = torch.cat(
                 (
@@ -1059,18 +1014,12 @@ class _ExactHybridAttention(torch.autograd.Function):
                 positions,
                 kv_constant,
             ) = ctx.saved_tensors
-            indices, _ = _hybrid_indices_for_positions(
-                positions, ctx.ratio, ctx.compressed_capacity
-            )
+            indices, _ = _hybrid_indices_for_positions(positions, ctx.ratio, ctx.compressed_capacity)
             with torch.enable_grad():
                 q = q_saved.detach().requires_grad_(True)
                 kv_input = kv_saved.detach().requires_grad_(True)
-                kv_segment = _kv_norm_rope_torch(
-                    kv_input, kv_norm_weight, freqs_cis, positions, ctx.eps
-                )
-                kv = torch.cat(
-                    (kv_constant.to(kv_segment.dtype).unsqueeze(0), kv_segment), dim=1
-                )
+                kv_segment = _kv_norm_rope_torch(kv_input, kv_norm_weight, freqs_cis, positions, ctx.eps)
+                kv = torch.cat((kv_constant.to(kv_segment.dtype).unsqueeze(0), kv_segment), dim=1)
                 surrogate = sparse_attn_torch(
                     q,
                     kv,
@@ -1118,9 +1067,7 @@ class _ExactHybridAttention(torch.autograd.Function):
         ) = ctx.saved_tensors
         sequence_length = q_saved.shape[1]
         positions = _positions(1, sequence_length, q_saved.device)
-        indices, _, compressed_capacity = _hybrid_prefill_indices(
-            sequence_length, ctx.ratio, q_saved.device
-        )
+        indices, _, compressed_capacity = _hybrid_prefill_indices(sequence_length, ctx.ratio, q_saved.device)
         with torch.enable_grad():
             q = q_saved.detach().requires_grad_(True)
             kv_input = kv_saved.detach().requires_grad_(True)

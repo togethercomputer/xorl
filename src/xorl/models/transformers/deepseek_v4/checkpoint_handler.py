@@ -700,9 +700,7 @@ class DeepseekV4CheckpointHandler(CheckpointHandler):
         # safetensors shards.
         self.pending: dict[str, dict[str, torch.Tensor]] = {}
         self.expert_buf: dict[int, dict[str, dict[int, torch.Tensor]]] = {}
-        self.native_expert_buf: dict[
-            int, dict[str, dict[int, tuple[torch.Tensor, torch.Tensor]]]
-        ] = {}
+        self.native_expert_buf: dict[int, dict[str, dict[int, tuple[torch.Tensor, torch.Tensor]]]] = {}
 
     def _scale_name_for(self, weight_name: str) -> str | None:
         if weight_name.endswith(".weight"):
@@ -743,16 +741,13 @@ class DeepseekV4CheckpointHandler(CheckpointHandler):
             native_ws = self.native_expert_buf.get(layer_idx)
             expected = self.local_num_experts
             if native_ws is None or not all(
-                len(native_ws.get(projection, {})) == expected
-                for projection in ("w1", "w2", "w3")
+                len(native_ws.get(projection, {})) == expected for projection in ("w1", "w2", "w3")
             ):
                 return []
             native_ws = self.native_expert_buf.pop(layer_idx)
             fused_native = _fuse_native_mxfp4_bank(native_ws, expected)
             if fused_native is None:
-                raise RuntimeError(
-                    f"Exact DSV4 layer {layer_idx} produced no native MXFP4 expert payload"
-                )
+                raise RuntimeError(f"Exact DSV4 layer {layer_idx} produced no native MXFP4 expert payload")
             prefix = f"model.layers.{layer_idx}.mlp.experts.native_mxfp4_payload"
             self.summary.native_mxfp4_banks += 1
             return _native_mxfp4_payload_results(prefix, fused_native)
@@ -899,8 +894,7 @@ class DeepseekV4CheckpointHandler(CheckpointHandler):
             warnings.warn(f"Incomplete DSv4 expert weights after loading: {pending_experts}")
         if self.native_expert_buf:
             raise RuntimeError(
-                "Incomplete exact DSV4 native MXFP4 expert payloads after loading: "
-                f"{sorted(self.native_expert_buf)}"
+                f"Incomplete exact DSV4 native MXFP4 expert payloads after loading: {sorted(self.native_expert_buf)}"
             )
         return []
 

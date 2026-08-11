@@ -78,9 +78,7 @@ def unpack_expert_rows_from_float32(
     if torch.empty((), dtype=dtype).element_size() != 1:
         raise ValueError(f"DSV4 expert payload dtype must occupy one byte, got {dtype}")
     if tuple(packed.shape[:-1]) != shape[:-1]:
-        raise ValueError(
-            f"DSV4 expert payload prefix shape mismatch: {tuple(packed.shape[:-1])} != {shape[:-1]}"
-        )
+        raise ValueError(f"DSV4 expert payload prefix shape mismatch: {tuple(packed.shape[:-1])} != {shape[:-1]}")
     raw = packed.contiguous().view(torch.uint8)[..., : shape[-1]]
     return raw.contiguous().view(dtype).reshape(shape)
 
@@ -308,17 +306,14 @@ def _validate_single_adapter_batch_info(batch_info, rows: int, *, where: str) ->
     }
     if observed != expected:
         raise RuntimeError(
-            f"Exact DSV4 cached LoRA metadata was corrupted before {where}: "
-            f"expected={expected} observed={observed}"
+            f"Exact DSV4 cached LoRA metadata was corrupted before {where}: expected={expected} observed={observed}"
         )
 
 
 def _validate_all_single_adapter_batch_infos(device_index: int, *, where: str) -> None:
     """Validate every diagnostic LoRA metadata allocation on one device."""
 
-    for (cached_device_index, rows), batch_info in tuple(
-        _DIAGNOSTIC_SINGLE_ADAPTER_BATCH_INFOS.items()
-    ):
+    for (cached_device_index, rows), batch_info in tuple(_DIAGNOSTIC_SINGLE_ADAPTER_BATCH_INFOS.items()):
         if cached_device_index == device_index:
             _validate_single_adapter_batch_info(
                 batch_info,
@@ -414,9 +409,10 @@ def _native_grouped_wo_a_value(
     # serving-value compute view while the FSDP payload is gathered.
     scale_rows, scale_cols = payload.scale_shape
     weight_bf16 = (
-        weight.float().view(scale_rows, 128, scale_cols, 128)
-        * scales.float().view(scale_rows, 1, scale_cols, 1)
-    ).reshape(payload.out_features, payload.in_features).to(torch.bfloat16)
+        (weight.float().view(scale_rows, 128, scale_cols, 128) * scales.float().view(scale_rows, 1, scale_cols, 1))
+        .reshape(payload.out_features, payload.in_features)
+        .to(torch.bfloat16)
+    )
     return torch.einsum(
         "tgd,grd->tgr",
         input,
@@ -554,29 +550,37 @@ class Dsv4NativeMxfp4ExpertPayload(nn.Module):
         self.w2_scale_shape = (num_experts, hidden_size, intermediate_size // 32)
         self.packed_w13_weight_f32 = nn.Parameter(
             torch.empty(
-                *self.w13_shape[:-1], math.ceil(self.w13_shape[-1] / 4),
-                dtype=torch.float32, device=device,
+                *self.w13_shape[:-1],
+                math.ceil(self.w13_shape[-1] / 4),
+                dtype=torch.float32,
+                device=device,
             ),
             requires_grad=False,
         )
         self.packed_w2_weight_f32 = nn.Parameter(
             torch.empty(
-                *self.w2_shape[:-1], math.ceil(self.w2_shape[-1] / 4),
-                dtype=torch.float32, device=device,
+                *self.w2_shape[:-1],
+                math.ceil(self.w2_shape[-1] / 4),
+                dtype=torch.float32,
+                device=device,
             ),
             requires_grad=False,
         )
         self.packed_w13_scale_f32 = nn.Parameter(
             torch.empty(
-                *self.w13_scale_shape[:-1], math.ceil(self.w13_scale_shape[-1] / 4),
-                dtype=torch.float32, device=device,
+                *self.w13_scale_shape[:-1],
+                math.ceil(self.w13_scale_shape[-1] / 4),
+                dtype=torch.float32,
+                device=device,
             ),
             requires_grad=False,
         )
         self.packed_w2_scale_f32 = nn.Parameter(
             torch.empty(
-                *self.w2_scale_shape[:-1], math.ceil(self.w2_scale_shape[-1] / 4),
-                dtype=torch.float32, device=device,
+                *self.w2_scale_shape[:-1],
+                math.ceil(self.w2_scale_shape[-1] / 4),
+                dtype=torch.float32,
+                device=device,
             ),
             requires_grad=False,
         )
@@ -713,10 +717,7 @@ def _dsv4_marlin_quant_info(
         payload.packed_w13_scale_f32,
         payload.packed_w2_scale_f32,
     )
-    key = tuple(
-        (parameter._version, tuple(parameter.shape), parameter.dtype)
-        for parameter in source_parameters
-    )
+    key = tuple((parameter._version, tuple(parameter.shape), parameter.dtype) for parameter in source_parameters)
     cache = payload.__dict__.get("_marlin_repacked_cache")
     if cache is None or cache["key"] != key:
         w13, s13 = _prepare_mxfp4_marlin_bank(
@@ -926,9 +927,7 @@ def _dsv4_native_mxfp4_forward(
             torch.cuda.synchronize(hidden_states.device)
         except RuntimeError as exc:
             layer_idx = getattr(payload, "layer_idx", "unknown")
-            raise RuntimeError(
-                f"Diagnostic DSV4 base Marlin failed after layer {layer_idx}"
-            ) from exc
+            raise RuntimeError(f"Diagnostic DSV4 base Marlin failed after layer {layer_idx}") from exc
         _validate_all_single_adapter_batch_infos(
             hidden_states.device.index,
             where=f"base Marlin layer {getattr(payload, 'layer_idx', 'unknown')}",
@@ -1384,9 +1383,7 @@ class _Dsv4NativeSharedTpFunction(torch.autograd.Function):
         with torch.enable_grad():
             x = input.detach().requires_grad_(need_x)
             effective = [
-                (master.detach() if lora_live else torch.zeros_like(master))
-                .to(torch.bfloat16)
-                .requires_grad_(needed)
+                (master.detach() if lora_live else torch.zeros_like(master)).to(torch.bfloat16).requires_grad_(needed)
                 for master, needed in zip(masters, factor_targets)
             ]
             gate_weight = _dequantize_native_block_fp8_for_backward(module.gate_proj.native_base_payload)[start:end]

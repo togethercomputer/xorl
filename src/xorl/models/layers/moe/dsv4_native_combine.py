@@ -104,13 +104,9 @@ def compact_rank_padded_rows(
         raise ValueError(f"Invalid compact-row geometry: padded_rows={padded_rows}, row_counts={row_counts}")
     expected_rows = len(row_counts) * padded_rows
     if gathered.shape[0] != expected_rows:
-        raise ValueError(
-            f"Gathered row count {gathered.shape[0]} does not match {len(row_counts)}*{padded_rows}"
-        )
+        raise ValueError(f"Gathered row count {gathered.shape[0]} does not match {len(row_counts)}*{padded_rows}")
     pieces = [
-        gathered[rank * padded_rows : rank * padded_rows + count]
-        for rank, count in enumerate(row_counts)
-        if count
+        gathered[rank * padded_rows : rank * padded_rows + count] for rank, count in enumerate(row_counts) if count
     ]
     if pieces:
         return torch.cat(pieces, dim=0)

@@ -238,9 +238,7 @@ def test_sqrtsoftplus_noaux_requires_bias():
 
 
 def test_exact_sqrtsoftplus_matches_serving_slot_and_dtype_contract(monkeypatch):
-    logits = torch.tensor(
-        [[-2.0, 0.5, 1.0, 3.0]], dtype=torch.bfloat16
-    )
+    logits = torch.tensor([[-2.0, 0.5, 1.0, 3.0]], dtype=torch.bfloat16)
     bias = torch.zeros(4, dtype=torch.float32)
     real_topk = torch.topk
     sorted_arguments = []
@@ -272,9 +270,7 @@ def test_exact_sqrtsoftplus_matches_serving_slot_and_dtype_contract(monkeypatch)
 
     scores = F.softplus(logits.float()).sqrt().to(torch.bfloat16)
     expected = scores.gather(1, experts)
-    expected = expected / (
-        expected.sum(dim=-1, keepdim=True, dtype=torch.float32) + 1e-20
-    )
+    expected = expected / (expected.sum(dim=-1, keepdim=True, dtype=torch.float32) + 1e-20)
     assert sorted_arguments == [False]
     assert weights.dtype is torch.float32
     torch.testing.assert_close(weights, expected)

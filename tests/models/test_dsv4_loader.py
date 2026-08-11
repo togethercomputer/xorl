@@ -472,7 +472,6 @@ def test_strict_load_ignores_nonpersistent_rope_buffers():
 def test_end_to_end_synthetic_load_with_c4_layer():
     """C4 layer load exercises the indexer mapping + APE hotfix path."""
     from xorl.models.transformers.deepseek_v4 import DeepseekV4ForCausalLM, load_hf_state_dict_into_model
-    from xorl.models.transformers.deepseek_v4.checkpoint_handler import _undo_ape_hotfix
 
     cfg = _tiny_config(compress_ratios=[0, 4])
     model = DeepseekV4ForCausalLM(cfg, moe_implementation="eager").to(torch.float32)

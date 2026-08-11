@@ -369,9 +369,7 @@ def test_dsv4_expert_bank_export_maps_routed_banks_in_sglang_orientation(name, e
 def test_dsv4_expert_bank_export_maps_dense_and_lm_head_keys():
     tensor = torch.arange(8, dtype=torch.float32).reshape(2, 4)
 
-    dense_key, dense = dsv4_expert_bank_export_key_and_tensor(
-        "model.layers.2.self_attn.wq_a.lora_A", tensor
-    )
+    dense_key, dense = dsv4_expert_bank_export_key_and_tensor("model.layers.2.self_attn.wq_a.lora_A", tensor)
     head_key, head = dsv4_expert_bank_export_key_and_tensor("lm_head.lora_B", tensor)
 
     assert dense_key == "base_model.model.model.layers.2.self_attn.wq_a.lora_A.weight"

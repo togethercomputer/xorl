@@ -151,10 +151,7 @@ def main() -> int:
     output_ids = [int(token) for token in capture["output_ids"]]
     if args.max_decisions is not None:
         if not 1 <= args.max_decisions <= len(output_ids):
-            parser.error(
-                f"--max-decisions must be between 1 and {len(output_ids)}, "
-                f"got {args.max_decisions}"
-            )
+            parser.error(f"--max-decisions must be between 1 and {len(output_ids)}, got {args.max_decisions}")
         output_ids = output_ids[: args.max_decisions]
     full_ids = prompt_ids + output_ids
     input_ids = full_ids[:-1]
@@ -183,9 +180,7 @@ def main() -> int:
 
     decision_bytes = len(output_ids) * 4
     decode = base64.b64decode(capture["decode_selected_logprobs_b64"])[:decision_bytes]
-    teacher_forced = base64.b64decode(capture["teacher_forced_selected_logprobs_b64"])[
-        :decision_bytes
-    ]
+    teacher_forced = base64.b64decode(capture["teacher_forced_selected_logprobs_b64"])[:decision_bytes]
     trainer_equal = all(buffer == trainer_buffers[0] for buffer in trainer_buffers[1:])
     repo = Path(__file__).resolve().parents[1]
     artifact = {

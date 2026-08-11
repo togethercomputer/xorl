@@ -37,9 +37,7 @@ def test_variable_exchange_uses_nccl_tree_contributor_order(monkeypatch):
     import xorl.distributed.moe.comm as comm  # noqa: PLC0415
     import xorl.models.layers.moe.dsv4_native_combine as combine_module  # noqa: PLC0415
 
-    monkeypatch.setattr(
-        combine_module, "validate_dsv4_native_ep_combine_size", lambda ep_size: None
-    )
+    monkeypatch.setattr(combine_module, "validate_dsv4_native_ep_combine_size", lambda ep_size: None)
     monkeypatch.setattr(
         combine_module,
         "dsv4_nccl_tree_chain_order",

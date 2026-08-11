@@ -711,8 +711,7 @@ class LoRAAdapterManager:
             id(module.lora_A)
             for module in self.model.modules()
             if (
-                getattr(module, "_glm52_exact_tp16_lm_head", False)
-                or getattr(module, "_dsv4_exact_tp8_lm_head", False)
+                getattr(module, "_glm52_exact_tp16_lm_head", False) or getattr(module, "_dsv4_exact_tp8_lm_head", False)
             )
             and getattr(module, "lora_A", None) is not None
         }
@@ -990,9 +989,7 @@ class LoRAAdapterManager:
             param = current[name]
             raw = _parameter_layout_tensor(param)
             layout = state.tensor_layouts[name]
-            layout_was_dtensor = bool(
-                layout.placement_signature and layout.placement_signature[0] == "dtensor"
-            )
+            layout_was_dtensor = bool(layout.placement_signature and layout.placement_signature[0] == "dtensor")
             if id(param) != expected_id:
                 if not layout_was_dtensor:
                     raise RuntimeError(f"LoRA parameter identity changed after layout discovery: {name}")
@@ -1013,8 +1010,7 @@ class LoRAAdapterManager:
             if _HAS_DTENSOR and isinstance(raw, DTensor):
                 mesh_names = tuple(getattr(raw.device_mesh, "mesh_dim_names", ()) or ())
                 placements = tuple(
-                    type(placement).__name__ + ":" + str(getattr(placement, "dim", ""))
-                    for placement in raw.placements
+                    type(placement).__name__ + ":" + str(getattr(placement, "dim", "")) for placement in raw.placements
                 )
                 placement_signature = ("dtensor", mesh_names, placements, layout.is_ep_owned)
                 if placement_signature != layout.placement_signature:
@@ -1546,8 +1542,7 @@ class LoRAAdapterManager:
                 # SGLang disambiguates the physical query-B target with its
                 # parent path; XoRL's logical runtime inventory names it wq_b.
                 actual_target_modules = sorted(
-                    "wq_b" if module == "self_attn.wq_b" else module
-                    for module in actual_target_modules
+                    "wq_b" if module == "self_attn.wq_b" else module for module in actual_target_modules
                 )
             expected_target_modules = self._expected_target_modules()
             if actual_target_modules != expected_target_modules:

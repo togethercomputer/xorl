@@ -382,9 +382,7 @@ class DeepSeekV4Attention(nn.Module):
         carry_state = None
         if carry_offset is not None:
             if self.cp_size != 1 or bsz != 1:
-                raise RuntimeError(
-                    "DSV4 exact decode-cache carry admits one request without context parallelism"
-                )
+                raise RuntimeError("DSV4 exact decode-cache carry admits one request without context parallelism")
             carry_state = self.__dict__.get("_dsv4_decode_state")
             if carry_state is None:
                 from xorl.ops.dsv4.exact_attention import Dsv4DecodeCarryState  # noqa: PLC0415
@@ -408,9 +406,7 @@ class DeepSeekV4Attention(nn.Module):
             # rmsnorm differs by one BF16 ulp at rounding boundaries
             # (layer-4 q_norm, 2026-08-11 base ruler). Forward is the serving
             # kernel bytes; backward is the trainer-owned surrogate VJP.
-            q_lora = _ExactBatchInvariantRmsNorm.apply(
-                q_lora_pre_norm, self.q_norm.weight, self.eps
-            )
+            q_lora = _ExactBatchInvariantRmsNorm.apply(q_lora_pre_norm, self.q_norm.weight, self.eps)
         else:
             q_lora = self.q_norm(q_lora_pre_norm)  # [B, S, q_lora_rank]
         self._capture_diagnostic_component("q_post_qk_norm", q_lora)
@@ -1596,8 +1592,7 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
             # rank-local count to the variable-row MoE exchange.
             if h3d.shape[0] != 1:
                 raise RuntimeError(
-                    "Exact DSV4 packed-row compaction admits one request per rank; "
-                    f"got batch={h3d.shape[0]}"
+                    f"Exact DSV4 packed-row compaction admits one request per rank; got batch={h3d.shape[0]}"
                 )
             compute_rows = torch.tensor([live_token_count], dtype=torch.int64, device=h3d.device)
             if dist.is_available() and dist.is_initialized():

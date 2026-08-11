@@ -1854,8 +1854,7 @@ class ModelRunner:
         """Return a module that owns the loss projection, when one is required."""
 
         if lm_head is not None and (
-            getattr(lm_head, "_glm52_exact_tp16_lm_head", False)
-            or getattr(lm_head, "_dsv4_exact_tp8_lm_head", False)
+            getattr(lm_head, "_glm52_exact_tp16_lm_head", False) or getattr(lm_head, "_dsv4_exact_tp8_lm_head", False)
         ):
             return lm_head
         return ModelRunner._get_fp8_lm_head_module(lm_head)
@@ -5524,9 +5523,7 @@ class ModelRunner:
 
         first_valid = int(bounds[0].item())
         last_valid = -int(bounds[1].item())
-        dsv4_exact_decode_carry = bool(
-            getattr(getattr(self.model, "config", None), "_dsv4_flash_exact_mode", False)
-        )
+        dsv4_exact_decode_carry = bool(getattr(getattr(self.model, "config", None), "_dsv4_flash_exact_mode", False))
         # DSV4 exact mode replays each decode decision exactly as serving does:
         # an M=1 segment over carried per-layer attention state (paged FP8
         # raw/compressed key caches + compressor kv-score ring), seeded by the

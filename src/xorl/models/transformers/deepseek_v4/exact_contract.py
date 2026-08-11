@@ -18,9 +18,7 @@ import torch
 
 DSV4_FLASH_NON_ROUTED_LOGICAL_PROJECTION_COUNT = 345
 DSV4_FLASH_ROUTED_BANK_COUNT = 43
-DSV4_FLASH_TARGET_ENTITY_COUNT = (
-    DSV4_FLASH_NON_ROUTED_LOGICAL_PROJECTION_COUNT + DSV4_FLASH_ROUTED_BANK_COUNT
-)
+DSV4_FLASH_TARGET_ENTITY_COUNT = DSV4_FLASH_NON_ROUTED_LOGICAL_PROJECTION_COUNT + DSV4_FLASH_ROUTED_BANK_COUNT
 DSV4_FLASH_LOGICAL_FACTOR_COUNT = 948
 DSV4_FLASH_REQUIRED_TARGET_MODULES = frozenset(
     {
@@ -162,10 +160,7 @@ DSV4_FLASH_RCA_TRAINING_TOPOLOGY = Dsv4FlashTrainingTopology(
 
 def is_dsv4_flash_config(config: Any) -> bool:
     architectures = set(getattr(config, "architectures", None) or ())
-    return (
-        getattr(config, "model_type", None) == "deepseek_v4"
-        and "DeepseekV4ForCausalLM" in architectures
-    )
+    return getattr(config, "model_type", None) == "deepseek_v4" and "DeepseekV4ForCausalLM" in architectures
 
 
 def _validate_mapping(actual: Any, expected: dict[str, Any], *, label: str) -> list[str]:
@@ -268,8 +263,7 @@ def validate_dsv4_flash_official_geometry(config: Any) -> None:
     )
     if mismatches:
         raise ValueError(
-            "The exact DeepSeek-V4-Flash program supports only the official model geometry: "
-            + ", ".join(mismatches)
+            "The exact DeepSeek-V4-Flash program supports only the official model geometry: " + ", ".join(mismatches)
         )
 
 
@@ -465,8 +459,7 @@ def build_dsv4_flash_adapter_inventory(
     routed_count = sum(target.kind == "native_mxfp4_routed_bank" for target in inventory.targets)
     if routed_count != DSV4_FLASH_ROUTED_BANK_COUNT:
         raise AssertionError(
-            f"Internal DSV4 routed-bank inventory error: expected {DSV4_FLASH_ROUTED_BANK_COUNT}, "
-            f"got {routed_count}"
+            f"Internal DSV4 routed-bank inventory error: expected {DSV4_FLASH_ROUTED_BANK_COUNT}, got {routed_count}"
         )
     non_routed_count = len(inventory.targets) - routed_count
     if non_routed_count != DSV4_FLASH_NON_ROUTED_LOGICAL_PROJECTION_COUNT:
@@ -491,11 +484,7 @@ def bind_dsv4_flash_adapter_inventory(model: Any) -> Dsv4FlashAdapterInventory:
 
     inventory = build_dsv4_flash_adapter_inventory(model.config)
     expected = {factor.name: factor for factor in inventory.factors}
-    actual = {
-        name: parameter
-        for name, parameter in model.named_parameters()
-        if "lora_A" in name or "lora_B" in name
-    }
+    actual = {name: parameter for name, parameter in model.named_parameters() if "lora_A" in name or "lora_B" in name}
     missing = sorted(set(expected) - set(actual))
     extra = sorted(set(actual) - set(expected))
     if missing or extra:
@@ -507,19 +496,14 @@ def bind_dsv4_flash_adapter_inventory(model: Any) -> Dsv4FlashAdapterInventory:
     for name, spec in expected.items():
         parameter = actual[name]
         if tuple(parameter.shape) != spec.shape:
-            mismatches.append(
-                f"{name} shape={tuple(parameter.shape)} (requires {spec.shape})"
-            )
+            mismatches.append(f"{name} shape={tuple(parameter.shape)} (requires {spec.shape})")
         if parameter.dtype is not spec.dtype:
-            mismatches.append(
-                f"{name} dtype={parameter.dtype} (requires {spec.dtype})"
-            )
+            mismatches.append(f"{name} dtype={parameter.dtype} (requires {spec.dtype})")
         if not parameter.requires_grad:
             mismatches.append(f"{name} is frozen")
     if mismatches:
         raise RuntimeError(
-            "The live DSV4-Flash adapter violates its FP32 trainable-factor "
-            "contract: " + ", ".join(mismatches[:16])
+            "The live DSV4-Flash adapter violates its FP32 trainable-factor contract: " + ", ".join(mismatches[:16])
         )
     model._dsv4_adapter_inventory = inventory
     model._dsv4_flash_exact_active_lora_component = True

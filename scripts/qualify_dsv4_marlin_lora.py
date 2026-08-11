@@ -199,10 +199,7 @@ def qualify(
                 captured = captured["model.layers.0.router_selected_experts"]
             captured = captured.to(torch.int64)
             if captured.ndim != 2 or captured.shape[1] != top_k:
-                raise ValueError(
-                    "captured selected experts must have shape [tokens, 6], got "
-                    f"{tuple(captured.shape)}"
-                )
+                raise ValueError(f"captured selected experts must have shape [tokens, 6], got {tuple(captured.shape)}")
             if captured.shape[0] > tokens:
                 captured = captured[:tokens]
             local_start = ep_rank * experts
@@ -345,9 +342,7 @@ def qualify(
         },
         "ep": ep,
         "hot_experts": hot_experts,
-        "selected_experts_path": (
-            str(selected_experts_path) if selected_experts_path is not None else None
-        ),
+        "selected_experts_path": (str(selected_experts_path) if selected_experts_path is not None else None),
         "ep_rank": ep_rank,
         "force_block_size_m": force_block_size_m,
         "base_zero_byte_equal": equal,

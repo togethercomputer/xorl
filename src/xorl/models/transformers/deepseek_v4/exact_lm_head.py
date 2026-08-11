@@ -104,9 +104,7 @@ def _rank_order_variable_row_all_gather(
     )
     dist.all_gather_into_tensor(gathered, value, group=group)
     pieces = [
-        gathered[rank * padded_rows : rank * padded_rows + count]
-        for rank, count in enumerate(row_counts)
-        if count
+        gathered[rank * padded_rows : rank * padded_rows + count] for rank, count in enumerate(row_counts) if count
     ]
     return torch.cat(pieces, dim=0) if pieces else gathered[:0]
 
@@ -121,8 +119,10 @@ def _rank_order_vocab_all_gather(local_logits: Tensor, group: dist.ProcessGroup)
         device=local_logits.device,
     )
     dist.all_gather_into_tensor(gathered, local_logits, group=group)
-    return gathered.view(DSV4_LM_HEAD_TP_SIZE, rows, DSV4_LM_HEAD_LOCAL_VOCAB_SIZE).permute(1, 0, 2).reshape(
-        rows, DSV4_LM_HEAD_VOCAB_SIZE
+    return (
+        gathered.view(DSV4_LM_HEAD_TP_SIZE, rows, DSV4_LM_HEAD_LOCAL_VOCAB_SIZE)
+        .permute(1, 0, 2)
+        .reshape(rows, DSV4_LM_HEAD_VOCAB_SIZE)
     )
 
 
@@ -381,9 +381,13 @@ class Dsv4ExactTP8LmHeadSelectedLogprob(nn.Module):
         group = self._validate_tp_group()
         with torch.no_grad():
             local_reference = (
-                F.linear(hidden, local_weight)
-                + F.linear(F.linear(hidden.float(), effective_a.float()), effective_b.float()).to(torch.bfloat16)
-            ).float().contiguous()
+                (
+                    F.linear(hidden, local_weight)
+                    + F.linear(F.linear(hidden.float(), effective_a.float()), effective_b.float()).to(torch.bfloat16)
+                )
+                .float()
+                .contiguous()
+            )
             full_reference = _rank_order_vocab_all_gather(local_reference.to(torch.bfloat16), group).float()
         full_grad = _selected_logprob_reference_grad(full_reference, token_ids, grad_logprob)
         local_grad = full_grad[:, self.shard.vocab_start : self.shard.vocab_end].contiguous()
