@@ -999,6 +999,13 @@ class DeepseekV4MoE(MoEBlock):
         )
         self._capture_diagnostic_component("moe_native_gathered_routing", router_logits)
         self._capture_diagnostic_component("moe_native_local_ids", selected_experts)
+        # Serving applies active-LoRA factors only on the rank whose scheduler
+        # owns the lora-bearing rows (SGLang's per-scheduler ``lora_active``
+        # gate); the exact lane pins every request to DP rank 0
+        # (DSV4_FLASH_EXACT_ROUTED_DP_RANK), so ranks 1..7 contribute
+        # base-only EP/TP partials over the gathered rows.  Byte-verified
+        # against the per-rank serving dumps (layer 0, all 8 ranks).
+        adapter_partial_live = ep_rank == 0
         # Enter through Module.__call__ so the independently wrapped expert
         # FSDP unit materializes its native payload and LoRA factors before
         # the Marlin runner receives their pointers.
@@ -1007,6 +1014,7 @@ class DeepseekV4MoE(MoEBlock):
             routing_weights,
             selected_experts,
             dsv4_exact_native=True,
+            dsv4_exact_lora_live=adapter_partial_live,
         )
         validate_lora_metadata("routed expert return")
         self._capture_diagnostic_component("moe_native_routed", routed)
@@ -1018,6 +1026,7 @@ class DeepseekV4MoE(MoEBlock):
             tp_rank=ep_rank,
             tp_size=ep_size,
             diagnostic_capture=self._capture_diagnostic_component,
+            lora_live=adapter_partial_live,
         )
         validate_lora_metadata("shared expert return")
         local_partial = dsv4_join_routed_shared_partial(
