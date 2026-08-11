@@ -126,6 +126,10 @@ class DeepSeekV4Compressor(nn.Module):
         base = config.compress_rope_theta
         freqs_cis = wrapped_precompute_freqs_cis(config, rope_head_dim=rope_head_dim, base=base)
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
+        # Shared lru_cache table: rebuild_shared_freqs_cis() re-registers it
+        # after to_empty loads (deduplicated buffer snapshots zero every
+        # holder but the first — the layer-4 C4 base-ruler divergence).
+        self._freqs_cis_rebuild_args = (base, False, rope_head_dim)
 
     def overlap_transform_raw(self, tensor: torch.Tensor, value=0):
         return _overlap_transform(tensor, compress_ratio=self.compress_ratio, head_dim=self.head_dim, value=value)

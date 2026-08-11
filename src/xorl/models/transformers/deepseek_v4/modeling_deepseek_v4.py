@@ -347,7 +347,21 @@ class DeepSeekV4Attention(nn.Module):
         # ---------------- Q ----------------
         q_lora_pre_norm = self.wq_a(x)
         self._capture_diagnostic_component("q_pre_qk_norm", q_lora_pre_norm)
-        q_lora = self.q_norm(q_lora_pre_norm)  # [B, S, q_lora_rank]
+        if self._exact_attention:
+            # The serving deterministic contract runs standalone RMSNorms
+            # through the batch-invariant Triton kernel; sgl_kernel/native
+            # rmsnorm differs by one BF16 ulp at rounding boundaries
+            # (layer-4 q_norm, 2026-08-11 base ruler).
+            from sglang.srt.batch_invariant_ops.batch_invariant_ops import (  # noqa: PLC0415
+                rms_norm_batch_invariant,
+            )
+
+            q_flat = q_lora_pre_norm.reshape(-1, q_lora_pre_norm.shape[-1]).contiguous()
+            q_lora = rms_norm_batch_invariant(
+                q_flat, self.q_norm.weight, eps=self.eps
+            ).reshape_as(q_lora_pre_norm)
+        else:
+            q_lora = self.q_norm(q_lora_pre_norm)  # [B, S, q_lora_rank]
         self._capture_diagnostic_component("q_post_qk_norm", q_lora)
         qr = q_lora  # saved for the indexer below
         q = self.wq_b(q_lora)  # [B, S, n_heads * head_dim]

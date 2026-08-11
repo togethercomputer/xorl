@@ -1,14 +1,14 @@
 {
   "schema": "dsv4-exact-selected-logprob-trace-v1",
-  "created_at_unix": 1786435866.695651,
+  "created_at_unix": 1786447104.3522825,
   "label": "base-ruler-4dec",
   "adapter": null,
   "model_path": "/shared/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/60d8d70770c6776ff598c94bb586a859a38244f1",
   "model_revision": "60d8d70770c6776ff598c94bb586a859a38244f1",
   "source": {
-    "repo_head": "5f3f238b428c1fdd09639110462dc584762d27a6",
-    "sglang_head": "d040930ecf80248b038e6686342c8b622e74297f",
-    "sglang_diff_sha256": "6eacbd4a21a03d36f6190ed269a3ac0674cf5dbb354e3615d108eb8285f4dcfe"
+    "repo_head": "fe29cb8f2aab1f326aa6df42557d13c103287d9f",
+    "sglang_head": "92adccf5d12e57c0908963f73a2f9d7d7cd202c2",
+    "sglang_diff_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
   },
   "contract": {
     "temperature": 1.0,
