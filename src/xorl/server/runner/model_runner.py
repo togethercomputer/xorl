@@ -1345,6 +1345,7 @@ class ModelRunner:
             lora_alpha=self.lora_config.get("lora_alpha", 16),
             lora_target_modules=construction_target_modules,
             lora_target_manifest=self.lora_config.get("lora_target_manifest"),
+            unfuse_for_lora=self.lora_config.get("unfuse_for_lora", False),
             moe_hybrid_shared_lora=self.lora_config.get("moe_hybrid_shared_lora", False),
             enable_qlora=enable_qlora,
             block_fp8_qlora_training=block_fp8_qlora_training,

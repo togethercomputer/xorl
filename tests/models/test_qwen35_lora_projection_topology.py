@@ -168,12 +168,11 @@ def test_qwen_shared_expert_separate_factors_compose_with_exact_trunk_wrap() -> 
         set_trunk_linear_contract(False)
 
 
-def test_qwen_shared_expert_rejects_half_of_fused_gate_up_adapter_pair() -> None:
+def test_qwen_shared_expert_supports_independent_fused_gate_up_adapters() -> None:
     for target in ("gate_proj", "up_proj"):
         model = _Model(with_gdn=False)
-        try:
-            inject_lora_into_model(model, r=RANK, lora_alpha=RANK, target_modules=[target])
-        except ValueError as error:
-            assert "require gate_proj and up_proj" in str(error)
-        else:
-            raise AssertionError(f"Qwen shared expert accepted incomplete target {target}")
+        inject_lora_into_model(model, r=RANK, lora_alpha=RANK, target_modules=[target])
+        shared = model.model.layers[0].mlp.shared_expert
+        assert isinstance(getattr(shared, target), LoraDeltaLinear)
+        other = "up_proj" if target == "gate_proj" else "gate_proj"
+        assert not hasattr(shared, other)

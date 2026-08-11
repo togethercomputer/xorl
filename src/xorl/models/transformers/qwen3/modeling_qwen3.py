@@ -24,6 +24,7 @@ from xorl.models.layers.attention import (
     is_flash_attention,
     update_causal_mask,
 )
+from xorl.models.layers.fused_projection_lora import project_fused_linear_with_lora
 from xorl.models.module_utils import GradientCheckpointingLayer
 from xorl.models.outputs import BaseModelOutput, CausalLMOutput
 from xorl.models.transformers.qwen3 import parallelize
@@ -37,6 +38,8 @@ logger = logging.get_logger(__name__)
 
 
 class Qwen3MLP(nn.Module):
+    _supports_fused_gate_up_lora = True
+
     def __init__(self, config):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -56,10 +59,17 @@ class Qwen3MLP(nn.Module):
 
     def forward(self, x):
         if hasattr(self, "gate_up_proj"):
+            gate_up = project_fused_linear_with_lora(
+                self,
+                x,
+                base_name="gate_up_proj",
+                projection_names=("gate_proj", "up_proj"),
+                projection_sizes=(self.intermediate_size, self.intermediate_size),
+            )
             if self._use_fused_silu:
-                x = fused_silu_and_mul(self.gate_up_proj(x))
+                x = fused_silu_and_mul(gate_up)
             else:
-                gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
+                gate, up = gate_up.chunk(2, dim=-1)
                 x = self.act_fn(gate) * up
         else:
             x = self.act_fn(self.gate_proj(x)) * self.up_proj(x)

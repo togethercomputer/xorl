@@ -37,7 +37,7 @@ torchrun --nproc_per_node=8 -m xorl.cli.train config.yaml \
 | `deepep_num_sms` | `20` | SMs assigned to DeepEP communication kernels. Must be even. Lower values leave more SMs for overlapped compute. |
 | `deepep_async_combine` | `false` | Overlap DeepEP combine with the next layer's compute (experimental, unsafe). Forced to `false` in code unless `XORL_DEEPEP_UNSAFE_ASYNC_COMBINE=1` is exported; without that env var, deferring the comm-stream sync races the transformer block's read of the combined tensor on the default stream. |
 | `alltoall_combine_hidden_chunk_size` | `0` | Hidden-dimension chunk size for all-to-all EP combine. `0` disables chunking; use a positive value to reduce long-context MoE combine memory peaks. |
-| `merge_qkv` | `true` | Keep Q/K/V projections fused as `qkv_proj`. Set `false` for tensor parallelism or per-projection LoRA. |
+| `merge_qkv` | `true` | Keep Q/K/V projections fused as `qkv_proj`. Set `false` when required by tensor parallelism; audited LoRA families support independent q/k/v adapters over the fused base. |
 | `basic_modules` | `[]` | Additional module names (beyond `_no_split_modules`) to shard as separate FSDP units. |
 | `foundation` | `{}` | Extra foundation model config (dict). |
 | `encoders` | `{}` | Multimodal encoder configs, keyed by type (`image`, `video`, `audio`). Each value must have `model_path` and optionally `config_path`. |
@@ -232,7 +232,7 @@ Each entry in `datasets` (or `test_datasets`) is a dict:
 | `lora_rank` | `16` | LoRA rank (`r`). |
 | `lora_alpha` | `16` | LoRA scaling factor (`alpha`). Effective scale = `alpha / rank`. |
 | `lora_target_modules` | `null` | Module names to inject LoRA into. `null` = default linear projections for the architecture. |
-| `unfuse_for_lora` | `false` | Split fused `qkv_proj`/`gate_up_proj` before LoRA injection so `q/k/v` and `gate/up` can be adapted at all. Requires `enable_lora`; rejected with `enable_qlora`. Costs ~1.4% step time to unfuse (Qwen3-14B, 8xH100); the newly-reachable targets cost more to train. See [LoRA](/adapters/lora/#fused-projections). |
+| `unfuse_for_lora` | `false` | Explicitly split supported fused projections before LoRA injection. Requires `enable_lora`; rejected with `enable_qlora`. Audited common families retain fused bases automatically; use this fallback only when logical fused-base adapters are unavailable. See [LoRA](/adapters/lora/#fused-projections). |
 | `save_lora_only` | `false` | Only save LoRA adapter weights in HF checkpoints (not the full model). |
 | `enable_qlora` | `false` | Quantize base weights and train LoRA on top. Implies `enable_lora: true`. |
 | `quant_format` | `nvfp4` | Quantization format: `nvfp4` (4-bit, Hopper+), `block_fp8` (8-bit blocks), `nf4` (4-bit normal float). |

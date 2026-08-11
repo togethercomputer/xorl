@@ -1035,6 +1035,14 @@ class ServerArguments:
         },
     )
 
+    unfuse_for_lora: bool = field(
+        default=False,
+        metadata={
+            "help": "Replace supported fused projections with split projections before plain LoRA injection. "
+            "Use only when the architecture lacks fused-base logical LoRA support."
+        },
+    )
+
     moe_hybrid_shared_lora: bool = field(
         default=False,
         metadata={
@@ -1158,6 +1166,10 @@ class ServerArguments:
 
     def __post_init__(self):
         """Validate and set defaults."""
+        if self.unfuse_for_lora and not self.enable_lora:
+            raise ValueError("unfuse_for_lora requires enable_lora=True")
+        if self.unfuse_for_lora and self.enable_qlora:
+            raise ValueError("unfuse_for_lora is not supported with QLoRA")
         from xorl.qarl import normalize_qarl_quant_cfg, qarl_unsupported_scope_reason  # noqa: PLC0415
         from xorl.server.orchestrator.packing import ON_OVERSIZED_MODES, PACKING_STRATEGIES  # noqa: PLC0415
 
@@ -1503,6 +1515,7 @@ class ServerArguments:
                 "lora_alpha": self.lora_alpha,
                 "lora_target_modules": self.lora_target_modules,
                 "lora_target_manifest": self.lora_target_manifest,
+                "unfuse_for_lora": self.unfuse_for_lora,
                 "moe_hybrid_shared_lora": self.moe_hybrid_shared_lora,
                 "lora_export_format": self.lora_export_format,
                 "enable_qlora": self.enable_qlora,

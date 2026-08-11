@@ -75,6 +75,8 @@ def _raise_if_ring_fla_unsupported(config: Qwen3_5MoeConfig, ps) -> None:
 
 
 class Qwen3_5MoeMLP(nn.Module):
+    _supports_fused_gate_up_lora = True
+
     def __init__(self, config, intermediate_size=None):
         super().__init__()
         self.hidden_size = config.hidden_size

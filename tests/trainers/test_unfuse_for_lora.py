@@ -28,6 +28,19 @@ class _Unfusable(nn.Module):
         super().__init__()
         self.calls = calls if calls is not None else []
         self.config = SimpleNamespace(num_experts=0, model_type="qwen3")
+        self.config._resolved_numerical_program = {
+            "attn_implementation": "eager",
+            "router_fp32": False,
+            "lm_head_fp32": False,
+            "rmsnorm_mode": "native",
+            "qwen35_rmsnorm_family": None,
+            "activation_native": False,
+            "rope_native": False,
+            "rope_class_b": False,
+            "attention_cast_bf16": False,
+            "sparse_mla_enabled": False,
+            "sparse_mla_backend": None,
+        }
         self._no_split_modules = []
         self.proj = nn.Linear(4, 4, bias=False)
 
@@ -208,25 +221,47 @@ class TestTrainerOrdering:
                 model_path="unused",
                 attn_implementation="eager",
                 moe_implementation=None,
+                moe_routing_weights_before_down=False,
                 ep_dispatch="alltoall",
                 train_router=False,
                 record_routing_weights=False,
                 deepep_buffer_size_gb=2.0,
                 deepep_num_sms=20,
                 deepep_async_combine=False,
+                router_fp32=False,
+                lm_head_fp32=False,
+                alltoall_combine_hidden_chunk_size=0,
                 rmsnorm_mode="native",
+                qwen35_rmsnorm_family=None,
+                activation_native=False,
+                rope_native=False,
+                rope_class_b=False,
+                attention_cast_bf16=False,
+                sparse_mla_enabled=False,
+                sparse_mla_backend=None,
                 flash_attention_deterministic=False,
                 freeze_router=False,
                 merge_qkv=True,
                 encoders=None,
             ),
-            lora=SimpleNamespace(enable_lora=True, enable_qlora=False, unfuse_for_lora=True),
+            lora=SimpleNamespace(
+                enable_lora=True,
+                enable_qlora=False,
+                unfuse_for_lora=True,
+                lora_rank=2,
+                lora_alpha=2,
+            ),
             train=SimpleNamespace(
                 enable_mixed_precision=False,
                 init_device="meta",
                 enable_vision_encoder=False,
+                skip_param_upcast=False,
+                ce_mode="native",
+                enable_fp8_training=False,
+                enable_qarl=False,
             ),
         )
+        trainer._causallm_loss_params = {}
         return trainer
 
     def test_unfuse_precedes_lora_injection(self, monkeypatch):

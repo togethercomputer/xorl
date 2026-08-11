@@ -70,6 +70,10 @@ _SHIPPED_MOE_LORA_CONFIGS = (
     "examples/server/configs/lora/qwen3_5_35b_a3b_lora.yaml",
     "examples/server/configs/lora/qwen3_coder_30b_a3b_lora.yaml",
 )
+_SHIPPED_QWEN35_LORA_CONFIGS = (
+    "examples/server/configs/lora/qwen3_5_35b_a3b_lora.yaml",
+    "examples/server/configs/lora/qwen3_5_397b_a17b_lora.yaml",
+)
 _SHIPPED_QWEN_MOE_QLORA_CONFIGS = (
     "examples/server/configs/qlora/qwen3_235b_a22b_qlora_nf4.yaml",
     "examples/server/configs/qlora/qwen3_235b_a22b_qlora_nvfp4.yaml",
@@ -84,7 +88,9 @@ def clean_shipped_adapter_arguments():
     """Parse shipped configs in a clean process, outside this module's launcher stubs."""
 
     root = Path(__file__).resolve().parents[2]
-    relative_paths = _SHIPPED_MOE_LORA_CONFIGS + _SHIPPED_QWEN_MOE_QLORA_CONFIGS
+    relative_paths = tuple(
+        dict.fromkeys(_SHIPPED_MOE_LORA_CONFIGS + _SHIPPED_QWEN35_LORA_CONFIGS + _SHIPPED_QWEN_MOE_QLORA_CONFIGS)
+    )
     script = """
 import json
 import sys
@@ -124,6 +130,33 @@ def _assert_shipped_moe_lora_examples_restore_certified_quack(clean_shipped_adap
         parsed = clean_shipped_adapter_arguments[relative_path]
         assert config["moe_implementation"] == parsed["moe_implementation"] == "quack", relative_path
         assert config.get("moe_hybrid_shared_lora", False) is parsed["moe_hybrid_shared_lora"] is False
+    for relative_path in _SHIPPED_QWEN35_LORA_CONFIGS:
+        assert "g_proj" in clean_shipped_adapter_arguments[relative_path]["lora_target_modules"], relative_path
+
+
+def _assert_unfuse_for_lora_server_round_trip(tmp_path):
+    config_path = tmp_path / "server_lora.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model_path": "openai/gpt-oss-20b",
+                "enable_lora": True,
+                "unfuse_for_lora": True,
+                "lora_target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = load_server_arguments(str(config_path))
+    assert args.unfuse_for_lora is True
+    assert args.to_config_dict()["lora"]["unfuse_for_lora"] is True
+
+    config_path.write_text(
+        yaml.safe_dump({"model_path": "openai/gpt-oss-20b", "unfuse_for_lora": True}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="requires enable_lora"):
+        load_server_arguments(str(config_path))
 
 
 def _assert_shipped_qwen_quantized_moe_examples_restore_quack_expert_targets(clean_shipped_adapter_arguments):
@@ -1000,6 +1033,7 @@ def test_server_runtime_configuration_round_trip(tmp_path):
     _assert_adapter_gradient_transport_bucket_configuration(tmp_path)
     _assert_server_optimizer_and_runner_compatibility_contract(tmp_path)
     _assert_server_model_specific_configuration_contract(tmp_path)
+    _assert_unfuse_for_lora_server_round_trip(tmp_path)
 
 
 def test_server_quantized_training_configuration_contract(tmp_path, clean_shipped_adapter_arguments):
