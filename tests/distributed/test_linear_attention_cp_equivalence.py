@@ -20,7 +20,7 @@ THIS_DIR = Path(__file__).resolve().parent
 if str(THIS_DIR) not in sys.path:
     sys.path.insert(0, str(THIS_DIR))
 
-from distributed_utils import run_distributed_script, skip_if_gpu_count_less_than
+from distributed_utils import run_distributed_script, skip_if_gpu_count_less_than  # noqa: E402
 
 
 pytestmark = [pytest.mark.distributed]
@@ -66,6 +66,7 @@ def _build_test_layer(device: torch.device) -> GatedDeltaNet:
         use_short_conv=True,
         conv_size=4,
         norm_eps=1e-6,
+        exact_contract=True,
     ).to(device=device, dtype=torch.bfloat16)
     layer.eval()
     return layer

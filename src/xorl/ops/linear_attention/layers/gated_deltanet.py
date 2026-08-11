@@ -324,8 +324,6 @@ class GatedDeltaNet(nn.Module):
             raise RuntimeError("Exact Qwen3.5 GDN requires short convolution")
 
         if self.use_short_conv and _is_gdn_contract_enabled():
-            if cp_context is not None:
-                raise RuntimeError("Exact Qwen3.5 GDN does not support CP yet (conv prefix exchange)")
             if use_cache or last_state is not None:
                 raise RuntimeError(
                     "Exact Qwen3.5 trainer GDN supports packed prefill only, not recurrent cache updates"
@@ -338,6 +336,7 @@ class GatedDeltaNet(nn.Module):
                 self.k_conv1d,
                 self.v_conv1d,
                 cu_seqlens=cu_seqlens,
+                cp_context=cp_context,
             )
             conv_state_q = conv_state_k = conv_state_v = None
         elif self.use_short_conv:
