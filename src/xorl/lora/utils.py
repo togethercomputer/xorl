@@ -1054,8 +1054,11 @@ def save_lora_checkpoint(
 
     def _prepare_lora_tensor(tensor: torch.Tensor) -> torch.Tensor:
         tensor = tensor.detach().cpu().contiguous()
-        if preserve_lora_dtype:
+        if preserve_lora_dtype and lora_export_format != "dsv4_expert_banks":
             return tensor
+        # dsv4_expert_banks is a serving artifact: the sampler's fail-closed
+        # loader admits only BF16 factor views (the FP32 masters remain
+        # trainer/optimizer state and are not part of the export contract).
         return tensor.to(torch.bfloat16)
 
     def _is_moe_lora_param(name: str) -> bool:
