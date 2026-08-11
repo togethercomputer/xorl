@@ -8,9 +8,14 @@ REPO=/home/apanda/xorl-oss-dsv4-flash-lora-zero-k3-20260810
 VENV="$REPO/submodules/xorl-sglang/.venv"
 export PYTHONPATH="$REPO/src:$REPO/submodules/xorl-sglang/python"
 export HF_HOME=/shared/huggingface
-# Lane-scoped JIT caches: ~/.triton is weka-shared across hosts and races.
-export TRITON_CACHE_DIR="$REPO/results/dsv4_flash_zero_k3/jit-cache/triton-trainer"
-export TORCHINDUCTOR_CACHE_DIR="$REPO/results/dsv4_flash_zero_k3/jit-cache/inductor-trainer"
+# JIT caches: pod-local /dev/shm (weka rename visibility loses Triton's
+# concurrent-compile locking across the 8 torchrun ranks), seeded from the
+# lane snapshot; sync back with snapshot_jit_cache.sh after good runs.
+WEKA_CACHE="$REPO/results/dsv4_flash_zero_k3/jit-cache-snapshot"
+mkdir -p /dev/shm/sglang-cache
+[ -d "$WEKA_CACHE" ] && cp -r "$WEKA_CACHE/." /dev/shm/sglang-cache/ 2>/dev/null
+export TRITON_CACHE_DIR=/dev/shm/sglang-cache/triton-trainer
+export TORCHINDUCTOR_CACHE_DIR=/dev/shm/sglang-cache/inductor-trainer
 cd "$REPO"
 
 CONFIG="${DSV4_TRAINER_CONFIG:-$REPO/results/dsv4_flash_zero_k3/trainer_server_lora.yaml}"

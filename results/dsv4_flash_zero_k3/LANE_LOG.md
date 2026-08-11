@@ -63,6 +63,36 @@ Notes:
   are individually clean, so suspicion moves to embeddings/mHC pre-mix,
   attention (C0 window / compressor), indexer, or the EP combine order.
 
+## RCA progress (base ruler)
+
+- **Stage 1 byte-clean**: trainer `model.layers.0.layer_input` [1,10,4,4096]
+  is byte-equal to the raw checkpoint `embed.weight` rows on all four mHC
+  streams — identical to sampler semantics (`embed_tokens` → repeat ×4).
+  First divergence is inside layer 0 or deeper.
+- Hash routing (layers 0–2) and Marlin MXFP4 GEMM byte-clean individually;
+  since the trainer calls the same serving kernels, the remaining suspects
+  are server-side wiring: paged FP8 KV-cache layout, C0 window/compressor
+  overlap, chunked-prefill vs decode-cache alignment, EP combine order.
+- Sampler-side dump capture is gated on node-100 contention (see below).
+
+## Node-100 contention protocol
+
+The q36-canfold/cfold lane (same user, `/shared/apanda/k3_q36_cudagraph_fix_20260802/`)
+submits explicit-nodeName jobs to node 100 in bursts (observed 4–5 min cadence)
+and reaps foreign pods at submit time. `window_capture_dump.sh` now requires
+ten consecutive quiet minutes before claiming, then runs sampler-up → capture
+→ JIT-snapshot → release autonomously (retry loop around it).
+
+## JIT cache discipline (two distinct failure modes seen)
+
+1. Weka-shared `~/.cache/sglang`: cross-host writers corrupt Triton launcher
+   entries (missing `.so`).
+2. Lane-scoped weka dir: Triton's concurrent-compile locking relies on POSIX
+   rename visibility that weka does not provide across the 8 DP schedulers
+   (missing `.cubin` mid-compile).
+   → Caches now live on pod-local `/dev/shm/sglang-cache`, seeded from
+   `jit-cache-snapshot/` on weka and synced back after good runs.
+
 ## Next steps
 
 1. Sampler-side tensor dump of the same frozen request (layers 0–2)

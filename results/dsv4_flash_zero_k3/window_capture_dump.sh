@@ -68,6 +68,7 @@ grep -q "fired up and ready" "$RD/sampler_dump.log" 2>/dev/null || { log "sample
 log "sampler ready; capturing"
 
 kubectl exec -n apanda "$POD" -- bash "$RD/capture_base_dump.sh" || { log "capture failed"; exit 1; }
-log "capture done; stopping sampler"
+log "capture done; snapshotting JIT cache and stopping sampler"
+kubectl exec -n apanda "$POD" -- bash "$RD/snapshot_jit_cache.sh" >/dev/null 2>&1 || true
 kubectl exec -n apanda "$POD" -- bash "$RD/stop_sampler.sh" >/dev/null 2>&1 || true
 log "WINDOW CAPTURE COMPLETE"
