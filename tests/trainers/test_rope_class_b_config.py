@@ -434,6 +434,22 @@ def test_exact_qwen35_moe_admits_world8_ep8_topology():
     )
 
 
+def test_exact_qwen35_moe_admits_world8_ep8_ulysses8_topology():
+    config = _exact_qwen35_moe_config()
+    config._qwen35_exact_contract = True
+    _validate_exact_qwen35_topology(
+        config,
+        _qwen35_topology(
+            world_size=8,
+            dp_size=1,
+            dp_replicate_size=1,
+            dp_shard_size=1,
+            cp_size=8,
+            ulysses_size=8,
+        ),
+    )
+
+
 def test_exact_qwen35_dense_admits_single_gpu_topology():
     config = _exact_qwen35_dense_config()
     config._qwen35_exact_contract = True

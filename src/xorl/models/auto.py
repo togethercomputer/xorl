@@ -514,6 +514,7 @@ def _validate_exact_qwen35_topology(config: PretrainedConfig, parallel_state: An
     admitted = (
         (
             (8, 8, 1, 8, 1, 1, 8, 1, 1, 1),
+            (8, 1, 1, 1, 1, 1, 8, 8, 1, 8),
             (16, 16, 2, 8, 1, 1, 8, 1, 1, 1),
         )
         if _is_qwen35_moe(config)
