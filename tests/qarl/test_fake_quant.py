@@ -7,7 +7,14 @@ import torch.nn.functional as F
 
 from xorl.cli.export_quantized import quantize_weight_to_fp8
 from xorl.models.layers.moe.experts import MoEExperts
-from xorl.qarl import QARLLinear, inject_qarl_into_model, normalize_qarl_quant_cfg, summarize_qarl_model
+from xorl.qarl import (
+    QARLLinear,
+    inject_qarl_into_model,
+    normalize_qarl_quant_cfg,
+    qarl_activation_quant_override,
+    summarize_qarl_model,
+)
+from xorl.qarl.moe_experts import QARLMoEExperts, convert_moe_experts_to_qarl
 
 
 pytestmark = pytest.mark.cpu
@@ -27,12 +34,14 @@ class TinyDenseModel(nn.Module):
         self.lm_head = nn.Linear(4, 8)
 
 
-class TinyMoEModel(nn.Module):
+class _TinyW4A4Model(nn.Module):
     def __init__(self):
         super().__init__()
-        self.config = SimpleNamespace(model_type="tiny", num_experts=2)
-        self.proj = nn.Linear(4, 4)
-        self.experts = MoEExperts(num_experts=2, hidden_dim=4, intermediate_size=8)
+        self.qlin_off = QARLLinear(4, 4, quantize_activation=False, quant_format="nvfp4")
+        self.qlin_on = QARLLinear(4, 4, quantize_activation=True, quant_format="nvfp4")
+        experts = MoEExperts(num_experts=2, hidden_dim=4, intermediate_size=8, moe_implementation="eager")
+        self.experts = convert_moe_experts_to_qarl(experts, quantize_weight=True, quantize_activation=False)
+        self.plain = nn.Linear(4, 4)
 
 
 def _dequantize_block_fp8(quantized: torch.Tensor, scale: torch.Tensor, block_size: tuple[int, int]) -> torch.Tensor:
@@ -54,33 +63,7 @@ def _dequantize_block_fp8(quantized: torch.Tensor, scale: torch.Tensor, block_si
     return dequantized[:rows, :cols].contiguous()
 
 
-def test_qarl_linear_fake_quant_uses_ste_and_persists_state():
-    base = nn.Linear(4, 3)
-    layer = QARLLinear.from_linear(base, quant_cfg=normalize_qarl_quant_cfg("FP8_DEFAULT_CFG"))
-    x = torch.randn(2, 4, requires_grad=True)
-
-    y = layer(x).sum()
-    y.backward()
-
-    assert x.grad is not None
-    assert layer.weight.grad is not None
-    assert layer.qarl_forward_count.item() == 1
-    assert layer.qarl_input_amax.item() > 0
-    assert layer.qarl_weight_amax.item() > 0
-    assert layer.qarl_input_scale_inv.item() > 0
-    assert layer.qarl_weight_scale_inv.shape == (1, 1)
-    assert layer.qarl_weight_scale_inv.item() > 0
-
-    state = layer.state_dict()
-    restored = QARLLinear(4, 3)
-    restored.load_state_dict(state)
-    assert restored.qarl_forward_count.item() == 1
-    torch.testing.assert_close(restored.qarl_input_amax, layer.qarl_input_amax)
-    torch.testing.assert_close(restored.qarl_weight_scale_inv, layer.qarl_weight_scale_inv)
-    torch.testing.assert_close(restored.weight, layer.weight)
-
-
-def test_qarl_weight_fake_quant_matches_folded_block_fp8_export():
+def test_qarl_dense_fake_quant_injection_and_configuration_policy():
     base = nn.Linear(5, 3, bias=False)
     with torch.no_grad():
         base.weight.copy_(torch.arange(15, dtype=torch.float32).reshape(3, 5) / 8)
@@ -97,8 +80,20 @@ def test_qarl_weight_fake_quant_matches_folded_block_fp8_export():
     torch.testing.assert_close(qarl_out, F.linear(x, dequantized_weight), rtol=0, atol=0)
     torch.testing.assert_close(layer.qarl_weight_scale_inv, exported_scale)
 
+    restored = QARLLinear.from_linear(
+        nn.Linear(5, 3, bias=False),
+        quant_cfg=normalize_qarl_quant_cfg({"format": "fp8_e4m3", "activation": False, "weight_block_size": [2, 2]}),
+    )
+    restored.load_state_dict(layer.state_dict())
+    torch.testing.assert_close(restored.qarl_weight_scale_inv, layer.qarl_weight_scale_inv)
 
-def test_inject_qarl_wraps_dense_linears_and_preserves_parameter_names():
+    _assert_inject_qarl_dense_lifecycle_and_model_admission()
+    _assert_normalize_qarl_quant_cfg_rejects_static_or_unknown_recipes()
+    _assert_nvfp4_weight_only_forward_and_ste_policy()
+    _assert_activation_quant_override_lifecycle()
+
+
+def _assert_inject_qarl_dense_lifecycle_and_model_admission():
     model = TinyDenseModel()
 
     changed = inject_qarl_into_model(
@@ -124,29 +119,17 @@ def test_inject_qarl_wraps_dense_linears_and_preserves_parameter_names():
     assert summary["forward_counts"]["model.layers.0.proj"] == 1
     assert summary["forward_counts"]["lm_head"] == 1
 
-
-def test_inject_qarl_rejects_moe_models():
-    with pytest.raises(ValueError, match="dense full-weight models only"):
-        inject_qarl_into_model(TinyMoEModel())
-
-
-def test_inject_qarl_rejects_mtp_model_configs():
-    model = TinyDenseModel()
-    model.config = SimpleNamespace(model_type="tiny", text_config=SimpleNamespace(num_nextn_predict_layers=1))
-
-    with pytest.raises(ValueError, match="MTP/speculative and Mamba"):
-        inject_qarl_into_model(model)
+    for config in (
+        SimpleNamespace(model_type="tiny", text_config=SimpleNamespace(num_nextn_predict_layers=1)),
+        SimpleNamespace(model_type="mamba", architectures=["MambaForCausalLM"]),
+    ):
+        rejected = TinyDenseModel()
+        rejected.config = config
+        with pytest.raises(ValueError, match="MTP/speculative and Mamba"):
+            inject_qarl_into_model(rejected)
 
 
-def test_inject_qarl_rejects_mamba_model_configs():
-    model = TinyDenseModel()
-    model.config = SimpleNamespace(model_type="mamba", architectures=["MambaForCausalLM"])
-
-    with pytest.raises(ValueError, match="MTP/speculative and Mamba"):
-        inject_qarl_into_model(model)
-
-
-def test_normalize_qarl_quant_cfg_rejects_static_or_unknown_recipes():
+def _assert_normalize_qarl_quant_cfg_rejects_static_or_unknown_recipes():
     assert normalize_qarl_quant_cfg("fp8_default_cfg") == {
         "format": "fp8_e4m3",
         "weight": True,
@@ -167,3 +150,61 @@ def test_normalize_qarl_quant_cfg_rejects_static_or_unknown_recipes():
         normalize_qarl_quant_cfg("NVFP4_DEFAULT_CFG")
     with pytest.raises(ValueError, match="weight_block_size"):
         normalize_qarl_quant_cfg({"format": "fp8_e4m3", "weight_block_size": [0, 2]})
+
+
+def _assert_nvfp4_weight_only_forward_and_ste_policy():
+    assert normalize_qarl_quant_cfg("nvfp4") == {
+        "format": "nvfp4",
+        "weight": True,
+        "activation": False,
+        "dynamic": True,
+        "group_size": 16,
+    }
+    cfg = normalize_qarl_quant_cfg({"format": "nvfp4", "activation": True})
+    assert cfg["activation"] is True and cfg["group_size"] == 16
+    for group_size in (32, 15, 0):
+        with pytest.raises(ValueError, match="group_size"):
+            normalize_qarl_quant_cfg({"format": "nvfp4", "group_size": group_size})
+
+    torch.manual_seed(0)
+    linear = nn.Linear(64, 128, bias=True)
+    quantized = QARLLinear.from_linear(linear, quant_cfg=normalize_qarl_quant_cfg("nvfp4"))
+    assert quantized.qarl_group_size == 16
+    assert quantized.qarl_quantize_activation is False
+
+    x = torch.randn(8, 64)
+    output = quantized(x)
+    reference = F.linear(x, linear.weight, linear.bias)
+    assert output.shape == reference.shape
+    assert not torch.allclose(output, reference)
+    output.sum().backward()
+    expected_gradient = torch.ones(8, 128).T @ x
+    torch.testing.assert_close(quantized.weight.grad, expected_gradient, rtol=1e-4, atol=1e-4)
+
+    quantized.qarl_quantize_weight = False
+    torch.testing.assert_close(quantized(x), reference, rtol=0, atol=0)
+
+
+def _assert_activation_quant_override_lifecycle():
+    model = _TinyW4A4Model()
+    modules = [module for module in model.modules() if isinstance(module, (QARLLinear, QARLMoEExperts))]
+    assert len(modules) == 3
+    prior = {id(module): module.qarl_quantize_activation for module in modules}
+    assert [prior[id(module)] for module in modules] == [False, True, False]
+
+    for enabled in (True, False):
+        with qarl_activation_quant_override(model, enabled=enabled):
+            assert all(module.qarl_quantize_activation is enabled for module in modules)
+            assert not hasattr(model.plain, "qarl_quantize_activation")
+        assert {id(module): module.qarl_quantize_activation for module in modules} == prior
+
+    with pytest.raises(RuntimeError):
+        with qarl_activation_quant_override(model, enabled=True):
+            raise RuntimeError("boom")
+    assert {id(module): module.qarl_quantize_activation for module in modules} == prior
+
+    with qarl_activation_quant_override(model, enabled=True):
+        with qarl_activation_quant_override(model, enabled=False):
+            assert model.qlin_off.qarl_quantize_activation is False
+        assert model.qlin_off.qarl_quantize_activation is True
+    assert model.qlin_off.qarl_quantize_activation is False

@@ -15,6 +15,7 @@ with the participating hostnames attached. Verifies:
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from xorl.distributed.moe import deepep
 
@@ -26,52 +27,70 @@ class _FakeGroup:
     """Hashable stand-in for a ProcessGroup."""
 
 
+def _assert_async_combine_requires_explicit_unsafe_opt_in(monkeypatch):
+    captured = {}
+
+    def fake_apply(expert_output, buffer, ctx, async_combine):
+        del buffer, ctx
+        captured["async_combine"] = async_combine
+        return expert_output
+
+    monkeypatch.delenv("XORL_DEEPEP_UNSAFE_ASYNC_COMBINE", raising=False)
+    monkeypatch.setattr(deepep._FusedUnpermuteAndCombine, "apply", staticmethod(fake_apply))
+
+    expert_output = torch.ones(1, 2)
+    result = deepep.tokens_post_combine(
+        buffer=None,
+        expert_output=expert_output,
+        ctx=SimpleNamespace(),
+        async_combine=True,
+    )
+
+    assert result is expert_output
+    assert captured["async_combine"] is False
+
+    monkeypatch.setenv("XORL_DEEPEP_UNSAFE_ASYNC_COMBINE", "1")
+    result = deepep.tokens_post_combine(
+        buffer=None,
+        expert_output=expert_output,
+        ctx=SimpleNamespace(),
+        async_combine=True,
+    )
+
+    assert result is expert_output
+    assert captured["async_combine"] is True
+
+
 # ---------------------------------------------------------------------------
 # 1. _ep_group_spans_nodes
 # ---------------------------------------------------------------------------
 
 
 class TestEPGroupSpansNodes:
-    def test_unknown_when_dist_not_initialized(self, monkeypatch):
+    def _assert_topology_truth_table(self, monkeypatch):
         monkeypatch.setattr(deepep.dist, "is_initialized", lambda: False)
         assert deepep._ep_group_spans_nodes(None) is None
 
-    def test_unknown_without_local_world_size(self, monkeypatch):
         monkeypatch.setattr(deepep.dist, "is_initialized", lambda: True)
         monkeypatch.delenv("LOCAL_WORLD_SIZE", raising=False)
         assert deepep._ep_group_spans_nodes(None) is None
 
-    def test_unknown_with_malformed_local_world_size(self, monkeypatch):
-        monkeypatch.setattr(deepep.dist, "is_initialized", lambda: True)
         monkeypatch.setenv("LOCAL_WORLD_SIZE", "not-a-number")
         assert deepep._ep_group_spans_nodes(None) is None
 
-    def test_single_node_world_never_spans(self, monkeypatch):
-        monkeypatch.setattr(deepep.dist, "is_initialized", lambda: True)
         monkeypatch.setattr(deepep.dist, "get_world_size", lambda: 8)
         monkeypatch.setenv("LOCAL_WORLD_SIZE", "8")
         assert deepep._ep_group_spans_nodes(None) is False
 
-    def test_intranode_ep_group_in_multinode_world(self, monkeypatch):
-        monkeypatch.setattr(deepep.dist, "is_initialized", lambda: True)
         monkeypatch.setattr(deepep.dist, "get_world_size", lambda: 16)
         monkeypatch.setattr(deepep.dist, "get_process_group_ranks", lambda group: list(range(8)))
-        monkeypatch.setenv("LOCAL_WORLD_SIZE", "8")
         assert deepep._ep_group_spans_nodes(_FakeGroup()) is False
 
-    def test_internode_ep_group(self, monkeypatch):
-        monkeypatch.setattr(deepep.dist, "is_initialized", lambda: True)
-        monkeypatch.setattr(deepep.dist, "get_world_size", lambda: 16)
         monkeypatch.setattr(deepep.dist, "get_process_group_ranks", lambda group: list(range(16)))
-        monkeypatch.setenv("LOCAL_WORLD_SIZE", "8")
         assert deepep._ep_group_spans_nodes(_FakeGroup()) is True
 
-    def test_strided_internode_ep_group(self, monkeypatch):
-        """ep_intranode=False layouts stride EP groups across nodes."""
-        monkeypatch.setattr(deepep.dist, "is_initialized", lambda: True)
-        monkeypatch.setattr(deepep.dist, "get_world_size", lambda: 16)
+        # ep_intranode=False layouts stride EP groups across nodes.
         monkeypatch.setattr(deepep.dist, "get_process_group_ranks", lambda group: [0, 8])
-        monkeypatch.setenv("LOCAL_WORLD_SIZE", "8")
         assert deepep._ep_group_spans_nodes(_FakeGroup()) is True
 
 
@@ -93,7 +112,11 @@ def _arm_internode(monkeypatch, world=2, hosts=("node-a", "node-b")):
 
 
 class TestPreflightInternodeTransport:
-    def test_skipped_via_env(self, monkeypatch):
+    def _assert_preflight_internode_transport_policy(self, monkeypatch):
+        def _no_buffer(**kwargs):
+            raise AssertionError("no buffer should be created when the preflight is disabled")
+
+        monkeypatch.setattr(deepep, "get_default_buffer", _no_buffer)
         monkeypatch.setenv(deepep._SKIP_PREFLIGHT_ENV, "1")
 
         def _fail(group):
@@ -102,21 +125,18 @@ class TestPreflightInternodeTransport:
         monkeypatch.setattr(deepep, "_ep_group_spans_nodes", _fail)
         deepep.preflight_internode_transport(None, hidden_dim=128)
 
-    def test_noop_when_dist_not_initialized(self, monkeypatch):
+        monkeypatch.delenv(deepep._SKIP_PREFLIGHT_ENV)
         monkeypatch.setattr(deepep.dist, "is_initialized", lambda: False)
         deepep.preflight_internode_transport(None, hidden_dim=128)
 
-    def test_noop_when_intranode(self, monkeypatch):
         monkeypatch.setattr(deepep.dist, "is_initialized", lambda: True)
         monkeypatch.setattr(deepep, "_ep_group_spans_nodes", lambda group: False)
-
-        def _no_buffer(**kwargs):
-            raise AssertionError("no buffer should be created for intranode EP groups")
-
-        monkeypatch.setattr(deepep, "get_default_buffer", _no_buffer)
         deepep.preflight_internode_transport(None, hidden_dim=128)
 
-    def test_transport_failure_names_nodes(self, monkeypatch):
+        self._assert_transport_failure_names_nodes(monkeypatch)
+        self._assert_roundtrip_accepts_identity_and_rejects_corruption(monkeypatch)
+
+    def _assert_transport_failure_names_nodes(self, monkeypatch):
         _arm_internode(monkeypatch)
         buf = SimpleNamespace(init_buffer=lambda hidden_bytes: None)
         monkeypatch.setattr(deepep, "get_default_buffer", lambda **kwargs: buf)
@@ -132,20 +152,7 @@ class TestPreflightInternodeTransport:
         assert "CPU recv timeout" in msg
         assert deepep._SKIP_PREFLIGHT_ENV in msg
 
-    def test_roundtrip_corruption_detected(self, monkeypatch):
-        _arm_internode(monkeypatch)
-        buf = SimpleNamespace(init_buffer=lambda hidden_bytes: None)
-        monkeypatch.setattr(deepep, "get_default_buffer", lambda **kwargs: buf)
-
-        def identity_dispatch(buffer, x, w, idx, num_experts):
-            return x, idx, w, [1] * num_experts, "handle"
-
-        monkeypatch.setattr(deepep, "dispatch_no_grad", identity_dispatch)
-        monkeypatch.setattr(deepep, "combine_no_grad", lambda buffer, x, handle: x + 1.0)
-        with pytest.raises(RuntimeError, match="corrupted"):
-            deepep.preflight_internode_transport(_FakeGroup(), hidden_dim=128)
-
-    def test_healthy_roundtrip_passes(self, monkeypatch):
+    def _assert_roundtrip_accepts_identity_and_rejects_corruption(self, monkeypatch):
         _arm_internode(monkeypatch)
         buf = SimpleNamespace(init_buffer=lambda hidden_bytes: None)
         monkeypatch.setattr(deepep, "get_default_buffer", lambda **kwargs: buf)
@@ -156,6 +163,10 @@ class TestPreflightInternodeTransport:
         monkeypatch.setattr(deepep, "dispatch_no_grad", identity_dispatch)
         monkeypatch.setattr(deepep, "combine_no_grad", lambda buffer, x, handle: x.clone())
         deepep.preflight_internode_transport(_FakeGroup(), hidden_dim=128)
+
+        monkeypatch.setattr(deepep, "combine_no_grad", lambda buffer, x, handle: x + 1.0)
+        with pytest.raises(RuntimeError, match="corrupted"):
+            deepep.preflight_internode_transport(_FakeGroup(), hidden_dim=128)
 
 
 # ---------------------------------------------------------------------------
@@ -198,24 +209,29 @@ class TestBufferSizeValidation:
         buf = deepep.DeepEPBuffer(ep_group=group, buffer_size_gb=buffer_size_gb)
         return buf, captured
 
-    def test_oversized_nvl_with_rdma_raises(self, monkeypatch):
+    def _assert_buffer_size_alignment_and_rdma_admission_policy(self, monkeypatch):
         buf, _ = self._buffer(monkeypatch, buffer_size_gb=4.0, rdma_bytes=1 << 20)
         with pytest.raises(ValueError, match="int32 limit"):
             buf.init_buffer(hidden_bytes=4096)
 
-    def test_oversized_nvl_without_rdma_allowed(self, monkeypatch):
-        buf, captured = self._buffer(monkeypatch, buffer_size_gb=4.0, rdma_bytes=0)
-        buf.init_buffer(hidden_bytes=4096)
-        assert captured["num_nvl_bytes"] == 4_000_000_000
+        cases = (
+            (4.0, 0, 4_000_000_000),
+            (1e-6, 0, 896),
+            (2.0, 1 << 20, 2_000_000_000),
+        )
+        for buffer_size_gb, rdma_bytes, expected_nvl_bytes in cases:
+            buf, captured = self._buffer(monkeypatch, buffer_size_gb=buffer_size_gb, rdma_bytes=rdma_bytes)
+            buf.init_buffer(hidden_bytes=4096)
+            assert captured["num_nvl_bytes"] == expected_nvl_bytes
+            assert captured["num_rdma_bytes"] == rdma_bytes
 
-    def test_unaligned_bytes_rounded_down(self, monkeypatch):
-        # 0.000001 GB = 1000 bytes -> 896 after 128-byte alignment
-        buf, captured = self._buffer(monkeypatch, buffer_size_gb=1e-6, rdma_bytes=0)
-        buf.init_buffer(hidden_bytes=4096)
-        assert captured["num_nvl_bytes"] == 896
 
-    def test_default_two_gb_with_rdma_passes(self, monkeypatch):
-        buf, captured = self._buffer(monkeypatch, buffer_size_gb=2.0, rdma_bytes=1 << 20)
-        buf.init_buffer(hidden_bytes=4096)
-        assert captured["num_nvl_bytes"] == 2_000_000_000
-        assert captured["num_rdma_bytes"] == 1 << 20
+def test_deepep_internode_topology_preflight_and_buffer_admission_policy(monkeypatch):
+    with monkeypatch.context() as topology_patch:
+        TestEPGroupSpansNodes()._assert_topology_truth_table(topology_patch)
+    with monkeypatch.context() as preflight_patch:
+        TestPreflightInternodeTransport()._assert_preflight_internode_transport_policy(preflight_patch)
+    with monkeypatch.context() as buffer_patch:
+        TestBufferSizeValidation()._assert_buffer_size_alignment_and_rdma_admission_policy(buffer_patch)
+    with monkeypatch.context() as async_patch:
+        _assert_async_combine_requires_explicit_unsafe_opt_in(async_patch)

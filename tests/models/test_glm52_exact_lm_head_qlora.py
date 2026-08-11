@@ -26,7 +26,7 @@ from xorl.models.transformers.glm5.exact_lm_head_qlora import (
 from xorl.ops.bi_families_v2 import exact_temperature_scale_fp32_logits
 
 
-def _component(tp_rank: int = 0) -> Glm52ExactTP16LmHeadSelectedLogprob:
+def _component(tp_rank: int = 0, tp_group=None) -> Glm52ExactTP16LmHeadSelectedLogprob:
     shard = glm52_lm_head_shard(tp_rank)
     return Glm52ExactTP16LmHeadSelectedLogprob(
         tp_rank=tp_rank,
@@ -34,6 +34,7 @@ def _component(tp_rank: int = 0) -> Glm52ExactTP16LmHeadSelectedLogprob:
         vocab_end=shard.vocab_end,
         padded_vocab_start=shard.padded_vocab_start,
         padded_vocab_end=shard.padded_vocab_end,
+        tp_group=tp_group,
     )
 
 
@@ -55,7 +56,7 @@ def _meta_operands(rows: int = 2):
     return hidden, weight, lora_A, lora_B, token_ids
 
 
-def test_official_tp16_shards_match_sglang_padding_and_rank_order() -> None:
+def _assert_official_tp16_shards_match_sglang_padding_and_rank_order() -> None:
     shards = [glm52_lm_head_shard(rank) for rank in range(GLM52_LM_HEAD_TP_SIZE)]
 
     assert GLM52_LM_HEAD_PADDED_VOCAB_SIZE == GLM52_LM_HEAD_VOCAB_SIZE
@@ -72,7 +73,7 @@ def test_official_tp16_shards_match_sglang_padding_and_rank_order() -> None:
         glm52_lm_head_shard(16)
 
 
-def test_component_fails_closed_on_shard_ranges() -> None:
+def _assert_component_fails_closed_on_shard_ranges() -> None:
     component = _component(7)
     shard = glm52_lm_head_shard(7)
 
@@ -100,7 +101,7 @@ def test_component_fails_closed_on_shard_ranges() -> None:
         )
 
 
-def test_operand_contract_is_official_local_bf16_rank_one_and_stride_exact() -> None:
+def _assert_operand_contract_is_official_local_bf16_rank_one_and_stride_exact() -> None:
     component = _component()
     operands = _meta_operands()
     component._validate_operands(*operands, require_cuda=False)
@@ -158,7 +159,7 @@ def test_operand_contract_is_official_local_bf16_rank_one_and_stride_exact() -> 
         )
 
 
-def test_cpu_rejection_happens_before_sglang_import_or_group_use() -> None:
+def _assert_cpu_rejection_happens_before_sglang_import_or_group_use() -> None:
     before = {name for name in sys.modules if name == "sglang" or name.startswith("sglang.")}
     component = _component()
     hidden, weight, lora_A, lora_B, token_ids = _meta_operands()
@@ -170,7 +171,7 @@ def test_cpu_rejection_happens_before_sglang_import_or_group_use() -> None:
     assert after == before
 
 
-def test_rank_order_vocab_reshape_is_byte_exact_and_has_identity_token_mapping() -> None:
+def _assert_rank_order_vocab_reshape_is_byte_exact_and_has_identity_token_mapping() -> None:
     rows = 2
     local = GLM52_LM_HEAD_LOCAL_VOCAB_SIZE
     row_values = torch.arange(rows * local, dtype=torch.float32).reshape(rows, local)
@@ -196,22 +197,7 @@ def test_rank_order_vocab_reshape_is_byte_exact_and_has_identity_token_mapping()
         )
 
 
-def test_effective_factor_views_are_the_live_bf16_bytes() -> None:
-    component = _component(5)
-    lora_A = torch.arange(GLM52_LM_HEAD_HIDDEN_SIZE, dtype=torch.float32).sub_(101).div_(257).unsqueeze(0)
-    lora_B = torch.arange(GLM52_LM_HEAD_LOCAL_VOCAB_SIZE, dtype=torch.float32).sub_(503).div_(997).unsqueeze(1)
-    master_A = lora_A.clone()
-    master_B = lora_B.clone()
-
-    effective_A, effective_B = component.effective_factor_views(lora_A, lora_B)
-
-    assert torch.equal(effective_A.view(torch.uint8), master_A.to(torch.bfloat16).view(torch.uint8))
-    assert torch.equal(effective_B.view(torch.uint8), master_B.to(torch.bfloat16).view(torch.uint8))
-    assert torch.equal(lora_A, master_A)
-    assert torch.equal(lora_B, master_B)
-
-
-def test_local_fp32_surrogate_vjp_matches_standalone_qlora_reference() -> None:
+def _assert_local_fp32_surrogate_vjp_matches_standalone_qlora_reference() -> None:
     hidden = torch.arange(24, dtype=torch.float32).reshape(3, 8).sub_(7).div_(19).to(torch.bfloat16)
     weight = torch.arange(56, dtype=torch.float32).reshape(7, 8).sub_(23).div_(37).to(torch.bfloat16)
     effective_A = torch.arange(8, dtype=torch.float32).sub_(3).div_(11).reshape(1, 8).to(torch.bfloat16)
@@ -242,7 +228,19 @@ def test_local_fp32_surrogate_vjp_matches_standalone_qlora_reference() -> None:
     assert torch.equal(grad_B, reference_B.grad)
 
 
-def test_custom_boundary_is_grad_enabled_and_saves_effective_factor_bytes() -> None:
+def test_exact_lm_head_cpu_contract(monkeypatch) -> None:
+    _assert_official_tp16_shards_match_sglang_padding_and_rank_order()
+    _assert_component_fails_closed_on_shard_ranges()
+    _assert_tp_group_validation_rejects_size_order_rank_and_backend(monkeypatch)
+    monkeypatch.undo()
+    _assert_operand_contract_is_official_local_bf16_rank_one_and_stride_exact()
+    _assert_cpu_rejection_happens_before_sglang_import_or_group_use()
+    _assert_rank_order_vocab_reshape_is_byte_exact_and_has_identity_token_mapping()
+    _assert_local_fp32_surrogate_vjp_matches_standalone_qlora_reference()
+    _assert_custom_boundary_is_grad_enabled_and_saves_effective_factor_bytes()
+
+
+def _assert_custom_boundary_is_grad_enabled_and_saves_effective_factor_bytes() -> None:
     captures = {}
 
     class FakeComponent:
@@ -343,10 +341,9 @@ def test_identity_reference_gradient_is_unchanged_beside_filtered_row() -> None:
     assert torch.equal(actual[1], filtered[0])
 
 
-def test_tp_group_validation_rejects_size_order_rank_and_backend(monkeypatch) -> None:
-    component = _component(3)
+def _assert_tp_group_validation_rejects_size_order_rank_and_backend(monkeypatch) -> None:
     group = object()
-    component.bind_tp_group(group)
+    component = _component(3, tp_group=group)
     state = {
         "world": 16,
         "group_rank": 3,
@@ -450,7 +447,8 @@ def test_official_local_shard_literal_v2_bytes_tail_and_surrogate_gradients() ->
     weight_bytes = local_weight.view(torch.uint8).clone()
     A_bytes = lora_A.view(torch.uint8).clone()
     B_bytes = lora_B.view(torch.uint8).clone()
-    effective_A, effective_B = component.effective_factor_views(lora_A, lora_B)
+    effective_A = lora_A.detach().to(torch.bfloat16).contiguous()
+    effective_B = lora_B.detach().to(torch.bfloat16).contiguous()
 
     batch_info = lm_head_impl._single_adapter_lm_head_batch_info(device.index, rows)
     direct_base, _direct_lse = head_v2_full_logits_with_lse(hidden, local_weight)

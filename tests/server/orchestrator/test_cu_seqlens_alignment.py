@@ -24,6 +24,8 @@ from xorl.data.collators.packing_concat_collator import (
     PackingConcatCollator,
 )
 from xorl.data.collators.sequence_shard_collator import TextSequenceShardCollator
+from xorl.data.constants import IGNORE_INDEX
+from xorl.distributed import sync_padding
 from xorl.server.backend import DummyBackend
 from xorl.server.orchestrator.packing import SequentialPacker, unpack_per_token_outputs
 from xorl.server.orchestrator.request_processor import RequestProcessor
@@ -100,7 +102,7 @@ class TestCuSeqlensAlignmentAndDtype:
 
     @patch("xorl.server.orchestrator.packing.get_parallel_state")
     @patch("xorl.data.collators.packing_concat_collator.get_parallel_state")
-    def test_server_cli_match_dtype_and_edge_cases(self, mock_cli_ps, mock_server_ps):
+    def test_server_cli_sequence_metadata_and_padding_policy(self, mock_cli_ps, mock_server_ps, monkeypatch):
         """Test value match for 2/3 sequences, int32 dtype, single sample, SP enabled, and many short seqs."""
         mock_ps = Mock(cp_enabled=False, cp_size=1, cp_rank=0, ringattn_size=1)
         mock_cli_ps.return_value = mock_ps
@@ -150,18 +152,75 @@ class TestCuSeqlensAlignmentAndDtype:
         assert torch.equal(server_batch["cu_seq_lens_q"], expected)
         assert torch.equal(cli_batch["cu_seq_lens_q"], expected)
 
-    @patch("xorl.server.orchestrator.packing.get_parallel_state")
-    def test_sp_enabled_skips_cu_seqlens(self, mock_ps):
-        """When SP is enabled, packer should NOT compute cu_seq_lens."""
-        mock_ps.return_value = Mock(cp_enabled=True, cp_size=2, cp_rank=0, ringattn_size=1)
+        # SP owns sequence metadata after sharding, so the packer must not emit it.
+        mock_server_ps.return_value = Mock(cp_enabled=True, cp_size=2, cp_rank=0, ringattn_size=1)
         batch = _server_path_cu_seqlens([_make_datum([1, 2, 3]), _make_datum([4, 5])])[0]
         assert "cu_seq_lens_q" not in batch
+
+        TestOriginalPositionIdsAndPadding()._assert_sequence_shard_collator_preservation_and_stale_overwrite()
+        TestPadToMultipleWithSpSize()._assert_lcm_padding_and_collator_divisibility()
+        TestUnpackingWithPadding()._assert_padding_boundary_handling()
+        with monkeypatch.context() as sync_patch:
+            _assert_cross_rank_padding_extends_packed_sequence_metadata(sync_patch)
+
+
+def _assert_cross_rank_padding_extends_packed_sequence_metadata(monkeypatch):
+    monkeypatch.setattr(sync_padding.dist, "is_initialized", lambda: True)
+    monkeypatch.setattr(sync_padding.dist, "get_world_size", lambda group=None: 8)
+    monkeypatch.setattr(sync_padding, "get_device_type", lambda: "cpu")
+    monkeypatch.setattr(sync_padding, "get_parallel_state", lambda: Mock(cp_enabled=False))
+
+    def fake_all_reduce(tensor, op=None, group=None):
+        tensor.fill_(512)
+
+    monkeypatch.setattr(sync_padding.dist, "all_reduce", fake_all_reduce)
+
+    micro_batches = [
+        {
+            "input_ids": torch.ones(1, 176, dtype=torch.long),
+            "labels": torch.ones(1, 176, dtype=torch.long),
+            "position_ids": torch.arange(176).unsqueeze(0),
+            "attention_mask": torch.ones(1, 176, dtype=torch.long),
+            "cu_seq_lens_q": torch.tensor([0, 83, 167, 176], dtype=torch.int32),
+            "cu_seq_lens_k": torch.tensor([0, 83, 167, 176], dtype=torch.int32),
+            "max_length_q": torch.tensor(84, dtype=torch.int32),
+            "max_length_k": torch.tensor(84, dtype=torch.int32),
+        },
+        {
+            "input_ids": torch.ones(1, 512, dtype=torch.long),
+            "labels": torch.cat(
+                [torch.ones(176, dtype=torch.long), torch.full((336,), IGNORE_INDEX, dtype=torch.long)]
+            ).unsqueeze(0),
+            "position_ids": torch.arange(512).unsqueeze(0),
+            "attention_mask": torch.cat(
+                [torch.ones(176, dtype=torch.long), torch.zeros(336, dtype=torch.long)]
+            ).unsqueeze(0),
+            "cu_seq_lens_q": torch.tensor([0, 83, 167, 176], dtype=torch.int32),
+            "cu_seq_lens_k": torch.tensor([0, 83, 167, 176], dtype=torch.int32),
+            "max_length_q": torch.tensor(84, dtype=torch.int32),
+            "max_length_k": torch.tensor(84, dtype=torch.int32),
+        },
+    ]
+
+    sync_padding.synchronize_micro_batch_padding(micro_batches)
+
+    for micro_batch in micro_batches:
+        for name in ("input_ids", "labels", "position_ids", "attention_mask"):
+            assert micro_batch[name].shape[-1] == 512
+        assert torch.equal(micro_batch["labels"][0, 176:], torch.full((336,), IGNORE_INDEX))
+        assert micro_batch["attention_mask"][0, 176:].sum().item() == 0
+        assert micro_batch["cu_seq_lens_q"].tolist() == [0, 83, 167, 512]
+        assert micro_batch["cu_seq_lens_k"].tolist() == [0, 83, 167, 512]
+        assert micro_batch["max_length_q"] == 345
+        assert micro_batch["max_length_k"] == 345
+        assert isinstance(micro_batch["max_length_q"], int)
+        assert isinstance(micro_batch["max_length_k"], int)
 
 
 class TestOriginalPositionIdsAndPadding:
     """Verify _original_position_ids preservation, stale cu_seq_lens, and padding alignment."""
 
-    def test_sequence_shard_collator_preservation_and_stale_overwrite(self):
+    def _assert_sequence_shard_collator_preservation_and_stale_overwrite(self):
         """Test _original_position_ids preservation, no-pad, and stale cu_seq_lens overwrite."""
 
         # Preservation (SP size 2, 6 tokens)
@@ -252,7 +311,7 @@ class TestPadToMultipleWithSpSize:
     """Verify padding accounts for both pad_to_multiple_of and cp_size."""
 
     @patch("xorl.server.orchestrator.packing.get_parallel_state")
-    def test_lcm_padding_and_collator_divisibility(self, mock_ps):
+    def _assert_lcm_padding_and_collator_divisibility(self, mock_ps):
         """Test lcm-based padding, RequestProcessor computation, and collator output divisibility."""
         # cp_size=3, base=128 -> lcm=384
         mock_ps.return_value = Mock(cp_enabled=True, cp_size=3, cp_rank=0, ringattn_size=1)
@@ -313,7 +372,7 @@ class TestUnpackingWithPadding:
     """Verify that padding doesn't create spurious samples during unpacking."""
 
     @patch("xorl.server.orchestrator.packing.get_parallel_state")
-    def test_padding_boundary_handling(self, mock_ps):
+    def _assert_padding_boundary_handling(self, mock_ps):
         """Padding creates extra boundary; no padding has correct count."""
 
         mock_ps.return_value = Mock(cp_enabled=False, cp_size=1, cp_rank=0, ringattn_size=1)

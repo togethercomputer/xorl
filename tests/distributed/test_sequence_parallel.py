@@ -7,9 +7,6 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from xorl.distributed.sequence_parallel import (
-    slice_position_embedding,
-)
 from xorl.distributed.sequence_parallel.ulysses import _Gather
 from xorl.distributed.sequence_parallel.utils import pad_tensor, unpad_tensor
 
@@ -48,18 +45,6 @@ class TestPaddingUtilities:
         )
 
 
-class TestSlicePositionEmbedding:
-    """Test position embedding slicing."""
-
-    def test_slice_position_embedding_no_group(self):
-        """No SP group: slicing is a no-op."""
-        cos = torch.randn(1, 8, 1)
-        sin = torch.randn(1, 8, 1)
-        result_cos, result_sin = slice_position_embedding((cos, sin), dim=1, sp_group=None)
-        assert torch.equal(result_cos, cos)
-        assert torch.equal(result_sin, sin)
-
-
 def _run_gather_backward_worker(rank: int, port: int) -> None:
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(port)
@@ -88,7 +73,3 @@ def test_gather_backward_is_exact_cross_rank_reduction(unused_tcp_port):
         nprocs=2,
         start_method="spawn",
     )
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])

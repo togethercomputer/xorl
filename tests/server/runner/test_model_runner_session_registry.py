@@ -1,6 +1,5 @@
 """Tests for LoRA session-registry synchronization in ModelRunner."""
 
-import importlib.util
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,13 +7,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-
-_MODULE_PATH = Path(__file__).resolve().parents[3] / "src" / "xorl" / "server" / "runner" / "model_runner.py"
-_SPEC = importlib.util.spec_from_file_location("xorl_test_model_runner_session_registry", _MODULE_PATH)
-assert _SPEC is not None and _SPEC.loader is not None
-_MODULE = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(_MODULE)
-ModelRunner = _MODULE.ModelRunner
+import xorl.server.runner.model_runner as model_runner_module
+from xorl.server.runner.model_runner import ModelRunner
 
 
 pytestmark = [pytest.mark.cpu, pytest.mark.server]
@@ -75,6 +69,18 @@ class _FakeCheckpointManager:
         return {"success": True, "path": path, "model_id": model_id}
 
 
+class _KillSessionAdapterManager:
+    def __init__(self, has_adapter: bool) -> None:
+        self._has_adapter = has_adapter
+        self.removed = []
+
+    def has_adapter(self, model_id: str) -> bool:
+        return self._has_adapter
+
+    def remove_adapter(self, model_id: str) -> None:
+        self.removed.append(model_id)
+
+
 class _TinyModule(torch.nn.Module):
     def __init__(self) -> None:
         super().__init__()
@@ -107,11 +113,11 @@ def _build_runner() -> ModelRunner:
     return runner
 
 
-def test_optim_step_syncs_registered_lora_session_spec(monkeypatch):
+def test_lora_session_registry_syncs_after_optimizer_checkpoint_load_and_kill(monkeypatch, tmp_path):
     runner = _build_runner()
     runner._adapter_manager = _FakeAdapterManager(lr=0.05)
 
-    monkeypatch.setattr(_MODULE, "synchronize", lambda: None)
+    monkeypatch.setattr(model_runner_module, "synchronize", lambda: None)
 
     result = ModelRunner.optim_step(runner, gradient_clip=1.0, lr=0.25, model_id="policy-a")
 
@@ -119,8 +125,6 @@ def test_optim_step_syncs_registered_lora_session_spec(monkeypatch):
     assert runner._adapter_manager.optim_step_calls == [("policy-a", 0.25, 1.0)]
     assert runner._lora_session_specs["policy-a"]["optimizer_config"]["learning_rate"] == pytest.approx(0.25)
 
-
-def test_load_adapter_state_syncs_registered_lora_session_spec():
     runner = _build_runner()
     runner._adapter_manager = _FakeAdapterManager(lr=0.25)
     runner._checkpoint_mgr = _FakeCheckpointManager()
@@ -146,8 +150,52 @@ def test_load_adapter_state_syncs_registered_lora_session_spec():
     assert runner._lora_session_specs["policy-a"]["optimizer_config"]["learning_rate"] == pytest.approx(0.25)
     assert compiled_model_ids == ["policy-a"]
 
+    _assert_kill_session_nonresident_lora_checkpoint_lifecycle(tmp_path)
 
-def test_optim_step_preserves_distsignsgd_scaling_and_clip(monkeypatch):
+
+def _assert_kill_session_nonresident_lora_checkpoint_lifecycle(tmp_path: Path) -> None:
+    runner = object.__new__(ModelRunner)
+    runner.rank = 0
+    runner.lora_config = {"enable_lora": True}
+    runner.train_config = {"output_dir": str(tmp_path)}
+    runner._adapter_manager = _KillSessionAdapterManager(has_adapter=False)
+    runner._lora_session_specs = {
+        "policy-a": {
+            "base_model": "Qwen/Qwen3-8B",
+            "is_lora": True,
+        }
+    }
+    runner._accumulated_valid_tokens = {"policy-a": 17}
+
+    with pytest.raises(FileNotFoundError, match="no evicted checkpoint exists"):
+        runner.kill_session("policy-a", save_checkpoint=True)
+
+    assert "policy-a" in runner._lora_session_specs
+    assert runner._accumulated_valid_tokens["policy-a"] == 17
+    assert runner._adapter_manager.removed == []
+
+    evicted_path = tmp_path / "adapters" / "evicted" / "policy-a"
+    evicted_path.mkdir(parents=True)
+    (evicted_path / "metadata.json").write_text('{"saved": true}', encoding="utf-8")
+
+    result = runner.kill_session("policy-a", save_checkpoint=True)
+    promoted_path = tmp_path / "weights" / "policy-a" / "session_policy-a_final"
+
+    assert result == {
+        "success": True,
+        "message": "LoRA session 'policy-a' killed successfully.",
+        "checkpoint_path": str(promoted_path),
+    }
+    assert (promoted_path / "metadata.json").read_text(encoding="utf-8") == '{"saved": true}'
+    assert "policy-a" not in runner._lora_session_specs
+    assert "policy-a" not in runner._accumulated_valid_tokens
+    assert runner._adapter_manager.removed == []
+
+    with pytest.raises(ValueError, match="model_id"):
+        runner.kill_session("../../outside", save_checkpoint=True)
+
+
+def test_optim_step_preserves_distsignsgd_scaling_clip_and_cache_policy(monkeypatch):
     runner = object.__new__(ModelRunner)
     runner.rank = 0
     runner.is_sleeping = False
@@ -167,21 +215,21 @@ def test_optim_step_preserves_distsignsgd_scaling_and_clip(monkeypatch):
     captured = {}
 
     monkeypatch.setattr(
-        _MODULE,
+        model_runner_module,
         "get_parallel_state",
         lambda: type("ParallelState", (), {"fsdp_group": None, "pp_group": None})(),
     )
     monkeypatch.setattr(
-        _MODULE,
+        model_runner_module,
         "clip_gradients",
         lambda model, clip_value, pp_enabled=False, pp_group=None: (
             captured.update({"clip_value": clip_value, "grad": model.param.grad.item()}) or 7.0
         ),
     )
-    monkeypatch.setattr(_MODULE, "all_reduce", lambda value, group=None: value)
-    monkeypatch.setattr(_MODULE, "synchronize", lambda: None)
-    monkeypatch.setattr(_MODULE, "_maybe_merge_lora_util", lambda *args, **kwargs: None)
-    monkeypatch.setattr(_MODULE.torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(model_runner_module, "all_reduce", lambda value, group=None: value)
+    monkeypatch.setattr(model_runner_module, "synchronize", lambda: None)
+    monkeypatch.setattr(model_runner_module, "_maybe_merge_lora_util", lambda *args, **kwargs: None)
+    monkeypatch.setattr(model_runner_module.torch.cuda, "empty_cache", lambda: None)
 
     result = ModelRunner.optim_step(runner, model_id="default")
 
@@ -193,8 +241,6 @@ def test_optim_step_preserves_distsignsgd_scaling_and_clip(monkeypatch):
     assert result["grad_norm"] == pytest.approx(7.0)
     assert result["optim_empty_cache_skipped"] is False
 
-
-def test_optim_step_can_skip_empty_cache_after_optimizer_step(monkeypatch):
     runner = object.__new__(ModelRunner)
     runner.rank = 0
     runner.is_sleeping = False
@@ -203,7 +249,10 @@ def test_optim_step_can_skip_empty_cache_after_optimizer_step(monkeypatch):
     runner._accumulated_valid_tokens = {"default": 100}
     runner._accumulated_active_microbatches = {"default": 2}
     runner._accumulated_active_voter_total = {"default": 4}
-    runner.train_config = {"max_grad_norm": 1.0}
+    runner.train_config = {
+        "max_grad_norm": 1.0,
+        "skip_empty_cache_after_optim_step": True,
+    }
     runner.lora_config = {"enable_lora": False, "merge_lora_interval": 0}
     runner.model = _TinyModule()
     runner.model.param.grad = torch.tensor([4.0])
@@ -213,17 +262,16 @@ def test_optim_step_can_skip_empty_cache_after_optimizer_step(monkeypatch):
 
     empty_cache_calls = []
 
-    monkeypatch.setenv("XORL_SKIP_EMPTY_CACHE_AFTER_OPTIM_STEP", "1")
     monkeypatch.setattr(
-        _MODULE,
+        model_runner_module,
         "get_parallel_state",
         lambda: type("ParallelState", (), {"fsdp_group": None, "pp_group": None})(),
     )
-    monkeypatch.setattr(_MODULE, "clip_gradients", lambda *args, **kwargs: 7.0)
-    monkeypatch.setattr(_MODULE, "all_reduce", lambda value, group=None: value)
-    monkeypatch.setattr(_MODULE, "synchronize", lambda: None)
-    monkeypatch.setattr(_MODULE, "_maybe_merge_lora_util", lambda *args, **kwargs: None)
-    monkeypatch.setattr(_MODULE.torch.cuda, "empty_cache", lambda: empty_cache_calls.append("empty_cache"))
+    monkeypatch.setattr(model_runner_module, "clip_gradients", lambda *args, **kwargs: 7.0)
+    monkeypatch.setattr(model_runner_module, "all_reduce", lambda value, group=None: value)
+    monkeypatch.setattr(model_runner_module, "synchronize", lambda: None)
+    monkeypatch.setattr(model_runner_module, "_maybe_merge_lora_util", lambda *args, **kwargs: None)
+    monkeypatch.setattr(model_runner_module.torch.cuda, "empty_cache", lambda: empty_cache_calls.append("empty_cache"))
 
     result = ModelRunner.optim_step(runner, model_id="default")
 

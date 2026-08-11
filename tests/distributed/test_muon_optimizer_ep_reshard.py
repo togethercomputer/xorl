@@ -307,7 +307,7 @@ if __name__ != "__main__":
     # torch.cuda.is_available(); we just gate whether GPUs are exposed to the ranks.)
     _GPU_RANKS = torch.cuda.is_available() and torch.cuda.device_count() >= 4
 
-    def _run_case(save_ep: int, load_ep: int):
+    def _assert_case(save_ep: int, load_ep: int):
         extra_env = {
             "PYTHONPATH": os.path.join(REPO_ROOT, "src"),
             "XORL_TEST_SAVE_EP": str(save_ep),
@@ -327,21 +327,10 @@ if __name__ != "__main__":
 
     @pytest.mark.cpu
     @pytest.mark.distributed
-    def test_muon_momentum_reshard_ep2_to_ep4():
-        """Save under ep_size=2 (ep_fsdp=2), load under ep_size=4 (ep_fsdp=1)."""
-        _run_case(save_ep=2, load_ep=4)
-
-    @pytest.mark.cpu
-    @pytest.mark.distributed
-    def test_muon_momentum_reshard_ep4_to_ep2():
-        """Save under ep_size=4 (ep_fsdp=1), load under ep_size=2 (ep_fsdp=2)."""
-        _run_case(save_ep=4, load_ep=2)
-
-    @pytest.mark.cpu
-    @pytest.mark.distributed
-    def test_muon_momentum_same_ep_size_is_identity():
-        """Same-ep_size round-trip: numeric no-op (bit-identical momentum)."""
-        _run_case(save_ep=2, load_ep=2)
+    def test_muon_momentum_ep_reshard_transition_matrix():
+        """Both reshard directions and same-EP identity preserve global momentum."""
+        for save_ep, load_ep in ((2, 4), (4, 2), (2, 2)):
+            _assert_case(save_ep=save_ep, load_ep=load_ep)
 
 
 if __name__ == "__main__":

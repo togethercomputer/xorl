@@ -85,8 +85,8 @@ class TestDRGRPOLoss:
     Then update the assert_close(...) calls with the new values.
     """
 
-    def test_forward(self, inputs):
-        """Forward pass produces expected loss value (regression test)."""
+    def test_forward_backward_and_metrics(self, inputs):
+        """Forward value, gradients, and metric schema form one numerical contract."""
         d = inputs
         hidden_states = d["hidden_states"].clone().requires_grad_(True)
 
@@ -109,8 +109,27 @@ class TestDRGRPOLoss:
         # Default loss_reducer is TokenPartial(scale=mask.sum()); fixture has 4
         # active tokens of 8 → 2× the previous numel-scaled value.
         assert_close(output.loss, torch.tensor(0.727356))
+        expected_keys = {
+            "loss/ratio/mean",
+            "loss/kl_policy/mean",
+            "loss/clip/clipped_ratio/mean",
+            "loss/clip/high_fraction",
+            "loss/clip/low_fraction",
+            "loss/kl_ref/mean",
+        }
+        assert expected_keys <= output.metrics.keys()
 
-    def test_logprob_temperature_changes_behavior_k3(self):
+        output.loss.backward()
+        assert hidden_states.grad is not None
+        assert hidden_states.grad.isfinite().all()
+        assert_close(hidden_states.grad.norm(), torch.tensor(3.028616))
+
+        self._assert_zero_loss_boundaries(inputs)
+        self._assert_positive_advantages_encourage_high_prob(inputs)
+        self._assert_kl_penalty_requires_reference_and_affects_loss(inputs)
+        self._assert_logprob_temperature_changes_behavior_k3()
+
+    def _assert_logprob_temperature_changes_behavior_k3(self):
         hidden_states = torch.tensor([[[1.0, -0.5], [0.25, 0.75]]])
         weight = torch.tensor([[0.5, -1.0], [-0.25, 0.75], [1.0, 0.5]])
         labels = torch.tensor([[0, 2]])
@@ -146,33 +165,8 @@ class TestDRGRPOLoss:
         torch.testing.assert_close(raw.metrics["loss/kl_policy/mean"], torch.tensor(0.0), atol=1e-6, rtol=0.0)
         assert behavior.metrics["loss/kl_policy/mean"].abs() > 1e-6
 
-    def test_backward(self, inputs):
-        """Backward pass produces expected gradient norm (regression test)."""
-        d = inputs
-        hidden_states = d["hidden_states"].clone().requires_grad_(True)
-
-        output = drgrpo_loss_function(
-            hidden_states=hidden_states,
-            weight=d["weight"],
-            labels=d["labels_with_mask"],
-            old_logprobs=d["old_logprobs"],
-            advantages=d["advantages"],
-            ref_logprobs=d["ref_logprobs"],
-            ignore_index=d["ignore_index"],
-            clip_low=0.2,
-            clip_high=0.2,
-            beta=0.1,
-        )
-
-        output.loss.backward()
-        assert hidden_states.grad is not None
-        assert hidden_states.grad.isfinite().all()
-        # Regression test: expected value computed with seed=42 fixture inputs.
-        # Loss scaled 2× under new TokenPartial(scale=mask.sum()) default → grad scaled 2×.
-        assert_close(hidden_states.grad.norm(), torch.tensor(3.028616))
-
-    def test_zero_advantages(self, inputs):
-        """Zero advantages produce finite (near-zero) loss."""
+    def _assert_zero_loss_boundaries(self, inputs):
+        """Zero advantages, no trainable labels, and empty sequences remain finite and zero."""
         d = inputs
         advantages = torch.zeros_like(d["advantages"])
 
@@ -187,15 +181,9 @@ class TestDRGRPOLoss:
         )
 
         assert output.loss.isfinite()
-        # With zero advantages, policy gradient loss should be zero
         assert output.loss.abs() < 1e-5
 
-    def test_all_ignored_labels(self, inputs):
-        """Loss should be finite (zero) when all labels are ignored (no trainable tokens)."""
-        d = inputs
-        # Set all labels to ignore_index
         all_ignored = torch.full_like(d["labels"], d["ignore_index"])
-
         output = drgrpo_loss_function(
             hidden_states=d["hidden_states"],
             weight=d["weight"],
@@ -209,8 +197,6 @@ class TestDRGRPOLoss:
         assert output.loss.isfinite()
         assert output.loss == 0.0
 
-    def test_empty_sequence(self):
-        """Loss should be zero when sequence length is 0."""
         B, V, H = 2, 10, 16
         hidden_states = torch.empty(B, 0, H)
         weight = torch.randn(V, H)
@@ -230,23 +216,7 @@ class TestDRGRPOLoss:
         assert output.loss.isfinite()
         assert output.loss == 0.0
 
-    def test_requires_ref_logprobs_when_beta_positive(self, inputs):
-        """ValueError raised when beta > 0 but ref_logprobs is None."""
-        d = inputs
-
-        with pytest.raises(ValueError, match="ref_logprobs required"):
-            drgrpo_loss_function(
-                hidden_states=d["hidden_states"],
-                weight=d["weight"],
-                labels=d["labels_with_mask"],
-                old_logprobs=d["old_logprobs"],
-                advantages=d["advantages"],
-                ref_logprobs=None,
-                ignore_index=d["ignore_index"],
-                beta=0.1,
-            )
-
-    def test_positive_advantages_encourage_high_prob(self, inputs):
+    def _assert_positive_advantages_encourage_high_prob(self, inputs):
         """With positive advantages, higher target probability yields lower loss."""
         d = inputs
         B, S, V, H = d["B"], d["S"], d["V"], d["H"]
@@ -294,9 +264,21 @@ class TestDRGRPOLoss:
         # Higher probability should yield lower (more negative) loss
         assert loss_high.loss < loss_low.loss
 
-    def test_kl_penalty_affects_loss(self, inputs):
-        """KL penalty modifies loss when beta > 0."""
+    def _assert_kl_penalty_requires_reference_and_affects_loss(self, inputs):
+        """Positive KL weight requires reference logprobs and changes the loss."""
         d = inputs
+
+        with pytest.raises(ValueError, match="ref_logprobs required"):
+            drgrpo_loss_function(
+                hidden_states=d["hidden_states"],
+                weight=d["weight"],
+                labels=d["labels_with_mask"],
+                old_logprobs=d["old_logprobs"],
+                advantages=d["advantages"],
+                ref_logprobs=None,
+                ignore_index=d["ignore_index"],
+                beta=0.1,
+            )
 
         loss_no_kl = drgrpo_loss_function(
             hidden_states=d["hidden_states"],
@@ -323,35 +305,6 @@ class TestDRGRPOLoss:
         assert loss_with_kl.loss.isfinite()
         # KL metrics should be present when beta > 0
         assert "loss/kl_ref/mean" in loss_with_kl.metrics
-
-    def test_metrics_present(self, inputs):
-        """Output includes expected metrics."""
-        d = inputs
-
-        output = drgrpo_loss_function(
-            hidden_states=d["hidden_states"],
-            weight=d["weight"],
-            labels=d["labels_with_mask"],
-            old_logprobs=d["old_logprobs"],
-            advantages=d["advantages"],
-            ref_logprobs=d["ref_logprobs"],
-            ignore_index=d["ignore_index"],
-            clip_low=0.2,
-            clip_high=0.2,
-            beta=0.1,
-        )
-
-        expected_keys = [
-            "loss/ratio/mean",
-            "loss/kl_policy/mean",
-            "loss/clip/clipped_ratio/mean",
-            "loss/clip/high_fraction",
-            "loss/clip/low_fraction",
-            "loss/kl_ref/mean",
-        ]
-
-        for key in expected_keys:
-            assert key in output.metrics, f"Missing metric: {key}"
 
     def test_microbatch_composition(self, inputs):
         """Per-mb partial shares sum to single-batch values for both loss and metrics.

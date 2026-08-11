@@ -41,7 +41,7 @@ class _DummyCheckpointer:
         )
 
 
-def test_checkpoint_manager_materializes_skip_mode_and_omits_missing_optimizer(monkeypatch):
+def test_checkpoint_loading_lifecycle(monkeypatch):
     model = _MetaModel()
     checkpointer = _DummyCheckpointer()
     info_messages = []
@@ -74,8 +74,13 @@ def test_checkpoint_manager_materializes_skip_mode_and_omits_missing_optimizer(m
     assert "DCP zero-meta gate passed at post_to_empty: meta_parameters=0, meta_buffers=0" in info_messages
     assert "DCP zero-meta gate passed at post_dcp_restore: meta_parameters=0, meta_buffers=0" in info_messages
 
+    _assert_checkpoint_manager_zero_meta_gate_fails_before_and_after_restore(monkeypatch)
+    monkeypatch.undo()
+    _assert_model_runner_initial_checkpoint_restore_lifecycle()
+    _assert_default_adapter_initialization_never_snapshots_uninitialized_storage()
 
-def test_checkpoint_manager_fails_if_to_empty_leaves_meta_tensor(monkeypatch):
+
+def _assert_checkpoint_manager_zero_meta_gate_fails_before_and_after_restore(monkeypatch):
     class BrokenMaterializationModel(_MetaModel):
         def to_empty(self, *, device, recurse=True):  # noqa: ARG002
             self.to_empty_device = device
@@ -103,8 +108,6 @@ def test_checkpoint_manager_fails_if_to_empty_leaves_meta_tensor(monkeypatch):
 
     assert checkpointer.path is None
 
-
-def test_checkpoint_manager_fails_if_dcp_restore_leaves_meta_tensor(monkeypatch):
     class MetaAfterRestoreCheckpointer(_DummyCheckpointer):
         def load(self, path, state):
             super().load(path, state)
@@ -134,77 +137,60 @@ def test_checkpoint_manager_fails_if_dcp_restore_leaves_meta_tensor(monkeypatch)
     assert checkpointer.path == "/tmp/model-only-dcp"
 
 
-def test_model_runner_loads_initial_checkpoint_and_syncs_state():
+def _assert_model_runner_initial_checkpoint_restore_lifecycle():
     class FakeCheckpointManager:
-        def __init__(self):
+        def __init__(self, error=None):
             self.calls = []
             self.global_step = 13
             self.global_forward_backward_step = 17
+            self.error = error
 
         def load_state(self, checkpoint_path, load_optimizer=True):
             self.calls.append((checkpoint_path, load_optimizer))
+            if self.error is not None:
+                raise self.error
 
     runner = object.__new__(ModelRunner)
     runner.train_config = {"load_checkpoint_path": "/tmp/initial-dcp"}
     runner.global_step = 0
     runner.global_forward_backward_step = 0
     runner._checkpoint_mgr = FakeCheckpointManager()
+    runner._base_checkpoint_restore_complete = True
 
-    runner._load_initial_checkpoint()
+    runner._restore_initial_base_checkpoint()
 
     assert runner._checkpoint_mgr.calls == [("/tmp/initial-dcp", True)]
     assert runner.global_step == 13
     assert runner.global_forward_backward_step == 17
-
-
-def test_model_runner_can_skip_initial_checkpoint_optimizer_state():
-    class FakeCheckpointManager:
-        def __init__(self):
-            self.calls = []
-            self.global_step = 13
-            self.global_forward_backward_step = 17
-
-        def load_state(self, checkpoint_path, load_optimizer=True):
-            self.calls.append((checkpoint_path, load_optimizer))
+    assert runner._base_checkpoint_restore_complete is True
 
     runner = object.__new__(ModelRunner)
     runner.train_config = {"load_checkpoint_path": "/tmp/initial-dcp", "load_optimizer": False}
     runner.global_step = 0
     runner.global_forward_backward_step = 0
     runner._checkpoint_mgr = FakeCheckpointManager()
+    runner._base_checkpoint_restore_complete = True
 
-    runner._load_initial_checkpoint()
+    runner._restore_initial_base_checkpoint()
 
     assert runner._checkpoint_mgr.calls == [("/tmp/initial-dcp", False)]
     assert runner.global_step == 13
     assert runner.global_forward_backward_step == 17
-
-
-def test_model_runner_marks_base_restore_complete_only_after_success():
-    events = []
-    runner = object.__new__(ModelRunner)
-    runner._base_checkpoint_restore_complete = True
-
-    def restore():
-        events.append(("restore", runner._base_checkpoint_restore_complete))
-
-    runner._load_initial_checkpoint = restore
-
-    runner._restore_initial_base_checkpoint()
-
-    assert events == [("restore", False)]
     assert runner._base_checkpoint_restore_complete is True
 
-    def fail_restore():
-        raise RuntimeError("restore failed")
-
-    runner._load_initial_checkpoint = fail_restore
+    runner = object.__new__(ModelRunner)
+    runner.train_config = {"load_checkpoint_path": "/tmp/initial-dcp"}
+    runner.global_step = 0
+    runner.global_forward_backward_step = 0
+    runner._checkpoint_mgr = FakeCheckpointManager(RuntimeError("restore failed"))
+    runner._base_checkpoint_restore_complete = True
     with pytest.raises(RuntimeError, match="restore failed"):
         runner._restore_initial_base_checkpoint()
+    assert runner._checkpoint_mgr.calls == [("/tmp/initial-dcp", True)]
     assert runner._base_checkpoint_restore_complete is False
 
 
-def test_default_adapter_initialization_never_snapshots_uninitialized_storage():
+def _assert_default_adapter_initialization_never_snapshots_uninitialized_storage():
     class GuardedAdapterManager:
         def __init__(self):
             self.current_adapter_id = None

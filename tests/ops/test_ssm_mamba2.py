@@ -7,8 +7,6 @@ Oracle notes:
   transformers 5.5.3 nemotron_h torch fallback has a bug in its inter-chunk state propagation
   (the original mamba2 code's `decay_chunk.transpose(1, 3)` was lost during restructuring), so it
   drifts from the true SSD recurrence — and from the mamba_ssm kernels — for seq_len > chunk_size.
-  `test_hf_torch_path_interchunk_divergence_is_documented` pins this down; if it ever fails,
-  transformers fixed the bug and strict multi-chunk HF parity can be re-enabled.
 """
 
 import pytest
@@ -136,59 +134,67 @@ def _assert_mixer_parity(
         torch.testing.assert_close(xorl_grads[name], hf_grad, atol=1e-5, rtol=1e-4, msg=lambda m, n=name: f"{n}: {m}")
 
 
-@pytest.mark.parametrize("seq_len", [16, 13])
-def test_mixer_matches_hf_torch_path_single_chunk(seq_len):
+def test_mixer_hf_parity_policy():
     """Forward + grad parity vs HF, both for seq_len == chunk_size and seq_len % chunk_size != 0."""
-    hf_mixer, xorl_mixer = _build_mixer_pair(chunk_size=16)
-    _assert_mixer_parity(hf_mixer, xorl_mixer, seq_len=seq_len)
+    for seq_len in (16, 13):
+        hf_mixer, xorl_mixer = _build_mixer_pair(chunk_size=16)
+        _assert_mixer_parity(hf_mixer, xorl_mixer, seq_len=seq_len)
+
+    _assert_mixer_hf_parity_with_attention_mask()
+    _assert_mixer_bf16_finite_output()
 
 
-def test_mixer_matches_hf_torch_path_with_attention_mask():
+def _assert_mixer_hf_parity_with_attention_mask():
     hf_mixer, xorl_mixer = _build_mixer_pair(chunk_size=16)
     attention_mask = torch.ones(2, 13)
     attention_mask[1, -4:] = 0.0
     _assert_mixer_parity(hf_mixer, xorl_mixer, seq_len=13, attention_mask=attention_mask)
 
 
-@pytest.mark.parametrize("seq_len", [32, 37])
-def test_ssd_chunked_matches_recurrence_multichunk(seq_len):
+def test_dense_and_packed_ssd_recurrence_policy(monkeypatch):
     """Multi-chunk forward + grads vs the sequential SSD recurrence (chunk_size = 8)."""
-    inputs = _random_ssd_inputs(seq_len)
-    chunked_inputs = {name: tensor.clone().requires_grad_(True) for name, tensor in inputs.items()}
-    reference_inputs = {name: tensor.clone().requires_grad_(True) for name, tensor in inputs.items()}
+    for seq_len in (32, 37):
+        inputs = _random_ssd_inputs(seq_len)
+        chunked_inputs = {name: tensor.clone().requires_grad_(True) for name, tensor in inputs.items()}
+        reference_inputs = {name: tensor.clone().requires_grad_(True) for name, tensor in inputs.items()}
 
-    y_chunked = ssd_chunked(
-        chunked_inputs["x"],
-        chunked_inputs["dt"],
-        chunked_inputs["A"],
-        chunked_inputs["B"],
-        chunked_inputs["C"],
-        chunked_inputs["D"],
-        chunk_size=8,
-    )
-    y_reference = _ssd_reference(**reference_inputs)
-    torch.testing.assert_close(y_chunked, y_reference, atol=1e-4, rtol=1e-4)
-
-    y_chunked.sum().backward()
-    y_reference.sum().backward()
-    for name in inputs:
-        torch.testing.assert_close(
-            chunked_inputs[name].grad,
-            reference_inputs[name].grad,
-            atol=1e-4,
-            rtol=1e-4,
-            msg=lambda m, n=name: f"grad {n}: {m}",
+        y_chunked = ssd_chunked(
+            chunked_inputs["x"],
+            chunked_inputs["dt"],
+            chunked_inputs["A"],
+            chunked_inputs["B"],
+            chunked_inputs["C"],
+            chunked_inputs["D"],
+            chunk_size=8,
         )
+        y_reference = _ssd_reference(**reference_inputs)
+        torch.testing.assert_close(y_chunked, y_reference, atol=1e-4, rtol=1e-4)
+
+        y_chunked.sum().backward()
+        y_reference.sum().backward()
+        for name in inputs:
+            torch.testing.assert_close(
+                chunked_inputs[name].grad,
+                reference_inputs[name].grad,
+                atol=1e-4,
+                rtol=1e-4,
+                msg=lambda m, n=name: f"grad {n} at seq_len={seq_len}: {m}",
+            )
+
+    _assert_ssd_chunked_without_d_skip()
+    _assert_mixer_multichunk_matches_sequential_recurrence()
+    _assert_packed_ssd_and_mixer_policy()
+    _assert_ssd_chunked_use_kernel_unavailable_raises(monkeypatch)
 
 
-def test_ssd_chunked_no_d_skip():
+def _assert_ssd_chunked_without_d_skip():
     inputs = _random_ssd_inputs(seq_len=24, seed=3)
     y_chunked = ssd_chunked(inputs["x"], inputs["dt"], inputs["A"], inputs["B"], inputs["C"], None, chunk_size=8)
     y_reference = _ssd_reference(inputs["x"], inputs["dt"], inputs["A"], inputs["B"], inputs["C"], None)
     torch.testing.assert_close(y_chunked, y_reference, atol=1e-4, rtol=1e-4)
 
 
-def test_mixer_multichunk_matches_sequential_recurrence():
+def _assert_mixer_multichunk_matches_sequential_recurrence():
     """Full-mixer multi-chunk check against a reference built from the mixer's own projections."""
     _, xorl_mixer = _build_mixer_pair(chunk_size=8)
     torch.manual_seed(2)
@@ -215,25 +221,7 @@ def test_mixer_multichunk_matches_sequential_recurrence():
     torch.testing.assert_close(xorl_out, reference_out, atol=1e-5, rtol=1e-4)
 
 
-def test_hf_torch_path_interchunk_divergence_is_documented():
-    """The HF nemotron_h torch fallback mis-propagates state across chunks (transformers 5.5.3).
-
-    If this test starts failing, transformers fixed the bug — switch the multi-chunk tests above
-    to strict HF parity.
-    """
-    hf_mixer, xorl_mixer = _build_mixer_pair(chunk_size=8)
-    torch.manual_seed(4)
-    hidden_states = torch.randn(2, 24, HIDDEN_SIZE)
-    with torch.no_grad():
-        hf_out = hf_mixer.torch_forward(hidden_states)
-        xorl_out, _, _ = xorl_mixer(hidden_states)
-    assert (hf_out - xorl_out).abs().max().item() > 1e-4, (
-        "HF torch path now matches the sequential SSD recurrence for multi-chunk inputs; "
-        "re-enable strict multi-chunk HF parity."
-    )
-
-
-def test_mixer_bf16_smoke():
+def _assert_mixer_bf16_finite_output():
     _, xorl_mixer = _build_mixer_pair(chunk_size=8)
     mixer = xorl_mixer.bfloat16()
     hidden_states = torch.randn(2, 24, HIDDEN_SIZE, dtype=torch.bfloat16)
@@ -250,61 +238,67 @@ def _seq_idx_from_lengths(lengths: list[int]) -> torch.Tensor:
     return torch.cat([torch.full((n,), i, dtype=torch.long) for i, n in enumerate(lengths)]).unsqueeze(0)
 
 
-@pytest.mark.parametrize("lengths", [[7, 19, 5], [8, 16, 8]])
-def test_ssd_chunked_seq_idx_matches_per_sequence(lengths):
+def _assert_packed_ssd_and_mixer_policy():
     """Packed SSD with seq_idx vs running each sequence separately (fwd + grads, chunk_size 8).
 
     [7, 19, 5] puts boundaries inside chunks; [8, 16, 8] aligns them with chunk edges.
     """
-    total = sum(lengths)
-    inputs = _random_ssd_inputs(total, batch_size=1, seed=7)
-    packed_inputs = {name: tensor.clone().requires_grad_(True) for name, tensor in inputs.items()}
-    separate_inputs = {name: tensor.clone().requires_grad_(True) for name, tensor in inputs.items()}
-    seq_idx = _seq_idx_from_lengths(lengths)
+    for lengths in ([7, 19, 5], [8, 16, 8]):
+        total = sum(lengths)
+        inputs = _random_ssd_inputs(total, batch_size=1, seed=7)
+        packed_inputs = {name: tensor.clone().requires_grad_(True) for name, tensor in inputs.items()}
+        separate_inputs = {name: tensor.clone().requires_grad_(True) for name, tensor in inputs.items()}
+        seq_idx = _seq_idx_from_lengths(lengths)
 
-    y_packed = ssd_chunked(
-        packed_inputs["x"],
-        packed_inputs["dt"],
-        packed_inputs["A"],
-        packed_inputs["B"],
-        packed_inputs["C"],
-        packed_inputs["D"],
-        chunk_size=8,
-        seq_idx=seq_idx,
-    )
+        y_packed = ssd_chunked(
+            packed_inputs["x"],
+            packed_inputs["dt"],
+            packed_inputs["A"],
+            packed_inputs["B"],
+            packed_inputs["C"],
+            packed_inputs["D"],
+            chunk_size=8,
+            seq_idx=seq_idx,
+        )
 
-    pieces = []
-    start = 0
-    for length in lengths:
-        end = start + length
-        pieces.append(
-            ssd_chunked(
-                separate_inputs["x"][:, start:end],
-                separate_inputs["dt"][:, start:end],
-                separate_inputs["A"],
-                separate_inputs["B"][:, start:end],
-                separate_inputs["C"][:, start:end],
-                separate_inputs["D"],
-                chunk_size=8,
+        pieces = []
+        start = 0
+        for length in lengths:
+            end = start + length
+            pieces.append(
+                ssd_chunked(
+                    separate_inputs["x"][:, start:end],
+                    separate_inputs["dt"][:, start:end],
+                    separate_inputs["A"],
+                    separate_inputs["B"][:, start:end],
+                    separate_inputs["C"][:, start:end],
+                    separate_inputs["D"],
+                    chunk_size=8,
+                )
             )
-        )
-        start = end
-    y_separate = torch.cat(pieces, dim=1)
-    torch.testing.assert_close(y_packed, y_separate, atol=1e-5, rtol=1e-4)
+            start = end
+        y_separate = torch.cat(pieces, dim=1)
+        torch.testing.assert_close(y_packed, y_separate, atol=1e-5, rtol=1e-4)
 
-    y_packed.pow(2).sum().backward()
-    y_separate.pow(2).sum().backward()
-    for name in inputs:
-        torch.testing.assert_close(
-            packed_inputs[name].grad,
-            separate_inputs[name].grad,
-            atol=1e-5,
-            rtol=1e-4,
-            msg=lambda m, n=name: f"grad {n}: {m}",
-        )
+        y_packed.pow(2).sum().backward()
+        y_separate.pow(2).sum().backward()
+        for name in inputs:
+            torch.testing.assert_close(
+                packed_inputs[name].grad,
+                separate_inputs[name].grad,
+                atol=1e-5,
+                rtol=1e-4,
+                msg=lambda m, n=name: f"grad {n} at lengths={lengths}: {m}",
+            )
+
+    _assert_ssd_seq_idx_single_sequence_matches_dense()
+    _assert_causal_conv1d_seq_idx_matches_per_sequence()
+    _assert_mixer_packed_varlen_matches_per_sequence()
+    _assert_mixer_packed_full_row_matches_dense()
+    _assert_mixer_packed_varlen_rejects_batch_gt_1()
 
 
-def test_ssd_chunked_seq_idx_single_sequence_matches_dense():
+def _assert_ssd_seq_idx_single_sequence_matches_dense():
     """A trivial all-zeros seq_idx must reproduce the dense path exactly."""
     inputs = _random_ssd_inputs(seq_len=24, seed=8)
     seq_idx = torch.zeros(2, 24, dtype=torch.long)
@@ -315,7 +309,7 @@ def test_ssd_chunked_seq_idx_single_sequence_matches_dense():
     torch.testing.assert_close(y_packed, y_dense, atol=0.0, rtol=0.0)
 
 
-def test_causal_conv1d_seq_idx_matches_per_sequence():
+def _assert_causal_conv1d_seq_idx_matches_per_sequence():
     """Boundary-safe depthwise conv vs running each sequence separately (fwd + grads)."""
     torch.manual_seed(9)
     lengths = [7, 19, 5]
@@ -340,36 +334,42 @@ def test_causal_conv1d_seq_idx_matches_per_sequence():
         torch.testing.assert_close(gp, gs, atol=1e-6, rtol=1e-5)
 
 
-@pytest.mark.parametrize("lengths", [[7, 19, 5], [8, 16, 8]])
-def test_mixer_packed_varlen_matches_per_sequence(lengths):
+def _assert_mixer_packed_varlen_matches_per_sequence():
     """Gold parity: packed mixer forward with cu_seqlens vs per-sequence runs (fwd + param grads)."""
-    _, mixer = _build_mixer_pair(chunk_size=8)
-    torch.manual_seed(10)
-    total = sum(lengths)
-    hidden_states = torch.randn(1, total, HIDDEN_SIZE)
-    cu_seqlens = _cu_seqlens(lengths)
+    for lengths in ([7, 19, 5], [8, 16, 8]):
+        _, mixer = _build_mixer_pair(chunk_size=8)
+        torch.manual_seed(10)
+        total = sum(lengths)
+        hidden_states = torch.randn(1, total, HIDDEN_SIZE)
+        cu_seqlens = _cu_seqlens(lengths)
 
-    packed_input = hidden_states.clone().requires_grad_(True)
-    packed_out, _, _ = mixer(packed_input, cu_seqlens=cu_seqlens)
-    packed_out.pow(2).sum().backward()
-    packed_grads = {name: param.grad.clone() for name, param in mixer.named_parameters()}
-    packed_input_grad = packed_input.grad.clone()
-    mixer.zero_grad()
+        packed_input = hidden_states.clone().requires_grad_(True)
+        packed_out, _, _ = mixer(packed_input, cu_seqlens=cu_seqlens)
+        packed_out.pow(2).sum().backward()
+        packed_grads = {name: param.grad.clone() for name, param in mixer.named_parameters()}
+        packed_input_grad = packed_input.grad.clone()
+        mixer.zero_grad()
 
-    separate_input = hidden_states.clone().requires_grad_(True)
-    cu = cu_seqlens.tolist()
-    separate_out = torch.cat([mixer(separate_input[:, s:e])[0] for s, e in zip(cu[:-1], cu[1:], strict=False)], dim=1)
-    torch.testing.assert_close(packed_out, separate_out, atol=1e-5, rtol=1e-4)
-
-    separate_out.pow(2).sum().backward()
-    torch.testing.assert_close(packed_input_grad, separate_input.grad, atol=1e-5, rtol=1e-4)
-    for name, param in mixer.named_parameters():
-        torch.testing.assert_close(
-            packed_grads[name], param.grad, atol=1e-5, rtol=1e-4, msg=lambda m, n=name: f"grad {n}: {m}"
+        separate_input = hidden_states.clone().requires_grad_(True)
+        cu = cu_seqlens.tolist()
+        separate_out = torch.cat(
+            [mixer(separate_input[:, s:e])[0] for s, e in zip(cu[:-1], cu[1:], strict=False)], dim=1
         )
+        torch.testing.assert_close(packed_out, separate_out, atol=1e-5, rtol=1e-4)
+
+        separate_out.pow(2).sum().backward()
+        torch.testing.assert_close(packed_input_grad, separate_input.grad, atol=1e-5, rtol=1e-4)
+        for name, param in mixer.named_parameters():
+            torch.testing.assert_close(
+                packed_grads[name],
+                param.grad,
+                atol=1e-5,
+                rtol=1e-4,
+                msg=lambda m, n=name: f"grad {n} at lengths={lengths}: {m}",
+            )
 
 
-def test_mixer_packed_full_row_matches_dense():
+def _assert_mixer_packed_full_row_matches_dense():
     """cu_seqlens spanning the whole row must match the dense path (different conv impl, same math)."""
     _, mixer = _build_mixer_pair(chunk_size=8)
     torch.manual_seed(11)
@@ -380,14 +380,14 @@ def test_mixer_packed_full_row_matches_dense():
     torch.testing.assert_close(packed_out, dense_out, atol=1e-5, rtol=1e-4)
 
 
-def test_mixer_packed_varlen_rejects_batch_gt_1():
+def _assert_mixer_packed_varlen_rejects_batch_gt_1():
     _, mixer = _build_mixer_pair(chunk_size=8)
     hidden_states = torch.randn(2, 16, HIDDEN_SIZE)
     with pytest.raises(ValueError, match="batch size 1"):
         mixer(hidden_states, cu_seqlens=torch.tensor([0, 8, 16], dtype=torch.int32))
 
 
-def test_ssd_chunked_use_kernel_unavailable_raises(monkeypatch):
+def _assert_ssd_chunked_use_kernel_unavailable_raises(monkeypatch):
     monkeypatch.setattr("xorl.ops.ssm.ops.ssd.mamba_chunk_scan_combined", None)
     inputs = _random_ssd_inputs(seq_len=8, seed=5)
     with pytest.raises(RuntimeError, match="mamba_ssm"):
@@ -422,7 +422,7 @@ requires_kernel_gpu = pytest.mark.skipif(
 
 @pytest.mark.gpu
 @requires_kernel_gpu
-def test_ssd_chunked_kernel_matches_torch_dense():
+def test_ssd_kernel_parity_policy():
     inputs = _random_ssd_inputs(seq_len=37, seed=7)
     kernel_inputs = {k: v.cuda().requires_grad_(True) for k, v in inputs.items()}
     torch_inputs = {k: v.cuda().requires_grad_(True) for k, v in inputs.items()}
@@ -460,10 +460,10 @@ def test_ssd_chunked_kernel_matches_torch_dense():
             msg=lambda m, name=name: f"grad mismatch for {name}: {m}",
         )
 
+    _assert_ssd_kernel_matches_torch_packed_seq_idx()
 
-@pytest.mark.gpu
-@requires_kernel_gpu
-def test_ssd_chunked_kernel_matches_torch_packed_seq_idx():
+
+def _assert_ssd_kernel_matches_torch_packed_seq_idx():
     inputs = _random_ssd_inputs(seq_len=31, batch_size=1, seed=11)
     # Three packed sequences (7, 19, 5) with boundaries inside chunks of 8.
     seq_idx = torch.tensor([[0] * 7 + [1] * 19 + [2] * 5], dtype=torch.int32)

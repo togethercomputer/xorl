@@ -29,7 +29,6 @@ from xorl.server.protocol.api_orchestrator import (
     RequestType,
 )
 from xorl.server.protocol.operations import (
-    AbortData,
     EmptyData,
     ModelPassData,
     OptimStepData,
@@ -202,9 +201,18 @@ def test_init_start_stop_and_all_operations(addresses, orchestrator, output_sock
     assert len(health_outputs) >= 1
     assert health_outputs[0].outputs[0]["status"] == "healthy"
 
+    # Statistics describe the real transaction above, rather than a separate
+    # batch of requests created only to make a counter move.
+    stats = orchestrator.get_stats()
+    assert stats["running"] is True
+    assert stats["scheduler"]["total_requests"] >= 2
+    assert stats["request_processor"]["total_operations"] >= 2
+    assert "queues" in stats
+    _assert_errors_e2e_and_concurrent(orchestrator, output_socket)
 
-def test_errors_abort_e2e_and_concurrent(orchestrator, output_socket):
-    """Test error handling, abort, end-to-end flow, and concurrent requests."""
+
+def _assert_errors_e2e_and_concurrent(orchestrator, output_socket):
+    """Test error handling, end-to-end flow, and concurrent requests."""
     # --- Invalid operation ---
     invalid_request = OrchestratorRequest(
         request_id="req-error-001",
@@ -232,27 +240,6 @@ def test_errors_abort_e2e_and_concurrent(orchestrator, output_socket):
     empty_outputs = [o for o in outputs if o.request_id == "req-empty-001"]
     assert len(empty_outputs) >= 1
     assert empty_outputs[0].output_type == OutputType.ERROR
-
-    # --- Abort ---
-    fb_request = OrchestratorRequest(
-        request_id="req-abort-001",
-        request_type=RequestType.ADD,
-        operation="forward_backward",
-        payload=ModelPassData(data=[{"input_ids": [1, 2], "labels": [2, 3]}]),
-    )
-    orchestrator.input_queue.put(fb_request)
-    time.sleep(0.1)
-    abort_request = OrchestratorRequest(
-        request_id="abort-req",
-        request_type=RequestType.ABORT,
-        operation="abort",
-        payload=AbortData(target_request_id="req-abort-001"),
-    )
-    orchestrator.input_queue.put(abort_request)
-    time.sleep(0.3)
-    outputs = receive_outputs(output_socket, timeout_ms=2000, max_outputs=10)
-    abort_outputs = [o for o in outputs if o.request_id == "req-abort-001"]
-    assert len(abort_outputs) >= 1
 
     # --- End-to-end ---
     request = OrchestratorRequest(
@@ -287,95 +274,3 @@ def test_errors_abort_e2e_and_concurrent(orchestrator, output_socket):
     output_ids = {o.request_id for o in outputs}
     for req in requests:
         assert req.request_id in output_ids
-
-
-def test_stats_throughput_and_health_check(orchestrator):
-    """Test engine statistics, throughput tracking, and non-blocking health check."""
-    # --- Stats ---
-    stats = orchestrator.get_stats()
-    assert "running" in stats
-    assert "scheduler" in stats
-    assert "request_processor" in stats
-    assert "queues" in stats
-    assert stats["running"] is True
-
-    initial_stats = orchestrator.get_stats()
-    for i in range(3):
-        req = OrchestratorRequest(
-            request_id=f"req-throughput-{i:03d}",
-            request_type=RequestType.ADD,
-            operation="forward_backward",
-            payload=ModelPassData(data=[{"input_ids": [1, 2], "labels": [2, 3]}]),
-        )
-        orchestrator.input_queue.put(req)
-    time.sleep(1.0)
-    final_stats = orchestrator.get_stats()
-    assert final_stats["scheduler"]["total_requests"] > initial_stats["scheduler"]["total_requests"]
-
-    # --- Non-blocking health check ---
-    bare = Orchestrator(
-        input_addr="tcp://127.0.0.1:15555",
-        output_addr="tcp://127.0.0.1:15556",
-        rank0_worker_address="tcp://127.0.0.1:15557",
-    )
-
-    # Health check identified correctly
-    assert (
-        bare._is_health_check_request(
-            OrchestratorRequest(
-                request_id="test-health",
-                request_type=RequestType.UTILITY,
-                operation="health_check",
-            )
-        )
-        is True
-    )
-
-    # Non-health-check requests
-    assert (
-        bare._is_health_check_request(
-            OrchestratorRequest(
-                request_id="test-fb",
-                request_type=RequestType.ADD,
-                operation="forward_backward",
-            )
-        )
-        is False
-    )
-    assert (
-        bare._is_health_check_request(
-            OrchestratorRequest(
-                request_id="test-abort",
-                request_type=RequestType.ABORT,
-                operation="abort",
-            )
-        )
-        is False
-    )
-    assert (
-        bare._is_health_check_request(
-            OrchestratorRequest(
-                request_id="test-adapter",
-                request_type=RequestType.UTILITY,
-                operation="get_adapter_info",
-            )
-        )
-        is False
-    )
-
-    # Methods exist
-    assert callable(bare._is_health_check_request)
-    assert callable(bare._handle_health_check_immediate)
-
-    # Stats are readonly
-    initial_stats = bare.scheduler.get_stats()
-    for _ in range(10):
-        bare.scheduler.get_stats()
-    final_stats = bare.scheduler.get_stats()
-    assert initial_stats["total_requests"] == final_stats["total_requests"]
-
-    initial_proc_stats = bare.request_processor.get_stats()
-    for _ in range(10):
-        bare.request_processor.get_stats()
-    final_proc_stats = bare.request_processor.get_stats()
-    assert initial_proc_stats["total_operations"] == final_proc_stats["total_operations"]

@@ -1,9 +1,8 @@
 """CPU tests for NVFP4 weight-only QARL MoE expert fake-quant.
 
-Covers the in-place class-swap (parameter/identity preservation), the STE
-fake-quant of the two 3D GKN expert tensors, the __dict__-shadow mechanism that
-feeds the inherited forward, the eager backend path end-to-end on CPU, and the
-inject_qarl_into_model MoE wiring (nvfp4 allowed, fp8 rejected).
+Covers the in-place class-swap, the eager backend path end-to-end on CPU, and
+the inject_qarl_into_model MoE wiring (nvfp4 allowed, fp8 rejected). The exact
+3D fake-quant arithmetic and STE are owned by the quantization-op suite.
 """
 
 import pytest
@@ -34,7 +33,7 @@ def _make_experts(num_experts=4, hidden_dim=32, intermediate_size=16, impl="eage
 
 
 class TestClassSwap:
-    def test_swap_preserves_identity_and_attrs(self):
+    def _assert_conversion_identity_and_admission_policy(self):
         e = _make_experts()
         gup, down = e.gate_up_proj, e.down_proj
         out = convert_moe_experts_to_qarl(e, group_size=16)
@@ -48,61 +47,38 @@ class TestClassSwap:
         assert e.qarl_format == "nvfp4"
         assert e.moe_implementation == "eager"  # backend setting preserved
 
-    def test_idempotent(self):
+        self._assert_idempotent()
+        self._assert_rejects_non_experts()
+
+    def _assert_idempotent(self):
         e = convert_moe_experts_to_qarl(_make_experts())
         assert convert_moe_experts_to_qarl(e) is e
 
-    def test_rejects_non_experts(self):
+    def _assert_rejects_non_experts(self):
         with pytest.raises(TypeError):
             convert_moe_experts_to_qarl(nn.Linear(8, 8))
 
 
-class TestFakeQuantAndShadow:
-    def test_fake_quant_weights_lossy_with_ste(self):
-        e = convert_moe_experts_to_qarl(_make_experts())
-        gup_fq, down_fq = e._qarl_fake_quant_weights()
-        assert gup_fq.shape == e.gate_up_proj.shape
-        assert down_fq.shape == e.down_proj.shape
-        assert not torch.equal(gup_fq.detach(), e.gate_up_proj.detach())
-        assert not torch.equal(down_fq.detach(), e.down_proj.detach())
-        # STE: d(sum(fq))/d(param) == ones.
-        gup_fq.sum().backward()
-        down_fq.sum().backward()
-        torch.testing.assert_close(e.gate_up_proj.grad, torch.ones_like(e.gate_up_proj), rtol=0, atol=0)
-        torch.testing.assert_close(e.down_proj.grad, torch.ones_like(e.down_proj), rtol=0, atol=0)
-
-    def test_shadow_swaps_then_restores(self):
-        e = convert_moe_experts_to_qarl(_make_experts())
-        real_gup, real_down = e.gate_up_proj, e.down_proj
-        a = torch.zeros_like(real_gup)
-        b = torch.ones_like(real_down)
-        with e._qarl_shadow_weights(a, b):
-            assert e.gate_up_proj is a  # __dict__ shadow takes precedence
-            assert e.down_proj is b
-        assert e.gate_up_proj is real_gup  # real Parameters restored
-        assert e.down_proj is real_down
-
-
 class TestEagerForwardCPU:
-    def test_forward_lossy_and_grad(self):
-        e = convert_moe_experts_to_qarl(_make_experts(), group_size=16)
-        x = torch.randn(5, 32)
-        out = e(x, expert_idx=0)
-        assert out.shape == (5, 32)
-        assert torch.isfinite(out).all()
-        out.sum().backward()
-        assert e.gate_up_proj.grad is not None
-        assert e.down_proj.grad is not None
-
-    def test_differs_from_unquantized(self):
+    def _assert_eager_execution_and_weight_quantization_policy(self):
         ref = _make_experts()
         x = torch.randn(5, 32)
         out_ref = ref(x, expert_idx=1)
-        q = convert_moe_experts_to_qarl(_make_experts())  # same seed -> same init
+        q = convert_moe_experts_to_qarl(_make_experts(), group_size=16)
+        gate_up, down = q.gate_up_proj, q.down_proj
         out_q = q(x, expert_idx=1)
+        assert out_q.shape == (5, 32)
+        assert torch.isfinite(out_q).all()
         assert not torch.allclose(out_q, out_ref)
+        assert q.gate_up_proj is gate_up
+        assert q.down_proj is down
+        out_q.sum().backward()
+        assert q.gate_up_proj.grad is not None
+        assert q.down_proj.grad is not None
 
-    def test_disable_weight_quant_is_passthrough(self):
+        self._assert_disabled_weight_quant_is_passthrough()
+
+    def _assert_disabled_weight_quant_is_passthrough(self):
         ref = _make_experts()
         x = torch.randn(5, 32)
         out_ref = ref(x, expert_idx=2)
@@ -119,7 +95,7 @@ class TestInjectMoE:
         m.experts = _make_experts()
         return m
 
-    def test_inject_nvfp4_converts_experts_and_linear(self):
+    def _assert_injection_selection_and_admission_policy(self):
         m = self._model_with_experts()
         n = inject_qarl_into_model(m, quant_cfg=normalize_qarl_quant_cfg("nvfp4"))
         assert isinstance(m.experts, QARLMoEExperts)
@@ -127,26 +103,60 @@ class TestInjectMoE:
         assert n == 2  # 1 Linear + 1 MoE expert container
         assert m._qarl_config["moe_expert_modules"] == ["experts"]
 
-    def test_inject_fp8_rejects_moe(self):
+        self._assert_fp8_rejects_moe()
+        self._assert_target_modules_select_independently()
+
+    def _assert_fp8_rejects_moe(self):
         m = self._model_with_experts()
         with pytest.raises(ValueError, match="nvfp4"):
             inject_qarl_into_model(m, quant_cfg=normalize_qarl_quant_cfg("fp8"))
 
-    def test_target_modules_honored_for_experts(self):
-        """target_modules now gates the expert pass too: targeting only the Linear must
-        leave the experts unquantized (previously experts were always converted)."""
-        m = self._model_with_experts()
-        n = inject_qarl_into_model(m, quant_cfg=normalize_qarl_quant_cfg("nvfp4"), target_modules=["attn"])
-        assert isinstance(m.attn, QARLLinear)
-        assert not isinstance(m.experts, QARLMoEExperts)  # not targeted -> untouched
-        assert n == 1
-        assert m._qarl_config["moe_expert_modules"] == []
+    def _assert_target_modules_select_independently(self):
+        cases = [
+            ("attn", True, False, []),
+            ("experts", False, True, ["experts"]),
+        ]
+        for target, linear_wrapped, experts_wrapped, expert_modules in cases:
+            m = self._model_with_experts()
+            n = inject_qarl_into_model(
+                m,
+                quant_cfg=normalize_qarl_quant_cfg("nvfp4"),
+                target_modules=[target],
+            )
+            assert isinstance(m.attn, QARLLinear) is linear_wrapped
+            assert isinstance(m.experts, QARLMoEExperts) is experts_wrapped
+            assert n == 1
+            assert m._qarl_config["moe_expert_modules"] == expert_modules
 
-    def test_target_modules_can_select_experts(self):
-        """Targeting `experts` converts the expert container and leaves the Linear alone."""
-        m = self._model_with_experts()
-        n = inject_qarl_into_model(m, quant_cfg=normalize_qarl_quant_cfg("nvfp4"), target_modules=["experts"])
-        assert isinstance(m.experts, QARLMoEExperts)
-        assert not isinstance(m.attn, QARLLinear)
-        assert n == 1
-        assert m._qarl_config["moe_expert_modules"] == ["experts"]
+
+def test_nvfp4_moe_expert_conversion_execution_and_injection_policy():
+    TestClassSwap()._assert_conversion_identity_and_admission_policy()
+    TestEagerForwardCPU()._assert_eager_execution_and_weight_quantization_policy()
+    TestInjectMoE()._assert_injection_selection_and_admission_policy()
+    _assert_activation_quant_shadow_backend_lifecycle()
+
+
+def _assert_activation_quant_shadow_backend_lifecycle():
+    experts = convert_moe_experts_to_qarl(
+        _make_experts(impl="triton"),
+        quantize_weight=True,
+        quantize_activation=True,
+    )
+    assert isinstance(experts, QARLMoEExperts)
+    assert experts.moe_implementation == "triton"
+
+    with pytest.raises(RuntimeError):
+        with experts._qarl_shadow_moe_impl():
+            assert experts.moe_implementation == "triton_w4a4"
+            raise RuntimeError("boom")
+    assert experts.moe_implementation == "triton"
+
+    for implementation, quantize_activation in (("triton", False), ("eager", True)):
+        experts = convert_moe_experts_to_qarl(
+            _make_experts(impl=implementation),
+            quantize_weight=True,
+            quantize_activation=quantize_activation,
+        )
+        with experts._qarl_shadow_moe_impl():
+            assert experts.moe_implementation == implementation
+        assert experts.moe_implementation == implementation
