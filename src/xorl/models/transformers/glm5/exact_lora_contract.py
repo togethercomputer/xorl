@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 
-GLM52_EXACT_LORA_CONFIGS = frozenset({(1, 1), (16, 32)})
-
-
 def glm52_exact_lora_scaling(rank: int, alpha: int) -> float:
-    if (rank, alpha) not in GLM52_EXACT_LORA_CONFIGS:
+    if isinstance(rank, bool) or not isinstance(rank, int) or rank <= 0:
         raise ValueError(
-            "GLM-5.2 exact active LoRA requires rank=1 and alpha=1 or "
-            f"rank=16 and alpha=32; got rank={rank} and alpha={alpha}"
+            "GLM-5.2 exact active LoRA requires a positive integer rank; "
+            f"got rank={rank!r}"
+        )
+    if isinstance(alpha, bool) or not isinstance(alpha, int) or alpha <= 0:
+        raise ValueError(
+            "GLM-5.2 exact active LoRA requires a positive integer alpha; "
+            f"got alpha={alpha!r}"
         )
     return float(alpha) / float(rank)
 
 
-__all__ = ["GLM52_EXACT_LORA_CONFIGS", "glm52_exact_lora_scaling"]
+__all__ = ["glm52_exact_lora_scaling"]

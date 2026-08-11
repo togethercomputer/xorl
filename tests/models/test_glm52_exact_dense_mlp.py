@@ -165,10 +165,11 @@ def test_dense_mlp_forward_composes_fused_gate_up_production_activation_and_exac
 
 
 def test_dense_mlp_runtime_rank_alpha_contract_is_atomic_and_fails_before_forward() -> None:
-    with pytest.raises(ValueError, match="rank=1 and alpha=1"):
-        Glm52ExactTP1DenseMLP(8, 128, r=2, lora_alpha=1)
-    with pytest.raises(ValueError, match="rank=1 and alpha=1"):
-        Glm52ExactTP1DenseMLP(8, 128, r=1, lora_alpha=2)
+    rank_three = Glm52ExactTP1DenseMLP(8, 128, r=3, lora_alpha=7)
+    assert rank_three.down_proj.lora_A.shape == (3, 128)
+    assert rank_three.down_proj.lora_B.shape == (8, 3)
+    with pytest.raises(ValueError, match="positive integer rank"):
+        Glm52ExactTP1DenseMLP(8, 128, r=0, lora_alpha=1)
 
     module = _module()
     before = (
@@ -177,8 +178,8 @@ def test_dense_mlp_runtime_rank_alpha_contract_is_atomic_and_fails_before_forwar
         module.down_proj.active_r,
         module.down_proj.active_lora_alpha,
     )
-    with pytest.raises(ValueError, match="rank=1 and alpha=1"):
-        module.set_runtime_lora_config(2, 2)
+    with pytest.raises(ValueError, match="positive integer alpha"):
+        module.set_runtime_lora_config(1, 0)
     assert (
         module.active_r,
         module.active_lora_alpha,

@@ -80,10 +80,9 @@ def test_fused_gate_up_contract_is_one_native_leaf_with_four_logical_fp32_factor
     assert module.packed_weight_f32.requires_grad is False
     assert module.weight_scale_inv.requires_grad is False
 
-    with pytest.raises(ValueError, match="rank=1 and alpha=1"):
-        Glm52ExactTP1FusedGateUpBlockFP8QLoRA(8, 128, r=2)
-    with pytest.raises(ValueError, match="rank=1 and alpha=1"):
-        Glm52ExactTP1FusedGateUpBlockFP8QLoRA(8, 128, lora_alpha=2)
+    rank_three = Glm52ExactTP1FusedGateUpBlockFP8QLoRA(8, 128, r=3, lora_alpha=7)
+    assert rank_three.gate_proj.lora_A.shape == (3, 8)
+    assert rank_three.gate_proj.lora_B.shape == (128, 3)
     with pytest.raises(ValueError, match="bias-free"):
         Glm52ExactTP1FusedGateUpBlockFP8QLoRA(8, 128, bias=True)
     with pytest.raises(ValueError, match="rejects adaptive"):
@@ -95,10 +94,10 @@ def test_fused_gate_up_contract_is_one_native_leaf_with_four_logical_fp32_factor
     with pytest.raises(RuntimeError, match="explicit gate/up pair"):
         Glm52ExactTP1FusedGateUpBlockFP8QLoRA.from_linear(nn.Linear(8, 128, bias=False))
     module.set_runtime_lora_config(1, 1)
-    with pytest.raises(ValueError, match="rank=1 and alpha=1"):
-        module.set_runtime_lora_config(1, 2)
-    with pytest.raises(ValueError, match="rank=1 and alpha=1"):
-        module.set_runtime_lora_config(2, 1)
+    with pytest.raises(ValueError, match="positive integer rank"):
+        Glm52ExactTP1FusedGateUpBlockFP8QLoRA(8, 128, r=0)
+    with pytest.raises(ValueError, match="positive integer alpha"):
+        module.set_runtime_lora_config(1, 0)
 
 
 def test_fused_gate_up_loader_makes_gate_then_up_order_explicit_and_strict() -> None:

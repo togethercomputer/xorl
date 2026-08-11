@@ -1,7 +1,7 @@
 """Exact active-LoRA local partials for the GLM-5.2 shared expert.
 
 The admitted sampler executes the shared expert at genuine TP16.  Gate/up are
-merged-column projections with replicated rank-one A factors and output-row
+merged-column projections with replicated low-rank A factors and output-row
 sharded B factors.  Down is row parallel: its A input columns and frozen base
 columns are sharded, while B is replicated.  Each rank returns one unreduced
 BF16 partial; the already-versioned canonical MoE owner folds those partials
@@ -60,7 +60,7 @@ def _single_adapter_batch_info(device_index: int, rows: int, rank: int, scaling:
 
 
 class _SharedExpertProjection(NativeBlockFP8Linear):
-    """One frozen logical projection plus its FP32 rank-one masters."""
+    """One frozen logical projection plus its FP32 low-rank masters."""
 
     adapter_gradient_producer_family = "module_managed"
     fsdp_requires_full_precision = True

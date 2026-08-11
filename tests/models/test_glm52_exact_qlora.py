@@ -32,7 +32,7 @@ def _literal_cpu_value(base_weight, captures):
     return run
 
 
-def test_exact_tp1_wrapper_admits_only_rank1_alpha1_without_bias_or_aqn() -> None:
+def test_exact_tp1_wrapper_accepts_positive_rank_and_alpha_without_bias_or_aqn() -> None:
     module = _module()
 
     assert module.contract_version == GLM52_EXACT_TP1_QLORA_CONTRACT_VERSION
@@ -43,17 +43,19 @@ def test_exact_tp1_wrapper_admits_only_rank1_alpha1_without_bias_or_aqn() -> Non
     assert module.lora_A.dtype is torch.float32
     assert module.lora_B.dtype is torch.float32
 
-    with pytest.raises(ValueError, match="rank=1 and alpha=1"):
-        Glm52ExactTP1BlockFP8QLoRALinear(8, 6, r=2, lora_alpha=2)
+    rank_three = Glm52ExactTP1BlockFP8QLoRALinear(8, 6, r=3, lora_alpha=7)
+    assert rank_three.lora_A.shape == (3, 8)
+    assert rank_three.lora_B.shape == (6, 3)
+    assert rank_three.scaling == 7 / 3
     with pytest.raises(ValueError, match="bias-free"):
         Glm52ExactTP1BlockFP8QLoRALinear(8, 6, bias=True)
     with pytest.raises(ValueError, match="rejects adaptive quantization noise"):
         Glm52ExactTP1BlockFP8QLoRALinear(8, 6, enable_aqn=True)
     module.set_runtime_lora_config(1, 1)
-    with pytest.raises(ValueError, match="rank=1 and alpha=1"):
-        module.set_runtime_lora_config(1, 2)
-    with pytest.raises(ValueError, match="rank=1 and alpha=1"):
-        module.set_runtime_lora_config(2, 1)
+    with pytest.raises(ValueError, match="positive integer rank"):
+        Glm52ExactTP1BlockFP8QLoRALinear(8, 6, r=0)
+    with pytest.raises(ValueError, match="positive integer alpha"):
+        module.set_runtime_lora_config(1, 0)
 
 
 def test_exact_tp1_model_dtype_move_preserves_packed_state_master_dtype_and_identity() -> None:

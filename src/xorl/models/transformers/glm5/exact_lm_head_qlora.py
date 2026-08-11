@@ -6,7 +6,7 @@ weight.  Forward values come from the pinned public SGLang kernels in serving
 order:
 
 1. BF16 hidden/base-weight operands -> FP32 local base logits;
-2. literal segmented rank-one A SGEMM -> BF16 intermediate;
+2. literal segmented low-rank A SGEMM -> BF16 intermediate;
 3. literal segmented B SGEMM -> BF16 delta rounding and fused add/store into
    the FP32 base-logit buffer;
 4. rank-order TP16 vocabulary all-gather; and

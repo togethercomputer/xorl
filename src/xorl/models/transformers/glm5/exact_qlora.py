@@ -86,7 +86,7 @@ class Glm52ExactTP1BlockFP8QLoRALinear(BlockFP8QLoRALinear):
     """Canonical GLM-5.2 TP1 block-FP8 linear with active exact LoRA.
 
     This wrapper is intentionally narrower than :class:`BlockFP8QLoRALinear`.
-    It admits only the certified rank/alpha tuples, with bias and AQN disabled.
+    It admits positive rank/alpha configurations, with bias and AQN disabled.
     TP-sharded shared experts and the LM head have
     different physical programs and must use their own wrappers.
     """

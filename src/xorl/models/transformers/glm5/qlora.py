@@ -748,8 +748,8 @@ def prepare_glm52_block_fp8_qlora(
             glm52_exact_lora_scaling(adapter_rank, adapter_alpha)
         except ValueError as exc:
             raise ValueError(
-                "GLM-5.2 exact active-LoRA component requires adapter_rank=1 and adapter_alpha=1 "
-                "or adapter_rank=16 and adapter_alpha=32; "
+                "GLM-5.2 exact active-LoRA component requires positive integer "
+                "adapter_rank and adapter_alpha; "
                 f"got rank={adapter_rank}, alpha={adapter_alpha}"
             ) from exc
     targets = _expected_targets(model, config)

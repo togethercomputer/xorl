@@ -649,8 +649,11 @@ def _exact_glm52_rank1_server_config(tmp_path):
     }
 
 
-@pytest.mark.parametrize(("rank", "alpha"), ((1, 1), (16, 32)))
-def test_load_server_arguments_admits_exact_glm52_world16_tuples(tmp_path, rank, alpha):
+@pytest.mark.parametrize(
+    ("rank", "alpha"),
+    ((1, 1), (2, 3), (3, 7), (7, 11), (16, 32), (31, 47), (64, 128)),
+)
+def test_load_server_arguments_admits_any_positive_exact_glm52_rank(tmp_path, rank, alpha):
     payload = _exact_glm52_rank1_server_config(tmp_path)
     payload["lora"].update(lora_rank=rank, max_lora_rank=rank, lora_alpha=alpha)
     config_path = tmp_path / "server_config.yaml"

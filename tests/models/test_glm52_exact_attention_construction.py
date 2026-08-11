@@ -76,15 +76,15 @@ def test_glm52_exact_attention_component_preserves_complete_canonical_inventory(
     assert exact_dense_roots == {f"model.layers.{layer_idx}.mlp" for layer_idx in range(3)}
 
 
-@pytest.mark.parametrize(("rank", "alpha"), ((16, 16), (1, 2), (2, 1)))
-def test_glm52_exact_attention_component_rejects_non_rank1_alpha1_before_mutation(
+@pytest.mark.parametrize(("rank", "alpha"), ((0, 1), (1, 0), (-2, 1)))
+def test_glm52_exact_attention_component_rejects_nonpositive_rank_or_alpha_before_mutation(
     rank: int,
     alpha: int,
 ) -> None:
     config = _exact_attention_config()
     model = _meta_model(config)
 
-    with pytest.raises(ValueError, match="requires adapter_rank=1 and adapter_alpha=1"):
+    with pytest.raises(ValueError, match="must be positive"):
         prepare_glm52_block_fp8_qlora(model, config, adapter_rank=rank, adapter_alpha=alpha)
 
     assert not any("lora_" in name for name, _ in model.named_parameters())

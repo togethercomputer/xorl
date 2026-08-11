@@ -1254,7 +1254,12 @@ class ServerArguments:
         if self.lora_b_init_std and not (self.enable_lora or self.enable_qlora):
             raise ValueError("lora_b_init_std requires LoRA or QLoRA")
         if self.block_fp8_qlora_training:
-            exact_active_lora = (self.lora_rank, self.lora_alpha) in ((1, 1), (16, 32))
+            from xorl.models.transformers.glm5.exact_lora_contract import (  # noqa: PLC0415
+                glm52_exact_lora_scaling,
+            )
+
+            glm52_exact_lora_scaling(self.lora_rank, self.lora_alpha)
+            exact_active_lora = self.ep_dispatch == "alltoall"
             requirements = {
                 "enable_lora": (self.enable_lora, True),
                 "enable_qlora": (self.enable_qlora, True),

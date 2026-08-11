@@ -14,6 +14,7 @@ from xorl.models.transformers.glm5.exact_lm_head_qlora import (
     Glm52ExactTP16LmHeadSelectedLogprob,
     glm52_lm_head_shard,
 )
+from xorl.models.transformers.glm5.exact_lora_contract import glm52_exact_lora_scaling
 from xorl.models.transformers.glm5.exact_qlora import Glm52ExactTP1BlockFP8QLoRALinear
 from xorl.models.transformers.glm5.exact_routed_experts_qlora import (
     Glm52ExactEP16BlockFP8QLoRARoutedExperts,
@@ -21,7 +22,22 @@ from xorl.models.transformers.glm5.exact_routed_experts_qlora import (
 from xorl.models.transformers.glm5.exact_shared_expert_qlora import (
     Glm52ExactTP16SharedExpertBlockFP8QLoRA,
 )
-from xorl.ops.block_fp8_native import NativeBlockFP8Linear
+
+
+@pytest.mark.parametrize(("rank", "alpha"), ((1, 1), (2, 3), (3, 7), (7, 11), (16, 32), (31, 47), (64, 128)))
+def test_positive_rank_and_alpha_are_not_artificially_allowlisted(rank: int, alpha: int) -> None:
+    assert glm52_exact_lora_scaling(rank, alpha) == alpha / rank
+    module = Glm52ExactTP1BlockFP8QLoRALinear(
+        128, 256, r=rank, lora_alpha=alpha, device=torch.device("meta")
+    )
+    assert module.lora_A.shape == (rank, 128)
+    assert module.lora_B.shape == (256, rank)
+
+
+@pytest.mark.parametrize(("rank", "alpha"), ((0, 1), (-1, 1), (1, 0), (1, -1), (True, 1), (1, True)))
+def test_nonpositive_or_boolean_rank_alpha_are_rejected(rank, alpha) -> None:
+    with pytest.raises(ValueError, match="positive integer"):
+        glm52_exact_lora_scaling(rank, alpha)
 
 
 def test_rank16_alpha32_factor_shapes_cover_every_exact_glm_surface() -> None:
@@ -69,9 +85,12 @@ def test_rank16_alpha32_factor_shapes_cover_every_exact_glm_surface() -> None:
     assert head.max_lora_rank == 16
 
 
+@pytest.mark.parametrize(("rank", "alpha"), ((3, 7), (16, 32), (31, 47)))
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires Hopper CUDA")
-def test_rank16_dense_exact_value_matches_public_sglang_kernels_byte_for_byte() -> None:
+def test_arbitrary_rank_dense_exact_value_matches_public_sglang_kernels_byte_for_byte(
+    rank: int, alpha: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
     pytest.importorskip("sglang")
     if torch.cuda.get_device_capability()[0] != 9:
         pytest.skip("the exact GLM-5.2 component requires Hopper")
@@ -90,27 +109,25 @@ def test_rank16_dense_exact_value_matches_public_sglang_kernels_byte_for_byte() 
         .reshape(128, 128)
     )
     scales = torch.ones((1, 1), dtype=torch.float32, device=device)
-    native = NativeBlockFP8Linear(128, 128, device=device)
-    native.load_prequantized(weight, scales)
     exact = Glm52ExactTP1BlockFP8QLoRALinear(
-        128, 128, r=16, lora_alpha=32, device=device
+        128, 128, r=rank, lora_alpha=alpha, device=device
     )
     exact._source_fqn = "projection"
     exact._load_prequantized(lambda name: weight if name.endswith(".weight") else scales)
     with torch.no_grad():
         exact.lora_A.copy_(
-            torch.arange(16 * 128, dtype=torch.float32, device=device)
+            torch.arange(rank * 128, dtype=torch.float32, device=device)
             .remainder_(127)
             .sub_(63)
             .div_(256)
-            .reshape(16, 128)
+            .reshape(rank, 128)
         )
         exact.lora_B.copy_(
-            torch.arange(128 * 16, dtype=torch.float32, device=device)
+            torch.arange(128 * rank, dtype=torch.float32, device=device)
             .remainder_(113)
             .sub_(56)
             .div_(256)
-            .reshape(128, 16)
+            .reshape(128, rank)
         )
     inputs = (
         torch.arange(rows * 128, dtype=torch.float32, device=device)
@@ -126,8 +143,8 @@ def test_rank16_dense_exact_value_matches_public_sglang_kernels_byte_for_byte() 
         num_segments=1,
         seg_indptr=torch.tensor([0, rows], dtype=torch.int32, device=device),
         weight_indices=torch.zeros(1, dtype=torch.int32, device=device),
-        lora_ranks=torch.tensor([16], dtype=torch.int32, device=device),
-        scalings=torch.tensor([2.0], dtype=torch.float32, device=device),
+        lora_ranks=torch.tensor([rank], dtype=torch.int32, device=device),
+        scalings=torch.tensor([alpha / rank], dtype=torch.float32, device=device),
         max_len=rows,
         seg_lens=torch.tensor([rows], dtype=torch.int32, device=device),
         permutation=None,
@@ -136,7 +153,11 @@ def test_rank16_dense_exact_value_matches_public_sglang_kernels_byte_for_byte() 
     )
     effective_A = exact.lora_A.to(torch.bfloat16).contiguous()
     effective_B = exact.lora_B.to(torch.bfloat16).contiguous()
-    base = native(inputs)
+    base = torch.zeros((rows, 128), dtype=torch.bfloat16, device=device)
+    monkeypatch.setattr(
+        "xorl.models.transformers.glm5.exact_qlora._sglang_native_block_fp8_linear_value",
+        lambda *_args, **_kwargs: base.clone(),
+    )
     low = sgemm_lora_a_fwd(inputs, effective_A.unsqueeze(0), info)
     expected = sgemm_lora_b_fwd(
         low, effective_B.unsqueeze(0), info, base_output=base.clone()

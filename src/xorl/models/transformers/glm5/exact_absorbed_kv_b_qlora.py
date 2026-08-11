@@ -135,7 +135,7 @@ class Glm52ExactTP1AbsorbedKvBBlockFP8QLoRA(NativeBlockFP8Linear):
     adapter_gradient_producer_family = "module_managed"
     contract_version = GLM52_EXACT_TP1_ABSORBED_KV_B_QLORA_CONTRACT_VERSION
     logical_factor_names = ("lora_A", "lora_B")
-    max_lora_rank = 1
+    max_lora_rank: int
     fixed_graph_lora_slots = _GLM52_FIXED_GRAPH_LORA_SLOTS
 
     def __init__(
