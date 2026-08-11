@@ -6132,6 +6132,58 @@ class ModelRunner:
     # =========================================================================
 
     @staticmethod
+    def _gather_per_sample_k3_inputs(
+        k3_values: torch.Tensor,
+        valid_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Reassemble tokenwise K3 inputs before detecting packed samples.
+
+        Ulysses ranks own contiguous token shards. Computing sample boundaries
+        and means on each shard independently both splits samples at rank
+        boundaries and produces a different number of observer rows per rank.
+        Reassemble the tokenwise values first so every CP replica emits the same
+        full packed-sample result at the completion rendezvous.
+        """
+        position_ids = position_ids.view(1, -1) if position_ids.ndim == 1 else position_ids
+        batch_size = int(position_ids.shape[0])
+        if batch_size <= 0 or k3_values.numel() % batch_size != 0 or valid_mask.numel() != k3_values.numel():
+            raise ValueError(
+                "Per-sample K3 inputs have incompatible shapes: "
+                f"k3={tuple(k3_values.shape)}, valid={tuple(valid_mask.shape)}, "
+                f"position_ids={tuple(position_ids.shape)}"
+            )
+
+        ps = get_parallel_state()
+        if not ps.cp_enabled:
+            return k3_values.view(-1), valid_mask.view(-1), position_ids.reshape(-1)
+
+        local_tokens = k3_values.numel() // batch_size
+        original_seq_len = int(position_ids.shape[-1])
+        group = ps.sp_group
+        full_k3 = gather_outputs(
+            k3_values.reshape(batch_size, local_tokens),
+            gather_dim=-1,
+            padding_dim=-1,
+            unpad_dim_size=original_seq_len,
+            group=group,
+        )
+        full_valid = gather_outputs(
+            valid_mask.reshape(batch_size, local_tokens).to(dtype=torch.uint8),
+            gather_dim=-1,
+            padding_dim=-1,
+            unpad_dim_size=original_seq_len,
+            group=group,
+        ).bool()
+        if full_k3.shape != position_ids.shape or full_valid.shape != position_ids.shape:
+            raise RuntimeError(
+                "Per-sample K3 CP reassembly did not recover the original packed shape: "
+                f"k3={tuple(full_k3.shape)}, valid={tuple(full_valid.shape)}, "
+                f"position_ids={tuple(position_ids.shape)}"
+            )
+        return full_k3.reshape(-1), full_valid.reshape(-1), position_ids.reshape(-1)
+
+    @staticmethod
     def _compute_per_sample_k3(
         k3_values: torch.Tensor,
         valid_mask: torch.Tensor,
@@ -6439,20 +6491,13 @@ class ModelRunner:
                         )
                         log_ratio = new_lp - old_lp
                         k3_vals = (torch.exp(log_ratio) - log_ratio - 1.0).masked_fill(~_valid, 0.0)
-                        # position_ids and _original_position_ids are both kept
-                        # unsharded (full packed sequence length) for cu_seq_lens.
-                        # Slice to match local token count (k3_vals length) using
-                        # the Ulysses/CP shard boundaries.
                         _pos = micro_batch.get("_original_position_ids", micro_batch.get("position_ids"))
                         if _pos is not None:
-                            _pos_flat = _pos.view(-1)
-                            local_len = k3_vals.shape[0]
-                            if _pos_flat.shape[0] > local_len:
-                                # Slice position_ids to this rank's Ulysses shard
-                                ps = get_parallel_state()
-                                cp_rank = ps.ulysses_rank if ps.ulysses_enabled else 0
-                                start = cp_rank * local_len
-                                _pos_flat = _pos_flat[start : start + local_len]
+                            k3_vals, _valid, _pos_flat = self._gather_per_sample_k3_inputs(
+                                k3_vals,
+                                _valid,
+                                _pos,
+                            )
                             deferred_k3.append(
                                 {
                                     "k3_values": k3_vals.cpu(),
