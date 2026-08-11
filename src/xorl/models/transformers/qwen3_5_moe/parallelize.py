@@ -3,7 +3,6 @@
 from torch.distributed._tensor import Shard
 
 from ....distributed.parallel_plan import ParallelPlan
-from ...layers.moe import MoEBlock
 
 
 # TP plan for the base model (Qwen3_5MoeModel).
@@ -37,7 +36,8 @@ def unfuse_for_tp(model):
     for layer in model.model.layers:
         if getattr(layer, "self_attn", None) is not None and hasattr(layer.self_attn, "unfuse_for_tp"):
             layer.self_attn.unfuse_for_tp()
-        if isinstance(layer.mlp, MoEBlock):
+        # An MoE block exposes a shared expert; a dense MLP is the thing to unfuse.
+        if hasattr(layer.mlp, "shared_expert"):
             layer.mlp.shared_expert.unfuse_for_tp()
         else:
             layer.mlp.unfuse_for_tp()

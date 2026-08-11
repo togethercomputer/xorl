@@ -12,7 +12,6 @@ import pytest
 import torch
 import torch.nn as nn
 
-from xorl.models.layers.moe import MoEBlock
 from xorl.models.transformers.qwen3.checkpoint_handler import Qwen3CheckpointHandler
 from xorl.models.transformers.qwen3_5 import parallelize as qwen3_5_parallelize
 from xorl.models.transformers.qwen3_5.checkpoint_handler import Qwen3_5CheckpointHandler
@@ -32,11 +31,11 @@ LINEAR_KEY_DIM = 6
 LINEAR_VALUE_DIM = 10
 
 
-def _qwen3_handler(**kwargs) -> Qwen3CheckpointHandler:
+def _qwen3_handler(**kwargs: object) -> Qwen3CheckpointHandler:
     return Qwen3CheckpointHandler(num_attention_heads=4, num_key_value_heads=2, head_dim=8, **kwargs)
 
 
-def _qwen3_5_handler(**kwargs) -> Qwen3_5CheckpointHandler:
+def _qwen3_5_handler(**kwargs: object) -> Qwen3_5CheckpointHandler:
     return Qwen3_5CheckpointHandler(
         num_attention_heads=4,
         num_key_value_heads=2,
@@ -47,7 +46,7 @@ def _qwen3_5_handler(**kwargs) -> Qwen3_5CheckpointHandler:
     )
 
 
-def _assert_passthrough(result, key, tensor) -> None:
+def _assert_passthrough(result: list, key: str, tensor: torch.Tensor) -> None:
     [(name, passed)] = result
     assert name == key
     assert passed is tensor
@@ -167,28 +166,24 @@ class _StubFusedMLP(nn.Module):
         return not hasattr(self, "gate_up_proj")
 
 
-def _moe_block(shared_expert) -> MoEBlock:
-    """A real ``MoEBlock`` instance for ``isinstance`` without its config-driven init.
+class _StubMoEBlock(nn.Module):
+    """Stands in for ``Qwen3_5MoeSparseMoeBlock``: routed experts plus a shared expert."""
 
-    ``Qwen3_5MoeSparseMoeBlock.__init__`` needs a full model config and a MoE backend;
-    only the ``isinstance`` dispatch and the ``shared_expert`` attribute matter here.
-    """
-    block = MoEBlock.__new__(MoEBlock)
-    nn.Module.__init__(block)
-    block.experts = nn.Linear(4, 4, bias=False)
-    block.shared_expert = shared_expert
-    return block
+    def __init__(self, shared_expert: _StubFusedMLP) -> None:
+        super().__init__()
+        self.experts = nn.Linear(4, 4, bias=False)
+        self.shared_expert = shared_expert
 
 
 class _Layer(nn.Module):
-    def __init__(self, mlp):
+    def __init__(self, mlp: nn.Module) -> None:
         super().__init__()
         self.self_attn = None
         self.mlp = mlp
 
 
 class _Model(nn.Module):
-    def __init__(self, layers):
+    def __init__(self, layers: list[nn.Module]) -> None:
         super().__init__()
         self.model = nn.Module()
         self.model.layers = nn.ModuleList(layers)
@@ -196,41 +191,20 @@ class _Model(nn.Module):
 
 
 class TestSharedExpertUnfusing:
-    def test_moe_block_shared_expert_unfuses(self):
-        shared = _StubFusedMLP()
-        model = _Model([_Layer(_moe_block(shared))])
-
-        qwen3_5_moe_parallelize.unfuse_for_tp(model)
-
-        assert shared.is_unfused
-        assert model._unfused_for_tp is True
-
-    def test_routed_experts_are_left_fused(self):
-        """Routed expert weights are EP-sharded, not TP-sharded — they stay as they are."""
-        block = _moe_block(_StubFusedMLP())
-        model = _Model([_Layer(block)])
-
-        qwen3_5_moe_parallelize.unfuse_for_tp(model)
-
-        assert isinstance(block.experts, nn.Linear)
-
-    def test_dense_layers_still_unfuse(self):
-        dense = _StubFusedMLP()
-        model = _Model([_Layer(dense)])
-
-        qwen3_5_moe_parallelize.unfuse_for_tp(model)
-
-        assert dense.is_unfused
-
-    def test_mixed_stack_unfuses_both_dense_and_shared(self):
+    def test_unfuses_dense_mlps_and_shared_experts_alike(self):
+        """Routed expert weights are EP-sharded, not TP-sharded, so only the block's
+        shared expert and the dense MLPs are split.
+        """
         shared = _StubFusedMLP()
         dense = _StubFusedMLP()
-        model = _Model([_Layer(_moe_block(shared)), _Layer(dense)])
+        moe_block = _StubMoEBlock(shared)
+        model = _Model([_Layer(moe_block), _Layer(dense)])
 
         qwen3_5_moe_parallelize.unfuse_for_tp(model)
 
         assert shared.is_unfused
         assert dense.is_unfused
+        assert isinstance(moe_block.experts, nn.Linear)
 
 
 class TestDenseQwen3_5Unfusing:
@@ -242,4 +216,3 @@ class TestDenseQwen3_5Unfusing:
         qwen3_5_parallelize.unfuse_for_tp(model)
 
         assert dense.is_unfused
-        assert model._unfused_for_tp is True

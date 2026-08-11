@@ -949,8 +949,10 @@ def build_parallelize_model(
                         raise NotImplementedError("Tensor parallelism + LoRA is not currently supported.")
 
                 # Unfuse fused projections (qkv_proj, gate_up_proj) for TP compatibility.
-                # Skip when already unfused before parallelization: unfuse_for_tp
-                # deletes the fused module, so a second call raises AttributeError.
+                # Skip when the model is already unfused: unfuse_for_tp deletes the fused
+                # module, so a second call raises AttributeError. Reachable only for a
+                # MoE-only adapter set, whose MoEExpertsLoRA the LoraLinear check above
+                # does not catch; any LoraLinear is rejected before this point.
                 if hasattr(model_part, "unfuse_for_tp") and not getattr(model_part, "_unfused_for_tp", False):
                     if i == 0:
                         logger.info_rank0("Unfusing projections for tensor parallelism...")
@@ -1101,8 +1103,10 @@ def build_parallelize_model(
             raise NotImplementedError("Tensor parallelism + LoRA is not currently supported.")
 
         # Unfuse fused projections (qkv_proj, gate_up_proj) for TP compatibility.
-        # Skip when already unfused before parallelization: unfuse_for_tp deletes
-        # the fused module, so a second call raises AttributeError.
+        # Skip when the model is already unfused: unfuse_for_tp deletes the fused
+        # module, so a second call raises AttributeError. Reachable only for a
+        # MoE-only adapter set, whose MoEExpertsLoRA the LoraLinear check above
+        # does not catch; any LoraLinear is rejected before this point.
         if hasattr(model, "unfuse_for_tp") and not getattr(model, "_unfused_for_tp", False):
             logger.info_rank0("Unfusing projections for tensor parallelism...")
             model.unfuse_for_tp()

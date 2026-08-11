@@ -1839,7 +1839,8 @@ class LoRAArguments:
                 "Split fused qkv_proj / gate_up_proj before LoRA injection so q/k/v and "
                 "gate/up can be adapted. Without this they are stored fused, match no "
                 "target name, and train unadapted. Costs base-forward throughput: the "
-                "fused GEMMs split, and the MLP loses its fused SiLU-and-mul kernel."
+                "fused GEMMs split, and the MLP loses its fused SiLU-and-mul kernel. "
+                "Requires enable_lora; rejected with enable_qlora."
             )
         },
     )

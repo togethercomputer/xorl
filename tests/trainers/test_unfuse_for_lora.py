@@ -24,7 +24,7 @@ pytestmark = [pytest.mark.cpu]
 
 
 class _Unfusable(nn.Module):
-    def __init__(self, calls=None):
+    def __init__(self, calls: list[str] | None = None) -> None:
         super().__init__()
         self.calls = calls if calls is not None else []
         self.config = SimpleNamespace(num_experts=0, model_type="qwen3")
@@ -37,6 +37,14 @@ class _Unfusable(nn.Module):
 
 class _NotUnfusable(nn.Module):
     pass
+
+
+class _PlanWritingModel(_Unfusable):
+    """Mirrors the real ``unfuse_for_tp``, which also rewrites ``base_model_tp_plan``."""
+
+    def unfuse_for_tp(self):
+        super().unfuse_for_tp()
+        self.config.base_model_tp_plan = {"layers.*.self_attn.q_proj": "colwise"}
 
 
 class TestMaybeUnfuseProjections:
@@ -55,26 +63,61 @@ class TestMaybeUnfuseProjections:
         assert model.calls == ["unfuse"]
 
     def test_rejects_qlora(self):
-        """QLoRA targets the fused names, so unfusing would leave q/k/v and gate/up
-        both unquantized and unadapted while injection still reports success.
+        """Reject the QLoRA combination.
+
+        QLoRA targets the fused names, so unfusing would leave q/k/v and gate/up both
+        unquantized and unadapted while injection still reports success.
         """
         with pytest.raises(ValueError, match="not supported with QLoRA"):
             maybe_unfuse_projections(_Unfusable(), unfuse_for_lora=True, enable_lora=True, enable_qlora=True)
 
     def test_rejects_unfusing_without_lora(self):
-        """Splitting the GEMMs buys nothing if no adapter is going to use the names."""
+        """Reject unfusing without LoRA.
+
+        Splitting the GEMMs buys nothing if no adapter is going to use the names.
+        """
         with pytest.raises(ValueError, match="requires enable_lora"):
             maybe_unfuse_projections(_Unfusable(), unfuse_for_lora=True, enable_lora=False, enable_qlora=False)
 
     def test_raises_rather_than_silently_skipping(self):
-        """A silent skip is the exact failure mode this work exists to remove: the
-        targets would train unadapted while the config claims otherwise.
+        """Raise on an architecture that cannot unfuse.
+
+        A silent skip is the exact failure mode this work exists to remove: the targets
+        would train unadapted while the config claims otherwise.
         """
         with pytest.raises(NotImplementedError, match="cannot unfuse"):
             maybe_unfuse_projections(_NotUnfusable(), unfuse_for_lora=True, enable_lora=True, enable_qlora=False)
 
+    def test_leaves_no_tp_plan_on_the_config(self):
+        """The Trainer holds a reference to this config and save_pretrained's it into
+        every exported checkpoint, so a TP plan left behind by ``unfuse_for_tp`` would
+        ship in config.json — and it is always spurious here, since TP + LoRA is rejected.
+        """
+        model = _PlanWritingModel()
+
+        maybe_unfuse_projections(model, unfuse_for_lora=True, enable_lora=True, enable_qlora=False)
+
+        assert "base_model_tp_plan" not in model.config.__dict__
+
+    def test_restores_a_pre_existing_tp_plan(self):
+        """A plan the config already carried is the caller's, not ours to drop."""
+        model = _PlanWritingModel()
+        original = {"layers.*.mlp.down_proj": "rowwise"}
+        model.config.base_model_tp_plan = original
+
+        maybe_unfuse_projections(model, unfuse_for_lora=True, enable_lora=True, enable_qlora=False)
+
+        assert model.config.base_model_tp_plan == original
+
     def test_unsupported_architecture_is_fine_while_disabled(self):
-        maybe_unfuse_projections(_NotUnfusable(), unfuse_for_lora=False, enable_lora=True, enable_qlora=False)
+        """The disabled check must precede the capability check: an architecture that
+        cannot unfuse is only a problem when unfusing is actually requested.
+        """
+        model = _NotUnfusable()
+
+        maybe_unfuse_projections(model, unfuse_for_lora=False, enable_lora=True, enable_qlora=False)
+
+        assert not hasattr(model, "unfuse_for_tp")
 
 
 def _patch_builder(monkeypatch, model, calls):
@@ -115,8 +158,10 @@ class TestBuildTrainingModelOrdering:
         assert calls == ["unfuse", "inject", "parallelize"]
 
     def test_not_unfused_by_default(self, monkeypatch):
-        """Opt-in only: the inference-server ModelRunner shares this builder and must
-        keep its fused layout, which weight sync canonicalizes against.
+        """Stay fused unless asked.
+
+        The inference-server ModelRunner shares this builder and must keep its fused
+        layout, which weight sync canonicalizes against.
         """
         calls = []
         _patch_builder(monkeypatch, _Unfusable(calls), calls)
@@ -126,9 +171,11 @@ class TestBuildTrainingModelOrdering:
         assert calls == ["inject", "parallelize"]
 
     def test_merge_qkv_false_yields_to_unfuse_for_lora(self, monkeypatch):
-        """With both set, only the full unfuse runs. ``merge_qkv=False`` unfuses
-        attention per-layer, and running that after a full unfuse would raise
-        AttributeError, since unfuse_for_tp reads the fused weight before deleting it.
+        """With both set, only the full unfuse runs.
+
+        ``merge_qkv=False`` unfuses attention per-layer, and running that after a full
+        unfuse would raise AttributeError, since unfuse_for_tp reads the fused weight
+        before deleting it.
         """
         calls = []
         _patch_builder(monkeypatch, _Unfusable(calls), calls)

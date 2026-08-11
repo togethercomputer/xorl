@@ -138,9 +138,22 @@ lora:
 ```
 
 Cost: the fused GEMMs split (one qkv GEMM becomes three, one gate_up becomes two) and
-the MLP gives up its fused SiLU-and-mul kernel. Measured on Qwen3-14B over 8xH100,
-unfusing alone costs about **1.4%** step time; adapting all seven targets rather than
-two costs a further ~13%, which any wider-coverage approach pays.
+the MLP gives up its fused SiLU-and-mul kernel for the eager `act_fn(gate) * up` path.
+Measured on Qwen3-14B over 8xH100, unfusing alone costs about **1.4%** step time;
+adapting all seven targets rather than two costs a further ~13%, which any
+wider-coverage approach pays.
+
+That kernel change also moves numerics. An unfused trainer is no longer bitwise
+comparable with the fused layout an inference engine serves, so any workflow that
+compares trainer and generator logprobs — RL importance-sampling ratios above all —
+sees a divergence this flag introduces. The step-time numbers above are measured; the
+size of that divergence is not, and is worth quantifying before enabling the flag for
+an RL workload.
+
+The layout is fixed for a run's lifetime. Toggling the flag between runs renames
+`mlp.gate_up_proj.*` to `mlp.gate_proj.*` / `mlp.up_proj.*`, which checkpoint
+validation rejects with "Checkpoint incompatible with model" — resuming requires the
+same setting the checkpoint was written with.
 
 ## Key Parameters
 

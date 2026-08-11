@@ -161,21 +161,18 @@ def _find_target_modules(
     The algorithm processes modules top-down and skips children of replaced
     modules to avoid double-replacement.
 
+    Logs a warning for any requested target that matched no module, since it will
+    train unadapted. That check is satisfied by a single match anywhere, so a target
+    some modules carry and others lack stays silent: ``MoEExperts`` exposes
+    ``gate_proj``/``up_proj`` as properties, so routed experts satisfy those names
+    for the whole model even when a shared expert beside them is bare.
+
     Args:
         model: Model to search
         target_modules: List of module name patterns to match
 
     Returns:
         List of full module paths that match (in top-down order)
-
-    Warns:
-        When a requested target matched no module, since it will train unadapted.
-        The check is name-level and satisfied by a single module anywhere, so a
-        target that some modules carry and others lack does not warn -- notably
-        ``MoEExperts`` exposes ``gate_proj``/``up_proj`` as properties, so routed
-        experts satisfy those names for the whole model even when a shared expert
-        beside them is left bare. Verify coverage by full module path when that
-        distinction matters.
     """
     matched_paths = []
     replaced_prefixes: Set[str] = set()  # Track replaced module paths to skip their children
@@ -216,7 +213,7 @@ def _find_target_modules(
     # projection fused (qkv_proj / gate_up_proj), which no split name can reach.
     unmatched = sorted(set(target_modules) - matched_targets)
     if unmatched:
-        logger.warning(
+        logger.warning_rank0(
             f"LoRA targets matched no module and will train unadapted: {unmatched} "
             f"(adapted: {sorted(matched_targets)}). If this architecture stores them fused, "
             "either enable unfuse_for_lora or target the fused names directly."

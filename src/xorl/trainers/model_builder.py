@@ -1,8 +1,8 @@
 """Shared model build + LoRA/QLoRA injection + FSDP parallelization pipeline.
 
-Both the offline Trainer and the server ModelRunner call build_training_model()
-so that every feature (QLoRA, TP, DeepEP, …) is supported in both paths
-without reimplementation.
+The server ModelRunner calls build_training_model() so that every feature
+(QLoRA, TP, DeepEP, …) is supported without reimplementation. The offline Trainer
+builds its model directly and shares the individual helpers here instead.
 """
 
 from dataclasses import dataclass, field
@@ -168,7 +168,21 @@ def maybe_unfuse_projections(
             "directly."
         )
 
+    # unfuse_for_tp does two things: module surgery, which is what we want, and a
+    # config.base_model_tp_plan rewrite, which we do not. The Trainer keeps a reference
+    # to this config object and save_pretrained's it into every exported checkpoint, so
+    # leaving the plan behind ships a config.json advertising TP styles that are not HF
+    # ParallelInterface names. The write is always spurious here: this path requires
+    # LoRA, and TP + LoRA is rejected outright.
+    had_plan = "base_model_tp_plan" in model.config.__dict__
+    previous_plan = model.config.__dict__.get("base_model_tp_plan")
+
     model.unfuse_for_tp()
+
+    if had_plan:
+        model.config.base_model_tp_plan = previous_plan
+    else:
+        model.config.__dict__.pop("base_model_tp_plan", None)
     logger.info_rank0("Unfused qkv_proj / gate_up_proj so LoRA can adapt them")
 
 
