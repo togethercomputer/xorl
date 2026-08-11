@@ -229,8 +229,7 @@ def test_official_tp1_dense_vertical_composition_bytes_and_manual_vjp() -> None:
             base_output=raw_gate_up_base.clone(),
         )
         raw_activation = (
-            F.silu(raw_gate_up[:, :intermediate_size].float())
-            * raw_gate_up[:, intermediate_size:].float()
+            F.silu(raw_gate_up[:, :intermediate_size].float()) * raw_gate_up[:, intermediate_size:].float()
         ).to(torch.bfloat16)
         raw_down_base = triton_w8a8_block_fp8_linear(
             raw_activation,

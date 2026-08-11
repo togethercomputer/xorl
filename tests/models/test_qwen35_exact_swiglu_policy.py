@@ -31,6 +31,8 @@ def test_exact_glm52_dense_and_shared_mlp_select_fp32_swiglu():
     )
 
     assert Glm5MLP(config)._use_fused_silu
+
+
 def test_nonexact_qwen35_preserves_native_override():
     config = _config(exact=False, activation_native=True)
 
