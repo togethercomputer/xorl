@@ -26,6 +26,7 @@ from .transformers.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 from .transformers.deepseek_v3.support import validate_deepseek_v3_router_settings
 from .transformers.glm4_moe.configuration_glm4_moe import Glm4MoeConfig
 from .transformers.glm5.configuration_glm5 import Glm5Config
+from .transformers.glm5.exact_lora_contract import GLM52_EXACT_LORA_CONFIGS
 from .transformers.glm5.support import validate_glm5_router_settings, validate_glm5_sequence_parallel
 from .transformers.gpt_oss.configuration_gpt_oss import GptOssConfig
 from .transformers.minimax_m3.configuration_minimax_m3 import MiniMaxM3Config
@@ -812,7 +813,10 @@ def build_foundation_model(
     if block_fp8_qlora_training and not glm52_model:
         raise ValueError("block_fp8_qlora_training is supported only for the official GLM-5.2 model")
     exact_active_lora = bool(
-        server_training and glm52_model and block_fp8_qlora_training and (lora_rank, lora_alpha) == (1, 1)
+        server_training
+        and glm52_model
+        and block_fp8_qlora_training
+        and (lora_rank, lora_alpha) in GLM52_EXACT_LORA_CONFIGS
     )
     config._glm52_block_fp8_qlora = bool(block_fp8_qlora_training)
     config._glm52_exact_contract = bool(server_training and glm52_model and not block_fp8_qlora_training)
