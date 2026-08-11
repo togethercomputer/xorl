@@ -113,7 +113,9 @@ ten consecutive quiet minutes before claiming, then runs sampler-up → capture
    → Caches now live on pod-local `/dev/shm/sglang-cache`, seeded from
    `jit-cache-snapshot/` on weka and synced back after good runs.
 
-## Next steps
+## LANE CLOSED 2026-08-11 — see the qualification record in docs/k3/DSV4_FLASH_LORA_ZERO_K3_PLAN.md
+
+## Next steps (historical)
 
 1. Sampler-side tensor dump of the same frozen request (layers 0–2)
    — `window_capture_dump.sh` (auto-claims node 100, captures, releases).
