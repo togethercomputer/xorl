@@ -18,7 +18,7 @@ def main() -> None:
     parser.add_argument("--vocab-size", type=int, default=129280)
     args = parser.parse_args()
 
-    capture = torch.load(args.capture, map_location="cpu", weights_only=False)
+    capture = torch.load(args.capture, map_location="cpu", weights_only=True)
     prefix = f"model.layers.{args.layer}."
     logits = capture[prefix + "router_logits"][: args.rows].cuda().contiguous()
     input_ids = capture[prefix + "moe_native_gathered_ids"][: args.rows].cuda().contiguous()

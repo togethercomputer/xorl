@@ -1,9 +1,0 @@
-dumps/
-jit-cache/
-jit-cache-snapshot/
-adapter_zero/
-adapter_nonzero/
-adapter_nonzero_perturbed/
-trainer_output/
-*.log
-adapter_trained/

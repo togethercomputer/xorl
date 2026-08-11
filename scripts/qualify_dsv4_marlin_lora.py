@@ -194,7 +194,7 @@ def qualify(
             topk_ids.fill_(-1)
             topk_ids[:, :hot_experts] = torch.arange(hot_experts, dtype=torch.int32, device="cuda")
         if selected_experts_path is not None:
-            captured = torch.load(selected_experts_path, map_location="cpu", weights_only=False)
+            captured = torch.load(selected_experts_path, map_location="cpu", weights_only=True)
             if isinstance(captured, dict):
                 captured = captured["model.layers.0.router_selected_experts"]
             captured = captured.to(torch.int64)

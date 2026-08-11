@@ -208,10 +208,10 @@ time on optimizer or scale-out work before the forward contract is real.
 
 ## Qualification record (2026-08-11) — LANE CLOSED, K3 = 0
 
-All definition-of-done gates hold on the frozen WORLD8 lane (pod on
-research-common-h100-001; snapshot 60d8d707; torch-2.11 combined env at
-`submodules/xorl-sglang/.venv`; full continuity record with launch recipes and
-the divergence burn-down in `results/dsv4_flash_zero_k3/LANE_LOG.md`):
+All definition-of-done gates hold on the frozen WORLD8 lane with pinned
+trainer and sampler revisions and the Torch 2.11 combined environment. The
+campaign-only launch recipes, cluster paths, tensor traces, and raw replay
+artifacts are intentionally retained outside this production PR.
 
 1. **Base ruler**: 4-decision decode replay byte-equal at every retained
    decision (K3 = [0.0, 0.0, 0.0, 0.0]); sampler denominators byte-stable
@@ -240,8 +240,8 @@ the divergence burn-down in `results/dsv4_flash_zero_k3/LANE_LOG.md`):
    tensors, foreign checkpoint paths/symlinks, and mismatched base_model
    strings all raise instead of degrading.
 
-Nine byte-level root causes were repaired to close the ruler (see the
-burn-down table in the lane log): the batch-invariant router GEMM interpose,
+Nine byte-level root causes were repaired to close the ruler: the
+batch-invariant router GEMM interpose,
 replay row population, deduplicated shared RoPE buffers, the NCCL-tree EP
 combine order, the compressor APE layout, the compressor kv-score GEMM
 interpose, the batch-invariant standalone q-norm, CPU-vs-CUDA rope-table
