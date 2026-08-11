@@ -1,17 +1,21 @@
-"""DSV4-Flash native-EP combine: NCCL-tree-order contributor reproduction.
+"""DSV4-Flash native-EP combine over the shared canonical BF16 fold.
 
-ARCHITECTURE-SCOPED ON PURPOSE. The Qwen3.5/GLM exact lanes reduce MoE
-partials with the canonical adjacent-pair BF16 fold (``canonical_moe_fold_v1``
-in ``xorl.distributed.canonical_moe``); the DSV4-Flash serving contract
-instead pins ``NCCL_ALGO=allreduce:tree`` and the trainer reproduces the
-observed bitwise contributor order ``[1, 2, .., N-1, 0]`` as a
-left-associative BF16 chain. These are different byte programs: folding
-DSV4 through the generic adjacent-pair tree invalidates its 64-decision
-qualification (togethercomputer/xorl#45) and requires full requalification.
+Since the canonical-fold unification, DSV4 reduces MoE partials with the
+same version-1 adjacent-pair BF16 tree as the Qwen3.5/GLM exact lanes
+(``canonical_moe_fold_v1`` in ``xorl.distributed.canonical_moe``); serving
+mirrors this by routing its post-experts combine through the gated
+canonical all-reduce instead of relying on pinned NCCL tree behavior.
+The original NCCL-tree contributor-order reproduction (``[1, .., N-1, 0]``
+left-associative chain, togethercomputer/xorl#45) is retired; the fold
+switch changed serving bytes, so the unified program carries its own
+end-to-end qualification.
 
-The variable-row gather primitives are deliberately duplicated here rather
-than shared with the Qwen combine module so each architecture's byte
-contract can evolve (or be requalified) independently.
+What stays DSV4-specific is the TRANSPORT: dispatcher DP slices carry
+variable packed row counts, so partials are exchanged with per-rank splits
+(all-to-all) rather than Qwen's equal-count exchange. The variable-row
+gather primitives are deliberately duplicated here rather than shared with
+the Qwen combine module so each architecture's transport contract can
+evolve (or be requalified) independently.
 """
 
 from __future__ import annotations
@@ -133,40 +137,29 @@ def gather_ids_for_ep_combine(ids: torch.Tensor, group, padded_rows: int | None 
     return out
 
 
-def dsv4_nccl_tree_chain_order(ep_size: int) -> tuple[int, ...]:
-    """The DSV4-captured bitwise contributor order of NCCL_ALGO=allreduce:tree.
-
-    Captured 2026-08-11 on the EP8 qualification lane: the tree's result is a
-    left-associative BF16 chain seeded at rank 1, adding ranks 2..N-1, with
-    rank 0 last. Byte-verified against rank-0 serving dumps (40919/40960
-    columns matched with only expert-partial ulps outstanding at capture
-    time; end-to-end K3 = 0 after the remaining repairs).
-    """
-
-    validate_dsv4_native_ep_combine_size(ep_size)
-    return (*range(1, ep_size), 0)
-
-
-def exchange_variable_and_nccl_tree_chain_sum(
+def exchange_variable_and_canonical_fold(
     partial: torch.Tensor,
     group,
     row_counts: tuple[int, ...],
     local_rank: int,
 ) -> torch.Tensor:
-    """Variable-row partial exchange + the DSV4 NCCL-tree-order BF16 chain.
+    """Variable-row partial exchange + the shared canonical BF16 fold.
 
     ``partial`` contains every rank's live rows in destination-rank order.
-    Raw all-to-all returns this destination's rows from each source rank; the
-    final BF16 chain reproduces the serving contributor order (see
-    :func:`dsv4_nccl_tree_chain_order`).
+    Raw all-to-all returns this destination's rows from each source rank;
+    EP group-rank order is also DSV4's logical expert-slice ordinal order,
+    so the reshaped arrivals feed ``canonical_moe_fold_v1`` directly — the
+    same byte program serving evaluates through its gated canonical
+    post-experts all-reduce.
     """
 
+    from xorl.distributed.canonical_moe import canonical_moe_fold_v1  # noqa: PLC0415
     from xorl.distributed.moe.comm import _AllToAll  # noqa: PLC0415
 
     ep_size = len(row_counts)
     if not 0 <= local_rank < ep_size:
         raise ValueError(f"EP local rank {local_rank} is outside [0, {ep_size})")
-    chain_order = dsv4_nccl_tree_chain_order(ep_size)
+    validate_dsv4_native_ep_combine_size(ep_size)
     total_rows = sum(row_counts)
     if partial.shape[0] != total_rows:
         raise ValueError(f"Partial rows {partial.shape[0]} do not match live row total {total_rows}")
@@ -179,18 +172,14 @@ def exchange_variable_and_nccl_tree_chain_sum(
     )
     if local_rows == 0:
         return exchanged[:0]
-    seed = chain_order[0]
-    acc = exchanged[seed * local_rows : (seed + 1) * local_rows]
-    for source_rank in chain_order[1:]:
-        acc = acc + exchanged[source_rank * local_rows : (source_rank + 1) * local_rows]
-    return acc
+    logical_sources = exchanged.reshape(ep_size, local_rows, *exchanged.shape[1:])
+    return canonical_moe_fold_v1(logical_sources)
 
 
 __all__ = [
     "DSV4_NATIVE_EP_COMBINE_SIZES",
     "compact_rank_padded_rows",
-    "dsv4_nccl_tree_chain_order",
-    "exchange_variable_and_nccl_tree_chain_sum",
+    "exchange_variable_and_canonical_fold",
     "gather_ids_for_ep_combine",
     "gather_tokens_for_ep_combine",
     "max_rows_for_ep_combine",
