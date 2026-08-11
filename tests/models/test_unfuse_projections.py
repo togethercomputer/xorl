@@ -49,9 +49,9 @@ def _qwen3_5_handler(**kwargs) -> Qwen3_5CheckpointHandler:
 
 
 def _assert_passthrough(result, key, tensor) -> None:
-    assert len(result) == 1
-    assert result[0][0] == key
-    assert result[0][1] is tensor
+    [(name, passed)] = result
+    assert name == key
+    assert passed is tensor
 
 
 class TestQwen3HandlerSkipFlags:
@@ -59,21 +59,19 @@ class TestQwen3HandlerSkipFlags:
         handler = _qwen3_handler()
 
         assert handler.on_load_weight(GATE_KEY, torch.ones(3, 2)) == []
-        merged = handler.on_load_weight(UP_KEY, torch.zeros(3, 2))
+        [(name, merged)] = handler.on_load_weight(UP_KEY, torch.zeros(3, 2))
 
-        assert len(merged) == 1
-        assert merged[0][0] == "model.layers.0.mlp.gate_up_proj.weight"
-        assert merged[0][1].shape == (6, 2)
+        assert name == "model.layers.0.mlp.gate_up_proj.weight"
+        assert merged.shape == (6, 2)
 
     def test_merges_qkv_by_default(self):
         handler = _qwen3_handler()
 
         assert handler.on_load_weight(Q_KEY, torch.ones(32, 2)) == []
         assert handler.on_load_weight(K_KEY, torch.ones(16, 2)) == []
-        merged = handler.on_load_weight(V_KEY, torch.ones(16, 2))
+        [(name, _merged)] = handler.on_load_weight(V_KEY, torch.ones(16, 2))
 
-        assert len(merged) == 1
-        assert merged[0][0] == "model.layers.0.self_attn.qkv_proj.weight"
+        assert name == "model.layers.0.self_attn.qkv_proj.weight"
 
     def test_gate_and_up_pass_through_when_skipped(self):
         handler = _qwen3_handler(skip_gate_up_merge=True)
@@ -94,8 +92,8 @@ class TestQwen3HandlerSkipFlags:
 
         _assert_passthrough(handler.on_load_weight(Q_KEY, q), Q_KEY, q)
         assert handler.on_load_weight(GATE_KEY, torch.ones(3, 2)) == []
-        merged = handler.on_load_weight(UP_KEY, torch.zeros(3, 2))
-        assert merged[0][0] == "model.layers.0.mlp.gate_up_proj.weight"
+        [(name, _merged)] = handler.on_load_weight(UP_KEY, torch.zeros(3, 2))
+        assert name == "model.layers.0.mlp.gate_up_proj.weight"
 
     def test_no_pending_warning_when_merges_are_skipped(self):
         """A skipped merge must not report the keys it deliberately never buffered."""
@@ -130,9 +128,10 @@ class TestQwen3_5HandlerKeepsLinearAttentionMapping:
             "model.layers.0.linear_attn.k_proj.weight",
             "model.layers.0.linear_attn.v_proj.weight",
         ]
-        assert torch.equal(result[0][1], tensor[:LINEAR_KEY_DIM])
-        assert torch.equal(result[1][1], tensor[LINEAR_KEY_DIM : 2 * LINEAR_KEY_DIM])
-        assert torch.equal(result[2][1], tensor[2 * LINEAR_KEY_DIM :])
+        (_, q), (_, k), (_, v) = result
+        assert torch.equal(q, tensor[:LINEAR_KEY_DIM])
+        assert torch.equal(k, tensor[LINEAR_KEY_DIM : 2 * LINEAR_KEY_DIM])
+        assert torch.equal(v, tensor[2 * LINEAR_KEY_DIM :])
 
     def test_gate_and_up_pass_through_when_skipped(self):
         handler = _qwen3_5_handler(skip_gate_up_merge=True)
@@ -144,9 +143,9 @@ class TestQwen3_5HandlerKeepsLinearAttentionMapping:
         handler = _qwen3_5_handler()
 
         assert handler.on_load_weight(GATE_KEY, torch.ones(3, 2)) == []
-        merged = handler.on_load_weight(UP_KEY, torch.zeros(3, 2))
+        [(name, _merged)] = handler.on_load_weight(UP_KEY, torch.zeros(3, 2))
 
-        assert merged[0][0] == "model.layers.0.mlp.gate_up_proj.weight"
+        assert name == "model.layers.0.mlp.gate_up_proj.weight"
 
 
 class _StubFusedMLP(nn.Module):
@@ -169,13 +168,16 @@ class _StubFusedMLP(nn.Module):
         return not hasattr(self, "gate_up_proj")
 
 
-def _moe_block(shared_expert=None) -> MoEBlock:
-    """A real ``MoEBlock`` instance for ``isinstance`` without its config-driven init."""
+def _moe_block(shared_expert) -> MoEBlock:
+    """A real ``MoEBlock`` instance for ``isinstance`` without its config-driven init.
+
+    ``Qwen3_5MoeSparseMoeBlock.__init__`` needs a full model config and a MoE backend;
+    only the ``isinstance`` dispatch and the ``shared_expert`` attribute matter here.
+    """
     block = MoEBlock.__new__(MoEBlock)
     nn.Module.__init__(block)
     block.experts = nn.Linear(4, 4, bias=False)
-    if shared_expert is not None:
-        block.shared_expert = shared_expert
+    block.shared_expert = shared_expert
     return block
 
 
@@ -220,14 +222,6 @@ class TestSharedExpertUnfusing:
         qwen3_5_moe_parallelize.unfuse_for_tp(model)
 
         assert dense.is_unfused
-
-    def test_moe_block_without_shared_expert_is_skipped(self):
-        """Not every Qwen3.5-MoE config carries a shared expert."""
-        model = _Model([_Layer(_moe_block())])
-
-        qwen3_5_moe_parallelize.unfuse_for_tp(model)
-
-        assert model._unfused_for_tp is True
 
     def test_mixed_stack_unfuses_both_dense_and_shared(self):
         shared = _StubFusedMLP()

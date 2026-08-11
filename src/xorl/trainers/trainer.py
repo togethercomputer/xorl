@@ -763,7 +763,12 @@ class Trainer:
 
         # Unfuse projections — for LoRA coverage, or QKV-only for tensor parallelism.
         # Both must precede LoRA injection below and the weight load in _parallelize.
-        maybe_unfuse_projections(self.model, enabled=args.lora.unfuse_for_lora)
+        maybe_unfuse_projections(
+            self.model,
+            unfuse_for_lora=args.lora.unfuse_for_lora,
+            enable_lora=args.lora.enable_lora,
+            enable_qlora=args.lora.enable_qlora,
+        )
 
         if not args.model.merge_qkv and not args.lora.unfuse_for_lora:
             for layer in self.model.model.layers:

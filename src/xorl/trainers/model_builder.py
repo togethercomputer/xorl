@@ -106,32 +106,64 @@ def maybe_upcast_trainable_adapter_params(
     logger.info_rank0("Upcast trainable LoRA params to float32")
 
 
-def maybe_unfuse_projections(model: nn.Module, *, enabled: bool) -> None:
+def maybe_unfuse_projections(
+    model: nn.Module,
+    *,
+    unfuse_for_lora: bool,
+    enable_lora: bool = False,
+    enable_qlora: bool = False,
+) -> None:
     """Split fused ``qkv_proj`` / ``gate_up_proj`` into per-projection modules.
 
-    LoRA selects modules by name, so a projection stored fused is invisible to it:
-    ``q_proj`` / ``gate_proj`` and friends match nothing and are skipped with a
-    warning, leaving those weights adapted by nothing. Unfusing first turns them
-    into real modules, and as a side effect leaves every parameter name matching
-    the HuggingFace checkpoint, so weights load with no merge buffer.
+    LoRA selects modules by name, so a projection the model stores fused is invisible
+    to it: ``q_proj`` / ``gate_proj`` and friends match nothing and are skipped,
+    leaving those weights adapted by nothing. Unfusing first turns them into real
+    modules, which also leaves every parameter name matching the HuggingFace
+    checkpoint, so weights load with no merge buffer.
 
-    Reuses the tensor-parallel entry point, which does exactly this work; the
-    ``for_tp`` name predates its use here. Setting ``config.base_model_tp_plan``
-    on the way through is inert when TP is off — it is read only while building a
-    TP plan, and every affected config class already holds the identical plan.
+    Must run before LoRA injection and before weights are loaded: the underlying
+    ``unfuse_for_tp`` allocates fresh ``nn.Linear``s without copying from the fused
+    weight, so the checkpoint is what fills them.
 
-    Must run **before** LoRA injection and before weights are loaded:
-    ``unfuse_for_tp`` allocates fresh ``nn.Linear``s without copying from the
-    fused weight, so the checkpoint is what fills them.
+    Args:
+        model: Model to unfuse, in place.
+        unfuse_for_lora: Whether to unfuse at all. False is a no-op.
+        enable_lora: Whether plain LoRA is enabled for this run.
+        enable_qlora: Whether QLoRA is enabled for this run.
+
+    Raises:
+        ValueError: If unfusing is requested without plain LoRA, where it would only
+            cost throughput, or together with QLoRA, which targets the fused names.
+        NotImplementedError: If the architecture cannot unfuse its projections.
     """
-    if not enabled:
+    if not unfuse_for_lora:
         return
+
+    if enable_qlora:
+        # inject_qlora_into_model defaults its targets to the fused names
+        # ("qkv_proj", "gate_up_proj"). On an unfused model those match nothing while
+        # "o_proj"/"down_proj" still do, so injection succeeds with q/k/v/gate/up left
+        # unquantized and unadapted, and the packed checkpoint weights are then
+        # dispatched into plain bf16 parameters. Refuse rather than half-apply.
+        raise ValueError(
+            "unfuse_for_lora is not supported with QLoRA: QLoRA targets the fused module "
+            "names, so unfusing would leave q/k/v and gate/up both unquantized and "
+            "unadapted. Disable one of the two."
+        )
+
+    if not enable_lora:
+        raise ValueError(
+            "unfuse_for_lora requires enable_lora: without LoRA it only splits the fused "
+            "GEMMs and gives up the fused SiLU-and-mul kernel, costing throughput for no "
+            "benefit."
+        )
 
     if not hasattr(model, "unfuse_for_tp"):
         raise NotImplementedError(
             f"{type(model).__name__} cannot unfuse its projections, so LoRA would silently "
-            "skip any fused target. Implement unfuse_for_tp() on the architecture, or drop "
-            "the fused projections from the target list."
+            "skip every fused target. Either implement unfuse_for_tp() on the architecture, "
+            "or set unfuse_for_lora=false and target the fused names (qkv_proj, gate_up_proj) "
+            "directly."
         )
 
     model.unfuse_for_tp()
@@ -164,6 +196,10 @@ def build_training_model(
     lora_target_modules: Optional[List[str]] = None,
     lora_target_manifest: Optional[dict[str, Any] | str] = None,
     moe_hybrid_shared_lora: bool = False,
+    # Consumed by out-of-repo callers of this builder (the RL trainer) as well as
+    # `lora.unfuse_for_lora` on the offline Trainer. The inference-server ModelRunner
+    # deliberately does not pass it: weight sync canonicalizes trainer parameters to
+    # the fused names, so serving an unfused trainer model needs its own verification.
     unfuse_for_lora: bool = False,
     # --- QLoRA ---
     enable_qlora: bool = False,
@@ -334,7 +370,12 @@ def build_training_model(
     # Ordering matters: both forms must precede LoRA injection (step 3) and weight
     # loading (inside step 6), because unfusing allocates fresh Linears without
     # copying from the fused weight.
-    maybe_unfuse_projections(model, enabled=unfuse_for_lora)
+    maybe_unfuse_projections(
+        model,
+        unfuse_for_lora=unfuse_for_lora,
+        enable_lora=enable_lora,
+        enable_qlora=enable_qlora,
+    )
 
     if not merge_qkv and not unfuse_for_lora:
         for layer in model.model.layers:

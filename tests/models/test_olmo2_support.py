@@ -83,7 +83,16 @@ def _assert_olmo2_unfuse_for_tp_matches_hf_parameter_layout():
     assert not hasattr(layer.mlp, "gate_up_proj")
     assert hasattr(layer.mlp, "gate_proj")
     assert hasattr(layer.mlp, "up_proj")
-    assert model.get_checkpoint_handler() is None
+    # Unfused: the handler is still returned, with both merges disabled. It used to be
+    # dropped entirely, which also discarded everything else the handler does.
+    handler = model.get_checkpoint_handler()
+    assert handler is not None
+    assert handler._qkv_buffer is None
+    assert handler._gate_up_buffer is None
+    # HF's already-split keys therefore pass straight through to matching parameters.
+    key = "model.layers.0.self_attn.q_proj.weight"
+    passthrough = handler.on_load_weight(key, layer.self_attn.q_proj.weight.detach())
+    assert [name for name, _ in passthrough] == [key]
 
 
 def _assert_olmo2_checkpoint_handler_bidirectional_policy():

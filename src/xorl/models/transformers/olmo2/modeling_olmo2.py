@@ -224,8 +224,11 @@ class Olmo2PreTrainedModel(XorlPreTrainedModel):
             module.original_inv_freq = module.inv_freq
 
     def get_checkpoint_handler(self, **kwargs):
-        if getattr(self, "_unfused_for_tp", False):
-            return None
+        # When unfused, checkpoint keys (q_proj, k_proj, v_proj, gate_proj, up_proj)
+        # already match the model's parameter names, so both merges are skipped. The
+        # handler itself stays alive: it still carries the pre-quantized loading paths,
+        # which are independent of how the projections are stored.
+        unfused = getattr(self, "_unfused_for_tp", False)
 
         weights_path = kwargs.get("weights_path", None)
         is_prequantized = detect_prequantized_checkpoint(weights_path)
@@ -241,6 +244,8 @@ class Olmo2PreTrainedModel(XorlPreTrainedModel):
             num_attention_heads=self.config.num_attention_heads,
             num_key_value_heads=self.config.num_key_value_heads,
             head_dim=head_dim,
+            skip_qkv_merge=unfused,
+            skip_gate_up_merge=unfused,
             is_prequantized=is_prequantized,
             exclude_modules=exclude_modules,
             model=self if is_prequantized else None,

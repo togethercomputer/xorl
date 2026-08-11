@@ -38,12 +38,14 @@ class Llama3CheckpointHandler(CheckpointHandler):
         num_attention_heads: int,
         num_key_value_heads: int,
         head_dim: int,
+        skip_qkv_merge: bool = False,
+        skip_gate_up_merge: bool = False,
         is_prequantized: bool = False,
         exclude_modules: Optional[Set[str]] = None,
         model: Optional[nn.Module] = None,
     ):
-        self._gate_up_buffer = GateUpMergeBuffer()
-        self._qkv_buffer = QKVMergeBuffer()
+        self._gate_up_buffer: Optional[GateUpMergeBuffer] = None if skip_gate_up_merge else GateUpMergeBuffer()
+        self._qkv_buffer: Optional[QKVMergeBuffer] = None if skip_qkv_merge else QKVMergeBuffer()
         self._q_dim = num_attention_heads * head_dim
         self._kv_dim = num_key_value_heads * head_dim
         self._is_prequantized = is_prequantized
@@ -112,37 +114,41 @@ class Llama3CheckpointHandler(CheckpointHandler):
                 if OPROJ_WEIGHT_PATTERN.match(key) or DENSE_DOWN_PROJ_PATTERN.match(key):
                     return []
 
-        # QKV merge
-        if self._is_prequantized and key.endswith(".weight"):
-            if self._qkv_buffer.is_qkv_key(key):
-                return []
-        else:
-            qkv_result = self._qkv_buffer.add(key, tensor)
-            if qkv_result is not None:
-                return [qkv_result]
-            if self._qkv_buffer.is_qkv_key(key):
-                return []
+        # QKV merge (skipped when the model carries separate q/k/v projections)
+        if self._qkv_buffer is not None:
+            if self._is_prequantized and key.endswith(".weight"):
+                if self._qkv_buffer.is_qkv_key(key):
+                    return []
+            else:
+                qkv_result = self._qkv_buffer.add(key, tensor)
+                if qkv_result is not None:
+                    return [qkv_result]
+                if self._qkv_buffer.is_qkv_key(key):
+                    return []
 
-        # Gate/up merge
-        if self._is_prequantized and key.endswith(".weight"):
-            if self._gate_up_buffer.is_gate_up_key(key):
-                return []
-        else:
-            merge_result = self._gate_up_buffer.add(key, tensor)
-            if merge_result is not None:
-                return [merge_result]
-            if self._gate_up_buffer.is_gate_up_key(key):
-                return []
+        # Gate/up merge (skipped when the model carries separate gate/up projections)
+        if self._gate_up_buffer is not None:
+            if self._is_prequantized and key.endswith(".weight"):
+                if self._gate_up_buffer.is_gate_up_key(key):
+                    return []
+            else:
+                merge_result = self._gate_up_buffer.add(key, tensor)
+                if merge_result is not None:
+                    return [merge_result]
+                if self._gate_up_buffer.is_gate_up_key(key):
+                    return []
 
         return [(key, tensor)]
 
     def on_load_complete(self) -> List[Tuple[str, torch.Tensor]]:
-        pending_gu = self._gate_up_buffer.get_pending()
-        if pending_gu:
-            warnings.warn(f"Incomplete gate/up merge pairs after loading: {pending_gu}")
-        pending_qkv = self._qkv_buffer.get_pending()
-        if pending_qkv:
-            warnings.warn(f"Incomplete QKV merge groups after loading: {pending_qkv}")
+        if self._gate_up_buffer is not None:
+            pending_gu = self._gate_up_buffer.get_pending()
+            if pending_gu:
+                warnings.warn(f"Incomplete gate/up merge pairs after loading: {pending_gu}")
+        if self._qkv_buffer is not None:
+            pending_qkv = self._qkv_buffer.get_pending()
+            if pending_qkv:
+                warnings.warn(f"Incomplete QKV merge groups after loading: {pending_qkv}")
         if self._qlora_buffer is not None:
             self._qlora_buffer.set_inline_metadata()
         return []

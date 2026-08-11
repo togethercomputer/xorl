@@ -11,7 +11,7 @@ import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 import torch
 import torch.distributed as dist
@@ -170,6 +170,7 @@ def _find_target_modules(
     """
     matched_paths = []
     replaced_prefixes = set()  # Track replaced module paths to skip their children
+    matched_targets: Set[str] = set()
 
     for name, module in model.named_modules():
         # Skip if this module is under an already-matched parent
@@ -187,16 +188,31 @@ def _find_target_modules(
         if module_name in target_modules:
             matched_paths.append(name)
             replaced_prefixes.add(name)
+            matched_targets.add(module_name)
             continue
 
         # Indirect match: module has attributes/children matching target_modules
         # This handles MoE experts where user specifies "gate_proj" but the
         # actual module to replace is "experts" which contains gate_proj weights
         module_attrs = set(dir(module))
-        if any(target in module_attrs for target in target_modules):
+        indirect = {target for target in target_modules if target in module_attrs}
+        if indirect:
             matched_paths.append(name)
             replaced_prefixes.add(name)
+            matched_targets |= indirect
             continue
+
+    # A requested target that matched nothing trains unadapted. Injection only raises
+    # when *nothing* matched, so a 2-of-7 match is otherwise indistinguishable from
+    # success. The usual cause is the architecture storing that projection fused
+    # (qkv_proj / gate_up_proj), which no split target name can reach.
+    unmatched = sorted(set(target_modules) - matched_targets)
+    if unmatched:
+        logger.warning(
+            f"LoRA targets matched no module and will train unadapted: {unmatched} "
+            f"(adapted: {sorted(matched_targets)}). If this architecture stores them fused, "
+            f"either enable unfuse_for_lora or target the fused names directly."
+        )
 
     return matched_paths
 

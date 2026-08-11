@@ -106,10 +106,39 @@ lora:
   save_lora_only: true       # checkpoint only LoRA weights, not base model
 ```
 
-For QKV-fused models (default `merge_qkv: true`), target the fused projection names:
+## Fused projections
+
+Most architectures store the input-side projections fused — attention as a single
+`qkv_proj`, the dense MLP as a single `gate_up_proj`. Because LoRA selects modules by
+name, `q_proj` / `gate_proj` and friends match **nothing** on those models: they are
+skipped (with a warning) and train unadapted, leaving only `o_proj` and `down_proj`
+covered. Two ways to reach them.
+
+**Target the fused names.** Adapts each fused module as one target, at no throughput
+cost. One `lora_A` is shared across the halves, so this is a more constrained
+parameterization than two independent adapters, and the exported adapter carries fused
+key names — which do not line up with a HuggingFace base that stores them split:
+
 ```yaml
   lora_target_modules: [qkv_proj, gate_up_proj, down_proj, o_proj]
 ```
+
+**Unfuse before injection.** Splits the fused modules into real `q_proj`/`k_proj`/
+`v_proj` and `gate_proj`/`up_proj` first, so each gets an independent adapter and every
+exported key matches the HuggingFace layout. Requires `enable_lora`, and is rejected
+with `enable_qlora` (QLoRA targets the fused names):
+
+```yaml
+lora:
+  enable_lora: true
+  unfuse_for_lora: true
+  lora_target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+```
+
+Cost: the fused GEMMs split (one qkv GEMM becomes three, one gate_up becomes two) and
+the MLP gives up its fused SiLU-and-mul kernel. Measured on Qwen3-14B over 8xH100,
+unfusing alone costs about **1.4%** step time; adapting all seven targets rather than
+two costs a further ~13%, which any wider-coverage approach pays.
 
 ## Key Parameters
 
@@ -119,6 +148,7 @@ For QKV-fused models (default `merge_qkv: true`), target the fused projection na
 | `lora_rank` | `16` | Rank r of the low-rank decomposition |
 | `lora_alpha` | `32` | Scaling factor; effective LR scale = alpha/rank |
 | `lora_target_modules` | `null` | List of module name patterns to inject LoRA into |
+| `unfuse_for_lora` | `false` | Split fused `qkv_proj`/`gate_up_proj` before injection so q/k/v and gate/up can be adapted |
 | `save_lora_only` | `false` | Save only LoRA weights in checkpoints |
 
 ## LoRA with MoE Models

@@ -53,12 +53,8 @@ class Qwen3CheckpointHandler(CheckpointHandler):
         exclude_modules: Optional[Set[str]] = None,
         model: Optional[nn.Module] = None,
     ):
-        self._gate_up_buffer: Optional[GateUpMergeBuffer] = None
-        if not skip_gate_up_merge:
-            self._gate_up_buffer = GateUpMergeBuffer()
-        self._qkv_buffer: Optional[QKVMergeBuffer] = None
-        if not skip_qkv_merge:
-            self._qkv_buffer = QKVMergeBuffer()
+        self._gate_up_buffer: Optional[GateUpMergeBuffer] = None if skip_gate_up_merge else GateUpMergeBuffer()
+        self._qkv_buffer: Optional[QKVMergeBuffer] = None if skip_qkv_merge else QKVMergeBuffer()
         self._q_dim = num_attention_heads * head_dim
         self._kv_dim = num_key_value_heads * head_dim
         self._is_prequantized = is_prequantized

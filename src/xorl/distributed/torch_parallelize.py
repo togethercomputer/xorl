@@ -948,7 +948,9 @@ def build_parallelize_model(
                     if any(isinstance(m, LoraLinear) for m in model_part.modules()):
                         raise NotImplementedError("Tensor parallelism + LoRA is not currently supported.")
 
-                # Unfuse fused projections (qkv_proj, gate_up_proj) for TP compatibility
+                # Unfuse fused projections (qkv_proj, gate_up_proj) for TP compatibility.
+                # Skip when already unfused before parallelization: unfuse_for_tp
+                # deletes the fused module, so a second call raises AttributeError.
                 if hasattr(model_part, "unfuse_for_tp") and not getattr(model_part, "_unfused_for_tp", False):
                     if i == 0:
                         logger.info_rank0("Unfusing projections for tensor parallelism...")
@@ -1098,7 +1100,9 @@ def build_parallelize_model(
         if any(isinstance(m, LoraLinear) for m in model.modules()):
             raise NotImplementedError("Tensor parallelism + LoRA is not currently supported.")
 
-        # Unfuse fused projections (qkv_proj, gate_up_proj) for TP compatibility
+        # Unfuse fused projections (qkv_proj, gate_up_proj) for TP compatibility.
+        # Skip when already unfused before parallelization: unfuse_for_tp deletes
+        # the fused module, so a second call raises AttributeError.
         if hasattr(model, "unfuse_for_tp") and not getattr(model, "_unfused_for_tp", False):
             logger.info_rank0("Unfusing projections for tensor parallelism...")
             model.unfuse_for_tp()
