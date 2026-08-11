@@ -67,8 +67,11 @@ def test_reference_is_the_adjacent_bf16_tree(contributors: int):
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_shared_fold_replays_in_cuda_graph():
-    partials = torch.randn((8, 64, 32), device="cuda", dtype=torch.bfloat16)
+@pytest.mark.parametrize("contributors", [8, 16])
+def test_shared_fold_replays_in_cuda_graph(contributors: int):
+    partials = torch.randn(
+        (contributors, 64, 32), device="cuda", dtype=torch.bfloat16
+    )
     canonical_moe_fold_v1(partials)
     torch.cuda.synchronize()
 
