@@ -74,7 +74,8 @@ Notes:
 | 5 | Compressor APE | Loader "un-hotfixed" a table the checkpoint ships in natural layout | Removed 3 _undo_ape_hotfix applications | L2 attention byte-equal (live-probe stage proof) |
 | 6 | Compressor kv_score GEMM | Same interposed-mm class as #1, inside _serving_compressed_kv | matmul_persistent + widen | L2 attn core byte-equal vs TP8 boundary dump |
 | 7 | Standalone q_norm | BI rms_norm vs sgl_kernel rmsnorm: 1-ulp at rounding boundaries | Exact lane calls rms_norm_batch_invariant | L4 q_post byte-equal |
-| 8 | L4 attention residual | UNDER ISOLATION (0.0156 absmax, 1331/40960; independent of #7) | — | — |
+| 8 | RoPE table provenance | Trainer built freqs tables on CPU (glibc libm); serving builds under CUDA — 1 fp32 ulp on ~15% of components, rare BF16 boundary trips | precompute_freqs_cis runs on CUDA | L0-L4 q byte-equal vs debug_q; decisions 0 AND 1 byte-equal end to end |
+| 9 | Decisions 2-3 (ulp scale) | Prefix recompute is not row-count stable (bucketed kernels, e.g. mHC n_splits) — recomputed prefix rows drift at some segment lengths | M=1 decode segments over carried per-layer cache state (in build) | k3_max 0.019 pre-carry |
 
 Decode-semantics replay: decisions are replayed as full prefixes keeping only
 the decision position (no KV carry needed: cache bytes are position-local,
