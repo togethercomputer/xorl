@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: PLC0415
 """Replay one captured DSV4 hash-topk boundary without loading the model."""
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ def main() -> None:
     parser.add_argument("--vocab-size", type=int, default=129280)
     args = parser.parse_args()
 
-    capture = torch.load(args.capture, map_location="cpu", weights_only=False)
+    capture = torch.load(args.capture, map_location="cpu", weights_only=True)
     prefix = f"model.layers.{args.layer}."
     logits = capture[prefix + "router_logits"][: args.rows].cuda().contiguous()
     input_ids = capture[prefix + "moe_native_gathered_ids"][: args.rows].cuda().contiguous()
@@ -42,9 +43,7 @@ def main() -> None:
     result = {
         "rows": args.rows,
         "ids_byte_equal": torch.equal(ids.view(torch.uint8), expected_ids.view(torch.uint8)),
-        "weights_byte_equal": torch.equal(
-            weights.view(torch.uint8), expected_weights.view(torch.uint8)
-        ),
+        "weights_byte_equal": torch.equal(weights.view(torch.uint8), expected_weights.view(torch.uint8)),
         "max_weight_abs_diff": float((weights - expected_weights).abs().max()),
     }
     print(json.dumps(result, sort_keys=True))

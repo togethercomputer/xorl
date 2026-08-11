@@ -11,10 +11,10 @@ import torch
 import torch.nn.functional as F
 from safetensors import safe_open
 
+
 RD = Path(__file__).resolve().parent
 SNAP = Path(
-    "/shared/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/"
-    "60d8d70770c6776ff598c94bb586a859a38244f1"
+    "/shared/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/60d8d70770c6776ff598c94bb586a859a38244f1"
 )
 
 
@@ -25,7 +25,7 @@ def main() -> int:
     trainer = torch.load(
         RD / "campaign2/dumps_dec39_trainer2/components.rank0.pt",
         map_location="cpu",
-        weights_only=False,
+        weights_only=True,
     )
     hidden = trainer["model.layers.-1.final_norm.occurrence00039"].reshape(1, -1).cuda()
     logits = F.linear(hidden, weight)

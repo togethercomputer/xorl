@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: PLC0415
 """Does Marlin MoE change bytes for the same rows inside a bigger batch?
 
 Replay question: the trainer's EP-gathered batch is 8 duplicated copies of the
@@ -12,6 +13,7 @@ import sys
 from pathlib import Path
 
 import torch
+
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO / "scripts"))

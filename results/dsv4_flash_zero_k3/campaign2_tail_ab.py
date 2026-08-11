@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: PLC0415
 """Offline A/B of the DSV4 logprob tail at decision 39.
 
 Inputs: the byte-equal final-norm hidden (trainer dump, pseudo-layer -1) and
@@ -13,15 +14,16 @@ wire: serving -0.000823974609375 (ba580000) / trainer -0.000827789306640625
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
 import torch.nn.functional as F
-from pathlib import Path
 from safetensors import safe_open
+
 
 RD = Path(__file__).resolve().parent
 SNAP = Path(
-    "/shared/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/"
-    "60d8d70770c6776ff598c94bb586a859a38244f1"
+    "/shared/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/60d8d70770c6776ff598c94bb586a859a38244f1"
 )
 WIRE_SERVING = -0.000823974609375
 WIRE_TRAINER = -0.000827789306640625
@@ -48,7 +50,7 @@ def main() -> int:
     trainer = torch.load(
         RD / "campaign2/dumps_dec39_trainer2/components.rank0.pt",
         map_location="cpu",
-        weights_only=False,
+        weights_only=True,
     )
     hidden = trainer["model.layers.-1.final_norm.occurrence00039"].reshape(1, -1).cuda()
     print("hidden", tuple(hidden.shape), hidden.dtype)
@@ -63,10 +65,7 @@ def main() -> int:
         return float(lp[0, TOKEN])
 
     # t1: trainer program — 8 per-shard BF16 F.linear, rank-order concat.
-    parts = [
-        F.linear(hidden, weight[r * shard_rows : (r + 1) * shard_rows])
-        for r in range(8)
-    ]
+    parts = [F.linear(hidden, weight[r * shard_rows : (r + 1) * shard_rows]) for r in range(8)]
     t1 = torch.cat(parts, dim=-1)
     print("t1 per-shard F.linear + concat:", repr(lp_of(t1)), tag(lp_of(t1)))
 
@@ -81,18 +80,12 @@ def main() -> int:
     print("v2 full F.linear M=8:", repr(lp_of(v2)), tag(lp_of(v2)))
 
     # v3: per-shard with M=8.
-    parts8 = [
-        F.linear(h8, weight[r * shard_rows : (r + 1) * shard_rows])
-        for r in range(8)
-    ]
+    parts8 = [F.linear(h8, weight[r * shard_rows : (r + 1) * shard_rows]) for r in range(8)]
     v3 = torch.cat(parts8, dim=-1)[0:1]
     print("v3 per-shard M=8:", repr(lp_of(v3)), tag(lp_of(v3)))
 
     # v4: fp32 GEMM then bf16 cast (lm_head_fp32-style) per shard.
-    parts32 = [
-        F.linear(hidden.float(), weight[r * shard_rows : (r + 1) * shard_rows].float())
-        for r in range(8)
-    ]
+    parts32 = [F.linear(hidden.float(), weight[r * shard_rows : (r + 1) * shard_rows].float()) for r in range(8)]
     v4 = torch.cat(parts32, dim=-1).to(torch.bfloat16)
     print("v4 per-shard fp32->bf16:", repr(lp_of(v4)), tag(lp_of(v4)))
 
@@ -102,10 +95,7 @@ def main() -> int:
             matmul_persistent,
         )
 
-        partsbi = [
-            matmul_persistent(hidden, weight[r * shard_rows : (r + 1) * shard_rows].t())
-            for r in range(8)
-        ]
+        partsbi = [matmul_persistent(hidden, weight[r * shard_rows : (r + 1) * shard_rows].t()) for r in range(8)]
         v5 = torch.cat(partsbi, dim=-1)
         print("v5 per-shard matmul_persistent:", repr(lp_of(v5)), tag(lp_of(v5)))
         v6 = matmul_persistent(hidden, weight.t())

@@ -13,11 +13,12 @@ from pathlib import Path
 
 import torch
 
+
 RD = Path(__file__).resolve().parent
 
 
 def load_trainer(rep: int = 0, rank: int = 0) -> dict:
-    d = torch.load(RD / f"dumps/trainer_ruler_rep{rep}.rank{rank}.pt", map_location="cpu", weights_only=False)
+    d = torch.load(RD / f"dumps/trainer_ruler_rep{rep}.rank{rank}.pt", map_location="cpu", weights_only=True)
     d.pop("__metadata__", None)
     d.pop("labels", None)
     return d
@@ -48,7 +49,7 @@ def main() -> None:
     root = RD / "dumps/sampler_base"
     if args.list:
         for proc, pass_file in sampler_passes(root):
-            data = torch.load(pass_file, map_location="cpu", weights_only=False)
+            data = torch.load(pass_file, map_location="cpu", weights_only=True)
             ids = data.get("model.forward_batch_info.input_ids")
             n = ids.numel() if isinstance(ids, torch.Tensor) else "?"
             print(f"{proc}/{pass_file.name}: {len(data)} tensors, input_ids={n}")
@@ -58,7 +59,7 @@ def main() -> None:
         # Pick the prefill pass of the real request: input_ids length == prompt len.
         candidates = []
         for proc, pass_file in sampler_passes(root):
-            data = torch.load(pass_file, map_location="cpu", weights_only=False)
+            data = torch.load(pass_file, map_location="cpu", weights_only=True)
             for key, value in data.items():
                 if key.endswith("forward_batch_info.input_ids") and isinstance(value, torch.Tensor):
                     if value.numel() == args.prompt_len:
@@ -71,13 +72,15 @@ def main() -> None:
     else:
         pass_file = args.pass_file
 
-    sampler = torch.load(pass_file, map_location="cpu", weights_only=False)
+    sampler = torch.load(pass_file, map_location="cpu", weights_only=True)
     trainer = load_trainer()
 
     print("=== sampler tensor names (layer 0-2 subset) ===")
     for name in sorted(sampler):
         if any(f"layers.{i}." in name for i in (0, 1, 2)) or "embed" in name:
-            print(" ", name, describe(sampler[name]) if isinstance(sampler[name], torch.Tensor) else type(sampler[name]))
+            print(
+                " ", name, describe(sampler[name]) if isinstance(sampler[name], torch.Tensor) else type(sampler[name])
+            )
 
     print("=== trainer components (layer 0, prefill) ===")
     for name in sorted(trainer):

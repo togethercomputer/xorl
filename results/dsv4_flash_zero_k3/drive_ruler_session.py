@@ -10,10 +10,10 @@ import time
 
 import requests
 
+
 URL = "http://127.0.0.1:6000"
 SNAP = (
-    "/shared/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash/"
-    "snapshots/60d8d70770c6776ff598c94bb586a859a38244f1"
+    "/shared/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/60d8d70770c6776ff598c94bb586a859a38244f1"
 )
 
 
@@ -21,9 +21,7 @@ def wait_future(request_id: str, timeout: float = 1800.0) -> dict:
     deadline = time.monotonic() + timeout
     interval = 0.5
     while True:
-        response = requests.post(
-            f"{URL}/api/v1/retrieve_future", json={"request_id": request_id}, timeout=300
-        )
+        response = requests.post(f"{URL}/api/v1/retrieve_future", json={"request_id": request_id}, timeout=300)
         response.raise_for_status()
         result = response.json()
         if isinstance(result, dict) and result.get("type") == "try_again":

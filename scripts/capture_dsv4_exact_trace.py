@@ -24,9 +24,7 @@ def _post(url: str, payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _git(path: Path, *args: str) -> str:
-    return subprocess.check_output(
-        ["git", "-C", str(path), *args], text=True
-    ).strip()
+    return subprocess.check_output(["git", "-C", str(path), *args], text=True).strip()
 
 
 def _raw(meta: dict[str, Any], side: str) -> bytes:
@@ -72,9 +70,7 @@ def main() -> int:
 
     repo = Path(__file__).resolve().parents[1]
     model_path = Path(args.model_path).resolve()
-    tokenizer = AutoTokenizer.from_pretrained(
-        str(model_path), trust_remote_code=True, local_files_only=True
-    )
+    tokenizer = AutoTokenizer.from_pretrained(str(model_path), trust_remote_code=True, local_files_only=True)
     if args.prompt_ids_json:
         prompt_ids = [int(token) for token in json.loads(args.prompt_ids_json)]
     else:
@@ -110,9 +106,7 @@ def main() -> int:
         )
         output_ids = _selected_output_ids(generation)
         if len(output_ids) != args.decisions:
-            raise ValueError(
-                f"generation returned {len(output_ids)} decisions, expected {args.decisions}"
-            )
+            raise ValueError(f"generation returned {len(output_ids)} decisions, expected {args.decisions}")
         decode_bytes = _raw(generation["meta_info"], "output")
 
         full_ids = prompt_ids + output_ids
@@ -145,10 +139,8 @@ def main() -> int:
 
     denominator_equal = all(
         capture["output_ids"] == captures[0]["output_ids"]
-        and capture["decode_selected_logprobs_b64"]
-        == captures[0]["decode_selected_logprobs_b64"]
-        and capture["teacher_forced_selected_logprobs_b64"]
-        == captures[0]["teacher_forced_selected_logprobs_b64"]
+        and capture["decode_selected_logprobs_b64"] == captures[0]["decode_selected_logprobs_b64"]
+        and capture["teacher_forced_selected_logprobs_b64"] == captures[0]["teacher_forced_selected_logprobs_b64"]
         for capture in captures[1:]
     )
     artifact = {
@@ -162,9 +154,7 @@ def main() -> int:
             "repo_head": _git(repo, "rev-parse", "HEAD"),
             "sglang_head": _git(repo / "submodules/xorl-sglang", "rev-parse", "HEAD"),
             "sglang_diff_sha256": _sha256(
-                subprocess.check_output(
-                    ["git", "-C", str(repo / "submodules/xorl-sglang"), "diff", "--binary"]
-                )
+                subprocess.check_output(["git", "-C", str(repo / "submodules/xorl-sglang"), "diff", "--binary"])
             ),
         },
         "contract": {

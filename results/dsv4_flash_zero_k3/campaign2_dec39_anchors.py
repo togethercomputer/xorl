@@ -56,7 +56,7 @@ def main() -> int:
     frozen = cap["output_ids"][: args.decision + 1]
     print("token path matches frozen trace:", out_ids == frozen)
     raw = base64.b64decode(meta["output_token_logprobs_raw_b64"])
-    values = struct.unpack(f"<{len(raw)//4}f", raw)
+    values = struct.unpack(f"<{len(raw) // 4}f", raw)
     print(
         f"decision {args.decision}: selected token {out_ids[args.decision]} "
         f"raw fp32 logprob {values[args.decision]!r} "

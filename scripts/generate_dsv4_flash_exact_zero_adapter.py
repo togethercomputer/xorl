@@ -116,9 +116,9 @@ def main() -> None:
                 raise ValueError(f"Unknown DSV4 export key for perturbation: {args.perturb_export_key}")
             if args.perturb_add == 0.0:
                 raise ValueError("--perturb-export-key requires a nonzero --perturb-add")
-            tensors[args.perturb_export_key] = (
-                tensors[args.perturb_export_key] + args.perturb_add
-            ).to(specs[0].export_dtype)
+            tensors[args.perturb_export_key] = (tensors[args.perturb_export_key] + args.perturb_add).to(
+                specs[0].export_dtype
+            )
         weights_path = temporary / "adapter_model.safetensors"
         save_file(
             tensors,
@@ -144,9 +144,7 @@ def main() -> None:
             raise AssertionError("Generated DSV4 distinguishable adapter is all-zero")
 
         role_counts = Counter(spec.role for spec in specs)
-        total_elements = sum(
-            torch.Size(spec.export_shape).numel() for spec in specs
-        )
+        total_elements = sum(torch.Size(spec.export_shape).numel() for spec in specs)
         _write_json(
             temporary / "manifest.json",
             {
@@ -167,9 +165,7 @@ def main() -> None:
             },
         )
         if len(keys) != DSV4_FLASH_LOGICAL_FACTOR_COUNT:
-            raise AssertionError(
-                f"Expected {DSV4_FLASH_LOGICAL_FACTOR_COUNT} tensors, got {len(keys)}"
-            )
+            raise AssertionError(f"Expected {DSV4_FLASH_LOGICAL_FACTOR_COUNT} tensors, got {len(keys)}")
         os.replace(temporary, output_dir)
         print(output_dir)
     except BaseException:

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# ruff: noqa: PLC0415
 """Locate the first divergent layer/component at decision 39 across engines.
 
 Serving side: campaign2/dumps_dec39/<rank0 proc>/Pass*.pt — the 40th
@@ -14,6 +15,7 @@ from pathlib import Path
 
 import torch
 
+
 RD = Path(__file__).resolve().parent
 
 
@@ -22,11 +24,7 @@ def bytes_equal(a: torch.Tensor, b: torch.Tensor) -> bool:
     b = b.reshape(-1)
     if a.shape != b.shape or a.dtype != b.dtype:
         return False
-    return bool(
-        torch.equal(
-            a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8)
-        )
-    )
+    return bool(torch.equal(a.contiguous().view(torch.uint8), b.contiguous().view(torch.uint8)))
 
 
 def main() -> int:
@@ -36,9 +34,7 @@ def main() -> int:
     args = parser.parse_args()
 
     serving_root = RD / "campaign2/dumps_dec39"
-    proc = sorted(
-        p for p in serving_root.iterdir() if p.name.startswith(f"TP{args.rank}_")
-    )[0]
+    proc = sorted(p for p in serving_root.iterdir() if p.name.startswith(f"TP{args.rank}_"))[0]
 
     # Identify decision k's decode pass by its absolute position: the forward
     # that PRODUCES decision k consumes the token at position prompt_len+k-1.
@@ -55,7 +51,7 @@ def main() -> int:
     n_passes = 0
     for pass_file in sorted(proc.glob("Pass*.pt")):
         n_passes += 1
-        data = torch.load(pass_file, map_location="cpu", weights_only=False)
+        data = torch.load(pass_file, map_location="cpu", weights_only=True)
         ids = pos = None
         for key, value in data.items():
             if key.endswith("forward_batch_info.input_ids") and torch.is_tensor(value):
@@ -72,14 +68,16 @@ def main() -> int:
             serving = data
             pass_name = pass_file.name
             break
-    print(f"[serving] scanned {n_passes} passes; decision {args.decision} (pos {want_position}, tok {want_token}) -> {pass_name}")
+    print(
+        f"[serving] scanned {n_passes} passes; decision {args.decision} (pos {want_position}, tok {want_token}) -> {pass_name}"
+    )
     if serving is None:
         raise SystemExit("no matching decode pass found")
 
     trainer = torch.load(
         RD / f"campaign2/dumps_dec39_trainer/components.rank{args.rank}.pt",
         map_location="cpu",
-        weights_only=False,
+        weights_only=True,
     )
     # Trainer occurrence 0 is the prefill, which yields decision 0; decode
     # occurrence k (k >= 1) consumes position prompt_len+k-1 and yields

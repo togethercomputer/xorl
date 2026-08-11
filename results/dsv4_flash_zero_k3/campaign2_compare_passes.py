@@ -16,7 +16,7 @@ import torch
 
 
 def load_pass(path: Path) -> dict:
-    d = torch.load(path, map_location="cpu", weights_only=False)
+    d = torch.load(path, map_location="cpu", weights_only=True)
     d.pop("__metadata__", None)
     return d
 
@@ -31,11 +31,7 @@ def tensors_equal(a, b) -> bool:
         bv = b.contiguous().flatten().view(torch.uint8)
         return bool(torch.equal(av, bv))
     if isinstance(a, (list, tuple)):
-        return (
-            isinstance(b, (list, tuple))
-            and len(a) == len(b)
-            and all(tensors_equal(x, y) for x, y in zip(a, b))
-        )
+        return isinstance(b, (list, tuple)) and len(a) == len(b) and all(tensors_equal(x, y) for x, y in zip(a, b))
     return a == b
 
 
@@ -69,7 +65,7 @@ def main() -> int:
                 a, b = base[diverged], other[diverged]
                 n_bad = None
                 if torch.is_tensor(a) and a.shape == b.shape and a.dtype.is_floating_point:
-                    mismatch = (a != b)
+                    mismatch = a != b
                     n_bad = int(mismatch.sum())
                     rows = torch.unique(mismatch.reshape(mismatch.shape[0], -1).any(dim=-1).nonzero())[:8]
                     print(
