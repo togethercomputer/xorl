@@ -120,10 +120,7 @@ def resolve_canonical_moe_transport(
     )
     if mode is CanonicalMoETransport.AUTO:
         packed_admitted = (
-            plan.role is ParallelRole.TRAINER
-            and plan.cp_size == 16
-            and plan.ep_size == 16
-            and not graph_mode
+            plan.role is ParallelRole.TRAINER and plan.cp_size == 16 and plan.ep_size == 16 and not graph_mode
         )
         return CanonicalMoETransport.PACKED_EP16_V2 if packed_admitted else CanonicalMoETransport.DENSE_V1
     if mode is CanonicalMoETransport.CP_SHARDED_V3 and cp_v3_reasons:

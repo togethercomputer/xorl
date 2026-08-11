@@ -97,9 +97,7 @@ class TestCollatorCall:
             {
                 "input_ids": torch.tensor([[10, 11, 20, 21, 30, 31, 40, 41]]),
                 "attention_mask": torch.ones(1, 8, dtype=torch.long),
-                "labels": torch.tensor(
-                    [[IGNORE_INDEX, 91, IGNORE_INDEX, 92, IGNORE_INDEX, 93, IGNORE_INDEX, 94]]
-                ),
+                "labels": torch.tensor([[IGNORE_INDEX, 91, IGNORE_INDEX, 92, IGNORE_INDEX, 93, IGNORE_INDEX, 94]]),
                 "position_ids": torch.tensor([[0, 1, 0, 1, 0, 1, 0, 1]]),
             }
         )

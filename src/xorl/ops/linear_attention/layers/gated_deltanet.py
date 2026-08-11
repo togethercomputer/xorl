@@ -277,9 +277,7 @@ class GatedDeltaNet(nn.Module):
                 raise ValueError("Ulysses native FLA CP currently supports chunk mode only.")
             if _is_gdn_contract_enabled():
                 if cp_context.group is None or cp_context.global_cu_seqlens is None:
-                    raise ValueError(
-                        "Exact Qwen3.5 GDN CP requires the Ulysses group and global cu_seqlens metadata."
-                    )
+                    raise ValueError("Exact Qwen3.5 GDN CP requires the Ulysses group and global cu_seqlens metadata.")
                 # Native FLA CP is mathematically equivalent but changes the chunk/state
                 # association at shard boundaries.  The exact trainer-serving contract
                 # instead reconstructs the original packed sequence, executes precisely
