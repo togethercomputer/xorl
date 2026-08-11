@@ -182,6 +182,40 @@ def _select_attn_impl():
     return impl
 
 
+class _ExactBatchInvariantRmsNorm(torch.autograd.Function):
+    """Serving-value RMSNorm: BI Triton kernel forward, surrogate VJP backward.
+
+    The deterministic serving contract patches standalone RMSNorms to the
+    batch-invariant kernel; its bytes differ from sgl_kernel/native rmsnorm by
+    one BF16 ulp at rounding boundaries. The kernel carries no autograd, so
+    backward differentiates the native recompute (the norm weight is frozen
+    base state and receives no gradient).
+    """
+
+    @staticmethod
+    def forward(ctx, x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+        from sglang.srt.batch_invariant_ops.batch_invariant_ops import (  # noqa: PLC0415
+            rms_norm_batch_invariant,
+        )
+
+        flat = x.reshape(-1, x.shape[-1]).contiguous()
+        out = rms_norm_batch_invariant(flat, weight, eps=eps).reshape_as(x)
+        ctx.save_for_backward(x, weight)
+        ctx.eps = eps
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        x, weight = ctx.saved_tensors
+        with torch.enable_grad():
+            x_live = x.detach().requires_grad_(True)
+            hidden = x_live.float()
+            variance = hidden.pow(2).mean(-1, keepdim=True)
+            surrogate = (hidden * torch.rsqrt(variance + ctx.eps)).to(x.dtype) * weight
+            (grad_x,) = torch.autograd.grad(surrogate, (x_live,), grad_output, create_graph=False)
+        return grad_x, None, None
+
+
 class DeepSeekV4Attention(nn.Module):
     """V4 sparse-MLA attention with per-layer ``compress_ratio``.
 
@@ -372,15 +406,11 @@ class DeepSeekV4Attention(nn.Module):
             # The serving deterministic contract runs standalone RMSNorms
             # through the batch-invariant Triton kernel; sgl_kernel/native
             # rmsnorm differs by one BF16 ulp at rounding boundaries
-            # (layer-4 q_norm, 2026-08-11 base ruler).
-            from sglang.srt.batch_invariant_ops.batch_invariant_ops import (  # noqa: PLC0415
-                rms_norm_batch_invariant,
+            # (layer-4 q_norm, 2026-08-11 base ruler). Forward is the serving
+            # kernel bytes; backward is the trainer-owned surrogate VJP.
+            q_lora = _ExactBatchInvariantRmsNorm.apply(
+                q_lora_pre_norm, self.q_norm.weight, self.eps
             )
-
-            q_flat = q_lora_pre_norm.reshape(-1, q_lora_pre_norm.shape[-1]).contiguous()
-            q_lora = rms_norm_batch_invariant(
-                q_flat, self.q_norm.weight, eps=self.eps
-            ).reshape_as(q_lora_pre_norm)
         else:
             q_lora = self.q_norm(q_lora_pre_norm)  # [B, S, q_lora_rank]
         self._capture_diagnostic_component("q_post_qk_norm", q_lora)

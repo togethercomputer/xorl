@@ -177,7 +177,38 @@ class Dsv4NativeBlockFp8Payload(nn.Module):
             self.packed_scale_f32.copy_(packed_scale.to(self.packed_scale_f32.device))
 
 
+def _payload_values_for_backward(payload: Dsv4NativeBlockFp8Payload) -> tuple[torch.Tensor, torch.Tensor]:
+    """Materialize payload bytes inside a backward pass.
+
+    Module __call__ gathers the FSDP-sharded packed parameters via the
+    pre-forward hook, but firing that hook during autograd (surrogate VJPs)
+    trips FSDP root state. Explicitly unshard/reshard instead and read the
+    typed views directly.
+    """
+
+    unshard = getattr(payload, "unshard", None)
+    reshard = getattr(payload, "reshard", None)
+    if callable(unshard):
+        unshard()
+    try:
+        return payload.fp8_weight().clone(), payload.e8m0_scale().clone()
+    finally:
+        if callable(reshard):
+            reshard()
+
+
+def _dequantize_native_block_fp8_for_backward(payload: Dsv4NativeBlockFp8Payload) -> torch.Tensor:
+    weight, scales = _payload_values_for_backward(payload)
+    weight = weight.float()
+    scales = scales.float()
+    expanded = scales.repeat_interleave(128, dim=0).repeat_interleave(128, dim=1)
+    return (weight * expanded[: payload.out_features, : payload.in_features]).to(torch.bfloat16)
+
+
 def _dequantize_native_block_fp8(payload: Dsv4NativeBlockFp8Payload) -> torch.Tensor:
+    # Call forward() directly: the payload holds only whole (non-sharded)
+    # packed buffers, and Module.__call__ would fire FSDP pre-forward hooks —
+    # fatal when this runs inside a backward (surrogate VJPs).
     weight, scales = payload()
     weight = weight.float()
     scales = scales.float()
@@ -209,7 +240,7 @@ class _Dsv4NativeBlockFp8Function(torch.autograd.Function):
         if not ctx.needs_input_grad[0]:
             return None, None
         payload = ctx.module.native_base_payload
-        weight = _dequantize_native_block_fp8(payload)
+        weight = _dequantize_native_block_fp8_for_backward(payload)
         rows = grad_output.numel() // payload.out_features
         grad_input = grad_output.reshape(rows, payload.out_features).float() @ weight.float()
         return grad_input.to(grad_output.dtype).reshape(*grad_output.shape[:-1], payload.in_features), None
@@ -341,7 +372,7 @@ class _Dsv4NativeBlockFp8LoraFunction(torch.autograd.Function):
         grad_A = grad_low_rank.transpose(0, 1) @ x
         grad_input = grad_low_rank @ a
         if ctx.needs_input_grad[0]:
-            base_weight = _dequantize_native_block_fp8(module.native_base_payload)
+            base_weight = _dequantize_native_block_fp8_for_backward(module.native_base_payload)
             grad_input = grad_input + dy @ base_weight.float()
             grad_input = grad_input.to(input.dtype).reshape_as(input)
         else:
@@ -461,7 +492,7 @@ class _Dsv4NativeGroupedWoALoraFunction(torch.autograd.Function):
         grad_A = torch.einsum("tgr,tgd->rd", grad_low_rank, x)
         grad_input = grad_low_rank @ a
         if ctx.needs_input_grad[0]:
-            base_weight = _dequantize_native_block_fp8(module.native_base_payload).view(
+            base_weight = _dequantize_native_block_fp8_for_backward(module.native_base_payload).view(
                 groups, out_per_group, module.in_features
             )
             grad_input = grad_input + torch.einsum("tgo,god->tgd", dy, base_weight.float())
@@ -1358,9 +1389,9 @@ class _Dsv4NativeSharedTpFunction(torch.autograd.Function):
                 .requires_grad_(needed)
                 for master, needed in zip(masters, factor_targets)
             ]
-            gate_weight = _dequantize_native_block_fp8(module.gate_proj.native_base_payload)[start:end]
-            up_weight = _dequantize_native_block_fp8(module.up_proj.native_base_payload)[start:end]
-            down_weight = _dequantize_native_block_fp8(module.down_proj.native_base_payload)[:, start:end]
+            gate_weight = _dequantize_native_block_fp8_for_backward(module.gate_proj.native_base_payload)[start:end]
+            up_weight = _dequantize_native_block_fp8_for_backward(module.up_proj.native_base_payload)[start:end]
+            down_weight = _dequantize_native_block_fp8_for_backward(module.down_proj.native_base_payload)[:, start:end]
             gate = torch.nn.functional.linear(x, gate_weight)
             gate = gate + (x @ effective[0].T) @ effective[1][start:end].T
             up = torch.nn.functional.linear(x, up_weight)
