@@ -650,11 +650,29 @@ class DeepseekV4MoE(MoEBlock):
         compatible.
         """
         if self._dsv4_exact_native:
-            # The frozen DSV4 sampler's observable router program is a BF16
-            # gate GEMM whose result is widened to FP32 before the dedicated
-            # hash/fused-topk kernel.  Keeping the widened BF16 values matters:
-            # a true FP32-output GEMM changes every sqrt-softplus weight.
-            router_logits = self.gate(hidden_states).float()
+            # The pinned sampler's router calls linear_bf16_fp32 ->
+            # torch.mm(x, w.t(), out_dtype=fp32), but under its deterministic
+            # contract torch.mm is patched to the batch-invariant persistent
+            # Triton GEMM: matmul_persistent(x, w.t().contiguous()).to(fp32)
+            # — a BF16-output kernel widened to FP32. Call that kernel
+            # directly (never patch mm globally in a training graph). A
+            # cuBLAS BF16 GEMM differs by one BF16 ulp on rounding-boundary
+            # logits, which perturbs the sqrt-softplus weights and every
+            # routed contribution downstream (first divergence of the
+            # 2026-08-11 base ruler).
+            from sglang.srt.batch_invariant_ops.batch_invariant_ops import (  # noqa: PLC0415
+                matmul_persistent,
+            )
+
+            gate_weight = self.gate.weight
+            if hidden_states.dtype is not torch.bfloat16 or gate_weight.dtype is not torch.bfloat16:
+                raise TypeError("DSV4 exact router requires BF16 hidden states and BF16 gate weights")
+            flat = hidden_states.reshape(-1, hidden_states.shape[-1]).contiguous()
+            router_logits = (
+                matmul_persistent(flat, gate_weight.t().contiguous())
+                .to(torch.float32)
+                .reshape(*hidden_states.shape[:-1], gate_weight.shape[0])
+            )
         elif getattr(self, "config", None) is not None and getattr(self.config, "_router_fp32", False):
             router_logits = F.linear(hidden_states.float(), self.gate.weight.float())
         else:

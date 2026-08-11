@@ -14,6 +14,7 @@ export SGLANG_CACHE_DIR=/dev/shm/sglang-cache
 mkdir -p "$SGLANG_CACHE_DIR"
 [ -d "$WEKA_CACHE" ] && cp -r "$WEKA_CACHE/." "$SGLANG_CACHE_DIR/" 2>/dev/null
 export SGLANG_DEBUG_TENSOR_DUMP_PARENT_MODULES=1
+export SGLANG_DEBUG_ROUTER_GEMM_TRACE=1
 export SGLANG_OPT_FUSE_WQA_WKV=0
 export SGLANG_SIMULATE_UNIFORM_EXPERTS=0
 export SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS=0
@@ -29,5 +30,4 @@ exec .venv/bin/python -m sglang.launch_server \
   --enable-lora \
   --trust-remote-code \
   --debug-tensor-dump-output-folder "$REPO/results/dsv4_flash_zero_k3/dumps/sampler_base" \
-  --debug-tensor-dump-layers 0 1 2 \
   --host 127.0.0.1 --port 30000

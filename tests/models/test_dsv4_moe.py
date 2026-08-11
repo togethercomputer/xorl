@@ -311,13 +311,21 @@ def test_exact_hash_route_disables_unarmed_pdl(monkeypatch):
         "sglang.kernels.ops",
         "sglang.kernels.ops.attention",
         "sglang.kernels.ops.attention.dsv4",
+        "sglang.srt",
+        "sglang.srt.batch_invariant_ops",
+        "sglang.srt.batch_invariant_ops.batch_invariant_ops",
     )
+    leaf_names = {"sglang.kernels.ops.attention.dsv4", "sglang.srt.batch_invariant_ops.batch_invariant_ops"}
     for module_name in module_names:
         module = ModuleType(module_name)
-        if module_name != module_names[-1]:
+        if module_name not in leaf_names:
             module.__path__ = []
         monkeypatch.setitem(sys.modules, module_name, module)
-    sys.modules[module_names[-1]].hash_topk = fake_hash_topk
+    sys.modules["sglang.kernels.ops.attention.dsv4"].hash_topk = fake_hash_topk
+    # The exact router mirrors the sampler's patched mm: a BF16-output GEMM.
+    sys.modules["sglang.srt.batch_invariant_ops.batch_invariant_ops"].matmul_persistent = (
+        lambda a, b: torch.mm(a, b)
+    )
     block.route(
         torch.ones(3, cfg.hidden_size, dtype=torch.bfloat16),
         input_ids=torch.tensor([1, 2, 3]),

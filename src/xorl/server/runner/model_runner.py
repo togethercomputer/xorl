@@ -5534,6 +5534,12 @@ class ModelRunner:
                     device=input_ids.device,
                 )
                 segment_position_ids = torch.arange(start, end, device=input_ids.device, dtype=torch.long).unsqueeze(0)
+                # Serving idle DP ranks contribute zero rows to the EP-gathered
+                # expert batch, and the Marlin MoE kernels are not row-count
+                # invariant. Dummy ranks (no valid labels) must therefore
+                # declare zero live tokens so the gathered population matches
+                # the serving forward exactly.
+                dummy_rank_kwargs = {} if local_has_valid else {"num_samples": 0}
                 outputs = self.model(
                     input_ids=segment_input_ids,
                     attention_mask=segment_attention_mask,
@@ -5541,6 +5547,7 @@ class ModelRunner:
                     past_key_values=past_key_values,
                     output_hidden_states=diagnostic_hidden_states,
                     diagnostic_decode_cache=True,
+                    **dummy_rank_kwargs,
                     **self._index_share_forward_kwargs(IndexShareMode.FORWARD_ONLY),
                 )
                 returned_past_key_values = getattr(outputs, "past_key_values", None)
