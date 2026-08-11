@@ -1,0 +1,80 @@
+{
+  "schema": "dsv4-exact-trainer-replay-v1",
+  "created_at_unix": 1786417701.9736762,
+  "trace": "/home/apanda/xorl-oss-dsv4-flash-lora-zero-k3-20260810/results/dsv4_flash_zero_k3/trace_base_4dec.json",
+  "trace_label": "base-ruler-4dec",
+  "model_id": "ruler",
+  "capture_index": 0,
+  "decisions": 4,
+  "trainer_repetitions": 2,
+  "trainer_denominator_byte_equal": false,
+  "trainer_repetition_sha256": [
+    "be5597d7aee12efd5b8d348073095e52ab87940c2b4fd9f1e6a52a67e454938b",
+    "8877b8136509eddefe2ffcb3f115acbd9eab391620b4a1ca254806871ab56e32"
+  ],
+  "trainer_repetition_selected_logprobs": [
+    [
+      -2.03125,
+      -12.0625,
+      -6.96875,
+      -15.25
+    ],
+    [
+      -1.8046875,
+      -12.0625,
+      -6.96875,
+      -15.25
+    ]
+  ],
+  "trainer_selected_logprobs_b64": "AAACwAAAQcEAAN/AAAB0wQ==",
+  "trainer_selected_logprobs": [
+    -2.03125,
+    -12.0625,
+    -6.96875,
+    -15.25
+  ],
+  "decode_comparison": {
+    "byte_equal": false,
+    "reference_sha256": "7665ae54f7b2c075463ab452ec85b2e4e34ec4fa7dd5f34046c7724d406b4f7e",
+    "trainer_sha256": "be5597d7aee12efd5b8d348073095e52ab87940c2b4fd9f1e6a52a67e454938b",
+    "first_difference": {
+      "decision": 0,
+      "reference": -3.765625,
+      "trainer": -2.03125,
+      "reference_bits_hex": "c0710000",
+      "trainer_bits_hex": "c0020000"
+    },
+    "k3": [
+      0.9108854848718619,
+      6603.747478810665,
+      1031.9734624394093,
+      244310.47347185915
+    ],
+    "k3_mean": 62986.77632464853,
+    "k3_max": 244310.47347185915
+  },
+  "teacher_forced_comparison": {
+    "byte_equal": false,
+    "reference_sha256": "92ffe356938b9582e146d132a434e6030827f87b2c7cec4693bb0767e488f6ea",
+    "trainer_sha256": "be5597d7aee12efd5b8d348073095e52ab87940c2b4fd9f1e6a52a67e454938b",
+    "first_difference": {
+      "decision": 0,
+      "reference": -3.557795524597168,
+      "trainer": -2.03125,
+      "reference_bits_hex": "c063b2ec",
+      "trainer_bits_hex": "c0020000"
+    },
+    "k3": [
+      0.7438305025421705,
+      6761.30056772291,
+      1036.5410845202184,
+      263531.69591328624
+    ],
+    "k3_mean": 67832.57034900798,
+    "k3_max": 263531.69591328624
+  },
+  "source": {
+    "repo_head": "1a2028b6b48dbf7c39539d2c83469d97b15f0ee0",
+    "repo_diff_sha256": "c4acc4f968d0b3d6a8d74476cd16c36c768c58d4f938ee2d2c62239e095167ee"
+  }
+}
