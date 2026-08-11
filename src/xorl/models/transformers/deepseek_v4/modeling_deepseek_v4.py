@@ -956,9 +956,13 @@ class DeepseekV4MoE(MoEBlock):
         """Mirror serving DP-attention gather, TP8 MoE partial, and rank sum."""
 
         from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
-        from xorl.models.layers.moe.ep_native_combine import (  # noqa: PLC0415
+
+        # Architecture-scoped combine: DSV4 reproduces the pinned NCCL-tree
+        # contributor order, NOT the Qwen/GLM canonical adjacent-pair fold.
+        # See dsv4_native_combine's module docstring before unifying.
+        from xorl.models.layers.moe.dsv4_native_combine import (  # noqa: PLC0415
             compact_rank_padded_rows,
-            exchange_variable_and_chain_sum,
+            exchange_variable_and_nccl_tree_chain_sum,
             gather_ids_for_ep_combine,
             gather_tokens_for_ep_combine,
             row_counts_for_ep_combine,
@@ -1066,17 +1070,11 @@ class DeepseekV4MoE(MoEBlock):
         )
         validate_lora_metadata("routed/shared join")
         self._capture_diagnostic_component("moe_native_local_partial", local_partial)
-        # The DSV4 serving contract pins NCCL_ALGO=allreduce:tree; the tree's
-        # bitwise result over EP8 is a left-associative BF16 chain in
-        # contributor order [1, 2, .., 7, 0] (captured 2026-08-11; rank-0
-        # dump matched 40919/40960 columns with only expert-partial ulps
-        # remaining). Qwen3.5's default reverse-rank chain does not match.
-        combined = exchange_variable_and_chain_sum(
+        combined = exchange_variable_and_nccl_tree_chain_sum(
             local_partial,
             ep_group,
             row_counts,
             ep_rank,
-            chain_order=(*range(1, ep_size), 0),
         )
         validate_lora_metadata("EP exchange/combine")
         self._capture_diagnostic_component("moe_native_combined", combined)
