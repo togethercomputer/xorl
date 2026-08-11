@@ -2361,6 +2361,15 @@ def post_process_after_weight_loading(
             continue
         _dispatch_buffer(model, name, buffer, dtensor_factory)
 
+    # named_buffers() deduplicates shared tensor objects, so the snapshot above
+    # restores a shared buffer under only its first FQN and to_empty leaves the
+    # other holders zeroed. Models that share large tables across layers (e.g.
+    # DSV4 RoPE freqs) rebuild them here.
+    rebuild_shared = getattr(model, "rebuild_shared_freqs_cis", None)
+    if callable(rebuild_shared):
+        rebuilt_count = rebuild_shared()
+        logger.info_rank0(f"Rebuilt {rebuilt_count} shared freqs_cis buffers after weight loading")
+
     if parameter_names_left:
         logger.info_rank0(f"Find missing key(s) in state dict: {parameter_names_left}, initialize them.")
         for name in parameter_names_left:

@@ -300,6 +300,13 @@ class DeepSeekV4Attention(nn.Module):
             config, rope_head_dim=self.rope_head_dim, base=rope_base, yarn_disabled=yarn_disabled
         )
         self.register_buffer("freqs_cis", freqs_cis, persistent=False)
+        # The table above is one lru_cache-shared tensor object registered on
+        # every layer with the same (base, yarn) args. Loaders that snapshot
+        # named_buffers() (which deduplicates by object) and restore after
+        # to_empty() would silently leave every layer but the first holder
+        # with zeroed RoPE, so rebuild_shared_freqs_cis() re-registers the
+        # tables post-materialization from these stashed args.
+        self._freqs_cis_rebuild_args = (rope_base, yarn_disabled, self.rope_head_dim)
 
     def to(self, *args, **kwargs):
         return _dsv4_model_to(self, *args, preserve_keep_fp32=False, **kwargs)
@@ -1145,6 +1152,39 @@ class DeepseekV4PreTrainedModel(XorlPreTrainedModel):
     config_class = None  # set by importer to avoid circular import
     base_model_prefix = "model"
     _no_split_modules = ["DeepseekV4DecoderLayer"]
+
+    def rebuild_shared_freqs_cis(self) -> int:
+        """Re-register the lru_cache-shared RoPE tables after to_empty loads.
+
+        named_buffers() deduplicates shared tensor objects, so buffer restore
+        recovers each table under only its first FQN and every other layer's
+        RoPE runs on zeroed storage (the 2026-08-11 base-ruler first
+        divergence: layers 1 and 3-42 emitted rope-slice zeros). Rebuild one
+        table per distinct (base, yarn, head_dim) argument tuple per device
+        and share it across the layers that use it.
+        """
+
+        shared: dict[tuple, torch.Tensor] = {}
+        rebuilt = 0
+        for module in self.modules():
+            args = getattr(module, "_freqs_cis_rebuild_args", None)
+            if args is None or "freqs_cis" not in getattr(module, "_buffers", {}):
+                continue
+            rope_base, yarn_disabled, rope_head_dim = args
+            device = module.freqs_cis.device
+            key = (rope_base, yarn_disabled, rope_head_dim, device)
+            table = shared.get(key)
+            if table is None:
+                table = wrapped_precompute_freqs_cis(
+                    self.config,
+                    rope_head_dim=rope_head_dim,
+                    base=rope_base,
+                    yarn_disabled=yarn_disabled,
+                ).to(device)
+                shared[key] = table
+            module.register_buffer("freqs_cis", table, persistent=False)
+            rebuilt += 1
+        return rebuilt
 
     def get_ignore_modules_in_mixed_precision(self):
         """Keep native dense payload bytes outside the decoder BF16 policy."""
