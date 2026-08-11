@@ -17,7 +17,7 @@ form, while production consumes the post-EP sixteen-expert form directly.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, replace
+from dataclasses import replace
 
 import torch
 import torch.nn.functional as F
@@ -40,18 +40,6 @@ GLM52_ROUTED_GLOBAL_EXPERTS = 256
 GLM52_ROUTED_EP_SIZE = 16
 GLM52_ROUTED_LOCAL_EXPERTS = 16
 GLM52_ROUTED_MAX_LORAS_PER_BATCH = 8
-
-
-@dataclass(frozen=True)
-class Glm52ExactRoutedValueTrace:
-    """Sampler-owned intermediate bytes captured by a component test."""
-
-    gate_up_base: Tensor
-    gate_up_post_lora: Tensor
-    activated: Tensor
-    down_base_routed: Tensor
-    down_post_lora_routed: Tensor
-    owner_output: Tensor
 
 
 def localize_glm52_ep16_expert_ids(global_ids: Tensor, ep_rank: int) -> Tensor:
@@ -94,13 +82,12 @@ class _Glm52ExactEP16RoutedQLoRAFunction(torch.autograd.Function):
         effective = tuple(
             factor.to(torch.bfloat16).contiguous() for factor in (gate_A, gate_B, up_A, up_B, down_A, down_B)
         )
-        output, _ = module._sampler_value(
+        output = module._sampler_value(
             hidden,
             routing,
             local_ids,
             *effective,
             routed_scaling_factor=float(routed_scaling_factor),
-            capture_trace=False,
         )
         expected_shape = (hidden.shape[0], module.hidden_size)
         if output.dtype is not torch.bfloat16 or tuple(output.shape) != expected_shape:
@@ -499,10 +486,6 @@ class Glm52ExactEP16BlockFP8QLoRARoutedExperts(Glm52NativeBlockFP8Experts):
             "down_lora_b_weights": down_B_buffer,
         }
 
-    def physical_factor_buffers(self) -> dict[str, Tensor]:
-        effective = tuple(getattr(self, name).to(torch.bfloat16).contiguous() for name in self.logical_factor_names)
-        return self._physical_factor_buffers(*effective)
-
     def _lora_info(self, rows: int, physical: dict[str, Tensor]):
         try:
             from sglang.srt.lora.lora_moe_runners import LoRAInfo  # noqa: PLC0415
@@ -546,8 +529,7 @@ class Glm52ExactEP16BlockFP8QLoRARoutedExperts(Glm52NativeBlockFP8Experts):
         down_B: Tensor,
         *,
         routed_scaling_factor: float,
-        capture_trace: bool,
-    ) -> tuple[Tensor, Glm52ExactRoutedValueTrace | None]:
+    ) -> Tensor:
         """Invoke S4's literal base/hook/activation/hook/fold sequence."""
 
         physical = self._physical_factor_buffers(gate_A, gate_B, up_A, up_B, down_A, down_B)
@@ -581,27 +563,6 @@ class Glm52ExactEP16BlockFP8QLoRARoutedExperts(Glm52NativeBlockFP8Experts):
             block_shape=[128, 128],
         )
         hooks = build_lora_hooks(hidden, self._lora_info(hidden.shape[0], physical), local_ids)
-        trace_values: dict[str, Tensor] = {}
-        if capture_trace:
-            original_gate_up = hooks.after_gate_up
-            original_down = hooks.after_down
-
-            def traced_gate_up(x, cache, weights, ids):
-                trace_values["gate_up_base"] = cache.clone()
-                assert original_gate_up is not None
-                original_gate_up(x, cache, weights, ids)
-                trace_values["gate_up_post_lora"] = cache.clone()
-
-            def traced_down(activated, cache, weights, ids):
-                trace_values["activated"] = activated.clone()
-                trace_values["down_base_routed"] = cache.clone()
-                assert original_down is not None
-                original_down(activated, cache, weights, ids)
-                trace_values["down_post_lora_routed"] = cache.clone()
-
-            hooks.after_gate_up = traced_gate_up
-            hooks.after_down = traced_down
-
         output = _fused_moe_kernel_sequence(
             hidden,
             w1,
@@ -642,10 +603,7 @@ class Glm52ExactEP16BlockFP8QLoRARoutedExperts(Glm52NativeBlockFP8Experts):
             gate_up_interleaved=False,
             a1_q=None,
         )
-        trace = None
-        if capture_trace:
-            trace = Glm52ExactRoutedValueTrace(owner_output=output.clone(), **trace_values)
-        return output, trace
+        return output
 
     def _dequantized_base(self) -> tuple[Tensor, Tensor]:
         try:
@@ -764,28 +722,6 @@ class Glm52ExactEP16BlockFP8QLoRARoutedExperts(Glm52NativeBlockFP8Experts):
         iterator = iter(computed)
         return tuple(next(iterator) if needed else None for needed in needs)
 
-    def sampler_value_trace(
-        self,
-        hidden: Tensor,
-        routing: Tensor,
-        global_ids: Tensor,
-        *,
-        routed_scaling_factor: float = 1.0,
-    ) -> Glm52ExactRoutedValueTrace:
-        local_ids = self.localize_global_expert_ids(global_ids)
-        self._validate_runtime_contract(hidden, routing, local_ids)
-        effective = tuple(getattr(self, name).to(torch.bfloat16).contiguous() for name in self.logical_factor_names)
-        _, trace = self._sampler_value(
-            hidden,
-            routing,
-            local_ids,
-            *effective,
-            routed_scaling_factor=float(routed_scaling_factor),
-            capture_trace=True,
-        )
-        assert trace is not None
-        return trace
-
     def forward(
         self,
         hidden_states: Tensor,
@@ -831,6 +767,5 @@ __all__ = [
     "GLM52_ROUTED_GLOBAL_EXPERTS",
     "GLM52_ROUTED_LOCAL_EXPERTS",
     "Glm52ExactEP16BlockFP8QLoRARoutedExperts",
-    "Glm52ExactRoutedValueTrace",
     "localize_glm52_ep16_expert_ids",
 ]

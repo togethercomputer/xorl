@@ -71,76 +71,6 @@ def _tiny_config(*, compress_ratios, num_hash_layers=0):
     )
 
 
-# ---------------------------------------------------------------------------
-# Name mapping
-# ---------------------------------------------------------------------------
-
-
-def test_name_mapping_top_level():
-    from xorl.models.transformers.deepseek_v4.checkpoint_handler import _hf_to_xorl_name
-
-    assert _hf_to_xorl_name("embed.weight") == "model.embed_tokens.weight"
-    assert _hf_to_xorl_name("head.weight") == "lm_head.weight"
-    assert _hf_to_xorl_name("norm.weight") == "model.norm.weight"
-    assert _hf_to_xorl_name("hc_head_fn") == "model.hc_head_fn"
-    assert _hf_to_xorl_name("hc_head_base") == "model.hc_head_base"
-    assert _hf_to_xorl_name("hc_head_scale") == "model.hc_head_scale"
-
-
-def test_name_mapping_attention():
-    from xorl.models.transformers.deepseek_v4.checkpoint_handler import _hf_to_xorl_name
-
-    assert _hf_to_xorl_name("layers.0.attn.wq_a.weight") == "model.layers.0.self_attn.wq_a.weight"
-    assert _hf_to_xorl_name("layers.5.attn.attn_sink") == "model.layers.5.self_attn.attn_sink"
-    assert _hf_to_xorl_name("layers.10.attn.compressor.ape") == "model.layers.10.self_attn.compressor.ape"
-    # Indexer name renames: HF ``indexer.wq_b`` -> xorl ``indexer.linear_wq_b``.
-    assert (
-        _hf_to_xorl_name("layers.10.attn.indexer.wq_b.weight") == "model.layers.10.self_attn.indexer.linear_wq_b.weight"
-    )
-    assert (
-        _hf_to_xorl_name("layers.10.attn.indexer.weights_proj.weight")
-        == "model.layers.10.self_attn.indexer.linear_weights_proj.weight"
-    )
-
-
-def test_name_mapping_ffn_norms_hc():
-    from xorl.models.transformers.deepseek_v4.checkpoint_handler import _hf_to_xorl_name
-
-    assert _hf_to_xorl_name("layers.3.attn_norm.weight") == "model.layers.3.input_layernorm.weight"
-    assert _hf_to_xorl_name("layers.3.ffn_norm.weight") == "model.layers.3.post_attention_layernorm.weight"
-    assert _hf_to_xorl_name("layers.3.hc_attn_fn") == "model.layers.3.hc_attn_fn"
-    assert _hf_to_xorl_name("layers.3.hc_ffn_scale") == "model.layers.3.hc_ffn_scale"
-
-    # noaux_tc bias rename: HF gate.bias -> xorl mlp.gate.e_score_correction_bias.
-    assert _hf_to_xorl_name("layers.0.ffn.gate.bias") == "model.layers.0.mlp.gate.e_score_correction_bias"
-    # tid2eid sits on the block, not on the gate.
-    assert _hf_to_xorl_name("layers.0.ffn.gate.tid2eid") == "model.layers.0.mlp.tid2eid"
-    # Shared expert renames w1/w2/w3 -> gate_proj/down_proj/up_proj.
-    assert (
-        _hf_to_xorl_name("layers.0.ffn.shared_experts.w1.weight")
-        == "model.layers.0.mlp.shared_experts.gate_proj.weight"
-    )
-    assert (
-        _hf_to_xorl_name("layers.0.ffn.shared_experts.w2.weight")
-        == "model.layers.0.mlp.shared_experts.down_proj.weight"
-    )
-    assert (
-        _hf_to_xorl_name("layers.0.ffn.shared_experts.w3.weight") == "model.layers.0.mlp.shared_experts.up_proj.weight"
-    )
-
-
-def test_name_mapping_skips_mtp_and_unknown():
-    from xorl.models.transformers.deepseek_v4.checkpoint_handler import _hf_to_xorl_name
-
-    assert _hf_to_xorl_name("mtp.0.attn.wq_a.weight") is None
-    assert _hf_to_xorl_name("totally.bogus.name") is None
-
-
-# ---------------------------------------------------------------------------
-# APE hotfix undo
-# ---------------------------------------------------------------------------
-
-
 def _miles_apply_ape_hotfix(param):
     """Forward direction of miles ``_apply_ape_hotfix_mirror`` for the test."""
     assert param.shape[0] == 4
@@ -148,32 +78,13 @@ def _miles_apply_ape_hotfix(param):
     return torch.cat([a, b], dim=0).view(4, -1).contiguous()
 
 
-def test_ape_hotfix_round_trip():
-    """``_undo_ape_hotfix(_miles_apply_ape_hotfix(x)) == x`` for all C4 shapes."""
-    from xorl.models.transformers.deepseek_v4.checkpoint_handler import _undo_ape_hotfix
-
-    torch.manual_seed(0)
-    for head_dim in (4, 16, 128):
-        x = torch.randn(4, 2 * head_dim)
-        hf_layout = _miles_apply_ape_hotfix(x)
-        recovered = _undo_ape_hotfix(hf_layout)
-        torch.testing.assert_close(recovered, x)
-
-
-def test_ape_hotfix_assertion_on_wrong_shape():
-    from xorl.models.transformers.deepseek_v4.checkpoint_handler import _undo_ape_hotfix
-
-    with pytest.raises(AssertionError):
-        _undo_ape_hotfix(torch.zeros(8, 16))
-
-
 # ---------------------------------------------------------------------------
 # FP8 block dequantization
 # ---------------------------------------------------------------------------
 
 
-def test_fp8_dequantize_matches_hand_computed():
-    """Tiny 256x256 weight, block 128: per-block scale repeats correctly."""
+def _assert_fp8_dequantize_matches_block_and_tail_references():
+    """Full blocks and non-aligned tails use their corresponding scale cells."""
     from xorl.models.transformers.deepseek_v4.checkpoint_handler import _dequantize_fp8_block
 
     torch.manual_seed(1)
@@ -196,10 +107,18 @@ def test_fp8_dequantize_matches_hand_computed():
 
     torch.testing.assert_close(bf16, expected)
 
+    torch.manual_seed(2)
+    tail_shape = (130, 200)
+    tail_weight = (torch.randn(*tail_shape) * 0.1).to(torch.float8_e4m3fn)
+    tail_scale = torch.tensor([[1.0, 2.0], [4.0, 8.0]]).to(torch.float8_e8m0fnu)
+    tail_out = _dequantize_fp8_block(tail_weight, tail_scale, block, torch.bfloat16)
+    tail_scale_full = tail_scale.float().repeat_interleave(128, 0).repeat_interleave(128, 1)[:130, :200]
+    tail_expected = (tail_weight.float() * tail_scale_full).to(torch.bfloat16)
+    torch.testing.assert_close(tail_out, tail_expected)
 
-def test_mxfp4_dequantize_known_pattern():
-    """Hand-encode 4 FP4 values into 2 int8 bytes, verify the dequant produces
-    the expected values * scale.
+
+def _assert_mxfp4_dequantize_known_values_and_block_scaling():
+    """Hand-encoded values decode correctly and select their scale blocks.
 
     Encoding: byte 0 packs (element 0 = +0.5, element 1 = -2.0) =
     (low nibble = 0001, high nibble = 1100) = 0xC1.
@@ -217,13 +136,6 @@ def test_mxfp4_dequantize_known_pattern():
     expected = torch.tensor([[0.5, -2.0, 1.0, 6.0]], dtype=torch.float32)
     torch.testing.assert_close(out, expected)
 
-
-def test_mxfp4_dequantize_handles_block_scaling():
-    """Two scale blocks -> different magnitudes per block."""
-    from xorl.models.transformers.deepseek_v4.checkpoint_handler import (
-        _dequantize_mxfp4_packed_int8,
-    )
-
     # 1 row, 32 packed bytes = 64 FP4 elements -> 2 scale blocks of 32.
     M, Np = 1, 32
     raw = torch.zeros(M, Np, dtype=torch.int8)
@@ -239,24 +151,6 @@ def test_mxfp4_dequantize_handles_block_scaling():
     torch.testing.assert_close(out[0, 1], torch.tensor(1.5 * 2.0))
     torch.testing.assert_close(out[0, 32], torch.tensor(1.0 * 8.0))
     torch.testing.assert_close(out[0, 33], torch.tensor(1.5 * 8.0))
-
-
-def test_fp8_dequantize_handles_non_block_aligned():
-    """When out/in is not a multiple of the block, the residual is dequantized
-    using the closest block scale (slice-and-truncate semantics)."""
-    from xorl.models.transformers.deepseek_v4.checkpoint_handler import _dequantize_fp8_block
-
-    torch.manual_seed(2)
-    out_dim, in_dim = 130, 200
-    block = (128, 128)
-    weight = (torch.randn(out_dim, in_dim) * 0.1).to(torch.float8_e4m3fn)
-    # 2 row-blocks (covering 0-128, 128-256 truncated at 130) and 2 col-blocks.
-    scale = torch.tensor([[1.0, 2.0], [4.0, 8.0]]).to(torch.float8_e8m0fnu)
-    out = _dequantize_fp8_block(weight, scale, block, torch.bfloat16)
-    assert out.shape == (out_dim, in_dim)
-    assert out.dtype == torch.bfloat16
-    # Sanity: no NaNs / Infs since every block has finite scale and small weights.
-    assert torch.isfinite(out).all()
 
 
 # ---------------------------------------------------------------------------
@@ -349,7 +243,7 @@ def _make_synthetic_hf_state_dict(cfg):
     return sd
 
 
-def test_end_to_end_synthetic_load_window_only():
+def _assert_end_to_end_synthetic_load_window_only():
     """Fully load a tiny 2-layer C0/C0 model from a fabricated HF state-dict."""
     from xorl.models.transformers.deepseek_v4 import DeepseekV4ForCausalLM, load_hf_state_dict_into_model
 
@@ -390,10 +284,48 @@ def test_end_to_end_synthetic_load_window_only():
         sd["head.weight"],
     )
     torch.testing.assert_close(model.model.hc_head_fn, sd["hc_head_fn"])
-    torch.testing.assert_close(model.model.layers[0].self_attn.attn_sink, sd["layers.0.attn.attn_sink"])
+    layer = model.model.layers[0]
+    torch.testing.assert_close(
+        layer.input_layernorm.weight,
+        sd["layers.0.attn_norm.weight"].to(layer.input_layernorm.weight.dtype),
+    )
+    torch.testing.assert_close(
+        layer.post_attention_layernorm.weight,
+        sd["layers.0.ffn_norm.weight"].to(layer.post_attention_layernorm.weight.dtype),
+    )
+    torch.testing.assert_close(
+        layer.self_attn.wq_a.weight,
+        sd["layers.0.attn.wq_a.weight"].to(layer.self_attn.wq_a.weight.dtype),
+    )
+    torch.testing.assert_close(layer.self_attn.attn_sink, sd["layers.0.attn.attn_sink"])
+    torch.testing.assert_close(layer.hc_attn_fn, sd["layers.0.hc_attn_fn"])
+    torch.testing.assert_close(
+        layer.mlp.gate.e_score_correction_bias,
+        sd["layers.0.ffn.gate.bias"],
+    )
+    torch.testing.assert_close(
+        layer.mlp.shared_experts.gate_proj.weight,
+        sd["layers.0.ffn.shared_experts.w1.weight"].to(layer.mlp.shared_experts.gate_proj.weight.dtype),
+    )
+    expected_gate_up = torch.stack(
+        [
+            torch.cat(
+                (
+                    sd[f"layers.0.ffn.experts.{expert}.w1.weight"].t(),
+                    sd[f"layers.0.ffn.experts.{expert}.w3.weight"].t(),
+                ),
+                dim=-1,
+            )
+            for expert in range(cfg.n_routed_experts)
+        ]
+    )
+    torch.testing.assert_close(
+        layer.mlp.experts.gate_up_proj,
+        expected_gate_up.to(layer.mlp.experts.gate_up_proj.dtype),
+    )
 
 
-def test_checkpoint_handler_ep_filters_and_fuses_local_experts():
+def _assert_checkpoint_handler_ep_filters_and_fuses_local_experts():
     """The generic distributed loader handler should emit only this EP rank's experts."""
     cfg = _tiny_config(compress_ratios=[0])
     sd = _make_synthetic_hf_state_dict(cfg)
@@ -438,7 +370,7 @@ def test_checkpoint_handler_ep_filters_and_fuses_local_experts():
     torch.testing.assert_close(down, torch.stack(expected_down_rows, dim=0))
 
 
-def test_checkpoint_handler_skips_mtp_even_without_ep_filter():
+def _assert_checkpoint_handler_skips_mtp_and_accounts_unknown_keys_without_ep_filter():
     cfg = _tiny_config(compress_ratios=[0])
     handler = DeepseekV4CheckpointHandler(
         cfg,
@@ -454,8 +386,11 @@ def test_checkpoint_handler_skips_mtp_even_without_ep_filter():
     assert skip_key_fn("mtp.0.ffn.experts.0.w1.weight") is True
     assert skip_key_fn("embed.weight") is False
 
+    assert handler.on_load_weight("totally.bogus.name", torch.zeros(1)) == []
+    assert handler.summary.unmapped == ["totally.bogus.name"]
 
-def test_strict_load_ignores_nonpersistent_rope_buffers():
+
+def _assert_strict_load_ignores_nonpersistent_rope_buffers():
     """``strict=True`` should not require config-derived RoPE cache buffers."""
     from xorl.models.transformers.deepseek_v4 import DeepseekV4ForCausalLM, load_hf_state_dict_into_model
 
@@ -469,7 +404,7 @@ def test_strict_load_ignores_nonpersistent_rope_buffers():
     assert summary.missing_in_model == []
 
 
-def test_end_to_end_synthetic_load_with_c4_layer():
+def _assert_end_to_end_synthetic_load_with_c4_layer():
     """C4 layer load exercises the indexer mapping + APE hotfix path."""
     from xorl.models.transformers.deepseek_v4 import DeepseekV4ForCausalLM, load_hf_state_dict_into_model
     from xorl.models.transformers.deepseek_v4.checkpoint_handler import _undo_ape_hotfix
@@ -497,9 +432,19 @@ def test_end_to_end_synthetic_load_with_c4_layer():
 
     torch.testing.assert_close(model.model.layers[1].self_attn.compressor.ape, expected_compressor_ape)
     torch.testing.assert_close(model.model.layers[1].self_attn.indexer.compressor.ape, expected_indexer_ape)
+    torch.testing.assert_close(
+        model.model.layers[1].self_attn.indexer.linear_wq_b.weight,
+        sd["layers.1.attn.indexer.wq_b.weight"].to(model.model.layers[1].self_attn.indexer.linear_wq_b.weight.dtype),
+    )
+    torch.testing.assert_close(
+        model.model.layers[1].self_attn.indexer.linear_weights_proj.weight,
+        sd["layers.1.attn.indexer.weights_proj.weight"].to(
+            model.model.layers[1].self_attn.indexer.linear_weights_proj.weight.dtype
+        ),
+    )
 
 
-def test_end_to_end_synthetic_load_with_hash_layer():
+def _assert_end_to_end_synthetic_load_with_hash_layer():
     """First layer is hash-routed: tid2eid is filled, gate.bias is absent."""
     from xorl.models.transformers.deepseek_v4 import DeepseekV4ForCausalLM, load_hf_state_dict_into_model
 
@@ -522,3 +467,18 @@ def test_end_to_end_synthetic_load_with_hash_layer():
 
     assert summary.unmapped == []
     assert summary.missing_in_model == []
+
+
+def test_dsv4_checkpoint_codec_and_handler_ownership_contract():
+    _assert_fp8_dequantize_matches_block_and_tail_references()
+    _assert_mxfp4_dequantize_known_values_and_block_scaling()
+    _assert_checkpoint_handler_ep_filters_and_fuses_local_experts()
+    _assert_checkpoint_handler_skips_mtp_and_accounts_unknown_keys_without_ep_filter()
+    _assert_dsv4_synthetic_load_contract()
+
+
+def _assert_dsv4_synthetic_load_contract():
+    _assert_end_to_end_synthetic_load_window_only()
+    _assert_strict_load_ignores_nonpersistent_rope_buffers()
+    _assert_end_to_end_synthetic_load_with_c4_layer()
+    _assert_end_to_end_synthetic_load_with_hash_layer()

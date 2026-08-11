@@ -10,7 +10,6 @@ import pytest
 import requests
 import torch
 
-from xorl.server.weight_sync.backends import create_backend
 from xorl.server.weight_sync.backends.base import EndpointConfig, TransportConfig
 from xorl.server.weight_sync.backends.sparse_delta import SparseDeltaTransportBackend
 
@@ -39,7 +38,7 @@ class _FakeResponse:
 def _make_backend(tmp_path: Path, *, world_size: int = 2) -> SparseDeltaTransportBackend:
     SparseDeltaTransportBackend.clear_cached_baselines()
     cfg = TransportConfig(
-        endpoints=[EndpointConfig(host="infer-0", port=30000, world_size=world_size)],
+        endpoints=[EndpointConfig(host="127.0.0.1", port=30000, world_size=world_size)],
         group_name=f"test-sparse-delta-{tmp_path.name}",
         training_rank=0,
         backend_config={"output_dir": str(tmp_path), "keep_files": True},
@@ -67,7 +66,7 @@ def _make_backend_with_config(
 ) -> SparseDeltaTransportBackend:
     SparseDeltaTransportBackend.clear_cached_baselines()
     cfg = TransportConfig(
-        endpoints=[EndpointConfig(host="infer-0", port=30000, world_size=world_size)],
+        endpoints=[EndpointConfig(host="127.0.0.1", port=30000, world_size=world_size)],
         group_name=f"test-sparse-delta-{tmp_path.name}",
         training_rank=0,
         backend_config={"output_dir": str(tmp_path), "keep_files": True, **backend_config},
@@ -78,18 +77,7 @@ def _make_backend_with_config(
     return backend
 
 
-def test_factory_creates_sparse_delta_backend(tmp_path: Path) -> None:
-    cfg = TransportConfig(
-        endpoints=[EndpointConfig(host="infer-0", port=30000, world_size=1)],
-        backend_config={"output_dir": str(tmp_path)},
-    )
-
-    backend = create_backend("sparse_delta", cfg)
-
-    assert isinstance(backend, SparseDeltaTransportBackend)
-
-
-def test_transfer_bucket_posts_packed_delta_to_each_tp_rank(tmp_path: Path) -> None:
+def test_transfer_bucket_sparse_encoding_lifecycle(tmp_path: Path) -> None:
     backend = _make_backend(tmp_path, world_size=2)
     captured: list[dict[str, _FakeEncoded]] = []
 
@@ -107,11 +95,13 @@ def test_transfer_bucket_posts_packed_delta_to_each_tp_rank(tmp_path: Path) -> N
             flush_cache=True,
             weight_version="sync-1",
         )
+        backend.transfer_bucket([("model.norm.weight", torch.tensor([1.0, 4.0, 3.0], dtype=torch.bfloat16))])
+        backend.transfer_bucket([("model.norm.weight", torch.tensor([1.0, 4.0, 3.0], dtype=torch.bfloat16))])
 
-    assert posted.call_count == 1
-    url = posted.call_args.args[0]
-    body = posted.call_args.kwargs["json"]
-    assert url == "http://infer-0:30000/update_weights_from_sparse_delta"
+    assert posted.call_count == 2
+    url = posted.call_args_list[0].args[0]
+    body = posted.call_args_list[0].kwargs["json"]
+    assert url == "http://127.0.0.1:30000/update_weights_from_sparse_delta"
     assert body["delta_paths"] == [body["delta_paths"][0], body["delta_paths"][0]]
     assert body["delta_paths"][0].endswith(".packed")
     assert body["flush_cache"] is True
@@ -122,43 +112,23 @@ def test_transfer_bucket_posts_packed_delta_to_each_tp_rank(tmp_path: Path) -> N
     assert encoded.values.dtype == torch.bfloat16
     assert encoded.values.tolist() == [1.0, 2.0, 3.0]
     assert encoded.shape == (3,)
-
-
-def test_repeated_transfer_encodes_only_exact_byte_changes(tmp_path: Path) -> None:
-    backend = _make_backend(tmp_path, world_size=1)
-    captured: list[dict[str, _FakeEncoded]] = []
-
-    def fake_write(encoded_tensors: dict[str, _FakeEncoded], path: str | Path) -> Path:
-        captured.append(encoded_tensors)
-        out = Path(path)
-        out.write_bytes(b"packed")
-        return out
-
-    backend._write_packed_file = fake_write
-
-    with patch("requests.post", return_value=_FakeResponse()):
-        backend.transfer_bucket([("model.norm.weight", torch.tensor([1.0, 2.0, 3.0], dtype=torch.bfloat16))])
-        backend.transfer_bucket([("model.norm.weight", torch.tensor([1.0, 4.0, 3.0], dtype=torch.bfloat16))])
-
-    first = captured[0]["model.norm.weight"]
     second = captured[1]["model.norm.weight"]
-    assert first.flat_indices.tolist() == [0, 1, 2]
     assert second.flat_indices.tolist() == [1]
     assert second.values.tolist() == [4.0]
-
-
-def test_unchanged_nonfinal_bucket_skips_post(tmp_path: Path) -> None:
-    backend = _make_backend(tmp_path, world_size=1)
-
-    with patch("requests.post", return_value=_FakeResponse()) as posted:
-        backend.transfer_bucket([("model.norm.weight", torch.tensor([1.0], dtype=torch.bfloat16))])
-        backend.transfer_bucket([("model.norm.weight", torch.tensor([1.0], dtype=torch.bfloat16))])
-
-    assert posted.call_count == 1
     assert backend.stats_summary()["skipped_unchanged_buckets"] == 1.0
 
+    _assert_prime_baseline_posts_only_final_empty_update(tmp_path / "prime")
+    _assert_receiver_failure_does_not_update_baseline(tmp_path / "receiver-failure")
+    post_path = tmp_path / "post"
+    post_path.mkdir()
+    _assert_post_packed_delta_paths_threads_metadata_and_per_rank_paths(post_path)
+    initialize_path = tmp_path / "initialize"
+    initialize_path.mkdir()
+    _assert_initialize_enforces_post_only_and_prepacked_policy(initialize_path)
 
-def test_prime_baseline_posts_only_final_empty_update(tmp_path: Path) -> None:
+
+def _assert_prime_baseline_posts_only_final_empty_update(tmp_path: Path) -> None:
+    tmp_path.mkdir()
     backend = _make_backend_with_config(tmp_path, {"prime_baseline": True})
     captured: list[dict[str, _FakeEncoded]] = []
 
@@ -190,24 +160,7 @@ def test_prime_baseline_posts_only_final_empty_update(tmp_path: Path) -> None:
     assert summary["baseline_update_s"] >= 0.0
 
 
-def test_post_packed_delta_paths_replicates_single_path_to_tp_ranks(tmp_path: Path) -> None:
-    backend = _make_backend(tmp_path, world_size=2)
-    packed = tmp_path / "delta.packed"
-    packed.write_bytes(b"packed")
-
-    with patch("requests.post", return_value=_FakeResponse()) as posted:
-        backend.post_packed_delta_paths([str(packed)], flush_cache=True, weight_version="sync-1")
-
-    body = posted.call_args.kwargs["json"]
-    assert body["delta_paths"] == [str(packed), str(packed)]
-    assert body["flush_cache"] is True
-    assert body["weight_version"] == "sync-1"
-    summary = backend.stats_summary()
-    assert summary["posted_files"] == 1.0
-    assert summary["total_packed_bytes"] == float(len(b"packed"))
-
-
-def test_post_packed_delta_paths_threads_fp8_kv_cache_metadata(tmp_path: Path) -> None:
+def _assert_post_packed_delta_paths_threads_metadata_and_per_rank_paths(tmp_path: Path) -> None:
     backend = _make_backend_with_config(
         tmp_path,
         {
@@ -216,9 +169,12 @@ def test_post_packed_delta_paths_threads_fp8_kv_cache_metadata(tmp_path: Path) -
             "fp8_kv_cache_postprocess_required": True,
             "fp8_kv_cache_static_scales": True,
         },
+        world_size=2,
     )
-    packed = tmp_path / "delta.packed"
-    packed.write_bytes(b"packed")
+    packed0 = tmp_path / "rank0.packed"
+    packed1 = tmp_path / "rank1.packed"
+    packed0.write_bytes(b"0")
+    packed1.write_bytes(b"11")
 
     with patch(
         "requests.post",
@@ -232,9 +188,10 @@ def test_post_packed_delta_paths_threads_fp8_kv_cache_metadata(tmp_path: Path) -
             }
         ),
     ) as posted:
-        backend.post_packed_delta_paths([str(packed)], flush_cache=True, weight_version="sync-1")
+        backend.post_packed_delta_paths([str(packed0), str(packed1)], flush_cache=True, weight_version="sync-1")
 
     body = posted.call_args.kwargs["json"]
+    assert body["delta_paths"] == [str(packed0), str(packed1)]
     assert body["flush_cache"] is True
     assert body["weight_version"] == "sync-1"
     assert body["run_post_process_weights"] is True
@@ -243,7 +200,7 @@ def test_post_packed_delta_paths_threads_fp8_kv_cache_metadata(tmp_path: Path) -
     assert body["fp8_kv_cache_static_scales"] is True
     assert backend.endpoint_results == [
         {
-            "host": "infer-0",
+            "host": "127.0.0.1",
             "port": 30000,
             "success": True,
             "message": "ok",
@@ -252,78 +209,42 @@ def test_post_packed_delta_paths_threads_fp8_kv_cache_metadata(tmp_path: Path) -
             "fp8_kv_cache_static_scales_updated": True,
         }
     ]
+    summary = backend.stats_summary()
+    assert summary["posted_files"] == 2.0
+    assert summary["total_packed_bytes"] == 3.0
 
 
-def test_post_packed_delta_paths_accepts_per_tp_paths(tmp_path: Path) -> None:
-    backend = _make_backend(tmp_path, world_size=2)
-    packed0 = tmp_path / "rank0.packed"
-    packed1 = tmp_path / "rank1.packed"
-    packed0.write_bytes(b"0")
-    packed1.write_bytes(b"11")
+def _assert_initialize_enforces_post_only_and_prepacked_policy(tmp_path: Path) -> None:
+    cases = [
+        (
+            "post-only skips delta-encoding import",
+            {"post_only": True, "delta_encoding_path": str(tmp_path / "does-not-exist")},
+            True,
+        ),
+        ("prepacked-only rejects streaming", {"prepacked_only": True}, False),
+        ("prepacked post-only", {"post_only": True, "prepacked_only": True}, True),
+    ]
 
-    with patch("requests.post", return_value=_FakeResponse()) as posted:
-        backend.post_packed_delta_paths([str(packed0), str(packed1)])
+    for label, backend_config, expected in cases:
+        cfg = TransportConfig(
+            endpoints=[EndpointConfig(host="127.0.0.1", port=30000, world_size=1)],
+            group_name=f"test-sparse-delta-{tmp_path.name}-{label}",
+            training_rank=0,
+            backend_config={"output_dir": str(tmp_path), **backend_config},
+        )
+        backend = SparseDeltaTransportBackend(cfg)
 
-    body = posted.call_args.kwargs["json"]
-    assert body["delta_paths"] == [str(packed0), str(packed1)]
-    assert backend.stats_summary()["total_packed_bytes"] == 3.0
+        assert backend.initialize() is expected, label
+        if expected:
+            backend.destroy()
 
-
-def test_post_only_initialize_does_not_import_delta_encoding(tmp_path: Path) -> None:
-    cfg = TransportConfig(
-        endpoints=[EndpointConfig(host="infer-0", port=30000, world_size=1)],
-        group_name=f"test-sparse-delta-{tmp_path.name}",
-        training_rank=0,
-        backend_config={
-            "output_dir": str(tmp_path),
-            "post_only": True,
-            "delta_encoding_path": str(tmp_path / "does-not-exist"),
-        },
-    )
-    backend = SparseDeltaTransportBackend(cfg)
-
-    assert backend.initialize() is True
-
-    backend.destroy()
+    _assert_initialize_loads_delta_encoding_with_runtime_helper(tmp_path)
 
 
-def test_prepacked_only_refuses_streaming_initialize(tmp_path: Path) -> None:
-    cfg = TransportConfig(
-        endpoints=[EndpointConfig(host="infer-0", port=30000, world_size=1)],
-        group_name=f"test-sparse-delta-{tmp_path.name}",
-        training_rank=0,
-        backend_config={
-            "output_dir": str(tmp_path),
-            "prepacked_only": True,
-        },
-    )
-    backend = SparseDeltaTransportBackend(cfg)
-
-    assert backend.initialize() is False
-
-
-def test_prepacked_only_allows_post_only_initialize(tmp_path: Path) -> None:
-    cfg = TransportConfig(
-        endpoints=[EndpointConfig(host="infer-0", port=30000, world_size=1)],
-        group_name=f"test-sparse-delta-{tmp_path.name}",
-        training_rank=0,
-        backend_config={
-            "output_dir": str(tmp_path),
-            "post_only": True,
-            "prepacked_only": True,
-        },
-    )
-    backend = SparseDeltaTransportBackend(cfg)
-
-    assert backend.initialize() is True
-
-    backend.destroy()
-
-
-def test_initialize_loads_delta_encoding_with_runtime_helper(tmp_path: Path) -> None:
+def _assert_initialize_loads_delta_encoding_with_runtime_helper(tmp_path: Path) -> None:
     delta_path = tmp_path / "delta-encoding"
     cfg = TransportConfig(
-        endpoints=[EndpointConfig(host="infer-0", port=30000, world_size=1)],
+        endpoints=[EndpointConfig(host="127.0.0.1", port=30000, world_size=1)],
         group_name=f"test-sparse-delta-{tmp_path.name}",
         training_rank=0,
         backend_config={
@@ -359,7 +280,8 @@ def test_initialize_loads_delta_encoding_with_runtime_helper(tmp_path: Path) -> 
     backend.destroy()
 
 
-def test_receiver_failure_does_not_update_baseline(tmp_path: Path) -> None:
+def _assert_receiver_failure_does_not_update_baseline(tmp_path: Path) -> None:
+    tmp_path.mkdir()
     backend = _make_backend(tmp_path, world_size=1)
     captured: list[dict[str, _FakeEncoded]] = []
 

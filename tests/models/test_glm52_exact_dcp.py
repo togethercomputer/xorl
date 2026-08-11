@@ -95,9 +95,16 @@ def test_exact_base_dcp_contract_exhausts_three_dense_and_315_scale_aliases(tmp_
     assert result["unexpected_in_checkpoint"] == []
     assert result["missing_buffers_in_checkpoint"] == []
     assert result["unexpected_buffers_in_checkpoint"] == []
+    with monkeypatch.context() as case_patch:
+        _assert_distributed_checkpointer_loads_official_base_dcp_keys_into_exact_runtime_state(
+            tmp_path / "official-load",
+            case_patch,
+        )
 
 
-def test_distributed_checkpointer_loads_official_base_dcp_keys_into_exact_runtime_state(tmp_path, monkeypatch) -> None:
+def _assert_distributed_checkpointer_loads_official_base_dcp_keys_into_exact_runtime_state(
+    tmp_path, monkeypatch
+) -> None:
     source_model = _OneDenseExactModel()
     source_projection = Glm52ExactBaseDcpLoadProjection(source_model)
     source_state = {
@@ -177,7 +184,7 @@ def test_exact_base_dcp_dense_staging_fuses_into_four_rank_shard() -> None:
     )
 
 
-def test_skip_mode_defers_base_loading_to_dcp_but_keeps_fsdp_deregistration(monkeypatch) -> None:
+def test_skip_mode_admission_and_fsdp_deregistration_policy(monkeypatch) -> None:
     model = nn.Module()
     model.config = SimpleNamespace(**dict.fromkeys(GLM52_EXACT_ACTIVE_LORA_FLAGS, True))
     calls = []
@@ -197,10 +204,8 @@ def test_skip_mode_defers_base_loading_to_dcp_but_keeps_fsdp_deregistration(monk
 
     assert calls == [(model, ("packed_weight_f32",))]
 
-
-def test_skip_mode_rejects_non_exact_qlora_model() -> None:
-    model = nn.Module()
-    model.config = SimpleNamespace()
+    non_exact_model = nn.Module()
+    non_exact_model.config = SimpleNamespace()
 
     with pytest.raises(ValueError, match="complete GLM-5.2 exact active-LoRA model"):
-        model_builder._deferred_qlora_quantize(model, "/dcp-only", load_weights_mode="skip")
+        model_builder._deferred_qlora_quantize(non_exact_model, "/dcp-only", load_weights_mode="skip")

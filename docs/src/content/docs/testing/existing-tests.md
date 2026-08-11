@@ -10,7 +10,6 @@ Tests the full data pipeline: raw dataset loading, packing, batching, and collat
 - `test_shared.py` — loading datasets from Hugging Face Hub, local paths, and URLs; train/validation splits; merging multiple datasets
 - `test_packing.py` — FFD (First-Fit Decreasing) packing, sequential allocation, position ID generation, packed dataset merging
 - `test_hash.py` — dataset fingerprinting and config hashing for cache invalidation
-- `test_file_lock_loader.py` — multi-process safe dataset preparation with file locking; counter management and cleanup
 - `test_utils.py` — retry strategies (exponential, linear, constant backoff), MD5/SHA256 hashing
 
 **`data/collators/`**
@@ -130,5 +129,4 @@ E2E tests use small randomly-initialized model variants (no downloads required) 
 | `tiny_dense_model_dir_with_weights` | Random-init dense with weights on disk |
 | `tiny_moe_model_dir` | Random-init Qwen3-MoE |
 | `tiny_moe_model_dir_with_weights` | Random-init MoE with weights on disk |
-| `small_dense_model_dir_with_weights` | Dense, hidden size 256 |
 | `small_moe_model_dir_with_weights` | MoE, intermediate size 64 (NF4 group_size compatible) |

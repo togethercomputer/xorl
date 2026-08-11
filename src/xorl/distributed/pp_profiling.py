@@ -27,7 +27,6 @@ import torch
 
 __all__ = [
     "PPBubbleProfiler",
-    "analytic_bubble_fraction",
     "estimate_p2p_bytes_per_step",
     "merge_busy_intervals",
 ]
@@ -55,34 +54,6 @@ def merge_busy_intervals(intervals: Iterable[tuple[float, float]]) -> float:
     if cur_start is not None:
         total += cur_end - cur_start
     return total
-
-
-def analytic_bubble_fraction(schedule_name: str, pp: int, virtual_stages: int, n_microbatches: int) -> float:
-    """Textbook bubble fraction for a schedule at (pp, virtual_stages, n_microbatches).
-
-    GPipe/1F1B: ``(p-1)/(m+p-1)``. Interleaved1F1B: ``(p-1)/(v*m+p-1)`` (interleaving
-    with v virtual stages divides the bubble by ~v). Zero-bubble schedules
-    (InterleavedZeroBubble, ZBVZeroBubble, DualPipeV): ~0.0 by construction.
-
-    All values are approximations: they assume uniform per-microbatch compute across
-    stages, fwd:bwd cost ratios matching the schedule's design assumptions, enough
-    microbatches to fill the pipeline, and zero exposed communication. Real zero-bubble
-    runs retain small warmup/comm residues, so measured > 0 is expected.
-    """
-    if pp < 1 or virtual_stages < 1 or n_microbatches < 1:
-        raise ValueError(
-            f"pp, virtual_stages, n_microbatches must all be >= 1, got ({pp}, {virtual_stages}, {n_microbatches})"
-        )
-    key = schedule_name.lower()
-    if key in ("gpipe", "1f1b"):
-        if virtual_stages != 1:
-            raise ValueError(f"Schedule '{schedule_name}' is single-stage-per-rank; virtual_stages must be 1")
-        return (pp - 1) / (n_microbatches + pp - 1)
-    if key == "interleaved1f1b":
-        return (pp - 1) / (virtual_stages * n_microbatches + pp - 1)
-    if key in ("interleavedzerobubble", "zbvzerobubble", "dualpipev"):
-        return 0.0
-    raise ValueError(f"No analytic bubble model for schedule '{schedule_name}'")
 
 
 def _nbytes(t: torch.Tensor) -> int:

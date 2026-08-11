@@ -175,9 +175,6 @@ class LoraLinear(LoraModule, nn.Linear):
     # Merged-forward exact-model contract lane
     # ------------------------------------------------------------------
 
-    def invalidate_merged_weight_cache(self) -> None:
-        self._merged_weight_cache = {}
-
     def _merged_weight_key(self) -> tuple:
         t = (self.lora_A, self.lora_B, self.weight)
         return (

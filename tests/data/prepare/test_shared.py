@@ -3,9 +3,12 @@
 from unittest.mock import Mock, patch
 
 import pytest
+import requests
 from datasets import Dataset as HFDataset
+from huggingface_hub.errors import HfHubHTTPError
 
 from xorl.arguments import DatasetConfig
+from xorl.data.prepare.hash import generate_dataset_hash_from_config, generate_split_fingerprints
 from xorl.data.prepare.shared import (
     create_train_validation_split,
     datasets_with_name_generator,
@@ -15,6 +18,7 @@ from xorl.data.prepare.shared import (
     merge_datasets,
     save_preprocessed_dataset,
 )
+from xorl.data.prepare.utils import retry_on_request_exceptions
 
 
 pytestmark = pytest.mark.cpu
@@ -41,7 +45,7 @@ def _make_config(**overrides):
 class TestDatasetsWithNameGeneratorAndDatasetType:
     """Tests for datasets_with_name_generator and get_dataset_type."""
 
-    def test_expansion_and_passthrough_behaviors(self):
+    def test_dataset_preparation_lifecycle(self, tmp_path, monkeypatch):
         """Covers name expansion, preprocess_shards expansion, shards-blocks expansion,
         and get_dataset_type inference from extension and explicit ds_type."""
         # Multiple names expansion
@@ -57,10 +61,8 @@ class TestDatasetsWithNameGeneratorAndDatasetType:
         assert len(result) == 3
         assert [r.shards_idx for r in result] == [0, 1, 2]
 
-        # Preprocess_shards NOT expanded when shards already set
-        config_no_expand = _make_config(path="ds1", shards=4, preprocess_shards=3)
-        result = list(datasets_with_name_generator([config_no_expand]))
-        assert len(result) == 1
+        with pytest.raises(ValueError, match="mutually exclusive"):
+            _make_config(path="ds1", shards=4, preprocess_shards=3)
 
         # get_dataset_type: explicit ds_type overrides extension
         config_explicit = _make_config(path="data.parquet", ds_type="arrow")
@@ -78,11 +80,94 @@ class TestDatasetsWithNameGeneratorAndDatasetType:
         for path, expected_type in extension_map:
             assert get_dataset_type(_make_config(path=path)) == expected_type
 
+        TestSplitAndMerge()._assert_split_and_merge_operations()
+        load_root = tmp_path / "load"
+        load_root.mkdir()
+        with monkeypatch.context() as load_patch:
+            TestLoadDatasetWithConfig()._assert_local_and_hub_loading(load_root, load_patch)
+        save_root = tmp_path / "save"
+        save_root.mkdir()
+        TestSaveAndLoadPreprocessedDataset()._assert_save_load_and_missing(save_root)
+        _assert_dataset_hash_and_split_fingerprint_policy()
+        _assert_request_retry_policy(monkeypatch)
+
+
+def _assert_request_retry_policy(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr("xorl.data.prepare.utils.time.sleep", sleeps.append)
+
+    transient = Mock(
+        side_effect=[requests.exceptions.ReadTimeout("timeout"), requests.exceptions.ReadTimeout("timeout"), "success"]
+    )
+    wrapped = retry_on_request_exceptions(max_retries=3, delay=0.01)(transient)
+    assert wrapped() == "success"
+    assert transient.call_count == 3
+    assert sleeps == [0.01, 0.02]
+
+    response = Mock(status_code=500, headers={})
+    hub_transient = Mock(side_effect=[HfHubHTTPError("HF error", response=response), "success"])
+    wrapped = retry_on_request_exceptions(max_retries=3, delay=0.01)(hub_transient)
+    sleeps.clear()
+    assert wrapped() == "success"
+    assert sleeps == [0.01]
+
+    persistent = Mock(side_effect=requests.exceptions.ReadTimeout("persistent timeout"))
+    wrapped = retry_on_request_exceptions(max_retries=2, delay=0.01)(persistent)
+    sleeps.clear()
+    with pytest.raises(requests.exceptions.ReadTimeout):
+        wrapped()
+    assert persistent.call_count == 2
+    assert sleeps == [0.01]
+
+    unrelated = Mock(side_effect=ValueError("not a request exception"))
+    wrapped = retry_on_request_exceptions(max_retries=3, delay=0.01)(unrelated)
+    sleeps.clear()
+    with pytest.raises(ValueError):
+        wrapped()
+    assert unrelated.call_count == 1
+    assert sleeps == []
+
+
+def _assert_dataset_hash_and_split_fingerprint_policy():
+    dataset = Mock(spec=HFDataset)
+    dataset._fingerprint = "base_fingerprint"
+    train, evaluation = generate_split_fingerprints(dataset, val_set_size=100, seed=42)
+    train_again, evaluation_again = generate_split_fingerprints(dataset, val_set_size=100, seed=42)
+    assert train != evaluation
+    assert (train, evaluation) == (train_again, evaluation_again)
+    assert len(train) == len(evaluation) == 32
+
+    dataset_two = Mock(spec=HFDataset)
+    dataset_two._fingerprint = "fingerprint2"
+    assert train != generate_split_fingerprints(dataset, val_set_size=200, seed=42)[0]
+    assert train != generate_split_fingerprints(dataset, val_set_size=100, seed=99)[0]
+    assert train != generate_split_fingerprints(dataset_two, val_set_size=100, seed=42)[0]
+    fractional_train, fractional_evaluation = generate_split_fingerprints(dataset, val_set_size=0.1, seed=42)
+    assert fractional_train != fractional_evaluation
+
+    args = Mock()
+    args.data.select_columns = None
+    config = _make_config()
+    dataset_hash = generate_dataset_hash_from_config(args, [config], "gpt2")
+    assert dataset_hash == generate_dataset_hash_from_config(args, [config], "gpt2")
+    assert len(dataset_hash) == 32
+
+    args_with_columns = Mock()
+    args_with_columns.data.select_columns = ["col1", "col2"]
+    config_two = _make_config(path="dataset2")
+    assert dataset_hash != generate_dataset_hash_from_config(args, [config], "llama")
+    assert dataset_hash != generate_dataset_hash_from_config(args, [config_two], "gpt2")
+    assert dataset_hash != generate_dataset_hash_from_config(args_with_columns, [config], "gpt2")
+    assert dataset_hash != generate_dataset_hash_from_config(args, [config, config_two], "gpt2")
+    assert generate_dataset_hash_from_config(args, [config, config_two], "gpt2") == generate_dataset_hash_from_config(
+        args, [config_two, config], "gpt2"
+    )
+
 
 class TestSplitAndMerge:
     """Tests for create_train_validation_split and merge_datasets."""
 
-    def test_split_and_merge_operations(self):
+    def _assert_split_and_merge_operations(self):
         """Covers absolute/fractional split, merge with shuffle variants, and empty merge error."""
         dataset = HFDataset.from_dict(
             {
@@ -103,24 +188,25 @@ class TestSplitAndMerge:
         assert len(train_ds) == 8
         assert len(eval_ds) == 2
 
-        # Merge without shuffle
-        ds1 = HFDataset.from_dict({"input_ids": [[1, 2, 3]], "labels": [[1, 2, 3]]})
-        ds2 = HFDataset.from_dict({"input_ids": [[4, 5, 6]], "labels": [[4, 5, 6]]})
+        # The shuffle modes must change ordering, not merely preserve row count.
+        ds1 = HFDataset.from_dict({"input_ids": [[i] for i in range(3)], "labels": [[i] for i in range(3)]})
+        ds2 = HFDataset.from_dict({"input_ids": [[i] for i in range(3, 6)], "labels": [[i] for i in range(3, 6)]})
         args.data.shuffle_merged_datasets = False
         args.data.shuffle_before_merging_datasets = False
-        assert len(merge_datasets([ds1, ds2], args)) == 2
+        merged = merge_datasets([ds1, ds2], args)
+        assert [row[0] for row in merged["input_ids"]] == list(range(6))
 
-        # Merge with shuffle_merged_datasets
-        ds1 = HFDataset.from_dict({"input_ids": [[i] for i in range(3)], "labels": [[i] for i in range(3)]})
-        ds2 = HFDataset.from_dict({"input_ids": [[i] for i in range(3)], "labels": [[i] for i in range(3)]})
         args.data.shuffle_merged_datasets = True
-        args.data.shuffle_before_merging_datasets = False
-        assert len(merge_datasets([ds1, ds2], args)) == 6
+        shuffled_values = [row[0] for row in merge_datasets([ds1, ds2], args)["input_ids"]]
+        assert sorted(shuffled_values) == list(range(6))
+        assert shuffled_values != list(range(6))
 
-        # Merge with shuffle_before_merging
         args.data.shuffle_merged_datasets = False
         args.data.shuffle_before_merging_datasets = True
-        assert len(merge_datasets([ds1, ds2], args)) == 6
+        individually_shuffled = [row[0] for row in merge_datasets([ds1, ds2], args)["input_ids"]]
+        assert set(individually_shuffled[:3]) == set(range(3))
+        assert set(individually_shuffled[3:]) == set(range(3, 6))
+        assert individually_shuffled != list(range(6))
 
         # Empty dataset list raises ValueError
         args.data.shuffle_merged_datasets = False
@@ -131,7 +217,7 @@ class TestSplitAndMerge:
 class TestLoadDatasetWithConfig:
     """Tests for load_dataset_with_config function."""
 
-    def test_local_and_hub_loading(self, tmp_path, monkeypatch):
+    def _assert_local_and_hub_loading(self, tmp_path, monkeypatch):
         import datasets.config
 
         hf_cache = str(tmp_path / "hf_cache")
@@ -182,10 +268,12 @@ class TestLoadDatasetWithConfig:
             with pytest.raises(ValueError, match="The dataset could not be loaded"):
                 load_dataset_with_config(config, use_auth_token=False, streaming=False)
 
+        self._assert_data_files_string_and_list()
+
     @patch("xorl.data.prepare.shared._check_if_hub_dataset")
     @patch("xorl.data.prepare.shared.hf_hub_download")
     @patch("xorl.data.prepare.shared.load_dataset")
-    def test_data_files_string_and_list(self, mock_load_dataset, mock_hub_download, mock_check_hub):
+    def _assert_data_files_string_and_list(self, mock_load_dataset, mock_hub_download, mock_check_hub):
         """Covers loading from data_files as string and as list."""
         mock_check_hub.return_value = False
         mock_load_dataset.return_value = HFDataset.from_dict({"input_ids": [[1]], "labels": [[1]]})
@@ -195,19 +283,23 @@ class TestLoadDatasetWithConfig:
         config = _make_config(path="user/ds", split=None, data_files="data.json", ds_type="json")
         assert load_dataset_with_config(config, use_auth_token=False, streaming=False) is not None
         mock_hub_download.assert_called_once()
+        assert mock_load_dataset.call_args.args == ("json",)
+        assert mock_load_dataset.call_args.kwargs["data_files"] == "/tmp/file.json"
 
         # data_files as list
         mock_hub_download.reset_mock()
-        mock_hub_download.side_effect = ["/tmp/file1.json", "/tmp/file2.json"]
-        config = _make_config(path="user/ds", split=None, data_files=["d1.json", "d2.json"], ds_type="json")
+        mock_hub_download.side_effect = ["/tmp/file1.parquet", "/tmp/file2.parquet"]
+        config = _make_config(path="user/ds", split=None, data_files=["d1.parquet", "d2.parquet"], ds_type="parquet")
         assert load_dataset_with_config(config, use_auth_token=False, streaming=False) is not None
         assert mock_hub_download.call_count == 2
+        assert mock_load_dataset.call_args.args == ("parquet",)
+        assert mock_load_dataset.call_args.kwargs["data_files"] == ["/tmp/file1.parquet", "/tmp/file2.parquet"]
 
 
 class TestSaveAndLoadPreprocessedDataset:
     """Tests for save/load preprocessed dataset functions."""
 
-    def test_save_load_and_missing(self, tmp_path):
+    def _assert_save_load_and_missing(self, tmp_path):
         """Covers save+load round-trip and load returning None when not found."""
 
         args = Mock()

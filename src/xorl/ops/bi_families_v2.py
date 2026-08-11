@@ -23,8 +23,6 @@
 # recorded under v1 must be re-taken under v2, and both engines must flip
 # together.
 
-import os
-
 import torch
 import triton
 import triton.language as tl
@@ -55,21 +53,16 @@ def _select_nonexact_families() -> None:
 def families_v2_enabled() -> bool:
     """Return the selected reduction family for the current process.
 
-    Exact model programs select their family structurally and ignore the
-    legacy rollback variables.  Without an exact model selection, preserve the
-    pre-existing non-exact behavior for compatibility.
+    Exact model programs select their family structurally. Ordinary models use
+    the current v2 family; there is no process-environment rollback path.
     """
     if _EXACT_FAMILIES_VERSION is not None:
         return _EXACT_FAMILIES_VERSION == "v2"
-    return not any(os.getenv(v, "1").lower() in _V2_OFF for v in FAMILIES_V2_ENV_VARS)
+    return True
 
 
 # Contract constants (bit-relevant; never tuning axes).
 V2_NORM_BLOCK_H = 4096  # per-chunk tree width for hidden-dim norms
-V2_QK_MAX_HEAD_DIM = 256
-
-FAMILIES_V2_ENV_VARS = ("XORL_FAMILIES_V2", "SGLANG_FAMILIES_V2")
-_V2_OFF = ("0", "false", "no")
 
 
 @triton.jit
@@ -172,59 +165,6 @@ def _rms_norm_v2_kernel(
         tl.store(out_ptr + row * stride_out + cols, y.to(out_ptr.dtype.element_ty), mask=mask)
 
 
-QK_V2_ROWS_PER_PROG = 16  # head-rows per program (perf-only, NOT bit-relevant)
-
-
-@triton.jit
-def _qk_norm_v2_kernel(
-    x_ptr,
-    w_ptr,
-    out_ptr,
-    n_rows,
-    n_heads,
-    head_dim,
-    stride_x_tok,
-    stride_x_head,
-    stride_out_tok,
-    stride_out_head,
-    eps,
-    ZERO_CENTERED: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-    ROWS: tl.constexpr,
-):
-    """Family-1' strided qk-norm: reads head rows straight out of the packed
-    qkv projection (no reshape/contiguous copies). Same tree as
-    _rms_norm_v2_kernel (single chunk: head_dim <= V2_QK_MAX_HEAD_DIM).
-    Each program handles ROWS independent head-rows (row batching is grid
-    shape only — per-row math identical, like BLOCK_M in the GEMM).
-    In-place safe per row: the full head row is loaded before any store.
-    """
-    pid = tl.program_id(0)
-    rows = pid * ROWS + tl.arange(0, ROWS)
-    row_mask = rows < n_rows
-    rows_safe = tl.where(row_mask, rows, 0)
-    tok = rows_safe // n_heads
-    head = rows_safe % n_heads
-    d = tl.arange(0, BLOCK_D)
-    col_mask = d < head_dim
-    mask = row_mask[:, None] & col_mask[None, :]
-    base = tok * stride_x_tok + head * stride_x_head
-    x = tl.load(x_ptr + base[:, None] + d[None, :], mask=mask, other=0.0).to(tl.float32)
-    total = _pairwise_tree_sum_rows(x * x, BLOCK_D)
-    var = total / head_dim.to(tl.float32)
-    inv_rms = tl.rsqrt(var + eps)
-    w = tl.load(w_ptr + d, mask=col_mask, other=0.0).to(tl.float32)
-    if ZERO_CENTERED:
-        w = 1.0 + w
-    y = x * inv_rms[:, None] * w[None, :]
-    out_base = tok * stride_out_tok + head * stride_out_head
-    tl.store(
-        out_ptr + out_base[:, None] + d[None, :],
-        y.to(out_ptr.dtype.element_ty),
-        mask=mask,
-    )
-
-
 def rms_norm_v2(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -291,55 +231,6 @@ def _rms_norm_v2_fused(x, weight, eps, residual, zero_centered):
         ZERO_CENTERED=zero_centered,
         BLOCK_H=V2_NORM_BLOCK_H,
     )
-    return out
-
-
-def qk_norm_v2(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    eps: float = 1e-6,
-    *,
-    head_dim: int,
-    out: torch.Tensor | None = None,
-    zero_centered: bool = False,
-):
-    """v2 per-head qk-norm over strided input.
-
-    ``x``: ``[T, n_heads * head_dim]`` view into the packed qkv output — any
-    row stride, unit element stride, heads contiguous within a row. ``out``
-    defaults to a fresh tensor (trainer); pass ``out=x`` for in-place (serving).
-    """
-    assert x.ndim == 2 and x.stride(1) == 1
-    assert x.dtype == torch.bfloat16, "families v2 is bf16-only (contract dtype)"
-    assert x.shape[1] % head_dim == 0
-    assert head_dim <= V2_QK_MAX_HEAD_DIM
-    assert weight.ndim == 1 and weight.shape[0] == head_dim
-    assert x.is_cuda
-    T = x.shape[0]
-    n_heads = x.shape[1] // head_dim
-    weight = weight.contiguous()
-    if out is None:
-        out = torch.empty_like(x)
-    else:
-        assert out.shape == x.shape and out.stride(1) == 1 and out.dtype == x.dtype
-    if T > 0:
-        n_rows = T * n_heads
-        _qk_norm_v2_kernel[(triton.cdiv(n_rows, QK_V2_ROWS_PER_PROG),)](
-            x,
-            weight,
-            out,
-            n_rows,
-            n_heads,
-            head_dim,
-            x.stride(0),
-            head_dim,
-            out.stride(0),
-            head_dim,
-            eps,
-            ZERO_CENTERED=zero_centered,
-            BLOCK_D=triton.next_power_of_2(head_dim),
-            ROWS=QK_V2_ROWS_PER_PROG,
-        )
     return out
 
 

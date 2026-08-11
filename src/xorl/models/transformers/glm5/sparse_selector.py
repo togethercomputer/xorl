@@ -367,50 +367,6 @@ def select_glm52_logical_indices(
     return Glm52Selection(CanonicalLogicalIndices(output), valid_counts)
 
 
-def physical_cache_to_logical_indices(
-    physical_indices: torch.Tensor,
-    physical_to_logical: torch.Tensor,
-) -> CanonicalLogicalIndices:
-    """Convert cache/page slots to canonical sequence positions."""
-    if physical_indices.dtype not in (torch.int32, torch.int64):
-        raise TypeError("physical_indices must be int32 or int64")
-    if physical_to_logical.dtype not in (torch.int32, torch.int64):
-        raise TypeError("physical_to_logical must be int32 or int64")
-    if physical_to_logical.ndim not in (1, 2):
-        raise ValueError("physical_to_logical must be [slots] or [batch, slots]")
-
-    valid = physical_indices >= 0
-    clamped = physical_indices.clamp_min(0).long()
-    if physical_to_logical.ndim == 1:
-        if bool(torch.any(clamped[valid] >= physical_to_logical.shape[0])):
-            raise ValueError("physical index exceeds the physical-to-logical table")
-        logical = physical_to_logical[clamped]
-    else:
-        if physical_indices.shape[0] != physical_to_logical.shape[0]:
-            raise ValueError("Batched physical index and page-map batch dimensions differ")
-        if bool(torch.any(clamped[valid] >= physical_to_logical.shape[1])):
-            raise ValueError("physical index exceeds the batched physical-to-logical table")
-        batch_index = torch.arange(physical_indices.shape[0], device=physical_indices.device)
-        batch_index = batch_index.view(-1, *([1] * (physical_indices.ndim - 1))).expand_as(clamped)
-        logical = physical_to_logical[batch_index, clamped]
-    logical = logical.to(torch.int32).masked_fill(~valid, -1)
-    return CanonicalLogicalIndices(logical)
-
-
-def gather_selected_logical_values(values: torch.Tensor, indices: CanonicalLogicalIndices) -> torch.Tensor:
-    """Gather selected values with finite-zero semantics for ``-1`` slots."""
-    selected = indices.values
-    if values.ndim != 3 or selected.ndim != 3:
-        raise ValueError("Expected values [B,K,D] and selected indices [B,Q,T]")
-    if values.shape[0] != selected.shape[0]:
-        raise ValueError("Value and selected-index batch dimensions differ")
-    valid = selected >= 0
-    clamped = selected.clamp_min(0).long()
-    batch = torch.arange(values.shape[0], device=values.device).view(-1, 1, 1).expand_as(clamped)
-    gathered = values[batch, clamped]
-    return torch.where(valid.unsqueeze(-1), gathered, torch.zeros_like(gathered))
-
-
 __all__ = [
     "FP8_E4M3_MAX",
     "GLM52_HADAMARD_IMPORT",
@@ -421,8 +377,6 @@ __all__ = [
     "GLM52_SELECTOR_VERSION",
     "Glm52Selection",
     "dequantize_e4m3_blocks",
-    "gather_selected_logical_values",
-    "physical_cache_to_logical_indices",
     "quantize_e4m3_dynamic",
     "quantize_e4m3_ue8m0",
     "quantize_sparse_key_cache",

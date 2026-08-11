@@ -24,7 +24,6 @@ Validates:
    explicit-flag path.
 """
 
-import inspect
 import logging
 import sys
 import types
@@ -76,6 +75,10 @@ def routed_inputs():
 @pytest.fixture()
 def auto_state(monkeypatch):
     """Reset the auto-resolution log latch and the cached stack probe."""
+    _reset_auto_state(monkeypatch)
+
+
+def _reset_auto_state(monkeypatch):
     monkeypatch.setattr(experts_mod, "_MOE_SGLANG_FUSED_EXPERTS_AUTO_LOGGED", False)
     monkeypatch.setattr(experts_mod, "_MOE_SGLANG_FUSED_EXPERTS_STACK_AVAILABLE", None)
 
@@ -104,7 +107,7 @@ def log_spy(monkeypatch):
     return spy
 
 
-def test_auto_resolution_ep1_enables_and_logs_once(monkeypatch, auto_state, log_spy):
+def test_sglang_fused_experts_policy(monkeypatch, auto_state, log_spy, routed_inputs):
     monkeypatch.delenv(FLAG, raising=False)
     _stack_available(monkeypatch, True)
     assert experts_mod.moe_sglang_fused_experts_enabled(1, torch.device("cuda")) is True
@@ -112,15 +115,34 @@ def test_auto_resolution_ep1_enables_and_logs_once(monkeypatch, auto_state, log_
     logged = [m for _, m in log_spy.records if "auto-enabled (ep=1)" in m]
     assert len(logged) == 1, "auto resolution must be logged exactly once"
 
+    for check in (
+        _assert_auto_resolution_ep_gt1_disables,
+        _assert_explicit_env_overrides_auto,
+        _assert_auto_requires_cuda_input_and_stack,
+    ):
+        _reset_auto_state(monkeypatch)
+        log_spy.records.clear()
+        check(monkeypatch, log_spy)
+    _reset_auto_state(monkeypatch)
+    _assert_auto_requires_supported_expert_module(monkeypatch)
+    with monkeypatch.context() as case_patch:
+        _assert_moe_block_dispatch_and_precedence_policy(routed_inputs, case_patch)
+    with monkeypatch.context() as case_patch:
+        _assert_fused_expert_admission_and_trainable_dispatch_policy(routed_inputs, case_patch)
+    with monkeypatch.context() as case_patch:
+        _assert_weight_mode_cache_and_kernel_layout_policy(routed_inputs, case_patch)
+    with monkeypatch.context() as case_patch:
+        _assert_sglang_runtime_context_policy(case_patch)
 
-def test_auto_resolution_ep_gt1_disables(monkeypatch, auto_state, log_spy):
+
+def _assert_auto_resolution_ep_gt1_disables(monkeypatch, log_spy):
     monkeypatch.delenv(FLAG, raising=False)
     _stack_available(monkeypatch, True)
     assert experts_mod.moe_sglang_fused_experts_enabled(8, torch.device("cuda")) is False
     assert any("auto-disabled (ep=8)" in m for _, m in log_spy.records)
 
 
-def test_explicit_env_overrides_auto(monkeypatch, auto_state, log_spy):
+def _assert_explicit_env_overrides_auto(monkeypatch, log_spy):
     _stack_available(monkeypatch, True)
     monkeypatch.setenv(FLAG, "0")
     assert experts_mod.moe_sglang_fused_experts_enabled(1, torch.device("cuda")) is False
@@ -129,7 +151,7 @@ def test_explicit_env_overrides_auto(monkeypatch, auto_state, log_spy):
     assert not log_spy.records, "explicit 1/0 must not emit the auto-resolution log"
 
 
-def test_auto_requires_cuda_input_and_stack(monkeypatch, auto_state, log_spy):
+def _assert_auto_requires_cuda_input_and_stack(monkeypatch, log_spy):
     monkeypatch.delenv(FLAG, raising=False)
     # CPU/meta inputs keep the stock path quietly (unit tests, tracing).
     _stack_available(monkeypatch, True)
@@ -143,7 +165,7 @@ def test_auto_requires_cuda_input_and_stack(monkeypatch, auto_state, log_spy):
     assert warned and warned[0][0] == logging.WARNING
 
 
-def test_auto_requires_supported_expert_module(monkeypatch, auto_state):
+def _assert_auto_requires_supported_expert_module(monkeypatch):
     monkeypatch.delenv(FLAG, raising=False)
     _stack_available(monkeypatch, True)
     cuda = torch.device("cuda")
@@ -169,7 +191,7 @@ def test_auto_requires_supported_expert_module(monkeypatch, auto_state):
     assert experts_mod.moe_sglang_fused_experts_enabled(1, cuda, object()) is False
 
 
-def test_flag_off_keeps_default_path(routed_inputs, monkeypatch):
+def _assert_moe_block_dispatch_and_precedence_policy(routed_inputs, monkeypatch):
     monkeypatch.delenv(FLAG, raising=False)
     blk = _block("eager")
     x, _, _ = routed_inputs
@@ -187,8 +209,11 @@ def test_flag_off_keeps_default_path(routed_inputs, monkeypatch):
     assert not called.get("hit")
     assert torch.equal(out, baseline)
 
+    _assert_forward_dispatches_sglang_path(routed_inputs, monkeypatch)
+    _assert_forward_experts_only_dispatches_sglang_path(routed_inputs, monkeypatch)
 
-def test_forward_dispatches_sglang_path_for_non_eager_backends(routed_inputs, monkeypatch):
+
+def _assert_forward_dispatches_sglang_path(routed_inputs, monkeypatch):
     """The flag must override the configured backend (real configs resolve to triton)."""
     blk = _block("triton")
     x, w, ids = routed_inputs
@@ -207,7 +232,7 @@ def test_forward_dispatches_sglang_path_for_non_eager_backends(routed_inputs, mo
     assert out.shape == (1, TOKENS, HID)
 
 
-def test_forward_experts_only_dispatches_sglang_path(routed_inputs, monkeypatch):
+def _assert_forward_experts_only_dispatches_sglang_path(routed_inputs, monkeypatch):
     blk = _block("triton")
     x, w, ids = routed_inputs
     called = {}
@@ -223,28 +248,7 @@ def test_forward_experts_only_dispatches_sglang_path(routed_inputs, monkeypatch)
     assert out.shape == (1, TOKENS, HID)
 
 
-def test_fp64_parity_mode_takes_precedence(routed_inputs, monkeypatch):
-    blk = _block("triton")
-    x, w, ids = routed_inputs
-    called = {}
-
-    def fake_sglang(*args, **kwargs):
-        called["sglang"] = True
-        return torch.zeros_like(x)
-
-    def fake_fp64(hidden_states, routing_weights, selected_experts):
-        called["fp64"] = True
-        return torch.zeros_like(hidden_states)
-
-    monkeypatch.setattr(blk.experts, "sglang_fused_experts_forward", fake_sglang)
-    monkeypatch.setattr(blk, "_eager_forward_fp64", fake_fp64)
-    monkeypatch.setenv(FLAG, "1")
-    monkeypatch.setenv("XORL_MOE_FP64_ACCUM", "1")
-    blk.forward(x.view(1, TOKENS, HID))
-    assert called.get("fp64") and not called.get("sglang")
-
-
-def test_guards_reject_unsupported_experts(routed_inputs, monkeypatch):
+def _assert_fused_expert_admission_and_trainable_dispatch_policy(routed_inputs, monkeypatch):
     monkeypatch.setenv(FLAG, "1")
     blk = _block("eager")
     x, w, ids = routed_inputs
@@ -267,16 +271,19 @@ def test_guards_reject_unsupported_experts(routed_inputs, monkeypatch):
     with pytest.raises(ValueError):
         blk.experts.sglang_fused_experts_forward(x, None, None)
 
+    _assert_positive_swiglu_limit_fails_before_load(routed_inputs, monkeypatch)
+    _assert_trainable_guards(routed_inputs, monkeypatch)
+    _assert_trainable_dispatch_uses_autograd_function(routed_inputs, monkeypatch)
 
-def test_positive_swiglu_limit_fails_before_sglang_load_or_kernel(routed_inputs, monkeypatch):
-    """Every SGLang fused-kernel/runner entry must reject XoRL's
+
+def _assert_positive_swiglu_limit_fails_before_load(routed_inputs, monkeypatch):
+    """Every supported SGLang fused-kernel entry must reject XoRL's
     semantically different clamp before importing or invoking SGLang."""
     blk = _block("triton")
     blk.experts.swiglu_limit = 1.0
     x, w, ids = routed_inputs
     cumsum = torch.arange(1, NUM_EXPERTS + 1, dtype=torch.int64)
     local_ids = ids.to(torch.int32)
-    parallel_state = SimpleNamespace(tp_size=1)
     loaded = []
 
     def forbidden_loader():
@@ -284,14 +291,11 @@ def test_positive_swiglu_limit_fails_before_sglang_load_or_kernel(routed_inputs,
         raise AssertionError("positive swiglu_limit must fail before loading SGLang")
 
     monkeypatch.setattr(type(blk.experts), "_load_sglang_fused_experts_impl", staticmethod(forbidden_loader))
-    monkeypatch.setattr(type(blk.experts), "_load_sglang_moe_runner_stack", staticmethod(forbidden_loader))
 
     entrypoints = (
         lambda: blk.experts.sglang_fused_experts_forward(x, w, ids),
         lambda: blk.experts.sglang_fused_experts_ep_compute(x[:NUM_EXPERTS], cumsum, w[:NUM_EXPERTS, 0]),
         lambda: blk.experts.sglang_ep_native_routed_partial(x, w, local_ids),
-        lambda: blk.experts._sglang_moe_tp_sim_sglang_forward(x, w, ids, parallel_state),
-        lambda: blk.experts._sglang_moe_tp_sim_sglang_runner_forward(x, w, ids, parallel_state),
     )
     for entrypoint in entrypoints:
         with pytest.raises(NotImplementedError, match="positive swiglu_limit"):
@@ -299,19 +303,7 @@ def test_positive_swiglu_limit_fails_before_sglang_load_or_kernel(routed_inputs,
     assert loaded == []
 
 
-def test_missing_sglang_raises_import_error_naming_flag(routed_inputs, monkeypatch):
-    import importlib.util  # noqa: PLC0415
-
-    if importlib.util.find_spec("sglang") is not None:
-        pytest.skip("sglang installed; import-error guard not testable here")
-    monkeypatch.setenv(FLAG, "1")
-    blk = _block("eager")
-    x, w, ids = routed_inputs
-    with pytest.raises(ImportError, match=FLAG):
-        blk.experts.sglang_fused_experts_forward(x, w, ids)
-
-
-def test_trainable_dispatch_uses_autograd_function(routed_inputs, monkeypatch):
+def _assert_trainable_dispatch_uses_autograd_function(routed_inputs, monkeypatch):
     """When gradients are required, the flag path must route through the
     autograd Function; the no-grad path must keep using the plain kernel call."""
     from xorl.models.layers.moe import experts as experts_mod  # noqa: PLC0415
@@ -351,7 +343,7 @@ def test_trainable_dispatch_uses_autograd_function(routed_inputs, monkeypatch):
     assert called == {"plain": True}
 
 
-def test_trainable_guards(routed_inputs, monkeypatch):
+def _assert_trainable_guards(routed_inputs, monkeypatch):
     blk = _block("eager")
     x, w, ids = routed_inputs
     monkeypatch.setenv(FLAG, "1")
@@ -371,8 +363,15 @@ def test_trainable_guards(routed_inputs, monkeypatch):
     blk.experts.hidden_act = "silu"
 
 
-@pytest.mark.gpu
-def test_trainable_grads_match_stock_triton(monkeypatch):
+def _assert_trainable_gradient_numerics_policy(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    with monkeypatch.context() as case_patch:
+        _assert_trainable_grads_match_stock_triton(case_patch)
+    _assert_masked_trainable_gradient_policy()
+
+
+def _assert_trainable_grads_match_stock_triton(monkeypatch):
     """dX / dW13 / dW2 / d_topk_weights must be bit-identical to the stock
     triton path's gradients given the same drawn token permutation."""
     if not torch.cuda.is_available():
@@ -446,8 +445,7 @@ def _masked_problem(device, seed=0, all_valid=False, all_masked=False):
     return x, wts, local_ids, gu, dn, e_local
 
 
-@pytest.mark.gpu
-def test_masked_trainable_grads_match_compacted_stock():
+def _assert_masked_trainable_gradient_policy():
     """filter_expert=True grads must be bit-identical to the stock (unmasked)
     Function run directly on the compacted valid-pair topk=1 presentation, and
     masked slots' d(topk_weights) must be exactly zero."""
@@ -495,9 +493,11 @@ def test_masked_trainable_grads_match_compacted_stock():
     dx_ref = dx_full.reshape(x.shape[0], wts.shape[1], -1).sum(dim=1)
     assert torch.equal(a[0].grad, dx_ref), "dX mismatch vs compacted stock presentation"
 
+    _assert_masked_all_valid_matches_unmasked()
+    _assert_all_masked_output_and_gradients_are_zero()
 
-@pytest.mark.gpu
-def test_masked_all_valid_bitwise_matches_unmasked_path():
+
+def _assert_masked_all_valid_matches_unmasked():
     """With zero masked slots, the filter_expert lane must produce grads
     bit-identical to the stock (filter_expert=False) lane."""
     if not torch.cuda.is_available():
@@ -524,8 +524,7 @@ def test_masked_all_valid_bitwise_matches_unmasked_path():
         assert torch.equal(mine, stock), f"{name}: all-valid masked lane diverged from stock lane"
 
 
-@pytest.mark.gpu
-def test_masked_all_masked_zero_output_and_grads():
+def _assert_all_masked_output_and_gradients_are_zero():
     """A rank that owns none of the routed experts: zero forward, zero grads."""
     if not torch.cuda.is_available():
         pytest.skip("needs CUDA")
@@ -548,7 +547,7 @@ def test_masked_all_masked_zero_output_and_grads():
         assert g is not None and g.shape == ref.shape and (g == 0).all(), f"{name} must be exact zeros"
 
 
-def test_weight_cache_reuses_and_invalidates(routed_inputs, monkeypatch):
+def _assert_weight_mode_cache_and_kernel_layout_policy(routed_inputs, monkeypatch):
     """Cache mode: transposes are reused across forwards, invalidated on
     in-place parameter updates; transient mode makes fresh copies each forward."""
     blk = _block("eager")
@@ -565,15 +564,13 @@ def test_weight_cache_reuses_and_invalidates(routed_inputs, monkeypatch):
 
     # transient mode -> fresh transpose copies each forward
     monkeypatch.setenv("XORL_MOE_SGLANG_FUSED_EXPERTS_WEIGHT_MODE", "transient")
-    monkeypatch.delenv("XORL_MOE_SGLANG_FUSED_EXPERTS_CACHE_WEIGHTS", raising=False)
     blk.experts.sglang_fused_experts_forward(x, w, ids)
     blk.experts.sglang_fused_experts_forward(x, w, ids)
     assert seen[0][0] is not seen[1][0]
     assert seen[0][0].is_contiguous()
 
-    # legacy cache alias (no explicit mode) -> same transposed tensors reused
-    monkeypatch.delenv("XORL_MOE_SGLANG_FUSED_EXPERTS_WEIGHT_MODE", raising=False)
-    monkeypatch.setenv("XORL_MOE_SGLANG_FUSED_EXPERTS_CACHE_WEIGHTS", "1")
+    # cached mode -> same transposed tensors reused
+    monkeypatch.setenv("XORL_MOE_SGLANG_FUSED_EXPERTS_WEIGHT_MODE", "cached")
     seen.clear()
     blk.experts.sglang_fused_experts_forward(x, w, ids)
     blk.experts.sglang_fused_experts_forward(x, w, ids)
@@ -592,20 +589,22 @@ def test_weight_cache_reuses_and_invalidates(routed_inputs, monkeypatch):
     blk.experts.invalidate_sglang_fused_weight_cache()
     assert blk.experts._sglang_fused_weight_cache == {}
 
+    _assert_weight_mode_selection(monkeypatch)
+    _assert_strided_mode_passes_zero_copy_views(routed_inputs, monkeypatch)
+    _assert_kernel_receives_sglang_layout(routed_inputs, monkeypatch)
+    _assert_strided_adapter_layout_policy(monkeypatch)
 
-def test_weight_mode_selection(monkeypatch):
-    """Default is strided; explicit WEIGHT_MODE wins; legacy cache env aliases
-    cached; invalid rejects."""
+
+def _assert_weight_mode_selection(monkeypatch):
+    """Default is strided; explicit modes resolve; invalid values reject."""
     from xorl.models.layers.moe.experts import moe_sglang_fused_experts_weight_mode  # noqa: PLC0415
 
     monkeypatch.delenv("XORL_MOE_SGLANG_FUSED_EXPERTS_WEIGHT_MODE", raising=False)
-    monkeypatch.delenv("XORL_MOE_SGLANG_FUSED_EXPERTS_CACHE_WEIGHTS", raising=False)
     assert moe_sglang_fused_experts_weight_mode() == "strided"
 
-    monkeypatch.setenv("XORL_MOE_SGLANG_FUSED_EXPERTS_CACHE_WEIGHTS", "1")
+    monkeypatch.setenv("XORL_MOE_SGLANG_FUSED_EXPERTS_WEIGHT_MODE", "cached")
     assert moe_sglang_fused_experts_weight_mode() == "cached"
 
-    # explicit mode overrides the legacy cache alias
     monkeypatch.setenv("XORL_MOE_SGLANG_FUSED_EXPERTS_WEIGHT_MODE", "transient")
     assert moe_sglang_fused_experts_weight_mode() == "transient"
     monkeypatch.setenv("XORL_MOE_SGLANG_FUSED_EXPERTS_WEIGHT_MODE", "strided")
@@ -616,7 +615,7 @@ def test_weight_mode_selection(monkeypatch):
         moe_sglang_fused_experts_weight_mode()
 
 
-def test_strided_mode_passes_zero_copy_views(routed_inputs, monkeypatch):
+def _assert_strided_mode_passes_zero_copy_views(routed_inputs, monkeypatch):
     """Strided mode must hand the kernel transpose-VIEWS of the GKN parameters
     (same storage, non-contiguous, serving element order) and never populate the cache."""
     blk = _block("eager")
@@ -644,15 +643,8 @@ def test_strided_mode_passes_zero_copy_views(routed_inputs, monkeypatch):
     assert seen["gemm1_limit"] is None
     assert getattr(blk.experts, "_sglang_fused_weight_cache", None) in (None, {})
 
-    # strided mode ignores the legacy cache env (explicit mode wins)
-    monkeypatch.setenv("XORL_MOE_SGLANG_FUSED_EXPERTS_CACHE_WEIGHTS", "1")
-    seen.clear()
-    blk.experts.sglang_fused_experts_forward(x, w, ids)
-    assert seen["w13"].data_ptr() == blk.experts.gate_up_proj.data_ptr()
-    assert getattr(blk.experts, "_sglang_fused_weight_cache", None) in (None, {})
 
-
-def test_strided_vendored_impl_layout_guard():
+def _assert_strided_adapter_layout_policy(monkeypatch):
     """The vendored strided impl accepts serving-contiguous and GKN transpose-view
     layouts and nothing else (importable without sglang)."""
     from xorl.ops.moe.sglang_fused_moe_strided import serving_layout_or_gkn_view  # noqa: PLC0415
@@ -662,8 +654,10 @@ def test_strided_vendored_impl_layout_guard():
     assert serving_layout_or_gkn_view(gkn.transpose(1, 2).contiguous())  # serving layout
     assert not serving_layout_or_gkn_view(gkn[:, ::2, :].transpose(1, 2))  # sliced: neither
 
+    _assert_strided_impl_split_gate_up_layout(monkeypatch)
 
-def test_strided_impl_delegates_with_split_gate_up_layout(monkeypatch):
+
+def _assert_strided_impl_split_gate_up_layout(monkeypatch):
     import xorl.ops.moe.sglang_fused_moe_strided as strided_mod  # noqa: PLC0415
 
     seen = {}
@@ -737,7 +731,7 @@ def _install_fake_sglang_runtime(monkeypatch, *, existing, deterministic=True, f
     return created, published
 
 
-def test_ensure_sglang_runtime_publishes_xorl_deterministic_context(monkeypatch):
+def _assert_sglang_runtime_context_policy(monkeypatch):
     from xorl.models.layers.moe.experts import MoEExperts  # noqa: PLC0415
 
     created, published = _install_fake_sglang_runtime(monkeypatch, existing=False)
@@ -754,8 +748,11 @@ def test_ensure_sglang_runtime_publishes_xorl_deterministic_context(monkeypatch)
     assert len(published) == 1
     assert published[0][1] == "scheduler"
 
+    _assert_sglang_runtime_preserves_compatible_context(monkeypatch)
+    _assert_sglang_runtime_rejects_incompatible_context(monkeypatch)
 
-def test_ensure_sglang_runtime_preserves_compatible_context(monkeypatch):
+
+def _assert_sglang_runtime_preserves_compatible_context(monkeypatch):
     from xorl.models.layers.moe.experts import MoEExperts  # noqa: PLC0415
 
     created, published = _install_fake_sglang_runtime(monkeypatch, existing=True)
@@ -765,31 +762,33 @@ def test_ensure_sglang_runtime_preserves_compatible_context(monkeypatch):
     assert published == []
 
 
-@pytest.mark.parametrize(
-    ("deterministic", "fused_sum_all_reduce"),
-    [(False, False), (True, True)],
-)
-def test_ensure_sglang_runtime_rejects_incompatible_context(monkeypatch, deterministic, fused_sum_all_reduce):
+def _assert_sglang_runtime_rejects_incompatible_context(monkeypatch):
     from xorl.models.layers.moe.experts import MoEExperts  # noqa: PLC0415
 
-    _install_fake_sglang_runtime(
-        monkeypatch,
-        existing=True,
-        deterministic=deterministic,
-        fused_sum_all_reduce=fused_sum_all_reduce,
-    )
-    with pytest.raises(RuntimeError, match="SGLang MoE parity requires"):
-        MoEExperts._ensure_sglang_server_args()
-
-
-def test_sglang_runtime_api_does_not_regress_to_legacy_globals():
-    source = inspect.getsource(experts_mod.MoEExperts._ensure_sglang_server_args)
-    assert "get_global_server_args" not in source
-    assert "set_global_server_args_for_scheduler" not in source
+    for deterministic, fused_sum_all_reduce in ((False, False), (True, True)):
+        _install_fake_sglang_runtime(
+            monkeypatch,
+            existing=True,
+            deterministic=deterministic,
+            fused_sum_all_reduce=fused_sum_all_reduce,
+        )
+        with pytest.raises(RuntimeError, match="SGLang MoE parity requires"):
+            MoEExperts._ensure_sglang_server_args()
 
 
 @pytest.mark.gpu
-def test_strided_mode_bit_identical_to_transient(monkeypatch):
+def test_real_sglang_parity_policy(monkeypatch, auto_state):
+    if not torch.cuda.is_available():
+        pytest.skip("needs CUDA")
+    with monkeypatch.context() as case_patch:
+        _assert_trainable_gradient_numerics_policy(case_patch)
+    with monkeypatch.context() as case_patch:
+        _assert_strided_mode_bit_identical_to_transient(case_patch)
+    with monkeypatch.context() as case_patch:
+        _assert_auto_parity_forward_deterministic_and_matches_explicit(case_patch, auto_state)
+
+
+def _assert_strided_mode_bit_identical_to_transient(monkeypatch):
     """Forward and all gradients under WEIGHT_MODE=strided must be bit-identical
     to the transient-transpose mode (same kernels, view-strided addressing)."""
     if not torch.cuda.is_available():
@@ -841,7 +840,7 @@ def test_strided_mode_bit_identical_to_transient(monkeypatch):
         assert torch.equal(a, b), f"{name} differs between strided and transient weight modes"
 
 
-def test_kernel_receives_sglang_layout_and_fp32_weights(routed_inputs, monkeypatch):
+def _assert_kernel_receives_sglang_layout(routed_inputs, monkeypatch):
     """Fake the kernel to check the exact tensors the SGLang path hands over."""
     blk = _block("eager")
     x, w, ids = routed_inputs
@@ -873,35 +872,7 @@ def test_kernel_receives_sglang_layout_and_fp32_weights(routed_inputs, monkeypat
     assert seen["kwargs"]["apply_router_weight_on_input"] is False
 
 
-@pytest.mark.gpu
-def test_auto_ep1_forward_dispatches_parity_path(monkeypatch, auto_state):
-    """Unset env at ep=1 on CUDA must dispatch MoEBlock.forward to the parity
-    path; explicit 0 is the escape hatch back to the stock tree."""
-    if not torch.cuda.is_available():
-        pytest.skip("needs CUDA")
-    monkeypatch.delenv(FLAG, raising=False)
-    _stack_available(monkeypatch, True)
-    blk = _block("triton").to("cuda")
-    torch.manual_seed(1)
-    x = torch.randn(TOKENS, HID, dtype=torch.bfloat16, device="cuda")
-    called = {}
-
-    def fake(hidden_states, routing_weights, selected_experts):
-        called["hit"] = True
-        return torch.zeros_like(hidden_states)
-
-    monkeypatch.setattr(blk.experts, "sglang_fused_experts_forward", fake)
-    blk.forward(x.view(1, TOKENS, HID))
-    assert called.get("hit"), "unset env at ep=1 on CUDA must auto-enable the parity path"
-
-    called.clear()
-    monkeypatch.setenv(FLAG, "0")
-    blk.forward(x.view(1, TOKENS, HID))
-    assert not called.get("hit"), "explicit 0 must keep the stock path"
-
-
-@pytest.mark.gpu
-def test_auto_parity_forward_deterministic_and_matches_explicit(monkeypatch, auto_state):
+def _assert_auto_parity_forward_deterministic_and_matches_explicit(monkeypatch, auto_state):
     """Real-kernel ep=1 sanity: the auto-enabled forward is bit-identical across
     two runs (determinism) and to the explicit FLAG=1 path."""
     if not torch.cuda.is_available():

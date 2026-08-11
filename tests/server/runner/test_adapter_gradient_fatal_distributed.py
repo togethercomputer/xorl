@@ -41,6 +41,15 @@ from xorl.server.runner.runner_dispatcher import RunnerDispatcher
 pytestmark = pytest.mark.server
 
 
+def _stage_and_commit_gradient_capture(manager, model_id: str, *, denominator: float) -> None:
+    manager.stage_gradient_numerators(
+        model_id,
+        denominator=denominator,
+        backward_completed=True,
+    )
+    manager.commit_gradient_capture(model_id)
+
+
 class _AdapterLayer(nn.Module):
     adapter_gradient_producer_family = "module_managed"
 
@@ -127,7 +136,7 @@ def _run_worker() -> None:
     manager.begin_gradient_capture("policy", scale_state=GradientScaleState.RAW_NUMERATOR)
     for parameter in model.parameters():
         parameter.grad = torch.full_like(parameter, float(rank + 1))
-    manager.capture_gradient_numerators("policy", denominator=1, backward_completed=True)
+    _stage_and_commit_gradient_capture(manager, "policy", denominator=1)
 
     if rank == 1:
         parameter = next(iter(state.local_params.values()))
@@ -309,7 +318,7 @@ def _build_post_mutation_runner(label: str) -> tuple[ModelRunner, LoRAAdapterMan
     assert manager.begin_gradient_capture("policy", scale_state=GradientScaleState.RAW_NUMERATOR)
     for parameter in model.parameters():
         parameter.grad = torch.full_like(parameter, float(rank + 1))
-    manager.capture_gradient_numerators("policy", denominator=2, backward_completed=True)
+    _stage_and_commit_gradient_capture(manager, "policy", denominator=2)
 
     runner = object.__new__(ModelRunner)
     runner.model = model
@@ -414,9 +423,11 @@ def test_pre_rendezvous_rank_failure_prevents_peer_capture_commit_with_bounded_t
     assert "RANK_LOCAL_FAILURE_BEFORE_RENDEZVOUS" in combined
     assert "PEER_STAGED_CAPTURE_NEVER_COMMITTED" in combined
 
+    _assert_asymmetric_model_runner_tail_failure_prevents_external_publication()
+    _assert_asymmetric_publication_commit_failure_prevents_external_publication()
 
-@pytest.mark.cpu
-def test_asymmetric_model_runner_tail_failure_prevents_external_publication() -> None:
+
+def _assert_asymmetric_model_runner_tail_failure_prevents_external_publication() -> None:
     from tests.distributed.distributed_utils import run_distributed_script
 
     result = run_distributed_script(
@@ -433,8 +444,7 @@ def test_asymmetric_model_runner_tail_failure_prevents_external_publication() ->
     assert "MODEL_RUNNER_TAIL_EXTERNAL_OPTIM_RESPONSE" not in combined
 
 
-@pytest.mark.cpu
-def test_asymmetric_publication_commit_failure_prevents_external_publication() -> None:
+def _assert_asymmetric_publication_commit_failure_prevents_external_publication() -> None:
     from tests.distributed.distributed_utils import run_distributed_script
 
     result = run_distributed_script(

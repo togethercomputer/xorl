@@ -314,12 +314,3 @@ def block_fp8_dequantize_gkn_rowwise(
 
     _block_fp8_dequantize_gkn_rowwise_kernel[grid](x, s, y, M, N, BLOCK_SIZE=block_size)
     return y
-
-
-# ---------------------------------------------------------------------------
-# Backward-compat aliases
-# ---------------------------------------------------------------------------
-
-block_fp8_weight_quant = block_fp8_quantize_gkn
-block_fp8_weight_dequant = block_fp8_dequantize_gkn
-block_fp8_weight_quant_gkn = block_fp8_quantize_gkn

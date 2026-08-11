@@ -27,42 +27,6 @@ LOG = logging.get_logger(__name__)
 
 
 @numba.njit
-def ffd_check(sequence_lengths: np.ndarray, bin_capacity: int, num_bins: int) -> bool:
-    """First-fit-decreasing bin packing algorithm check.
-
-    Checks if sequences with the given lengths could fit in the specified number of
-    bins.
-
-    Args:
-        sequence_lengths: Array of sequence lengths.
-        bin_capacity: Maximum capacity of each bin.
-        num_bins: Number of bins available.
-
-    Returns:
-        `True` if all sequences can be packed, `False` otherwise.
-    """
-    # Sort sequence lengths in descending order for optimal packing
-    sequence_lengths = np.sort(sequence_lengths)[::-1]
-    # Initialize all bins with full capacity
-    bins = np.full((num_bins,), bin_capacity, dtype=sequence_lengths.dtype)
-
-    # Try to place each sequence in the first bin it fits
-    for size in sequence_lengths:
-        not_found = True
-        for idx in range(num_bins):
-            if bins[idx] >= size:
-                bins[idx] -= size
-                not_found = False
-                break
-
-        # If no bin could fit this sequence, packing failed
-        if not_found:
-            return False
-
-    return True
-
-
-@numba.njit
 def pack_group(
     sequence_lengths: np.ndarray,
     group_offset: int,

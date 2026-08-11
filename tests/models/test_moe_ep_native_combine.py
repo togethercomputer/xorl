@@ -16,12 +16,30 @@ from xorl.models.layers.moe.ep_native_combine import (
 pytestmark = [pytest.mark.cpu]
 
 
-def test_qwen35_native_combine_admits_only_ep8():
+def test_qwen35_native_combine_policy(monkeypatch):
     assert QWEN35_NATIVE_EP_COMBINE_SIZES == frozenset({8})
     validate_qwen35_native_ep_combine_size(8)
     for size in (1, 2, 4, 16):
         with pytest.raises(ValueError, match="EP8"):
             validate_qwen35_native_ep_combine_size(size)
+
+    blk = _qwen_block(exact=True)
+    assert blk._native_ep_combine
+    assert blk._exact_batch_invariant_router
+    assert blk.router._exact_batch_invariant
+
+    x = torch.randn(1, 4, 32, dtype=torch.bfloat16)
+    routing = torch.zeros(4, 2, dtype=torch.float32)
+    selected = torch.zeros(4, 2, dtype=torch.int64)
+    with pytest.raises(RuntimeError, match="trainer EP"):
+        blk._ep_combine_native(x, routing, selected)
+
+    with monkeypatch.context() as rows_patch:
+        _assert_variable_row_collectives_pad_tokens_and_ids_and_share_max_rows(rows_patch)
+    with monkeypatch.context() as gate_patch:
+        _assert_serving_fused_gate_forward_preserves_trainer_gradients(gate_patch)
+    with monkeypatch.context() as dispatch_patch:
+        _assert_native_combine_dispatch_and_actual_operand_policy(dispatch_patch)
 
 
 def _qwen_block(*, exact: bool = False):
@@ -43,23 +61,7 @@ def _qwen_block(*, exact: bool = False):
     return Qwen3_5MoeSparseMoeBlock(cfg, moe_implementation="eager", layer_idx=0).to(torch.bfloat16)
 
 
-def test_exact_native_requires_trainer_ep():
-    blk = _qwen_block(exact=True)
-    x = torch.randn(1, 4, 32, dtype=torch.bfloat16)
-    routing = torch.zeros(4, 2, dtype=torch.float32)
-    selected = torch.zeros(4, 2, dtype=torch.int64)
-    with pytest.raises(RuntimeError, match="trainer EP"):
-        blk._ep_combine_native(x, routing, selected)
-
-
-def test_exact_native_combine_is_structural():
-    blk = _qwen_block(exact=True)
-    assert blk._native_ep_combine
-    assert blk._exact_batch_invariant_router
-    assert blk.router._exact_batch_invariant
-
-
-def test_native_routed_partial_enters_through_module_call(monkeypatch):
+def _assert_native_routed_partial_enters_through_module_call(monkeypatch):
     """The EP serving-kernel lane must run inside FSDP's pre-forward hooks."""
     blk = _qwen_block()
     hidden = torch.randn(4, 32, dtype=torch.bfloat16)
@@ -86,7 +88,7 @@ def test_native_routed_partial_enters_through_module_call(monkeypatch):
     assert torch.equal(result, torch.zeros_like(hidden))
 
 
-def test_variable_row_token_gather_unpads_backward(monkeypatch):
+def _assert_variable_row_collectives_pad_tokens_and_ids_and_share_max_rows(monkeypatch):
     """The live River packer gives EP ranks unequal T; collectives must not."""
     import xorl.models.layers.moe.ep_native_combine as combine  # noqa: PLC0415
 
@@ -112,26 +114,16 @@ def test_variable_row_token_gather_unpads_backward(monkeypatch):
     gathered.sum().backward()
     assert torch.equal(x.grad, torch.full_like(x, 2.0))
 
-
-def test_variable_row_id_gather_uses_invalid_padding(monkeypatch):
-    import xorl.models.layers.moe.ep_native_combine as combine  # noqa: PLC0415
-
-    monkeypatch.setattr(combine.dist, "get_world_size", lambda _group: 2)
-
-    def fake_gather(out, local, group=None):
+    def fake_id_gather(out, local, group=None):
         del group
         assert torch.equal(local, torch.tensor([[4, 5], [-1, -1], [-1, -1]]))
         out[:3].copy_(local)
         out[3:].copy_(local)
 
-    monkeypatch.setattr(combine.dist, "all_gather_into_tensor", fake_gather)
-    gathered = gather_ids_for_ep_combine(torch.tensor([[4, 5]]), group=None, padded_rows=3)
-    assert gathered.shape == (6, 2)
-    assert torch.equal(gathered[1:3], torch.full((2, 2), -1))
-
-
-def test_max_rows_for_ep_combine(monkeypatch):
-    import xorl.models.layers.moe.ep_native_combine as combine  # noqa: PLC0415
+    monkeypatch.setattr(combine.dist, "all_gather_into_tensor", fake_id_gather)
+    gathered_ids = gather_ids_for_ep_combine(torch.tensor([[4, 5]]), group=None, padded_rows=3)
+    assert gathered_ids.shape == (6, 2)
+    assert torch.equal(gathered_ids[1:3], torch.full((2, 2), -1))
 
     def fake_max(rows, op=None, group=None):
         del op, group
@@ -141,7 +133,7 @@ def test_max_rows_for_ep_combine(monkeypatch):
     assert max_rows_for_ep_combine(6016, torch.device("cpu"), group=None) == 8192
 
 
-def test_serving_fused_gate_forward_preserves_trainer_gradients(monkeypatch):
+def _assert_serving_fused_gate_forward_preserves_trainer_gradients(monkeypatch):
     import xorl.models.layers.moe.ep_native_combine as combine  # noqa: PLC0415
 
     def fake_serving_kernel(hidden, weight, shared, final):
@@ -168,8 +160,11 @@ def test_serving_fused_gate_forward_preserves_trainer_gradients(monkeypatch):
         torch.testing.assert_close(actual_grad, reference_input.grad)
 
 
-def test_native_combine_captures_actual_operands(monkeypatch):
+def _assert_native_combine_dispatch_and_actual_operand_policy(monkeypatch):
     """The layer-selected diagnostic hook exposes every exact-combine boundary."""
+    with monkeypatch.context() as routed_partial_monkeypatch:
+        _assert_native_routed_partial_enters_through_module_call(routed_partial_monkeypatch)
+
     import xorl.distributed.parallel_state as parallel_state  # noqa: PLC0415
     import xorl.models.layers.moe.ep_native_combine as combine  # noqa: PLC0415
     import xorl.ops.batch_invariant_ops as batch_invariant_ops  # noqa: PLC0415
@@ -199,8 +194,9 @@ def test_native_combine_captures_actual_operands(monkeypatch):
     monkeypatch.setattr(
         combine,
         "sglang_fused_gate_sigmoid_mul_add",
-        lambda hidden, weight, shared, routed: routed
-        + torch.sigmoid((hidden * weight).sum(dim=-1, keepdim=True)) * shared,
+        lambda hidden, weight, shared, routed: (
+            routed + torch.sigmoid((hidden * weight).sum(dim=-1, keepdim=True)) * shared
+        ),
     )
     monkeypatch.setattr(
         batch_invariant_ops._BatchInvariantTrunkLinearFn,

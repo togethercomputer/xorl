@@ -23,15 +23,8 @@ from .common import split_gate_up_proj
 logger = logging.getLogger(__name__)
 
 _MOE_SGLANG_FUSED_EXPERTS_ENV = "XORL_MOE_SGLANG_FUSED_EXPERTS"
-_MOE_SGLANG_FUSED_EXPERTS_SLOT_COMBINE_ENV = "XORL_MOE_SGLANG_FUSED_EXPERTS_SLOT_COMBINE"
-_MOE_SGLANG_FUSED_EXPERTS_CACHE_ENV = "XORL_MOE_SGLANG_FUSED_EXPERTS_CACHE_WEIGHTS"
 _MOE_SGLANG_FUSED_EXPERTS_WEIGHT_MODE_ENV = "XORL_MOE_SGLANG_FUSED_EXPERTS_WEIGHT_MODE"
 _MOE_SGLANG_FUSED_EXPERTS_WEIGHT_MODES = ("transient", "cached", "strided")
-_SG_LANG_MOE_TP_SIM_ENV = "XORL_SGLANG_MOE_TP_SIM"
-_SG_LANG_MOE_TP_SIM_SIZE_ENV = "XORL_SGLANG_MOE_TP_SIM_SIZE"
-_SG_LANG_MOE_TP_SIM_LAYERS_ENV = "XORL_SGLANG_MOE_TP_SIM_LAYERS"
-_SG_LANG_MOE_TP_SIM_BF16_REDUCE_ENV = "XORL_SGLANG_MOE_TP_SIM_BF16_REDUCE"
-_SG_LANG_MOE_TP_SIM_CARRY_SHARDS_ENV = "XORL_SGLANG_MOE_TP_SIM_CARRY_SHARDS"
 
 
 def _flag_enabled(name: str) -> bool:
@@ -60,19 +53,6 @@ def _env_float_or_none(name: str) -> float | None:
         return float(raw)
     except (TypeError, ValueError):
         return None
-
-
-def _env_layer_filter_enabled(name: str, layer_idx: int | None) -> bool:
-    raw = os.environ.get(name, "").strip()
-    if not raw or raw.lower() in {"all", "*"}:
-        return True
-    if layer_idx is None:
-        return False
-    try:
-        enabled_layers = {int(item.strip()) for item in raw.split(",") if item.strip()}
-    except ValueError as exc:
-        raise ValueError(f"Invalid {name}={raw!r}; expected comma-separated layer indices") from exc
-    return layer_idx in enabled_layers
 
 
 _MOE_SGLANG_FUSED_EXPERTS_AUTO_LOGGED = False
@@ -179,47 +159,6 @@ def moe_sglang_fused_experts_enabled(
     return True
 
 
-def moe_sglang_fused_experts_slot_combine_enabled() -> bool:
-    """Formal-guarantee EP combine variant for the serving-kernel parity mode.
-
-    ``XORL_MOE_SGLANG_FUSED_EXPERTS_SLOT_COMBINE=1`` (sub-flag of
-    ``XORL_MOE_SGLANG_FUSED_EXPERTS``, only honored while that flag is on and
-    EP dispatch is ``alltoall``) replaces the alltoall fp32 scatter-add combine
-    with a slot-order gather + sgl_kernel ``moe_sum_reduce`` — the exact top-k
-    combine kernel the serving engine runs at topk>1. The default scatter-add
-    combine is empirically bit-identical on validated data; this variant makes
-    the combine-tree match structural rather than empirical.
-    """
-    return _flag_enabled(_MOE_SGLANG_FUSED_EXPERTS_SLOT_COMBINE_ENV)
-
-
-def moe_sglang_fused_experts_cache_enabled() -> bool:
-    """Opt-in cache for the serving-layout weight transposes (default off).
-
-    ``XORL_MOE_SGLANG_FUSED_EXPERTS_CACHE_WEIGHTS=1`` keeps the transposed
-    ``w13``/``w2`` copies alive on the owning :class:`MoEExperts` module
-    instead of re-materializing them per forward (the transposes dominate the
-    parity-mode tax: ~4.5 ms vs ~0.45 ms kernel per q30 layer).
-
-    Invalidation contract: entries are keyed on the source parameter's
-    ``(data_ptr, _version, shape, dtype)``, so plain in-place optimizer updates
-    invalidate automatically. Under FSDP2 the unsharded parameter buffer can be
-    re-materialized at the same address with a fresh version counter, which can
-    FALSELY HIT after a sharded optimizer step — call
-    :meth:`MoEExperts.invalidate_sglang_fused_weight_cache` after each step, or
-    leave the cache off (default) under FSDP2 training.
-
-    Memory: the cache duplicates the full expert weights in the serving layout
-    (~1.1 GiB per q30 layer, ~54 GiB for all 48 layers per rank at bf16) — size
-    it against free HBM before enabling model-wide.
-
-    Legacy alias: equivalent to ``XORL_MOE_SGLANG_FUSED_EXPERTS_WEIGHT_MODE=cached``;
-    an explicit weight mode takes precedence (see
-    :func:`moe_sglang_fused_experts_weight_mode`).
-    """
-    return _flag_enabled(_MOE_SGLANG_FUSED_EXPERTS_CACHE_ENV)
-
-
 def moe_sglang_fused_experts_weight_mode() -> str:
     """How the parity mode presents xorl's GKN weights to the serving kernel.
 
@@ -236,9 +175,10 @@ def moe_sglang_fused_experts_weight_mode() -> str:
       layer; the fallback if the vendored orchestration cannot bind to the
       sglang tree on PYTHONPATH after an upstream restructure);
     - ``cached``: keep the transposed copies alive on the module (fast, but
-      ~1.1 GiB per q30 layer — see :func:`moe_sglang_fused_experts_cache_enabled`
-      for the FSDP2 invalidation contract; that legacy env is an alias for this
-      mode when no explicit mode is set).
+      ~1.1 GiB per q30 layer). Cache entries key the source parameter's pointer,
+      version, shape, and dtype; FSDP2 callers must explicitly invalidate after
+      optimizer steps because an unsharded buffer can be rematerialized at the
+      same address with a fresh version counter.
     """
     raw = os.environ.get(_MOE_SGLANG_FUSED_EXPERTS_WEIGHT_MODE_ENV, "").strip().lower()
     if raw:
@@ -248,7 +188,7 @@ def moe_sglang_fused_experts_weight_mode() -> str:
                 f"expected one of {', '.join(_MOE_SGLANG_FUSED_EXPERTS_WEIGHT_MODES)}"
             )
         return raw
-    return "cached" if moe_sglang_fused_experts_cache_enabled() else "strided"
+    return "strided"
 
 
 def _validate_sglang_swiglu_limit(swiglu_limit: float | None) -> None:
@@ -968,23 +908,6 @@ class _SglangFusedExpertsEPTrainFunction(torch.autograd.Function):
         )
 
 
-def _sglang_moe_tp_sim_accumulate(output: torch.Tensor, shard_output: torch.Tensor) -> torch.Tensor:
-    if _flag_enabled(_SG_LANG_MOE_TP_SIM_BF16_REDUCE_ENV):
-        return output.to(torch.bfloat16) + shard_output.to(torch.bfloat16)
-    return output + shard_output.to(output.dtype)
-
-
-def _attach_sglang_moe_tp_shards(
-    output: torch.Tensor,
-    shard_outputs: list[torch.Tensor],
-    original_shape: torch.Size,
-) -> torch.Tensor:
-    if not _flag_enabled(_SG_LANG_MOE_TP_SIM_CARRY_SHARDS_ENV) or not shard_outputs:
-        return output
-    output._xorl_sglang_moe_tp_shards = tuple(shard.reshape(original_shape) for shard in shard_outputs)
-    return output
-
-
 def _deepep_parity_diagnostic_enabled() -> bool:
     return _flag_enabled("XORL_DEEPEP_PARITY_DIAGNOSTIC")
 
@@ -1668,9 +1591,6 @@ class MoEExperts(nn.Module):
         if self.fp8_training_enabled and self.moe_implementation != "quack":
             raise NotImplementedError("FP8 grouped MoE compute currently requires moe_implementation='quack'")
 
-        if self.sglang_moe_tp_sim_enabled(parallel_state) and expert_idx is None:
-            return self._sglang_moe_tp_sim_forward(hidden_states, routing_weights, selected_experts, parallel_state)
-
         if self.moe_implementation == "eager":
             fn = MOE_EXPERT_BACKENDS[self.moe_implementation]
             assert expert_idx is not None
@@ -1714,566 +1634,6 @@ class MoEExperts(nn.Module):
             gated=self.gated,
         )
 
-    def sglang_moe_tp_sim_enabled(self, parallel_state=None) -> bool:
-        """Whether to simulate SGLang's MoE expert kernel/reduce order.
-
-        This is a K3 parity diagnostic path for no-EP Qwen3-MoE replays. Under
-        TP, xorl currently keeps MoE experts full-local while SGLang shards the
-        expert intermediate dimension and all-reduces the hidden output. Under
-        TP1/FSDP, the same env-gated path is useful for testing SGLang's local
-        fused expert kernel/order without changing production MoE defaults.
-        """
-        if not _flag_enabled(_SG_LANG_MOE_TP_SIM_ENV):
-            return False
-        if parallel_state is None:
-            from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
-
-            parallel_state = get_parallel_state()
-        if getattr(parallel_state, "ep_enabled", False):
-            return False
-        if not _env_layer_filter_enabled(_SG_LANG_MOE_TP_SIM_LAYERS_ENV, getattr(self, "layer_idx", None)):
-            return False
-        return True
-
-    def _sglang_moe_tp_sim_forward(
-        self,
-        hidden_states: torch.Tensor,
-        routing_weights: torch.Tensor,
-        selected_experts: torch.Tensor,
-        parallel_state,
-    ) -> torch.Tensor:
-        mode = os.environ.get(_SG_LANG_MOE_TP_SIM_ENV, "0").strip().lower()
-        if mode == "cache":
-            return self._sglang_moe_tp_sim_cache_forward(
-                hidden_states, routing_weights, selected_experts, parallel_state
-            )
-        if mode in {"triton", "backend"}:
-            return self._sglang_moe_tp_sim_triton_forward(
-                hidden_states,
-                routing_weights,
-                selected_experts,
-                parallel_state,
-            )
-        if mode in {"triton_sgl_reduce", "triton_sglang_reduce", "sglang_reduce"}:
-            return self._sglang_moe_tp_sim_triton_sglang_reduce_forward(
-                hidden_states,
-                routing_weights,
-                selected_experts,
-                parallel_state,
-            )
-        if mode in {"deep_gemm", "deepgemm", "dg"}:
-            return self._sglang_moe_tp_sim_deep_gemm_forward(
-                hidden_states,
-                routing_weights,
-                selected_experts,
-                parallel_state,
-            )
-        if mode in {"sglang", "sgl_kernel", "fused"}:
-            return self._sglang_moe_tp_sim_sglang_forward(
-                hidden_states,
-                routing_weights,
-                selected_experts,
-                parallel_state,
-            )
-        if mode in {"sglang_runner", "sgl_runner", "runner"}:
-            return self._sglang_moe_tp_sim_sglang_runner_forward(
-                hidden_states,
-                routing_weights,
-                selected_experts,
-                parallel_state,
-            )
-        return self._sglang_moe_tp_sim_direct_forward(hidden_states, routing_weights, selected_experts, parallel_state)
-
-    def _validate_sglang_moe_tp_sim_inputs(
-        self,
-        routing_weights: torch.Tensor,
-        selected_experts: torch.Tensor,
-        parallel_state,
-    ) -> tuple[int, int]:
-        if routing_weights is None or selected_experts is None:
-            raise ValueError(f"{_SG_LANG_MOE_TP_SIM_ENV}=1 requires routing_weights and selected_experts")
-        if not self.gated:
-            raise NotImplementedError(f"{_SG_LANG_MOE_TP_SIM_ENV}=1 currently supports gated MoE experts only")
-        if self.down_bias is not None:
-            raise NotImplementedError(f"{_SG_LANG_MOE_TP_SIM_ENV}=1 does not support down_bias")
-
-        tp_size = max(1, int(getattr(parallel_state, "tp_size", 1)))
-        requested_tp_size = _env_int(_SG_LANG_MOE_TP_SIM_SIZE_ENV, 0)
-        if requested_tp_size > 0:
-            tp_size = requested_tp_size
-        if self.intermediate_size % tp_size != 0:
-            raise ValueError(
-                f"Cannot simulate SGLang MoE TP with intermediate_size={self.intermediate_size} "
-                f"not divisible by tp_size={tp_size}"
-            )
-        return tp_size, self.intermediate_size // tp_size
-
-    def _sglang_moe_tp_sim_direct_forward(
-        self,
-        hidden_states: torch.Tensor,
-        routing_weights: torch.Tensor,
-        selected_experts: torch.Tensor,
-        parallel_state,
-    ) -> torch.Tensor:
-        """Compute experts as TP-intermediate shards, then sum shard outputs.
-
-        SGLang's unquantized Qwen3-MoE FusedMoE shards w1/w3 on the expert
-        intermediate output dimension and w2 on the matching input dimension.
-        Each TP rank computes a hidden-sized partial output and the model path
-        all-reduces those partials. Since xorl has full expert tensors on every
-        TP rank today, this parity path computes each shard locally and adds the
-        shard outputs in rank order.
-        """
-        tp_size, shard_intermediate = self._validate_sglang_moe_tp_sim_inputs(
-            routing_weights,
-            selected_experts,
-            parallel_state,
-        )
-        original_shape = hidden_states.shape
-        hidden_flat = hidden_states.reshape(-1, int(hidden_states.shape[-1]))
-        selected_flat = selected_experts.reshape(hidden_flat.shape[0], -1)
-        routing_flat = routing_weights.reshape(hidden_flat.shape[0], -1)
-        hidden_dim = int(hidden_flat.shape[-1])
-        compute_dtype = torch.bfloat16 if hidden_flat.dtype in {torch.bfloat16, torch.float16} else hidden_flat.dtype
-
-        from xorl.ops.moe.activations import apply_moe_activation  # noqa: PLC0415
-
-        output = hidden_flat.new_zeros(hidden_flat.shape[0], hidden_dim)
-        shard_outputs = []
-        for tp_rank in range(tp_size):
-            start = tp_rank * shard_intermediate
-            end = start + shard_intermediate
-            shard_output = hidden_flat.new_zeros(hidden_flat.shape[0], hidden_dim)
-
-            for expert_idx in range(self.num_experts):
-                mask = selected_flat == expert_idx
-                if not bool(mask.any().item()):
-                    continue
-                token_rows, topk_slots = mask.nonzero(as_tuple=True)
-                tokens = hidden_flat.index_select(0, token_rows).to(compute_dtype)
-
-                gate = tokens.matmul(self.gate_up_proj[expert_idx, :, start:end].to(compute_dtype))
-                up = tokens.matmul(
-                    self.gate_up_proj[
-                        expert_idx,
-                        :,
-                        self.intermediate_size + start : self.intermediate_size + end,
-                    ].to(compute_dtype)
-                )
-                if self.swiglu_limit > 0:
-                    gate = gate.clamp(-self.swiglu_limit, self.swiglu_limit)
-
-                activated = apply_moe_activation(self.hidden_act, gate, up)
-                expert_out = activated.matmul(self.down_proj[expert_idx, start:end, :].to(compute_dtype))
-                expert_out = expert_out * routing_flat[token_rows, topk_slots].to(expert_out.dtype).unsqueeze(-1)
-                shard_output.index_add_(0, token_rows, expert_out.to(shard_output.dtype))
-
-            output = _sglang_moe_tp_sim_accumulate(output, shard_output)
-            shard_outputs.append(shard_output)
-
-        result = output.reshape(original_shape)
-        return _attach_sglang_moe_tp_shards(result, shard_outputs, original_shape)
-
-    def _sglang_moe_tp_sim_cache_forward(
-        self,
-        hidden_states: torch.Tensor,
-        routing_weights: torch.Tensor,
-        selected_experts: torch.Tensor,
-        parallel_state,
-    ) -> torch.Tensor:
-        """Diagnostic cache-order variant of the SGLang MoE TP simulation."""
-        tp_size, shard_intermediate = self._validate_sglang_moe_tp_sim_inputs(
-            routing_weights,
-            selected_experts,
-            parallel_state,
-        )
-        original_shape = hidden_states.shape
-        hidden_flat = hidden_states.reshape(-1, int(hidden_states.shape[-1]))
-        selected_flat = selected_experts.reshape(hidden_flat.shape[0], -1)
-        routing_flat = routing_weights.reshape(hidden_flat.shape[0], -1)
-        hidden_dim = int(hidden_flat.shape[-1])
-        compute_dtype = torch.bfloat16 if hidden_flat.dtype in {torch.bfloat16, torch.float16} else hidden_flat.dtype
-
-        from xorl.ops.moe.activations import apply_moe_activation  # noqa: PLC0415
-
-        output = hidden_flat.new_zeros(hidden_flat.shape[0], hidden_dim)
-        shard_outputs = []
-        for tp_rank in range(tp_size):
-            start = tp_rank * shard_intermediate
-            end = start + shard_intermediate
-            topk = selected_flat.shape[1]
-            num_assignments = hidden_flat.shape[0] * topk
-            gate_up_cache = hidden_flat.new_zeros(num_assignments, 2 * shard_intermediate)
-            down_cache = hidden_flat.new_zeros(hidden_flat.shape[0], topk, hidden_dim)
-
-            for expert_idx in range(self.num_experts):
-                mask = selected_flat == expert_idx
-                if not bool(mask.any().item()):
-                    continue
-                token_rows, topk_slots = mask.nonzero(as_tuple=True)
-                assignment_rows = token_rows * topk + topk_slots
-                tokens = hidden_flat.index_select(0, token_rows).to(compute_dtype)
-
-                gate = tokens.matmul(self.gate_up_proj[expert_idx, :, start:end].to(compute_dtype))
-                up = tokens.matmul(
-                    self.gate_up_proj[
-                        expert_idx,
-                        :,
-                        self.intermediate_size + start : self.intermediate_size + end,
-                    ].to(compute_dtype)
-                )
-                if self.gate_up_bias is not None:
-                    gate = gate + self.gate_up_bias[expert_idx, start:end].to(compute_dtype)
-                    up = up + self.gate_up_bias[
-                        expert_idx,
-                        self.intermediate_size + start : self.intermediate_size + end,
-                    ].to(compute_dtype)
-
-                gate_up_cache[assignment_rows, :shard_intermediate] = gate.to(gate_up_cache.dtype)
-                gate_up_cache[assignment_rows, shard_intermediate:] = up.to(gate_up_cache.dtype)
-
-            gate = gate_up_cache[:, :shard_intermediate].to(compute_dtype)
-            up = gate_up_cache[:, shard_intermediate:].to(compute_dtype)
-            if self.swiglu_limit > 0:
-                gate = gate.clamp(-self.swiglu_limit, self.swiglu_limit)
-            activation_cache = apply_moe_activation(self.hidden_act, gate, up).to(gate_up_cache.dtype)
-
-            for expert_idx in range(self.num_experts):
-                mask = selected_flat == expert_idx
-                if not bool(mask.any().item()):
-                    continue
-                token_rows, topk_slots = mask.nonzero(as_tuple=True)
-                assignment_rows = token_rows * topk + topk_slots
-
-                activated = activation_cache.index_select(0, assignment_rows).to(compute_dtype)
-                expert_out = activated.matmul(self.down_proj[expert_idx, start:end, :].to(compute_dtype))
-                expert_out = expert_out * routing_flat[token_rows, topk_slots].to(expert_out.dtype).unsqueeze(-1)
-                down_cache[token_rows, topk_slots, :] = expert_out.to(down_cache.dtype)
-
-            shard_output = down_cache.to(torch.float32).sum(dim=1).to(down_cache.dtype)
-
-            output = _sglang_moe_tp_sim_accumulate(output, shard_output)
-            shard_outputs.append(shard_output)
-
-        result = output.reshape(original_shape)
-        return _attach_sglang_moe_tp_shards(result, shard_outputs, original_shape)
-
-    def _sglang_moe_tp_sim_triton_forward(
-        self,
-        hidden_states: torch.Tensor,
-        routing_weights: torch.Tensor,
-        selected_experts: torch.Tensor,
-        parallel_state,
-    ) -> torch.Tensor:
-        """Diagnostic TP-shard simulation using xorl's local Triton MoE backend."""
-        tp_size, shard_intermediate = self._validate_sglang_moe_tp_sim_inputs(
-            routing_weights,
-            selected_experts,
-            parallel_state,
-        )
-        original_shape = hidden_states.shape
-        hidden_flat = hidden_states.reshape(-1, int(hidden_states.shape[-1]))
-        selected_flat = selected_experts.reshape(hidden_flat.shape[0], -1)
-        routing_flat = routing_weights.reshape(hidden_flat.shape[0], -1)
-
-        from xorl.ops.moe.triton import triton_moe_forward  # noqa: PLC0415
-
-        output = hidden_flat.new_zeros(hidden_flat.shape)
-        shard_outputs = []
-        for tp_rank in range(tp_size):
-            start = tp_rank * shard_intermediate
-            end = start + shard_intermediate
-            gate_proj = self.gate_up_proj[:, :, start:end].contiguous()
-            up_proj = self.gate_up_proj[
-                :,
-                :,
-                self.intermediate_size + start : self.intermediate_size + end,
-            ].contiguous()
-            gate_up_proj = torch.cat([gate_proj, up_proj], dim=-1).contiguous()
-            down_proj = self.down_proj[:, start:end, :].contiguous()
-
-            shard_output = triton_moe_forward(
-                module=None,
-                num_experts=self.num_experts,
-                routing_weights=routing_flat,
-                selected_experts=selected_flat,
-                hidden_states=hidden_flat,
-                gate_proj=gate_proj,
-                up_proj=up_proj,
-                down_proj=down_proj,
-                gate_up_proj=gate_up_proj,
-                hidden_act=self.hidden_act,
-                swiglu_limit=self.swiglu_limit,
-                gated=self.gated,
-            )
-            output = _sglang_moe_tp_sim_accumulate(output, shard_output)
-            shard_outputs.append(shard_output)
-
-        result = output.reshape(original_shape)
-        return _attach_sglang_moe_tp_shards(result, shard_outputs, original_shape)
-
-    @staticmethod
-    def _sglang_topk_sum_reduce(per_slot: torch.Tensor) -> torch.Tensor:
-        """Mirror SGLang's top-k MoE output reduction for topk > 1.
-
-        SGLang's deterministic Triton path accumulates the top-k slot outputs
-        into fp32 in slot order and casts once to the output dtype. PyTorch
-        ``sum(dim=1)`` can choose a different reduction tree, so keep this
-        explicit for parity diagnostics.
-        """
-        topk = int(per_slot.shape[1])
-        if topk == 1:
-            return per_slot[:, 0, :]
-        accumulator = per_slot[:, 0, :].to(torch.float32)
-        for topk_idx in range(1, topk):
-            accumulator = accumulator + per_slot[:, topk_idx, :].to(torch.float32)
-        return accumulator.to(per_slot.dtype)
-
-    def _sglang_moe_tp_sim_triton_sglang_reduce_forward(
-        self,
-        hidden_states: torch.Tensor,
-        routing_weights: torch.Tensor,
-        selected_experts: torch.Tensor,
-        parallel_state,
-    ) -> torch.Tensor:
-        """Use xorl grouped GEMMs but SGLang's deterministic top-k combine order."""
-        tp_size, shard_intermediate = self._validate_sglang_moe_tp_sim_inputs(
-            routing_weights,
-            selected_experts,
-            parallel_state,
-        )
-        original_shape = hidden_states.shape
-        hidden_flat = hidden_states.reshape(-1, int(hidden_states.shape[-1]))
-        selected_flat = selected_experts.reshape(hidden_flat.shape[0], -1)
-        routing_flat = routing_weights.reshape(hidden_flat.shape[0], -1)
-
-        from xorl.ops.group_gemm.kernel.group_gemm import group_gemm_same_nk  # noqa: PLC0415
-        from xorl.ops.group_gemm.kernel.moe import (  # noqa: PLC0415
-            expert_histogram,
-            moe_index_compute,
-            moe_scatter,
-        )
-        from xorl.ops.moe.activations import apply_moe_activation  # noqa: PLC0415
-
-        splits = expert_histogram(selected_flat, self.num_experts)
-        cumsum_t = torch.cumsum(splits, dim=0)
-        scatter_index = moe_index_compute(selected_flat, cumsum_t)
-        scatter_output = moe_scatter(hidden_flat, scatter_index)
-        max_m = scatter_output.shape[0]
-
-        output = hidden_flat.new_zeros(hidden_flat.shape)
-        shard_outputs = []
-        for tp_rank in range(tp_size):
-            start = tp_rank * shard_intermediate
-            end = start + shard_intermediate
-            gate_proj = self.gate_up_proj[:, :, start:end].contiguous()
-            up_proj = self.gate_up_proj[
-                :,
-                :,
-                self.intermediate_size + start : self.intermediate_size + end,
-            ].contiguous()
-            gate_up_proj = torch.cat([gate_proj, up_proj], dim=-1).contiguous()
-            down_proj = self.down_proj[:, start:end, :].contiguous()
-
-            gate_up_output = group_gemm_same_nk(
-                a=scatter_output,
-                b=gate_up_proj,
-                cumsum_M=cumsum_t,
-                max_M=max_m,
-            )
-            gate, up = gate_up_output.split(shard_intermediate, dim=-1)
-            if self.swiglu_limit > 0:
-                gate = gate.clamp(-self.swiglu_limit, self.swiglu_limit)
-            activated = apply_moe_activation(self.hidden_act, gate, up)
-
-            down_output = group_gemm_same_nk(
-                a=activated,
-                b=down_proj,
-                cumsum_M=cumsum_t,
-                max_M=max_m,
-            )
-            per_slot = down_output[scatter_index.flatten()].reshape(
-                hidden_flat.shape[0],
-                selected_flat.shape[1],
-                -1,
-            )
-            weighted = per_slot * routing_flat.to(per_slot.dtype).unsqueeze(-1)
-            shard_output = self._sglang_topk_sum_reduce(weighted)
-            output = _sglang_moe_tp_sim_accumulate(output, shard_output)
-            shard_outputs.append(shard_output)
-
-        result = output.reshape(original_shape)
-        return _attach_sglang_moe_tp_shards(result, shard_outputs, original_shape)
-
-    @staticmethod
-    def _deep_gemm_group_gemm_same_nk(
-        *,
-        a: torch.Tensor,
-        b: torch.Tensor,
-        cumsum_M: torch.Tensor,
-    ) -> torch.Tensor:
-        """Run DeepGEMM BF16 contiguous grouped GEMM using xorl's compact layout.
-
-        xorl's grouped-GEMM helpers keep expert rows compact. DeepGEMM's
-        contiguous grouped layout requires each expert segment to be padded to
-        the kernel's M alignment, with invalid pad rows marked by ``m_indices``.
-        ``b`` follows xorl's [expert, K, N] layout and is transposed for
-        DeepGEMM's NT contract [expert, N, K].
-        """
-        if a.dtype != torch.bfloat16 or b.dtype != torch.bfloat16:
-            raise RuntimeError("DeepGEMM BF16 grouped MoE diagnostic requires bf16 tensors")
-        if not a.is_cuda or not b.is_cuda:
-            raise RuntimeError("DeepGEMM BF16 grouped MoE diagnostic requires CUDA tensors")
-
-        try:
-            import deep_gemm  # noqa: PLC0415
-        except ImportError as exc:
-            raise ImportError(f"{_SG_LANG_MOE_TP_SIM_ENV}=deep_gemm requires the optional deep_gemm package") from exc
-
-        if a.shape[0] == 0:
-            return a.new_empty((0, int(b.shape[2])))
-
-        alignment = int(deep_gemm.get_mk_alignment_for_contiguous_layout())
-        starts = torch.cat([cumsum_M.new_zeros(1), cumsum_M[:-1]]).detach().to(torch.int64).cpu().tolist()
-        ends = cumsum_M.detach().to(torch.int64).cpu().tolist()
-        chunks: list[torch.Tensor] = []
-        m_indices: list[int] = []
-        ranges: list[tuple[int, int, int, int]] = []
-        padded_start = 0
-        for expert_idx, (start, end) in enumerate(zip(starts, ends)):
-            count = int(end) - int(start)
-            if count <= 0:
-                continue
-            aligned_count = ((count + alignment - 1) // alignment) * alignment
-            chunk = a[int(start) : int(end)]
-            if aligned_count != count:
-                padded = a.new_zeros((aligned_count, int(a.shape[1])))
-                padded[:count].copy_(chunk)
-                chunk = padded
-            chunks.append(chunk.contiguous())
-            m_indices.extend([expert_idx] * count)
-            m_indices.extend([-1] * (aligned_count - count))
-            ranges.append((int(start), int(end), padded_start, padded_start + count))
-            padded_start += aligned_count
-
-        out = a.new_empty((int(a.shape[0]), int(b.shape[2])))
-        if not chunks:
-            return out
-
-        padded_a = torch.cat(chunks, dim=0).contiguous()
-        padded_out = a.new_empty((int(padded_a.shape[0]), int(b.shape[2])))
-        m_indices_tensor = torch.tensor(m_indices, dtype=torch.int32, device=a.device)
-        deep_gemm.m_grouped_bf16_gemm_nt_contiguous(
-            padded_a,
-            b.transpose(1, 2).contiguous(),
-            padded_out,
-            m_indices_tensor,
-        )
-        for start, end, padded_valid_start, padded_valid_end in ranges:
-            out[start:end].copy_(padded_out[padded_valid_start:padded_valid_end])
-        return out
-
-    @staticmethod
-    def _sglang_stable_moe_slot_order(
-        selected_experts: torch.Tensor,
-        num_experts: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return SGLang's stable expert-major compact slot order.
-
-        SGLang's BF16 DeepGEMM diagnostic compacts flattened token/top-k slots
-        by stable-sorting on expert id. xorl's generic Triton scatter index uses
-        relaxed atomic reservations, which can place the same valid slot at a
-        different compact M row. DeepGEMM output can vary at one-ulp scale with
-        that row placement, so the parity diagnostic must use SGLang's order.
-        """
-        flat_experts = selected_experts.reshape(-1).to(torch.int64)
-        valid_mask = (flat_experts >= 0) & (flat_experts < int(num_experts))
-        if not bool(valid_mask.any().item()):
-            counts = torch.zeros(int(num_experts), dtype=torch.int32, device=selected_experts.device)
-            return torch.empty(0, dtype=torch.long, device=selected_experts.device), counts
-
-        valid_positions = torch.nonzero(valid_mask, as_tuple=False).flatten()
-        sort_keys = flat_experts.index_select(0, valid_positions)
-        try:
-            sort_relative = torch.argsort(sort_keys, stable=True)
-        except TypeError:
-            sort_relative = torch.argsort(sort_keys)
-        slot_order = valid_positions.index_select(0, sort_relative)
-        sorted_experts = flat_experts.index_select(0, slot_order)
-        counts = torch.bincount(sorted_experts, minlength=int(num_experts)).to(dtype=torch.int32)
-        cumsum_m = torch.cumsum(counts, dim=0).to(dtype=torch.int32)
-        return slot_order, cumsum_m
-
-    def _sglang_moe_tp_sim_deep_gemm_forward(
-        self,
-        hidden_states: torch.Tensor,
-        routing_weights: torch.Tensor,
-        selected_experts: torch.Tensor,
-        parallel_state,
-    ) -> torch.Tensor:
-        """Diagnostic TP-shard simulation using DeepGEMM BF16 grouped GEMM."""
-        tp_size, shard_intermediate = self._validate_sglang_moe_tp_sim_inputs(
-            routing_weights,
-            selected_experts,
-            parallel_state,
-        )
-        if self.gate_up_bias is not None:
-            raise NotImplementedError(f"{_SG_LANG_MOE_TP_SIM_ENV}=deep_gemm does not support gate_up_bias")
-        original_shape = hidden_states.shape
-        hidden_flat = hidden_states.reshape(-1, int(hidden_states.shape[-1]))
-        selected_flat = selected_experts.reshape(hidden_flat.shape[0], -1)
-        routing_flat = routing_weights.reshape(hidden_flat.shape[0], -1)
-
-        from xorl.ops.moe.activations import apply_sglang_moe_activation  # noqa: PLC0415
-
-        topk = int(selected_flat.shape[1])
-        slot_order, cumsum_t = self._sglang_stable_moe_slot_order(selected_flat, self.num_experts)
-        if slot_order.numel() == 0:
-            return hidden_flat.new_zeros(hidden_flat.shape).reshape(original_shape)
-
-        hidden_slots = hidden_flat.repeat_interleave(topk, dim=0)
-        scatter_output = hidden_slots.index_select(0, slot_order).contiguous()
-
-        output = hidden_flat.new_zeros(hidden_flat.shape)
-        shard_outputs = []
-        for tp_rank in range(tp_size):
-            start = tp_rank * shard_intermediate
-            end = start + shard_intermediate
-            gate_proj = self.gate_up_proj[:, :, start:end].contiguous()
-            up_proj = self.gate_up_proj[
-                :,
-                :,
-                self.intermediate_size + start : self.intermediate_size + end,
-            ].contiguous()
-            gate_up_proj = torch.cat([gate_proj, up_proj], dim=-1).contiguous()
-            down_proj = self.down_proj[:, start:end, :].contiguous()
-
-            gate_up_output = self._deep_gemm_group_gemm_same_nk(
-                a=scatter_output,
-                b=gate_up_proj,
-                cumsum_M=cumsum_t,
-            )
-            gate, up = gate_up_output.split(shard_intermediate, dim=-1)
-            if self.swiglu_limit > 0:
-                gate = gate.clamp(-self.swiglu_limit, self.swiglu_limit)
-            activated = apply_sglang_moe_activation(self.hidden_act, gate, up).contiguous()
-
-            down_output = self._deep_gemm_group_gemm_same_nk(
-                a=activated,
-                b=down_proj,
-                cumsum_M=cumsum_t,
-            )
-            per_slot_flat = hidden_flat.new_zeros((hidden_flat.shape[0] * topk, hidden_flat.shape[-1]))
-            per_slot_flat.index_copy_(0, slot_order, down_output)
-            per_slot = per_slot_flat.reshape(hidden_flat.shape[0], topk, -1)
-            weighted = per_slot * routing_flat.to(per_slot.dtype).unsqueeze(-1)
-            shard_output = self._sglang_topk_sum_reduce(weighted)
-            output = _sglang_moe_tp_sim_accumulate(output, shard_output)
-            shard_outputs.append(shard_output)
-
-        result = output.reshape(original_shape)
-        return _attach_sglang_moe_tp_shards(result, shard_outputs, original_shape)
-
     @staticmethod
     def _ensure_sglang_server_args() -> None:
         try:
@@ -2281,7 +1641,7 @@ class MoEExperts(nn.Module):
             from sglang.srt.server_args import ServerArgs  # noqa: PLC0415
         except ImportError as exc:
             raise ImportError(
-                f"{_SG_LANG_MOE_TP_SIM_ENV}=sglang requires an environment with sglang and sgl_kernel installed"
+                f"{_MOE_SGLANG_FUSED_EXPERTS_ENV}=1 requires an environment with sglang and sgl_kernel installed"
             ) from exc
 
         try:
@@ -2318,7 +1678,7 @@ class MoEExperts(nn.Module):
             )
         except ImportError as exc:
             raise ImportError(
-                f"{_SG_LANG_MOE_TP_SIM_ENV}=sglang requires an environment with sglang and sgl_kernel installed"
+                f"{_MOE_SGLANG_FUSED_EXPERTS_ENV}=1 requires an environment with sglang and sgl_kernel installed"
             ) from exc
 
         MoEExperts._ensure_sglang_server_args()
@@ -2330,29 +1690,6 @@ class MoEExperts(nn.Module):
 
             return fused_experts_impl_strided
         return fused_experts_impl
-
-    @staticmethod
-    def _load_sglang_moe_runner_stack():
-        try:
-            from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig  # noqa: PLC0415
-            from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo  # noqa: PLC0415
-            from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput  # noqa: PLC0415
-            from sglang.srt.layers.moe.topk import StandardTopKOutput  # noqa: PLC0415
-            from sglang.srt.layers.moe.utils import MoeRunnerBackend  # noqa: PLC0415
-        except ImportError as exc:
-            raise ImportError(
-                f"{_SG_LANG_MOE_TP_SIM_ENV}=sglang_runner requires an environment with sglang and sgl_kernel installed"
-            ) from exc
-
-        MoEExperts._ensure_sglang_server_args()
-        return (
-            MoeRunner,
-            MoeRunnerBackend,
-            MoeRunnerConfig,
-            TritonMoeQuantInfo,
-            StandardDispatchOutput,
-            StandardTopKOutput,
-        )
 
     def sglang_ep_native_routed_partial(
         self,
@@ -2541,8 +1878,8 @@ class MoEExperts(nn.Module):
 
     def invalidate_sglang_fused_weight_cache(self) -> None:
         """Drop cached serving-layout weight transposes (see
-        :func:`moe_sglang_fused_experts_cache_enabled` for the invalidation
-        contract — call after optimizer steps under FSDP2)."""
+        :func:`moe_sglang_fused_experts_weight_mode`; call after optimizer
+        steps under FSDP2)."""
         cache = getattr(self, "_sglang_fused_weight_cache", None)
         if cache is not None:
             cache.clear()
@@ -2617,9 +1954,9 @@ class MoEExperts(nn.Module):
         ``w13 [E_local, 2I, H]`` / ``w2 [E_local, H, I]`` per
         :func:`moe_sglang_fused_experts_weight_mode`: a zero-copy transpose-view
         (strided mode, default), a transient transpose-copy (~150 MB per q30
-        EP8 layer), or a cached copy (~7 GB/rank model-wide at q30 EP8 — see
-        :func:`moe_sglang_fused_experts_cache_enabled` for the FSDP2
-        invalidation contract) — all three bit-identical.
+        EP8 layer), or a cached copy (~7 GB/rank model-wide at q30 EP8, with
+        explicit FSDP2 invalidation after optimizer steps) — all three
+        bit-identical.
 
         Trainable: when gradients are required the same serving forward runs
         under :class:`_SglangFusedExpertsEPTrainFunction`, whose backward is
@@ -2720,238 +2057,6 @@ class MoEExperts(nn.Module):
 
         return _compute
 
-    @staticmethod
-    def _sglang_fused_experts_pair_slot_order(selected_experts: torch.Tensor) -> torch.Tensor:
-        """(token, slot) -> pair-row order for the slot-combine variant.
-
-        Pair rows return from the combine all-to-all in the local ``permute()``
-        order: global-expert-major, token-ascending within each expert — i.e.
-        (expert, token) pairs sorted by (e, t). This is a deterministic function
-        of ``selected_experts``: returns ``order`` such that
-        ``slots_flat.index_copy_(0, order, pair_rows)`` lands arrival row ``r``
-        at flat slot index ``token * topk + slot``.
-        """
-        num_tokens, topk = selected_experts.shape
-        token_idx = torch.arange(num_tokens, device=selected_experts.device).repeat_interleave(topk)
-        keys = selected_experts.reshape(-1).to(torch.int64) * num_tokens + token_idx
-        return torch.argsort(keys)
-
-    def _sglang_fused_experts_slot_combine(self, expert_output, ctx, dispatch_kwargs, parallel_state):
-        """Formal-guarantee combine variant: slot-order gather + sgl_kernel ``moe_sum_reduce``.
-
-        The default alltoall combine (fp32 ``scatter_add_`` over arrival-order
-        pair rows) is empirically order-invariant on bit-identical per-slot
-        contributions, but ``scatter_add_``'s addition order is not formally
-        specified. This variant re-orders the returned pair rows into SGLang's
-        ``[num_tokens, topk, hidden]`` slot layout and reduces with sgl_kernel's
-        ``moe_sum_reduce`` — the exact combine kernel the serving engine executes
-        at topk>1. The return-path re-sort + all-to-all is identical to
-        ``tokens_post_all2all``; only the final unpermute/reduce differs.
-
-        Scoring-only: ``moe_sum_reduce`` writes through an out-parameter with no
-        autograd, so a grad-requiring expert output would silently detach the
-        graph — reject it loudly (train with the default scatter-add combine).
-        """
-        if torch.is_grad_enabled() and expert_output.requires_grad:
-            raise NotImplementedError(
-                f"{_MOE_SGLANG_FUSED_EXPERTS_SLOT_COMBINE_ENV}=1 is scoring-only (sgl_kernel moe_sum_reduce "
-                "has no autograd); train with the default alltoall scatter-add combine instead"
-            )
-        from sgl_kernel import moe_sum_reduce  # noqa: PLC0415
-
-        from xorl.distributed.moe.alltoall import _expert_chunk_unpermute_order  # noqa: PLC0415
-        from xorl.distributed.moe.comm import all_to_all  # noqa: PLC0415
-        from xorl.distributed.moe.utils import sort_chunks_by_idxs  # noqa: PLC0415
-
-        ep_group = parallel_state.ep_group
-        expert_output = sort_chunks_by_idxs(
-            expert_output,
-            ctx.num_tokens_per_expert.T.ravel(),
-            _expert_chunk_unpermute_order(ctx.num_experts, ep_group.size()),
-        )
-        pair_rows = all_to_all(ep_group, expert_output, ctx.input_splits, ctx.output_splits)
-
-        selected_experts = dispatch_kwargs["selected_experts"]
-        selected_flat = selected_experts.reshape(-1, selected_experts.shape[-1])
-        num_tokens, topk = selected_flat.shape
-        if pair_rows.shape[0] != num_tokens * topk:
-            raise NotImplementedError(
-                f"{_MOE_SGLANG_FUSED_EXPERTS_SLOT_COMBINE_ENV}=1 requires unique expert selections per "
-                f"token (got {pair_rows.shape[0]} pair rows for {num_tokens}x{topk} slots)"
-            )
-        order = self._sglang_fused_experts_pair_slot_order(selected_flat)
-        slots = pair_rows.new_empty((num_tokens * topk, pair_rows.shape[-1]))
-        slots.index_copy_(0, order, pair_rows)
-        slots = slots.reshape(num_tokens, topk, -1)
-        output = torch.empty(ctx.orig_shape, device=pair_rows.device, dtype=pair_rows.dtype)
-        moe_sum_reduce(slots.contiguous(), output, 1.0)
-        return output
-
-    def _sglang_moe_tp_sim_sglang_forward(
-        self,
-        hidden_states: torch.Tensor,
-        routing_weights: torch.Tensor,
-        selected_experts: torch.Tensor,
-        parallel_state,
-    ) -> torch.Tensor:
-        """Diagnostic TP-shard simulation using SGLang's fused experts kernel."""
-        _validate_sglang_swiglu_limit(self.swiglu_limit)
-        tp_size, shard_intermediate = self._validate_sglang_moe_tp_sim_inputs(
-            routing_weights,
-            selected_experts,
-            parallel_state,
-        )
-        original_shape = hidden_states.shape
-        hidden_flat = hidden_states.reshape(-1, int(hidden_states.shape[-1])).contiguous()
-        selected_flat = selected_experts.reshape(hidden_flat.shape[0], -1).contiguous()
-        routing_flat = routing_weights.reshape(hidden_flat.shape[0], -1).contiguous()
-
-        fused_experts_impl = self._load_sglang_fused_experts_impl()
-        activation = "gelu" if self.hidden_act == "gelu_tanh" else self.hidden_act
-
-        output = hidden_flat.new_zeros(hidden_flat.shape)
-        shard_outputs = []
-        for tp_rank in range(tp_size):
-            start = tp_rank * shard_intermediate
-            end = start + shard_intermediate
-            gate_proj = self.gate_up_proj[:, :, start:end].transpose(1, 2).contiguous()
-            up_proj = (
-                self.gate_up_proj[
-                    :,
-                    :,
-                    self.intermediate_size + start : self.intermediate_size + end,
-                ]
-                .transpose(1, 2)
-                .contiguous()
-            )
-            w1 = torch.cat([gate_proj, up_proj], dim=1).contiguous()
-            w2 = self.down_proj[:, start:end, :].transpose(1, 2).contiguous()
-            b1 = None
-            if self.gate_up_bias is not None:
-                gate_bias = self.gate_up_bias[:, start:end]
-                up_bias = self.gate_up_bias[:, self.intermediate_size + start : self.intermediate_size + end]
-                b1 = torch.cat([gate_bias, up_bias], dim=1).contiguous()
-
-            shard_output = fused_experts_impl(
-                hidden_flat,
-                w1,
-                w2,
-                routing_flat,
-                selected_flat,
-                b1=b1,
-                b2=None,
-                inplace=False,
-                activation=activation,
-                is_gated=self.gated,
-                apply_router_weight_on_input=False,
-                no_combine=False,
-                routed_scaling_factor=None,
-                gemm1_limit=None,
-                gate_up_interleaved=False,
-                filter_expert=False,
-            )
-            output = _sglang_moe_tp_sim_accumulate(output, shard_output)
-            shard_outputs.append(shard_output)
-
-        result = output.reshape(original_shape)
-        return _attach_sglang_moe_tp_shards(result, shard_outputs, original_shape)
-
-    def _sglang_moe_tp_sim_sglang_runner_forward(
-        self,
-        hidden_states: torch.Tensor,
-        routing_weights: torch.Tensor,
-        selected_experts: torch.Tensor,
-        parallel_state,
-    ) -> torch.Tensor:
-        """Diagnostic TP-shard simulation through SGLang's MoeRunner wrapper."""
-        _validate_sglang_swiglu_limit(self.swiglu_limit)
-        tp_size, shard_intermediate = self._validate_sglang_moe_tp_sim_inputs(
-            routing_weights,
-            selected_experts,
-            parallel_state,
-        )
-        original_shape = hidden_states.shape
-        hidden_flat = hidden_states.reshape(-1, int(hidden_states.shape[-1])).contiguous()
-        selected_flat = selected_experts.reshape(hidden_flat.shape[0], -1).contiguous()
-        routing_flat = routing_weights.reshape(hidden_flat.shape[0], -1).contiguous()
-        hidden_dim = int(hidden_flat.shape[-1])
-
-        (
-            MoeRunner,
-            MoeRunnerBackend,
-            MoeRunnerConfig,
-            TritonMoeQuantInfo,
-            StandardDispatchOutput,
-            StandardTopKOutput,
-        ) = self._load_sglang_moe_runner_stack()
-
-        activation = "gelu" if self.hidden_act == "gelu_tanh" else self.hidden_act
-        output = hidden_flat.new_zeros(hidden_flat.shape)
-        shard_outputs = []
-        for tp_rank in range(tp_size):
-            start = tp_rank * shard_intermediate
-            end = start + shard_intermediate
-            gate_proj = self.gate_up_proj[:, :, start:end].transpose(1, 2).contiguous()
-            up_proj = (
-                self.gate_up_proj[
-                    :,
-                    :,
-                    self.intermediate_size + start : self.intermediate_size + end,
-                ]
-                .transpose(1, 2)
-                .contiguous()
-            )
-            w13 = torch.cat([gate_proj, up_proj], dim=1).contiguous()
-            w2 = self.down_proj[:, start:end, :].transpose(1, 2).contiguous()
-            b13 = None
-            if self.gate_up_bias is not None:
-                gate_bias = self.gate_up_bias[:, start:end]
-                up_bias = self.gate_up_bias[:, self.intermediate_size + start : self.intermediate_size + end]
-                b13 = torch.cat([gate_bias, up_bias], dim=1).contiguous()
-
-            config = MoeRunnerConfig(
-                num_experts=self.num_experts,
-                num_local_experts=self.num_experts,
-                hidden_size=hidden_dim,
-                intermediate_size_per_partition=shard_intermediate,
-                layer_id=0,
-                top_k=int(selected_flat.shape[1]),
-                params_dtype=hidden_flat.dtype,
-                activation=activation,
-                apply_router_weight_on_input=False,
-                inplace=False,
-                no_combine=False,
-                routed_scaling_factor=None,
-                gemm1_alpha=None,
-                gemm1_clamp_limit=None,
-                is_gated=self.gated,
-                gate_up_interleaved=False,
-            )
-            topk_output = StandardTopKOutput(
-                topk_weights=routing_flat,
-                topk_ids=selected_flat,
-                router_logits=None,
-            )
-            dispatch_output = StandardDispatchOutput(
-                hidden_states=hidden_flat,
-                hidden_states_scale=None,
-                topk_output=topk_output,
-            )
-            quant_info = TritonMoeQuantInfo(
-                w13_weight=w13,
-                w2_weight=w2,
-                b13=b13,
-                b2=None,
-            )
-            runner = MoeRunner(MoeRunnerBackend.TRITON, config)
-            combine_input = runner.run(dispatch_output, quant_info)
-            shard_output = combine_input.hidden_states
-            output = output + shard_output.to(output.dtype)
-            shard_outputs.append(shard_output)
-
-        result = output.reshape(original_shape)
-        return _attach_sglang_moe_tp_shards(result, shard_outputs, original_shape)
-
     @torch.compiler.disable
     def _ep_forward(
         self,
@@ -3012,7 +2117,7 @@ class MoEExperts(nn.Module):
         if sglang_fused_experts:
             # K3 parity mode: the serving-kernel expert compute overrides the
             # configured backend; dispatch and combine stay on the stock
-            # alltoall path (combine optionally swaps under the sub-flag below).
+            # alltoall path.
             compute_fn = self._sglang_fused_experts_ep_compute_fn()
 
         # Step 1: Dispatch tokens to expert-owning ranks
@@ -3197,11 +2302,8 @@ class MoEExperts(nn.Module):
             )
 
         # Step 3: Combine expert outputs back to original ranks
-        if sglang_fused_experts and moe_sglang_fused_experts_slot_combine_enabled():
-            result = self._sglang_fused_experts_slot_combine(expert_output, ctx, dispatch_kwargs, parallel_state)
-        else:
-            combine_kwargs = self._build_combine_kwargs(expert_output, ctx, dispatch_kwargs, parallel_state)
-            result = combine_fn(**combine_kwargs)
+        combine_kwargs = self._build_combine_kwargs(expert_output, ctx, dispatch_kwargs, parallel_state)
+        result = combine_fn(**combine_kwargs)
         if deepep_diagnostic_id is not None:
             self._emit_deepep_parity_diagnostic(
                 record_id=deepep_diagnostic_id,

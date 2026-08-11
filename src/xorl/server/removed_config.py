@@ -11,6 +11,9 @@ _AUTHORITATIVE_OWNERSHIP_MIGRATION = (
     "observe, or shadow mode"
 )
 _ZORL_REMOVAL_MIGRATION = "ZORL was removed; remove this field and migrate training to forward_backward plus optim_step"
+_FP8_CFG_MIGRATION = (
+    "NeMo fp8_cfg translation was removed; set enable_fp8_training and the native fp8_training_* fields explicitly"
+)
 
 
 # One inventory is shared by YAML loading, CLI overrides, and public request
@@ -28,6 +31,7 @@ REMOVED_CONFIGURATION_FIELDS: dict[str, str] = {
     "zorl_seed": _ZORL_REMOVAL_MIGRATION,
     "zorl": _ZORL_REMOVAL_MIGRATION,
     "zorl_config": _ZORL_REMOVAL_MIGRATION,
+    "fp8_cfg": _FP8_CFG_MIGRATION,
 }
 
 

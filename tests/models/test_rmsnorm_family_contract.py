@@ -32,6 +32,8 @@ from xorl.models.layers.normalization import (
 )
 from xorl.models.transformers.qwen3.configuration_qwen3 import Qwen3Config
 from xorl.models.transformers.qwen3.modeling_qwen3 import Qwen3DecoderLayer
+from xorl.models.transformers.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
+from xorl.models.transformers.qwen3_moe.modeling_qwen3_moe import Qwen3MoeDecoderLayer, Qwen3MoeModel
 from xorl.ops.batch_invariant_ops import (
     bi_fused_add_rms_norm,
     bi_rms_norm,
@@ -53,9 +55,15 @@ HIDDEN_SHAPE = (1024, 2048)
 
 
 @pytest.fixture(autouse=True)
-def _pin_legacy_family_trees(monkeypatch):
-    """Keep the legacy-family contract independent of test collection order."""
-    monkeypatch.setenv("XORL_FAMILIES_V2", "0")
+def _pin_qualified_v1_family():
+    """Keep the v1-family contract independent of test collection order."""
+    from xorl.ops.bi_families_v2 import _select_nonexact_families, _select_qwen35_families_v1
+
+    _select_qwen35_families_v1()
+    try:
+        yield
+    finally:
+        _select_nonexact_families()
 
 
 def _make(shape, seed, device="cuda", dtype=torch.bfloat16):
@@ -66,21 +74,28 @@ def _make(shape, seed, device="cuda", dtype=torch.bfloat16):
 # --------------------------------------------------------------------------- #
 # Structural guards (CPU).
 # --------------------------------------------------------------------------- #
-def test_unknown_family_rejected_at_construction_and_call():
+def test_rmsnorm_family_structure_policy():
     with pytest.raises(ValueError, match="Unknown RMSNorm family"):
         RMSNorm(4, eps=EPS, family="serving_qk")
     norm = RMSNorm(4, eps=EPS)
     with pytest.raises(ValueError, match="Unknown RMSNorm family"):
         norm(torch.ones(1, 4), family="family-3")
 
+    _assert_no_residual_family_rejects_residual_stream()
+    _assert_no_residual_family_rejects_residual_tree_force()
+    _assert_fused_add_through_no_residual_family_raises()
+    _assert_funnel_rejects_unknown_family()
+    _assert_zero_centered_rejects_residual_tree_family()
+    _assert_qwen_rmsnorm_site_declaration_policy()
 
-def test_no_residual_family_rejects_residual_stream():
+
+def _assert_no_residual_family_rejects_residual_stream():
     norm = RMSNorm(4, eps=EPS, family=RMS_NORM_FAMILY_NO_RESIDUAL)
     with pytest.raises(ValueError, match="residual stream"):
         norm(torch.ones(1, 4), residual=torch.ones(1, 4), prenorm=True)
 
 
-def test_no_residual_family_rejects_residual_tree_force():
+def _assert_no_residual_family_rejects_residual_tree_force():
     norm = RMSNorm(4, eps=EPS, family=RMS_NORM_FAMILY_NO_RESIDUAL)
     with pytest.raises(ValueError, match="family flip"):
         norm(torch.ones(1, 4), force_sglang_residual=True)
@@ -88,19 +103,19 @@ def test_no_residual_family_rejects_residual_tree_force():
         norm(torch.ones(1, 4), force_sglang_residual_kernel=True)
 
 
-def test_fused_add_through_no_residual_family_raises():
+def _assert_fused_add_through_no_residual_family_raises():
     x = torch.ones(2, 4)
     with pytest.raises(ValueError, match="no fused-add kernel"):
         bi_fused_add_rms_norm(x, x, torch.ones(4), EPS, family=RMS_NORM_FAMILY_NO_RESIDUAL)
 
 
-def test_funnel_rejects_unknown_family():
+def _assert_funnel_rejects_unknown_family():
     x = torch.ones(2, 4)
     with pytest.raises(ValueError, match="Unknown RMSNorm family"):
         bi_rms_norm(x, torch.ones(4), EPS, family="serving")
 
 
-def test_zero_centered_rejects_residual_tree_family():
+def _assert_zero_centered_rejects_residual_tree_family():
     x = torch.ones(2, 4)
     with pytest.raises(ValueError, match="only exists in the 'serving_no_residual' family"):
         bi_rms_norm(x, torch.ones(4), EPS, family=RMS_NORM_FAMILY_RESIDUAL_TREE, zero_centered=True)
@@ -109,7 +124,7 @@ def test_zero_centered_rejects_residual_tree_family():
 # --------------------------------------------------------------------------- #
 # Modeling declarations: the K3 parity models must declare their families.
 # --------------------------------------------------------------------------- #
-def test_dense_qwen3_declares_site_families():
+def _assert_qwen_rmsnorm_site_declaration_policy():
     cfg = Qwen3Config(
         hidden_size=64,
         intermediate_size=128,
@@ -127,8 +142,11 @@ def test_dense_qwen3_declares_site_families():
     assert layer0.self_attn.q_norm.family == RMS_NORM_FAMILY_NO_RESIDUAL
     assert layer0.self_attn.k_norm.family == RMS_NORM_FAMILY_NO_RESIDUAL
 
+    _assert_shared_attention_qk_norms_declare_no_residual_family()
+    _assert_qwen3_moe_norm_family_declaration_policy()
 
-def test_shared_attention_qk_norms_declare_no_residual_family():
+
+def _assert_shared_attention_qk_norms_declare_no_residual_family():
     cfg = Qwen3Config(
         hidden_size=64,
         intermediate_size=128,
@@ -143,12 +161,69 @@ def test_shared_attention_qk_norms_declare_no_residual_family():
     assert attn.k_norm.family == RMS_NORM_FAMILY_NO_RESIDUAL
 
 
+def _assert_qwen3_moe_norm_family_declaration_policy():
+    class CaptureNorm(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.family_values = []
+
+        def forward(self, hidden_states, *, force_sglang_residual=False, family=None):
+            assert force_sglang_residual is False
+            self.family_values.append(family)
+            return hidden_states
+
+    class IdentityAttention(torch.nn.Module):
+        def forward(self, hidden_states, **kwargs):
+            return hidden_states, None
+
+    class IdentityPostAttentionNorm(torch.nn.Module):
+        def forward(self, hidden_states, residual=None, prenorm=False, **kwargs):
+            return hidden_states, residual
+
+    config = Qwen3MoeConfig(
+        hidden_size=4,
+        intermediate_size=8,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        num_hidden_layers=2,
+        num_experts=0,
+        use_qk_norm=False,
+        _attn_implementation="eager",
+        pad_token_id=0,
+    )
+    for layer_idx, expected_family in (
+        (0, RMS_NORM_FAMILY_NO_RESIDUAL),
+        (1, RMS_NORM_FAMILY_RESIDUAL_TREE),
+    ):
+        layer = Qwen3MoeDecoderLayer(config, layer_idx=layer_idx)
+        input_norm = CaptureNorm()
+        layer.input_layernorm = input_norm
+        layer.self_attn = IdentityAttention()
+        layer.post_attention_layernorm = IdentityPostAttentionNorm()
+        hidden_states = torch.ones(1, 2, 4)
+
+        layer._pre_mlp_forward(hidden_states, position_embeddings=(hidden_states, hidden_states))
+
+        assert input_norm.family_values == [expected_family]
+
+    model = Qwen3MoeModel(config)
+    assert model.norm.family == RMS_NORM_FAMILY_RESIDUAL_TREE
+
+    class StubLayer(torch.nn.Module):
+        def forward(self, hidden_states, *args, **kwargs):
+            return (hidden_states,)
+
+    model.layers = torch.nn.ModuleList([StubLayer()])
+    final_norm = CaptureNorm()
+    model.norm = final_norm
+    model(input_ids=torch.tensor([[0, 1]]))
+    assert final_norm.family_values == [None]
+
+
 # --------------------------------------------------------------------------- #
 # Loud tripwire for undeclared parity-lane calls.
 # --------------------------------------------------------------------------- #
-@requires_cuda
-@pytest.mark.gpu
-def test_undeclared_family_warns_in_parity_lane():
+def _assert_family_declaration_tripwire_policy(monkeypatch):
     normalization._WARNED_UNDECLARED_FAMILY.clear()
     norm = RMSNorm(64, eps=EPS, mode="sglang_fused").to("cuda")
     x = torch.randn(4, 64, device="cuda", dtype=torch.bfloat16)
@@ -158,10 +233,11 @@ def test_undeclared_family_warns_in_parity_lane():
     # Warned once per (mode, call-shape); a second call is silent.
     normalization._WARNED_UNDECLARED_FAMILY.clear()
 
+    _assert_declared_and_legacy_calls_do_not_warn()
+    _assert_undeclared_family_raises_when_required(monkeypatch)
 
-@requires_cuda
-@pytest.mark.gpu
-def test_undeclared_family_raises_when_required(monkeypatch):
+
+def _assert_undeclared_family_raises_when_required(monkeypatch):
     monkeypatch.setenv("XORL_RMSNORM_REQUIRE_FAMILY", "1")
     norm = RMSNorm(64, eps=EPS, mode="sglang_fused").to("cuda")
     x = torch.randn(4, 64, device="cuda", dtype=torch.bfloat16)
@@ -173,9 +249,7 @@ def test_undeclared_family_raises_when_required(monkeypatch):
         norm(x, family=RMS_NORM_FAMILY_RESIDUAL_TREE)
 
 
-@requires_cuda
-@pytest.mark.gpu
-def test_declared_and_legacy_calls_do_not_warn():
+def _assert_declared_and_legacy_calls_do_not_warn():
     norm = RMSNorm(64, eps=EPS, mode="sglang_fused", family=RMS_NORM_FAMILY_NO_RESIDUAL).to("cuda")
     tree = RMSNorm(64, eps=EPS, mode="sglang_fused").to("cuda")
     x = torch.randn(4, 64, device="cuda", dtype=torch.bfloat16)
@@ -190,10 +264,7 @@ def test_declared_and_legacy_calls_do_not_warn():
 # family-declared module calls match the legacy call shapes, and the two
 # families genuinely differ on the seed shape.
 # --------------------------------------------------------------------------- #
-@requires_cuda
-@pytest.mark.gpu
-@pytest.mark.parametrize("shape", [SEED_SHAPE, HIDDEN_SHAPE])
-def test_funnel_matches_legacy_kernels_bitwise(shape):
+def _assert_funnel_matches_legacy_kernels_bitwise(shape):
     x = _make(shape, 0)
     w = _make((shape[-1],), 300)
     with torch.no_grad():
@@ -214,7 +285,18 @@ def test_funnel_matches_legacy_kernels_bitwise(shape):
 
 @requires_cuda
 @pytest.mark.gpu
-def test_zero_centered_twin_is_family1_with_fold():
+def test_rmsnorm_family_funnel_policy(monkeypatch):
+    with monkeypatch.context() as case_patch:
+        _assert_family_declaration_tripwire_policy(case_patch)
+    for shape in (SEED_SHAPE, HIDDEN_SHAPE):
+        _assert_funnel_matches_legacy_kernels_bitwise(shape)
+
+    _assert_zero_centered_twin_is_family1_with_fold()
+    _assert_families_differ_on_seed_shape()
+    _assert_family_module_dispatch_policy()
+
+
+def _assert_zero_centered_twin_is_family1_with_fold():
     """The Qwen3.5 zero-centered twin (#468) registered in the family API: the
     funnel's zero_centered form, the differentiable wrapper, the raw family-1
     kernel on the folded operands, and the interpose lane all agree bitwise."""
@@ -231,9 +313,7 @@ def test_zero_centered_twin_is_family1_with_fold():
     assert torch.equal(funnel, interpose), "zero-centered twin diverged from the interpose lane"
 
 
-@requires_cuda
-@pytest.mark.gpu
-def test_trunk_contract_lane_dispatches_family1_and_warns_undeclared():
+def _assert_family_module_dispatch_policy():
     """#467 composition: under the scoped trunk-contract lane (global interpose
     off), no-residual sglang_fused dispatch is the family-1 kernel with real
     gradients -- for declared serving_no_residual sites without a warning, and
@@ -261,10 +341,10 @@ def test_trunk_contract_lane_dispatches_family1_and_warns_undeclared():
     assert torch.equal(out_declared, ref), "trunk-lane declared qk-norm left family-1"
     assert torch.equal(out_undeclared, ref)
 
+    _assert_family_declared_module_calls_match_legacy_bitwise_policy()
 
-@requires_cuda
-@pytest.mark.gpu
-def test_families_differ_on_seed_shape():
+
+def _assert_families_differ_on_seed_shape():
     """The tripwire vitality check: if the two families ever collapse to the
     same bits on the seed shape, every bitwise family gate is vacuous and this
     contract should be re-evaluated."""
@@ -279,13 +359,9 @@ def test_families_differ_on_seed_shape():
     assert n_diff < x.numel() * 1e-3
 
 
-@requires_cuda
-@pytest.mark.gpu
-@pytest.mark.parametrize("mode", ["native", "sglang", "sglang_fused"])
-@pytest.mark.parametrize("bi", [False, True])
-def test_family_declared_module_calls_match_legacy_bitwise(mode, bi):
+def _assert_family_declared_module_calls_match_legacy_bitwise(mode):
     """Family declarations replace the legacy force_sglang_residual call-site
-    exprs without changing a single bit, in every (mode, batch-invariant) lane.
+    expressions without changing a single bit in each mode branch.
 
     The legacy trunk marker is set explicitly here; exact Qwen production no
     longer mutates it as a model-build side effect, so test order must not
@@ -303,7 +379,7 @@ def test_family_declared_module_calls_match_legacy_bitwise(mode, bi):
 
     set_trunk_linear_contract(True)
     try:
-        with set_batch_invariant_mode(bi), torch.no_grad(), warnings.catch_warnings():
+        with set_batch_invariant_mode(False), torch.no_grad(), warnings.catch_warnings():
             warnings.simplefilter("ignore")
             # qk-norm / layer-0 input: declared no-residual == legacy bare call.
             assert torch.equal(make_norm(family=RMS_NORM_FAMILY_NO_RESIDUAL)(x), make_norm()(x))
@@ -321,3 +397,8 @@ def test_family_declared_module_calls_match_legacy_bitwise(mode, bi):
             assert torch.equal(rout_new, rout_old)
     finally:
         set_trunk_linear_contract(False)
+
+
+def _assert_family_declared_module_calls_match_legacy_bitwise_policy():
+    for mode in ("native", "sglang", "sglang_fused"):
+        _assert_family_declared_module_calls_match_legacy_bitwise(mode)

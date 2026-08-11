@@ -42,7 +42,7 @@ from xorl.lora.expert_adapter_contract import (
     validate_gated_silu_expert_adapter_semantics,
 )
 from xorl.lora.modules.base import LoraModule
-from xorl.ops.group_gemm.kernel.lora_utils import compute_lora_scaling
+from xorl.ops.group_gemm.kernel import compute_lora_scaling
 from xorl.ops.quantize import (
     block_fp8_dequantize_gkn,
     block_fp8_quantize_gkn,

@@ -1,7 +1,5 @@
 """MoE operations: scatter, gather, histogram, and index computation."""
 
-import os
-
 import torch
 import triton
 import triton.language as tl
@@ -12,19 +10,8 @@ from .triton_utils.memory import (
 )
 
 
-def _deterministic_scatter_enabled() -> bool:
-    """Deterministic scatter is the default: build the token->slot permutation with
-    a stable sort instead of relaxed atomics, so `moe_index_compute` returns the
-    same permutation on every run (required for bit-reproducible training).
-    Escape hatch: XORL_MOE_DETERMINISTIC_SCATTER=0 restores the atomics kernel."""
-    value = os.environ.get("XORL_MOE_DETERMINISTIC_SCATTER")
-    if value is None:
-        return True
-    return value.strip().lower() not in {"0", "false", "no", "off", ""}
-
-
 def _moe_index_compute_deterministic(experts_for_tokens: torch.Tensor) -> torch.Tensor:
-    """Run-invariant replacement for `_moe_index_compute_kernel`.
+    """Build a run-invariant token-to-expert-slot permutation.
 
     A stable argsort of the flattened expert ids yields slots where expert
     regions appear in expert-id order (the same `[cumsum[e-1], cumsum[e])`
@@ -346,50 +333,6 @@ def moe_scatter(x: torch.Tensor, index: torch.Tensor, out_dtype=None):
     return out
 
 
-@triton.jit
-def _moe_index_compute_kernel(
-    indices_ptr,
-    experts_for_tokens_ptr,
-    temp_histogram_cumsum_ptr,
-    num_elts,
-    NUM_EXPERTS: tl.constexpr,
-    BLOCK_SIZE: tl.constexpr,  # Unlikely to be aligned, so we don't test for alignment.
-):
-    _OOB_EXPERT_ID: tl.constexpr = 1023
-    tl.static_assert(_OOB_EXPERT_ID > NUM_EXPERTS, "Too many experts for me.")
-
-    start_pos = tl.program_id(0)
-    processing_range = start_pos * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-    expert_ids = tl.load(
-        experts_for_tokens_ptr + processing_range,
-        processing_range < num_elts,
-        _OOB_EXPERT_ID,
-    )
-    assert expert_ids < NUM_EXPERTS or expert_ids == _OOB_EXPERT_ID
-
-    indices = tl.zeros([BLOCK_SIZE], dtype=tl.int32)
-    for expert_id in tl.static_range(NUM_EXPERTS):
-        mask = expert_ids == expert_id
-        one_if_expert_id_matches = mask.to(tl.int32)
-
-        # Tokens allocated to this expert.
-        slots_to_reserve = tl.sum(one_if_expert_id_matches)
-        slot_ids = (
-            # Reserve last `slots_to_reserve` slots for us.
-            tl.atomic_add(temp_histogram_cumsum_ptr + expert_id, -slots_to_reserve, sem="relaxed")
-            # `atomic_add` returns old value, so we need to do subtraction again.
-            - slots_to_reserve
-            # Local offset for each token in `expert_ids`.
-            + tl.cumsum(one_if_expert_id_matches)
-            # Result of `cumsum` is "1-based".
-            - 1
-        )
-        assigned_slot_or_zero = tl.where(mask, slot_ids, 0)
-        indices += assigned_slot_or_zero.to(tl.int32)
-
-    tl.store(indices_ptr + processing_range, indices, processing_range < num_elts)
-
-
 def moe_index_compute(experts_for_tokens: torch.Tensor, expert_histogram_cumsum: torch.Tensor) -> torch.Tensor:
     """Calculate row number into activation passed to MoE fc1 for each token.
 
@@ -413,21 +356,4 @@ def moe_index_compute(experts_for_tokens: torch.Tensor, expert_histogram_cumsum:
         f"experts_for_tokens.device = {experts_for_tokens.device}, expert_histogram_cumsum.device = {expert_histogram_cumsum.device}"
     )
 
-    if _deterministic_scatter_enabled():
-        return _moe_index_compute_deterministic(experts_for_tokens)
-
-    BLOCK_SIZE = 128  # Faster than 1024, not sure why. May be better occupancy?
-
-    histogram_cumsum_copy = expert_histogram_cumsum.clone().detach()  # Temporary workspace.
-    indices = torch.empty_like(experts_for_tokens, dtype=int)
-
-    _moe_index_compute_kernel[(triton.cdiv(experts_for_tokens.numel(), BLOCK_SIZE),)](
-        indices_ptr=indices,
-        experts_for_tokens_ptr=experts_for_tokens,
-        temp_histogram_cumsum_ptr=histogram_cumsum_copy,
-        num_elts=experts_for_tokens.numel(),
-        NUM_EXPERTS=histogram_cumsum_copy.numel(),
-        BLOCK_SIZE=BLOCK_SIZE,
-    )
-
-    return indices
+    return _moe_index_compute_deterministic(experts_for_tokens)

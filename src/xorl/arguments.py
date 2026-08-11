@@ -154,6 +154,9 @@ class DatasetConfig:
         """Validate the dataset loading configuration based on path and other fields"""
         path = self.path
 
+        if self.shards is not None and self.preprocess_shards is not None:
+            raise ValueError("'shards' and 'preprocess_shards' are mutually exclusive.")
+
         if path == "dummy":
             if self.type != "tokenized":
                 raise ValueError("Dummy dataset only supports type='tokenized'.")
@@ -991,16 +994,6 @@ class TrainingArguments:
             )
         },
     )
-    fp8_cfg: Optional[Dict[str, Any]] = field(
-        default=None,
-        metadata={
-            "help": (
-                "Optional compatibility alias for NeMo-style FP8 configs. Supported values are "
-                "{enabled: true, fp8: e4m3, fp8_recipe: blockwise, fp8_param: false}; "
-                "TransformerEngine-only recipes are rejected."
-            )
-        },
-    )
     enable_fp8_training: bool = field(
         default=False,
         metadata={
@@ -1211,15 +1204,6 @@ class TrainingArguments:
             )
         },
     )
-    moe_checkpoint_method: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": (
-                "Deprecated compatibility alias. Use gradient_checkpointing_method instead. "
-                "The legacy value 'moe_act' maps to 'recompute_before_dispatch'."
-            )
-        },
-    )
 
     @property
     def moe_recomputed(self) -> bool:
@@ -1338,14 +1322,6 @@ class TrainingArguments:
     ep_intranode: bool = field(
         default=True,
         metadata={"help": "Place EP all-to-all within the node (NVLink). When False, EP spans across nodes."},
-    )
-    ep_outside: Optional[bool] = field(
-        default=None,
-        metadata={
-            "help": (
-                "Deprecated compatibility alias for ep_intranode. When set, ep_intranode is resolved to not ep_outside."
-            )
-        },
     )
     ulysses_parallel_size: int = field(
         default=1,
@@ -1639,11 +1615,8 @@ class TrainingArguments:
     )
 
     def __post_init__(self):
-        from xorl.fp8_training.config_compat import normalize_fp8_training_config  # noqa: PLC0415
         from xorl.qarl import normalize_qarl_quant_cfg  # noqa: PLC0415
 
-        normalized_fp8_config = normalize_fp8_training_config(vars(self), context="train")
-        self.enable_fp8_training = bool(normalized_fp8_config.get("enable_fp8_training", self.enable_fp8_training))
         if self.enable_qarl:
             if self.enable_fp8_training:
                 raise ValueError(
@@ -1656,23 +1629,6 @@ class TrainingArguments:
             if self.qarl_calib_data is None and (self.qarl_calib_size or self.qarl_quant_sequence_length is not None):
                 raise ValueError("qarl_calib_size and qarl_quant_sequence_length require qarl_calib_data")
             self.qarl_quant_cfg = normalize_qarl_quant_cfg(self.qarl_quant_cfg)
-
-        if self.ep_outside is not None:
-            self.ep_intranode = not self.ep_outside
-
-        if self.moe_checkpoint_method is not None:
-            if self.moe_checkpoint_method != "moe_act":
-                raise ValueError(
-                    f"Unknown moe_checkpoint_method: {self.moe_checkpoint_method!r}. "
-                    "The only supported legacy value is 'moe_act'."
-                )
-            if self.gradient_checkpointing_method not in (None, "recompute_before_dispatch"):
-                raise ValueError(
-                    "moe_checkpoint_method='moe_act' is a legacy alias for "
-                    "gradient_checkpointing_method='recompute_before_dispatch'; "
-                    f"got gradient_checkpointing_method={self.gradient_checkpointing_method!r}."
-                )
-            self.gradient_checkpointing_method = "recompute_before_dispatch"
 
         # Resolve gradient_checkpointing_method into internal fields used by
         # the model and parallelization code.
@@ -2237,21 +2193,11 @@ def parse_args(rootclass: T) -> T:
             input_data: Dict[str, Dict[str, Any]] = json.load(f)
 
     if input_data:
-        from xorl.fp8_training.config_compat import (  # noqa: PLC0415
-            extract_nemo_fp8_cfg,
-            validate_external_fp8_runtime_config,
-        )
+        from xorl.fp8_training.config_compat import validate_external_fp8_runtime_config  # noqa: PLC0415
+        from xorl.server.removed_config import reject_removed_configuration_fields  # noqa: PLC0415
 
+        reject_removed_configuration_fields(input_data, context=input_path or "config")
         validate_external_fp8_runtime_config(input_data, context=input_path or "config")
-        nemo_fp8_cfg = extract_nemo_fp8_cfg(input_data)
-        if nemo_fp8_cfg is not None:
-            train_data = input_data.setdefault("train", {})
-            if not isinstance(train_data, dict):
-                raise ValueError("train config section must be a mapping")
-            train_data.setdefault("fp8_cfg", nemo_fp8_cfg)
-            policy_data = input_data.get("policy")
-            if isinstance(policy_data, dict) and set(policy_data) == {"megatron_cfg"}:
-                input_data.pop("policy")
 
     for base, arg_dict in input_data.items():
         for arg_name, arg_value in arg_dict.items():

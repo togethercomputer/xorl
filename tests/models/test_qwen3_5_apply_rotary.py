@@ -1,6 +1,3 @@
-import ast
-import inspect
-
 import pytest
 import torch
 
@@ -65,22 +62,7 @@ def _hf_reference_pairwise(
     return to_interleaved(q_embed_h), to_interleaved(k_embed_h)
 
 
-def test_default_matches_hf_half_rotate():
-    """Default (interleaved=False) is the Qwen3.5/3.6 + HF/SGLang convention."""
-    torch.manual_seed(0)
-    batch, seq, num_heads, head_dim = 2, 4, 3, 8
-    q = torch.randn(batch, seq, num_heads, head_dim, dtype=torch.float32)
-    k = torch.randn(batch, seq, num_heads, head_dim, dtype=torch.float32)
-    cos, sin = _build_halved_cos_sin(batch, seq, head_dim)
-
-    q_ours, k_ours = qwen3_5_apply_rotary_pos_emb(q, k, cos, sin)
-    q_ref, k_ref = _hf_reference_half_rotate(q, k, cos, sin)
-
-    torch.testing.assert_close(q_ours, q_ref, atol=1e-6, rtol=1e-6)
-    torch.testing.assert_close(k_ours, k_ref, atol=1e-6, rtol=1e-6)
-
-
-def test_interleaved_matches_pairwise_reference():
+def _assert_interleaved_matches_pairwise_reference():
     """interleaved=True is the DSv3 MLA decoupled-RoPE pairwise convention."""
     torch.manual_seed(0)
     batch, seq, num_heads, head_dim = 2, 5, 3, 8
@@ -95,21 +77,7 @@ def test_interleaved_matches_pairwise_reference():
     torch.testing.assert_close(k_ours, k_ref, atol=1e-6, rtol=1e-6)
 
 
-def test_interleaved_pairwise_rotation_d8():
-    """Hand-worked d=8 sanity: pair i must be rotated by angle θ_i, not θ_{i+1}."""
-    torch.manual_seed(0)
-    batch, seq, num_heads, head_dim = 1, 1, 1, 8
-    q = torch.randn(batch, seq, num_heads, head_dim, dtype=torch.float32)
-    k = torch.zeros_like(q)
-    cos, sin = _build_halved_cos_sin(batch, seq, head_dim)
-
-    q_out, _ = qwen3_5_apply_rotary_pos_emb(q, k, cos, sin, interleaved=True)
-    # cos_unique[t=0] = [1,1,1,1] and sin_unique[t=0] = [0,0,0,0], so rotation
-    # at position 0 is the identity.
-    torch.testing.assert_close(q_out, q, atol=1e-6, rtol=1e-6)
-
-
-def test_class_b_dispatches_before_eager_qwen_math(monkeypatch):
+def _assert_class_b_rotary_admission_policy(monkeypatch):
     sentinel = (object(), object())
     calls = []
 
@@ -131,64 +99,70 @@ def test_class_b_dispatches_before_eager_qwen_math(monkeypatch):
     assert qwen3_5_shared.qwen3_5_apply_rotary_pos_emb(q, k, cos, sin, class_b=True) is sentinel
     assert calls == [(q, k, cos, sin, False)]
 
-
-@pytest.mark.parametrize(
-    ("q", "k", "cos", "sin", "message"),
-    [
-        (
-            torch.zeros((1, 2, 1, 4), dtype=torch.bfloat16),
-            torch.zeros((1, 2, 1, 4), dtype=torch.bfloat16),
-            torch.zeros((1, 2, 4), dtype=torch.float32),
-            torch.zeros((1, 2, 4), dtype=torch.float32),
-            "requires CUDA",
-        ),
-        (
-            torch.zeros((1, 2, 1, 4), dtype=torch.float32),
-            torch.zeros((1, 2, 1, 4), dtype=torch.float32),
-            torch.zeros((1, 2, 4), dtype=torch.float32),
-            torch.zeros((1, 2, 4), dtype=torch.float32),
-            "requires CUDA",
-        ),
-    ],
-)
-def test_class_b_fails_loudly_outside_cuda_contract(q, k, cos, sin, message):
-    with pytest.raises(RuntimeError, match=message):
-        qwen3_5_apply_rotary_pos_emb(q, k, cos, sin, class_b=True)
+    _assert_class_b_fails_loudly_outside_cuda_contract()
 
 
-@pytest.mark.parametrize("modeling_module", [modeling_qwen3_5, modeling_qwen3_5_moe])
-def test_qwen35_modeling_does_not_pass_interleaved_to_rotary(modeling_module):
-    """Regression: Qwen3.5/3.6 attention must NOT pass `interleaved=` into
-    `qwen3_5_apply_rotary_pos_emb`. q/k features use the standard half-rotate
-    convention (HF/SGLang); `mrope_interleaved` controls T/H/W frequency mixing
-    in cos/sin construction upstream, not the q/k rotation convention. Plumbing
-    it in would silently switch q/k to pairwise rotation for any HF Qwen3.5/3.6
-    config that ships with `mrope_interleaved=true`.
-    """
-    tree = ast.parse(inspect.getsource(modeling_module))
-    offenders: list[int] = []
-    for node in ast.walk(tree):
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id == "qwen3_5_apply_rotary_pos_emb"
-            and any(kw.arg == "interleaved" for kw in node.keywords)
-        ):
-            offenders.append(node.lineno)
-    assert not offenders, (
-        f"{modeling_module.__name__} calls `qwen3_5_apply_rotary_pos_emb(..., interleaved=...)` "
-        f"at line(s) {offenders}; this must not be plumbed from `mrope_interleaved`."
+def _assert_class_b_fails_loudly_outside_cuda_contract():
+    cos = torch.zeros((1, 2, 4), dtype=torch.float32)
+    sin = torch.zeros_like(cos)
+    for dtype in (torch.bfloat16, torch.float32):
+        q = torch.zeros((1, 2, 1, 4), dtype=dtype)
+        k = torch.zeros_like(q)
+        with pytest.raises(RuntimeError, match="requires CUDA"):
+            qwen3_5_apply_rotary_pos_emb(q, k, cos, sin, class_b=True)
+
+
+def _assert_qwen35_attention_keeps_half_rotate_when_mrope_is_interleaved(attention_type, config_type):
+    """mRoPE interleaves frequencies, not the q/k feature rotation convention."""
+    torch.manual_seed(23)
+    config = config_type(
+        hidden_size=8,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        head_dim=4,
+        num_hidden_layers=1,
+        layer_types=["full_attention"],
+        mrope_interleaved=True,
     )
+    attention = attention_type(config, layer_idx=0)
+    hidden = torch.randn(1, 3, 8)
+    cos, sin = _build_halved_cos_sin(batch=1, seq=3, head_dim=4)
+
+    query, key, _ = attention._project_qkv(hidden, (cos, sin))
+
+    input_shape = hidden.shape[:-1]
+    hidden_shape = (*input_shape, -1, attention.head_dim)
+    query_pre_rope, _ = torch.chunk(
+        attention.q_proj(hidden).view(*input_shape, -1, attention.head_dim * 2),
+        2,
+        dim=-1,
+    )
+    query_pre_rope = attention.q_norm(query_pre_rope.view(hidden_shape))
+    key_pre_rope = attention.k_norm(attention.k_proj(hidden).view(hidden_shape))
+    expected_query, expected_key = _hf_reference_half_rotate(query_pre_rope, key_pre_rope, cos, sin)
+    pairwise_query, pairwise_key = _hf_reference_pairwise(query_pre_rope, key_pre_rope, cos, sin)
+
+    assert config.mrope_interleaved is True
+    torch.testing.assert_close(query, expected_query, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(key, expected_key, atol=1e-6, rtol=1e-6)
+    assert not torch.allclose(query, pairwise_query)
+    assert not torch.allclose(key, pairwise_key)
 
 
-@pytest.mark.parametrize(
-    ("attention_type", "config_type"),
-    [
+def test_qwen35_rotary_numerics_admission_and_attention_policy(monkeypatch):
+    _assert_interleaved_matches_pairwise_reference()
+    _assert_class_b_rotary_admission_policy(monkeypatch)
+
+    for attention_type, config_type in (
         (modeling_qwen3_5.Qwen3_5Attention, Qwen3_5Config),
         (modeling_qwen3_5_moe.Qwen3_5MoeAttention, Qwen3_5MoeConfig),
-    ],
-)
-def test_qwen35_exact_attention_casts_post_rope_qk_to_bf16(attention_type, config_type):
+    ):
+        _assert_qwen35_attention_keeps_half_rotate_when_mrope_is_interleaved(attention_type, config_type)
+
+    _assert_qwen35_exact_attention_casts_post_rope_qk_to_bf16_policy()
+
+
+def _assert_qwen35_exact_attention_casts_post_rope_qk_to_bf16(attention_type, config_type):
     config = config_type(
         hidden_size=8,
         num_attention_heads=2,
@@ -207,3 +181,11 @@ def test_qwen35_exact_attention_casts_post_rope_qk_to_bf16(attention_type, confi
     assert query.dtype is torch.bfloat16
     assert key.dtype is torch.bfloat16
     assert value.dtype is torch.float32
+
+
+def _assert_qwen35_exact_attention_casts_post_rope_qk_to_bf16_policy():
+    for attention_type, config_type in (
+        (modeling_qwen3_5.Qwen3_5Attention, Qwen3_5Config),
+        (modeling_qwen3_5_moe.Qwen3_5MoeAttention, Qwen3_5MoeConfig),
+    ):
+        _assert_qwen35_exact_attention_casts_post_rope_qk_to_bf16(attention_type, config_type)

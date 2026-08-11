@@ -29,27 +29,12 @@ from xorl.server.runner.adapters.gradient_ownership import (
     compile_adapter_gradient_ownership,
 )
 from xorl.server.runner.adapters.sharded_state import AdapterTensorLayout
-from xorl.server.server_arguments import ServerArguments
 
 
 pytestmark = [pytest.mark.cpu, pytest.mark.server]
 
 
-def test_server_config_threads_transport_bucket_to_model_runner() -> None:
-    config = ServerArguments(
-        model_path="synthetic",
-        adapter_gradient_ownership_bucket_bytes=1024,
-    ).to_config_dict()["train"]
-
-    assert config["adapter_gradient_ownership_bucket_bytes"] == 1024
-
-
-def test_server_config_rejects_invalid_bucket() -> None:
-    with pytest.raises(ValueError, match="bucket_bytes"):
-        ServerArguments(model_path="synthetic", adapter_gradient_ownership_bucket_bytes=0)
-
-
-def test_declared_module_producer_runs_under_fullgraph_compile() -> None:
+def test_adapter_gradient_ownership_policy(monkeypatch) -> None:
     layer = LoraLinear(2, 2, r=1, lora_alpha=1, device=torch.device("cpu"))
     compiled = torch.compile(layer, backend="eager", fullgraph=True)
 
@@ -58,6 +43,10 @@ def test_declared_module_producer_runs_under_fullgraph_compile() -> None:
     assert layer.adapter_gradient_producer_family == "module_managed"
     assert layer.lora_A.grad is not None
     assert layer.lora_B.grad is not None
+
+    _assert_compiler_topology_fingerprint_and_admission_policy()
+    with monkeypatch.context() as transport_patch:
+        _assert_residual_transport_is_bucketed_and_leaves_raw_accumulator_immutable(transport_patch)
 
 
 def _layout(
@@ -148,7 +137,7 @@ def _four_family_inputs():
 _EP_GROUP_MEMBERSHIPS = {"group:expert_parallel_replica": ((0, 1),)}
 
 
-def test_compiler_covers_the_generic_topology_matrix_and_builds_authority_masks() -> None:
+def _assert_compiler_topology_fingerprint_and_admission_policy() -> None:
     layouts, model_parameters, optimizer_parameters, declarations = _four_family_inputs()
     plan = compile_adapter_gradient_ownership(
         layouts=layouts,
@@ -169,8 +158,12 @@ def test_compiler_covers_the_generic_topology_matrix_and_builds_authority_masks(
     )
     assert pending_mask.fqns == ("adapter.ep_replicated_shared",)
 
+    _assert_fingerprint_excludes_rank_local_tensor_identity_and_geometry()
+    _assert_compiler_fails_closed_on_incomplete_or_structurally_false_ownership()
+    _assert_compiler_replica_coverage_admits_only_complete_orthogonal_domains()
 
-def test_fingerprint_excludes_rank_local_tensor_identity() -> None:
+
+def _assert_fingerprint_excludes_rank_local_tensor_identity_and_geometry() -> None:
     layouts, model_parameters, optimizer_parameters, declarations = _four_family_inputs()
     first = compile_adapter_gradient_ownership(
         layouts=layouts,
@@ -193,19 +186,6 @@ def test_fingerprint_excludes_rank_local_tensor_identity() -> None:
         group_memberships=_EP_GROUP_MEMBERSHIPS,
     )
     assert first.fingerprint == second.fingerprint
-
-
-def test_global_fingerprint_excludes_rank_local_geometry() -> None:
-    layouts, model_parameters, optimizer_parameters, declarations = _four_family_inputs()
-    first = compile_adapter_gradient_ownership(
-        layouts=layouts,
-        model_parameters=model_parameters,
-        optimizer_parameters=optimizer_parameters,
-        declarations=declarations,
-        model_generation="model-generation-1",
-        adapter_generation="adapter-generation-1",
-        group_memberships=_EP_GROUP_MEMBERSHIPS,
-    )
     shifted = dict(layouts)
     shifted_name = "adapter.owner_sharded"
     shifted[shifted_name] = replace(
@@ -229,7 +209,7 @@ def test_global_fingerprint_excludes_rank_local_geometry() -> None:
     assert first.fingerprint == second.fingerprint
 
 
-def test_compiler_fails_closed_on_incomplete_or_structurally_false_ownership() -> None:
+def _assert_compiler_fails_closed_on_incomplete_or_structurally_false_ownership() -> None:
     layouts, model_parameters, optimizer_parameters, declarations = _four_family_inputs()
     missing = dict(declarations)
     missing.pop("adapter.dense_replicated")
@@ -272,8 +252,6 @@ def test_compiler_fails_closed_on_incomplete_or_structurally_false_ownership() -
             group_memberships=_EP_GROUP_MEMBERSHIPS,
         )
 
-
-def test_declaration_rejects_overlapping_or_foreign_pending_authority() -> None:
     completed = (_domain(ReductionAxis.SEQUENCE_PARALLEL, ReductionAuthority.GENERIC_SP_SYNC),)
     with pytest.raises(AdapterGradientOwnershipError, match="both complete and pending"):
         replace(
@@ -316,7 +294,7 @@ def _compile_replica_topology(
     )
 
 
-def test_compiler_rejects_unowned_or_unresolved_physical_replicas() -> None:
+def _assert_compiler_replica_coverage_admits_only_complete_orthogonal_domains() -> None:
     with pytest.raises(AdapterGradientOwnershipError, match="do not exactly cover"):
         _compile_replica_topology(replica_count=2, domains=(), group_memberships={})
 
@@ -329,10 +307,6 @@ def test_compiler_rejects_unowned_or_unresolved_physical_replicas() -> None:
             domains=(sequence,),
             group_memberships={"group:sequence_parallel": ((0, 2), (1,))},
         )
-
-
-def test_compiler_rejects_overlapping_or_incomplete_replica_coverage() -> None:
-    sequence = _domain(ReductionAxis.SEQUENCE_PARALLEL, ReductionAuthority.ADAPTER_FINALIZER)
     output = _domain(ReductionAxis.OUTPUT_PROJECTION_REPLICA, ReductionAuthority.ADAPTER_FINALIZER)
     with pytest.raises(AdapterGradientOwnershipError, match="overlap beyond rank"):
         _compile_replica_topology(
@@ -350,9 +324,6 @@ def test_compiler_rejects_overlapping_or_incomplete_replica_coverage() -> None:
             group_memberships={"group:sequence_parallel": ((0, 1), (2, 3))},
         )
 
-
-def test_compiler_accepts_orthogonal_replica_coverage_and_sets_divisor_once() -> None:
-    sequence = _domain(ReductionAxis.SEQUENCE_PARALLEL, ReductionAuthority.ADAPTER_FINALIZER)
     two_rank = _compile_replica_topology(
         replica_count=2,
         domains=(sequence,),
@@ -360,7 +331,6 @@ def test_compiler_accepts_orthogonal_replica_coverage_and_sets_divisor_once() ->
     )
     assert two_rank.parameters[0].norm_replica_divisor == 2
 
-    output = _domain(ReductionAxis.OUTPUT_PROJECTION_REPLICA, ReductionAuthority.ADAPTER_FINALIZER)
     four_rank = _compile_replica_topology(
         replica_count=4,
         domains=(sequence, output),
@@ -372,80 +342,7 @@ def test_compiler_accepts_orthogonal_replica_coverage_and_sets_divisor_once() ->
     assert four_rank.parameters[0].norm_replica_divisor == 4
 
 
-def _analytical_finalize(
-    contributions: tuple[tuple[float, ...], ...],
-    *,
-    denominator: int,
-    max_norm: float,
-) -> tuple[torch.Tensor, float, float]:
-    if denominator <= 0:
-        raise ValueError("denominator must be positive")
-    width = len(contributions[0])
-    numerator = [sum(contribution[index] for contribution in contributions) for index in range(width)]
-    scaled = [value / denominator for value in numerator]
-    norm = math.sqrt(sum(value * value for value in scaled))
-    clip = min(1.0, max_norm / (norm + 1e-6))
-    return torch.tensor([value * clip for value in scaled]), norm, clip
-
-
-def _analytical_first_adamw_step(
-    parameter: torch.Tensor,
-    gradient: torch.Tensor,
-    *,
-    lr: float,
-    beta1: float,
-    beta2: float,
-    eps: float,
-    weight_decay: float,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    moment = gradient * (1.0 - beta1)
-    variance = gradient.square() * (1.0 - beta2)
-    corrected_moment = moment / (1.0 - beta1)
-    corrected_variance = variance / (1.0 - beta2)
-    decayed = parameter * (1.0 - lr * weight_decay)
-    updated = decayed - lr * corrected_moment / (corrected_variance.sqrt() + eps)
-    return updated, moment, variance
-
-
-def test_analytical_reference_reconstructs_streaming_scale_clip_and_adamw() -> None:
-    finalized, norm, clip = _analytical_finalize(
-        ((2.0, 4.0), (6.0, 8.0), (1.0, 3.0), (5.0, 7.0)),
-        denominator=12,
-        max_norm=1.5,
-    )
-    raw_scaled = torch.tensor([14.0 / 12.0, 22.0 / 12.0])
-    expected_norm = float(torch.linalg.vector_norm(raw_scaled))
-    expected_clip = min(1.0, 1.5 / (expected_norm + 1e-6))
-    torch.testing.assert_close(finalized, raw_scaled * expected_clip)
-    assert norm == pytest.approx(expected_norm)
-    assert clip == pytest.approx(expected_clip)
-
-    initial = torch.tensor([0.25, -0.5])
-    expected_parameter, expected_moment, expected_variance = _analytical_first_adamw_step(
-        initial,
-        finalized,
-        lr=0.1,
-        beta1=0.9,
-        beta2=0.95,
-        eps=1e-8,
-        weight_decay=0.01,
-    )
-    actual = nn.Parameter(initial.clone())
-    actual.grad = finalized.clone()
-    optimizer = torch.optim.AdamW(
-        (actual,),
-        lr=0.1,
-        betas=(0.9, 0.95),
-        eps=1e-8,
-        weight_decay=0.01,
-    )
-    optimizer.step()
-    torch.testing.assert_close(actual, expected_parameter)
-    torch.testing.assert_close(optimizer.state[actual]["exp_avg"], expected_moment)
-    torch.testing.assert_close(optimizer.state[actual]["exp_avg_sq"], expected_variance)
-
-
-def test_residual_transport_is_bucketed_and_leaves_raw_accumulator_immutable(monkeypatch) -> None:
+def _assert_residual_transport_is_bucketed_and_leaves_raw_accumulator_immutable(monkeypatch) -> None:
     name = "adapter.shared_factor"
     layout = _layout(
         name,

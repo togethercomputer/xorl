@@ -368,9 +368,6 @@ def _result_throughput_point(
         moe_implementation=_first_non_none(
             throughput.get("moe_implementation"), topology_defaults.get("moe_implementation")
         ),
-        moe_checkpoint_method=_first_non_none(
-            throughput.get("moe_checkpoint_method"), topology_defaults.get("moe_checkpoint_method")
-        ),
         muon_update_dtype=_first_non_none(
             throughput.get("muon_update_dtype"), topology_defaults.get("muon_update_dtype")
         ),
@@ -1135,9 +1132,6 @@ def _best_by_mfu_point(
             _trial_moe_implementation(trial),
             topology_defaults.get("moe_implementation"),
         ),
-        moe_checkpoint_method=_first_non_none(
-            row.get("moe_checkpoint_method"), topology_defaults.get("moe_checkpoint_method")
-        ),
         muon_update_dtype=_first_non_none(
             row.get("muon_update_dtype"),
             _trial_muon_update_dtype(trial),
@@ -1679,7 +1673,6 @@ def _resolved_run_behavior_point(
         fsdp_reduce_dtype=_config_fsdp_reduce_dtype(raw_config),
         ce_mode=_config_ce_mode(raw_config),
         moe_implementation=_config_str(raw_config, "model", "moe_implementation"),
-        moe_checkpoint_method=_config_str(raw_config, "train", "moe_checkpoint_method"),
         muon_momentum=_config_float(raw_config, "train", "muon_momentum"),
         muon_update_dtype=_config_str(raw_config, "train", "muon_update_dtype"),
         attention_backend=_config_attention_backend(raw_config),
@@ -1837,7 +1830,6 @@ def _standalone_log_behavior_point(
         fsdp_reduce_dtype=_config_fsdp_reduce_dtype(raw_config),
         ce_mode=_config_ce_mode(raw_config),
         moe_implementation=_config_str(raw_config, "model", "moe_implementation"),
-        moe_checkpoint_method=_config_str(raw_config, "train", "moe_checkpoint_method"),
         muon_momentum=_config_float(raw_config, "train", "muon_momentum"),
         muon_update_dtype=_config_str(raw_config, "train", "muon_update_dtype"),
         attention_backend=_config_attention_backend(raw_config),
@@ -1988,7 +1980,6 @@ def _flashqla_summary_point(
         fsdp_reduce_dtype=_config_fsdp_reduce_dtype(raw_config),
         ce_mode=_config_ce_mode(raw_config),
         moe_implementation=_config_str(raw_config, "model", "moe_implementation"),
-        moe_checkpoint_method=_config_str(raw_config, "train", "moe_checkpoint_method"),
         muon_momentum=_config_float(raw_config, "train", "muon_momentum"),
         muon_update_dtype=_config_str(raw_config, "train", "muon_update_dtype"),
         attention_backend=backend,
@@ -2374,11 +2365,6 @@ def behavior_point_workload_mismatches(point: BenchmarkBehaviorPoint, raw_config
         ("fsdp_reduce_dtype", point.fsdp_reduce_dtype, _config_fsdp_reduce_dtype(raw_config)),
         ("ce_mode", point.ce_mode, _config_ce_mode(raw_config)),
         ("moe_implementation", point.moe_implementation, _config_str(raw_config, "model", "moe_implementation")),
-        (
-            "moe_checkpoint_method",
-            point.moe_checkpoint_method,
-            _config_str(raw_config, "train", "moe_checkpoint_method"),
-        ),
         ("muon_momentum", point.muon_momentum, _config_float(raw_config, "train", "muon_momentum")),
         ("muon_update_dtype", point.muon_update_dtype, _config_str(raw_config, "train", "muon_update_dtype")),
     )

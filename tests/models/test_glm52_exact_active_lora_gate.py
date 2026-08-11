@@ -28,7 +28,7 @@ def _config_with_all_active_lora_flags():
     return config
 
 
-def test_complete_active_lora_flags_enable_exact_forward_without_scoring_marker() -> None:
+def test_active_lora_composite_admission_policy() -> None:
     config = _config_with_all_active_lora_flags()
 
     assert glm52_exact_active_lora_enabled(config)
@@ -36,8 +36,20 @@ def test_complete_active_lora_flags_enable_exact_forward_without_scoring_marker(
     assert _is_exact_glm52(config)
     assert _moe_bi_router_enabled(config)
 
+    for missing_flag in GLM52_EXACT_ACTIVE_LORA_FLAGS:
+        partial = _config_with_all_active_lora_flags()
+        setattr(partial, missing_flag, False)
 
-def test_active_lora_component_flags_are_set_and_cleared_atomically() -> None:
+        assert not glm52_exact_active_lora_enabled(partial)
+        assert not glm52_exact_forward_enabled(partial)
+        assert not _is_exact_glm52(partial)
+        assert not _moe_bi_router_enabled(partial)
+
+    scoring_only = _official_config()
+    scoring_only._glm52_exact_contract = True
+    assert not glm52_exact_active_lora_enabled(scoring_only)
+    assert glm52_exact_forward_enabled(scoring_only)
+
     config = _official_config()
     config._glm52_exact_active_lora_dense_component = True
 
@@ -90,7 +102,7 @@ def _build_exact_rank1(monkeypatch: pytest.MonkeyPatch, *, lm_head_tp_size: int 
     )
 
 
-def test_rank1_server_training_derives_the_complete_family_without_private_flags(
+def test_rank1_server_training_derives_the_complete_family_and_checks_topology(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     model = _build_exact_rank1(monkeypatch)
@@ -98,35 +110,9 @@ def test_rank1_server_training_derives_the_complete_family_without_private_flags
     assert glm52_exact_active_lora_enabled(model.config)
     assert model.config._glm52_exact_contract is False
     assert all(getattr(model.config, flag) is True for flag in GLM52_EXACT_ACTIVE_LORA_FLAGS)
-
-
-def test_rank1_server_training_rejects_non_tp16_lm_head_before_loading(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
     with pytest.raises(ValueError, match="lm-head-TP16"):
         _build_exact_rank1(monkeypatch, lm_head_tp_size=1)
 
-
-@pytest.mark.parametrize("missing_flag", GLM52_EXACT_ACTIVE_LORA_FLAGS)
-def test_every_active_lora_component_is_required(missing_flag: str) -> None:
-    config = _config_with_all_active_lora_flags()
-    setattr(config, missing_flag, False)
-
-    assert not glm52_exact_active_lora_enabled(config)
-    assert not glm52_exact_forward_enabled(config)
-    assert not _is_exact_glm52(config)
-    assert not _moe_bi_router_enabled(config)
-
-
-def test_scoring_only_marker_remains_an_independent_exact_forward_admission() -> None:
-    config = _official_config()
-    config._glm52_exact_contract = True
-
-    assert not glm52_exact_active_lora_enabled(config)
-    assert glm52_exact_forward_enabled(config)
-
-
-def test_cached_indexer_and_moe_surfaces_activate_only_for_complete_composite() -> None:
     complete = _config_with_all_active_lora_flags()
     partial = _config_with_all_active_lora_flags()
     partial._glm52_exact_active_lora_lm_head_component = False

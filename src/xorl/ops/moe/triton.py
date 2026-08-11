@@ -1,5 +1,3 @@
-import os
-
 import torch
 import torch.nn.functional as F
 
@@ -43,13 +41,8 @@ def set_routing_weights_before_down(enabled: bool) -> None:
 
 
 def routing_weights_before_down() -> bool:
-    """Whether expert_scores fold into the down-GEMM input instead of its output.
-
-    The ``XORL_MOE_ROUTING_WEIGHTS_BEFORE_DOWN=1`` env var force-enables the
-    before-down position regardless of config; it is read lazily (per forward)
-    so it keeps working when set after import.
-    """
-    return _ROUTING_WEIGHTS_BEFORE_DOWN_CONFIG or os.environ.get("XORL_MOE_ROUTING_WEIGHTS_BEFORE_DOWN", "0") == "1"
+    """Whether expert_scores fold into the down-GEMM input instead of its output."""
+    return _ROUTING_WEIGHTS_BEFORE_DOWN_CONFIG
 
 
 def resolve_routing_weights_before_down(setting: bool | str, *, train_router: bool, ep_dispatch: str) -> bool:
@@ -64,9 +57,9 @@ def resolve_routing_weights_before_down(setting: bool | str, *, train_router: bo
     if isinstance(setting, bool):
         return setting
     normalized = str(setting).strip().lower()
-    if normalized in ("true", "1"):
+    if normalized == "true":
         return True
-    if normalized in ("false", "0"):
+    if normalized == "false":
         return False
     if normalized != "auto":
         raise ValueError(f"Invalid moe_routing_weights_before_down={setting!r}; expected 'auto', true, or false.")

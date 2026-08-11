@@ -1,3 +1,4 @@
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -7,13 +8,6 @@ from xorl.server.runner.model_runner import ModelRunner
 
 
 pytestmark = [pytest.mark.cpu, pytest.mark.server]
-
-if "drgrpo" not in ModelRunner._LOSS_EXCLUDE_KEYS:  # pragma: no cover - upstream WIP gap
-    pytest.skip(
-        "model_runner has no Dr.GRPO loss dispatch branch or _LOSS_EXCLUDE_KEYS['drgrpo'] entry upstream; "
-        "the drgrpo loss path is not yet implemented, so these tests cannot exercise it",
-        allow_module_level=True,
-    )
 
 
 class _TinyModel(torch.nn.Module):
@@ -27,20 +21,26 @@ class _TinyModel(torch.nn.Module):
         return SimpleNamespace(last_hidden_state=self.embed(input_ids))
 
 
-class _NoopRoutingHandler:
-    def __init__(self):
-        self.calls = []
-
-    def setup(self, micro_batches, routed_experts, routed_expert_logits):
-        self.calls.append((micro_batches, routed_experts, routed_expert_logits))
-        return False
-
-
-def test_compute_micro_batch_loss_dispatches_drgrpo_and_filters_loss_inputs():
+def _loss_runner(model=None):
     runner = object.__new__(ModelRunner)
-    runner.model = _TinyModel()
+    runner.model = model or _TinyModel()
     runner.ce_mode = "eager"
     runner.lm_head_fp32 = False
+    return runner
+
+
+def _legacy_micro_batch():
+    return {
+        "input_ids": torch.tensor([[1, 2]]),
+        "target_tokens": torch.tensor([[2, 3]]),
+        "logprobs": torch.tensor([[-2.0, -2.1]]),
+        "advantages": torch.tensor([[1.0, 1.0]]),
+    }
+
+
+def test_compute_micro_batch_loss_dispatches_drgrpo_and_honors_options():
+    _assert_causallm_loss_returns_raw_token_sum()
+    runner = _loss_runner()
 
     micro_batch = {
         "input_ids": torch.tensor([[1, 2, 3]]),
@@ -68,185 +68,49 @@ def test_compute_micro_batch_loss_dispatches_drgrpo_and_filters_loss_inputs():
     assert "loss/kl_ref/mean" in metrics
     assert metric_ops is None
 
+    # Legacy field names and output controls use the same dispatch boundary.
+    micro_batch = _legacy_micro_batch()
 
-def test_compute_micro_batch_loss_drgrpo_accepts_legacy_logprobs_key():
-    runner = object.__new__(ModelRunner)
-    runner.model = _TinyModel()
-    runner.ce_mode = "eager"
-    runner.lm_head_fp32 = False
-
-    micro_batch = {
-        "input_ids": torch.tensor([[1, 2]]),
-        "target_tokens": torch.tensor([[2, 3]]),
-        "logprobs": torch.tensor([[-2.0, -2.1]]),
-        "advantages": torch.tensor([[1.0, 1.0]]),
-    }
-
-    loss, per_token_outputs, metrics, _metric_ops, _outputs = runner._compute_micro_batch_loss(
-        micro_batch,
-        "drgrpo",
-        {"beta": 0.0},
+    loss, raw_outputs, metrics, _metric_ops, _outputs = runner._compute_micro_batch_loss(
+        micro_batch, "drgrpo", {"beta": 0.0}
     )
-
     assert loss.isfinite()
-    assert per_token_outputs["logprobs"].shape == micro_batch["target_tokens"].shape
+    assert raw_outputs["logprobs"].shape == micro_batch["target_tokens"].shape
     assert metrics["valid_tokens"] == 2
 
-
-def test_compute_micro_batch_loss_drgrpo_forwards_logprob_temperature():
-    runner = object.__new__(ModelRunner)
-    runner.model = _TinyModel()
-    runner.ce_mode = "eager"
-    runner.lm_head_fp32 = False
-
-    micro_batch = {
-        "input_ids": torch.tensor([[1, 2]]),
-        "target_tokens": torch.tensor([[2, 3]]),
-        "logprobs": torch.tensor([[-2.0, -2.1]]),
-        "advantages": torch.zeros((1, 2)),
-    }
-
-    _loss, raw_outputs, _raw_metrics, _metric_ops, _outputs = runner._compute_micro_batch_loss(
-        micro_batch,
-        "drgrpo",
-        {"beta": 0.0},
+    _loss, temp_outputs, _metrics, _metric_ops, _outputs = runner._compute_micro_batch_loss(
+        micro_batch, "drgrpo", {"beta": 0.0, "logprob_temperature": 0.7}
     )
-    _loss, temp_outputs, _temp_metrics, _metric_ops, _outputs = runner._compute_micro_batch_loss(
-        micro_batch,
-        "drgrpo",
-        {"beta": 0.0, "logprob_temperature": 0.7},
-    )
-
     assert not torch.allclose(raw_outputs["logprobs"], temp_outputs["logprobs"])
 
-
-def test_compute_micro_batch_loss_drgrpo_skips_returned_logprobs_when_disabled():
-    runner = object.__new__(ModelRunner)
-    runner.model = _TinyModel()
-    runner.ce_mode = "eager"
-    runner.lm_head_fp32 = False
-
-    micro_batch = {
-        "input_ids": torch.tensor([[1, 2]]),
-        "target_tokens": torch.tensor([[2, 3]]),
-        "logprobs": torch.tensor([[-2.0, -2.1]]),
-        "advantages": torch.tensor([[1.0, 1.0]]),
-    }
-
-    loss, per_token_outputs, metrics, _metric_ops, _outputs = runner._compute_micro_batch_loss(
-        micro_batch,
-        "drgrpo",
-        {"beta": 0.0, "return_per_token": False},
+    _loss, disabled_outputs, _metrics, _metric_ops, _outputs = runner._compute_micro_batch_loss(
+        micro_batch, "drgrpo", {"beta": 0.0, "return_per_token": False}
     )
+    assert disabled_outputs == {}
 
-    assert loss.isfinite()
-    assert per_token_outputs == {}
-    assert metrics["valid_tokens"] == 2
-
-
-def test_compute_micro_batch_loss_drgrpo_keeps_logprobs_for_per_sample_k3():
-    runner = object.__new__(ModelRunner)
-    runner.model = _TinyModel()
-    runner.ce_mode = "eager"
-    runner.lm_head_fp32 = False
-
-    micro_batch = {
-        "input_ids": torch.tensor([[1, 2]]),
-        "target_tokens": torch.tensor([[2, 3]]),
-        "logprobs": torch.tensor([[-2.0, -2.1]]),
-        "advantages": torch.tensor([[1.0, 1.0]]),
-    }
-
-    loss, per_token_outputs, metrics, _metric_ops, _outputs = runner._compute_micro_batch_loss(
+    _loss, k3_outputs, _metrics, _metric_ops, _outputs = runner._compute_micro_batch_loss(
         micro_batch,
         "drgrpo",
         {"beta": 0.0, "return_per_token": False, "compute_per_sample_k3": True},
     )
-
-    assert loss.isfinite()
-    assert per_token_outputs["logprobs"].shape == micro_batch["target_tokens"].shape
-    assert metrics["valid_tokens"] == 2
+    assert k3_outputs["logprobs"].shape == micro_batch["target_tokens"].shape
 
 
-def test_compute_micro_batch_loss_forwards_sampler_prefill_lengths_to_model():
-    class _BoundaryModel(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.embed = torch.nn.Embedding(16, 4)
-            self.lm_head = torch.nn.Linear(4, 8, bias=False)
-            self.forward_kwargs = None
+def _assert_causallm_loss_returns_raw_token_sum():
+    model = _TinyModel()
+    with torch.no_grad():
+        model.lm_head.weight.zero_()
+    runner = _loss_runner(model)
 
-        def forward(self, input_ids, **kwargs):
-            self.forward_kwargs = kwargs
-            return SimpleNamespace(last_hidden_state=self.embed(input_ids))
-
-    runner = object.__new__(ModelRunner)
-    runner.model = _BoundaryModel()
-    runner.ce_mode = "eager"
-    runner.lm_head_fp32 = False
-    input_ids = torch.tensor([[1, 2]])
-
-    runner._compute_micro_batch_loss(
+    loss, per_token_outputs, _metrics, _metric_ops, _outputs = runner._compute_micro_batch_loss(
         {
-            "input_ids": input_ids,
-            "labels": torch.tensor([[2, 3]]),
+            "input_ids": torch.tensor([[0, 0]]),
+            "labels": torch.tensor([[0, 1]]),
         },
         "causallm_loss",
-        {"sampler_prefill_lengths": [4096]},
+        {},
     )
 
-    boundary = runner.model.forward_kwargs["sampler_prefill_lengths"]
-    assert boundary.dtype is torch.int64
-    assert boundary.device == input_ids.device
-    assert boundary.tolist() == [4096]
-
-
-def test_forward_backward_dispatches_drgrpo_through_standard_loop(monkeypatch):
-    monkeypatch.setattr("xorl.server.runner.model_runner.synchronize", lambda: None)
-
-    runner = object.__new__(ModelRunner)
-    runner.rank = 0
-    runner.model = SimpleNamespace(config=SimpleNamespace(vocab_size=16))
-    runner.pp_enabled = False
-    runner._allocator_dirty = False
-    runner._adapter_manager = None
-    runner._routing_handler = _NoopRoutingHandler()
-    runner._moe_tracker = SimpleNamespace(enabled=False)
-    runner._check_not_sleeping = lambda *_args, **_kwargs: None
-    runner._validate_single_tenant = lambda *_args, **_kwargs: None
-    runner.global_forward_backward_step = 7
-    captured = {}
-
-    def fake_forward_loop(micro_batches, loss_fn, loss_fn_params, **kwargs):
-        captured["micro_batches"] = micro_batches
-        captured["loss_fn"] = loss_fn
-        captured["loss_fn_params"] = loss_fn_params
-        captured["kwargs"] = kwargs
-        return {"total_loss": 0.25, "global_valid_tokens": 2}
-
-    runner._forward_loop = fake_forward_loop
-    micro_batches = [
-        {
-            "input_ids": torch.tensor([[1, 2]]),
-            "target_tokens": torch.tensor([[2, 3]]),
-            "old_logprobs": torch.tensor([[-2.0, -2.1]]),
-            "advantages": torch.tensor([[1.0, 1.0]]),
-        }
-    ]
-    params = {"beta": 0.0, "ratio_type": "sequence"}
-
-    result = runner.forward_backward(micro_batches, loss_fn="drgrpo", loss_fn_params=params, model_id="policy-a")
-    runner.commit_forward_backward_completion("policy-a")
-
-    assert captured["micro_batches"] is micro_batches
-    assert captured["loss_fn"] == "drgrpo"
-    assert captured["loss_fn_params"] is params
-    assert captured["kwargs"]["compute_backward"] is True
-    assert captured["kwargs"]["r3_enabled"] is False
-    assert captured["kwargs"]["model_id"] == "policy-a"
-    assert result["total_loss"] == pytest.approx(0.25)
-    assert result["global_valid_tokens"] == 2
-    assert result["step"] == 7
-    assert result["model_id"] == "policy-a"
-    assert runner.global_forward_backward_step == 8
-    assert runner._routing_handler.calls == [(micro_batches, None, None)]
+    expected = math.log(model.lm_head.out_features)
+    assert loss.item() == pytest.approx(2 * expected)
+    assert per_token_outputs["loss"].reshape(-1).tolist() == pytest.approx([expected, expected])

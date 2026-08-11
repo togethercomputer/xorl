@@ -130,17 +130,6 @@ class AdapterCoordinator:
 
         logger.debug(f"Rank {self.rank}: Broadcast adapter state for model_id={model_id}")
 
-    def broadcast_adapter_optimizer_state(self, model_id: str) -> None:
-        """Deprecated no-op: optimizer state is topology-specific and not broadcastable."""
-        if self.world_size <= 1:
-            return
-        self._validate_pipeline_parallel_broadcast_safe()
-        logger.debug(
-            "Rank %s: refusing rank-0 optimizer broadcast for local-shard adapter %s; use all_ranks checkpoint restore",
-            self.rank,
-            model_id,
-        )
-
     @staticmethod
     def _strip_optimizer_config(session_spec: Dict[str, Any]) -> Dict[str, Any]:
         stripped = deepcopy(session_spec)

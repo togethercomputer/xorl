@@ -162,13 +162,6 @@ def fake_quantize_nvfp4(w: Tensor, block_size: int = 16) -> Tensor:
     return w + (w_dq - w).detach()
 
 
-def fake_quantize(w: Tensor, quant_format: str = "nvfp4", block_size: int = 16) -> Tensor:
-    """Format-dispatched fake quantization (STE). Currently supports ``nvfp4``."""
-    if quant_format == "nvfp4":
-        return fake_quantize_nvfp4(w, block_size)
-    raise ValueError(f"Unsupported quant_format={quant_format!r}; supported: {sorted(_SUPPORTED_FORMATS)}")
-
-
 def fake_quantize_activation_nvfp4(x: Tensor, block_size: int = 16) -> Tensor:
     """Fake-quantize an **activation** tensor to NVFP4 with an STE backward.
 

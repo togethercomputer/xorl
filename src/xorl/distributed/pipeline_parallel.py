@@ -53,7 +53,6 @@ __all__ = [
     "build_pipeline_schedule",
     "schedule_stage_style",
     "stage_ids_for_rank",
-    "is_single_stage_schedule",
     "schedule_splits_backward",
     "validate_pp_schedule_config",
 ]
@@ -78,11 +77,6 @@ def schedule_stage_style(schedule_name: str) -> str:
     if key not in _SCHEDULE_STYLES:
         raise ValueError(f"Unsupported PP schedule '{schedule_name}'. Supported schedules: {sorted(_SCHEDULE_STYLES)}")
     return _SCHEDULE_STYLES[key]
-
-
-def is_single_stage_schedule(schedule_name: str) -> bool:
-    """True when the schedule requires exactly one stage per rank (GPipe, 1F1B)."""
-    return issubclass(get_schedule_class(schedule_name), PipelineScheduleSingle)
 
 
 _BACKWARD_SPLIT_SCHEDULES = frozenset({"interleavedzerobubble", "zbvzerobubble", "dualpipev"})

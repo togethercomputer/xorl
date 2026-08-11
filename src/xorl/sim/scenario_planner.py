@@ -232,7 +232,6 @@ _SCENARIO_RUNTIME_SIGNATURE_FIELDS = (
     ("train", "fsdp_reduce_dtype"),
     ("train", "ce_mode"),
     ("model", "moe_implementation"),
-    ("train", "moe_checkpoint_method"),
     ("train", "muon_momentum"),
     ("train", "muon_update_dtype"),
     ("model", "deepep_async_combine"),

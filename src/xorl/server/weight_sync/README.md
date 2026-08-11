@@ -300,12 +300,10 @@ P2P tuning options:
 - With P2P and explicit FP8 sync quantization, the handler quantizes supported
   projection weights on the trainer side, transfers FP8 weights plus
   `weight_scale_inv` tensors, and skips receiver post-processing by default
-  because direct P2P writes already target receiver-native FP8 storage. Set
-  `XORL_WEIGHT_SYNC_RUN_POST_PROCESS_WEIGHTS=1` or
-  `XORL_P2P_RUN_POST_PROCESS_WEIGHTS=1` only for legacy receivers that still
-  require finalization after P2P writes. If the receiver is FP8 but the sync
-  request has no FP8 quantization config, tensor-size validation should fail
-  instead of silently copying bf16 into FP8 locators.
+  because direct P2P writes already target receiver-native FP8 storage. If the
+  receiver is FP8 but the sync request has no FP8 quantization config,
+  tensor-size validation should fail instead of silently copying bf16 into FP8
+  locators.
 - The SGLang receiver must expose a matching block-FP8 layout. XORL emits
   block-wise `weight_scale_inv` tensors; a receiver exposing only per-tensor
   `weight_scale` tensors for FusedMoE is not compatible with this sender path.
@@ -348,20 +346,9 @@ P2P tuning options:
   multi-endpoint P2P. It sends each receiver endpoint through its own serialized
   sync group, avoiding cross-endpoint Mooncake session reuse at the cost of
   giving up normal endpoint fanout parallelism.
-- `XORL_P2P_SCATTER_COPY_MODE`: controls how rank 0 builds per-sender tensor
-  map payloads for direct-EP scatter. Default `none` reuses read-only locator
-  lists/dicts while constructing scatter payloads. Set `list` to shallow-copy
-  lists or `deep` to copy every locator dict for debugging.
-- `XORL_P2P_SCATTER_REUSE_LOCATORS`: legacy boolean alias for the default
-  scatter copy mode. Set `1` to force locator reuse even when older manifests
-  still set `XORL_P2P_SCATTER_COPY_MODE=list`; set `0` to force shallow list
-  copies when `XORL_P2P_SCATTER_COPY_MODE` is unset.
 - `XORL_WEIGHT_SYNC_MOE_BUCKET_BYTES`: explicit MoE bucket cap override.
   Without this override, P2P uses a 2 GiB MoE bucket cap to amortize
   Mooncake fixed costs; non-P2P backends keep the 256 MiB default.
-- `XORL_WEIGHT_SYNC_BUCKET_BYTES`: legacy alias for the MoE bucket cap. Prefer
-  `XORL_WEIGHT_SYNC_MOE_BUCKET_BYTES` so dense/root chunking stays independent
-  from MoE batching.
 - `XORL_P2P_USE_ASYNC_API=1`: opt into Mooncake's async write API. The default
   synchronous API path is the sustained-test path; async status polling has
   shown repeated-update `status=-1` failures and should remain experimental.

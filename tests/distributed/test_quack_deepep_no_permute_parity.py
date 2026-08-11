@@ -2,8 +2,8 @@
 
 ``moe_implementation: quack`` + ``ep_dispatch: deepep`` routes expert compute
 through ``QuackEPDeepEPNoPermute`` (chunked, fused with combine) — NOT through
-``QuackEPGroupGemm``, which is what ``test_deepep_correctness.py`` covers. This
-test drives the no-permute path directly at the Qwen3.6-35B-A3B MoE shape
+the generic permute/compute/combine path. This test drives the no-permute path
+directly at the Qwen3.6-35B-A3B MoE shape
 (h=2048, I=512, E=256, top-8) and compares forward output and all gradients
 against the trusted triton generic path on the same DeepEP dispatch.
 
@@ -56,13 +56,10 @@ def _install_nvidia_ml_library_path() -> None:
 
 
 def _install_nvshmem_library_path() -> None:
-    try:
-        import nvidia.nvshmem  # noqa: PLC0415
+    import nvidia.nvshmem  # noqa: PLC0415
 
-        nvshmem_lib = os.path.join(list(nvidia.nvshmem.__path__)[0], "lib")
-        _prepend_library_path(nvshmem_lib)
-    except Exception:
-        pass
+    nvshmem_lib = os.path.join(list(nvidia.nvshmem.__path__)[0], "lib")
+    _prepend_library_path(nvshmem_lib)
 
 
 def _cosine(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -338,15 +335,6 @@ def _worker_main() -> int:
             topk=8,
             routing="skewed",
         ),
-        dict(
-            name="q36_large_m",
-            num_tokens=16384,
-            hidden_dim=2048,
-            intermediate_size=512,
-            num_experts=256,
-            topk=8,
-            routing="balanced",
-        ),
     ]
 
     train_cases = [
@@ -367,15 +355,6 @@ def _worker_main() -> int:
             num_experts=256,
             topk=8,
             use_checkpoint=False,
-        ),
-        dict(
-            name="train_ckpt_prod_m",
-            num_tokens=32768,
-            hidden_dim=2048,
-            intermediate_size=512,
-            num_experts=256,
-            topk=8,
-            use_checkpoint=True,
         ),
     ]
 

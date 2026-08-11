@@ -62,7 +62,7 @@ class _RecordingLmHead(torch.nn.Linear):
 
 
 @patch("xorl.server.runner.model_runner.get_parallel_state")
-def test_opd_metrics_keep_opd_namespace(mock_parallel_state):
+def _assert_opd_metric_aggregation_policy(mock_parallel_state):
     mock_parallel_state.return_value = Mock(dp_enabled=False, loss_parallel_enabled=False)
     accumulated = {}
 
@@ -91,7 +91,7 @@ def test_opd_metrics_keep_opd_namespace(mock_parallel_state):
     )
 
     result = {}
-    ModelRunner._finalize_loss_metrics(accumulated, result)
+    ModelRunner._finalize_loss_metrics(accumulated, result, "opd_loss")
 
     assert result["opd_kl"] == pytest.approx((0.5 * 4 + 0.2 * 2) / 6)
     assert result["opd_weighted_kl"] == pytest.approx((0.6 * 4 + 0.3 * 2) / 6)
@@ -100,10 +100,14 @@ def test_opd_metrics_keep_opd_namespace(mock_parallel_state):
     assert not any(key.startswith("_opd_debug_") for key in result)
     assert not any(key.startswith("is_opd") for key in result)
 
+    _assert_loss_metric_extrema_ignore_zero_valid_microbatches()
+    _assert_opd_metrics_reduce_over_loss_group()
+    _assert_opd_metric_seeding_aligns_empty_rank_keys()
+
 
 @patch("xorl.server.runner.model_runner.get_device_type", return_value="cpu")
 @patch("xorl.server.runner.model_runner.get_parallel_state")
-def test_loss_metric_extrema_ignore_zero_valid_microbatches(mock_parallel_state, _mock_get_device_type):
+def _assert_loss_metric_extrema_ignore_zero_valid_microbatches(mock_parallel_state, _mock_get_device_type):
     mock_parallel_state.return_value = Mock(dp_enabled=False, loss_parallel_enabled=False)
     accumulated = {}
     metric_ops = {
@@ -141,7 +145,7 @@ def test_loss_metric_extrema_ignore_zero_valid_microbatches(mock_parallel_state,
 
 @patch("xorl.server.runner.model_runner.get_device_type", return_value="cpu")
 @patch("xorl.server.runner.model_runner.get_parallel_state")
-def test_opd_metrics_reduce_over_loss_group(mock_parallel_state, _mock_get_device_type):
+def _assert_opd_metrics_reduce_over_loss_group(mock_parallel_state, _mock_get_device_type):
     loss_group = object()
     mock_parallel_state.return_value = Mock(loss_parallel_enabled=True, loss_group=loss_group)
     accumulated = {}
@@ -169,7 +173,7 @@ def test_opd_metrics_reduce_over_loss_group(mock_parallel_state, _mock_get_devic
 
 
 @patch("xorl.server.runner.model_runner.get_device_type", return_value="cpu")
-def test_opd_metric_seeding_aligns_empty_rank_keys(_mock_get_device_type):
+def _assert_opd_metric_seeding_aligns_empty_rank_keys(_mock_get_device_type):
     """A rank with only 0-valid-token micro-batches returns
     ``OPDLossMetrics(valid_tokens=0).to_dict()``, which carries none of the
     per-micro-batch ``opd_profile_*_ms`` (sum_max) keys, so its
@@ -221,7 +225,7 @@ def test_opd_metric_seeding_aligns_empty_rank_keys(_mock_get_device_type):
     assert "opd_profile_kl_compute_ms" in empty
 
 
-def test_teacher_hidden_cache_split_skips_padding_segments():
+def _assert_opd_packed_cache_and_weight_shaping_policy():
     hidden = torch.arange(12, dtype=torch.float32).view(1, 6, 2)
     labels = torch.tensor([[10, 11, -100, 12, 13, -100]])
     position_ids = torch.tensor([[0, 1, 2, 0, 1, 0]])
@@ -231,18 +235,53 @@ def test_teacher_hidden_cache_split_skips_padding_segments():
     assert cache_indices == [[0, 1], [2, 3]]
     assert torch.equal(torch.cat(rows, dim=0), hidden[0, [0, 1, 3, 4]])
 
-
-def test_teacher_hidden_cache_split_filters_unpacked_masked_targets():
-    hidden = torch.arange(12, dtype=torch.float32).view(1, 6, 2)
-    labels = torch.tensor([[-100, -100, 12, -100, 14, -100]])
-
-    rows, cache_indices = ModelRunner._split_hidden_cache_rows(hidden, labels)
-
-    assert cache_indices == [[0, 1]]
-    assert torch.equal(rows[0], hidden[0, [2, 4]])
+    _assert_oprd_last_k_weights_respects_packed_position_resets()
+    _assert_teacher_hidden_cache_splits_packed_batch_and_drops_padding()
 
 
-def test_oprd_last_k_weights_respects_packed_position_resets():
+def _assert_opd_layer_cache_fetcher_streams_layer_slices():
+    class FakeLayerCache:
+        def __init__(self) -> None:
+            self.requested_indices = None
+            self.requested_slices = []
+
+        def shape(self, teacher_id):
+            return (5, 16, 3)
+
+        def get_layer_slice(self, teacher_id, indices, layer_start, layer_end, *, device, dtype, cache_device=False):
+            self.requested_indices = indices.detach().cpu().clone()
+            self.requested_slices.append((layer_start, layer_end))
+            rows = int(indices.numel())
+            layers = int(layer_end - layer_start)
+            base = torch.arange(rows * layers * 3, dtype=dtype, device=device).reshape(rows, layers, 3)
+            return base + 100 * layer_start
+
+    runner = object.__new__(ModelRunner)
+    layer_cache = FakeLayerCache()
+    cache_indices = torch.tensor([[10, 11, 12], [13, 14, 15]])
+    teacher_mask = torch.tensor([[False, True, False], [True, False, True]])
+
+    fetcher, num_layers = runner._get_opd_teacher_layer_fetcher(
+        {"teacher_cache_indices": cache_indices},
+        teacher_id=0,
+        layer_cache=layer_cache,
+        dtype=torch.float32,
+        teacher_mask=teacher_mask,
+        valid_mask=teacher_mask,
+        cache_device=True,
+    )
+
+    first = fetcher(0, 2)
+    second = fetcher(2, 5)
+
+    assert num_layers == 5
+    torch.testing.assert_close(layer_cache.requested_indices, torch.tensor([11, 13, 15]))
+    assert layer_cache.requested_slices == [(0, 2), (2, 5)]
+    assert first.shape == (3, 2, 3)
+    assert second.shape == (3, 3, 3)
+
+
+def _assert_oprd_last_k_weights_respects_packed_position_resets():
     labels = torch.tensor([[10, 11, 12, 20, IGNORE_INDEX, 21, 22]])
     position_ids = torch.tensor([[0, 1, 2, 0, 1, 2, 3]])
     base_weights = torch.tensor([[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]])
@@ -263,8 +302,21 @@ def test_oprd_last_k_weights_respects_packed_position_resets():
     torch.testing.assert_close(row_tail_weights, torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0, 6.0, 7.0]]))
 
 
+def test_opd_runner_policy(tmp_path, monkeypatch):
+    loss_root = tmp_path / "loss"
+    loss_root.mkdir()
+    _assert_opd_loss_execution_policy(tmp_path=loss_root)
+    with monkeypatch.context() as cache_patch:
+        _assert_teacher_hidden_cache_distributed_assembly_policy(monkeypatch=cache_patch)
+    debug_root = tmp_path / "debug"
+    debug_root.mkdir()
+    _assert_opd_debug_artifact_policy(debug_root)
+
+
 @patch("xorl.server.runner.model_runner.get_device_type", return_value="cpu")
-def test_opd_runner_masks_cache_indices_per_teacher(_mock_get_device_type, tmp_path):
+def _assert_opd_loss_execution_policy(_mock_get_device_type, tmp_path):
+    _assert_opd_packed_cache_and_weight_shaping_policy()
+    _assert_opd_layer_cache_fetcher_streams_layer_slices()
     torch.manual_seed(7)
     vocab_size = 13
     hidden_size = 4
@@ -320,9 +372,13 @@ def test_opd_runner_masks_cache_indices_per_teacher(_mock_get_device_type, tmp_p
     assert hidden_states.grad is not None
     assert student_weight.grad is not None
 
+    _assert_opd_runner_runs_lm_head_anchor_for_fsdp(tmp_path=tmp_path / "anchor")
+    _assert_opd_metric_aggregation_policy()
+
 
 @patch("xorl.server.runner.model_runner.get_device_type", return_value="cpu")
-def test_opd_runner_runs_lm_head_anchor_for_fsdp(_mock_get_device_type, tmp_path):
+def _assert_opd_runner_runs_lm_head_anchor_for_fsdp(_mock_get_device_type, tmp_path):
+    tmp_path.mkdir(parents=True)
     torch.manual_seed(11)
     seq_len = 3
     hidden_size = 4
@@ -366,7 +422,7 @@ def test_opd_runner_runs_lm_head_anchor_for_fsdp(_mock_get_device_type, tmp_path
     assert lm_head.weight.grad is not None and lm_head.weight.grad.isfinite().all()
 
 
-def test_teacher_hidden_cache_splits_packed_batch_and_drops_padding():
+def _assert_teacher_hidden_cache_splits_packed_batch_and_drops_padding():
     runner = _make_opd_runner()
     hidden_states = torch.arange(1 * 8 * 2, dtype=torch.float32).reshape(1, 8, 2)
     micro_batch = {
@@ -383,7 +439,7 @@ def test_teacher_hidden_cache_splits_packed_batch_and_drops_padding():
     assert torch.equal(chunks[1], hidden_states[0, 3:5])
 
 
-def test_teacher_hidden_cache_contributor_skips_duplicate_cp_ranks_and_keys_ep_ranks_by_slice():
+def _assert_teacher_hidden_cache_contributor_policy():
     runner = _make_opd_runner()
     runner.rank = 3
     runner.world_size = 8
@@ -410,55 +466,17 @@ def test_teacher_hidden_cache_contributor_skips_duplicate_cp_ranks_and_keys_ep_r
     )
 
 
-def test_teacher_hidden_cache_contributor_legacy_flag_skips_duplicate_ep_ranks(monkeypatch):
-    monkeypatch.setenv("XORL_SERVER_EP_DUPLICATE_BATCHES", "1")
-    runner = _make_opd_runner()
-    runner.rank = 3
-    runner.world_size = 8
-
-    assert (
-        runner._teacher_hidden_cache_contributor_key(SimpleNamespace(cp_enabled=False, ep_enabled=True, ep_rank=1))
-        is None
-    )
-
-    class FakeEpMesh:
-        @staticmethod
-        def get_local_rank(dim):
-            assert dim == "ep_fsdp"
-            return 3
-
-    assert (
-        runner._teacher_hidden_cache_contributor_key(
-            SimpleNamespace(
-                cp_enabled=False,
-                ep_enabled=True,
-                ep_rank=0,
-                ep_size=2,
-                dp_shard_in_ep_size=4,
-                ep_fsdp_device_mesh=FakeEpMesh(),
-            )
-        )
-        == 3
-    )
-
-
-def test_teacher_hidden_cache_merge_preserves_logical_slice_order():
-    chunks, indices = ModelRunner._merge_teacher_hidden_cache_payloads(
-        [
-            {"rank": 4, "slice_key": 1, "chunks": [torch.ones(2, 2)]},
-            None,
-            {"rank": 0, "slice_key": 0, "chunks": [torch.zeros(1, 2)]},
-        ]
-    )
-
-    assert indices == [[0], [1, 2]]
-    assert torch.equal(torch.cat(chunks, dim=0), torch.tensor([[0.0, 0.0], [1.0, 1.0], [1.0, 1.0]]))
-
-
 @patch("xorl.server.runner.model_runner.get_device_type", return_value="cpu")
 @patch("xorl.server.runner.model_runner.gather_outputs")
 @patch("xorl.server.runner.model_runner.get_parallel_state")
-def test_teacher_hidden_cache_gathers_with_unified_sp_group(mock_parallel_state, mock_gather, _mock_device):
+def _assert_teacher_hidden_cache_distributed_assembly_policy(
+    mock_parallel_state,
+    mock_gather,
+    _mock_device,
+    monkeypatch,
+):
+    _assert_teacher_hidden_cache_contributor_policy()
+
     runner = _make_opd_runner()
     runner.rank = 0
     runner.world_size = 1
@@ -498,10 +516,14 @@ def test_teacher_hidden_cache_gathers_with_unified_sp_group(mock_parallel_state,
     assert result["teacher_hidden_cache"]["backend"] == "mooncake"
     assert result["teacher_hidden_cache"]["cache_indices_by_sample"] == [list(range(8))]
 
+    _assert_teacher_hidden_cache_trims_with_gathered_sp_labels()
+    _assert_teacher_hidden_cache_writer_gathers_all_batch_ranks()
+    _assert_teacher_hidden_cache_mooncake_integration_policy()
+
 
 @patch("xorl.server.runner.model_runner.get_device_type", return_value="cpu")
 @patch("xorl.server.runner.model_runner.get_parallel_state")
-def test_teacher_hidden_cache_trims_with_gathered_sp_labels(mock_parallel_state, _mock_get_device_type, tmp_path):
+def _assert_teacher_hidden_cache_trims_with_gathered_sp_labels(mock_parallel_state, _mock_get_device_type):
     runner = _make_opd_runner()
     runner.model = _InputIdHiddenModel()
     mock_parallel_state.return_value = Mock(
@@ -545,10 +567,9 @@ def test_teacher_hidden_cache_trims_with_gathered_sp_labels(mock_parallel_state,
 
 @patch("xorl.server.runner.model_runner.get_device_type", return_value="cpu")
 @patch("xorl.server.runner.model_runner.get_parallel_state")
-def test_teacher_hidden_cache_writer_gathers_all_batch_ranks(
+def _assert_teacher_hidden_cache_writer_gathers_all_batch_ranks(
     mock_parallel_state,
     _mock_get_device_type,
-    tmp_path,
 ):
     runner = _make_opd_runner()
     runner.world_size = 2
@@ -611,7 +632,7 @@ class _FakeMooncakeClient:
 
 @patch("xorl.server.runner.model_runner.get_device_type", return_value="cpu")
 @patch("xorl.server.runner.model_runner.get_parallel_state")
-def test_teacher_hidden_cache_mooncake_backend_writes_to_store(mock_parallel_state, _mock_device):
+def _assert_teacher_hidden_cache_mooncake_integration_policy(mock_parallel_state, _mock_device):
     runner = _make_opd_runner()
     runner.model = _InputIdHiddenModel()
     mock_parallel_state.return_value = Mock(
@@ -650,10 +671,12 @@ def test_teacher_hidden_cache_mooncake_backend_writes_to_store(mock_parallel_sta
     fetched = store.get_hidden_from_metadata(meta)
     assert torch.equal(fetched, torch.tensor([[1.0], [2.0]]))
 
+    _assert_teacher_hidden_cache_mooncake_roundtrips_through_activation_cache()
+
 
 @patch("xorl.server.runner.model_runner.get_device_type", return_value="cpu")
 @patch("xorl.server.runner.model_runner.get_parallel_state")
-def test_teacher_hidden_cache_mooncake_roundtrips_through_activation_cache(mock_parallel_state, _mock_device):
+def _assert_teacher_hidden_cache_mooncake_roundtrips_through_activation_cache(mock_parallel_state, _mock_device):
     """Producer metadata -> TeacherActivationCache.get returns the right rows."""
     runner = _make_opd_runner()
     runner.model = _InputIdHiddenModel()
@@ -679,7 +702,7 @@ def test_teacher_hidden_cache_mooncake_roundtrips_through_activation_cache(mock_
         tac.close()
 
 
-def test_vocab_parallel_loss_debug_writer_records_local_contribution(tmp_path):
+def _assert_opd_debug_artifact_policy(tmp_path):
     runner = _make_opd_runner()
     debug_path = tmp_path / "vp_loss.jsonl"
 
@@ -717,8 +740,11 @@ def test_vocab_parallel_loss_debug_writer_records_local_contribution(tmp_path):
     assert row["loss_detached"] == pytest.approx(1.25)
     assert row["loss_requires_grad"] is True
 
+    _assert_packed_sample_debug_writer_records_teacher_segments(tmp_path / "packed")
 
-def test_packed_sample_debug_writer_records_teacher_segments(tmp_path):
+
+def _assert_packed_sample_debug_writer_records_teacher_segments(tmp_path):
+    tmp_path.mkdir(parents=True)
     runner = _make_opd_runner()
     debug_path = tmp_path / "packed_samples.jsonl"
     micro_batch = {

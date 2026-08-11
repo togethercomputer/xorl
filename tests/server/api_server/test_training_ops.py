@@ -50,7 +50,7 @@ def _build_server():
     return server
 
 
-async def test_optim_step_uses_orchestrator_learning_rate_key():
+async def _assert_optim_step_surfaces_metrics_and_maps_current_controls_to_payload():
     server = _build_server()
 
     response = await server.optim_step(OptimStepRequest(model_id="test-session", learning_rate=2e-4, gradient_clip=1.0))
@@ -62,24 +62,8 @@ async def test_optim_step_uses_orchestrator_learning_rate_key():
     assert server.orchestrator_client.last_request.payload.lr == pytest.approx(2e-4)
 
 
-async def test_optim_step_maps_legacy_grad_clip_norm_to_orchestrator_payload():
-    server = _build_server()
-
-    response = await server.optim_step(
-        OptimStepRequest(
-            **{
-                "session_id": "legacy-session",
-                "adam_params": {"learning_rate": 3e-4, "grad_clip_norm": 2.5},
-            }
-        )
-    )
-
-    assert response.metrics["grad_norm"] == pytest.approx(7.5)
-    assert server.orchestrator_client.last_request.payload.lr == pytest.approx(3e-4)
-    assert server.orchestrator_client.last_request.payload.gradient_clip == pytest.approx(2.5)
-
-
-async def test_forward_surfaces_auto_load_info():
+async def test_forward_response_info_and_profile_metrics():
+    await _assert_optim_step_surfaces_metrics_and_maps_current_controls_to_payload()
     server = _build_server()
 
     async def _wait_for_response(self, response_future, request_id, timeout, timeout_message="timeout"):
@@ -116,10 +100,6 @@ async def test_forward_surfaces_auto_load_info():
         "auto_loaded": True,
         "auto_load_path": "/tmp/evicted/session-a",
     }
-
-
-async def test_forward_backward_surfaces_profile_and_executor_timing_metrics():
-    server = _build_server()
 
     async def _wait_for_response(self, response_future, request_id, timeout, timeout_message="timeout"):
         return types.SimpleNamespace(

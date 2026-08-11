@@ -3123,8 +3123,6 @@ class MoEGradientCheckpointingLayer(nn.Module):
             materialized_hidden_states = layer_output_override(materialized_hidden_states)
             self._capture_diagnostic_component("layer_output_override", materialized_hidden_states)
             hidden_states = materialized_hidden_states
-        elif getattr(self, "_delay_moe_residual_output", False):
-            hidden_states = (hidden_states, residual)
         else:
             hidden_states = materialized_hidden_states
 

@@ -1,28 +1,40 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import MethodType
 
 import pytest
 import torch
+from torch import nn
 from torch.distributed._tensor import Replicate, Shard
 
 from tests.models.test_glm52_qlora import _meta_model, _official_config
+from xorl.models.transformers.glm5.exact_absorbed_kv_b_qlora import (
+    Glm52ExactTP1AbsorbedKvBBlockFP8QLoRA,
+)
+from xorl.models.transformers.glm5.exact_dense_mlp import Glm52ExactTP1DenseMLP
 from xorl.models.transformers.glm5.exact_lm_head_qlora import (
     Glm52ExactTP16LmHeadLoraLinear,
     Glm52ExactTP16LmHeadSelectedLogprob,
     glm52_lm_head_shard,
 )
+from xorl.models.transformers.glm5.exact_qlora import Glm52ExactTP1BlockFP8QLoRALinear
 from xorl.models.transformers.glm5.exact_routed_experts_qlora import (
     Glm52ExactEP16BlockFP8QLoRARoutedExperts,
 )
 from xorl.models.transformers.glm5.exact_shared_expert_qlora import (
     Glm52ExactTP16SharedExpertBlockFP8QLoRA,
 )
+from xorl.models.transformers.glm5.modeling_glm5 import Glm5MoEBlock
 from xorl.models.transformers.glm5.parallelize import get_ep_plan
 from xorl.models.transformers.glm5.qlora import GLM52_QLORA_FACTOR_COUNT, prepare_glm52_block_fp8_qlora
 from xorl.qlora.modules.block_fp8_linear import BlockFP8QLoRALinear
 from xorl.qlora.modules.moe_experts import BlockFP8QLoRAMoeExperts
 from xorl.server.runner.adapters.sharded_state import discover_adapter_layouts
+
+
+_ORDINARY_ATTENTION_PROJECTIONS = ("q_a_proj", "kv_a_proj_with_mqa", "q_b_proj", "o_proj")
+_ALL_ATTENTION_PROJECTIONS = (*_ORDINARY_ATTENTION_PROJECTIONS, "kv_b_proj")
 
 
 @dataclass(frozen=True)
@@ -101,6 +113,66 @@ def _patch_exact_world16_rank7(monkeypatch: pytest.MonkeyPatch) -> object:
     return group
 
 
+def _empty_moe_block() -> Glm5MoEBlock:
+    block = Glm5MoEBlock.__new__(Glm5MoEBlock)
+    nn.Module.__init__(block)
+    block.routed_scaling_factor = 2.5
+    return block
+
+
+def _assert_canonical_moe_routed_and_shared_boundary_policy() -> None:
+    block = _empty_moe_block()
+    experts = Glm52ExactEP16BlockFP8QLoRARoutedExperts(128, 128, ep_rank=7, device="cpu")
+    captured = {}
+
+    def forward(self, hidden, routing, selected_experts=None, **kwargs):
+        captured.update(
+            hidden=hidden,
+            routing=routing,
+            selected_experts=selected_experts,
+            local_ids=kwargs["sglang_ep_native_local_ids"],
+            routed_scaling_factor=kwargs["routed_scaling_factor"],
+        )
+        return torch.ones_like(hidden)
+
+    experts.forward = MethodType(forward, experts)
+    block.experts = experts
+    hidden = torch.zeros((3, 128), dtype=torch.bfloat16)
+    routing = torch.arange(24, dtype=torch.float32).reshape(3, 8).div_(32)
+    global_ids = torch.arange(24, dtype=torch.int64).reshape(3, 8).add_(112)
+    local_ids = torch.arange(24, dtype=torch.int32).reshape(3, 8).remainder_(16)
+
+    output = block._canonical_routed_local_partial(hidden, routing, global_ids, local_ids)
+
+    assert torch.equal(output, torch.ones_like(hidden))
+    assert captured["hidden"] is hidden
+    assert captured["routing"] is routing
+    assert captured["selected_experts"] is global_ids
+    assert captured["local_ids"] is local_ids
+    assert captured["routed_scaling_factor"] == 2.5
+
+    shared = Glm52ExactTP16SharedExpertBlockFP8QLoRA(device="meta")
+    captured.clear()
+
+    def shared_forward(self, shared_hidden, *, contributor_ordinal):
+        captured.update(hidden=shared_hidden, contributor_ordinal=contributor_ordinal)
+        return torch.full_like(shared_hidden, 0.5)
+
+    shared.forward = MethodType(shared_forward, shared)
+    block.shared_experts = shared
+    hidden = torch.zeros((3, 6144), dtype=torch.bfloat16)
+
+    output = block._canonical_shared_local_partial(
+        hidden,
+        contributor_ordinal=7,
+        contributor_count=16,
+    )
+
+    assert torch.equal(output, torch.full_like(hidden, 0.5))
+    assert captured["hidden"] is hidden
+    assert captured["contributor_ordinal"] == 7
+
+
 def test_glm52_exact_moe_construction_preserves_complete_global_inventory_and_sources(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -129,6 +201,8 @@ def test_glm52_exact_moe_construction_preserves_complete_global_inventory_and_so
     assert len({id(parameter) for parameter in trainable.values()}) == GLM52_QLORA_FACTOR_COUNT
     assert all(parameter.dtype is torch.float32 for parameter in trainable.values())
     assert all(factor.dtype is torch.float32 for factor in inventory.factors)
+
+    _assert_complete_attention_and_dense_inventory(model, inventory, trainable)
 
     assert not any(
         isinstance(module, BlockFP8QLoRALinear)
@@ -177,8 +251,45 @@ def test_glm52_exact_moe_construction_preserves_complete_global_inventory_and_so
             f"{routed_fqn}.{factor_name}" for factor_name in routed.logical_factor_names
         }
 
+    with monkeypatch.context() as admission_patch:
+        _assert_glm52_exact_moe_construction_admission_policy(admission_patch)
+    with monkeypatch.context() as layout_patch:
+        _assert_glm52_exact_moe_post_ep_layout_preserves_factor_fqns_and_owner_logical_shapes(layout_patch)
+    with monkeypatch.context() as head_patch:
+        _assert_glm52_complete_exact_construction_attaches_only_selected_logprob_lm_head(head_patch)
+    _assert_canonical_moe_routed_and_shared_boundary_policy()
 
-def test_glm52_exact_moe_post_ep_layout_preserves_factor_fqns_and_owner_logical_shapes(
+
+def _assert_complete_attention_and_dense_inventory(model, inventory, trainable) -> None:
+    expected_attention_factors = {
+        f"model.layers.{layer_idx}.self_attn.{projection}.lora_{factor}"
+        for layer_idx in range(78)
+        for projection in _ALL_ATTENTION_PROJECTIONS
+        for factor in ("A", "B")
+    }
+    actual_attention_factors = {factor.name for factor in inventory.factors if factor.role.startswith("attention.")}
+    assert actual_attention_factors == expected_attention_factors
+    assert len(actual_attention_factors) == 78 * 5 * 2 == 780
+
+    for layer_idx, layer in enumerate(model.model.layers):
+        attention = layer.self_attn
+        prefix = f"model.layers.{layer_idx}.self_attn"
+        for projection in _ORDINARY_ATTENTION_PROJECTIONS:
+            module = getattr(attention, projection)
+            assert type(module) is Glm52ExactTP1BlockFP8QLoRALinear
+            assert module._source_fqn == f"{prefix}.{projection}"
+        assert type(attention.kv_b_proj) is Glm52ExactTP1AbsorbedKvBBlockFP8QLoRA
+        assert attention.kv_b_proj._source_fqn == f"{prefix}.kv_b_proj"
+        assert {name for name in trainable if name.startswith(f"{prefix}.")} == {
+            f"{prefix}.{projection}.lora_{factor}" for projection in _ALL_ATTENTION_PROJECTIONS for factor in ("A", "B")
+        }
+
+    assert {name for name, module in model.named_modules() if isinstance(module, Glm52ExactTP1DenseMLP)} == {
+        f"model.layers.{layer_idx}.mlp" for layer_idx in range(3)
+    }
+
+
+def _assert_glm52_exact_moe_post_ep_layout_preserves_factor_fqns_and_owner_logical_shapes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _patch_ep16_rank7(monkeypatch)
@@ -234,7 +345,7 @@ def test_glm52_exact_moe_post_ep_layout_preserves_factor_fqns_and_owner_logical_
             assert layouts[full_name].local_logical_offset[0] == 112
 
 
-def test_glm52_complete_exact_construction_attaches_only_selected_logprob_lm_head(
+def _assert_glm52_complete_exact_construction_attaches_only_selected_logprob_lm_head(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     group = _patch_exact_world16_rank7(monkeypatch)
@@ -266,9 +377,27 @@ def test_glm52_complete_exact_construction_attaches_only_selected_logprob_lm_hea
         lm_head(torch.empty((1, 6_144), device="meta", dtype=torch.bfloat16))
 
 
-@pytest.mark.parametrize(
-    ("override", "message"),
-    (
+def _assert_glm52_exact_moe_construction_rejects_incomplete_dependency_flags(
+    monkeypatch: pytest.MonkeyPatch,
+    override: dict[str, object],
+    message: str,
+) -> None:
+    _patch_ep16_rank7(monkeypatch)
+    config = _exact_moe_config()
+    for name, value in override.items():
+        setattr(config, name, value)
+    model = _meta_model(config)
+
+    with pytest.raises(ValueError, match=message):
+        prepare_glm52_block_fp8_qlora(model, config, adapter_rank=1, adapter_alpha=1)
+
+    assert not any("lora_" in name for name, _ in model.named_parameters())
+
+
+def _assert_glm52_exact_moe_construction_admission_policy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for override, message in (
         ({"_glm52_exact_active_lora_dense_component": False}, "requires the exact active-LoRA dense component"),
         (
             {"_glm52_exact_active_lora_attention_component": False},
@@ -287,47 +416,15 @@ def test_glm52_complete_exact_construction_attaches_only_selected_logprob_lm_hea
         ),
         ({"_sparse_mla_enabled": False}, "requires sparse_mla_enabled=true"),
         ({"_ep_dispatch": "deepep"}, "requires ep_dispatch='alltoall'"),
-    ),
-)
-def test_glm52_exact_moe_construction_rejects_incomplete_dependency_flags_before_mutation(
-    monkeypatch: pytest.MonkeyPatch,
-    override: dict[str, object],
-    message: str,
-) -> None:
-    _patch_ep16_rank7(monkeypatch)
-    config = _exact_moe_config()
-    for name, value in override.items():
-        setattr(config, name, value)
-    model = _meta_model(config)
+    ):
+        _assert_glm52_exact_moe_construction_rejects_incomplete_dependency_flags(monkeypatch, override, message)
 
-    with pytest.raises(ValueError, match=message):
-        prepare_glm52_block_fp8_qlora(model, config, adapter_rank=1, adapter_alpha=1)
-
-    assert not any("lora_" in name for name, _ in model.named_parameters())
-
-
-@pytest.mark.parametrize(
-    "state",
-    (
+    for state in (
         _EPState(ep_enabled=False, ep_size=16, ep_rank=0),
         _EPState(ep_enabled=True, ep_size=8, ep_rank=7),
-    ),
-)
-def test_glm52_exact_moe_construction_rejects_non_ep16_before_mutation(
-    monkeypatch: pytest.MonkeyPatch,
-    state: _EPState,
-) -> None:
-    monkeypatch.setattr("xorl.models.transformers.glm5.qlora.get_parallel_state", lambda: state)
-    config = _exact_moe_config()
-    model = _meta_model(config)
+    ):
+        _assert_glm52_exact_moe_construction_rejects_non_ep16(monkeypatch, state)
 
-    with pytest.raises(RuntimeError, match="require initialized EP16"):
-        prepare_glm52_block_fp8_qlora(model, config, adapter_rank=1, adapter_alpha=1)
-
-    assert not any("lora_" in name for name, _ in model.named_parameters())
-
-
-def test_glm52_exact_lm_head_rejects_non_world16_before_mutation(monkeypatch: pytest.MonkeyPatch) -> None:
     group = object()
     state = _EPState(
         ep_enabled=True,
@@ -347,9 +444,25 @@ def test_glm52_exact_lm_head_rejects_non_world16_before_mutation(monkeypatch: py
 
     assert not any("lora_" in name for name, _ in model.named_parameters())
 
+    for rank, alpha in ((1, 2), (2, 1)):
+        _assert_glm52_exact_moe_construction_rejects_non_rank1_alpha1(monkeypatch, rank, alpha)
 
-@pytest.mark.parametrize(("rank", "alpha"), ((16, 16), (1, 2), (2, 1)))
-def test_glm52_exact_moe_construction_rejects_non_rank1_alpha1_before_mutation(
+
+def _assert_glm52_exact_moe_construction_rejects_non_ep16(
+    monkeypatch: pytest.MonkeyPatch,
+    state: _EPState,
+) -> None:
+    monkeypatch.setattr("xorl.models.transformers.glm5.qlora.get_parallel_state", lambda: state)
+    config = _exact_moe_config()
+    model = _meta_model(config)
+
+    with pytest.raises(RuntimeError, match="require initialized EP16"):
+        prepare_glm52_block_fp8_qlora(model, config, adapter_rank=1, adapter_alpha=1)
+
+    assert not any("lora_" in name for name, _ in model.named_parameters())
+
+
+def _assert_glm52_exact_moe_construction_rejects_non_rank1_alpha1(
     monkeypatch: pytest.MonkeyPatch,
     rank: int,
     alpha: int,

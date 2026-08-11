@@ -1,5 +1,6 @@
 """LM-head LoRA folding on the server loss path."""
 
+import json
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -8,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from tests._helpers import stage_and_commit_gradient_capture
 from xorl.lora.fold import canonical_lora_fold_linear
 from xorl.lora.modules.linear import LoraLinear
 from xorl.models.layers.moe.lora import MoEExpertsLoRA, MoELoRAConfig
@@ -39,7 +41,7 @@ from xorl.server.runner.model_runner import ModelRunner
 pytestmark = pytest.mark.cpu
 
 
-def test_effective_lm_head_uses_canonical_merged_weight_with_adapter_gradients():
+def _assert_effective_lm_head_selection_policy():
     head = LoraLinear(5, 7, r=2, lora_alpha=4, bias=False, dtype=torch.bfloat16)
     head.exact_merged_forward = True
     with torch.no_grad():
@@ -63,8 +65,10 @@ def test_effective_lm_head_uses_canonical_merged_weight_with_adapter_gradients()
     assert head.lora_A.grad is not None and torch.count_nonzero(head.lora_A.grad) > 0
     assert head.lora_B.grad is not None and torch.count_nonzero(head.lora_B.grad) > 0
 
+    _assert_effective_lm_head_keeps_legacy_unmerged_formula()
 
-def test_effective_lm_head_keeps_legacy_unmerged_formula_without_contract():
+
+def _assert_effective_lm_head_keeps_legacy_unmerged_formula():
     head = LoraLinear(3, 4, r=2, lora_alpha=2, bias=False, dtype=torch.bfloat16)
     runner = ModelRunner.__new__(ModelRunner)
     runner.model = SimpleNamespace(lm_head=head)
@@ -73,7 +77,62 @@ def test_effective_lm_head_keeps_legacy_unmerged_formula_without_contract():
     assert torch.equal(runner._get_effective_lm_head_weight(), expected)
 
 
-def test_runner_compiles_module_and_direct_output_properties_at_registration(tmp_path, monkeypatch):
+def _assert_runner_lora_target_source_precedence(tmp_path):
+    root = tmp_path / "target-resolution"
+    root.mkdir()
+
+    def make_runner(model_type, lora_config):
+        config_dir = root / model_type
+        config_dir.mkdir()
+        (config_dir / "config.json").write_text(json.dumps({"model_type": model_type}))
+        runner = object.__new__(ModelRunner)
+        runner.model_config = {"config_path": str(config_dir)}
+        runner.lora_config = lora_config
+        return runner
+
+    for model_type, config, expected in (
+        (
+            "glm_moe_dsa",
+            {"train_attn": True, "train_mlp": False, "train_unembed": False},
+            ["q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj"],
+        ),
+        (
+            "kimi_k25",
+            {"train_attn": True, "train_mlp": False, "train_unembed": True},
+            ["q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj", "lm_head"],
+        ),
+    ):
+        assert make_runner(model_type, config)._resolve_lora_target_modules() == expected
+
+    explicit = ["q_b_proj", "o_proj"]
+    runner = make_runner(
+        "deepseek_v3",
+        {
+            "lora_target_modules": explicit,
+            "train_attn": False,
+            "train_mlp": False,
+            "train_unembed": False,
+        },
+    )
+    assert runner._resolve_lora_target_modules() == explicit
+
+    runner.lora_config = {
+        "lora_target_manifest": {
+            "schema_version": 1,
+            "target_modules": explicit,
+            "expected_modules": [
+                {"pattern": "model.layers.*.self_attn.q_b_proj", "count": 4, "rank": 8},
+            ],
+            "allow_unlisted": False,
+        },
+        "train_attn": False,
+        "train_mlp": False,
+        "train_unembed": False,
+    }
+    assert runner._resolve_lora_target_modules() == explicit
+
+
+def test_runner_gradient_ownership_compiler_policy(tmp_path, monkeypatch):
     class _Model(nn.Module):
         def __init__(self):
             super().__init__()
@@ -115,8 +174,26 @@ def test_runner_compiles_module_and_direct_output_properties_at_registration(tmp
     assert dict(by_name["trunk.lora_A"].config_guard_fields)["merged_forward"] is False
     assert dict(by_name["lm_head.lora_B"].config_guard_fields)["merged_forward"] is True
 
+    with monkeypatch.context() as case_patch:
+        _assert_runner_compiles_exact_lm_head_vjp_and_shard_capture_without_double_ownership(
+            tmp_path / "exact-lm-head",
+            case_patch,
+        )
+    with monkeypatch.context() as case_patch:
+        _assert_runner_compiler_replica_topology_policy(tmp_path / "replica-topology", case_patch)
+    _assert_forward_backward_aborts_a_staged_capture_when_the_call_fails(tmp_path / "abort")
+    expert_root = tmp_path / "expert-factors"
+    expert_root.mkdir()
+    with monkeypatch.context() as expert_patch:
+        _assert_runner_expert_factor_compile_and_admission_policy(expert_root, expert_patch)
+    direct_root = tmp_path / "direct-output"
+    direct_root.mkdir()
+    with monkeypatch.context() as direct_patch:
+        _assert_direct_output_projection_runs_through_authoritative_analytical_step(direct_root, direct_patch)
+    _assert_runner_lora_target_source_precedence(tmp_path)
 
-def test_runner_compiles_exact_lm_head_vjp_and_shard_capture_without_double_ownership(tmp_path, monkeypatch):
+
+def _assert_runner_compiles_exact_lm_head_vjp_and_shard_capture_without_double_ownership(tmp_path, monkeypatch):
     shard = glm52_lm_head_shard(0)
     head = Glm52ExactTP16LmHeadLoraLinear(3, 4, r=1, lora_alpha=1)
     head._glm52_exact_selected_logprob = Glm52ExactTP16LmHeadSelectedLogprob(
@@ -220,11 +297,7 @@ def test_runner_compiles_exact_lm_head_vjp_and_shard_capture_without_double_owne
     assert (ReductionAxis.FSDP_SHARD, ReductionAuthority.FSDP) not in masks
 
 
-@pytest.mark.parametrize(
-    ("sp_size", "output_size", "replica_count"),
-    ((2, 1, 2), (1, 4, 4), (2, 4, 8)),
-)
-def test_runner_compiler_uses_world_discovered_replica_count_once(
+def _assert_runner_compiler_uses_world_discovered_replica_count_once(
     tmp_path,
     monkeypatch,
     sp_size,
@@ -306,17 +379,23 @@ def test_runner_compiler_uses_world_discovered_replica_count_once(
     assert by_name["lm_head.lora_A"].norm_replica_divisor == replica_count
 
 
-@pytest.mark.parametrize(
-    ("case", "replica_count", "sp_families", "output_families", "error_match"),
-    (
-        ("unowned", 2, (), (), "exactly cover"),
-        ("incomplete", 4, (), ((0, 1), (2, 3)), "exactly cover"),
-        ("overlap", 4, ((0, 1), (2, 3)), ((0, 1), (2, 3)), "overlap beyond"),
-        ("outside", 4, (), ((0, 1, 4), (2, 3)), "outside the replica class"),
-        ("missing", 2, (), ((0, 1),), "identity .* is missing"),
-    ),
-)
-def test_production_runner_compiler_rejects_invalid_replica_coverage(
+def _assert_runner_compiler_replica_topology_policy(tmp_path, monkeypatch):
+    for sp_size, output_size, replica_count in ((2, 1, 2), (1, 4, 4), (2, 4, 8)):
+        with monkeypatch.context() as case_patch:
+            _assert_runner_compiler_uses_world_discovered_replica_count_once(
+                tmp_path,
+                case_patch,
+                sp_size,
+                output_size,
+                replica_count,
+            )
+
+    _assert_production_runner_compiler_rejects_invalid_replica_coverage_policy(tmp_path, monkeypatch)
+    with monkeypatch.context() as case_patch:
+        _assert_production_runner_compiler_rejects_general_model_tensor_parallelism(tmp_path, case_patch)
+
+
+def _assert_production_runner_compiler_rejects_invalid_replica_coverage(
     tmp_path,
     monkeypatch,
     case,
@@ -385,7 +464,23 @@ def test_production_runner_compiler_rejects_invalid_replica_coverage(
         )
 
 
-def test_production_runner_compiler_rejects_general_model_tensor_parallelism(tmp_path, monkeypatch):
+def _assert_production_runner_compiler_rejects_invalid_replica_coverage_policy(tmp_path, monkeypatch):
+    for case in (
+        ("unowned", 2, (), (), "exactly cover"),
+        ("incomplete", 4, (), ((0, 1), (2, 3)), "exactly cover"),
+        ("overlap", 4, ((0, 1), (2, 3)), ((0, 1), (2, 3)), "overlap beyond"),
+        ("outside", 4, (), ((0, 1, 4), (2, 3)), "outside the replica class"),
+        ("missing", 2, (), ((0, 1),), "identity .* is missing"),
+    ):
+        with monkeypatch.context() as case_patch:
+            _assert_production_runner_compiler_rejects_invalid_replica_coverage(
+                tmp_path,
+                case_patch,
+                *case,
+            )
+
+
+def _assert_production_runner_compiler_rejects_general_model_tensor_parallelism(tmp_path, monkeypatch):
     class _Model(nn.Module):
         def __init__(self):
             super().__init__()
@@ -418,7 +513,7 @@ def test_production_runner_compiler_rejects_general_model_tensor_parallelism(tmp
         runner._compile_registered_adapter_gradient_ownership("policy")
 
 
-def test_forward_backward_aborts_a_staged_capture_when_the_call_fails(tmp_path):
+def _assert_forward_backward_aborts_a_staged_capture_when_the_call_fails(tmp_path):
     class _Model(nn.Module):
         def __init__(self):
             super().__init__()
@@ -483,17 +578,7 @@ def test_forward_backward_aborts_a_staged_capture_when_the_call_fails(tmp_path):
     assert all(parameter.grad is None for name, parameter in model.named_parameters() if name in state.tensor_layouts)
 
 
-@pytest.mark.parametrize(
-    ("implementation", "exact_merged_forward", "expected_producer"),
-    (
-        ("eager", False, ProducerFamily.MODULE_MANAGED),
-        ("eager", True, ProducerFamily.FUSED_MANAGED),
-        ("triton", False, ProducerFamily.FUSED_MANAGED),
-        ("native", False, ProducerFamily.FUSED_MANAGED),
-        ("quack", False, ProducerFamily.FUSED_MANAGED),
-    ),
-)
-def test_runner_compiles_certified_unquantized_expert_backends(
+def _assert_runner_compiles_certified_unquantized_expert_backend(
     tmp_path, monkeypatch, implementation, exact_merged_forward, expected_producer
 ):
     class _Model(nn.Module):
@@ -541,7 +626,35 @@ def test_runner_compiles_certified_unquantized_expert_backends(
     assert {item.topology for item in plan.parameters} == {TopologyFamily.DENSE_REPLICATED}
 
 
-def test_runner_rejects_expert_hybrid_metadata_mismatch(tmp_path, monkeypatch):
+def _assert_runner_expert_factor_compile_and_admission_policy(tmp_path, monkeypatch):
+    cases = (
+        (_assert_runner_compiles_certified_unquantized_expert_backends, "unquantized"),
+        (_assert_runner_specializes_expert_factor_contract_to_registered_session_rank, "session-rank"),
+        (_assert_runner_admits_generic_block_fp8_triton_deepep_expert_factors, "block-fp8-deepep"),
+        (_assert_runner_admits_generic_quantized_expert_contracts, "quantized"),
+    )
+    for assert_case, path_name in cases:
+        with monkeypatch.context() as case_patch:
+            assert_case(tmp_path / path_name, case_patch)
+
+
+def _assert_runner_compiles_certified_unquantized_expert_backends(tmp_path, monkeypatch):
+    # Eager's ordinary and exact-merged paths are distinct. All non-eager
+    # backend labels select the same fused-managed compiler branch, represented
+    # by Triton here; backend-specific execution is covered in the MoE suites.
+    for case in (
+        ("eager", False, ProducerFamily.MODULE_MANAGED),
+        ("eager", True, ProducerFamily.FUSED_MANAGED),
+        ("triton", False, ProducerFamily.FUSED_MANAGED),
+    ):
+        with monkeypatch.context() as case_patch:
+            _assert_runner_compiles_certified_unquantized_expert_backend(tmp_path, case_patch, *case)
+
+    with monkeypatch.context() as case_patch:
+        _assert_runner_rejects_expert_hybrid_metadata_mismatch(tmp_path, case_patch)
+
+
+def _assert_runner_rejects_expert_hybrid_metadata_mismatch(tmp_path, monkeypatch):
     class _Model(nn.Module):
         def __init__(self):
             super().__init__()
@@ -581,7 +694,7 @@ def test_runner_rejects_expert_hybrid_metadata_mismatch(tmp_path, monkeypatch):
         runner._compile_registered_adapter_gradient_ownership("policy")
 
 
-def test_runner_specializes_expert_factor_contract_to_registered_session_rank(tmp_path, monkeypatch):
+def _assert_runner_specializes_expert_factor_contract_to_registered_session_rank(tmp_path, monkeypatch):
     class _Model(nn.Module):
         def __init__(self):
             super().__init__()
@@ -633,7 +746,7 @@ def test_runner_specializes_expert_factor_contract_to_registered_session_rank(tm
         assert layout.logical_shape[rank_dim] == 2
 
 
-def test_runner_admits_generic_block_fp8_triton_deepep_expert_factors(tmp_path, monkeypatch):
+def _assert_runner_admits_generic_block_fp8_triton_deepep_expert_factors(tmp_path, monkeypatch):
     class _Model(nn.Module):
         def __init__(self):
             super().__init__()
@@ -690,7 +803,7 @@ def test_runner_admits_generic_block_fp8_triton_deepep_expert_factors(tmp_path, 
         assert guard["expert_factor_layout"] == "gkn_gate_up_down"
 
 
-def test_runner_rejects_expert_factor_shape_drift_from_declared_contract(tmp_path, monkeypatch):
+def _assert_runner_rejects_expert_factor_shape_drift_from_declared_contract(tmp_path, monkeypatch):
     class _Model(nn.Module):
         def __init__(self):
             super().__init__()
@@ -734,16 +847,7 @@ def test_runner_rejects_expert_factor_shape_drift_from_declared_contract(tmp_pat
         runner._compile_registered_adapter_gradient_ownership("policy")
 
 
-@pytest.mark.parametrize("implementation", ("eager", "triton", "native", "quack"))
-@pytest.mark.parametrize(
-    ("expert_cls", "quant_format"),
-    (
-        (NF4QLoRAMoeExperts, "nf4"),
-        (NvFP4QLoRAMoeExperts, "nvfp4"),
-        (BlockFP8QLoRAMoeExperts, "block_fp8"),
-    ),
-)
-def test_runner_admits_generic_quantized_expert_contracts(
+def _assert_runner_admits_generic_quantized_expert_contract(
     tmp_path, monkeypatch, implementation, expert_cls, quant_format
 ):
     class _Model(nn.Module):
@@ -797,14 +901,30 @@ def test_runner_admits_generic_quantized_expert_contracts(
         assert "expert_supported_quant_formats" not in guard
 
 
-@pytest.mark.parametrize(
-    ("implementation", "ep_fsdp_size", "expected_error"),
-    (
-        ("eager", 1, "does not provide LoRA EP execution"),
-        ("quack", 2, "does not support eFSDP replication"),
-    ),
-)
-def test_runner_rejects_uncertified_quantized_expert_parallelism(
+def _assert_runner_admits_generic_quantized_expert_contracts(tmp_path, monkeypatch):
+    # Pairwise coverage retains every quant format and backend label while
+    # exercising both module-managed eager and fused-managed producer paths.
+    for expert_cls, quant_format, implementation in (
+        (NF4QLoRAMoeExperts, "nf4", "eager"),
+        (NF4QLoRAMoeExperts, "nf4", "triton"),
+        (NvFP4QLoRAMoeExperts, "nvfp4", "native"),
+        (BlockFP8QLoRAMoeExperts, "block_fp8", "quack"),
+    ):
+        with monkeypatch.context() as case_patch:
+            _assert_runner_admits_generic_quantized_expert_contract(
+                tmp_path,
+                case_patch,
+                implementation,
+                expert_cls,
+                quant_format,
+            )
+
+    with monkeypatch.context() as case_patch:
+        _assert_runner_rejects_expert_factor_shape_drift_from_declared_contract(tmp_path, case_patch)
+    _assert_runner_rejects_uncertified_quantized_expert_parallelism_policy(tmp_path, monkeypatch)
+
+
+def _assert_runner_rejects_uncertified_quantized_expert_parallelism(
     tmp_path,
     monkeypatch,
     implementation,
@@ -855,7 +975,18 @@ def test_runner_rejects_uncertified_quantized_expert_parallelism(
         runner._compile_registered_adapter_gradient_ownership("policy")
 
 
-def test_direct_output_projection_runs_through_authoritative_analytical_step(tmp_path, monkeypatch):
+def _assert_runner_rejects_uncertified_quantized_expert_parallelism_policy(tmp_path, monkeypatch):
+    for case in (
+        ("eager", 1, "does not provide LoRA EP execution"),
+        ("quack", 2, "does not support eFSDP replication"),
+    ):
+        with monkeypatch.context() as case_patch:
+            _assert_runner_rejects_uncertified_quantized_expert_parallelism(tmp_path, case_patch, *case)
+
+
+def _assert_direct_output_projection_runs_through_authoritative_analytical_step(tmp_path, monkeypatch):
+    _assert_effective_lm_head_selection_policy()
+
     class _Model(nn.Module):
         def __init__(self):
             super().__init__()
@@ -896,11 +1027,7 @@ def test_direct_output_projection_runs_through_authoritative_analytical_step(tmp
         for name, parameter in model.named_parameters()
         if name in state.tensor_layouts
     }
-    manager.capture_gradient_numerators(
-        "policy",
-        denominator=1,
-        backward_completed=True,
-    )
+    stage_and_commit_gradient_capture(manager, "policy", denominator=1)
     expected_norm = float(torch.sqrt(sum(gradient.float().square().sum() for gradient in raw.values())))
 
     actual_norm = manager.optim_step("policy", 0.1)

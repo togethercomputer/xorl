@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
-from typing import Callable, Iterator
+from typing import Callable
 
 import torch
 
@@ -191,16 +190,6 @@ class IndexShareContextManager:
 
         if not succeeded or context.mode is IndexShareMode.FORWARD_ONLY:
             self.end(context)
-
-    @contextmanager
-    def invocation(self, *, mode: IndexShareMode | str) -> Iterator[IndexShareContext]:
-        context = self.begin(mode=mode)
-        succeeded = False
-        try:
-            yield context
-            succeeded = True
-        finally:
-            self.finish_forward(context, succeeded=succeeded)
 
 
 __all__ = [

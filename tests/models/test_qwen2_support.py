@@ -60,8 +60,11 @@ def test_build_foundation_model_accepts_hf_qwen2_config_object():
     assert model.model.layers[0].self_attn.qkv_proj.bias is not None
     assert model.model.layers[0].self_attn.o_proj.bias is None
 
+    _assert_qwen2_unfuse_for_tp_matches_hf_parameter_layout()
+    _assert_qwen2_checkpoint_handler_bidirectional_policy()
 
-def test_qwen2_unfuse_for_tp_matches_hf_parameter_layout():
+
+def _assert_qwen2_unfuse_for_tp_matches_hf_parameter_layout():
     model = Qwen2ForCausalLM(_make_xorl_qwen2_config())
 
     model.unfuse_for_tp()
@@ -81,7 +84,7 @@ def test_qwen2_unfuse_for_tp_matches_hf_parameter_layout():
     assert model.get_checkpoint_handler() is None
 
 
-def test_qwen2_checkpoint_handler_exports_hf_compatible_attention_keys():
+def _assert_qwen2_checkpoint_handler_bidirectional_policy():
     model = Qwen2ForCausalLM(_make_xorl_qwen2_config())
     handler = model.get_checkpoint_handler()
 
@@ -104,8 +107,10 @@ def test_qwen2_checkpoint_handler_exports_hf_compatible_attention_keys():
     assert "model.layers.0.self_attn.qkv_proj.weight" not in transformed
     assert "model.layers.0.mlp.gate_up_proj.weight" not in transformed
 
+    _assert_qwen2_checkpoint_handler_loads_hf_weights_into_fused_model()
 
-def test_qwen2_checkpoint_handler_loads_hf_weights_into_fused_model():
+
+def _assert_qwen2_checkpoint_handler_loads_hf_weights_into_fused_model():
     hf_config = _make_hf_qwen2_config()
     hf_config._attn_implementation = "eager"
     xorl_config = _make_xorl_qwen2_config()

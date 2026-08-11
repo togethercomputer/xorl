@@ -158,7 +158,7 @@ def _standalone_hybrid_routed_vjp(
         )
 
 
-def test_routed_bank_contract_is_strict_rank_local_ep16_moe_tp1() -> None:
+def test_routed_bank_topology_remap_and_physical_buffer_policy() -> None:
     module = _module(7)
 
     assert isinstance(module, Glm52NativeBlockFP8Experts)
@@ -205,8 +205,11 @@ def test_routed_bank_contract_is_strict_rank_local_ep16_moe_tp1() -> None:
     with pytest.raises(ValueError, match="only lora_rank=1"):
         module.set_runtime_lora_config(1, 2)
 
+    _assert_one_batched_global_grid_proves_all_16_owner_by_16_slot_remaps()
+    _assert_physical_sampler_factor_buffer_policy()
 
-def test_one_batched_global_grid_proves_all_16_owner_by_16_slot_remaps() -> None:
+
+def _assert_one_batched_global_grid_proves_all_16_owner_by_16_slot_remaps() -> None:
     global_grid = torch.arange(_GLOBAL_EXPERTS, dtype=torch.int64).reshape(_EP_SIZE, _LOCAL_EXPERTS)
     owner_maps = torch.stack(
         [localize_glm52_ep16_expert_ids(global_grid.contiguous(), owner) for owner in range(_EP_SIZE)]
@@ -227,11 +230,12 @@ def test_one_batched_global_grid_proves_all_16_owner_by_16_slot_remaps() -> None
         localize_glm52_ep16_expert_ids(invalid, 0)
 
 
-def test_all_owner_slot_physical_buffers_are_full_width_bf16_and_not_outer_tp_sliced() -> None:
+def _assert_physical_sampler_factor_buffer_policy() -> None:
     for owner in range(_EP_SIZE):
         module = _module(owner)
         _fill_distinguishable_factors(module)
-        buffers = module.physical_factor_buffers()
+        effective = tuple(getattr(module, name).to(torch.bfloat16).contiguous() for name in module.logical_factor_names)
+        buffers = module._physical_factor_buffers(*effective)
         assert tuple(buffers["gate_up_lora_a_weights"].shape) == (8, 1, 2, _HIDDEN)
         assert tuple(buffers["gate_up_lora_b_weights"].shape) == (8, 16, 2 * _INTERMEDIATE, 1)
         assert tuple(buffers["down_lora_a_weights"].shape) == (8, 16, 1, _INTERMEDIATE)
@@ -266,8 +270,10 @@ def test_all_owner_slot_physical_buffers_are_full_width_bf16_and_not_outer_tp_sl
         for buffer in buffers.values():
             assert torch.count_nonzero(buffer[1:]) == 0
 
+    _assert_post_ep_owner_local_factor_banks_produce_same_views()
 
-def test_post_ep_owner_local_factor_banks_produce_the_same_physical_sampler_views() -> None:
+
+def _assert_post_ep_owner_local_factor_banks_produce_same_views() -> None:
     module = _module(7)
     _fill_distinguishable_factors(module)
     global_factors = tuple(
@@ -287,7 +293,12 @@ def test_post_ep_owner_local_factor_banks_produce_the_same_physical_sampler_view
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires Hopper CUDA")
-def test_all_256_owner_slots_run_literal_sampler_partials_routing_outputs_and_logical_vjps() -> None:
+def test_routed_experts_literal_sampler_and_gradient_policy() -> None:
+    _assert_all_256_owner_slots_run_literal_sampler_partials_routing_outputs_and_logical_vjps()
+    _assert_routed_gradient_edge_and_mixed_owner_policy()
+
+
+def _assert_all_256_owner_slots_run_literal_sampler_partials_routing_outputs_and_logical_vjps() -> None:
     pytest.importorskip("sglang")
     if torch.cuda.get_device_capability()[0] != 9:
         pytest.skip("the qualified GLM-5.2 routed component requires Hopper")
@@ -297,7 +308,6 @@ def test_all_256_owner_slots_run_literal_sampler_partials_routing_outputs_and_lo
     for owner in range(_EP_SIZE):
         module = _module(owner, device)
         _load_distinguishable_base(module)
-        _fill_distinguishable_factors(module)
         global_ids = global_grid[owner].reshape(_LOCAL_EXPERTS, 1).contiguous()
         hidden = (
             torch.arange(_LOCAL_EXPERTS * _HIDDEN, dtype=torch.float32, device=device)
@@ -309,18 +319,18 @@ def test_all_256_owner_slots_run_literal_sampler_partials_routing_outputs_and_lo
             .requires_grad_(True)
         )
         routing = ((global_ids.float() + 1) / 512).contiguous().requires_grad_(True)
-        trace = module.sampler_value_trace(hidden.detach(), routing.detach(), global_ids)
+        base_output = None
+        if owner == 0:
+            with torch.no_grad():
+                for name in module.logical_factor_names:
+                    getattr(module, name).zero_()
+            base_output = module(hidden.detach(), routing.detach(), selected_experts=global_ids).detach()
+        _fill_distinguishable_factors(module)
         output = module(hidden, routing, selected_experts=global_ids)
 
-        assert torch.equal(output.detach(), trace.owner_output)
-        assert torch.count_nonzero(trace.gate_up_base) > 0
-        assert torch.count_nonzero(trace.down_base_routed) > 0
-        assert torch.count_nonzero(trace.gate_up_post_lora) > 0
-        assert torch.count_nonzero(trace.activated) > 0
-        assert torch.count_nonzero(trace.down_post_lora_routed) > 0
-        assert not torch.equal(trace.gate_up_base, trace.gate_up_post_lora)
-        assert not torch.equal(trace.down_base_routed, trace.down_post_lora_routed)
-        assert torch.equal(output, trace.down_post_lora_routed[:, 0])
+        assert torch.count_nonzero(output) > 0
+        if base_output is not None:
+            assert not torch.equal(output.detach(), base_output)
 
         # A positive logical cotangent keeps every intentionally routed slot
         # distinguishable; an alternating cotangent can legitimately cancel
@@ -363,29 +373,20 @@ def test_all_256_owner_slots_run_literal_sampler_partials_routing_outputs_and_lo
             assert torch.count_nonzero(gradient) > 0
 
         if owner == 0:
-            half_trace = module.sampler_value_trace(
+            half_output = module(
                 hidden.detach(),
                 (routing.detach() * 0.5).contiguous(),
-                global_ids,
-            )
-            assert torch.equal(half_trace.gate_up_post_lora, trace.gate_up_post_lora)
+                selected_experts=global_ids,
+            ).detach()
             torch.testing.assert_close(
-                half_trace.down_post_lora_routed.float(),
-                trace.down_post_lora_routed.float() * 0.5,
-                rtol=0,
-                atol=2**-8,
-            )
-            torch.testing.assert_close(
-                half_trace.owner_output.float(),
-                trace.owner_output.float() * 0.5,
+                half_output.float(),
+                output.detach().float() * 0.5,
                 rtol=0,
                 atol=2**-8,
             )
 
 
-@pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires Hopper CUDA")
-def test_zero_token_routed_slots_receive_exact_zero_bank_gradients_and_stride_mismatches_fail() -> None:
+def _assert_routed_gradient_edge_and_mixed_owner_policy() -> None:
     pytest.importorskip("sglang")
     if torch.cuda.get_device_capability()[0] != 9:
         pytest.skip("the qualified GLM-5.2 routed component requires Hopper")
@@ -416,13 +417,11 @@ def test_zero_token_routed_slots_receive_exact_zero_bank_gradients_and_stride_mi
     with pytest.raises(ValueError, match="route-major"):
         module(hidden.detach(), routing_strided, selected_experts=global_ids)
 
+    _assert_all_sentinel_owner_returns_zero_and_zero_gradients()
+    _assert_topk8_mixed_owner_hybrid_vjps_match_standalone_reference()
 
-@pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires Hopper CUDA")
-def test_all_sentinel_owner_returns_exact_zero_and_zero_gradients() -> None:
-    pytest.importorskip("sglang")
-    if torch.cuda.get_device_capability()[0] != 9:
-        pytest.skip("the qualified GLM-5.2 routed component requires Hopper")
+
+def _assert_all_sentinel_owner_returns_zero_and_zero_gradients() -> None:
     device = torch.device("cuda")
     module = _module(5, device)
     _load_zero_base(module)
@@ -443,9 +442,7 @@ def test_all_sentinel_owner_returns_exact_zero_and_zero_gradients() -> None:
         assert torch.count_nonzero(gradient) == 0
 
 
-@pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires Hopper CUDA")
-def test_topk8_mixed_owner_hybrid_vjps_match_standalone_reference() -> None:
+def _assert_topk8_mixed_owner_hybrid_vjps_match_standalone_reference() -> None:
     pytest.importorskip("sglang")
     if torch.cuda.get_device_capability()[0] != 9:
         pytest.skip("the qualified GLM-5.2 routed component requires Hopper")

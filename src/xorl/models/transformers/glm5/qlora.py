@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections import Counter
 from dataclasses import dataclass
 
 import torch
@@ -100,10 +99,6 @@ class Glm52AdapterInventory:
     @property
     def factor_names(self) -> frozenset[str]:
         return frozenset(factor.name for factor in self.factors)
-
-    @property
-    def role_counts(self) -> dict[str, int]:
-        return dict(Counter(target.role for target in self.targets))
 
 
 def _official_indexer_schedule() -> tuple[str, ...]:

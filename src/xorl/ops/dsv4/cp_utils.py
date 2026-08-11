@@ -141,6 +141,6 @@ def get_freqs_cis_for_cp(
             "DSv4 RoPE cache is too short for this context-parallel slice: "
             f"need positions [{start}, {stop}) with stride {stride}, "
             f"but freqs_cis only has {freqs_cis.size(0)} positions. "
-            "Increase XORL_DSV4_ROPE_MAX_SEQ_LEN or config.max_position_embeddings."
+            "Increase config.max_position_embeddings."
         )
     return result

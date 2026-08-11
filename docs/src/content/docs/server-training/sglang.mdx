@@ -126,20 +126,20 @@ After a weight sync, xorl-sglang flushes its KV cache. The training server sends
 
 ## Installation
 
-xorl-sglang is included as a git submodule under `submodules/xorl-sglang`. If you cloned with `--recurse-submodules`, it's already checked out.
+xorl-sglang is included as a git submodule under `submodules/xorl-sglang`. If you cloned with `--recurse-submodules`, it's already checked out. Keep it in the isolated Torch 2.11 environment; the default XoRL profile uses Torch 2.12 and is not ABI-compatible with the pinned `sglang-kernel` wheel.
 
 ```bash
-pip install -e "submodules/xorl-sglang/python[all]"
+uv venv .venv-sglang --python 3.12
+uv pip install --python .venv-sglang/bin/python -e submodules/xorl-sglang/python
+uv pip install --python .venv-sglang/bin/python \
+  torchdata==0.11.0 nvidia-cutlass-dsl==4.5.2 quack-kernels==0.5.0
+uv pip install --python .venv-sglang/bin/python --no-deps -e .
+uv pip install --python .venv-sglang/bin/python pytest
+PYTHONPATH=src:submodules/xorl-sglang/python XORL_REQUIRE_SGL_KERNEL=1 \
+  .venv-sglang/bin/python -m pytest -q tests/ops/test_sgl_kernel_smoke.py
 ```
 
-Or use `pyproject.sglang.toml` to install xorl, xorl-client, and xorl-sglang together (pins PyTorch to 2.9.1):
-
-```bash
-cp pyproject.sglang.toml pyproject.toml
-uv sync          # or: pip install -e .
-```
-
-See the [installation guide](/xorl/getting-started/installation/#install-submodules) for full details.
+The bundled `pyproject.sglang.toml` pins the same Torch 2.11 combined profile. See the [installation guide](/xorl/getting-started/installation/#install-submodules) for full details.
 
 ## Launching xorl-sglang
 

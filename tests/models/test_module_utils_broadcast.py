@@ -12,9 +12,11 @@ from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
 from xorl.models import module_utils
+from xorl.models.transformers.qwen3_5_shared import QWEN3_5_CHECKPOINT_SKIP_KEY_PATTERNS
 
 
 pytestmark = [pytest.mark.cpu]
+_ORIGINAL_GET_OBJECT_BROADCAST_DEVICE = module_utils._get_object_broadcast_device
 
 
 class _DummyModel:
@@ -79,6 +81,13 @@ def _cpu_dtensor_materialize_worker(rank: int, world_size: int, port: int) -> No
         materialized = module_utils._materialize_tensor_for_save(dtensor)
         assert materialized.device.type == "cpu"
         assert torch.equal(materialized, full_tensor)
+        targeted = module_utils._materialize_tensor_for_save(dtensor, dst_rank=3)
+        if rank == 3:
+            assert targeted is not None
+            assert targeted.device.type == "cpu"
+            assert torch.equal(targeted, full_tensor)
+        else:
+            assert targeted is None
     finally:
         dist.destroy_process_group()
 
@@ -116,82 +125,12 @@ def _cpu_dtensor_materialize_to_rank_worker(rank: int, world_size: int, port: in
         dist.destroy_process_group()
 
 
-def _cpu_dtensor_materialize_2d_to_rank_worker(rank: int, world_size: int, port: int, dst_rank: int) -> None:
-    dist.init_process_group("gloo", init_method=f"tcp://127.0.0.1:{port}", rank=rank, world_size=world_size)
-    try:
-        module_utils._cpu_save_device_mesh_cache.clear()
-        mesh = DeviceMesh(
-            "cpu",
-            mesh=torch.arange(world_size).view(2, 2),
-            mesh_dim_names=("ep", "fsdp"),
-            backend_override=(("gloo", None), ("gloo", None)),
-        )
-        full_tensor = torch.arange(16, dtype=torch.float32).view(4, 4)
-        row = rank // 2
-        col = rank % 2
-        local_tensor = full_tensor[row * 2 : (row + 1) * 2, col * 2 : (col + 1) * 2].clone()
-        dtensor = DTensor.from_local(
-            local_tensor,
-            device_mesh=mesh,
-            placements=[DTShard(0), DTShard(1)],
-            shape=full_tensor.shape,
-            stride=full_tensor.stride(),
-        )
-        materialized = module_utils._materialize_tensor_for_save(dtensor, dst_rank=dst_rank)
-        if rank == dst_rank:
-            assert materialized is not None
-            assert materialized.device.type == "cpu"
-            assert torch.equal(materialized, full_tensor)
-        else:
-            assert materialized is None
-    finally:
-        dist.destroy_process_group()
-
-
-def test_copy_into_existing_dtensor_shard_for_replicated_tensor():
+def _assert_dtensor_checkpoint_materialization_policy():
     dtensor = _FakeDTensor(torch.zeros(4, dtype=torch.float32), mesh_size=4, local_rank=2, placements=(Replicate(),))
     full_tensor = torch.arange(4, dtype=torch.float32)
-
-    copied = module_utils._copy_into_existing_dtensor_shard(dtensor, full_tensor)
-
-    assert copied is True
+    assert module_utils._copy_into_existing_dtensor_shard(dtensor, full_tensor) is True
     assert torch.equal(dtensor._local_tensor, full_tensor)
 
-
-def test_materialize_tensor_for_save_uses_cpu_mesh_for_dtensors():
-    port = _find_free_port()
-    mp.start_processes(
-        _cpu_dtensor_materialize_worker,
-        args=(4, port),
-        nprocs=4,
-        join=True,
-        start_method="fork",
-    )
-
-
-def test_materialize_tensor_for_save_gathers_1d_dtensor_to_writer_rank():
-    port = _find_free_port()
-    mp.start_processes(
-        _cpu_dtensor_materialize_to_rank_worker,
-        args=(4, port, 2),
-        nprocs=4,
-        join=True,
-        start_method="fork",
-    )
-
-
-def test_materialize_tensor_for_save_gathers_2d_dtensor_to_writer_rank():
-    port = _find_free_port()
-    mp.start_processes(
-        _cpu_dtensor_materialize_2d_to_rank_worker,
-        args=(4, port, 3),
-        nprocs=4,
-        join=True,
-        start_method="fork",
-    )
-
-
-def test_copy_into_existing_dtensor_shard_for_sharded_tensor():
     dtensor = _FakeDTensor(
         torch.zeros(2, 3, dtype=torch.float32),
         mesh_size=4,
@@ -199,14 +138,9 @@ def test_copy_into_existing_dtensor_shard_for_sharded_tensor():
         placements=(DTShard(0),),
     )
     full_tensor = torch.arange(24, dtype=torch.float32).view(8, 3)
-
-    copied = module_utils._copy_into_existing_dtensor_shard(dtensor, full_tensor)
-
-    assert copied is True
+    assert module_utils._copy_into_existing_dtensor_shard(dtensor, full_tensor) is True
     assert torch.equal(dtensor._local_tensor, full_tensor[2:4])
 
-
-def test_copy_into_existing_dtensor_shard_trims_padded_tail_shards():
     dtensor = _FakeDTensor(
         torch.zeros(0, 3, dtype=torch.float32),
         mesh_size=8,
@@ -214,24 +148,28 @@ def test_copy_into_existing_dtensor_shard_trims_padded_tail_shards():
         placements=(DTShard(0),),
     )
     full_tensor = torch.arange(15, dtype=torch.float32).view(5, 3)
-
-    copied = module_utils._copy_into_existing_dtensor_shard(dtensor, full_tensor)
-
-    assert copied is True
+    assert module_utils._copy_into_existing_dtensor_shard(dtensor, full_tensor) is True
     assert tuple(dtensor._local_tensor.shape) == (0, 3)
 
-
-def test_copy_into_existing_dtensor_shard_rejects_shape_mismatched_replicates():
     dtensor = _FakeDTensor(torch.zeros(1, 3, dtype=torch.float32), mesh_size=4, local_rank=0, placements=(Replicate(),))
     full_tensor = torch.arange(15, dtype=torch.float32).view(5, 3)
-
-    copied = module_utils._copy_into_existing_dtensor_shard(dtensor, full_tensor)
-
-    assert copied is False
+    assert module_utils._copy_into_existing_dtensor_shard(dtensor, full_tensor) is False
     assert torch.equal(dtensor._local_tensor, torch.zeros(1, 3, dtype=torch.float32))
 
+    for worker, worker_args in (
+        (_cpu_dtensor_materialize_worker, (4, _find_free_port())),
+        (_cpu_dtensor_materialize_to_rank_worker, (4, _find_free_port(), 2)),
+    ):
+        mp.start_processes(
+            worker,
+            args=worker_args,
+            nprocs=4,
+            join=True,
+            start_method="fork",
+        )
 
-def test_broadcast_object_list_serializes_over_tensor_broadcast_for_nccl_groups(monkeypatch):
+
+def _assert_object_broadcast_transport_policy(monkeypatch):
     fake_group = object()
     state = {"rank": 3}
     stored = []
@@ -263,8 +201,11 @@ def test_broadcast_object_list_serializes_over_tensor_broadcast_for_nccl_groups(
 
     assert received_payload == source_payload
 
+    _assert_get_object_broadcast_device_uses_default_nccl_group(monkeypatch)
+    _assert_object_broadcast_weight_load_uses_weight_load_group(monkeypatch)
 
-def test_get_object_broadcast_device_uses_default_nccl_group(monkeypatch):
+
+def _assert_get_object_broadcast_device_uses_default_nccl_group(monkeypatch):
     fake_dist = SimpleNamespace(
         is_available=lambda: True,
         is_initialized=lambda: True,
@@ -272,13 +213,14 @@ def test_get_object_broadcast_device_uses_default_nccl_group(monkeypatch):
     )
 
     monkeypatch.setattr(module_utils, "dist", fake_dist)
+    monkeypatch.setattr(module_utils, "_get_object_broadcast_device", _ORIGINAL_GET_OBJECT_BROADCAST_DEVICE)
     monkeypatch.setattr(module_utils, "get_device_type", lambda: "cuda")
     monkeypatch.setattr(module_utils, "get_device_id", lambda: 3)
 
     assert module_utils._get_object_broadcast_device(None) == torch.device("cuda:3")
 
 
-def test_broadcast_object_list_weight_load_uses_weight_load_group(monkeypatch):
+def _assert_object_broadcast_weight_load_uses_weight_load_group(monkeypatch):
     fake_group = object()
     calls = []
 
@@ -295,7 +237,16 @@ def test_broadcast_object_list_weight_load_uses_weight_load_group(monkeypatch):
     assert calls == [(payload, 7, fake_group)]
 
 
-def test_rank0_broadcast_path_calls_load_state_dict_on_nonzero_ranks(monkeypatch):
+def _assert_rank0_checkpoint_resolution_transport_and_loading_policy(monkeypatch):
+    with monkeypatch.context() as case_patch:
+        _assert_object_broadcast_transport_policy(case_patch)
+    with monkeypatch.context() as case_patch:
+        _assert_rank0_broadcast_loading_policy(case_patch)
+    with monkeypatch.context() as case_patch:
+        _assert_state_dict_resolution_policy(case_patch)
+
+
+def _assert_rank0_broadcast_loading_policy(monkeypatch):
     calls = []
 
     def fake_broadcast_object_list(obj, src=0, group=None, device=None):
@@ -331,8 +282,10 @@ def test_rank0_broadcast_path_calls_load_state_dict_on_nonzero_ranks(monkeypatch
 
     assert calls == ["dummy-weights"]
 
+    _assert_rank0_broadcast_uses_handler_filtered_prefetch(monkeypatch)
 
-def test_rank0_broadcast_path_uses_filtered_prefetch_for_handler_skips(monkeypatch):
+
+def _assert_rank0_broadcast_uses_handler_filtered_prefetch(monkeypatch):
     batch_meta_calls = []
     dispatched = []
     handler_calls = {"loaded": [], "skipped": []}
@@ -418,7 +371,7 @@ def test_rank0_broadcast_path_uses_filtered_prefetch_for_handler_skips(monkeypat
     ]
 
 
-def test_try_load_state_dict_uses_rank0_for_local_resolution(monkeypatch):
+def _assert_state_dict_resolution_policy(monkeypatch):
     local_resolution_calls = []
 
     def fake_broadcast_object_list(obj, src=0, group=None, device=None):
@@ -446,10 +399,11 @@ def test_try_load_state_dict_uses_rank0_for_local_resolution(monkeypatch):
     assert local_resolution_calls == []
     assert [it.filepath for it in iterators] == ["shard-0.safetensors", "shard-1.safetensors"]
 
+    _assert_local_state_dict_directory_skips_broadcast(monkeypatch)
 
-@pytest.mark.parametrize(
-    ("key", "expected"),
-    [
+
+def _assert_checkpoint_expert_key_classifies_supported_expert_formats():
+    cases = (
         ("model.layers.43.mlp.experts.7.gate_proj.weight", True),
         ("model.layers.43.mlp.experts.7.down_proj.weight_scale_inv", True),
         ("model.layers.43.mlp.experts.gate_up_proj", True),
@@ -459,17 +413,19 @@ def test_try_load_state_dict_uses_rank0_for_local_resolution(monkeypatch):
         ("layers.12.ffn.experts.7.w1.weight", True),
         ("layers.12.ffn.experts.7.w2.scale", True),
         ("model.layers.12.ffn.experts.7.w3.weight", True),
+        ("model.language_model.layers.43.mlp.experts.gate_up_proj", True),
+        ("model.language_model.layers.43.mlp.experts.down_proj", True),
         ("model.layers.43.mlp.shared_expert.down_proj.weight", False),
         ("layers.12.ffn.shared_experts.w1.weight", False),
+        ("model.language_model.layers.43.mlp.shared_expert.down_proj.weight", False),
         ("model.layers.43.mlp.gate_up_proj.weight", False),
         ("model.layers.43.self_attn.q_proj.weight", False),
-    ],
-)
-def test_checkpoint_expert_key_classifies_supported_expert_formats(key, expected):
-    assert module_utils._is_checkpoint_expert_key(key) is expected
+    )
+    for key, expected in cases:
+        assert module_utils._is_checkpoint_expert_key(key) is expected, key
 
 
-def test_try_load_state_dict_local_directory_skips_broadcast(monkeypatch):
+def _assert_local_state_dict_directory_skips_broadcast(monkeypatch):
     local_resolution_calls = []
 
     fake_dist = SimpleNamespace(
@@ -493,15 +449,14 @@ def test_try_load_state_dict_local_directory_skips_broadcast(monkeypatch):
     assert [it.filepath for it in iterators] == ["local-shard.safetensors"]
 
 
-def test_checkpoint_expert_filter_handles_wrapped_language_model_keys():
-    assert module_utils._is_checkpoint_expert_key("model.language_model.layers.43.mlp.experts.gate_up_proj")
-    assert module_utils._is_checkpoint_expert_key("model.language_model.layers.43.mlp.experts.down_proj")
-    assert not module_utils._is_checkpoint_expert_key(
-        "model.language_model.layers.43.mlp.shared_expert.down_proj.weight"
-    )
+def test_grouped_load_routing_and_strict_coverage_policy(monkeypatch):
+    _assert_dtensor_checkpoint_materialization_policy()
+    with monkeypatch.context() as case_patch:
+        _assert_rank0_checkpoint_resolution_transport_and_loading_policy(case_patch)
+    _assert_checkpoint_expert_key_classifies_supported_expert_formats()
+    with monkeypatch.context() as case_patch:
+        _assert_post_process_strict_coverage_policy(case_patch)
 
-
-def test_grouped_load_weights_uses_filtered_prefetch_on_group_leader(monkeypatch):
     batch_meta_calls = []
     dispatched = []
     transfer_calls = []
@@ -670,8 +625,12 @@ def test_grouped_load_weights_uses_filtered_prefetch_on_group_leader(monkeypatch
         ],
     )
 
+    _assert_grouped_load_routes_hf_fused_experts(monkeypatch)
+    _assert_grouped_load_routes_ffn_expert_source_format(monkeypatch)
+    _assert_grouped_load_group_fallback_policy(monkeypatch)
 
-def test_grouped_load_weights_routes_hf_fused_experts_through_expert_queue(monkeypatch):
+
+def _assert_grouped_load_routes_hf_fused_experts(monkeypatch):
     dense_loaded = []
     expert_loaded = []
     dispatched = []
@@ -706,7 +665,7 @@ def test_grouped_load_weights_routes_hf_fused_experts_through_expert_queue(monke
 
     class _GroupedModel:
         _checkpoint_conversion_mapping = {r"^model\.language_model\.": "model."}
-        _checkpoint_skip_key_patterns = [r"^mtp\."]
+        _checkpoint_skip_key_patterns = QWEN3_5_CHECKPOINT_SKIP_KEY_PATTERNS
 
         def named_buffers(self):
             return []
@@ -746,6 +705,8 @@ def test_grouped_load_weights_routes_hf_fused_experts_through_expert_queue(monke
         if skip_key_fn(raw_expert_key):
             prefetch_calls.append("dense")
             assert skip_key_fn(raw_skipped_key)
+            assert skip_key_fn("mtp.pre_fc_norm_embedding.weight")
+            assert not skip_key_fn("model.layers.0.mlp.gate_proj.weight")
             assert not skip_key_fn("keep.weight")
             yield ({"keep.weight": torch.tensor([2.0])}, [])
         else:
@@ -792,7 +753,7 @@ def test_grouped_load_weights_routes_hf_fused_experts_through_expert_queue(monke
     assert dispatched == ["keep.weight", expert_param]
 
 
-def test_grouped_load_weights_routes_ffn_expert_source_format_through_expert_queue(monkeypatch):
+def _assert_grouped_load_routes_ffn_expert_source_format(monkeypatch):
     dense_loaded = []
     expert_loaded = []
     dispatched = []
@@ -896,7 +857,7 @@ def test_grouped_load_weights_routes_ffn_expert_source_format_through_expert_que
     assert dispatched == ["keep.weight", expert_param]
 
 
-def test_grouped_load_weights_treats_missing_dense_group_as_local(monkeypatch):
+def _assert_grouped_load_group_fallback_policy(monkeypatch):
     dispatched = []
     fake_group = object()
 
@@ -982,8 +943,11 @@ def test_grouped_load_weights_treats_missing_dense_group_as_local(monkeypatch):
 
     assert dispatched == ["keep.weight"]
 
+    _assert_grouped_load_falls_back_without_ep_group(monkeypatch)
+    _assert_grouped_load_strict_rejects_fallback_without_ep_group(monkeypatch)
 
-def test_grouped_load_weights_falls_back_without_ep_group(monkeypatch):
+
+def _assert_grouped_load_falls_back_without_ep_group(monkeypatch):
     called = []
 
     fake_dist = SimpleNamespace(
@@ -1012,7 +976,7 @@ def test_grouped_load_weights_falls_back_without_ep_group(monkeypatch):
     assert not hasattr(model, "device")
 
 
-def test_grouped_load_weights_strict_rejects_fallback_without_ep_group(monkeypatch):
+def _assert_grouped_load_strict_rejects_fallback_without_ep_group(monkeypatch):
     fake_dist = SimpleNamespace(
         is_available=lambda: True,
         is_initialized=lambda: True,
@@ -1031,7 +995,7 @@ def test_grouped_load_weights_strict_rejects_fallback_without_ep_group(monkeypat
         module_utils.grouped_load_weights(_DummyModel(), "dummy-weights", init_device="cpu", strict=True)
 
 
-def test_post_process_strict_rejects_missing_unexpected_and_duplicate_names():
+def _assert_post_process_strict_coverage_policy(monkeypatch):
     with pytest.raises(RuntimeError, match="Strict checkpoint source-to-target coverage failed") as exc_info:
         module_utils.post_process_after_weight_loading(
             _DummyModel(),
@@ -1047,8 +1011,12 @@ def test_post_process_strict_rejects_missing_unexpected_and_duplicate_names():
     assert "unexpected.weight" in message
     assert "duplicate.weight" in message
 
+    _assert_post_process_strict_rejects_missing_persistent_buffer()
+    _assert_post_process_strict_rejects_duplicate_persistent_buffer()
+    _assert_post_process_strict_accepts_complete_persistent_buffer_coverage(monkeypatch)
 
-def test_post_process_strict_rejects_missing_persistent_buffer():
+
+def _assert_post_process_strict_rejects_missing_persistent_buffer():
     with pytest.raises(RuntimeError, match="missing_persistent_buffers=.*missing.buffer"):
         module_utils.post_process_after_weight_loading(
             _DummyModel(),
@@ -1058,7 +1026,7 @@ def test_post_process_strict_rejects_missing_persistent_buffer():
         )
 
 
-def test_post_process_strict_rejects_duplicate_persistent_buffer():
+def _assert_post_process_strict_rejects_duplicate_persistent_buffer():
     with pytest.raises(RuntimeError, match="duplicate_persistent_buffers=.*duplicate.buffer"):
         module_utils.post_process_after_weight_loading(
             _DummyModel(),
@@ -1068,7 +1036,7 @@ def test_post_process_strict_rejects_duplicate_persistent_buffer():
         )
 
 
-def test_post_process_strict_accepts_complete_persistent_buffer_coverage(monkeypatch):
+def _assert_post_process_strict_accepts_complete_persistent_buffer_coverage(monkeypatch):
     dispatched = []
 
     class _CompleteModel(_DummyModel):

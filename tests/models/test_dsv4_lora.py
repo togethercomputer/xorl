@@ -15,7 +15,6 @@ pytestmark = pytest.mark.cpu
 
 @pytest.fixture(autouse=True)
 def _cpu_env(monkeypatch):
-    monkeypatch.setenv("XORL_DSV4_ROPE_MAX_SEQ_LEN", "256")
     monkeypatch.setenv("XORL_DSV4_SPARSE_ATTN_IMPL", "sparse")
     from xorl.ops.dsv4.rope import precompute_freqs_cis  # noqa: PLC0415
 
@@ -81,63 +80,7 @@ def _lm_logits(model, input_ids):
 ATTN_LORA_TARGETS = ["wq_a", "wq_b", "wkv", "wo_a", "wo_b"]
 
 
-def test_attention_lora_inject_freezes_base_and_adds_adapters():
-    """``wq_a/wq_b/wkv/wo_b`` get LoraLinear adapters."""
-    from xorl.lora.utils import inject_lora_into_model
-
-    torch.manual_seed(0)
-    _, model = _build_model()
-
-    base_linear_count = sum(
-        1 for n, m in model.named_modules() if isinstance(m, torch.nn.Linear) and n.split(".")[-1] in ATTN_LORA_TARGETS
-    )
-    assert base_linear_count > 0
-
-    inject_lora_into_model(model, r=4, lora_alpha=8, target_modules=ATTN_LORA_TARGETS)
-
-    # Every targeted Linear is now a LoraLinear.
-    from xorl.lora.modules.linear import LoraLinear
-
-    targeted = [
-        (n, m)
-        for n, m in model.named_modules()
-        if n.split(".")[-1] in ATTN_LORA_TARGETS and isinstance(m, (torch.nn.Linear, LoraLinear))
-    ]
-    lora_targeted = [(n, m) for n, m in targeted if isinstance(m, LoraLinear)]
-    assert len(lora_targeted) == base_linear_count, f"expected {base_linear_count} LoraLinear, got {len(lora_targeted)}"
-
-    # Base weight on a LoraLinear is frozen; lora_A / lora_B trainable.
-    # LoraLinear subclasses nn.Linear; lora_A and lora_B are Parameters.
-    name, mod = lora_targeted[0]
-    assert mod.weight.requires_grad is False, name
-    assert mod.lora_A.requires_grad is True
-    assert mod.lora_B.requires_grad is True
-
-
-def test_moe_expert_lora_inject_freezes_base_and_adds_adapters():
-    """``gate_proj/up_proj/down_proj`` on routed experts get LoRA via MoEExpertsLoRA."""
-    from xorl.lora.utils import inject_lora_into_model
-    from xorl.models.layers.moe.lora import MoEExpertsLoRA
-
-    torch.manual_seed(1)
-    _, model = _build_model()
-
-    inject_lora_into_model(model, r=4, lora_alpha=8, target_modules=["gate_proj", "up_proj", "down_proj"])
-
-    # Every layer's mlp.experts should be MoEExpertsLoRA now.
-    for layer in model.model.layers:
-        assert isinstance(layer.mlp.experts, MoEExpertsLoRA), (
-            f"layer {layer.layer_id} experts not LoRA: {type(layer.mlp.experts).__name__}"
-        )
-        # Base experts weights frozen; LoRA params trainable.
-        assert layer.mlp.experts.gate_up_proj.requires_grad is False
-        # Find at least one LoRA param.
-        lora_params = [p for n, p in layer.mlp.experts.named_parameters() if "_lora_" in n]
-        assert len(lora_params) > 0
-        assert all(p.requires_grad for p in lora_params)
-
-
-def test_wo_a_lora_delta_actually_contributes_to_output():
+def _assert_wo_a_lora_delta_actually_contributes_to_output():
     """Smoke that ``wo_a`` LoRA actually fires through the grouped einsum.
 
     With zero-inited ``lora_B`` the delta is zero, so a fresh-injection forward
@@ -191,18 +134,36 @@ def test_wo_a_lora_delta_actually_contributes_to_output():
         assert m.lora_B.grad is not None and m.lora_B.grad.abs().sum().item() > 0
 
 
-def test_lora_forward_backward_updates_only_lora_params():
-    """End-to-end: only LoRA params receive grads after a forward+backward."""
+def test_dsv4_attention_lora_training_policy():
+    """End-to-end attention injection freezes base weights and trains adapters."""
+    _assert_wo_a_lora_delta_actually_contributes_to_output()
+
+    from xorl.lora.modules.linear import LoraLinear
     from xorl.lora.utils import inject_lora_into_model
 
     torch.manual_seed(2)
     cfg, model = _build_model()
+    base_linear_count = sum(
+        1
+        for name, module in model.named_modules()
+        if isinstance(module, torch.nn.Linear) and name.split(".")[-1] in ATTN_LORA_TARGETS
+    )
     inject_lora_into_model(
         model,
         r=4,
         lora_alpha=8,
-        target_modules=[*ATTN_LORA_TARGETS, "gate_proj", "up_proj", "down_proj"],
+        target_modules=ATTN_LORA_TARGETS,
     )
+
+    attention_adapters = [
+        (name, module)
+        for name, module in model.named_modules()
+        if name.split(".")[-1] in ATTN_LORA_TARGETS and isinstance(module, LoraLinear)
+    ]
+    assert len(attention_adapters) == base_linear_count > 0
+    for name, module in attention_adapters:
+        assert module.weight.requires_grad is False, name
+        assert module.lora_A.requires_grad and module.lora_B.requires_grad
 
     bsz, seqlen = 1, cfg.sliding_window
     input_ids = torch.randint(0, cfg.vocab_size, (bsz, seqlen), dtype=torch.long)

@@ -106,12 +106,13 @@ def datasets_with_name_generator(
         if config.name and isinstance(config.name, list):
             for name in config.name:
                 yield replace(config, name=name)
-        elif config.preprocess_shards and not config.shards:
+        elif config.preprocess_shards:
             for shard_idx in range(config.preprocess_shards):
                 yield replace(
                     config,
                     shards=config.preprocess_shards,
                     shards_idx=shard_idx,
+                    preprocess_shards=None,
                 )
         else:
             yield config
@@ -371,7 +372,7 @@ def _load_from_data_files(
     else:
         raise ValueError("data_files must be either a string or list of strings")
 
-    return load_dataset("json", data_files=file_path, **load_dataset_kwargs)
+    return load_dataset(get_dataset_type(dataset_config), data_files=file_path, **load_dataset_kwargs)
 
 
 def get_prepared_dataset_path(args: Arguments, dataset_hash: str) -> Path:

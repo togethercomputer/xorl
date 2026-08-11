@@ -317,6 +317,8 @@ def generate_training_config(
     lora_rank: int = 8,
     lora_alpha: int = 8,
     lora_target_modules: Optional[List[str]] = None,
+    extra_model: Optional[Dict[str, Any]] = None,
+    extra_data: Optional[Dict[str, Any]] = None,
     extra_train: Optional[Dict[str, Any]] = None,
     extra_lora: Optional[Dict[str, Any]] = None,
 ) -> str:
@@ -382,6 +384,12 @@ def generate_training_config(
 
     if moe_implementation:
         config["model"]["moe_implementation"] = moe_implementation
+
+    if extra_model:
+        config["model"].update(extra_model)
+
+    if extra_data:
+        config["data"].update(extra_data)
 
     if extra_train:
         config["train"].update(extra_train)

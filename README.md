@@ -76,14 +76,26 @@ The repo includes two git submodules under `submodules/` (needed for server / on
 - **[xorl-client](https://github.com/togethercomputer/xorl-client)** — Lightweight Python SDK (no PyTorch dependency) for driving the xorl training server. Provides `ServiceClient`, `TrainingClient`, `SamplingClient`, and `RestClient` with async-first `APIFuture` semantics, automatic request ordering, and Tinker API compatibility.
 - **[xorl-sglang](https://github.com/togethercomputer/xorl-sglang)** — XoRL's fork of [SGLang](https://github.com/sgl-project/sglang) with NCCL-based weight sync endpoints, MoE routing data export (R3), and numerical alignment flags for online RL.
 
-Install individually:
+Install the client in the default environment. Keep SGLang in its own
+Torch-2.11 environment; its compiled kernel wheel is not ABI-compatible with
+the default Torch-2.12 profile:
 
 ```bash
 pip install -e submodules/xorl-client
-pip install -e "submodules/xorl-sglang/python[all]"
+uv venv .venv-sglang --python 3.12
+uv pip install --python .venv-sglang/bin/python -e submodules/xorl-sglang/python
+uv pip install --python .venv-sglang/bin/python \
+  torchdata==0.11.0 nvidia-cutlass-dsl==4.5.2 quack-kernels==0.5.0
+uv pip install --python .venv-sglang/bin/python --no-deps -e .
+uv pip install --python .venv-sglang/bin/python pytest
+PYTHONPATH=src:submodules/xorl-sglang/python XORL_REQUIRE_SGL_KERNEL=1 \
+  .venv-sglang/bin/python -m pytest -q tests/ops/test_sgl_kernel_smoke.py
 ```
 
-Or use the bundled `pyproject.sglang.toml` which pins PyTorch to 2.9.1 (required by sglang) and installs everything together:
+The bundled `pyproject.sglang.toml` provides the same combined profile for uv.
+It also overrides SGLang's newer Quack/CUTLASS metadata with the versions used
+by XoRL's trainer source; the exact SGLang kernel smoke above validates that
+boundary.
 
 **uv:**
 ```bash
@@ -92,15 +104,7 @@ uv sync
 source .venv/bin/activate
 ```
 
-**conda:**
-```bash
-conda create -n xorl-sglang python=3.12
-conda activate xorl-sglang
-cp pyproject.sglang.toml pyproject.toml
-pip install -e .
-```
-
-> **Note:** The default `pyproject.toml` uses PyTorch 2.10.0. sglang requires PyTorch 2.9.1, so the two cannot coexist in the same environment unless you use `pyproject.sglang.toml`.
+> **Note:** The default `pyproject.toml` uses Torch 2.12.1. Pinned SGLang requires Torch 2.11.0; do not install `sglang-kernel` into the default environment.
 
 See the [installation guide](https://togethercomputer.github.io/xorl/getting-started/installation/) for full setup including optional dependencies (DeepEP, Flash Attention).
 

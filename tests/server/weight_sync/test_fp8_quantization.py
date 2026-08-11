@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -7,8 +8,10 @@ import torch.nn as nn
 from xorl.fp8_training import enrich_sync_quantization_with_fp8_bf16_islands
 from xorl.lora.modules.delta_linear import LoraDeltaLinear
 from xorl.lora.modules.linear import LoraLinear
+from xorl.qarl import inject_qarl_into_model, qarl_sync_quantization_config
 from xorl.qlora.modules.linear import QLoRALinear
 from xorl.qlora.modules.moe_experts import QLoRAMoeExperts
+from xorl.server.protocol.operations import SyncWeightsData
 from xorl.server.weight_sync.handler import WeightSyncHandler
 
 
@@ -92,37 +95,16 @@ class TinySyncIslandModel(nn.Module):
         return {"layer_prefix": "model.layers", "num_layers": self.config.num_hidden_layers}
 
 
-def test_fp8_quantization_emits_cpu_weight_and_scale_tensors():
-    name = "model.layers.0.mlp.gate_proj.weight"
-    tensor = torch.arange(32, dtype=torch.bfloat16).reshape(4, 8)
-    if torch.cuda.is_available():
-        tensor = tensor.cuda()
-
-    out = dict(
-        WeightSyncHandler._quantize_buffer_for_fp8(
-            [(name, tensor)],
-            quantization_config={
-                "quant_method": "fp8",
-                "fmt": "e4m3",
-                "weight_block_size": [2, 4],
-            },
-            target_device="cpu",
-        )
-    )
-
-    assert set(out) == {name, "model.layers.0.mlp.gate_proj.weight_scale_inv"}
-    quantized = out[name]
-    scale = out["model.layers.0.mlp.gate_proj.weight_scale_inv"]
-    assert quantized.device.type == "cpu"
-    assert scale.device.type == "cpu"
-    assert quantized.dtype == torch.float8_e4m3fn
-    assert scale.dtype == torch.float32
-    assert quantized.shape == (4, 8)
-    assert scale.shape == (2, 2)
-    assert torch.all(scale > 0)
+class _TinyQARLSyncModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.config = SimpleNamespace(model_type="tiny")
+        self.embed_tokens = nn.Embedding(8, 4)
+        self.proj = nn.Linear(4, 4, bias=False)
+        self.lm_head = nn.Linear(4, 8, bias=False)
 
 
-def test_generated_first_last_bf16_islands_pass_through_fp8_sync_quantization():
+def test_fp8_sync_quantization_policy(monkeypatch):
     model = TinySyncIslandModel(num_layers=4)
     quantization = enrich_sync_quantization_with_fp8_bf16_islands(
         model,
@@ -160,8 +142,75 @@ def test_generated_first_last_bf16_islands_pass_through_fp8_sync_quantization():
     assert out[last_name].dtype == torch.bfloat16
     assert last_name.replace(".weight", ".weight_scale_inv") not in out
 
+    _assert_fp8_matches_slime_blockwise_scale_contract()
+    _assert_fp8_zero_padding_for_partial_layout()
+    _assert_fp8_projection_selection_stack_and_existing_dtype_policy()
+    with monkeypatch.context() as adapter_patch:
+        _assert_fp8_adapter_merge_policy(adapter_patch)
+    with monkeypatch.context() as expert_patch:
+        _assert_fp8_cpu_expert_projection_and_workspace_policy(expert_patch)
+    with monkeypatch.context() as qarl_patch:
+        _assert_qarl_training_to_weight_sync_quantization_lifecycle(qarl_patch)
 
-def test_fp8_quantization_matches_slime_blockwise_scale_contract():
+
+def _assert_qarl_training_to_weight_sync_quantization_lifecycle(monkeypatch):
+    model = _TinyQARLSyncModel()
+    inject_qarl_into_model(
+        model,
+        quant_cfg={"format": "fp8_e4m3", "weight_block_size": [2, 2]},
+        target_modules=["proj"],
+    )
+
+    config = qarl_sync_quantization_config(model)
+
+    assert config is not None
+    assert config["quant_method"] == "fp8"
+    assert config["weight_block_size"] == [2, 2]
+    assert set(config["modules_to_not_convert"]) == {"embed_tokens", "lm_head"}
+    assert config["xorl_qarl_sync"] == {
+        "enabled": True,
+        "folded_modules": ["proj"],
+        "source": "qarl_fake_quant",
+    }
+
+    quantized = WeightSyncHandler._quantize_buffer_for_fp8(
+        [
+            ("embed_tokens.weight", model.embed_tokens.weight.detach()),
+            ("proj.weight", model.proj.weight.detach()),
+            ("lm_head.weight", model.lm_head.weight.detach()),
+        ],
+        quantization_config=config,
+    )
+    names = {name for name, _tensor in quantized}
+    assert {"embed_tokens.weight", "proj.weight", "proj.weight_scale_inv", "lm_head.weight"} <= names
+    assert "embed_tokens.weight_scale_inv" not in names
+    assert "lm_head.weight_scale_inv" not in names
+
+    trainer = SimpleNamespace(model=model, train_config={})
+    handler = WeightSyncHandler(rank=0, world_size=1, trainer=trainer)
+    captured = {}
+
+    def fake_sync_weights(**kwargs):
+        captured["quantization"] = kwargs["quantization"]
+        return {"success": True}
+
+    monkeypatch.setattr(handler, "_sync_weights", fake_sync_weights)
+    result = asyncio.run(handler.handle_sync_inference_weights({"payload": SyncWeightsData(quantization=None)}))
+    assert result["success"] is True
+    assert captured["quantization"]["weight_block_size"] == [2, 2]
+    assert set(captured["quantization"]["modules_to_not_convert"]) == {"embed_tokens", "lm_head"}
+
+    bad_handler = WeightSyncHandler(rank=0, world_size=1, trainer=trainer)
+    result = asyncio.run(
+        bad_handler.handle_sync_inference_weights(
+            {"payload": SyncWeightsData(quantization={"quant_method": "fp8", "weight_block_size": [4, 4]})}
+        )
+    )
+    assert result["success"] is False
+    assert "Failed to resolve QARL sync quantization" in result["message"]
+
+
+def _assert_fp8_matches_slime_blockwise_scale_contract():
     name = "model.layers.0.mlp.gate_proj.weight"
     block_size = (2, 4)
     tensor = torch.tensor(
@@ -189,6 +238,8 @@ def test_fp8_quantization_matches_slime_blockwise_scale_contract():
     scale_name = name.replace(".weight", ".weight_scale_inv")
 
     assert set(out) == {name, scale_name}
+    assert out[name].device.type == "cpu"
+    assert out[scale_name].device.type == "cpu"
     assert out[name].dtype == torch.float8_e4m3fn
     assert out[scale_name].dtype == torch.float32
     assert out[scale_name].shape == (2, 2)
@@ -202,7 +253,7 @@ def test_fp8_quantization_matches_slime_blockwise_scale_contract():
     )
 
 
-def test_fp8_quantization_zero_padding_differs_from_last_element_padding_for_partial_fused_layout():
+def _assert_fp8_zero_padding_for_partial_layout():
     name = "model.layers.0.self_attn.fused_qkv_a_proj_with_mqa.weight"
     block_size = (2, 4)
     tensor = torch.tensor(
@@ -236,7 +287,7 @@ def test_fp8_quantization_zero_padding_differs_from_last_element_padding_for_par
     assert not torch.equal(out[name].view(torch.uint8), last_padded_weight.view(torch.uint8))
 
 
-def test_fp8_quantization_uses_merged_dense_lora_weight_from_sync_extraction():
+def _assert_fp8_adapter_merge_policy(monkeypatch):
     class Layer(nn.Module):
         def __init__(self) -> None:
             super().__init__()
@@ -310,8 +361,13 @@ def test_fp8_quantization_uses_merged_dense_lora_weight_from_sync_extraction():
     dequantized = _dequantize_block_fp8_2d(out[weight_name], out[scale_name], block_size=(2, 2))
     assert dequantized.float().abs().max() > 0.0
 
+    _assert_fp8_uses_merged_qlora_weight(monkeypatch)
+    _assert_fp8_uses_merged_qlora_moe_experts(monkeypatch)
+    _assert_runtime_rank_moe_lora_buffer_scaling()
+    _assert_sync_extraction_folds_fused_gdn_lora_into_separate_base_projections()
 
-def test_fp8_quantization_uses_merged_qlora_weight_from_collective_ops(monkeypatch):
+
+def _assert_fp8_uses_merged_qlora_weight(monkeypatch):
     class FakeQLoRALinear(QLoRALinear):
         def __init__(self) -> None:
             super().__init__(4, 4, r=2, lora_alpha=2, quant_format="fake", quant_group_size=2, bias=False)
@@ -427,7 +483,7 @@ def test_fp8_quantization_uses_merged_qlora_weight_from_collective_ops(monkeypat
     assert dequantized.float().abs().max() > 0.0
 
 
-def test_fp8_quantization_uses_merged_qlora_moe_experts_from_collective_context(monkeypatch):
+def _assert_fp8_uses_merged_qlora_moe_experts(monkeypatch):
     class FakeQLoRAMoeExperts(QLoRAMoeExperts):
         def __init__(self) -> None:
             super().__init__(
@@ -451,18 +507,6 @@ def test_fp8_quantization_uses_merged_qlora_moe_experts_from_collective_context(
             assert expert_idx == 0
             assert self._base_by_proj[proj_name].shape == (K, N)
             return self._base_by_proj[proj_name].clone()
-
-        def _quantize_2d(self, w: torch.Tensor, global_amax: torch.Tensor | None = None):
-            raise NotImplementedError
-
-        def _dequantize_2d(self, packed: torch.Tensor, scales_dict: dict, K: int, N: int) -> torch.Tensor:
-            raise NotImplementedError
-
-        def merge_weights(self, ema_decay: float = 0.1) -> None:
-            raise NotImplementedError
-
-        def _load_experts(self, _load_tensor, _shard_cache) -> None:
-            raise NotImplementedError
 
     class Layer(nn.Module):
         def __init__(self) -> None:
@@ -559,126 +603,108 @@ def test_fp8_quantization_uses_merged_qlora_moe_experts_from_collective_context(
         assert dequantized.float().abs().max() > 0.0
 
 
-def test_fp8_quantization_skips_default_non_projection_weights():
-    tensor = torch.zeros(8, 4, dtype=torch.bfloat16)
-    out = WeightSyncHandler._quantize_buffer_for_fp8(
-        [("model.embed_tokens.weight", tensor)],
-        quantization_config={"quant_method": "fp8", "weight_block_size": [2, 4]},
-    )
+def _assert_runtime_rank_moe_lora_buffer_scaling():
+    class FakeRuntimeRankMoeModule:
+        num_local_experts = 1
+        hidden_size = 1
+        intermediate_size = 1
+        active_r = 2
+        scaling = 4.0
 
-    assert out == [("model.embed_tokens.weight", tensor)]
+        def _active_scaling(self) -> float:
+            return 2.0
 
+        def dequantize_expert(self, _proj_name: str, _expert_idx: int, K: int, N: int) -> torch.Tensor:
+            return torch.zeros((K, N), dtype=torch.float32)
 
-def test_fp8_quantization_includes_fused_mla_weight_by_default():
-    name = "model.layers.0.self_attn.fused_qkv_a_proj_with_mqa.weight"
-    tensor = torch.zeros(8, 4, dtype=torch.bfloat16)
-    out = dict(
-        WeightSyncHandler._quantize_buffer_for_fp8(
-            [(name, tensor)],
-            quantization_config={"quant_method": "fp8", "weight_block_size": [2, 4]},
-        )
-    )
+    lora_A = torch.tensor([[[1.0, 1.0, 0.0, 0.0]]], dtype=torch.float32)
+    lora_B = torch.tensor([[[1.0], [1.0], [0.0], [0.0]]], dtype=torch.float32)
+    lora_params = {
+        f"{projection}_{factor}": tensor.clone()
+        for projection in ("gate_proj", "up_proj", "down_proj")
+        for factor, tensor in (("lora_A", lora_A), ("lora_B", lora_B))
+    }
+    ctx = {
+        "module": FakeRuntimeRankMoeModule(),
+        "prefix": "model.layers.0.mlp.experts",
+        "lora_params": lora_params,
+    }
+    handler = object.__new__(WeightSyncHandler)
+    handler.rank = 0
 
-    assert set(out) == {name, "model.layers.0.self_attn.fused_qkv_a_proj_with_mqa.weight_scale_inv"}
-    assert out[name].dtype == torch.float8_e4m3fn
+    items = handler._compute_moe_experts_buffer(ctx)
 
-
-@pytest.mark.parametrize("projection", ["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"])
-def test_fp8_quantization_includes_qwen_linear_attention_packed_weights_by_default(projection):
-    name = f"model.layers.0.linear_attn.{projection}.weight"
-    tensor = torch.zeros(8, 4, dtype=torch.bfloat16)
-    out = dict(
-        WeightSyncHandler._quantize_buffer_for_fp8(
-            [(name, tensor)],
-            quantization_config={"quant_method": "fp8", "weight_block_size": [2, 4]},
-        )
-    )
-
-    assert set(out) == {name, f"model.layers.0.linear_attn.{projection}.weight_scale_inv"}
-    assert out[name].dtype == torch.float8_e4m3fn
-
-
-@pytest.mark.parametrize("prefix", ["model.layers.0.mlp.shared_expert", "model.layers.0.mlp.shared_experts"])
-@pytest.mark.parametrize("projection", ["gate_proj", "up_proj", "down_proj"])
-def test_fp8_quantization_includes_shared_expert_projections_by_default(prefix, projection):
-    name = f"{prefix}.{projection}.weight"
-    tensor = torch.zeros(8, 4, dtype=torch.bfloat16)
-    out = dict(
-        WeightSyncHandler._quantize_buffer_for_fp8(
-            [(name, tensor)],
-            quantization_config={"quant_method": "fp8", "weight_block_size": [2, 4]},
-        )
-    )
-
-    assert set(out) == {name, f"{prefix}.{projection}.weight_scale_inv"}
-    assert out[name].dtype == torch.float8_e4m3fn
-    assert out[f"{prefix}.{projection}.weight_scale_inv"].dtype == torch.float32
+    assert [name for name, _ in items] == [
+        "model.layers.0.mlp.experts.0.gate_proj.weight",
+        "model.layers.0.mlp.experts.0.up_proj.weight",
+        "model.layers.0.mlp.experts.0.down_proj.weight",
+    ]
+    for _, tensor in items:
+        assert tensor.dtype == torch.bfloat16
+        assert tensor.shape == (1, 1)
+        assert tensor.float().item() == pytest.approx(4.0)
+    assert ctx["lora_params"] is None
 
 
-def test_fp8_quantization_skips_shared_expert_gate_by_default():
-    name = "model.layers.0.mlp.shared_expert_gate.weight"
-    tensor = torch.zeros(1, 8, dtype=torch.bfloat16)
-    out = WeightSyncHandler._quantize_buffer_for_fp8(
-        [(name, tensor)],
-        quantization_config={"quant_method": "fp8", "weight_block_size": [2, 4]},
-    )
-
-    assert out == [(name, tensor)]
-
-
-def test_fp8_quantization_includes_qwen_linear_attention_packed_projections():
-    names = [
-        "model.layers.0.linear_attn.in_proj_qkv.weight",
-        "model.layers.0.linear_attn.in_proj_z.weight",
-        "model.layers.0.linear_attn.in_proj_b.weight",
-        "model.layers.0.linear_attn.in_proj_a.weight",
+def _assert_fp8_projection_selection_stack_and_existing_dtype_policy():
+    quantized_names = [
+        "model.layers.0.self_attn.fused_qkv_a_proj_with_mqa.weight",
+        *(
+            f"model.layers.0.linear_attn.{projection}.weight"
+            for projection in ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
+        ),
+        *(
+            f"{prefix}.{projection}.weight"
+            for prefix in ("model.layers.0.mlp.shared_expert", "model.layers.0.mlp.shared_experts")
+            for projection in ("gate_proj", "up_proj", "down_proj")
+        ),
+    ]
+    passthrough_names = [
+        "model.embed_tokens.weight",
+        "model.layers.0.mlp.shared_expert_gate.weight",
     ]
     tensor = torch.zeros(8, 4, dtype=torch.bfloat16)
 
     out = WeightSyncHandler._quantize_buffer_for_fp8(
-        [(name, tensor) for name in names],
+        [(name, tensor) for name in (*quantized_names, *passthrough_names)],
         quantization_config={"quant_method": "fp8", "weight_block_size": [2, 4]},
         target_device="cpu",
     )
 
     out_by_name = dict(out)
-    assert set(out_by_name) == set(names) | {name.replace(".weight", ".weight_scale_inv") for name in names}
-    for name in names:
+    assert set(out_by_name) == (
+        set(quantized_names)
+        | {name.replace(".weight", ".weight_scale_inv") for name in quantized_names}
+        | set(passthrough_names)
+    )
+    for name in quantized_names:
         assert out_by_name[name].dtype == torch.float8_e4m3fn
         assert out_by_name[name.replace(".weight", ".weight_scale_inv")].dtype == torch.float32
+    for name in passthrough_names:
+        assert out_by_name[name] is tensor
+
+    _assert_fp8_respects_modules_to_not_convert()
+    _assert_fp8_receiver_skip_list_preserves_passthrough_entries()
+    _assert_fp8_receiver_skip_list_enables_broad_selector()
+    _assert_fp8_stack_and_existing_dtype_policy()
 
 
-def test_fp8_quantization_respects_modules_to_not_convert():
+def _assert_fp8_respects_modules_to_not_convert():
     name = "model.layers.0.mlp.gate_proj.weight"
     tensor = torch.zeros(8, 4, dtype=torch.bfloat16)
-    out = WeightSyncHandler._quantize_buffer_for_fp8(
-        [(name, tensor)],
-        quantization_config={
-            "quant_method": "fp8",
-            "weight_block_size": [2, 4],
-            "modules_to_not_convert": ["model.layers.0.mlp.gate_proj"],
-        },
-    )
-
-    assert out == [(name, tensor)]
-
-
-def test_fp8_quantization_respects_modules_to_not_convert_weight_suffix():
-    name = "model.layers.0.mlp.gate_proj.weight"
-    tensor = torch.zeros(8, 4, dtype=torch.bfloat16)
-    out = WeightSyncHandler._quantize_buffer_for_fp8(
-        [(name, tensor)],
-        quantization_config={
-            "quant_method": "fp8",
-            "weight_block_size": [2, 4],
-            "modules_to_not_convert": ["model.layers.0.mlp.gate_proj.weight"],
-        },
-    )
-
-    assert out == [(name, tensor)]
+    for excluded_name in ("model.layers.0.mlp.gate_proj", "model.layers.0.mlp.gate_proj.weight"):
+        out = WeightSyncHandler._quantize_buffer_for_fp8(
+            [(name, tensor)],
+            quantization_config={
+                "quant_method": "fp8",
+                "weight_block_size": [2, 4],
+                "modules_to_not_convert": [excluded_name],
+            },
+        )
+        assert out == [(name, tensor)], excluded_name
 
 
-def test_fp8_quantization_with_receiver_skip_list_preserves_qwen_passthrough_entries():
+def _assert_fp8_receiver_skip_list_preserves_passthrough_entries():
     entries = [
         ("model.embed_tokens.weight", torch.zeros(16, 8, dtype=torch.bfloat16)),
         ("model.layers.0.input_layernorm.weight", torch.ones(8, dtype=torch.bfloat16)),
@@ -726,7 +752,7 @@ def test_fp8_quantization_with_receiver_skip_list_preserves_qwen_passthrough_ent
         assert out[name] is dict(entries)[name]
 
 
-def test_fp8_quantization_with_receiver_skip_list_uses_broad_2d_selector():
+def _assert_fp8_receiver_skip_list_enables_broad_selector():
     name = "model.layers.0.custom_dense.weight"
     tensor = torch.zeros(8, 4, dtype=torch.bfloat16)
 
@@ -750,15 +776,7 @@ def test_fp8_quantization_with_receiver_skip_list_uses_broad_2d_selector():
     assert skip_list_out[name].dtype == torch.float8_e4m3fn
 
 
-def test_fp8_quantization_can_detect_contiguous_expert_slice_groups():
-    stack = torch.zeros(3, 4, 8, dtype=torch.bfloat16)
-
-    assert WeightSyncHandler._can_group_fp8_tensor(stack[0], stack[1], 1)
-    assert WeightSyncHandler._can_group_fp8_tensor(stack[0], stack[2], 2)
-    assert not WeightSyncHandler._can_group_fp8_tensor(stack[0], stack[2], 1)
-
-
-def test_fp8_stack_quantization_matches_single_tensor_quantization():
+def _assert_fp8_stack_and_existing_dtype_policy():
     stack = torch.arange(3 * 4 * 8, dtype=torch.bfloat16).reshape(3, 4, 8)
     kwargs = {
         "fp8_dtype": torch.float8_e4m3fn,
@@ -777,8 +795,10 @@ def test_fp8_stack_quantization_matches_single_tensor_quantization():
         assert torch.equal(quantized_stack[idx].float(), quantized.float())
         assert torch.equal(scale_stack[idx], scale)
 
+    _assert_fp8_skips_already_quantized_weights()
 
-def test_fp8_quantization_skips_already_quantized_weights():
+
+def _assert_fp8_skips_already_quantized_weights():
     name = "model.layers.0.mlp.gate_proj.weight"
     tensor = torch.zeros(4, 8, dtype=torch.float8_e4m3fn)
 
@@ -790,7 +810,7 @@ def test_fp8_quantization_skips_already_quantized_weights():
     assert out == [(name, tensor)]
 
 
-def test_fp8_cpu_expert_projection_quantization_emits_hf_weights_and_scales():
+def _assert_fp8_cpu_expert_projection_and_workspace_policy(monkeypatch):
     local_data = torch.arange(2 * 4 * 8, dtype=torch.bfloat16).reshape(2, 4, 8)
     phase_s = {}
 
@@ -816,8 +836,14 @@ def test_fp8_cpu_expert_projection_quantization_emits_hf_weights_and_scales():
     assert out_by_name["model.layers.0.mlp.experts.2.gate_proj.weight_scale_inv"].shape == (4, 1)
     assert phase_s["direct_ep_fp8_cpu_transpose_s"] >= 0
 
+    _assert_fp8_cpu_expert_zero_padding()
+    _assert_fp8_cpu_expert_can_defer_quantization()
+    _assert_fp8_cpu_expert_respects_modules_to_not_convert()
+    with monkeypatch.context() as case_patch:
+        _assert_fp8_cpu_workspace_lifecycle_policy(case_patch)
 
-def test_fp8_cpu_expert_projection_zero_padding_differs_from_last_element_padding_for_partial_layout():
+
+def _assert_fp8_cpu_expert_zero_padding():
     block_size = (4, 4)
     hf_weight = torch.tensor(
         [
@@ -851,7 +877,7 @@ def test_fp8_cpu_expert_projection_zero_padding_differs_from_last_element_paddin
     assert not torch.equal(out_by_name[weight_name].view(torch.uint8), last_padded_weight.view(torch.uint8))
 
 
-def test_fp8_cpu_expert_projection_can_defer_quantization():
+def _assert_fp8_cpu_expert_can_defer_quantization():
     local_data = torch.arange(2 * 4 * 8, dtype=torch.bfloat16).reshape(2, 4, 8)
     phase_s = {}
 
@@ -876,7 +902,7 @@ def test_fp8_cpu_expert_projection_can_defer_quantization():
     assert phase_s["direct_ep_fp8_cpu_transpose_s"] >= 0
 
 
-def test_fp8_cpu_workspace_stages_quantizes_and_reuses_storage(monkeypatch):
+def _assert_fp8_cpu_workspace_lifecycle_policy(monkeypatch):
     monkeypatch.setenv("XORL_P2P_FP8_CPU_WORKSPACE", "1")
     monkeypatch.setenv("XORL_P2P_FP8_CPU_WORKSPACE_PINNED", "0")
     monkeypatch.setenv("XORL_P2P_FP8_CPU_WORKSPACE_MIN_CAPACITY", "2")
@@ -936,8 +962,12 @@ def test_fp8_cpu_workspace_stages_quantizes_and_reuses_storage(monkeypatch):
     )
     assert handler._fp8_cpu_workspaces[records[0][1]]["input"].data_ptr() == input_ptr
 
+    _assert_fp8_cpu_workspace_streams_quantized_chunks(monkeypatch)
+    _assert_fp8_cpu_workspace_flush_resets_capacity(monkeypatch)
+    _assert_empty_moe_flush_preserves_completion_metadata()
 
-def test_fp8_cpu_workspace_streams_quantized_chunks(monkeypatch):
+
+def _assert_fp8_cpu_workspace_streams_quantized_chunks(monkeypatch):
     class RecordingBackend:
         def __init__(self):
             self.calls = []
@@ -1010,7 +1040,7 @@ def test_fp8_cpu_workspace_streams_quantized_chunks(monkeypatch):
     assert phase_s["direct_ep_fp8_workspace_stream_wait_s"] >= 0
 
 
-def test_fp8_cpu_workspace_flush_resets_used_capacity(monkeypatch):
+def _assert_fp8_cpu_workspace_flush_resets_capacity(monkeypatch):
     class RecordingBackend:
         def __init__(self):
             self.calls = []
@@ -1024,6 +1054,7 @@ def test_fp8_cpu_workspace_flush_resets_used_capacity(monkeypatch):
                 }
             )
 
+    monkeypatch.delenv("XORL_P2P_FP8_CPU_WORKSPACE_STREAMING", raising=False)
     monkeypatch.setenv("XORL_P2P_FP8_CPU_WORKSPACE", "1")
     monkeypatch.setenv("XORL_P2P_FP8_CPU_WORKSPACE_PINNED", "0")
     monkeypatch.setenv("XORL_P2P_FP8_CPU_WORKSPACE_MIN_CAPACITY", "2")
@@ -1074,7 +1105,7 @@ def test_fp8_cpu_workspace_flush_resets_used_capacity(monkeypatch):
     assert [index for _, _, index in records] == [0, 1]
 
 
-def test_empty_moe_final_flush_preserves_p2p_completion_metadata():
+def _assert_empty_moe_flush_preserves_completion_metadata():
     class Config:
         def __init__(self):
             self.backend_config = {}
@@ -1100,7 +1131,7 @@ def test_empty_moe_final_flush_preserves_p2p_completion_metadata():
     assert backend.config.backend_config["weight_version"] == "sync-2"
 
 
-def test_fp8_cpu_expert_projection_respects_modules_to_not_convert():
+def _assert_fp8_cpu_expert_respects_modules_to_not_convert():
     local_data = torch.arange(2 * 4 * 8, dtype=torch.bfloat16).reshape(2, 4, 8)
 
     out, _ = WeightSyncHandler._quantize_ep_expert_projection_for_fp8_cpu(
@@ -1126,7 +1157,7 @@ def test_fp8_cpu_expert_projection_respects_modules_to_not_convert():
     assert out_by_name["model.layers.0.mlp.experts.0.gate_proj.weight"].device.type == "cpu"
 
 
-def test_sync_extraction_folds_fused_gdn_lora_into_separate_base_projections():
+def _assert_sync_extraction_folds_fused_gdn_lora_into_separate_base_projections():
     # River fuses one LoRA on GDN in_proj_qkvz (out = q|k|v|z contiguous) and one on
     # out_proj. The weight sync must FOLD those deltas into the trainer's SEPARATE
     # base q/k/v/g/o projections (contiguous row slices) and NOT ship the raw
@@ -1183,80 +1214,61 @@ def test_sync_extraction_folds_fused_gdn_lora_into_separate_base_projections():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_fp8_gpu_stack_quantization_returns_cpu_tensors(monkeypatch):
-    monkeypatch.setenv("XORL_P2P_FP8_QUANTIZE_DEVICE", "gpu")
-    stack = torch.arange(2 * 128 * 128, dtype=torch.bfloat16, device="cuda").reshape(2, 128, 128)
-    phase_s = {}
-
-    quantized, scale = WeightSyncHandler._quantize_fp8_stack(
-        stack,
-        fp8_dtype=torch.float8_e4m3fn,
-        fp8_max=torch.finfo(torch.float8_e4m3fn).max,
-        block_size_row=128,
-        block_size_col=128,
-        target_device="cpu",
-        phase_s=phase_s,
-        phase_prefix="test_fp8",
-    )
-
-    assert quantized.device.type == "cpu"
-    assert scale.device.type == "cpu"
-    assert quantized.dtype == torch.float8_e4m3fn
-    assert scale.shape == (2, 1, 1)
-    assert phase_s["test_fp8_gpu_quant_s"] >= 0
-    assert phase_s["test_fp8_gpu_output_copy_s"] >= 0
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_fp8_gpu_stack_quantization_returns_cuda_tensors_for_cuda_target(monkeypatch):
-    monkeypatch.setenv("XORL_P2P_FP8_QUANTIZE_DEVICE", "gpu")
-    stack = torch.arange(2 * 128 * 128, dtype=torch.bfloat16, device="cuda").reshape(2, 128, 128)
-    phase_s = {}
-
-    quantized, scale = WeightSyncHandler._quantize_fp8_stack(
-        stack,
-        fp8_dtype=torch.float8_e4m3fn,
-        fp8_max=torch.finfo(torch.float8_e4m3fn).max,
-        block_size_row=128,
-        block_size_col=128,
-        target_device="cuda",
-        phase_s=phase_s,
-        phase_prefix="test_fp8",
-    )
-
-    assert quantized.device.type == "cuda"
-    assert scale.device.type == "cuda"
-    assert quantized.dtype == torch.float8_e4m3fn
-    assert scale.shape == (2, 1, 1)
-    assert phase_s["test_fp8_gpu_quant_s"] >= 0
-    assert "test_fp8_gpu_output_copy_s" not in phase_s
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_fp8_gpu_stack_quantization_matches_cpu_path(monkeypatch):
+def test_fp8_gpu_quantization_policy(monkeypatch):
     base = torch.linspace(-7.5, 7.5, steps=2 * 128 * 256, dtype=torch.float32).reshape(2, 128, 256)
     stack = base.to(torch.bfloat16).cuda()
-    kwargs = {
+    common_kwargs = {
         "fp8_dtype": torch.float8_e4m3fn,
         "fp8_max": torch.finfo(torch.float8_e4m3fn).max,
         "block_size_row": 128,
         "block_size_col": 128,
-        "target_device": "cpu",
-        "phase_s": {},
         "phase_prefix": "test_fp8",
     }
 
     monkeypatch.setenv("XORL_P2P_FP8_QUANTIZE_DEVICE", "gpu")
-    gpu_quantized, gpu_scale = WeightSyncHandler._quantize_fp8_stack(stack, **kwargs)
+    gpu_cpu_phase = {}
+    gpu_quantized, gpu_scale = WeightSyncHandler._quantize_fp8_stack(
+        stack,
+        target_device="cpu",
+        phase_s=gpu_cpu_phase,
+        **common_kwargs,
+    )
+    assert gpu_quantized.device.type == "cpu"
+    assert gpu_scale.device.type == "cpu"
+    assert gpu_quantized.dtype == torch.float8_e4m3fn
+    assert gpu_cpu_phase["test_fp8_gpu_quant_s"] >= 0
+    assert gpu_cpu_phase["test_fp8_gpu_output_copy_s"] >= 0
+
+    gpu_cuda_phase = {}
+    cuda_quantized, cuda_scale = WeightSyncHandler._quantize_fp8_stack(
+        stack,
+        target_device="cuda",
+        phase_s=gpu_cuda_phase,
+        **common_kwargs,
+    )
+    assert cuda_quantized.device.type == "cuda"
+    assert cuda_scale.device.type == "cuda"
+    assert gpu_cuda_phase["test_fp8_gpu_quant_s"] >= 0
+    assert "test_fp8_gpu_output_copy_s" not in gpu_cuda_phase
+
     monkeypatch.setenv("XORL_P2P_FP8_QUANTIZE_DEVICE", "cpu")
-    cpu_quantized, cpu_scale = WeightSyncHandler._quantize_fp8_stack(stack.cpu(), **kwargs)
+    cpu_quantized, cpu_scale = WeightSyncHandler._quantize_fp8_stack(
+        stack.cpu(),
+        target_device="cpu",
+        phase_s={},
+        **common_kwargs,
+    )
 
     torch.testing.assert_close(gpu_scale, cpu_scale, rtol=0.0, atol=1e-6)
     torch.testing.assert_close(gpu_quantized.float(), cpu_quantized.float(), rtol=0.0, atol=0.0)
+    torch.testing.assert_close(cuda_scale.cpu(), cpu_scale, rtol=0.0, atol=1e-6)
+    torch.testing.assert_close(cuda_quantized.float().cpu(), cpu_quantized.float(), rtol=0.0, atol=0.0)
+
+    _assert_fp8_gpu_expert_matches_cpu_path(monkeypatch)
+    _assert_fp8_gpu_expert_respects_modules_to_not_convert(monkeypatch)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_fp8_gpu_expert_projection_matches_cpu_direct_ep_path(monkeypatch):
+def _assert_fp8_gpu_expert_matches_cpu_path(monkeypatch):
     monkeypatch.setenv("XORL_P2P_FP8_QUANTIZE_DEVICE", "gpu")
     base = torch.linspace(-9.0, 9.0, steps=3 * 256 * 128, dtype=torch.float32).reshape(3, 256, 128)
     local_cpu = base.to(torch.bfloat16)
@@ -1293,8 +1305,7 @@ def test_fp8_gpu_expert_projection_matches_cpu_direct_ep_path(monkeypatch):
             torch.testing.assert_close(gpu_tensor.float(), cpu_tensor.float(), rtol=0.0, atol=0.0)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_fp8_gpu_expert_projection_respects_modules_to_not_convert(monkeypatch):
+def _assert_fp8_gpu_expert_respects_modules_to_not_convert(monkeypatch):
     monkeypatch.setenv("XORL_P2P_FP8_QUANTIZE_DEVICE", "gpu")
     local_data = torch.arange(2 * 128 * 128, dtype=torch.bfloat16, device="cuda").reshape(2, 128, 128)
 

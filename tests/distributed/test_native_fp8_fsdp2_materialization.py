@@ -56,8 +56,9 @@ class _NestedNativeModel(nn.Module):
 
 
 def _run_fsdp2_materialization_regression() -> None:
-    assert torch.__version__ == "2.12.1+cu132"
-    assert torch.__future__.get_swap_module_params_on_conversion() is False
+    # Exercise the replacement path that originally corrupted frozen DTensor
+    # parameters instead of assuming the process-wide default still selects it.
+    torch.__future__.set_swap_module_params_on_conversion(False)
     dist.init_process_group(backend="gloo")
     try:
         mesh = init_device_mesh("cpu", (dist.get_world_size(),), mesh_dim_names=("dp_shard",))
@@ -121,23 +122,24 @@ def _run_fsdp2_materialization_regression() -> None:
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("family", ("linear", "experts"))
-def test_native_fp8_plain_apply_keeps_frozen_fp32_state(family: str) -> None:
+def test_native_fp8_plain_apply_keeps_frozen_fp32_state() -> None:
     """The DTensor fix must not change ordinary device/dtype conversion."""
 
-    module = _make_native_module(family, "meta")
-    module.to_empty(device=torch.device("cpu"))
-    _assert_frozen_fp32_parameters(module, device=torch.device("cpu"))
-    assert all(not isinstance(parameter, DTensor) for parameter in module.parameters())
-    before = {
-        name: parameter.detach().view(torch.uint8).clone() for name, parameter in module.named_parameters(recurse=False)
-    }
+    for family in ("linear", "experts"):
+        module = _make_native_module(family, "meta")
+        module.to_empty(device=torch.device("cpu"))
+        _assert_frozen_fp32_parameters(module, device=torch.device("cpu"))
+        assert all(not isinstance(parameter, DTensor) for parameter in module.parameters())
+        before = {
+            name: parameter.detach().view(torch.uint8).clone()
+            for name, parameter in module.named_parameters(recurse=False)
+        }
 
-    module.to(device=torch.device("cpu"), dtype=torch.bfloat16)
+        module.to(device=torch.device("cpu"), dtype=torch.bfloat16)
 
-    _assert_frozen_fp32_parameters(module, device=torch.device("cpu"))
-    for name, parameter in module.named_parameters(recurse=False):
-        assert torch.equal(parameter.detach().view(torch.uint8), before[name])
+        _assert_frozen_fp32_parameters(module, device=torch.device("cpu"))
+        for name, parameter in module.named_parameters(recurse=False):
+            assert torch.equal(parameter.detach().view(torch.uint8), before[name]), family
 
 
 if __name__ != "__main__":

@@ -106,7 +106,6 @@ from xorl.server.runner.utils import (
     MoeMetricsTracker,
     RoutingReplayHandler,
     batch_slice_rank_and_size,
-    ep_duplicate_batches_enabled,
     run_self_test,
     validate_token_ids,
 )
@@ -149,16 +148,8 @@ from xorl.utils.seqlen_pos_transform_utils import pos2culen
 logger = logging.getLogger(__name__)
 
 
-def _truthy_flag(value: Any) -> bool:
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "on"}
-    return bool(value)
-
-
 def _skip_empty_cache_after_optim_step(train_config: Dict[str, Any]) -> bool:
-    return _truthy_flag(os.environ.get("XORL_SKIP_EMPTY_CACHE_AFTER_OPTIM_STEP", False)) or _truthy_flag(
-        train_config.get("skip_empty_cache_after_optim_step", False)
-    )
+    return train_config.get("skip_empty_cache_after_optim_step") is True
 
 
 def _optimizer_effective_hparams(optimizer: Any) -> Dict[str, Any]:
@@ -277,11 +268,6 @@ def _sp_allreduce_kl_metrics(
     unfinalized. ``valid_tokens`` SUM-reduces alongside them; downstream
     accumulation divides mean metrics by the final token count.
     """
-    # Backward-compatible argument order for older tests/call sites:
-    # _sp_allreduce_kl_metrics(metrics, metric_ops, sp_group).
-    if isinstance(sp_group, dict):
-        metric_ops, sp_group = sp_group, metric_ops
-
     device = torch.device(get_device_type())
     local_n = float(metrics.get("valid_tokens", metrics.get("_n_valid_kl", 0)) or 0)
     metrics["valid_tokens"] = local_n
@@ -2192,32 +2178,8 @@ class ModelRunner:
             "router_logits": 35,
             "router_routing_weights": 36,
             "router_selected_experts": 37,
-            "materialized_layer_input": 38,
-            "delayed_pair_delta": 38,
-            "delayed_pair_residual": 38,
-            "delayed_pair_shard_sum": 38,
-            "delayed_pair_shard_materialized": 38,
             "input_norm_residual": 39,
             "attn_output_eager_candidate": 40,
-            "post_attention_o_proj_partial_sum": 41,
-            "post_attention_partial_residual": 41,
-            "post_attention_o_proj_partial_sum_split_output": 41,
-            "post_attention_partial_residual_split_output": 41,
-            "post_attention_o_proj_partial_sum_sum_then_residual": 41,
-            "post_attention_partial_residual_sum_then_residual": 41,
-            "post_attention_o_proj_partial_sum_residual_then_partials": 41,
-            "post_attention_partial_residual_residual_then_partials": 41,
-            "post_attention_o_proj_partial_sum_fp32_sum_then_residual": 41,
-            "post_attention_partial_residual_fp32_sum_then_residual": 41,
-            "moe_experts_output_tp_shard_0": 42,
-            "moe_experts_output_tp_shard_1": 42,
-            "moe_experts_output_tp_shard_2": 42,
-            "moe_experts_output_tp_shard_3": 42,
-            "moe_experts_output_tp_shard_4": 42,
-            "moe_experts_output_tp_shard_5": 42,
-            "moe_experts_output_tp_shard_6": 42,
-            "moe_experts_output_tp_shard_7": 42,
-            "moe_experts_output_tp_shard_sum": 42,
             "moe_experts_output_override": 43,
             "moe_input_override": 44,
             "final_residual_input": 45,
@@ -3131,15 +3093,12 @@ class ModelRunner:
         """Return this rank's logical cache slice key, or None for duplicate shards.
 
         Must mirror the dispatcher's batch_slice_rank_and_size mapping so cache
-        rows merge back in client datum order. Under legacy EP batch duplication
-        (XORL_SERVER_EP_DUPLICATE_BATCHES=1) only ep_rank 0 contributes.
+        rows merge back in client datum order.
         """
         if getattr(ps, "cp_enabled", False) and int(getattr(ps, "cp_rank", 0)) != 0:
             return None
 
         if getattr(ps, "ep_enabled", False):
-            if ep_duplicate_batches_enabled() and int(getattr(ps, "ep_rank", 0)) != 0:
-                return None
             cp_size = max(1, int(getattr(ps, "cp_size", 1) or 1)) if getattr(ps, "cp_enabled", False) else 1
             pp_size = max(1, int(getattr(ps, "pp_size", 1)))
             slice_rank, _ = batch_slice_rank_and_size(self.rank, self.world_size, ps, cp_size, pp_size)
@@ -3427,13 +3386,11 @@ class ModelRunner:
                     accumulated[key] = {"sum": zero(), "op": "sum_max"}
 
     @staticmethod
-    def _finalize_loss_metrics(accumulated, result, loss_fn: Optional[str] = None):
+    def _finalize_loss_metrics(accumulated, result, loss_fn: str):
         """All-reduce loss metrics, then add reduced values to result dict."""
         if not accumulated:
             return
         ps = get_parallel_state()
-        if loss_fn is None and all(str(k).startswith("opd_") for k in accumulated):
-            loss_fn = "opd_loss"
 
         if loss_fn == "opd_loss":
             reduce_group = ps.loss_group if ps.loss_parallel_enabled else None

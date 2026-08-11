@@ -412,17 +412,6 @@ class ServerArguments:
         default=None,
         metadata={"help": "Optional short names, FQNs, or globs to keep out of QARL fake quantization."},
     )
-    fp8_cfg: Optional[Dict[str, Any]] = field(
-        default=None,
-        metadata={
-            "help": (
-                "Optional compatibility alias for NeMo-style FP8 configs. Supported values are "
-                "{enabled: true, fp8: e4m3, fp8_recipe: blockwise, fp8_param: false}; "
-                "TransformerEngine-only recipes are rejected."
-            )
-        },
-    )
-
     fp8_training_num_first_layers_bf16: int = field(
         default=0,
         metadata={"help": "Number of initial decoder layers to keep in BF16 when FP8 training is enabled."},
@@ -882,18 +871,6 @@ class ServerArguments:
         },
     )
 
-    externalize_r3_payloads: bool = field(
-        default=False,
-        metadata={
-            "help": ("Deprecated alias for r3_payload_transport='mooncake'. Kept only for PR-426 compatibility.")
-        },
-    )
-
-    keep_r3_payloads: bool = field(
-        default=False,
-        metadata={"help": "Deprecated alias for r3_payload_keep."},
-    )
-
     storage_limit: str = field(
         default="10TB",
         metadata={
@@ -1181,7 +1158,6 @@ class ServerArguments:
 
     def __post_init__(self):
         """Validate and set defaults."""
-        from xorl.fp8_training.config_compat import normalize_fp8_training_config  # noqa: PLC0415
         from xorl.qarl import normalize_qarl_quant_cfg, qarl_unsupported_scope_reason  # noqa: PLC0415
         from xorl.server.orchestrator.packing import ON_OVERSIZED_MODES, PACKING_STRATEGIES  # noqa: PLC0415
 
@@ -1196,15 +1172,6 @@ class ServerArguments:
             )
         if self.pad_to_multiple_of < 1:
             raise ValueError(f"pad_to_multiple_of must be >= 1, got {self.pad_to_multiple_of}")
-        if self.externalize_r3_payloads:
-            if self.r3_payload_transport not in {"inline", "mooncake"}:
-                raise ValueError(
-                    "externalize_r3_payloads=True is a deprecated alias for "
-                    "r3_payload_transport='mooncake' and cannot be combined with filesystem transport"
-                )
-            self.r3_payload_transport = "mooncake"
-        if self.keep_r3_payloads:
-            self.r3_payload_keep = True
         if self.r3_payload_transport == "inline":
             if self.r3_payload_dir:
                 raise ValueError("r3_payload_dir requires r3_payload_transport='filesystem'")
@@ -1223,8 +1190,6 @@ class ServerArguments:
                 f"r3_payload_transport must be one of: inline, mooncake, filesystem; got {self.r3_payload_transport!r}"
             )
 
-        normalized_fp8_config = normalize_fp8_training_config(vars(self), context="server.train")
-        self.enable_fp8_training = bool(normalized_fp8_config.get("enable_fp8_training", self.enable_fp8_training))
         if self.enable_qarl and self.enable_fp8_training:
             raise ValueError(
                 "enable_qarl cannot be combined with enable_fp8_training; choose one low-precision train path"
@@ -1447,7 +1412,6 @@ class ServerArguments:
                 "qarl_sync_format": self.qarl_sync_format,
                 "qarl_target_modules": self.qarl_target_modules,
                 "qarl_exclude_modules": self.qarl_exclude_modules,
-                "fp8_cfg": self.fp8_cfg,
                 "fp8_training_num_first_layers_bf16": self.fp8_training_num_first_layers_bf16,
                 "fp8_training_num_last_layers_bf16": self.fp8_training_num_last_layers_bf16,
                 "fp8_training_allow_blackwell": self.fp8_training_allow_blackwell,

@@ -15,27 +15,15 @@ def _handler() -> rrh.RoutingReplayHandler:
     return rrh.RoutingReplayHandler(torch.nn.Module())
 
 
-def test_sp_routing_uses_actual_position_ids_length_without_128_padding(monkeypatch):
-    monkeypatch.setattr(rrh, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=True, cp_size=4, cp_rank=1))
-    micro_batches = [
+def _assert_sp_routing_uses_actual_position_length_with_and_without_padding(monkeypatch):
+    unpadded_batches = [
         {
             "input_ids": torch.zeros(1, 93, dtype=torch.long),
             "position_ids": torch.arange(372, dtype=torch.long).view(1, 372),
             "num_samples": 1,
         }
     ]
-
-    per_mb = _handler()._build_per_mb_routing(micro_batches, [_routing(0, 372)], num_layers_in_data=1, topk=2)
-
-    assert len(per_mb) == 1
-    assert per_mb[0].shape == (93, 1, 2)
-    assert per_mb[0][0, 0, 0].item() == 93
-    assert per_mb[0][-1, 0, 0].item() == 185
-
-
-def test_sp_routing_pads_to_actual_position_ids_length(monkeypatch):
-    monkeypatch.setattr(rrh, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=True, cp_size=4, cp_rank=3))
-    micro_batches = [
+    padded_batches = [
         {
             "input_ids": torch.zeros(1, 96, dtype=torch.long),
             "position_ids": torch.arange(384, dtype=torch.long).view(1, 384),
@@ -43,15 +31,20 @@ def test_sp_routing_pads_to_actual_position_ids_length(monkeypatch):
         }
     ]
 
-    per_mb = _handler()._build_per_mb_routing(micro_batches, [_routing(0, 372)], num_layers_in_data=1, topk=2)
+    monkeypatch.setattr(rrh, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=True, cp_size=4, cp_rank=1))
+    unpadded = _handler()._build_per_mb_routing(unpadded_batches, [_routing(0, 372)], 1, 2)
+    assert len(unpadded) == 1
+    assert unpadded[0].shape == (93, 1, 2)
+    assert unpadded[0][[0, -1], 0, 0].tolist() == [93, 185]
 
-    assert per_mb[0].shape == (96, 1, 2)
-    assert per_mb[0][0, 0, 0].item() == 288
-    assert per_mb[0][83, 0, 0].item() == 371
-    assert per_mb[0][84, 0].tolist() == [0, 1]
+    monkeypatch.setattr(rrh, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=True, cp_size=4, cp_rank=3))
+    padded = _handler()._build_per_mb_routing(padded_batches, [_routing(0, 372)], 1, 2)
+    assert padded[0].shape == (96, 1, 2)
+    assert padded[0][[0, 83], 0, 0].tolist() == [288, 371]
+    assert padded[0][84, 0].tolist() == [0, 1]
 
 
-def test_sp_routing_slices_unpacked_rows_independently(monkeypatch):
+def _assert_sp_routing_slices_unpacked_rows_independently(monkeypatch):
     monkeypatch.setattr(rrh, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=True, cp_size=4, cp_rank=1))
     micro_batches = [
         {
@@ -72,7 +65,7 @@ def test_sp_routing_slices_unpacked_rows_independently(monkeypatch):
     assert per_mb[0][:, 0, 0].tolist() == [3, 4, 5, 103, 104, 105]
 
 
-def test_ringattn_routing_uses_zigzag_layout_before_sp_slice(monkeypatch):
+def _assert_ringattn_routing_uses_zigzag_layout_before_sp_slice(monkeypatch):
     expected_by_rank = {
         0: [0, 1],
         1: [6, 7],
@@ -105,7 +98,7 @@ def test_ringattn_routing_uses_zigzag_layout_before_sp_slice(monkeypatch):
         assert per_mb[0][:, 0, 0].tolist() == expected
 
 
-def test_ringattn_routing_zigzag_respects_packed_document_boundaries(monkeypatch):
+def _assert_ringattn_routing_zigzag_respects_packed_document_boundaries(monkeypatch):
     monkeypatch.setattr(
         rrh,
         "get_parallel_state",
@@ -131,7 +124,7 @@ def test_ringattn_routing_zigzag_respects_packed_document_boundaries(monkeypatch
     assert per_mb[0][:, 0, 0].tolist() == [0, 3, 4, 7]
 
 
-def test_routing_truncates_excess_to_micro_batch_size(monkeypatch):
+def _assert_routing_truncates_excess_to_micro_batch_size(monkeypatch):
     monkeypatch.setattr(rrh, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=False))
     micro_batches = [{"input_ids": torch.zeros(1, 3, dtype=torch.long), "num_samples": 1}]
 
@@ -141,7 +134,7 @@ def test_routing_truncates_excess_to_micro_batch_size(monkeypatch):
     assert per_mb[0][:, 0, 0].tolist() == [0, 1, 2]
 
 
-def test_routing_weight_builder_preserves_float_values_and_padding(monkeypatch):
+def _assert_routing_weight_builder_preserves_float_values_and_padding(monkeypatch):
     monkeypatch.setattr(rrh, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=False))
     micro_batches = [{"input_ids": torch.zeros(1, 3, dtype=torch.long), "num_samples": 1}]
     weights = [[[[0.25, 0.75]], [[0.10, 0.90]]]]
@@ -170,7 +163,7 @@ def test_routing_weight_builder_preserves_float_values_and_padding(monkeypatch):
 # expert selections, so this is validated on CPU before spending GPU capacity.
 
 
-def test_decode_routed_experts_sglang_dict_base64_int32_format():
+def _assert_decode_routed_experts_sglang_dict_base64_int32_format():
     handler = _handler()
     arr = np.arange(3 * 2 * 8, dtype=np.int32).reshape(3, 2, 8)
     item = {"data": base64.b64encode(arr.tobytes()).decode("ascii"), "shape": [3, 2, 8]}
@@ -181,8 +174,8 @@ def test_decode_routed_experts_sglang_dict_base64_int32_format():
     np.testing.assert_array_equal(decoded, arr)
 
 
-def test_decode_routed_experts_base64_string_infers_shape_from_model_topk():
-    model = SimpleNamespace(config=SimpleNamespace(num_experts_per_tok=8))
+def _assert_decode_routed_experts_base64_string_infers_shape_from_model_topk():
+    model = SimpleNamespace(config=SimpleNamespace(text_config=SimpleNamespace(num_experts_per_tok=8)))
     handler = rrh.RoutingReplayHandler(model)
     assert handler._model_topk == 8
     arr = np.arange(4 * 2 * 8, dtype=np.int32).reshape(4, 2, 8)
@@ -194,42 +187,23 @@ def test_decode_routed_experts_base64_string_infers_shape_from_model_topk():
     np.testing.assert_array_equal(decoded, arr)
 
 
-def test_decode_routed_experts_nested_list_passthrough():
+def _assert_decode_routed_replay_accepts_materialized_python_numpy_and_tensor_values():
     handler = _handler()
     nested = [[[1, 2], [3, 4]], [[5, 6], [7, 8]]]
-
     assert handler.decode_routed_experts_item(nested, num_moe_layers=2) == nested
 
-
-def test_decode_routed_experts_accepts_decoded_numpy_array():
-    handler = _handler()
     arr = np.arange(3 * 2 * 2, dtype=np.int32).reshape(3, 2, 2)
-
     decoded = handler.decode_routed_experts_item(arr, num_moe_layers=2)
-
     assert isinstance(decoded, np.ndarray)
     np.testing.assert_array_equal(decoded, arr)
 
-
-def test_decode_routed_expert_logits_accepts_decoded_tensor():
-    handler = _handler()
     tensor = torch.arange(3 * 2 * 2, dtype=torch.float32).reshape(3, 2, 2)
-
     decoded = handler.decode_routed_expert_logits_item(tensor, num_moe_layers=2)
-
     assert isinstance(decoded, np.ndarray)
     np.testing.assert_array_equal(decoded, tensor.numpy())
 
 
-def test_decode_routed_experts_topk_extracted_from_nested_text_config():
-    # Qwen3.6 nests num_experts_per_tok under text_config; the handler must read
-    # it there so shape inference does not mispick top-k from row 0.
-    model = SimpleNamespace(config=SimpleNamespace(text_config=SimpleNamespace(num_experts_per_tok=8)))
-
-    assert rrh.RoutingReplayHandler(model)._model_topk == 8
-
-
-def test_routing_weight_builder_accepts_decoded_numpy_arrays(monkeypatch):
+def _assert_routing_weight_builder_accepts_decoded_numpy_arrays(monkeypatch):
     monkeypatch.setattr(rrh, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=True, cp_size=2, cp_rank=1))
     micro_batches = [
         {
@@ -251,3 +225,22 @@ def test_routing_weight_builder_accepts_decoded_numpy_arrays(monkeypatch):
     assert per_mb[0].dtype == torch.float32
     assert per_mb[0].shape == (3, 1, 2)
     torch.testing.assert_close(per_mb[0][:, 0, :], torch.tensor([[6.0, 7.0], [8.0, 9.0], [10.0, 11.0]]))
+
+
+def test_routing_replay_context_parallel_layout_contract(monkeypatch):
+    with monkeypatch.context() as sequence_patch:
+        _assert_sp_routing_uses_actual_position_length_with_and_without_padding(sequence_patch)
+        _assert_sp_routing_slices_unpacked_rows_independently(sequence_patch)
+        _assert_routing_truncates_excess_to_micro_batch_size(sequence_patch)
+
+    with monkeypatch.context() as ring_patch:
+        _assert_ringattn_routing_uses_zigzag_layout_before_sp_slice(ring_patch)
+        _assert_ringattn_routing_zigzag_respects_packed_document_boundaries(ring_patch)
+
+
+def test_routing_replay_wire_decode_and_weight_tensor_contract(monkeypatch):
+    _assert_decode_routed_experts_sglang_dict_base64_int32_format()
+    _assert_decode_routed_experts_base64_string_infers_shape_from_model_topk()
+    _assert_decode_routed_replay_accepts_materialized_python_numpy_and_tensor_values()
+    _assert_routing_weight_builder_preserves_float_values_and_padding(monkeypatch)
+    _assert_routing_weight_builder_accepts_decoded_numpy_arrays(monkeypatch)

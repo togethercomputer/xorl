@@ -32,7 +32,7 @@ def _literal_cpu_value(base_weight, captures):
     return run
 
 
-def test_exact_tp1_wrapper_admits_only_rank1_alpha1_without_bias_or_aqn() -> None:
+def _assert_exact_tp1_configuration_and_runtime_admission_policy() -> None:
     module = _module()
 
     assert module.contract_version == GLM52_EXACT_TP1_QLORA_CONTRACT_VERSION
@@ -55,8 +55,21 @@ def test_exact_tp1_wrapper_admits_only_rank1_alpha1_without_bias_or_aqn() -> Non
     with pytest.raises(ValueError, match="only lora_rank=1 and lora_alpha=1"):
         module.set_runtime_lora_config(2, 1)
 
+    before = {name for name in sys.modules if name == "sglang" or name.startswith("sglang.")}
+    with pytest.raises(TypeError, match="requires BF16 activations"):
+        module(torch.zeros(1, 8, dtype=torch.float32))
+    with pytest.raises(ValueError, match="contiguous sampler-layout"):
+        module(torch.zeros(8, 2, dtype=torch.bfloat16).transpose(0, 1))
+    with pytest.raises(RuntimeError, match="requires CUDA"):
+        module(torch.zeros(1, 8, dtype=torch.bfloat16))
 
-def test_exact_tp1_model_dtype_move_preserves_packed_state_master_dtype_and_identity() -> None:
+    after = {name for name in sys.modules if name == "sglang" or name.startswith("sglang.")}
+    assert after == before
+
+    _assert_exact_tp1_model_dtype_move_preserves_packed_state_master_dtype_and_identity()
+
+
+def _assert_exact_tp1_model_dtype_move_preserves_packed_state_master_dtype_and_identity() -> None:
     module = _module()
     with torch.no_grad():
         module.packed_weight_f32.copy_(
@@ -84,7 +97,8 @@ def test_exact_tp1_model_dtype_move_preserves_packed_state_master_dtype_and_iden
     assert torch.equal(module.weight_block_scales, scale_bytes)
 
 
-def test_exact_tp1_wrapper_rounds_master_factors_once_before_value_forward(monkeypatch) -> None:
+def test_exact_tp1_forward_surrogate_backward_and_safety_policy(monkeypatch) -> None:
+    _assert_exact_tp1_configuration_and_runtime_admission_policy()
     module = _module()
     base_weight = torch.arange(48, dtype=torch.float32).reshape(6, 8).div_(97).to(torch.bfloat16)
     captures = []
@@ -99,8 +113,6 @@ def test_exact_tp1_wrapper_rounds_master_factors_once_before_value_forward(monke
     expected = _literal_cpu_value(base_weight, [])(input, effective_A, effective_B)
     assert torch.equal(output, expected)
 
-
-def test_exact_tp1_surrogate_backward_matches_effective_factor_qlora_reference(monkeypatch) -> None:
     module = _module()
     base_weight = torch.arange(48, dtype=torch.float32).reshape(6, 8).sub_(17).div_(41).to(torch.bfloat16)
     monkeypatch.setattr(module, "_dequantize_weight", lambda: base_weight.float())
@@ -141,8 +153,10 @@ def test_exact_tp1_surrogate_backward_matches_effective_factor_qlora_reference(m
     assert torch.equal(module.lora_A.grad, reference_A.grad)
     assert torch.equal(module.lora_B.grad, reference_B.grad)
 
+    _assert_exact_tp1_backward_safety_policy(monkeypatch)
 
-def test_exact_tp1_factor_only_backward_does_not_materialize_base(monkeypatch) -> None:
+
+def _assert_exact_tp1_backward_safety_policy(monkeypatch) -> None:
     module = _module()
     base_weight = torch.zeros(6, 8, dtype=torch.bfloat16)
     monkeypatch.setattr(module, "_exact_forward_value", _literal_cpu_value(base_weight, []))
@@ -157,8 +171,6 @@ def test_exact_tp1_factor_only_backward_does_not_materialize_base(monkeypatch) -
     assert module.lora_A.grad is not None
     assert module.lora_B.grad is not None
 
-
-def test_exact_tp1_backward_rejects_master_mutation(monkeypatch) -> None:
     module = _module()
     base_weight = torch.zeros(6, 8, dtype=torch.bfloat16)
     monkeypatch.setattr(module, "_exact_forward_value", _literal_cpu_value(base_weight, []))
@@ -170,21 +182,6 @@ def test_exact_tp1_backward_rejects_master_mutation(monkeypatch) -> None:
 
     with pytest.raises(RuntimeError, match="modified by an inplace operation"):
         output.float().sum().backward()
-
-
-def test_exact_tp1_contract_fails_before_any_sglang_import() -> None:
-    before = {name for name in sys.modules if name == "sglang" or name.startswith("sglang.")}
-    module = _module()
-
-    with pytest.raises(TypeError, match="requires BF16 activations"):
-        module(torch.zeros(1, 8, dtype=torch.float32))
-    with pytest.raises(ValueError, match="contiguous sampler-layout"):
-        module(torch.zeros(8, 2, dtype=torch.bfloat16).transpose(0, 1))
-    with pytest.raises(RuntimeError, match="requires CUDA"):
-        module(torch.zeros(1, 8, dtype=torch.bfloat16))
-
-    after = {name for name in sys.modules if name == "sglang" or name.startswith("sglang.")}
-    assert after == before
 
 
 @pytest.mark.gpu

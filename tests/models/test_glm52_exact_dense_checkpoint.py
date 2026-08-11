@@ -83,8 +83,10 @@ def test_exact_dense_checkpoint_handler_emits_one_explicit_gate_then_up_native_p
     assert mlp._exact_gate_up_base_loaded is True
     handler.on_load_complete()
 
+    _assert_exact_dense_gate_up_pair_buffer_fails_on_missing_duplicate_or_invalid_members()
 
-def test_exact_dense_gate_up_pair_buffer_fails_on_missing_duplicate_or_invalid_members() -> None:
+
+def _assert_exact_dense_gate_up_pair_buffer_fails_on_missing_duplicate_or_invalid_members() -> None:
     model, _ = _model()
     pairs = _pairs()
 

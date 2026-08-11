@@ -76,7 +76,14 @@ def _build(monkeypatch, captured, *, model=None, server_training=False, freeze_r
     )
 
 
-def test_exact_server_model_wraps_trunk_linears_before_parallelize(monkeypatch):
+def test_exact_server_trunk_and_numerical_family_selection_policy(monkeypatch):
+    with monkeypatch.context() as trunk_patch:
+        _assert_trunk_linear_contract_engages_only_for_exact_server_models(trunk_patch)
+    with monkeypatch.context() as family_patch:
+        _assert_model_structure_selects_and_restores_v2_numerical_families(family_patch)
+
+
+def _assert_trunk_linear_contract_engages_only_for_exact_server_models(monkeypatch):
     captured = {}
     result = _build(monkeypatch, captured, model=ExactTinyTrunkModel(), server_training=True)
 
@@ -85,8 +92,7 @@ def test_exact_server_model_wraps_trunk_linears_before_parallelize(monkeypatch):
     assert not getattr(result.model.lm_head, "_xorl_bi_trunk_wrapped", False)
     assert is_trunk_linear_contract_enabled()
 
-
-def test_non_exact_server_model_does_not_wrap(monkeypatch):
+    set_trunk_linear_contract(False)
     captured = {}
     _build(monkeypatch, captured, server_training=True)
 
@@ -94,8 +100,6 @@ def test_non_exact_server_model_does_not_wrap(monkeypatch):
     assert captured["wrapped_at_parallelize"] == 0
     assert not is_trunk_linear_contract_enabled()
 
-
-def test_exact_model_is_not_implicitly_engaged_outside_server_training(monkeypatch):
     captured = {}
     _build(monkeypatch, captured, model=ExactTinyTrunkModel(), server_training=False)
 
@@ -103,7 +107,10 @@ def test_exact_model_is_not_implicitly_engaged_outside_server_training(monkeypat
     assert captured["wrapped_at_parallelize"] == 0
 
 
-def test_glm52_selects_v2_family_structurally(monkeypatch):
+def _assert_model_structure_selects_and_restores_v2_numerical_families(monkeypatch):
+    bi_families_v2._select_nonexact_families()
+    assert bi_families_v2.families_v2_enabled() is True
+
     captured = {}
     model = TinyTrunkModel()
     model.config = SimpleNamespace(
@@ -111,18 +118,13 @@ def test_glm52_selects_v2_family_structurally(monkeypatch):
         indexer_types=["full"],
         _glm52_exact_contract=True,
     )
-    monkeypatch.setenv("XORL_FAMILIES_V2", "0")
-
     _build(monkeypatch, captured, model=model, freeze_router=True)
 
     assert bi_families_v2.families_v2_enabled() is True
+    assert bi_families_v2._EXACT_FAMILIES_VERSION == "v2"
 
-
-def test_ordinary_model_restores_nonexact_family_selection(monkeypatch):
     captured = {}
-    bi_families_v2._select_glm52_families_v2()
-    monkeypatch.setenv("XORL_FAMILIES_V2", "0")
-
     _build(monkeypatch, captured)
 
-    assert bi_families_v2.families_v2_enabled() is False
+    assert bi_families_v2.families_v2_enabled() is True
+    assert bi_families_v2._EXACT_FAMILIES_VERSION is None

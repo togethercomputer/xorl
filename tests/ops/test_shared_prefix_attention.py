@@ -18,7 +18,10 @@ pytestmark = pytest.mark.gpu
 if not torch.cuda.is_available():
     pytest.skip("shared-prefix attention requires CUDA", allow_module_level=True)
 
-from flash_attn_interface import flash_attn_varlen_func  # noqa: E402
+flash_attn_varlen_func = pytest.importorskip(
+    "flash_attn_interface",
+    reason="shared-prefix attention requires the optional FA3 interface",
+).flash_attn_varlen_func
 
 from xorl.models.layers.attention.backend.shared_prefix_attention import (  # noqa: E402
     shared_prefix_attention_forward,
@@ -94,10 +97,7 @@ def _reference_dense(qp, kp, vp, qd, kd, vd, Rs, scale):
     return out.index_select(0, torch.tensor(dec_idx, device=qp.device))
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("head_dim", [64, 128])
-@pytest.mark.parametrize("hq,hkv", [(4, 4), (8, 2)])
-def test_shared_prefix_matches_dense_fwd_bwd(dtype, head_dim, hq, hkv):
+def _assert_shared_prefix_matches_dense_fwd_bwd(dtype, head_dim, hq, hkv):
     torch.manual_seed(0)
     device = "cuda"
     P, Rs = 48, [16, 8, 24]
@@ -131,7 +131,16 @@ def test_shared_prefix_matches_dense_fwd_bwd(dtype, head_dim, hq, hkv):
         torch.testing.assert_close(b, a, atol=tol, rtol=tol, msg=f"grad mismatch: {name}")
 
 
-def test_shared_prefix_singleton_equals_plain_causal():
+def test_shared_prefix_matches_dense_fwd_bwd_matrix():
+    for dtype in (torch.float16, torch.bfloat16):
+        for head_dim in (64, 128):
+            for hq, hkv in ((4, 4), (8, 2)):
+                _assert_shared_prefix_matches_dense_fwd_bwd(dtype, head_dim, hq, hkv)
+
+    _assert_shared_prefix_singleton_equals_plain_causal()
+
+
+def _assert_shared_prefix_singleton_equals_plain_causal():
     """A 1-member group reduces to ordinary causal attention over [prefix, resp]."""
     torch.manual_seed(1)
     device, dtype, head_dim, h = "cuda", torch.bfloat16, 64, 4
@@ -159,8 +168,10 @@ def test_shared_prefix_singleton_equals_plain_causal():
     )
     torch.testing.assert_close(out.squeeze(0)[ctx.dec_idx], ref, atol=2e-2, rtol=2e-2)
 
+    _assert_shared_prefix_p_equals_one_no_cross()
 
-def test_shared_prefix_p_equals_one_no_cross():
+
+def _assert_shared_prefix_p_equals_one_no_cross():
     """P==1 group (empty shared block) uses decoded self-attn only."""
     torch.manual_seed(2)
     device, dtype, head_dim, h = "cuda", torch.bfloat16, 64, 4

@@ -63,7 +63,7 @@ def _literal_gate_up_value(
     return (base + torch.cat((gate_delta, up_delta), dim=-1)).to(torch.bfloat16)
 
 
-def test_dense_mlp_root_preserves_six_canonical_unique_factor_paths_without_aliases() -> None:
+def _assert_dense_mlp_root_preserves_six_canonical_unique_factor_paths_without_aliases() -> None:
     module = _module()
     module.bind_checkpoint_sources("model.layers.0.mlp")
 
@@ -110,7 +110,9 @@ def test_dense_mlp_root_preserves_six_canonical_unique_factor_paths_without_alia
         module.bind_checkpoint_sources("model.layers.1.mlp")
 
 
-def test_dense_mlp_forward_composes_fused_gate_up_production_activation_and_exact_down(monkeypatch) -> None:
+def test_dense_mlp_forward_composes_fused_gate_up_production_activation_and_exact_down(monkeypatch, tmp_path) -> None:
+    _assert_dense_mlp_root_preserves_six_canonical_unique_factor_paths_without_aliases()
+    _assert_dense_mlp_runtime_rank_alpha_contract_is_atomic_and_fails_before_forward()
     module = _module()
     fused_base = torch.arange(256 * 8, dtype=torch.float32).reshape(256, 8).sub_(719).div_(1543).to(torch.bfloat16)
     down_base = torch.arange(8 * 128, dtype=torch.float32).reshape(8, 128).sub_(401).div_(1291).to(torch.bfloat16)
@@ -162,9 +164,10 @@ def test_dense_mlp_forward_composes_fused_gate_up_production_activation_and_exac
         ("down", (3, 128)),
     ]
     assert torch.equal(actual, expected)
+    _assert_dense_mlp_roundtrips_six_canonical_factors_through_xorl_and_peft_export(tmp_path)
 
 
-def test_dense_mlp_runtime_rank_alpha_contract_is_atomic_and_fails_before_forward() -> None:
+def _assert_dense_mlp_runtime_rank_alpha_contract_is_atomic_and_fails_before_forward() -> None:
     with pytest.raises(ValueError, match="rank=1 and alpha=1"):
         Glm52ExactTP1DenseMLP(8, 128, r=2, lora_alpha=1)
     with pytest.raises(ValueError, match="rank=1 and alpha=1"):
@@ -196,7 +199,7 @@ def test_dense_mlp_runtime_rank_alpha_contract_is_atomic_and_fails_before_forwar
         module(input)
 
 
-def test_dense_mlp_roundtrips_six_canonical_factors_through_xorl_and_peft_export(tmp_path) -> None:
+def _assert_dense_mlp_roundtrips_six_canonical_factors_through_xorl_and_peft_export(tmp_path) -> None:
     source = _module()
     state = get_lora_state_dict(source)
     assert tuple(state) == source.logical_factor_names

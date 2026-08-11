@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from xorl.ops.dsv4 import utils
 from xorl.ops.dsv4.compressor import DeepSeekV4Compressor
 from xorl.ops.dsv4.rope import precompute_freqs_cis
 
@@ -36,8 +37,7 @@ def _compressor_config(max_position_embeddings=768):
     )
 
 
-def test_c128_context_parallel_only_requires_ratio_divisibility(monkeypatch):
-    monkeypatch.delenv("XORL_DSV4_ROPE_MAX_SEQ_LEN", raising=False)
+def test_context_parallel_compression_ratio_admission_policy(monkeypatch):
     precompute_freqs_cis.cache_clear()
 
     compressor = DeepSeekV4Compressor(
@@ -56,9 +56,22 @@ def test_c128_context_parallel_only_requires_ratio_divisibility(monkeypatch):
 
     assert out.shape == (1, 3, 16)
 
+    # Exercise the cache-capacity guard through its production CP consumer.
+    short_cache_compressor = DeepSeekV4Compressor(
+        _compressor_config(max_position_embeddings=600),
+        head_dim=16,
+        compress_ratio=128,
+        rotate=False,
+        cp_group=_FakeCPGroup(),
+    )
+    with pytest.raises(ValueError, match="RoPE cache is too short"):
+        short_cache_compressor.forward_raw(torch.ones(1, 384, 32))
 
-def test_c4_context_parallel_keeps_overlap_divisibility_guard(monkeypatch):
-    monkeypatch.delenv("XORL_DSV4_ROPE_MAX_SEQ_LEN", raising=False)
+    _assert_c4_context_parallel_keeps_overlap_divisibility_guard(monkeypatch)
+    _assert_rotate_activation_fallback_is_orthonormal(monkeypatch)
+
+
+def _assert_c4_context_parallel_keeps_overlap_divisibility_guard(monkeypatch):
     precompute_freqs_cis.cache_clear()
 
     compressor = DeepSeekV4Compressor(
@@ -71,3 +84,18 @@ def test_c4_context_parallel_keeps_overlap_divisibility_guard(monkeypatch):
 
     with pytest.raises(AssertionError, match="overlap=True"):
         compressor.forward_raw(torch.ones(1, 12, 32))
+
+
+def _assert_rotate_activation_fallback_is_orthonormal(monkeypatch):
+    monkeypatch.setattr(utils, "_fast_hadamard_transform", None)
+    pattern = torch.tensor([[1.0, 0.0, 0.0, 0.0]], dtype=torch.bfloat16)
+    torch.testing.assert_close(utils.rotate_activation(pattern), torch.full_like(pattern, 0.5))
+
+    torch.manual_seed(0)
+    for width in (4, 16, 64, 256):
+        values = torch.randn(3, width, dtype=torch.bfloat16)
+        rotated = utils.rotate_activation(values)
+        torch.testing.assert_close(utils.rotate_activation(rotated), values, atol=8e-3, rtol=8e-3)
+        input_norm = values.float().pow(2).sum(dim=-1).sqrt()
+        output_norm = rotated.float().pow(2).sum(dim=-1).sqrt()
+        torch.testing.assert_close(input_norm, output_norm, atol=1e-2, rtol=1e-2)

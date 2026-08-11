@@ -138,22 +138,6 @@ class Glm52LayerPlan:
             raise ValueError(f"Pipeline layer ranges must cover exactly {num_layers} layers")
 
     @property
-    def full_indexer_layers(self) -> tuple[int, ...]:
-        return tuple(layer.layer_index for layer in self.layers if layer.indexer_type is IndexerType.FULL)
-
-    @property
-    def shared_indexer_layers(self) -> tuple[int, ...]:
-        return tuple(layer.layer_index for layer in self.layers if layer.indexer_type is IndexerType.SHARED)
-
-    @property
-    def dense_layers(self) -> tuple[int, ...]:
-        return tuple(layer.layer_index for layer in self.layers if layer.mlp_type is MLPType.DENSE)
-
-    @property
-    def sparse_layers(self) -> tuple[int, ...]:
-        return tuple(layer.layer_index for layer in self.layers if layer.mlp_type is MLPType.SPARSE)
-
-    @property
     def identity(self) -> str:
         payload = {
             "layers": [

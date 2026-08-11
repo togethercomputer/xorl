@@ -332,21 +332,3 @@ def deserialize_message(data: bytes) -> BaseMessage:
     if envelope["version"] != _WIRE_VERSION:
         raise ValueError(f"Unsupported runner protocol version: {envelope['version']!r}")
     return _message_from_mapping(envelope["message"])
-
-
-def create_ack_for_request(request: RunnerDispatchCommand) -> RunnerAck:
-    """Create an acknowledgement for a given request."""
-    return RunnerAck(request_id=request.message_id, received_at=time.time())
-
-
-def create_response_for_request(
-    request: RunnerDispatchCommand,
-    success: bool,
-    result: Optional[Dict[str, Any]] = None,
-    error: Optional[str] = None,
-    execution_time: Optional[float] = None,
-) -> RunnerResponse:
-    """Create a response for a given request."""
-    return RunnerResponse(
-        request_id=request.message_id, success=success, result=result or {}, error=error, execution_time=execution_time
-    )

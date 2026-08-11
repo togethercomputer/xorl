@@ -174,8 +174,6 @@ class RequestProcessor:
         r3_payload_dir: Optional[str] = None,
         r3_payload_keep: bool = False,
         r3_payload_namespace_prefix: Optional[str] = None,
-        routing_payload_dir: Optional[str] = None,
-        keep_routing_payloads: Optional[bool] = None,
         routing_payload_store: Optional[MooncakeSidePayloadStore] = None,
     ):
         """
@@ -198,8 +196,6 @@ class RequestProcessor:
             r3_payload_dir: Shared directory used only by the explicit filesystem fallback.
             r3_payload_keep: If True, do not delete side payloads after the backend call.
             r3_payload_namespace_prefix: Optional Mooncake namespace prefix for R3 payload keys.
-            routing_payload_dir: Backward-compatible alias for filesystem transport.
-            keep_routing_payloads: Backward-compatible alias for r3_payload_keep.
             routing_payload_store: Optional injected Mooncake side-payload store for tests.
         """
         self.backend = backend
@@ -210,13 +206,6 @@ class RequestProcessor:
         self.packing_strategy = packing_strategy
         self.on_oversized = on_oversized
         self.dp_size = max(1, int(dp_size))
-        if routing_payload_dir is not None:
-            if r3_payload_transport != "inline":
-                raise ValueError("routing_payload_dir alias cannot be combined with r3_payload_transport")
-            r3_payload_transport = "filesystem"
-            r3_payload_dir = routing_payload_dir
-        if keep_routing_payloads is not None:
-            r3_payload_keep = bool(keep_routing_payloads)
         if r3_payload_transport not in {"inline", "mooncake", "filesystem"}:
             raise ValueError(f"Unsupported r3_payload_transport {r3_payload_transport!r}")
         if r3_payload_transport == "inline" and r3_payload_keep:
@@ -376,9 +365,9 @@ class RequestProcessor:
             log_fn = logger.info if _r3_verbose_logging_enabled() else logger.debug
             log_fn("Cleaned external R3 Mooncake routing payload keys")
             return
-        self._cleanup_routing_payload_dir(cleanup)
+        self._cleanup_r3_payload_dir(cleanup)
 
-    def _cleanup_routing_payload_dir(self, root: Path) -> None:
+    def _cleanup_r3_payload_dir(self, root: Path) -> None:
         try:
             shutil.rmtree(root)
         except FileNotFoundError:

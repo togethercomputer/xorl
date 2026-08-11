@@ -8,7 +8,6 @@ import pytest
 
 from xorl.distributed.pipeline_parallel import (
     generate_llm_fqn_per_model_part,
-    is_single_stage_schedule,
     schedule_splits_backward,
     schedule_stage_style,
     stage_ids_for_rank,
@@ -22,7 +21,7 @@ pytestmark = [pytest.mark.distributed, pytest.mark.gpu]
 class TestFQNGeneration:
     """Test generate_llm_fqn_per_model_part FQN distribution logic."""
 
-    def test_basic_stage_distribution(self):
+    def _assert_fqn_partitioning_policy(self):
         """Various stage/layer combos: correct stage count, all layers present and contiguous."""
         # 2 stages, 4 layers (default FQN names)
         result = generate_llm_fqn_per_model_part(2, 4)
@@ -51,7 +50,14 @@ class TestFQNGeneration:
         result = generate_llm_fqn_per_model_part(2, 2)
         assert len([m for stage in result for m in stage if m.startswith("layers.")]) == 2
 
-    def test_qwen3_fqn_names_and_single_stage(self):
+        self._assert_qwen3_fqn_names_and_single_stage()
+        self._assert_error_too_many_stages()
+        self._assert_virtual_stage_split()
+        self._assert_explicit_first_last_layer_counts()
+        self._assert_explicit_layer_counts_infeasible()
+        self._assert_weighted_split_coverage()
+
+    def _assert_qwen3_fqn_names_and_single_stage(self):
         """Qwen3-style nested FQN names; single stage contains all modules."""
         result = generate_llm_fqn_per_model_part(
             2,
@@ -72,12 +78,12 @@ class TestFQNGeneration:
         assert result[0][-1] == "output"
         assert len(result[0]) == 7  # tok_embeddings + 4 layers + norm + output
 
-    def test_error_too_many_stages(self):
+    def _assert_error_too_many_stages(self):
         """Error when more stages than effective layers."""
         with pytest.raises(ValueError):
             generate_llm_fqn_per_model_part(10, 2)
 
-    def test_virtual_stage_split(self):
+    def _assert_virtual_stage_split(self):
         """num_stages > pp_degree (virtual stages): all layers covered, contiguous."""
         result = generate_llm_fqn_per_model_part(
             4,
@@ -92,7 +98,7 @@ class TestFQNGeneration:
         all_layers = [m for stage in result for m in stage if m.startswith("model.layers.")]
         assert all_layers == [f"model.layers.{i}" for i in range(8)]
 
-    def test_explicit_first_last_layer_counts(self):
+    def _assert_explicit_first_last_layer_counts(self):
         """Megatron-style pinned first/last stage layer counts override the weight heuristic."""
         result = generate_llm_fqn_per_model_part(4, 8, num_layers_in_first_stage=1, num_layers_in_last_stage=1)
         layer_counts = [len([m for m in stage if m.startswith("layers.")]) for stage in result]
@@ -105,14 +111,14 @@ class TestFQNGeneration:
         layer_counts = [len([m for m in stage if m.startswith("layers.")]) for stage in result]
         assert layer_counts == [1, 3, 3]
 
-    def test_explicit_layer_counts_infeasible(self):
+    def _assert_explicit_layer_counts_infeasible(self):
         """Pinned counts leaving too few layers for the unpinned stages raise."""
         with pytest.raises(ValueError):
             generate_llm_fqn_per_model_part(4, 3, num_layers_in_first_stage=1, num_layers_in_last_stage=1)
         with pytest.raises(ValueError):
             generate_llm_fqn_per_model_part(2, 4, num_layers_in_first_stage=3, num_layers_in_last_stage=3)
 
-    def test_weighted_split_coverage(self):
+    def _assert_weighted_split_coverage(self):
         """input/output weights shift layers off the first/last stages but never drop layers."""
         result = generate_llm_fqn_per_model_part(6, 13, input_weight=2, output_weight=3)
         all_layers = [m for stage in result for m in stage if m.startswith("layers.")]
@@ -122,30 +128,37 @@ class TestFQNGeneration:
 class TestStagePlacement:
     """stage_ids_for_rank must match torch's generate_stage_to_rank_mapping."""
 
-    @pytest.mark.parametrize("pp_size", [2, 3, 4, 8])
-    @pytest.mark.parametrize("stages_per_rank", [1, 2, 4])
-    @pytest.mark.parametrize("style", ["loop", "v"])
-    def test_matches_torch_reference(self, pp_size, stages_per_rank, style):
+    def _assert_stage_placement_policy(self):
         from torch.distributed.pipelining._utils import generate_rank_to_stage_mapping
 
-        if style == "v" and stages_per_rank == 1:
-            pytest.skip("v-style requires >=2 stages per rank")
-        num_stages = pp_size * stages_per_rank
-        ref = generate_rank_to_stage_mapping(pp_size, num_stages, style=style)
-        for rank in range(pp_size):
-            assert stage_ids_for_rank(rank, pp_size, num_stages, style) == ref[rank]
+        # One single-stage loop mapping and both multi-stage formulas exercise
+        # every production branch. More PP sizes only repeat the same index
+        # arithmetic and previously created 24 separately collected cases.
+        for pp_size, stages_per_rank, style in (
+            (2, 1, "loop"),
+            (4, 2, "loop"),
+            (4, 2, "v"),
+        ):
+            num_stages = pp_size * stages_per_rank
+            reference = generate_rank_to_stage_mapping(pp_size, num_stages, style=style)
+            for rank in range(pp_size):
+                assert stage_ids_for_rank(rank, pp_size, num_stages, style) == reference[rank]
 
-    def test_every_stage_owned_exactly_once(self):
+        self._assert_every_stage_owned_exactly_once()
+        self._assert_single_style_requires_one_stage_per_rank()
+        self._assert_v_style_first_rank_owns_first_and_last()
+
+    def _assert_every_stage_owned_exactly_once(self):
         for style in ("loop", "v"):
             owned = [s for r in range(4) for s in stage_ids_for_rank(r, 4, 8, style)]
             assert sorted(owned) == list(range(8))
 
-    def test_single_style_requires_one_stage_per_rank(self):
+    def _assert_single_style_requires_one_stage_per_rank(self):
         assert stage_ids_for_rank(1, 4, 4, "single") == [1]
         with pytest.raises(ValueError):
             stage_ids_for_rank(0, 4, 8, "single")
 
-    def test_v_style_first_rank_owns_first_and_last(self):
+    def _assert_v_style_first_rank_owns_first_and_last(self):
         assert stage_ids_for_rank(0, 4, 8, "v") == [0, 7]
         assert stage_ids_for_rank(3, 4, 8, "v") == [3, 4]
 
@@ -153,39 +166,29 @@ class TestStagePlacement:
 class TestScheduleValidation:
     """Schedule whitelist + virtual-stage/microbatch constraint checks."""
 
-    def test_styles(self):
-        assert schedule_stage_style("1F1B") == "single"
-        assert schedule_stage_style("GPipe") == "single"
-        assert schedule_stage_style("Interleaved1F1B") == "loop"
-        assert schedule_stage_style("InterleavedZeroBubble") == "loop"
-        assert schedule_stage_style("ZBVZeroBubble") == "v"
-        assert schedule_stage_style("DualPipeV") == "v"
+    def _assert_schedule_metadata_and_admission_policy(self):
+        expected = {
+            "1F1B": ("single", False),
+            "GPipe": ("single", False),
+            "Interleaved1F1B": ("loop", False),
+            "InterleavedZeroBubble": ("loop", True),
+            "ZBVZeroBubble": ("v", True),
+            "DualPipeV": ("v", True),
+        }
+        for schedule, (style, splits_backward) in expected.items():
+            assert schedule_stage_style(schedule) == style
+            assert schedule_splits_backward(schedule) is splits_backward
         with pytest.raises(ValueError):
             schedule_stage_style("LoopedBFS")
 
-    def test_single_vs_multi_classification(self):
-        assert is_single_stage_schedule("1F1B")
-        assert is_single_stage_schedule("GPipe")
-        assert not is_single_stage_schedule("Interleaved1F1B")
-        assert not is_single_stage_schedule("ZBVZeroBubble")
+        self._assert_schedule_config_admission()
 
-    def test_backward_split_classification(self):
-        # dX/dW-splitting schedules need donated buffers disabled (retain_graph backward)
-        assert schedule_splits_backward("InterleavedZeroBubble")
-        assert schedule_splits_backward("ZBVZeroBubble")
-        assert schedule_splits_backward("DualPipeV")
-        assert not schedule_splits_backward("1F1B")
-        assert not schedule_splits_backward("GPipe")
-        assert not schedule_splits_backward("Interleaved1F1B")
-
-    def test_valid_configs_pass(self):
+    def _assert_schedule_config_admission(self):
         validate_pp_schedule_config("1F1B", 1, 8, 4)
         validate_pp_schedule_config("Interleaved1F1B", 2, 8, 4)
         validate_pp_schedule_config("InterleavedZeroBubble", 2, 8, 4)
         validate_pp_schedule_config("ZBVZeroBubble", 2, 8, 4)
         validate_pp_schedule_config("DualPipeV", 2, 8, 4)
-
-    def test_invalid_configs_raise(self):
         # single-stage schedule with virtual stages
         with pytest.raises(ValueError):
             validate_pp_schedule_config("1F1B", 2, 8, 4)
@@ -201,3 +204,9 @@ class TestScheduleValidation:
         # DualPipeV minimum microbatch count (m >= num_stages)
         with pytest.raises(ValueError):
             validate_pp_schedule_config("DualPipeV", 2, 4, 4)
+
+
+def test_pipeline_partition_placement_and_schedule_policy():
+    TestFQNGeneration()._assert_fqn_partitioning_policy()
+    TestStagePlacement()._assert_stage_placement_policy()
+    TestScheduleValidation()._assert_schedule_metadata_and_admission_policy()

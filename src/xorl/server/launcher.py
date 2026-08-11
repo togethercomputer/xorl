@@ -40,7 +40,7 @@ import requests
 import uvicorn
 import yaml
 
-from xorl.fp8_training.config_compat import extract_nemo_fp8_cfg, validate_external_fp8_runtime_config
+from xorl.fp8_training.config_compat import validate_external_fp8_runtime_config
 from xorl.server.api_server.server import APIServer
 from xorl.server.orchestrator.orchestrator import Orchestrator
 from xorl.server.removed_config import reject_removed_configuration_fields
@@ -95,35 +95,6 @@ def configure_uvicorn_logging():
 # ============================================================================
 # Port Finding Utilities
 # ============================================================================
-
-
-def find_free_port(start_port: int = 50000, max_attempts: int = 10000) -> int:
-    """
-    Find a free port by randomly picking from a range.
-
-    Args:
-        start_port: Start of port range to search
-        max_attempts: Maximum number of ports to try
-
-    Returns:
-        Free port number
-
-    Raises:
-        RuntimeError: If no free port found
-    """
-
-    end_port = min(start_port + max_attempts, 60000)
-    ports = list(range(start_port, end_port))
-    random.shuffle(ports)
-    for port in ports:
-        with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
-            try:
-                sock.bind(("", port))
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                return port
-            except OSError:
-                continue
-    raise RuntimeError(f"Could not find free port in range {start_port}-{end_port}")
 
 
 def find_free_ports(count: int, start_port: int = 50000) -> List[int]:
@@ -435,7 +406,6 @@ def load_server_arguments(config_path: str, overrides: Optional[Dict[str, any]] 
 
     reject_removed_configuration_fields(config, context=f"server config {config_path!r}")
     validate_external_fp8_runtime_config(config, context=config_path)
-    nemo_fp8_cfg = extract_nemo_fp8_cfg(config)
 
     valid_fields = {f.name for f in fields(ServerArguments)}
 
@@ -453,9 +423,6 @@ def load_server_arguments(config_path: str, overrides: Optional[Dict[str, any]] 
         for section in ("model", "train"):
             for k, v in config.get(section, {}).items():
                 flat_config[k] = v
-        if nemo_fp8_cfg is not None and "fp8_cfg" not in flat_config:
-            flat_config["fp8_cfg"] = nemo_fp8_cfg
-
         # lora.* keys also map 1:1 except exclude_modules → qlora_exclude_modules
         for k, v in config.get("lora", {}).items():
             if k == "exclude_modules":
@@ -499,8 +466,6 @@ def load_server_arguments(config_path: str, overrides: Optional[Dict[str, any]] 
     else:
         # Flat config (ServerArguments style)
         flat_config = dict(config)
-        if nemo_fp8_cfg is not None and "fp8_cfg" not in flat_config:
-            flat_config["fp8_cfg"] = nemo_fp8_cfg
         filtered_config = {k: v for k, v in flat_config.items() if k in valid_fields}
 
         # Handle None values for Optional fields

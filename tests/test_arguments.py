@@ -12,158 +12,79 @@ from xorl.arguments import Arguments, parse_args
 pytestmark = [pytest.mark.cpu]
 
 
-def test_parse_args_accepts_signsgd_from_yaml(tmp_path, monkeypatch):
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text(
-        yaml.safe_dump(
-            {
-                "model": {
-                    "model_path": "Qwen/Qwen3-8B",
-                },
-                "data": {
-                    "datasets": [{"path": "dummy", "type": "tokenized"}],
-                },
-                "train": {
-                    "init_device": "meta",
-                    "output_dir": str(tmp_path / "outputs"),
-                    "optimizer": "signsgd",
-                    "use_wandb": False,
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-
+def test_parse_args_optimizer_packing_and_numeric_policy(tmp_path, monkeypatch):
     monkeypatch.setenv("WORLD_SIZE", "1")
     monkeypatch.setenv("LOCAL_WORLD_SIZE", "1")
     monkeypatch.setenv("RANK", "0")
     monkeypatch.setenv("LOCAL_RANK", "0")
-    monkeypatch.setattr(sys, "argv", ["train.py", str(config_path)])
 
-    args = parse_args(Arguments)
+    for optimizer in ("signsgd", "distsignsgd"):
+        config_path = tmp_path / f"{optimizer}.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "model": {
+                        "model_path": "Qwen/Qwen3-8B",
+                        "router_fp32": False,
+                        "lm_head_fp32": False,
+                        "rmsnorm_mode": "sglang",
+                        "activation_native": True,
+                        "rope_native": True,
+                        "attention_cast_bf16": True,
+                    },
+                    "data": {
+                        "datasets": [{"path": "dummy", "type": "tokenized"}],
+                        "sample_packing_method": "multipack",
+                        "sample_packing_sequence_len": 4096,
+                        "sample_packing_group_size": 64,
+                        "sample_packing_bin_size": 16,
+                    },
+                    "train": {
+                        "init_device": "meta",
+                        "output_dir": str(tmp_path / "outputs"),
+                        "optimizer": optimizer,
+                        "fsdp_reduce_dtype": "bf16",
+                        "skip_param_upcast": True,
+                        "use_wandb": False,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(sys, "argv", ["train.py", str(config_path)])
 
-    assert args.train.optimizer == "signsgd"
-    assert args.train.optimizer_kwargs == {}
-    assert args.train.load_weights_mode == "grouped"
+        args = parse_args(Arguments)
 
+        assert args.train.optimizer == optimizer
+        assert args.train.optimizer_kwargs == {}
+        assert args.train.load_weights_mode == "grouped"
+        assert args.train.fsdp_reduce_dtype == "bf16"
+        assert args.train.skip_param_upcast is True
+        assert args.data.sample_packing_method == "multipack"
+        assert args.data.sample_packing_sequence_len == 4096
+        assert args.data.sample_packing_group_size == 64
+        assert args.data.sample_packing_bin_size == 16
+        assert args.model.router_fp32 is False
+        assert args.model.lm_head_fp32 is False
+        assert args.model.rmsnorm_mode == "sglang"
+        assert args.model.activation_native is True
+        assert args.model.rope_native is True
+        assert args.model.attention_cast_bf16 is True
 
-def test_parse_args_accepts_distsignsgd_from_yaml(tmp_path, monkeypatch):
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text(
-        yaml.safe_dump(
-            {
-                "model": {
-                    "model_path": "Qwen/Qwen3-8B",
-                },
-                "data": {
-                    "datasets": [{"path": "dummy", "type": "tokenized"}],
-                },
-                "train": {
-                    "init_device": "meta",
-                    "output_dir": str(tmp_path / "outputs"),
-                    "optimizer": "distsignsgd",
-                    "use_wandb": False,
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    monkeypatch.setenv("WORLD_SIZE", "1")
-    monkeypatch.setenv("LOCAL_WORLD_SIZE", "1")
-    monkeypatch.setenv("RANK", "0")
-    monkeypatch.setenv("LOCAL_RANK", "0")
-    monkeypatch.setattr(sys, "argv", ["train.py", str(config_path)])
-
-    args = parse_args(Arguments)
-
-    assert args.train.optimizer == "distsignsgd"
-    assert args.train.optimizer_kwargs == {}
-
-
-def test_parse_args_accepts_multipack_bin_size_from_yaml(tmp_path, monkeypatch):
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text(
-        yaml.safe_dump(
-            {
-                "model": {
-                    "model_path": "Qwen/Qwen3-8B",
-                },
-                "data": {
-                    "datasets": [{"path": "dummy", "type": "tokenized"}],
-                    "sample_packing_method": "multipack",
-                    "sample_packing_sequence_len": 4096,
-                    "sample_packing_group_size": 64,
-                    "sample_packing_bin_size": 16,
-                },
-                "train": {
-                    "init_device": "meta",
-                    "output_dir": str(tmp_path / "outputs"),
-                    "use_wandb": False,
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    monkeypatch.setenv("WORLD_SIZE", "1")
-    monkeypatch.setenv("LOCAL_WORLD_SIZE", "1")
-    monkeypatch.setenv("RANK", "0")
-    monkeypatch.setenv("LOCAL_RANK", "0")
-    monkeypatch.setattr(sys, "argv", ["train.py", str(config_path)])
-
-    args = parse_args(Arguments)
-
-    assert args.data.sample_packing_method == "multipack"
-    assert args.data.sample_packing_sequence_len == 4096
-    assert args.data.sample_packing_group_size == 64
-    assert args.data.sample_packing_bin_size == 16
+    muon_root = tmp_path / "muon"
+    muon_root.mkdir()
+    _assert_parse_args_wires_muon_kwargs(muon_root, monkeypatch)
+    checkpoint_root = tmp_path / "checkpoint"
+    checkpoint_root.mkdir()
+    with monkeypatch.context() as checkpoint_patch:
+        _assert_parse_args_checkpoint_policy(checkpoint_root, checkpoint_patch)
+    low_precision_root = tmp_path / "low-precision"
+    low_precision_root.mkdir()
+    with monkeypatch.context() as low_precision_patch:
+        _assert_parse_args_low_precision_configuration_policy(low_precision_root, low_precision_patch)
 
 
-def test_parse_args_accepts_model_numeric_alignment_flags_from_yaml(tmp_path, monkeypatch):
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text(
-        yaml.safe_dump(
-            {
-                "model": {
-                    "model_path": "Qwen/Qwen3-8B",
-                    "router_fp32": False,
-                    "lm_head_fp32": False,
-                    "rmsnorm_mode": "sglang",
-                    "activation_native": True,
-                    "rope_native": True,
-                    "attention_cast_bf16": True,
-                },
-                "data": {
-                    "datasets": [{"path": "dummy", "type": "tokenized"}],
-                },
-                "train": {
-                    "init_device": "meta",
-                    "output_dir": str(tmp_path / "outputs"),
-                    "use_wandb": False,
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    monkeypatch.setenv("WORLD_SIZE", "1")
-    monkeypatch.setenv("LOCAL_WORLD_SIZE", "1")
-    monkeypatch.setenv("RANK", "0")
-    monkeypatch.setenv("LOCAL_RANK", "0")
-    monkeypatch.setattr(sys, "argv", ["train.py", str(config_path)])
-
-    args = parse_args(Arguments)
-
-    assert args.model.router_fp32 is False
-    assert args.model.lm_head_fp32 is False
-    assert args.model.rmsnorm_mode == "sglang"
-    assert args.model.activation_native is True
-    assert args.model.rope_native is True
-    assert args.model.attention_cast_bf16 is True
-
-
-def test_parse_args_wires_muon_kwargs_from_yaml(tmp_path, monkeypatch):
+def _assert_parse_args_wires_muon_kwargs(tmp_path, monkeypatch):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
         yaml.safe_dump(
@@ -216,7 +137,7 @@ def test_parse_args_wires_muon_kwargs_from_yaml(tmp_path, monkeypatch):
     assert args.train.optimizer_kwargs["muon_force_momentum_path"] is True
 
 
-def test_parse_args_accepts_legacy_ep_and_moe_checkpoint_aliases(tmp_path, monkeypatch):
+def _assert_parse_args_checkpoint_policy(tmp_path, monkeypatch):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
         yaml.safe_dump(
@@ -230,8 +151,7 @@ def test_parse_args_accepts_legacy_ep_and_moe_checkpoint_aliases(tmp_path, monke
                 "train": {
                     "init_device": "meta",
                     "output_dir": str(tmp_path / "outputs"),
-                    "ep_outside": True,
-                    "moe_checkpoint_method": "moe_act",
+                    "gradient_checkpointing_method": "recompute_before_dispatch",
                     "use_wandb": False,
                 },
             }
@@ -247,47 +167,18 @@ def test_parse_args_accepts_legacy_ep_and_moe_checkpoint_aliases(tmp_path, monke
 
     args = parse_args(Arguments)
 
-    assert args.train.ep_intranode is False
     assert args.train.gradient_checkpointing_method == "recompute_before_dispatch"
     assert args.train.moe_recomputed is False
 
-
-def test_parse_args_accepts_fsdp_reduce_dtype(tmp_path, monkeypatch):
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text(
-        yaml.safe_dump(
-            {
-                "model": {
-                    "model_path": "Qwen/Qwen3-8B",
-                },
-                "data": {
-                    "datasets": [{"path": "dummy", "type": "tokenized"}],
-                },
-                "train": {
-                    "init_device": "meta",
-                    "output_dir": str(tmp_path / "outputs"),
-                    "fsdp_reduce_dtype": "bf16",
-                    "skip_param_upcast": True,
-                    "use_wandb": False,
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    monkeypatch.setenv("WORLD_SIZE", "1")
-    monkeypatch.setenv("LOCAL_WORLD_SIZE", "1")
-    monkeypatch.setenv("RANK", "0")
-    monkeypatch.setenv("LOCAL_RANK", "0")
-    monkeypatch.setattr(sys, "argv", ["train.py", str(config_path)])
-
-    args = parse_args(Arguments)
-
-    assert args.train.fsdp_reduce_dtype == "bf16"
-    assert args.train.skip_param_upcast is True
+    auto_root = tmp_path / "auto-checkpoint"
+    auto_root.mkdir()
+    _assert_parse_args_resolves_auto_checkpoint_before_validation(auto_root, monkeypatch)
+    optimizer_root = tmp_path / "load-optimizer"
+    optimizer_root.mkdir()
+    _assert_parse_args_load_optimizer_flag(optimizer_root, monkeypatch)
 
 
-def test_parse_args_accepts_omitted_optional_fp8_module_overrides(tmp_path, monkeypatch):
+def _assert_parse_args_low_precision_configuration_policy(tmp_path, monkeypatch):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
         yaml.safe_dump(
@@ -323,97 +214,18 @@ def test_parse_args_accepts_omitted_optional_fp8_module_overrides(tmp_path, monk
     assert args.train.fp8_training_module_overrides is None
     assert args.train.fp8_training_allow_bf16_fallback is False
 
-
-def test_parse_args_accepts_fp8_cfg_alias_and_layer_islands(tmp_path, monkeypatch):
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text(
-        yaml.safe_dump(
-            {
-                "model": {
-                    "model_path": "Qwen/Qwen3-8B",
-                },
-                "data": {
-                    "datasets": [{"path": "dummy", "type": "tokenized"}],
-                },
-                "train": {
-                    "init_device": "meta",
-                    "output_dir": str(tmp_path / "outputs"),
-                    "fp8_cfg": {
-                        "enabled": True,
-                        "fp8": "e4m3",
-                        "fp8_recipe": "blockwise",
-                        "fp8_param": False,
-                    },
-                    "fp8_training_num_first_layers_bf16": 1,
-                    "fp8_training_num_last_layers_bf16": 2,
-                    "fp8_training_allow_blackwell": True,
-                    "fp8_training_blackwell_validation_artifact": "artifact.json",
-                    "use_wandb": False,
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    monkeypatch.setenv("WORLD_SIZE", "1")
-    monkeypatch.setenv("LOCAL_WORLD_SIZE", "1")
-    monkeypatch.setenv("RANK", "0")
-    monkeypatch.setenv("LOCAL_RANK", "0")
-    monkeypatch.setattr(sys, "argv", ["train.py", str(config_path)])
-
-    args = parse_args(Arguments)
-
-    assert args.train.enable_fp8_training is True
-    assert args.train.fp8_training_num_first_layers_bf16 == 1
-    assert args.train.fp8_training_num_last_layers_bf16 == 2
-    assert args.train.fp8_training_allow_blackwell is True
-    assert args.train.fp8_training_blackwell_validation_artifact == "artifact.json"
+    vllm_root = tmp_path / "vllm-rejections"
+    vllm_root.mkdir()
+    _assert_parse_args_rejects_vllm_fp8_runtime_knobs(vllm_root, monkeypatch)
+    default_root = tmp_path / "fallback-default"
+    default_root.mkdir()
+    _assert_parse_args_fp8_defaults_to_fail_fast_fallback(default_root, monkeypatch)
+    low_precision_root = tmp_path / "low-precision-modes"
+    low_precision_root.mkdir()
+    _assert_parse_args_low_precision_mode_policy(low_precision_root, monkeypatch)
 
 
-def test_parse_args_accepts_nemo_policy_fp8_cfg_alias(tmp_path, monkeypatch):
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text(
-        yaml.safe_dump(
-            {
-                "model": {
-                    "model_path": "Qwen/Qwen3-8B",
-                },
-                "data": {
-                    "datasets": [{"path": "dummy", "type": "tokenized"}],
-                },
-                "policy": {
-                    "megatron_cfg": {
-                        "fp8_cfg": {
-                            "enabled": True,
-                            "fp8": "e4m3",
-                            "fp8_recipe": "blockwise",
-                            "fp8_param": False,
-                        }
-                    }
-                },
-                "train": {
-                    "init_device": "meta",
-                    "output_dir": str(tmp_path / "outputs"),
-                    "use_wandb": False,
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    monkeypatch.setenv("WORLD_SIZE", "1")
-    monkeypatch.setenv("LOCAL_WORLD_SIZE", "1")
-    monkeypatch.setenv("RANK", "0")
-    monkeypatch.setenv("LOCAL_RANK", "0")
-    monkeypatch.setattr(sys, "argv", ["train.py", str(config_path)])
-
-    args = parse_args(Arguments)
-
-    assert args.train.enable_fp8_training is True
-    assert args.train.fp8_cfg == {"enabled": True, "fp8": "e4m3", "fp8_recipe": "blockwise", "fp8_param": False}
-
-
-def test_parse_args_rejects_vllm_fp8_runtime_knobs(tmp_path, monkeypatch):
+def _assert_parse_args_rejects_vllm_fp8_runtime_knobs(tmp_path, monkeypatch):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
         yaml.safe_dump(
@@ -565,7 +377,7 @@ def test_parse_args_rejects_vllm_fp8_runtime_knobs(tmp_path, monkeypatch):
         parse_args(Arguments)
 
 
-def test_parse_args_rejects_nemo_modelopt_qarl_configs(tmp_path, monkeypatch):
+def _assert_parse_args_low_precision_mode_policy(tmp_path, monkeypatch):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
         yaml.safe_dump(
@@ -598,8 +410,18 @@ def test_parse_args_rejects_nemo_modelopt_qarl_configs(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="ModelOpt QARL"):
         parse_args(Arguments)
 
+    qlora_root = tmp_path / "block-fp8-qlora"
+    qlora_root.mkdir()
+    _assert_parse_args_accepts_glm52_block_fp8_qlora_mode(qlora_root, monkeypatch)
+    qarl_root = tmp_path / "qarl"
+    qarl_root.mkdir()
+    _assert_parse_args_accepts_qarl_quant_cfg(qarl_root, monkeypatch)
+    rejection_root = tmp_path / "rejections"
+    rejection_root.mkdir()
+    _assert_parse_args_rejects_incompatible_low_precision_configs(rejection_root, monkeypatch)
 
-def test_parse_args_fp8_training_defaults_to_fail_fast_fallback(tmp_path, monkeypatch):
+
+def _assert_parse_args_fp8_defaults_to_fail_fast_fallback(tmp_path, monkeypatch):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
         yaml.safe_dump(
@@ -633,7 +455,7 @@ def test_parse_args_fp8_training_defaults_to_fail_fast_fallback(tmp_path, monkey
     assert args.train.fp8_training_allow_bf16_fallback is False
 
 
-def test_parse_args_accepts_glm52_block_fp8_qlora_mode(tmp_path, monkeypatch):
+def _assert_parse_args_accepts_glm52_block_fp8_qlora_mode(tmp_path, monkeypatch):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
         yaml.safe_dump(
@@ -682,7 +504,7 @@ def test_parse_args_accepts_glm52_block_fp8_qlora_mode(tmp_path, monkeypatch):
     assert args.lora.moe_hybrid_shared_lora is True
 
 
-def test_parse_args_accepts_qarl_quant_cfg_from_yaml(tmp_path, monkeypatch):
+def _assert_parse_args_accepts_qarl_quant_cfg(tmp_path, monkeypatch):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
         yaml.safe_dump(
@@ -735,7 +557,7 @@ def test_parse_args_accepts_qarl_quant_cfg_from_yaml(tmp_path, monkeypatch):
     assert args.train.qarl_exclude_modules == ["lm_head"]
 
 
-def test_parse_args_rejects_qarl_calibration_knobs_without_data(tmp_path, monkeypatch):
+def _assert_qarl_calibration_knobs_require_data(tmp_path, monkeypatch):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
         yaml.safe_dump(
@@ -768,9 +590,8 @@ def test_parse_args_rejects_qarl_calibration_knobs_without_data(tmp_path, monkey
         parse_args(Arguments)
 
 
-@pytest.mark.parametrize(
-    ("train_updates", "lora_updates", "expected_error"),
-    [
+def _assert_parse_args_rejects_incompatible_low_precision_configs(tmp_path, monkeypatch):
+    cases = (
         (
             {"enable_fp8_training": True},
             {"enable_lora": True},
@@ -791,45 +612,47 @@ def test_parse_args_rejects_qarl_calibration_knobs_without_data(tmp_path, monkey
             {"enable_qlora": True},
             "enable_qarl is a full-weight mode",
         ),
-    ],
-)
-def test_parse_args_rejects_full_weight_low_precision_with_adapters(
-    tmp_path, monkeypatch, train_updates, lora_updates, expected_error
-):
-    config_path = tmp_path / "config.yaml"
-    train_config = {
-        "init_device": "meta",
-        "output_dir": str(tmp_path / "outputs"),
-        "use_wandb": False,
-    }
-    train_config.update(train_updates)
-    config_path.write_text(
-        yaml.safe_dump(
-            {
-                "model": {
-                    "model_path": "Qwen/Qwen3-8B",
-                },
-                "data": {
-                    "datasets": [{"path": "dummy", "type": "tokenized"}],
-                },
-                "train": train_config,
-                "lora": lora_updates,
-            }
-        ),
-        encoding="utf-8",
     )
+    for train_updates, lora_updates, expected_error in cases:
+        config_path = tmp_path / "config.yaml"
+        train_config = {
+            "init_device": "meta",
+            "output_dir": str(tmp_path / "outputs"),
+            "use_wandb": False,
+        }
+        train_config.update(train_updates)
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "model": {
+                        "model_path": "Qwen/Qwen3-8B",
+                    },
+                    "data": {
+                        "datasets": [{"path": "dummy", "type": "tokenized"}],
+                    },
+                    "train": train_config,
+                    "lora": lora_updates,
+                }
+            ),
+            encoding="utf-8",
+        )
 
-    monkeypatch.setenv("WORLD_SIZE", "1")
-    monkeypatch.setenv("LOCAL_WORLD_SIZE", "1")
-    monkeypatch.setenv("RANK", "0")
-    monkeypatch.setenv("LOCAL_RANK", "0")
-    monkeypatch.setattr(sys, "argv", ["train.py", str(config_path)])
+        monkeypatch.setenv("WORLD_SIZE", "1")
+        monkeypatch.setenv("LOCAL_WORLD_SIZE", "1")
+        monkeypatch.setenv("RANK", "0")
+        monkeypatch.setenv("LOCAL_RANK", "0")
+        monkeypatch.setattr(sys, "argv", ["train.py", str(config_path)])
 
-    with pytest.raises(ValueError, match=expected_error):
-        parse_args(Arguments)
+        with pytest.raises(ValueError, match=expected_error):
+            parse_args(Arguments)
+
+    _assert_qarl_calibration_knobs_require_data(tmp_path, monkeypatch)
+    _assert_qarl_and_fp8_are_mutually_exclusive(tmp_path, monkeypatch)
+    _assert_qarl_rejects_mtp_metadata(tmp_path, monkeypatch)
+    _assert_qarl_rejects_mamba_config(tmp_path, monkeypatch)
 
 
-def test_parse_args_rejects_qarl_with_fp8_training(tmp_path, monkeypatch):
+def _assert_qarl_and_fp8_are_mutually_exclusive(tmp_path, monkeypatch):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
         yaml.safe_dump(
@@ -862,7 +685,7 @@ def test_parse_args_rejects_qarl_with_fp8_training(tmp_path, monkeypatch):
         parse_args(Arguments)
 
 
-def test_parse_args_rejects_qarl_with_mtp_model_metadata(tmp_path, monkeypatch):
+def _assert_qarl_rejects_mtp_metadata(tmp_path, monkeypatch):
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
         yaml.safe_dump(
@@ -895,7 +718,7 @@ def test_parse_args_rejects_qarl_with_mtp_model_metadata(tmp_path, monkeypatch):
         parse_args(Arguments)
 
 
-def test_parse_args_rejects_qarl_with_mamba_config_json(tmp_path, monkeypatch):
+def _assert_qarl_rejects_mamba_config(tmp_path, monkeypatch):
     model_dir = tmp_path / "mamba-model"
     model_dir.mkdir()
     (model_dir / "config.json").write_text(
@@ -933,7 +756,7 @@ def test_parse_args_rejects_qarl_with_mamba_config_json(tmp_path, monkeypatch):
         parse_args(Arguments)
 
 
-def test_parse_args_resolves_auto_checkpoint_before_skip_validation(tmp_path, monkeypatch):
+def _assert_parse_args_resolves_auto_checkpoint_before_validation(tmp_path, monkeypatch):
     resolved_checkpoint = str(tmp_path / "outputs" / "checkpoints" / "global_step_10")
     config_path = tmp_path / "config.yaml"
     config_path.write_text(
@@ -974,38 +797,35 @@ def test_parse_args_resolves_auto_checkpoint_before_skip_validation(tmp_path, mo
     assert args.train.load_checkpoint_path == resolved_checkpoint
 
 
-@pytest.mark.parametrize(
-    "yaml_value,expected",
-    [(None, True), (True, True), (False, False)],
-)
-def test_parse_args_load_optimizer_flag(tmp_path, monkeypatch, yaml_value, expected):
+def _assert_parse_args_load_optimizer_flag(tmp_path, monkeypatch):
     """load_optimizer defaults True (standard resume) and accepts an explicit False
     for a weights-only resume."""
-    train_cfg = {
-        "init_device": "meta",
-        "output_dir": str(tmp_path / "outputs"),
-        "use_wandb": False,
-    }
-    if yaml_value is not None:
-        train_cfg["load_optimizer"] = yaml_value
-    config_path = tmp_path / "config.yaml"
-    config_path.write_text(
-        yaml.safe_dump(
-            {
-                "model": {"model_path": "Qwen/Qwen3-8B"},
-                "data": {"datasets": [{"path": "dummy", "type": "tokenized"}]},
-                "train": train_cfg,
-            }
-        ),
-        encoding="utf-8",
-    )
+    for yaml_value, expected in ((None, True), (True, True), (False, False)):
+        train_cfg = {
+            "init_device": "meta",
+            "output_dir": str(tmp_path / "outputs"),
+            "use_wandb": False,
+        }
+        if yaml_value is not None:
+            train_cfg["load_optimizer"] = yaml_value
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.safe_dump(
+                {
+                    "model": {"model_path": "Qwen/Qwen3-8B"},
+                    "data": {"datasets": [{"path": "dummy", "type": "tokenized"}]},
+                    "train": train_cfg,
+                }
+            ),
+            encoding="utf-8",
+        )
 
-    monkeypatch.setenv("WORLD_SIZE", "1")
-    monkeypatch.setenv("LOCAL_WORLD_SIZE", "1")
-    monkeypatch.setenv("RANK", "0")
-    monkeypatch.setenv("LOCAL_RANK", "0")
-    monkeypatch.setattr(sys, "argv", ["train.py", str(config_path)])
+        monkeypatch.setenv("WORLD_SIZE", "1")
+        monkeypatch.setenv("LOCAL_WORLD_SIZE", "1")
+        monkeypatch.setenv("RANK", "0")
+        monkeypatch.setenv("LOCAL_RANK", "0")
+        monkeypatch.setattr(sys, "argv", ["train.py", str(config_path)])
 
-    args = parse_args(Arguments)
+        args = parse_args(Arguments)
 
-    assert args.train.load_optimizer is expected
+        assert args.train.load_optimizer is expected

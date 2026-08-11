@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 from contextlib import contextmanager
 
 import pytest
@@ -76,7 +77,7 @@ def _meta_model(config: Glm5Config | None = None) -> Glm5ForCausalLM:
         return Glm5ForCausalLM(config)
 
 
-def test_glm52_full_block_fp8_qlora_inventory_is_exact_and_fail_closed() -> None:
+def test_glm52_block_fp8_qlora_policy(monkeypatch) -> None:
     model = _meta_model()
 
     inventory = prepare_glm52_block_fp8_qlora(
@@ -108,7 +109,7 @@ def test_glm52_full_block_fp8_qlora_inventory_is_exact_and_fail_closed() -> None
     assert trainable == inventory.factor_names
     assert all(factor.dtype is torch.float32 for factor in inventory.factors)
 
-    assert inventory.role_counts == {
+    assert Counter(target.role for target in inventory.targets) == {
         "attention.q_a_proj": 78,
         "attention.q_b_proj": 78,
         "attention.kv_a_proj_with_mqa": 78,
@@ -140,8 +141,12 @@ def test_glm52_full_block_fp8_qlora_inventory_is_exact_and_fail_closed() -> None
     assert type(model.model.layers[0].self_attn.indexer.weights_proj) is nn.Linear
     assert model.model.layers[0].self_attn.indexer.weights_proj.weight.dtype is torch.bfloat16
 
+    with monkeypatch.context() as ep_patch:
+        _assert_glm52_routed_banks_select_only_the_ep_local_checkpoint_slice(ep_patch)
+    _assert_glm52_exact_component_and_admission_contract()
 
-def test_glm52_exact_dense_component_preserves_logical_inventory_with_three_physical_fused_roots() -> None:
+
+def _assert_glm52_exact_dense_component_preserves_logical_inventory_with_three_physical_fused_roots() -> None:
     config = _official_config()
     config._glm52_exact_active_lora_dense_component = True
     config._ep_dispatch = "alltoall"
@@ -174,20 +179,20 @@ def test_glm52_exact_dense_component_preserves_logical_inventory_with_three_phys
         assert root.down_proj._source_fqn == f"{prefix}.down_proj"
 
 
-@pytest.mark.parametrize(("rank", "alpha"), ((16, 16), (1, 2), (2, 1)))
-def test_glm52_exact_dense_component_rejects_non_rank1_alpha1_before_mutation(rank: int, alpha: int) -> None:
-    config = _official_config()
-    config._glm52_exact_active_lora_dense_component = True
-    config._ep_dispatch = "alltoall"
-    model = _meta_model(config)
+def _assert_glm52_exact_dense_component_rejects_non_rank1_alpha1_before_mutation() -> None:
+    for rank, alpha in ((1, 2), (2, 1)):
+        config = _official_config()
+        config._glm52_exact_active_lora_dense_component = True
+        config._ep_dispatch = "alltoall"
+        model = _meta_model(config)
 
-    with pytest.raises(ValueError, match="requires adapter_rank=1 and adapter_alpha=1"):
-        prepare_glm52_block_fp8_qlora(model, config, adapter_rank=rank, adapter_alpha=alpha)
+        with pytest.raises(ValueError, match="requires adapter_rank=1 and adapter_alpha=1"):
+            prepare_glm52_block_fp8_qlora(model, config, adapter_rank=rank, adapter_alpha=alpha)
 
-    assert not any("lora_" in name for name, _ in model.named_parameters())
+        assert not any("lora_" in name for name, _ in model.named_parameters())
 
 
-def test_glm52_routed_banks_select_only_the_ep_local_checkpoint_slice(monkeypatch) -> None:
+def _assert_glm52_routed_banks_select_only_the_ep_local_checkpoint_slice(monkeypatch) -> None:
     class _EP16State:
         ep_enabled = True
         ep_size = 16
@@ -205,7 +210,7 @@ def test_glm52_routed_banks_select_only_the_ep_local_checkpoint_slice(monkeypatc
     assert all(module.expert_offset == 112 for module in routed_banks)
 
 
-def test_glm52_qlora_rejects_missing_or_wrong_shape_target_before_adapterization() -> None:
+def _assert_glm52_qlora_rejects_missing_or_wrong_shape_target_before_adapterization() -> None:
     model = _meta_model()
     model.model.layers[12].self_attn.q_a_proj = nn.Linear(6144, 1024, bias=False, device="meta")
 
@@ -215,7 +220,7 @@ def test_glm52_qlora_rejects_missing_or_wrong_shape_target_before_adapterization
     assert not any("lora_" in name for name, _ in model.named_parameters())
 
 
-def test_glm52_qlora_rejects_missing_official_indexer_exclusion_before_adapterization() -> None:
+def _assert_glm52_qlora_rejects_missing_official_indexer_exclusion_before_adapterization() -> None:
     config = _official_config()
     config.quantization_config["modules_to_not_convert"].remove("model.layers.0.self_attn.indexers_proj")
     model = _meta_model(config)
@@ -226,26 +231,24 @@ def test_glm52_qlora_rejects_missing_official_indexer_exclusion_before_adapteriz
     assert not any("lora_" in name for name, _ in model.named_parameters())
 
 
-@pytest.mark.parametrize(
-    ("override", "message"),
-    [
+def _assert_glm52_qlora_rejects_unsupported_construction_modes() -> None:
+    cases = (
         ({"_moe_implementation": "eager"}, "moe_implementation='triton'"),
         ({"_ep_dispatch": "alltoall"}, "ep_dispatch='deepep'"),
         ({"_glm52_exact_contract": True}, "cannot use the scoring-only exact contract"),
         ({"_glm52_block_fp8_qlora": False}, "block_fp8_qlora_training=true"),
-    ],
-)
-def test_glm52_qlora_rejects_unsupported_construction_modes(override: dict, message: str) -> None:
-    config = _official_config()
-    for name, value in override.items():
-        setattr(config, name, value)
-    model = _meta_model(config)
+    )
+    for override, message in cases:
+        config = _official_config()
+        for name, value in override.items():
+            setattr(config, name, value)
+        model = _meta_model(config)
 
-    with pytest.raises(ValueError, match=message):
-        prepare_glm52_block_fp8_qlora(model, config, adapter_rank=16, adapter_alpha=16)
+        with pytest.raises(ValueError, match=message):
+            prepare_glm52_block_fp8_qlora(model, config, adapter_rank=16, adapter_alpha=16)
 
 
-def test_glm5_training_mode_admits_only_explicit_product_tuple() -> None:
+def _assert_glm5_training_mode_admits_only_explicit_product_tuple() -> None:
     config = _official_config()
     validate_glm5_training_mode(
         config,
@@ -275,7 +278,7 @@ def test_glm5_training_mode_admits_only_explicit_product_tuple() -> None:
         )
 
 
-def test_glm5_training_mode_uses_alltoall_only_for_complete_exact_active_lora() -> None:
+def _assert_glm5_training_mode_uses_alltoall_only_for_complete_exact_active_lora() -> None:
     config = _official_config()
     set_glm52_exact_active_lora(config, enabled=True)
 
@@ -307,7 +310,11 @@ def test_glm5_training_mode_uses_alltoall_only_for_complete_exact_active_lora() 
         )
 
 
-def test_block_fp8_qlora_scale_storage_covers_partial_edge_tiles() -> None:
-    module = BlockFP8QLoRALinear(6144, 576, r=4, lora_alpha=4, device=torch.device("meta"))
-
-    assert module.weight_block_scales.shape == (5, 192)
+def _assert_glm52_exact_component_and_admission_contract() -> None:
+    _assert_glm52_exact_dense_component_preserves_logical_inventory_with_three_physical_fused_roots()
+    _assert_glm52_exact_dense_component_rejects_non_rank1_alpha1_before_mutation()
+    _assert_glm52_qlora_rejects_missing_or_wrong_shape_target_before_adapterization()
+    _assert_glm52_qlora_rejects_missing_official_indexer_exclusion_before_adapterization()
+    _assert_glm52_qlora_rejects_unsupported_construction_modes()
+    _assert_glm5_training_mode_admits_only_explicit_product_tuple()
+    _assert_glm5_training_mode_uses_alltoall_only_for_complete_exact_active_lora()

@@ -8,7 +8,6 @@ config fields.
 """
 
 import math
-import os
 from functools import lru_cache
 
 import torch
@@ -86,11 +85,9 @@ def wrapped_precompute_freqs_cis(config, rope_head_dim: int, base: float, yarn_d
     beta_slow = float(rope_params.get("beta_slow", 1.0))
 
     # Full-weight V4 configs advertise their extended YaRN context in
-    # max_position_embeddings. Keep the env override for tests/profiling runs
-    # that intentionally want a smaller cache than the model maximum.
-    max_seq_len = int(
-        os.environ.get("XORL_DSV4_ROPE_MAX_SEQ_LEN", getattr(config, "max_position_embeddings", original_max_pos))
-    )
+    # max_position_embeddings. Tests and profiling configs should declare the
+    # smaller cache directly instead of overriding the model contract per process.
+    max_seq_len = int(getattr(config, "max_position_embeddings", original_max_pos))
     original_seq_len = 0 if yarn_disabled else original_max_pos
 
     return precompute_freqs_cis(

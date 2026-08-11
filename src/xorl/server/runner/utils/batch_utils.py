@@ -7,7 +7,6 @@ on communication and command dispatch.
 """
 
 import logging
-import os
 from typing import Any, Callable, Dict, Optional
 
 import torch
@@ -254,20 +253,6 @@ def batch_packed_rows(batches: list[Dict[str, Any]], row_batch_size: int) -> lis
     return grouped
 
 
-def ep_duplicate_batches_enabled() -> bool:
-    """Whether EP groups receive one duplicated batch slice (legacy dispatch).
-
-    Legacy dispatch keyed the batch slice on the ep_fsdp coordinate, so all
-    ep_size ranks of an EP group computed the same packed batch — ep_size-times
-    redundant compute. Per-rank-distinct slices are correct: the MoE all-to-all
-    routes per-rank-distinct tokens (the local-training path always runs this
-    way) and the OPD full-vocab KL is rank-local; loss normalization by global
-    valid tokens makes both regimes produce identical gradients. The duplication
-    is kept only as a rollback switch: XORL_SERVER_EP_DUPLICATE_BATCHES=1.
-    """
-    return os.getenv("XORL_SERVER_EP_DUPLICATE_BATCHES", "0").strip().lower() in {"1", "true", "yes"}
-
-
 def batch_slice_rank_and_size(
     rank: int,
     world_size: int,
@@ -278,26 +263,14 @@ def batch_slice_rank_and_size(
     """Return the logical request-batch slice rank and count.
 
     Ranks that shard the same sample through FSDP, CP/SP, TP, or pipeline
-    parallelism share a slice. EP ranks receive distinct slices unless the
-    legacy duplication switch is enabled.
+    parallelism share a slice. EP ranks receive distinct slices: the MoE
+    all-to-all routes their distinct tokens, matching local training without
+    redundant EP-wide batch replication.
     """
     tp_size = max(1, int(getattr(parallel_state, "tp_size", 1)))
     if getattr(parallel_state, "ep_enabled", False):
         ranks_per_pp_stage = max(1, world_size // max(1, pp_size))
         local_stage_rank = rank % ranks_per_pp_stage
-
-        if ep_duplicate_batches_enabled():
-            ep_size = max(1, int(getattr(parallel_state, "ep_size", 1)))
-            ep_fsdp_size = max(1, int(getattr(parallel_state, "dp_shard_in_ep_size", 1)))
-            ep_mesh = getattr(parallel_state, "ep_fsdp_device_mesh", None)
-            if ep_mesh is not None:
-                try:
-                    ep_fsdp_rank = int(ep_mesh.get_local_rank("ep_fsdp"))
-                    return min(ep_fsdp_rank, ep_fsdp_size - 1), ep_fsdp_size
-                except Exception:
-                    logger.debug("Could not read ep_fsdp local rank; falling back to rank arithmetic", exc_info=True)
-            ep_fsdp_rank = min(local_stage_rank // ep_size, ep_fsdp_size - 1)
-            return ep_fsdp_rank, ep_fsdp_size
 
         denom = max(1, cp_size * tp_size)
         slice_count = max(1, ranks_per_pp_stage // denom)

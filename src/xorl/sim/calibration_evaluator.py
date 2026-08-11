@@ -188,7 +188,6 @@ def _apply_point_runtime_signature(raw_config: dict[str, Any], point: BenchmarkB
     _set_if_known(train, "fsdp_reduce_dtype", point.fsdp_reduce_dtype)
     _set_if_known(train, "ce_mode", point.ce_mode)
     _set_if_known(model, "moe_implementation", point.moe_implementation)
-    _set_if_known(train, "moe_checkpoint_method", point.moe_checkpoint_method)
     _set_if_known(train, "muon_momentum", point.muon_momentum)
     _set_if_known(train, "muon_update_dtype", point.muon_update_dtype)
     if isinstance(simulator, dict):

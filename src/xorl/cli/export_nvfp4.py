@@ -29,7 +29,6 @@ import torch
 from safetensors import safe_open
 
 from xorl.ops.quantize.nvfp4_fake_quant import (
-    _E2M1_ABS,
     FP4_E2M1_MAX,
     FP8_E4M3_MAX,
     _nvfp4_quantize_blocks,
@@ -124,25 +123,6 @@ def quantize_weight_to_nvfp4(
     if act_amax > 0.0:
         entry[INPUT_SCALE_KEY] = activation_input_scale(act_amax)
     return entry
-
-
-def dequantize_nvfp4_export(entry: dict[str, torch.Tensor]) -> torch.Tensor:
-    """Reconstruct a bf16 weight from an NVFP4 entry (inverse of quantize)."""
-    packed = entry[WEIGHT_KEY]
-    M, half = packed.shape
-    K = half * 2
-    block_scale = entry[BLOCK_SCALE_KEY]
-    block_size = K // block_scale.shape[1]
-    flat = packed.reshape(-1)
-    lo = flat & 0x0F
-    hi = (flat >> 4) & 0x0F
-    codes = torch.stack([lo, hi], dim=1).reshape(M, K).to(torch.int64)
-    grid = torch.tensor(_E2M1_ABS, dtype=torch.float32)
-    sign = torch.where((codes & 0x8) > 0, -1.0, 1.0)
-    values = sign * grid[codes & 0x7]
-    eff = block_scale.float() * entry[GLOBAL_SCALE_KEY].float()  # [M, K/bs]
-    eff = eff.repeat_interleave(block_size, dim=1)  # [M, K]
-    return (values * eff).reshape(M, K).to(torch.bfloat16)
 
 
 def write_hf_quant_config(save_dir: Path, *, group_size: int, exclude_modules: list[str]) -> Path:

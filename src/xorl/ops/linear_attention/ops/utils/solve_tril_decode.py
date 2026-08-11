@@ -25,9 +25,8 @@ from xorl.ops.linear_attention.utils import input_guard
 
 # The forward-substitution reduction tree must match the pinned solve_tril
 # kernels (num_warps=2, see SOLVE_TRIL_NUM_WARPS). The diag kernel spells that
-# tree out explicitly (see _sum_rows_16_fla_tree), so its launch config is
-# free; bit-invariance across the config sweep is measured in
-# tests/ops/test_gdn_decode_prep.py rather than assumed.
+# tree out explicitly (see _sum_rows_16_fla_tree), while the launch geometry
+# remains pinned below.
 DIAG_HEAD_GROUP = 16
 DIAG_NUM_WARPS = 2
 DIAG_NUM_STAGES = 1

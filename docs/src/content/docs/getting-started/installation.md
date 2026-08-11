@@ -51,14 +51,25 @@ The repo ships two git submodules under `submodules/`:
 | [xorl-client](https://github.com/togethercomputer/xorl-client) | Lightweight Python client for the XoRL training service. Required for server/RL training mode. |
 | [xorl-sglang](https://github.com/togethercomputer/xorl-sglang) | XoRL's fork of [SGLang](https://github.com/sgl-project/sglang). Used as the inference engine in online RL loops. |
 
-Install individually:
+Install the client in the default environment. Keep SGLang in an isolated
+Torch-2.11 environment so its compiled kernel wheel never enters the default
+Torch-2.12 profile:
 
 ```bash
 pip install -e submodules/xorl-client
-pip install -e "submodules/xorl-sglang/python[all]"
+uv venv .venv-sglang --python 3.12
+uv pip install --python .venv-sglang/bin/python -e submodules/xorl-sglang/python
+uv pip install --python .venv-sglang/bin/python \
+  torchdata==0.11.0 nvidia-cutlass-dsl==4.5.2 quack-kernels==0.5.0
+uv pip install --python .venv-sglang/bin/python --no-deps -e .
+uv pip install --python .venv-sglang/bin/python pytest
+PYTHONPATH=src:submodules/xorl-sglang/python XORL_REQUIRE_SGL_KERNEL=1 \
+  .venv-sglang/bin/python -m pytest -q tests/ops/test_sgl_kernel_smoke.py
 ```
 
-Alternatively, use the bundled `pyproject.sglang.toml` which pins PyTorch to 2.9.1 (required by sglang) and installs xorl, xorl-client, and xorl-sglang together:
+The bundled `pyproject.sglang.toml` provides the same combined profile for uv.
+Its dependency overrides retain the Quack/CUTLASS versions required by XoRL's
+trainer imports while the exact-kernel smoke validates the SGLang boundary.
 
 **uv:**
 ```bash
@@ -67,15 +78,7 @@ uv sync
 source .venv/bin/activate
 ```
 
-**conda:**
-```bash
-conda create -n xorl-sglang python=3.12
-conda activate xorl-sglang
-cp pyproject.sglang.toml pyproject.toml
-pip install -e .
-```
-
-> **Note:** The default `pyproject.toml` uses PyTorch 2.10.0. sglang requires PyTorch 2.9.1, so the two cannot coexist in the same environment unless you use `pyproject.sglang.toml`.
+> **Note:** The default `pyproject.toml` uses Torch 2.12.1. Pinned SGLang requires Torch 2.11.0; do not install `sglang-kernel` into the default environment.
 
 > These submodules are only needed for **server training / online RL**. If you are only running local SFT or pretraining, you can skip this step.
 
@@ -84,9 +87,9 @@ pip install -e .
 
 | Package | Version | Notes |
 |---|---|---|
-| PyTorch | 2.10.0+cu129 | CUDA 12.9 build |
-| Flash Attention 3 | custom | FA3 + FA4 wheels |
-| Triton | 3.6.0 | MoE fused kernels |
+| PyTorch | 2.12.1 | Default XoRL profile; SGLang profile uses 2.11.0 |
+| Flash Attention 4 | pinned | Selected by each Torch profile |
+| Triton | 3.7.1 | Default profile; SGLang profile uses 3.6.0 |
 | Transformers | 5.0+ | Model loading |
 | FastAPI + uvicorn | latest | Server training API |
 | pyzmq | latest | Worker communication |

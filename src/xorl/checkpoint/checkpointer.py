@@ -2,7 +2,6 @@ import gc
 import json
 import os
 from abc import ABC, abstractmethod
-from collections import OrderedDict
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Set
 
@@ -472,50 +471,6 @@ class ModelState(Stateful):
         if self.base_dcp_projection is not None:
             self._base_dcp_model_state = model_state_dict
             model_state_dict = self.base_dcp_projection.project_state(model_state_dict)
-
-        return model_state_dict
-
-    @torch.no_grad()
-    def reference_state_dict(self):
-        """Collect a lightweight state dict of live params/buffers without DCP materialization.
-
-        This is intended for direct safetensors export paths where we only need
-        references to the current model tensors and will materialize them one at
-        a time during save.
-        """
-        model_state_dict: "OrderedDict[str, torch.Tensor]" = OrderedDict()
-        for part in _as_model_parts(self.model):
-            modules = dict(part.named_modules(remove_duplicate=False))
-
-            for name, parameter in part.named_parameters(remove_duplicate=False):
-                if parameter is not None:
-                    model_state_dict[name] = parameter
-
-            for name, buffer in part.named_buffers(remove_duplicate=False):
-                if buffer is None:
-                    continue
-                module_name, _, buffer_name = name.rpartition(".")
-                parent_module = modules[module_name] if module_name else part
-                if buffer_name in getattr(parent_module, "_non_persistent_buffers_set", set()):
-                    continue
-                model_state_dict[name] = buffer
-
-        if self.should_ep_aware:
-            logger.info_rank0(
-                "Collecting lightweight model tensor references from ModelState wrapper, "
-                "restoring EP dim for Experts module"
-            )
-            model_state_dict = self.get_state_dict_with_ep_dim(model_state_dict)
-
-        # Compile-agnostic keys (see state_dict): strip after EP-dim restoration.
-        model_state_dict = OrderedDict((_strip_compile_prefix(k), v) for k, v in model_state_dict.items())
-
-        if self.exclude_keys:
-            model_state_dict = OrderedDict((k, v) for k, v in model_state_dict.items() if k not in self.exclude_keys)
-
-        if self.save_lora_only:
-            model_state_dict = OrderedDict((k, v) for k, v in model_state_dict.items() if "lora_" in k)
-            logger.info_rank0(f"LoRA-only save: keeping {len(model_state_dict)} LoRA parameters")
 
         return model_state_dict
 

@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from typing import Optional, Unpack
 
 import torch
@@ -51,213 +50,6 @@ from xorl.utils import logging
 
 
 logger = logging.get_logger(__name__)
-
-
-def _qwen3_moe_delayed_residual_pair_enabled() -> bool:
-    return os.environ.get("XORL_QWEN3_MOE_DELAYED_RESIDUAL_PAIR", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
-def _qwen3_moe_delayed_residual_pair_sglang_rms_enabled() -> bool:
-    return os.environ.get("XORL_QWEN3_MOE_DELAYED_RESIDUAL_PAIR_SGLANG_RMS", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
-def _qwen3_moe_delayed_residual_pair_sglang_kernel_rms_enabled() -> bool:
-    return os.environ.get("XORL_QWEN3_MOE_DELAYED_RESIDUAL_PAIR_SGLANG_KERNEL_RMS", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
-def _qwen3_moe_post_attention_sglang_rms_enabled(layer_idx: int) -> bool:
-    if os.environ.get("XORL_QWEN3_MOE_POST_ATTENTION_SGLANG_RMS", "").strip().lower() not in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
-        return False
-    layer_filter = os.environ.get("XORL_QWEN3_MOE_POST_ATTENTION_SGLANG_RMS_LAYERS", "").strip()
-    if not layer_filter or layer_filter.lower() in {"all", "*"}:
-        return True
-    try:
-        enabled_layers = {int(item.strip()) for item in layer_filter.split(",") if item.strip()}
-    except ValueError as exc:
-        raise ValueError(
-            "Invalid XORL_QWEN3_MOE_POST_ATTENTION_SGLANG_RMS_LAYERS="
-            f"{layer_filter!r}; expected comma-separated layer indices"
-        ) from exc
-    return layer_idx in enabled_layers
-
-
-def _qwen3_moe_post_attention_o_proj_partial_residual_enabled(layer_idx: int) -> bool:
-    if os.environ.get("XORL_QWEN3_MOE_POST_ATTENTION_O_PROJ_PARTIAL_RESIDUAL", "").strip().lower() not in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
-        return False
-    layer_filter = os.environ.get("XORL_QWEN3_MOE_POST_ATTENTION_O_PROJ_PARTIAL_RESIDUAL_LAYERS", "").strip()
-    if not layer_filter or layer_filter.lower() in {"all", "*"}:
-        return True
-    try:
-        enabled_layers = {int(item.strip()) for item in layer_filter.split(",") if item.strip()}
-    except ValueError as exc:
-        raise ValueError(
-            "Invalid XORL_QWEN3_MOE_POST_ATTENTION_O_PROJ_PARTIAL_RESIDUAL_LAYERS="
-            f"{layer_filter!r}; expected comma-separated layer indices"
-        ) from exc
-    return layer_idx in enabled_layers
-
-
-def _qwen3_moe_capture_o_proj_partial_residual_candidates_enabled(layer_idx: int) -> bool:
-    if os.environ.get("XORL_QWEN3_MOE_CAPTURE_O_PROJ_PARTIAL_RESIDUAL_CANDIDATES", "").strip().lower() not in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }:
-        return False
-    layer_filter = os.environ.get("XORL_QWEN3_MOE_CAPTURE_O_PROJ_PARTIAL_RESIDUAL_CANDIDATES_LAYERS", "").strip()
-    if not layer_filter or layer_filter.lower() in {"all", "*"}:
-        return True
-    try:
-        enabled_layers = {int(item.strip()) for item in layer_filter.split(",") if item.strip()}
-    except ValueError as exc:
-        raise ValueError(
-            "Invalid XORL_QWEN3_MOE_CAPTURE_O_PROJ_PARTIAL_RESIDUAL_CANDIDATES_LAYERS="
-            f"{layer_filter!r}; expected comma-separated layer indices"
-        ) from exc
-    return layer_idx in enabled_layers
-
-
-def _qwen3_moe_delayed_residual_pair_tp_shard_carry_enabled() -> bool:
-    return os.environ.get("XORL_QWEN3_MOE_DELAYED_RESIDUAL_PAIR_TP_SHARD_CARRY", "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
-
-
-def _is_delayed_residual_pair(value) -> bool:
-    return (
-        isinstance(value, tuple)
-        and len(value) == 2
-        and isinstance(value[0], torch.Tensor)
-        and isinstance(value[1], torch.Tensor)
-    )
-
-
-def _get_delayed_pair_moe_tp_shards(hidden_delta: torch.Tensor):
-    if not _qwen3_moe_delayed_residual_pair_tp_shard_carry_enabled():
-        return None
-    shards = getattr(hidden_delta, "_xorl_sglang_moe_tp_shards", None)
-    if not shards:
-        return None
-    if not all(isinstance(shard, torch.Tensor) for shard in shards):
-        raise TypeError("_xorl_sglang_moe_tp_shards must contain tensors")
-    return tuple(shards)
-
-
-def _sum_delayed_pair_moe_tp_shards(hidden_delta: torch.Tensor, dtype: torch.dtype) -> Optional[torch.Tensor]:
-    shards = _get_delayed_pair_moe_tp_shards(hidden_delta)
-    if shards is None:
-        return None
-
-    shard_sum = shards[0].to(dtype)
-    for shard in shards[1:]:
-        shard_sum = shard_sum + shard.to(shard_sum.dtype)
-    return shard_sum.to(dtype)
-
-
-def _materialize_moe_tp_shards_with_residual(hidden_delta: torch.Tensor, residual: torch.Tensor) -> torch.Tensor:
-    shard_sum = _sum_delayed_pair_moe_tp_shards(hidden_delta, residual.dtype)
-    if shard_sum is None:
-        return hidden_delta + residual
-    return residual + shard_sum
-
-
-def _materialize_delayed_residual_pair(value):
-    if _is_delayed_residual_pair(value):
-        return _materialize_moe_tp_shards_with_residual(value[0], value[1])
-    return value
-
-
-def _get_o_proj_tp_partials(hidden_states: torch.Tensor):
-    partials = getattr(hidden_states, "_xorl_o_proj_tp_partials", None)
-    if not partials:
-        return None
-    if not all(isinstance(partial, torch.Tensor) for partial in partials):
-        raise TypeError("_xorl_o_proj_tp_partials must contain tensors")
-    return tuple(partials)
-
-
-def _sum_o_proj_tp_partials(partials: tuple[torch.Tensor, ...], dtype: torch.dtype) -> torch.Tensor:
-    partial_sum = partials[0].to(dtype)
-    for partial in partials[1:]:
-        partial_sum = partial_sum + partial.to(partial_sum.dtype)
-    return partial_sum.to(dtype)
-
-
-def _materialize_o_proj_partial_residual(
-    hidden_states: torch.Tensor,
-    residual: torch.Tensor,
-    partials: tuple[torch.Tensor, ...],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    mode = os.environ.get("XORL_QWEN3_MOE_POST_ATTENTION_O_PROJ_PARTIAL_RESIDUAL_MODE", "sum_then_residual")
-    mode = mode.strip().lower().replace("-", "_")
-    return _materialize_o_proj_partial_residual_mode(mode, hidden_states, residual, partials)
-
-
-def _materialize_o_proj_partial_residual_mode(
-    mode: str,
-    hidden_states: torch.Tensor,
-    residual: torch.Tensor,
-    partials: tuple[torch.Tensor, ...],
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if mode in {"split_output", "output"}:
-        partial_sum = hidden_states
-        return partial_sum, residual + partial_sum.to(residual.dtype)
-    if mode in {"sum_then_residual", "partial_sum"}:
-        partial_sum = _sum_o_proj_tp_partials(partials, hidden_states.dtype)
-        return partial_sum, residual + partial_sum.to(residual.dtype)
-    if mode in {"residual_then_partials", "sequential_bf16", "seq_bf16"}:
-        residual_out = residual
-        for partial in partials:
-            residual_out = (residual_out + partial.to(residual_out.dtype)).to(residual.dtype)
-        partial_sum = _sum_o_proj_tp_partials(partials, hidden_states.dtype)
-        return partial_sum, residual_out
-    if mode in {"fp32_sum_then_residual", "sum_fp32"}:
-        partial_sum = partials[0].to(torch.float32)
-        for partial in partials[1:]:
-            partial_sum = partial_sum + partial.to(torch.float32)
-        residual_out = (residual.to(torch.float32) + partial_sum).to(residual.dtype)
-        return partial_sum.to(hidden_states.dtype), residual_out
-    raise ValueError(
-        "Invalid XORL_QWEN3_MOE_POST_ATTENTION_O_PROJ_PARTIAL_RESIDUAL_MODE="
-        f"{mode!r}; expected split_output, sum_then_residual, residual_then_partials, or fp32_sum_then_residual"
-    )
-
-
-_O_PROJ_PARTIAL_RESIDUAL_CANDIDATE_MODES = (
-    "split_output",
-    "sum_then_residual",
-    "residual_then_partials",
-    "fp32_sum_then_residual",
-)
 
 
 class Qwen3MoeMLP(nn.Module):
@@ -472,68 +264,16 @@ class Qwen3MoeDecoderLayer(MoEGradientCheckpointingLayer):
                 self.mlp.experts.layer_idx = layer_idx
         else:
             self.mlp = Qwen3MoeMLP(config, intermediate_size=config.intermediate_size)
-        self._delay_moe_residual_output = (
-            _qwen3_moe_delayed_residual_pair_enabled() and is_sparse_layer and layer_idx < config.num_hidden_layers - 1
-        )
-
-    def _capture_o_proj_partial_residual_candidates(
-        self,
-        hidden_states: torch.Tensor,
-        residual: torch.Tensor,
-        partials: tuple[torch.Tensor, ...],
-    ) -> None:
-        if not _qwen3_moe_capture_o_proj_partial_residual_candidates_enabled(self.layer_idx):
-            return
-        for mode in _O_PROJ_PARTIAL_RESIDUAL_CANDIDATE_MODES:
-            partial_sum, partial_residual = _materialize_o_proj_partial_residual_mode(
-                mode,
-                hidden_states,
-                residual,
-                partials,
-            )
-            self._capture_diagnostic_component(f"post_attention_o_proj_partial_sum_{mode}", partial_sum)
-            self._capture_diagnostic_component(f"post_attention_partial_residual_{mode}", partial_residual)
 
     def _pre_mlp_forward(self, hidden_states, attention_mask=None, position_embeddings=None, **kwargs):
-        self._capture_diagnostic_component(
-            "materialized_layer_input", _materialize_delayed_residual_pair(hidden_states)
+        residual = hidden_states
+        # Family contract: layer-0 input norm is a no-residual site; at
+        # layer>0 the pre-summed input sits on the serving residual tree
+        # (the 2026-07-04 norm-seed fix, now declared explicitly).
+        hidden_states = self.input_layernorm(
+            hidden_states,
+            family=RMS_NORM_FAMILY_RESIDUAL_TREE if self.layer_idx > 0 else RMS_NORM_FAMILY_NO_RESIDUAL,
         )
-        if _is_delayed_residual_pair(hidden_states):
-            hidden_states, residual = hidden_states
-            self._capture_diagnostic_component("delayed_pair_delta", hidden_states)
-            self._capture_diagnostic_component("delayed_pair_residual", residual)
-            shard_sum = _sum_delayed_pair_moe_tp_shards(hidden_states, residual.dtype)
-            self._capture_diagnostic_component("delayed_pair_shard_sum", shard_sum)
-            if shard_sum is not None:
-                self._capture_diagnostic_component("delayed_pair_shard_materialized", residual + shard_sum)
-            shards = _get_delayed_pair_moe_tp_shards(hidden_states)
-            # Delayed-pair diagnostic sites keep their env-gated legacy dispatch
-            # (undeclared family; single-tensor calls fall to the aten interpose
-            # when the rms env is unset) — bits frozen, tripwire warns.
-            if shards is not None:
-                residual = _materialize_moe_tp_shards_with_residual(hidden_states, residual)
-                hidden_states = self.input_layernorm(
-                    residual,
-                    force_sglang_residual=_qwen3_moe_delayed_residual_pair_sglang_rms_enabled(),
-                    force_sglang_residual_kernel=_qwen3_moe_delayed_residual_pair_sglang_kernel_rms_enabled(),
-                )
-            else:
-                hidden_states, residual = self.input_layernorm(
-                    hidden_states,
-                    residual=residual,
-                    prenorm=True,
-                    force_sglang_residual=_qwen3_moe_delayed_residual_pair_sglang_rms_enabled(),
-                    force_sglang_residual_kernel=_qwen3_moe_delayed_residual_pair_sglang_kernel_rms_enabled(),
-                )
-        else:
-            residual = hidden_states
-            # Family contract: layer-0 input norm is a no-residual site; at
-            # layer>0 the pre-summed input sits on the serving residual tree
-            # (the 2026-07-04 norm-seed fix, now declared explicitly).
-            hidden_states = self.input_layernorm(
-                hidden_states,
-                family=RMS_NORM_FAMILY_RESIDUAL_TREE if self.layer_idx > 0 else RMS_NORM_FAMILY_NO_RESIDUAL,
-            )
         self._capture_diagnostic_component("input_norm_residual", residual)
         self._capture_diagnostic_component("input_norm", hidden_states)
         hidden_states, _ = self.self_attn(
@@ -542,36 +282,14 @@ class Qwen3MoeDecoderLayer(MoEGradientCheckpointingLayer):
             position_embeddings=position_embeddings,
             **kwargs,
         )
-        o_proj_partials = _get_o_proj_tp_partials(hidden_states)
-        if o_proj_partials is not None:
-            self._capture_o_proj_partial_residual_candidates(hidden_states, residual, o_proj_partials)
-        if o_proj_partials is not None and _qwen3_moe_post_attention_o_proj_partial_residual_enabled(self.layer_idx):
-            partial_sum, partial_residual = _materialize_o_proj_partial_residual(
-                hidden_states, residual, o_proj_partials
-            )
-            self._capture_diagnostic_component("post_attention_o_proj_partial_sum", partial_sum)
-            self._capture_diagnostic_component("post_attention_partial_residual", partial_residual)
-            self._capture_diagnostic_component("post_attention_norm_input", partial_residual)
-            norm_output = self.post_attention_layernorm(
-                partial_residual,
-                force_sglang_residual=_qwen3_moe_post_attention_sglang_rms_enabled(self.layer_idx),
-            )
-            if isinstance(norm_output, tuple):
-                hidden_states, returned_residual = norm_output
-                residual = partial_residual if returned_residual is None else returned_residual
-            else:
-                hidden_states = norm_output
-                residual = partial_residual
-        else:
-            self._capture_diagnostic_component("post_attention_norm_input", hidden_states)
-            self._capture_diagnostic_component("post_attention_norm_residual", residual)
-            hidden_states, residual = self.post_attention_layernorm(
-                hidden_states,
-                residual=residual,
-                prenorm=True,
-                force_sglang_residual=_qwen3_moe_post_attention_sglang_rms_enabled(self.layer_idx),
-                family=RMS_NORM_FAMILY_RESIDUAL_TREE,
-            )
+        self._capture_diagnostic_component("post_attention_norm_input", hidden_states)
+        self._capture_diagnostic_component("post_attention_norm_residual", residual)
+        hidden_states, residual = self.post_attention_layernorm(
+            hidden_states,
+            residual=residual,
+            prenorm=True,
+            family=RMS_NORM_FAMILY_RESIDUAL_TREE,
+        )
         self._capture_diagnostic_component("post_attention_norm", hidden_states)
         self._capture_diagnostic_component("post_attention_residual", residual)
         return hidden_states, residual
@@ -800,7 +518,7 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
             if decoder_layer is None:  # PP: pruned layer
                 continue
             if output_hidden_states:
-                all_hidden_states += (_materialize_delayed_residual_pair(hidden_states),)
+                all_hidden_states += (hidden_states,)
 
             if _grad_ckpt_method == "recompute_full_layer":
                 # Recompute entire layer in backward (including dispatch + combine)
@@ -851,7 +569,6 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
                 all_router_logits += (layer_outputs[-1],)
 
         # PP support: norm may be None on non-last stages
-        hidden_states = _materialize_delayed_residual_pair(hidden_states)
         if self.norm is not None:
             hidden_states = self.norm(hidden_states)
         if output_hidden_states:

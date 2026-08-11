@@ -87,42 +87,32 @@ class _ExactRoutedModel(nn.Module):
         return self.model.layers[3].mlp.experts
 
 
-def test_meta_slicing_replaces_full_shape_with_ep_local_shape():
-    """Meta param at full shape should be replaced with EP-local-shape meta param."""
+def test_meta_slicing_replaces_full_shape_and_preserves_parameter_contract():
+    """The skip-loading meta path slices before allocation and preserves parameter metadata."""
     num_experts, ep_size = 16, 4
     H, I = 32, 64
 
     model = _FakeModel(num_experts=num_experts, hidden=H, inter=I)
+    model.experts.gate_up_proj.requires_grad_(False)
     plan = ParallelPlan(ep_plan={"experts.gate_up_proj": Shard(0)})
-    fqn2spec = plan.apply(model, _fake_ep_fsdp_mesh(ep_size), already_local=False)
+    fqn2spec = plan.apply(model, _fake_ep_fsdp_mesh(ep_size), already_local=True)
 
     assert model.experts.gate_up_proj.is_meta
     assert tuple(model.experts.gate_up_proj.shape) == (num_experts // ep_size, H, 2 * I)
+    assert model.experts.gate_up_proj.dtype == torch.bfloat16
+    assert model.experts.gate_up_proj.requires_grad is False
 
     info = fqn2spec["experts.gate_up_proj"]
     assert isinstance(info, SpecInfo)
     assert isinstance(info.placement, Shard) and info.placement.dim == 0
 
-    # The unrelated param is not in the ep_plan — it should be Replicate-stamped.
     assert isinstance(fqn2spec["experts.unrelated"].placement, Replicate)
 
-
-def test_meta_slicing_dispatches_even_when_already_local_is_true():
-    """``already_local=True`` is the smoke's default (set by skip_weight_loading);
-    the meta dispatch must still fire so to_empty() doesn't materialize full shape."""
-    num_experts, ep_size = 8, 8
-    H, I = 16, 16
-
-    model = _FakeModel(num_experts=num_experts, hidden=H, inter=I)
-    plan = ParallelPlan(ep_plan={"experts.gate_up_proj": Shard(0)})
-    plan.apply(model, _fake_ep_fsdp_mesh(ep_size), already_local=True)
-
-    # Meta path runs first, slices to ep-local even with already_local=True.
-    assert tuple(model.experts.gate_up_proj.shape) == (1, H, 2 * I)
-    assert model.experts.gate_up_proj.is_meta
+    _assert_meta_slicing_rejects_indivisible_size()
+    _assert_parallel_plan_stamps_explicit_replicated_gradient_reduction()
 
 
-def test_meta_slicing_assertion_on_indivisible_size():
+def _assert_meta_slicing_rejects_indivisible_size():
     """Non-divisible expert dim should raise the existing ep-divisibility assert."""
     num_experts, ep_size = 7, 4  # 7 % 4 != 0
     model = _FakeModel(num_experts=num_experts, hidden=8, inter=8)
@@ -131,20 +121,7 @@ def test_meta_slicing_assertion_on_indivisible_size():
         plan.apply(model, _fake_ep_fsdp_mesh(ep_size), already_local=False)
 
 
-def test_meta_slicing_preserves_dtype_and_requires_grad():
-    """The new meta param must keep the original dtype and requires_grad flag."""
-    num_experts, ep_size = 8, 2
-    model = _FakeModel(num_experts=num_experts, hidden=8, inter=16)
-    model.experts.gate_up_proj.requires_grad_(False)
-
-    plan = ParallelPlan(ep_plan={"experts.gate_up_proj": Shard(0)})
-    plan.apply(model, _fake_ep_fsdp_mesh(ep_size), already_local=False)
-
-    assert model.experts.gate_up_proj.dtype == torch.bfloat16
-    assert model.experts.gate_up_proj.requires_grad is False
-
-
-def test_parallel_plan_stamps_explicit_replicated_gradient_reduction():
+def _assert_parallel_plan_stamps_explicit_replicated_gradient_reduction():
     model = _FakeSharedLoRAModel()
     plan = ParallelPlan(ep_plan={"experts.shared_lora": Shard(0)})
 
@@ -156,7 +133,7 @@ def test_parallel_plan_stamps_explicit_replicated_gradient_reduction():
     assert model.experts.shared_lora.spec_info.gradient_reduction == "ep_sum"
 
 
-def test_glm52_exact_meta_ep_plan_preserves_local_base_and_shards_only_expert_factors():
+def test_glm52_exact_meta_and_real_ep_plan_policy(monkeypatch):
     model = _ExactRoutedModel(device="meta")
 
     specs = get_glm52_ep_plan().apply(model, _fake_ep_fsdp_mesh(ep_size=16), already_local=True)
@@ -184,8 +161,11 @@ def test_glm52_exact_meta_ep_plan_preserves_local_base_and_shards_only_expert_fa
     assert all(getattr(experts, name).shape[0] == 16 for name in experts._ep_force_shard_parameter_names)
     assert all(hasattr(getattr(experts, name), "spec_info") for name in experts.logical_factor_names)
 
+    _assert_glm52_exact_ep_dispositions_reject_malformed_singletons()
+    _assert_glm52_exact_real_already_local_plan_still_shards_global_factor_banks(monkeypatch)
 
-def test_glm52_exact_real_already_local_plan_still_shards_global_factor_banks(monkeypatch):
+
+def _assert_glm52_exact_real_already_local_plan_still_shards_global_factor_banks(monkeypatch):
     model = _ExactRoutedModel(device="cpu")
     with torch.no_grad():
         model.experts.gate_proj_lora_B[:, 0, 0].copy_(torch.arange(256, dtype=torch.float32))
@@ -219,25 +199,19 @@ def test_glm52_exact_real_already_local_plan_still_shards_global_factor_banks(mo
         assert info.gradient_reduction is GradientReductionDomain.NONE
 
 
-@pytest.mark.parametrize(
-    ("parameter_name", "error_match"),
-    (
+def _assert_glm52_exact_ep_dispositions_reject_malformed_singletons() -> None:
+    for parameter_name, error_match in (
         ("gate_up_packed_weight_f32", "already-local parameter"),
         ("gate_proj_lora_B", "force-shard parameter"),
-    ),
-)
-def test_glm52_exact_explicit_ep_dispositions_reject_malformed_singletons(
-    parameter_name: str,
-    error_match: str,
-) -> None:
-    model = _ExactRoutedModel(device="cpu")
-    original = getattr(model.experts, parameter_name)
-    malformed_shape = (1, *original.shape[1:])
-    setattr(
-        model.experts,
-        parameter_name,
-        nn.Parameter(torch.empty(malformed_shape, dtype=original.dtype), requires_grad=original.requires_grad),
-    )
+    ):
+        model = _ExactRoutedModel(device="cpu")
+        original = getattr(model.experts, parameter_name)
+        malformed_shape = (1, *original.shape[1:])
+        setattr(
+            model.experts,
+            parameter_name,
+            nn.Parameter(torch.empty(malformed_shape, dtype=original.dtype), requires_grad=original.requires_grad),
+        )
 
-    with pytest.raises(ValueError, match=error_match):
-        get_glm52_ep_plan().apply(model, _fake_ep_fsdp_mesh(ep_size=16), already_local=True)
+        with pytest.raises(ValueError, match=error_match):
+            get_glm52_ep_plan().apply(model, _fake_ep_fsdp_mesh(ep_size=16), already_local=True)

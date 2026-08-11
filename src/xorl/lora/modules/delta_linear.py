@@ -86,9 +86,6 @@ class LoraDeltaLinear(LoraModule, nn.Module):
     def get_delta_weight(self) -> torch.Tensor:
         return (self.lora_B[:, : self.active_r] @ self.lora_A[: self.active_r]) * self._active_scaling()
 
-    def invalidate_merged_weight_cache(self) -> None:
-        self._merged_weight_cache = {}
-
     def _merged_weight(
         self,
         base_weight: torch.Tensor,

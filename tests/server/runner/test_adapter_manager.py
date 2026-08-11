@@ -14,6 +14,7 @@ import torch.nn as nn
 from safetensors.torch import load_file as safetensors_load_file
 from safetensors.torch import save_file as safetensors_save_file
 
+from tests._helpers import stage_and_commit_gradient_capture
 from xorl.optim import SignSGD
 from xorl.server.protocol.operations import AdapterStateData
 from xorl.server.runner.adapters import manager as adapter_manager_module
@@ -165,7 +166,7 @@ def _session_spec(*, rank: int, alpha: int, optimizer_type: str, lr: float, weig
     }
 
 
-def test_register_adapter_uses_shared_optimizer_factory_and_checkpoint_dir(tmp_path):
+def _assert_adapter_optimizer_construction_and_persistence_policy(tmp_path):
     manager = _build_manager(tmp_path, optimizer_type="signsgd", weight_decay=0.25)
 
     manager.register_adapter("policy-a", lr=0.1, initialize_fresh=True)
@@ -182,8 +183,12 @@ def test_register_adapter_uses_shared_optimizer_factory_and_checkpoint_dir(tmp_p
     assert metadata["optimizer"]["betas"] == [0.9, 0.95]
     assert metadata["optimizer"]["eps"] == pytest.approx(1e-8)
 
+    _assert_save_persists_current_learning_rate(tmp_path / "lr")
+    _assert_adam_hparams_are_hoisted(tmp_path / "adam")
+    _assert_muon_set_lr_preserves_group_lr(tmp_path / "muon")
 
-def test_compile_gradient_ownership_plan_is_explicit_and_rejects_pending_reconfiguration(tmp_path):
+
+def test_gradient_ownership_compile_and_admission_policy(tmp_path, monkeypatch):
     manager = _build_manager(tmp_path)
     manager.register_adapter("policy-owned", lr=0.1, initialize_fresh=True)
     state = manager.get_adapter_state("policy-owned")
@@ -219,8 +224,13 @@ def test_compile_gradient_ownership_plan_is_explicit_and_rejects_pending_reconfi
             adapter_generation="adapter-generation-2",
         )
 
+    _assert_uncompiled_manager_fails_closed(tmp_path / "uncompiled")
+    _assert_capture_rejects_invalid_gradient_state(tmp_path / "invalid")
+    _assert_capture_has_no_runtime_control_collective(tmp_path / "static", monkeypatch)
+    _assert_plan_routes_legacy_sync_exclusions(tmp_path / "exclusions")
 
-def test_raw_numerator_capture_preserves_model_grads_and_streams_into_one_fp32_image(tmp_path):
+
+def _assert_raw_numerator_capture_preserves_model_grads_and_streams_into_one_fp32_image(tmp_path):
     manager = _build_manager(tmp_path)
     manager.register_adapter("policy-capture", lr=0.1, initialize_fresh=True)
     state = manager.get_adapter_state("policy-capture")
@@ -253,11 +263,12 @@ def test_raw_numerator_capture_preserves_model_grads_and_streams_into_one_fp32_i
     for index, (name, parameter) in enumerate(model_parameters.items(), start=1):
         parameter.grad = torch.full_like(parameter, float(index))
         first[name] = parameter.grad.clone()
-    assert manager.capture_gradient_numerators(
+    manager.stage_gradient_numerators(
         "policy-capture",
         denominator=5,
         backward_completed=True,
-    ) == (0, 0)
+    )
+    assert manager.commit_gradient_capture("policy-capture") == (0, 0)
     for name, parameter in model_parameters.items():
         assert parameter.grad is None
         torch.testing.assert_close(state.gradient_scratch.numerators[name], first[name].float())
@@ -269,11 +280,12 @@ def test_raw_numerator_capture_preserves_model_grads_and_streams_into_one_fp32_i
     )
     for parameter in model_parameters.values():
         parameter.grad = torch.full_like(parameter, 3)
-    assert manager.capture_gradient_numerators(
+    manager.stage_gradient_numerators(
         "policy-capture",
         denominator=7,
         backward_completed=True,
-    ) == (0, 1)
+    )
+    assert manager.commit_gradient_capture("policy-capture") == (0, 1)
 
     assert state.gradient_scratch.denominator == 12
     for name in model_parameters:
@@ -283,7 +295,7 @@ def test_raw_numerator_capture_preserves_model_grads_and_streams_into_one_fp32_i
         )
 
 
-def test_uncompiled_manager_fails_closed(tmp_path):
+def _assert_uncompiled_manager_fails_closed(tmp_path):
     manager = LoRAAdapterManager(
         _DummyLoRAModel(),
         device=torch.device("cpu"),
@@ -307,7 +319,7 @@ def test_uncompiled_manager_fails_closed(tmp_path):
         torch.testing.assert_close(parameter, initial[name])
 
 
-def test_capture_rejects_normalized_or_missing_required_gradients(tmp_path):
+def _assert_capture_rejects_invalid_gradient_state(tmp_path):
     manager = _build_manager(tmp_path)
     manager.register_adapter("policy-reject", lr=0.1, initialize_fresh=True)
     state = manager.get_adapter_state("policy-reject")
@@ -340,14 +352,15 @@ def test_capture_rejects_normalized_or_missing_required_gradients(tmp_path):
         scale_state=GradientScaleState.RAW_NUMERATOR,
     )
     with pytest.raises(AdapterGradientOwnershipError, match="gradient is absent"):
-        manager.capture_gradient_numerators(
+        manager.stage_gradient_numerators(
             "policy-reject",
             denominator=1,
             backward_completed=True,
         )
+    manager.abort_gradient_capture("policy-reject")
 
 
-def test_capture_adds_no_runtime_control_collective(tmp_path, monkeypatch):
+def _assert_capture_has_no_runtime_control_collective(tmp_path, monkeypatch):
     manager = _build_manager(tmp_path)
     manager.register_adapter("policy-static-capture", lr=0.1, initialize_fresh=True)
     state = manager.get_adapter_state("policy-static-capture")
@@ -381,14 +394,11 @@ def test_capture_adds_no_runtime_control_collective(tmp_path, monkeypatch):
 
     monkeypatch.setattr(adapter_manager_module.torch.distributed, "all_reduce", _unexpected_collective)
 
-    assert manager.capture_gradient_numerators(
-        "policy-static-capture",
-        denominator=1,
-        backward_completed=True,
-    ) == (0, 0)
+    manager.stage_gradient_numerators("policy-static-capture", denominator=1, backward_completed=True)
+    assert manager.commit_gradient_capture("policy-static-capture") == (0, 0)
 
 
-def test_authoritative_plan_routes_legacy_sync_exclusions_before_mutation(tmp_path):
+def _assert_plan_routes_legacy_sync_exclusions(tmp_path):
     manager = _build_manager(tmp_path)
     manager.register_adapter("policy-route", lr=0.1, initialize_fresh=True)
     state = manager.get_adapter_state("policy-route")
@@ -469,11 +479,7 @@ def _capture_authoritative_dense_gradients(
         if nonfinite and not raw:
             parameter.grad.reshape(-1)[0] = float("nan")
         raw[name] = parameter.grad.detach().clone()
-    manager.capture_gradient_numerators(
-        model_id,
-        denominator=denominator,
-        backward_completed=True,
-    )
+    stage_and_commit_gradient_capture(manager, model_id, denominator=denominator)
     return raw
 
 
@@ -488,7 +494,9 @@ def _install_model_gradients(manager: LoRAAdapterManager, model_id: str, value: 
     return installed
 
 
-def test_capture_commit_uses_preallocated_staged_data_after_model_gradients_are_cleared(tmp_path):
+def test_gradient_capture_accumulation_commit_and_prevalidation_policy(tmp_path, monkeypatch):
+    _assert_raw_numerator_capture_preserves_model_grads_and_streams_into_one_fp32_image(tmp_path / "accumulation")
+
     manager = _build_manager(tmp_path)
     manager.register_adapter("policy-staged", lr=0.1, initialize_fresh=True)
     _compile_authoritative_dense_plan(manager, "policy-staged")
@@ -510,8 +518,11 @@ def test_capture_commit_uses_preallocated_staged_data_after_model_gradients_are_
     for name, numerator in state.gradient_scratch.numerators.items():
         torch.testing.assert_close(numerator, expected[name].float())
 
+    _assert_direct_dtensor_capture_preserves_grad(tmp_path / "dtensor", monkeypatch)
+    _assert_capture_prevalidation_is_atomic(tmp_path / "prevalidation")
 
-def test_direct_dtensor_capture_returns_completed_tensor_without_replacing_grad(tmp_path, monkeypatch):
+
+def _assert_direct_dtensor_capture_preserves_grad(tmp_path, monkeypatch):
     manager = _build_manager(tmp_path)
 
     class _FakeDTensor:
@@ -555,7 +566,7 @@ def test_direct_dtensor_capture_returns_completed_tensor_without_replacing_grad(
     torch.testing.assert_close(completed, torch.tensor([3.0]))
 
 
-def test_capture_commit_prevalidation_cannot_partially_mutate_numerators(tmp_path):
+def _assert_capture_prevalidation_is_atomic(tmp_path):
     manager = _build_manager(tmp_path)
     manager.register_adapter("policy-atomic-stage", lr=0.1, initialize_fresh=True)
     _compile_authoritative_dense_plan(manager, "policy-atomic-stage")
@@ -574,7 +585,7 @@ def test_capture_commit_prevalidation_cannot_partially_mutate_numerators(tmp_pat
     manager.abort_gradient_capture("policy-atomic-stage")
 
 
-def test_empty_authoritative_epoch_does_not_mutate_learning_rate_or_publication(tmp_path):
+def _assert_empty_authoritative_epoch_does_not_mutate_learning_rate_or_publication(tmp_path):
     manager = _build_manager(tmp_path)
     manager.register_adapter("policy-empty-epoch", lr=0.1, initialize_fresh=True)
     _compile_authoritative_dense_plan(manager, "policy-empty-epoch")
@@ -589,8 +600,10 @@ def test_empty_authoritative_epoch_does_not_mutate_learning_rate_or_publication(
     assert state.publication_eligible
     assert not state.publication_pending
 
+    _assert_abort_gradient_epoch_policy(tmp_path / "abort")
 
-def test_abort_gradient_epoch_discards_all_captures_and_is_idempotent(tmp_path):
+
+def _assert_abort_gradient_epoch_policy(tmp_path):
     manager = _build_manager(tmp_path)
     manager.register_adapter("policy-abort", lr=0.1, initialize_fresh=True)
     _compile_authoritative_dense_plan(manager, "policy-abort")
@@ -598,7 +611,7 @@ def test_abort_gradient_epoch_discards_all_captures_and_is_idempotent(tmp_path):
     for value in (2.0, 5.0):
         assert manager.begin_gradient_capture("policy-abort", scale_state=GradientScaleState.RAW_NUMERATOR)
         _install_model_gradients(manager, "policy-abort", value)
-        manager.capture_gradient_numerators("policy-abort", denominator=3, backward_completed=True)
+        stage_and_commit_gradient_capture(manager, "policy-abort", denominator=3)
     manager.increment_forward_backward_step("policy-abort")
     monotonic_successes = state.global_forward_backward_step
 
@@ -615,8 +628,10 @@ def test_abort_gradient_epoch_discards_all_captures_and_is_idempotent(tmp_path):
     assert all(not torch.count_nonzero(tensor) for tensor in state.gradient_scratch.numerators.values())
     assert all(parameter.grad is None for parameter in state.local_params.values())
 
+    _assert_abort_gradient_epoch_rejects_poison_and_publication_pending(tmp_path / "rejected")
 
-def test_abort_gradient_epoch_rejects_poison_and_publication_pending(tmp_path):
+
+def _assert_abort_gradient_epoch_rejects_poison_and_publication_pending(tmp_path):
     manager = _build_manager(tmp_path)
     manager.register_adapter("policy-abort-reject", lr=0.1, initialize_fresh=True)
     _compile_authoritative_dense_plan(manager, "policy-abort-reject")
@@ -631,7 +646,7 @@ def test_abort_gradient_epoch_rejects_poison_and_publication_pending(tmp_path):
         manager.abort_gradient_epoch("policy-abort-reject")
 
 
-def test_weight_publication_allows_clean_mid_epoch_but_checkpoint_publication_does_not(tmp_path):
+def _assert_weight_publication_allows_clean_mid_epoch_but_checkpoint_publication_does_not(tmp_path):
     manager = _build_manager(tmp_path)
     manager.register_adapter("policy-publication", lr=0.1, initialize_fresh=True)
     _compile_authoritative_dense_plan(manager, "policy-publication")
@@ -655,7 +670,8 @@ def test_weight_publication_allows_clean_mid_epoch_but_checkpoint_publication_do
         manager.validate_weight_publication("policy-publication")
 
 
-def test_authoritative_dense_step_matches_analytical_gradient_clip_adamw_and_moments(tmp_path):
+def test_authoritative_optimizer_lifecycle_policy(tmp_path, monkeypatch):
+    _assert_weight_publication_allows_clean_mid_epoch_but_checkpoint_publication_does_not(tmp_path / "publication")
     manager = _build_manager(tmp_path)
     manager.register_adapter("policy-step", lr=0.1, initialize_fresh=True)
     _compile_authoritative_dense_plan(manager, "policy-step")
@@ -698,8 +714,22 @@ def test_authoritative_dense_step_matches_analytical_gradient_clip_adamw_and_mom
     assert all(not torch.count_nonzero(tensor) for tensor in state.gradient_scratch.numerators.values())
     assert state.global_step == 1
 
+    with monkeypatch.context() as case_patch:
+        _assert_authoritative_dense_step_adds_only_logical_norm_collective(
+            tmp_path / "collectives",
+            case_patch,
+        )
+    _assert_empty_authoritative_epoch_does_not_mutate_learning_rate_or_publication(tmp_path / "empty")
+    with monkeypatch.context() as case_patch:
+        _assert_authoritative_optimizer_outcome_policy(tmp_path / "outcomes", case_patch)
+    with monkeypatch.context() as case_patch:
+        _assert_exact_lm_head_optimizer_coherence_accepts_scalar_tensor_state(
+            tmp_path / "lm-head-coherence",
+            case_patch,
+        )
 
-def test_authoritative_dense_step_adds_only_the_logical_norm_collective(tmp_path, monkeypatch):
+
+def _assert_authoritative_dense_step_adds_only_logical_norm_collective(tmp_path, monkeypatch):
     manager = _build_manager(tmp_path)
     manager.register_adapter("policy-collectives", lr=0.1, initialize_fresh=True)
     _compile_authoritative_dense_plan(manager, "policy-collectives")
@@ -727,7 +757,7 @@ def test_authoritative_dense_step_adds_only_the_logical_norm_collective(tmp_path
         manager.begin_gradient_capture("policy-collectives", scale_state=GradientScaleState.RAW_NUMERATOR)
 
 
-def test_exact_lm_head_optimizer_coherence_accepts_scalar_tensor_state(tmp_path, monkeypatch):
+def _assert_exact_lm_head_optimizer_coherence_accepts_scalar_tensor_state(tmp_path, monkeypatch):
     manager = _build_manager(tmp_path)
     parameter = nn.Parameter(torch.ones(1))
     manager._exact_lm_head_replicated_param_names = {"lm_head.lora_A"}
@@ -746,10 +776,10 @@ def test_exact_lm_head_optimizer_coherence_accepts_scalar_tensor_state(tmp_path,
         lambda: SimpleNamespace(lm_head_tp_group=group),
     )
 
-    manager._validate_exact_lm_head_tp_coherence(state, include_optimizer=True)
+    assert manager._validate_exact_lm_head_tp_coherence(state, include_optimizer=True) is None
 
 
-def test_authoritative_semantic_rejection_is_recoverable_before_mutation(tmp_path):
+def _assert_authoritative_optimizer_outcome_policy(tmp_path, monkeypatch):
     manager = _build_manager(tmp_path)
     manager.register_adapter("policy-semantic", lr=0.1, initialize_fresh=True)
     _compile_authoritative_dense_plan(manager, "policy-semantic")
@@ -770,8 +800,19 @@ def test_authoritative_semantic_rejection_is_recoverable_before_mutation(tmp_pat
     assert state.session_spec["optimizer_config"]["learning_rate"] == pytest.approx(0.1)
     assert [group["lr"] for group in state.optimizer.param_groups] == original_group_lrs
 
+    with monkeypatch.context() as case_patch:
+        _assert_authoritative_optimizer_failure_poisons_session_and_blocks_publication(
+            tmp_path / "optimizer-failure",
+            case_patch,
+        )
+    with monkeypatch.context() as case_patch:
+        _assert_authoritative_collective_failure_is_fatal_but_leaves_parameters_unchanged(
+            tmp_path / "collective-failure",
+            case_patch,
+        )
 
-def test_authoritative_optimizer_failure_poisons_session_and_blocks_publication(tmp_path, monkeypatch):
+
+def _assert_authoritative_optimizer_failure_poisons_session_and_blocks_publication(tmp_path, monkeypatch):
     manager = _build_manager(tmp_path)
     manager.register_adapter("policy-fatal", lr=0.1, initialize_fresh=True)
     _compile_authoritative_dense_plan(manager, "policy-fatal")
@@ -798,7 +839,7 @@ def test_authoritative_optimizer_failure_poisons_session_and_blocks_publication(
     assert any(not torch.equal(parameter, committed_parameters[name]) for name, parameter in state.local_params.items())
 
 
-def test_authoritative_collective_failure_is_fatal_but_leaves_parameters_unchanged(tmp_path, monkeypatch):
+def _assert_authoritative_collective_failure_is_fatal_but_leaves_parameters_unchanged(tmp_path, monkeypatch):
     manager = _build_manager(tmp_path)
     manager.register_adapter("policy-collective", lr=0.1, initialize_fresh=True)
     _compile_authoritative_dense_plan(manager, "policy-collective")
@@ -823,26 +864,24 @@ def test_authoritative_collective_failure_is_fatal_but_leaves_parameters_unchang
     assert not state.publication_eligible
 
 
-def test_save_adapter_state_preserves_lora_weight_dtype(tmp_path):
-    manager = _build_manager(tmp_path, optimizer_type="adamw")
-    manager.register_adapter("policy-fp32", lr=0.1, initialize_fresh=True)
-
-    save_path = Path(manager.save_adapter_state("policy-fp32")["path"])
-    weights = safetensors_load_file(str(save_path / "adapter_model.safetensors"))
-
-    assert weights["base_model.model.model.layers.0.self_attn.o_proj.lora_A"].dtype == torch.float32
-    assert weights["base_model.model.model.layers.0.self_attn.o_proj.lora_B"].dtype == torch.float32
-
-
-def test_save_adapter_state_rejects_path_outside_checkpoint_root(tmp_path):
-    manager = _build_manager(tmp_path, optimizer_type="adamw")
+def _assert_adapter_checkpoint_paths_stay_within_trusted_roots(tmp_path, monkeypatch):
+    server_root = tmp_path / "server"
+    monkeypatch.setenv("XORL_SERVER_ARTIFACT_ROOT", str(server_root))
+    manager = _build_manager(server_root, optimizer_type="adamw")
     manager.register_adapter("policy-contained", lr=0.1, initialize_fresh=True)
 
     with pytest.raises(ValueError, match="escapes configured root"):
-        manager.save_adapter_state("policy-contained", path=str(tmp_path / "outside"))
+        manager.save_adapter_state("policy-contained", path=str(server_root / "outside"))
+
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True)
+    with pytest.raises(ValueError, match="escapes configured root"):
+        manager.load_adapter_state("policy-contained", str(outside), load_optimizer=False)
+
+    _assert_save_and_validate_adapter_state_binds_strict_target_manifest(server_root / "manifest")
 
 
-def test_save_and_validate_adapter_state_binds_strict_target_manifest(tmp_path):
+def _assert_save_and_validate_adapter_state_binds_strict_target_manifest(tmp_path):
     manifest = {
         "schema_version": 1,
         "target_modules": ["o_proj"],
@@ -879,20 +918,7 @@ def test_save_and_validate_adapter_state_binds_strict_target_manifest(tmp_path):
         manager._validate_checkpoint_adapter_config(str(checkpoint))
 
 
-def test_load_adapter_state_uses_checkpoint_optimizer_contract_for_fresh_session(tmp_path):
-    source_manager = _build_manager(tmp_path, optimizer_type="signsgd")
-    source_manager.register_adapter("policy-b", lr=0.1, initialize_fresh=True)
-    checkpoint_path = source_manager.save_adapter_state("policy-b")["path"]
-
-    target_manager = _build_manager(tmp_path, optimizer_type="adamw")
-    result = target_manager.load_adapter_state("policy-b", checkpoint_path, load_optimizer=True)
-
-    assert result["model_id"] == "policy-b"
-    assert isinstance(target_manager.get_adapter_state("policy-b").optimizer, SignSGD)
-    assert target_manager.get_adapter_session_spec("policy-b")["optimizer_config"]["type"] == "signsgd"
-
-
-def test_authoritative_checkpoint_restore_resets_lifecycle_and_preserves_plan_contract(tmp_path):
+def _assert_authoritative_checkpoint_restore_resets_lifecycle_and_preserves_plan_contract(tmp_path):
     source_manager = _build_manager(tmp_path / "source")
     source_manager.register_adapter("policy-restore", lr=0.1, initialize_fresh=True)
     source_plan = _compile_authoritative_dense_plan(source_manager, "policy-restore")
@@ -913,8 +939,10 @@ def test_authoritative_checkpoint_restore_resets_lifecycle_and_preserves_plan_co
     restored_plan = _compile_authoritative_dense_plan(target_manager, "policy-restore")
     assert restored_plan.fingerprint == result["gradient_ownership_plan_fingerprint"]
 
+    _assert_authoritative_checkpoint_plan_admission_policy(tmp_path / "plan")
 
-def test_authoritative_checkpoint_ignores_identity_label_difference_when_direct_contract_matches(tmp_path):
+
+def _assert_authoritative_checkpoint_plan_admission_policy(tmp_path):
     source_manager = _build_manager(tmp_path / "source")
     source_manager.register_adapter("policy-plan", lr=0.1, initialize_fresh=True)
     _compile_authoritative_dense_plan(source_manager, "policy-plan")
@@ -936,8 +964,10 @@ def test_authoritative_checkpoint_ignores_identity_label_difference_when_direct_
 
     assert result["gradient_ownership_plan_fingerprint"] == source_plan.fingerprint
 
+    _assert_authoritative_checkpoint_rejects_direct_plan_mismatch(tmp_path / "mismatch")
 
-def test_authoritative_checkpoint_rejects_direct_plan_mismatch_before_mutation(tmp_path):
+
+def _assert_authoritative_checkpoint_rejects_direct_plan_mismatch(tmp_path):
     source_manager = _build_manager(tmp_path / "source")
     source_manager.register_adapter("policy-plan", lr=0.1, initialize_fresh=True)
     _compile_authoritative_dense_plan(source_manager, "policy-plan", merged_forward=False)
@@ -968,7 +998,7 @@ def test_authoritative_checkpoint_rejects_direct_plan_mismatch_before_mutation(t
     assert state.lr == before_lr
 
 
-def test_adapter_coordinator_loads_checkpoint_without_placeholder_spec_mismatch(tmp_path):
+def _assert_adapter_coordinator_checkpoint_materialization_policy(tmp_path):
     source_manager = _build_manager(tmp_path / "source", optimizer_type="signsgd")
     source_manager.register_adapter("policy-b", lr=0.1, initialize_fresh=True)
     source_checkpoint = source_manager.save_adapter_state("policy-b")["path"]
@@ -1002,8 +1032,10 @@ def test_adapter_coordinator_loads_checkpoint_without_placeholder_spec_mismatch(
         0.1
     )
 
+    _assert_coordinator_auto_load_uses_checkpoint_spec(tmp_path / "auto")
 
-def test_adapter_coordinator_auto_load_evicted_uses_checkpoint_session_spec(tmp_path):
+
+def _assert_coordinator_auto_load_uses_checkpoint_spec(tmp_path):
     target_manager = _build_manager(tmp_path / "target", optimizer_type="adamw")
     source_manager = _build_manager(tmp_path / "source", optimizer_type="signsgd")
     source_manager.register_adapter("policy-evicted", lr=0.2, initialize_fresh=True)
@@ -1029,7 +1061,7 @@ def test_adapter_coordinator_auto_load_evicted_uses_checkpoint_session_spec(tmp_
     )
 
 
-def test_load_adapter_state_rejects_registered_session_spec_mismatch(tmp_path):
+def test_adapter_checkpoint_restore_and_admission_policy(tmp_path, monkeypatch):
     source_manager = _build_manager(tmp_path, optimizer_type="signsgd")
     source_manager.register_adapter("policy-b", lr=0.1, initialize_fresh=True)
     checkpoint_path = source_manager.save_adapter_state("policy-b")["path"]
@@ -1040,19 +1072,18 @@ def test_load_adapter_state_rejects_registered_session_spec_mismatch(tmp_path):
     with pytest.raises(ValueError, match="Checkpoint optimizer type is incompatible"):
         target_manager.load_adapter_state("policy-b", checkpoint_path, load_optimizer=True)
 
+    with monkeypatch.context() as case_patch:
+        _assert_adapter_checkpoint_paths_stay_within_trusted_roots(tmp_path / "trusted-paths", case_patch)
+    _assert_authoritative_checkpoint_restore_resets_lifecycle_and_preserves_plan_contract(tmp_path / "lifecycle")
+    _assert_load_allows_lr_override(tmp_path / "lr-override")
+    _assert_weights_only_allows_optimizer_mismatch(tmp_path / "optimizer-mismatch")
+    _assert_weights_only_restores_checkpoint_lr(tmp_path / "lr-restore")
+    _assert_load_adapter_state_checkpoint_structure_admission_policy(tmp_path / "structure")
+    _assert_load_adapter_state_peft_filename_and_sharding_compatibility(tmp_path / "peft")
+    _assert_adapter_coordinator_checkpoint_materialization_policy(tmp_path / "coordinator")
 
-def test_load_adapter_state_rejects_checkpoint_outside_trusted_roots(tmp_path, monkeypatch):
-    server_root = tmp_path / "server"
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    monkeypatch.setenv("XORL_SERVER_ARTIFACT_ROOT", str(server_root))
-    manager = _build_manager(server_root, optimizer_type="adamw")
 
-    with pytest.raises(ValueError, match="escapes configured root"):
-        manager.load_adapter_state("policy-b", str(outside), load_optimizer=False)
-
-
-def test_load_adapter_state_allows_lr_override_for_registered_session(tmp_path):
+def _assert_load_allows_lr_override(tmp_path):
     source_manager = _build_manager(tmp_path / "source", optimizer_type="adamw")
     source_spec = _session_spec(rank=4, alpha=16, optimizer_type="adamw", lr=0.1, weight_decay=0.01)
     source_manager.register_adapter("policy-lr-override", session_spec=source_spec, initialize_fresh=True)
@@ -1078,13 +1109,13 @@ def test_load_adapter_state_allows_lr_override_for_registered_session(tmp_path):
     ] == pytest.approx(0.2)
 
 
-def test_load_adapter_state_allows_weights_only_optimizer_mismatch(tmp_path):
+def _assert_weights_only_allows_optimizer_mismatch(tmp_path):
     source_manager = _build_manager(tmp_path, optimizer_type="signsgd")
     source_spec = _session_spec(rank=4, alpha=16, optimizer_type="signsgd", lr=0.1)
     source_manager.register_adapter("policy-b", session_spec=source_spec, initialize_fresh=True)
     source_state = source_manager.get_adapter_state("policy-b")
-    source_state.lora_params["model.layers.0.self_attn.o_proj.lora_A"].data.fill_(1.25)
-    source_state.lora_params["model.layers.0.self_attn.o_proj.lora_B"].data.fill_(0.5)
+    source_state.local_params["model.layers.0.self_attn.o_proj.lora_A"].data.fill_(1.25)
+    source_state.local_params["model.layers.0.self_attn.o_proj.lora_B"].data.fill_(0.5)
     checkpoint_path = source_manager.save_adapter_state("policy-b")["path"]
 
     target_manager = _build_manager(tmp_path, optimizer_type="adamw")
@@ -1092,13 +1123,13 @@ def test_load_adapter_state_allows_weights_only_optimizer_mismatch(tmp_path):
     target_manager.register_adapter("policy-b", session_spec=target_spec, initialize_fresh=True)
     target_fresh_a = (
         target_manager.get_adapter_state("policy-b")
-        .lora_params["model.layers.0.self_attn.o_proj.lora_A"]
+        .local_params["model.layers.0.self_attn.o_proj.lora_A"]
         .detach()
         .clone()
     )
     target_fresh_b = (
         target_manager.get_adapter_state("policy-b")
-        .lora_params["model.layers.0.self_attn.o_proj.lora_B"]
+        .local_params["model.layers.0.self_attn.o_proj.lora_B"]
         .detach()
         .clone()
     )
@@ -1115,18 +1146,18 @@ def test_load_adapter_state_allows_weights_only_optimizer_mismatch(tmp_path):
     )
     assert target_state.optimizer.param_groups[0]["lr"] == pytest.approx(0.05)
     assert torch.allclose(
-        target_state.lora_params["model.layers.0.self_attn.o_proj.lora_A"],
+        target_state.local_params["model.layers.0.self_attn.o_proj.lora_A"],
         torch.full((4, 8), 1.25),
     )
     assert torch.allclose(
-        target_state.lora_params["model.layers.0.self_attn.o_proj.lora_B"],
+        target_state.local_params["model.layers.0.self_attn.o_proj.lora_B"],
         torch.full((8, 4), 0.5),
     )
-    assert not torch.equal(target_state.lora_params["model.layers.0.self_attn.o_proj.lora_A"], target_fresh_a)
-    assert not torch.equal(target_state.lora_params["model.layers.0.self_attn.o_proj.lora_B"], target_fresh_b)
+    assert not torch.equal(target_state.local_params["model.layers.0.self_attn.o_proj.lora_A"], target_fresh_a)
+    assert not torch.equal(target_state.local_params["model.layers.0.self_attn.o_proj.lora_B"], target_fresh_b)
 
 
-def test_load_adapter_state_weights_only_restores_checkpoint_lr_for_same_optimizer_contract(tmp_path):
+def _assert_weights_only_restores_checkpoint_lr(tmp_path):
     source_manager = _build_manager(tmp_path / "source", optimizer_type="adamw")
     source_spec = _session_spec(rank=4, alpha=16, optimizer_type="adamw", lr=0.1, weight_decay=0.01)
     source_manager.register_adapter("policy-lr-restore", session_spec=source_spec, initialize_fresh=True)
@@ -1148,7 +1179,7 @@ def test_load_adapter_state_weights_only_restores_checkpoint_lr_for_same_optimiz
     ] == pytest.approx(0.25)
 
 
-def test_load_adapter_state_rejects_checkpoint_target_module_mismatch(tmp_path):
+def _assert_load_adapter_state_checkpoint_structure_admission_policy(tmp_path):
     source_manager = _build_manager(tmp_path, optimizer_type="adamw")
     source_manager.register_adapter("policy-structure", lr=0.1, initialize_fresh=True)
     checkpoint_path = Path(source_manager.save_adapter_state("policy-structure")["path"])
@@ -1161,8 +1192,11 @@ def test_load_adapter_state_rejects_checkpoint_target_module_mismatch(tmp_path):
     with pytest.raises(ValueError, match="target_modules"):
         target_manager.load_adapter_state("policy-structure", str(checkpoint_path), load_optimizer=True)
 
+    _assert_checkpoint_with_missing_lora_tensors_is_rejected(tmp_path / "missing")
+    _assert_checkpoint_rank_exceeding_capacity_is_rejected(tmp_path / "rank")
 
-def test_load_adapter_state_rejects_checkpoint_with_missing_lora_tensors(tmp_path):
+
+def _assert_checkpoint_with_missing_lora_tensors_is_rejected(tmp_path):
     source_manager = _build_manager(tmp_path, optimizer_type="adamw")
     source_manager.register_adapter("policy-missing", lr=0.1, initialize_fresh=True)
     checkpoint_path = Path(source_manager.save_adapter_state("policy-missing")["path"])
@@ -1173,35 +1207,18 @@ def test_load_adapter_state_rejects_checkpoint_with_missing_lora_tensors(tmp_pat
     safetensors_save_file(weights, str(weights_path))
 
     target_manager = _build_manager(tmp_path, optimizer_type="adamw")
+    assert "policy-missing" not in target_manager.adapters
     with pytest.raises(ValueError, match="parameter set does not match"):
         target_manager.load_adapter_state("policy-missing", str(checkpoint_path), load_optimizer=True)
+    assert "policy-missing" not in target_manager.adapters
 
 
-def test_load_adapter_state_rolls_back_freshly_registered_adapter_on_failure(tmp_path):
-    source_manager = _build_manager(tmp_path, optimizer_type="adamw")
-    source_manager.register_adapter("policy-rollback", lr=0.1, initialize_fresh=True)
-    checkpoint_path = Path(source_manager.save_adapter_state("policy-rollback")["path"])
-
-    weights_path = checkpoint_path / "adapter_model.safetensors"
-    weights = safetensors_load_file(str(weights_path))
-    weights.pop("base_model.model.model.layers.0.self_attn.o_proj.lora_B")
-    safetensors_save_file(weights, str(weights_path))
-
-    target_manager = _build_manager(tmp_path, optimizer_type="adamw")
-    assert "policy-rollback" not in target_manager.adapters
-
-    with pytest.raises(ValueError, match="parameter set does not match"):
-        target_manager.load_adapter_state("policy-rollback", str(checkpoint_path), load_optimizer=True)
-
-    assert "policy-rollback" not in target_manager.adapters
-
-
-def test_load_adapter_state_accepts_weight_suffixed_checkpoint_tensor_names(tmp_path):
+def _assert_load_adapter_state_peft_filename_and_sharding_compatibility(tmp_path):
     source_manager = _build_manager(tmp_path / "source", optimizer_type="adamw")
     source_manager.register_adapter("policy-weight-suffix", lr=0.1, initialize_fresh=True)
     source_state = source_manager.get_adapter_state("policy-weight-suffix")
-    source_state.lora_params["model.layers.0.self_attn.o_proj.lora_A"].data.fill_(1.5)
-    source_state.lora_params["model.layers.0.self_attn.o_proj.lora_B"].data.fill_(0.75)
+    source_state.local_params["model.layers.0.self_attn.o_proj.lora_A"].data.fill_(1.5)
+    source_state.local_params["model.layers.0.self_attn.o_proj.lora_B"].data.fill_(0.75)
     checkpoint_path = Path(source_manager.save_adapter_state("policy-weight-suffix")["path"])
 
     weights_path = checkpoint_path / "adapter_model.safetensors"
@@ -1217,21 +1234,23 @@ def test_load_adapter_state_accepts_weight_suffixed_checkpoint_tensor_names(tmp_
     target_state = target_manager.get_adapter_state("policy-weight-suffix")
     assert result["model_id"] == "policy-weight-suffix"
     assert torch.allclose(
-        target_state.lora_params["model.layers.0.self_attn.o_proj.lora_A"],
+        target_state.local_params["model.layers.0.self_attn.o_proj.lora_A"],
         torch.full((4, 8), 1.5),
     )
     assert torch.allclose(
-        target_state.lora_params["model.layers.0.self_attn.o_proj.lora_B"],
+        target_state.local_params["model.layers.0.self_attn.o_proj.lora_B"],
         torch.full((8, 4), 0.75),
     )
 
+    _assert_indexed_sharded_peft_checkpoint_is_accepted(tmp_path / "sharded")
 
-def test_load_adapter_state_accepts_indexed_sharded_peft_checkpoint(tmp_path):
+
+def _assert_indexed_sharded_peft_checkpoint_is_accepted(tmp_path):
     source_manager = _build_manager(tmp_path / "source", optimizer_type="adamw")
     source_manager.register_adapter("policy-sharded", lr=0.1, initialize_fresh=True)
     source_state = source_manager.get_adapter_state("policy-sharded")
-    source_state.lora_params["model.layers.0.self_attn.o_proj.lora_A"].data.fill_(2.5)
-    source_state.lora_params["model.layers.0.self_attn.o_proj.lora_B"].data.fill_(1.25)
+    source_state.local_params["model.layers.0.self_attn.o_proj.lora_A"].data.fill_(2.5)
+    source_state.local_params["model.layers.0.self_attn.o_proj.lora_B"].data.fill_(1.25)
     checkpoint_path = Path(source_manager.save_adapter_state("policy-sharded")["path"])
 
     weights_path = checkpoint_path / "adapter_model.safetensors"
@@ -1254,16 +1273,16 @@ def test_load_adapter_state_accepts_indexed_sharded_peft_checkpoint(tmp_path):
     target_state = target_manager.get_adapter_state("policy-sharded")
     assert result["model_id"] == "policy-sharded"
     assert torch.allclose(
-        target_state.lora_params["model.layers.0.self_attn.o_proj.lora_A"],
+        target_state.local_params["model.layers.0.self_attn.o_proj.lora_A"],
         torch.full((4, 8), 2.5),
     )
     assert torch.allclose(
-        target_state.lora_params["model.layers.0.self_attn.o_proj.lora_B"],
+        target_state.local_params["model.layers.0.self_attn.o_proj.lora_B"],
         torch.full((8, 4), 1.25),
     )
 
 
-def test_load_adapter_state_rejects_checkpoint_rank_exceeding_model_capacity(tmp_path):
+def _assert_checkpoint_rank_exceeding_capacity_is_rejected(tmp_path):
     source_manager = _build_manager(
         tmp_path / "source",
         optimizer_type="adamw",
@@ -1287,13 +1306,13 @@ def test_load_adapter_state_rejects_checkpoint_rank_exceeding_model_capacity(tmp
         target_manager.load_adapter_state("policy-r8", checkpoint_path, load_optimizer=True)
 
 
-def test_register_adapter_refuses_to_evict_dirty_adapter(tmp_path):
+def _assert_register_adapter_eviction_policy(tmp_path, monkeypatch):
     manager = _build_manager(tmp_path, max_adapters=1, optimizer_type="adamw")
     manager.register_adapter("policy-a", session_spec=_session_spec(rank=4, alpha=16, optimizer_type="adamw", lr=0.1))
 
     dirty_state = manager.get_adapter_state("policy-a")
-    dirty_state.lora_params["model.layers.0.self_attn.o_proj.lora_A"].grad = torch.ones_like(
-        dirty_state.lora_params["model.layers.0.self_attn.o_proj.lora_A"]
+    dirty_state.local_params["model.layers.0.self_attn.o_proj.lora_A"].grad = torch.ones_like(
+        dirty_state.local_params["model.layers.0.self_attn.o_proj.lora_A"]
     )
 
     with pytest.raises(RuntimeError, match="pending gradients"):
@@ -1304,8 +1323,12 @@ def test_register_adapter_refuses_to_evict_dirty_adapter(tmp_path):
     assert manager.has_adapter("policy-a")
     assert not manager.has_adapter("policy-b")
 
+    _assert_clean_adapter_is_evicted_before_dirty_one(tmp_path / "clean")
+    _assert_resident_adapter_survives_auto_save_failure(tmp_path / "save-failure", monkeypatch)
+    _assert_multi_rank_eviction_is_rejected(tmp_path / "multi-rank", monkeypatch)
 
-def test_register_adapter_evicts_clean_adapter_before_dirty_one(tmp_path):
+
+def _assert_clean_adapter_is_evicted_before_dirty_one(tmp_path):
     manager = _build_manager(tmp_path, max_adapters=2, optimizer_type="adamw")
     manager.register_adapter("policy-a", session_spec=_session_spec(rank=4, alpha=16, optimizer_type="adamw", lr=0.1))
     manager.register_adapter("policy-b", session_spec=_session_spec(rank=4, alpha=16, optimizer_type="adamw", lr=0.2))
@@ -1314,8 +1337,8 @@ def test_register_adapter_evicts_clean_adapter_before_dirty_one(tmp_path):
     clean_state = manager.get_adapter_state("policy-b")
     dirty_state.last_access_time = 1.0
     clean_state.last_access_time = 2.0
-    dirty_state.lora_params["model.layers.0.self_attn.o_proj.lora_A"].grad = torch.ones_like(
-        dirty_state.lora_params["model.layers.0.self_attn.o_proj.lora_A"]
+    dirty_state.local_params["model.layers.0.self_attn.o_proj.lora_A"].grad = torch.ones_like(
+        dirty_state.local_params["model.layers.0.self_attn.o_proj.lora_A"]
     )
 
     manager.register_adapter("policy-c", session_spec=_session_spec(rank=4, alpha=16, optimizer_type="adamw", lr=0.3))
@@ -1325,7 +1348,7 @@ def test_register_adapter_evicts_clean_adapter_before_dirty_one(tmp_path):
     assert manager.has_adapter("policy-c")
 
 
-def test_register_adapter_refuses_multi_rank_eviction(tmp_path, monkeypatch):
+def _assert_multi_rank_eviction_is_rejected(tmp_path, monkeypatch):
     manager = _build_manager(tmp_path, max_adapters=1, optimizer_type="adamw")
     manager.register_adapter("policy-a", session_spec=_session_spec(rank=4, alpha=16, optimizer_type="adamw", lr=0.1))
     monkeypatch.setattr(adapter_manager_module, "_optimizer_shard_rank_world", lambda: (0, 8))
@@ -1339,7 +1362,7 @@ def test_register_adapter_refuses_multi_rank_eviction(tmp_path, monkeypatch):
     assert not manager.has_adapter("policy-b")
 
 
-def test_register_adapter_keeps_resident_adapter_when_auto_save_fails(tmp_path, monkeypatch):
+def _assert_resident_adapter_survives_auto_save_failure(tmp_path, monkeypatch):
     manager = _build_manager(tmp_path, max_adapters=1, optimizer_type="adamw")
     manager.auto_save_on_eviction = True
     manager.register_adapter("policy-a", session_spec=_session_spec(rank=4, alpha=16, optimizer_type="adamw", lr=0.1))
@@ -1357,7 +1380,9 @@ def test_register_adapter_keeps_resident_adapter_when_auto_save_fails(tmp_path, 
     assert not manager.has_adapter("policy-b")
 
 
-def test_multi_adapter_manager_supports_mixed_ranks_and_optimizers(tmp_path):
+def test_multi_adapter_registration_training_checkpoint_and_eviction_policy(tmp_path, monkeypatch):
+    _assert_adapter_optimizer_construction_and_persistence_policy(tmp_path / "optimizer-policy")
+
     manager = _build_manager(
         tmp_path,
         optimizer_type="adamw",
@@ -1378,15 +1403,15 @@ def test_multi_adapter_manager_supports_mixed_ranks_and_optimizers(tmp_path):
 
     assert isinstance(small_state.optimizer, SignSGD)
     assert isinstance(large_state.optimizer, torch.optim.AdamW)
-    assert tuple(small_state.lora_params["model.layers.0.self_attn.o_proj.lora_A"].shape) == (2, 8)
-    assert tuple(small_state.lora_params["model.layers.0.self_attn.o_proj.lora_B"].shape) == (8, 2)
-    assert tuple(large_state.lora_params["model.layers.0.self_attn.o_proj.lora_A"].shape) == (4, 8)
-    assert tuple(large_state.lora_params["model.layers.0.self_attn.o_proj.lora_B"].shape) == (8, 4)
+    assert tuple(small_state.local_params["model.layers.0.self_attn.o_proj.lora_A"].shape) == (2, 8)
+    assert tuple(small_state.local_params["model.layers.0.self_attn.o_proj.lora_B"].shape) == (8, 2)
+    assert tuple(large_state.local_params["model.layers.0.self_attn.o_proj.lora_A"].shape) == (4, 8)
+    assert tuple(large_state.local_params["model.layers.0.self_attn.o_proj.lora_B"].shape) == (8, 4)
 
-    small_state.lora_params["model.layers.0.self_attn.o_proj.lora_A"].data.fill_(1.5)
-    small_state.lora_params["model.layers.0.self_attn.o_proj.lora_B"].data.fill_(2.5)
-    large_state.lora_params["model.layers.0.self_attn.o_proj.lora_A"].data.fill_(3.5)
-    large_state.lora_params["model.layers.0.self_attn.o_proj.lora_B"].data.fill_(4.5)
+    small_state.local_params["model.layers.0.self_attn.o_proj.lora_A"].data.fill_(1.5)
+    small_state.local_params["model.layers.0.self_attn.o_proj.lora_B"].data.fill_(2.5)
+    large_state.local_params["model.layers.0.self_attn.o_proj.lora_A"].data.fill_(3.5)
+    large_state.local_params["model.layers.0.self_attn.o_proj.lora_B"].data.fill_(4.5)
 
     manager.prepare_forward("policy-small")
     assert layer.active_r == 2
@@ -1399,7 +1424,7 @@ def test_multi_adapter_manager_supports_mixed_ranks_and_optimizers(tmp_path):
     layer.lora_A.grad = torch.full_like(layer.lora_A, 1.0)
     layer.lora_B.grad = torch.full_like(layer.lora_B, 2.0)
     assert manager.begin_gradient_capture("policy-small", scale_state=GradientScaleState.RAW_NUMERATOR)
-    manager.capture_gradient_numerators("policy-small", denominator=1, backward_completed=True)
+    stage_and_commit_gradient_capture(manager, "policy-small", denominator=1)
     small_grad_norm = manager.optim_step("policy-small", lr=0.2)
     assert small_grad_norm > 0
     assert manager.get_global_step("policy-small") == 1
@@ -1413,7 +1438,7 @@ def test_multi_adapter_manager_supports_mixed_ranks_and_optimizers(tmp_path):
     layer.lora_A.grad = torch.full_like(layer.lora_A, 3.0)
     layer.lora_B.grad = torch.full_like(layer.lora_B, 4.0)
     assert manager.begin_gradient_capture("policy-large", scale_state=GradientScaleState.RAW_NUMERATOR)
-    manager.capture_gradient_numerators("policy-large", denominator=1, backward_completed=True)
+    stage_and_commit_gradient_capture(manager, "policy-large", denominator=1)
     large_grad_norm = manager.optim_step("policy-large", lr=0.05)
     assert large_grad_norm > 0
     assert manager.get_global_step("policy-large") == 1
@@ -1435,8 +1460,11 @@ def test_multi_adapter_manager_supports_mixed_ranks_and_optimizers(tmp_path):
     assert reloaded_manager.get_adapter_session_spec("policy-small")["lora_config"]["lora_rank"] == 2
     assert reloaded_manager.get_adapter_session_spec("policy-large")["lora_config"]["lora_rank"] == 4
 
+    with monkeypatch.context() as case_patch:
+        _assert_register_adapter_eviction_policy(tmp_path / "eviction", case_patch)
 
-def test_save_adapter_state_persists_current_learning_rate(tmp_path):
+
+def _assert_save_persists_current_learning_rate(tmp_path):
     manager = _build_manager(tmp_path, optimizer_type="adamw")
     session_spec = _session_spec(rank=4, alpha=16, optimizer_type="adamw", lr=0.1, weight_decay=0.01)
     manager.register_adapter("policy-lr", session_spec=session_spec, initialize_fresh=True)
@@ -1446,6 +1474,7 @@ def test_save_adapter_state_persists_current_learning_rate(tmp_path):
     checkpoint_path = Path(manager.save_adapter_state("policy-lr")["path"])
     session_spec_json = json.loads((checkpoint_path / "session_spec.json").read_text(encoding="utf-8"))
     metadata_json = json.loads((checkpoint_path / "metadata.json").read_text(encoding="utf-8"))
+    weights = safetensors_load_file(str(checkpoint_path / "adapter_model.safetensors"))
 
     assert manager.get_adapter_session_spec("policy-lr")["optimizer_config"]["learning_rate"] == pytest.approx(0.25)
     assert session_spec_json["optimizer_config"]["learning_rate"] == pytest.approx(0.25)
@@ -1457,9 +1486,11 @@ def test_save_adapter_state_persists_current_learning_rate(tmp_path):
         "exp_avg_sq:torch.float32": 2,
         "step:torch.float32": 2,
     }
+    assert weights["base_model.model.model.layers.0.self_attn.o_proj.lora_A"].dtype == torch.float32
+    assert weights["base_model.model.model.layers.0.self_attn.o_proj.lora_B"].dtype == torch.float32
 
 
-def test_register_adapter_hoists_common_adam_hparams_out_of_optimizer_kwargs(tmp_path):
+def _assert_adam_hparams_are_hoisted(tmp_path):
     manager = _build_manager(
         tmp_path,
         optimizer_type="adamw",
@@ -1502,7 +1533,7 @@ def test_register_adapter_hoists_common_adam_hparams_out_of_optimizer_kwargs(tmp
     }
 
 
-def test_muon_set_lr_preserves_muon_param_group_lr(tmp_path):
+def _assert_muon_set_lr_preserves_group_lr(tmp_path):
     manager = _build_manager(
         tmp_path,
         optimizer_type="muon",

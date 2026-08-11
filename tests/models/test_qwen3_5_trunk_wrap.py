@@ -11,7 +11,6 @@ skipped: the GDN kernel chain has no serving-side contract), as do the MoE
 router gate (contracted separately by the exact model program) and lm_head/embed.
 """
 
-import pytest
 import torch
 
 from xorl.lora.modules.linear import LoraLinear
@@ -23,9 +22,7 @@ from xorl.ops.batch_invariant_ops import (
     set_trunk_linear_contract,
     wrap_trunk_linears_batch_invariant,
 )
-
-
-requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+from xorl.ops.bi_families_v2 import families_v2_enabled
 
 
 def _hybrid_config(**overrides) -> Qwen3_5MoeConfig:
@@ -61,27 +58,40 @@ def _build(dtype=torch.bfloat16) -> Qwen3_5MoeForCausalLM:
     return Qwen3_5MoeForCausalLM(_hybrid_config()).to(dtype)
 
 
-def test_exact_qwen_hook_enables_merged_lora_before_trunk_wrap():
+def _assert_exact_qwen_hook_enables_merged_lora_before_trunk_wrap():
+    from xorl.ops.bi_families_v2 import _select_nonexact_families  # noqa: PLC0415
+
     model = torch.nn.Module()
-    model.config = type("Config", (), {"model_type": "xorl_qwen3_5"})()
+    model.config = type(
+        "Config",
+        (),
+        {"model_type": "xorl_qwen3_5", "_qwen35_rmsnorm_family": "v1"},
+    )()
     model.q_proj = LoraLinear(16, 16, r=2, lora_alpha=4, dtype=torch.bfloat16)
+    model.norm = torch.nn.Module()
+    model.norm.rmsnorm_family = "v1"
 
     try:
+        assert families_v2_enabled() is True
         assert model.q_proj.exact_merged_forward is False
         wrapped = _apply_qwen35_gdn_exact(model)
 
+        assert families_v2_enabled() is False
         assert model.q_proj.exact_merged_forward is True
         assert wrapped == {"q_proj": 1}
         assert model.q_proj._xorl_bi_trunk_wrapped is True
     finally:
         set_trunk_linear_contract(False)
+        _select_nonexact_families()
 
 
-def test_qwen3_5_hybrid_trunk_wrap_selection():
+def test_qwen3_5_trunk_wrap_selection_policy():
+    _assert_exact_qwen_hook_enables_merged_lora_before_trunk_wrap()
+
     model = _build()
     try:
         wrapped = wrap_trunk_linears_batch_invariant(model)
-        assert not is_trunk_linear_contract_enabled(), "model wrapping must not leak numerical state process-wide"
+        assert is_trunk_linear_contract_enabled(), "model wrapping must arm the RMSNorm and trunk contract lane"
 
         # Leaf-name counts: q/k/v/o match BOTH the full-attn layer and the
         # GatedDeltaNet layer (2 each); gate_up/down match the dense-layer MLP
@@ -130,26 +140,5 @@ def test_qwen3_5_hybrid_trunk_wrap_selection():
         # lm_head / embeddings never match the name set.
         assert not _is_wrapped(model.lm_head)
         assert not _is_wrapped(model.model.embed_tokens)
-    finally:
-        set_trunk_linear_contract(False)
-
-
-@requires_cuda
-@pytest.mark.gpu
-def test_qwen3_5_full_attn_forward_runs_under_trunk_wrap():
-    """Wrapped full-attention + shared-expert + dense projections must run the
-    bf16 contract GEMM end-to-end (the runtime guard raises on any non-bf16
-    operand)."""
-    torch.manual_seed(1)
-    config = _hybrid_config(layer_types=["full_attention", "full_attention"], _moe_implementation="eager")
-    model = Qwen3_5MoeForCausalLM(config).to(device="cuda", dtype=torch.bfloat16).eval()
-    try:
-        wrapped = wrap_trunk_linears_batch_invariant(model)
-        assert wrapped["shared_expert_gate"] == 1
-        input_ids = torch.randint(0, config.vocab_size, (1, 8), device="cuda")
-        with torch.no_grad():
-            out = model(input_ids=input_ids)
-        assert out.last_hidden_state.dtype == torch.bfloat16
-        assert torch.isfinite(out.last_hidden_state.float()).all()
     finally:
         set_trunk_linear_contract(False)

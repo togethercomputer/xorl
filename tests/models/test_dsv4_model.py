@@ -19,7 +19,6 @@ pytestmark = pytest.mark.cpu
 
 @pytest.fixture(autouse=True)
 def _cpu_env(monkeypatch):
-    monkeypatch.setenv("XORL_DSV4_ROPE_MAX_SEQ_LEN", "256")
     monkeypatch.setenv("XORL_DSV4_SPARSE_ATTN_IMPL", "sparse")
     from xorl.ops.dsv4.rope import precompute_freqs_cis  # noqa: PLC0415
 
@@ -85,7 +84,7 @@ def _lm_logits(model, input_ids):
     return model.lm_head(outputs.last_hidden_state)
 
 
-def test_for_causal_lm_rejects_pipeline_parallelism():
+def _assert_for_causal_lm_rejects_pipeline_parallelism():
     """DSv4 requires a dedicated PP forward because hyperconnection state is 4-D."""
     from xorl.models.transformers.deepseek_v4 import DeepseekV4ForCausalLM  # noqa: PLC0415
 
@@ -97,23 +96,7 @@ def test_for_causal_lm_rejects_pipeline_parallelism():
         model.get_pp_module_config()
 
 
-def test_model_forward_shape_window_only():
-    """3 layers, all window-only (no compressor, no indexer)."""
-    from xorl.models.transformers.deepseek_v4 import DeepseekV4Model  # noqa: PLC0415
-
-    torch.manual_seed(0)
-    cfg = _tiny_config(num_hidden_layers=3, compress_ratios=[0, 0, 0])
-    model = _make_model(cfg, DeepseekV4Model)
-
-    bsz, seqlen = 1, cfg.sliding_window
-    input_ids = torch.randint(0, cfg.vocab_size, (bsz, seqlen), dtype=torch.long)
-
-    out = model(input_ids).last_hidden_state
-    assert out.shape == (bsz, seqlen, cfg.hidden_size)
-    assert torch.isfinite(out).all()
-
-
-def test_model_forward_shape_with_c128():
+def _assert_model_forward_shape_with_c128():
     """One C128 layer + two C0 layers."""
     from xorl.models.transformers.deepseek_v4 import DeepseekV4Model  # noqa: PLC0415
 
@@ -129,7 +112,7 @@ def test_model_forward_shape_with_c128():
     assert torch.isfinite(out).all()
 
 
-def test_for_causal_lm_forward_backward():
+def _assert_for_causal_lm_forward_backward():
     """Full forward + backward through the LM head."""
     from xorl.models.transformers.deepseek_v4 import DeepseekV4ForCausalLM  # noqa: PLC0415
 
@@ -180,7 +163,7 @@ def test_for_causal_lm_forward_backward():
         assert grads[name].grad is None, f"{name} unexpectedly received a gradient"
 
 
-def test_for_causal_lm_with_hash_layer():
+def _assert_for_causal_lm_with_hash_layer():
     """First layer is hash-routed; verify input_ids threads through correctly."""
     from xorl.models.transformers.deepseek_v4 import DeepseekV4ForCausalLM  # noqa: PLC0415
 
@@ -208,7 +191,7 @@ def test_for_causal_lm_with_hash_layer():
     assert torch.isfinite(model.model.layers[0].mlp.gate.weight.grad).all()
 
 
-def test_keep_fp32_marks_propagated():
+def _assert_keep_fp32_marks_propagated():
     """All HC + attn_sink + compressor fp32 params carry _keep_fp32 = True."""
     from xorl.models.transformers.deepseek_v4 import DeepseekV4ForCausalLM  # noqa: PLC0415
 
@@ -229,7 +212,7 @@ def test_keep_fp32_marks_propagated():
         assert getattr(p, "_keep_fp32", False) is True, f"{name} missing _keep_fp32"
 
 
-def test_from_config_wires_parallel_groups(monkeypatch):
+def _assert_from_config_wires_parallel_groups(monkeypatch):
     """DSv4 factory passes xorl's sequence-parallel group into attention."""
     from xorl.models.transformers.deepseek_v4 import DeepseekV4ForCausalLM  # noqa: PLC0415
 
@@ -254,7 +237,38 @@ def test_from_config_wires_parallel_groups(monkeypatch):
     assert model.config._attn_implementation == "native"
 
 
-def test_from_config_dtype_cast_preserves_rope_and_fp32_params(monkeypatch):
+def _assert_attention_qat_dispatch_and_tp_admission(monkeypatch):
+    from xorl.models.transformers.deepseek_v4 import modeling_deepseek_v4  # noqa: PLC0415
+    from xorl.models.transformers.deepseek_v4.modeling_deepseek_v4 import (  # noqa: PLC0415
+        DeepSeekV4Attention,
+        DeepseekV4ForCausalLM,
+    )
+
+    cfg = _tiny_config(num_hidden_layers=1, compress_ratios=[0])
+    cfg.quantization_config = {"quant_method": "fp8"}
+    qat_calls = []
+
+    def record_qat(tensor, block_size):
+        qat_calls.append((tuple(tensor.shape), block_size))
+        return tensor.clone()
+
+    monkeypatch.setattr(modeling_deepseek_v4, "fp8_simulate_qat", record_qat)
+    model = _make_model(cfg, DeepseekV4ForCausalLM)
+    input_ids = torch.randint(0, cfg.vocab_size, (1, cfg.sliding_window), dtype=torch.long)
+    model(input_ids)
+
+    attention = model.model.layers[0].self_attn
+    assert qat_calls == [((1, cfg.sliding_window, attention.nope_head_dim), 64)]
+
+    class _TwoRankGroup:
+        def size(self):
+            return 2
+
+    with pytest.raises(AssertionError, match="TP > 1 is not implemented"):
+        DeepSeekV4Attention(cfg, layer_id=0, tp_group=_TwoRankGroup())
+
+
+def _assert_from_config_dtype_cast_preserves_rope_and_fp32_params(monkeypatch):
     """Registry construction keeps complex RoPE caches and fp32-only params intact."""
     from xorl.models.transformers.deepseek_v4 import DeepseekV4ForCausalLM  # noqa: PLC0415
 
@@ -288,7 +302,7 @@ def test_from_config_dtype_cast_preserves_rope_and_fp32_params(monkeypatch):
         assert buf.imag.abs().max() > 0, f"{name} lost its imaginary RoPE component"
 
 
-def test_direct_to_dtype_preserves_rope_and_fp32_params():
+def _assert_direct_to_dtype_preserves_rope_and_fp32_params():
     """Direct DSv4 dtype casts share the same RoPE/fp32 carve-outs as registry construction."""
     from xorl.models.transformers.deepseek_v4 import DeepseekV4ForCausalLM  # noqa: PLC0415
 
@@ -307,7 +321,7 @@ def test_direct_to_dtype_preserves_rope_and_fp32_params():
         assert buf.imag.abs().max() > 0, f"{name} lost its imaginary RoPE component"
 
 
-def test_outer_gradient_checkpointing_wraps_decoder_layers():
+def _assert_outer_gradient_checkpointing_wraps_decoder_layers():
     """DSv4Model has the checkpoint flag consumed by the decoder loop."""
     from xorl.models.module_utils import DEFAULT_GRADIENT_CHECKPOINTING_METHOD  # noqa: PLC0415
     from xorl.models.transformers.deepseek_v4 import DeepseekV4Model  # noqa: PLC0415
@@ -332,3 +346,32 @@ def test_outer_gradient_checkpointing_wraps_decoder_layers():
     assert out.shape == (1, cfg.sliding_window, cfg.hidden_size)
     assert len(calls) == cfg.num_hidden_layers
     assert all(call_kwargs["input_ids"] is input_ids for _, _, call_kwargs in calls)
+
+
+def test_dsv4_model_construction_topology_precision_and_runtime_contract(monkeypatch):
+    with monkeypatch.context() as construction_patch:
+        _assert_dsv4_model_construction_topology_and_precision_contract(construction_patch)
+    _assert_dsv4_model_runtime_contract()
+
+
+def _assert_dsv4_model_construction_topology_and_precision_contract(monkeypatch):
+    _assert_for_causal_lm_rejects_pipeline_parallelism()
+    with monkeypatch.context() as topology_patch:
+        _assert_from_config_wires_parallel_groups(topology_patch)
+    with monkeypatch.context() as attention_patch:
+        _assert_attention_qat_dispatch_and_tp_admission(attention_patch)
+    with monkeypatch.context() as precision_patch:
+        _assert_dsv4_model_precision_preservation_contract(precision_patch)
+
+
+def _assert_dsv4_model_runtime_contract():
+    _assert_model_forward_shape_with_c128()
+    _assert_for_causal_lm_forward_backward()
+    _assert_for_causal_lm_with_hash_layer()
+    _assert_outer_gradient_checkpointing_wraps_decoder_layers()
+
+
+def _assert_dsv4_model_precision_preservation_contract(monkeypatch):
+    _assert_keep_fp32_marks_propagated()
+    _assert_from_config_dtype_cast_preserves_rope_and_fp32_params(monkeypatch)
+    _assert_direct_to_dtype_preserves_rope_and_fp32_params()

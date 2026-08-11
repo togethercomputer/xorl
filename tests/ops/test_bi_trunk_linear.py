@@ -20,6 +20,7 @@ from xorl.lora.modules.linear import LoraLinear
 from xorl.ops.batch_invariant_ops import (
     is_trunk_linear_contract_enabled,
     matmul_persistent,
+    mean_dim,
     rms_norm_batch_invariant,
     set_batch_invariant_mode,
     set_trunk_linear_contract,
@@ -64,6 +65,7 @@ class _TrunkModel(nn.Module):
 
 @pytest.fixture(autouse=True)
 def _reset_contract_state():
+    set_trunk_linear_contract(False)
     yield
     set_trunk_linear_contract(False)
 
@@ -72,17 +74,20 @@ def _reset_contract_state():
 # Selection (CPU)
 # --------------------------------------------------------------------------- #
 @pytest.mark.cpu
-def test_wrap_selection_counts_and_exclusions():
+def test_wrap_selection_and_admission_policy():
     model = _TrunkModel(n_layers=2)
     wrapped = wrap_trunk_linears_batch_invariant(model)
     assert wrapped == dict.fromkeys(("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"), 2)
     assert not getattr(model.lm_head, "_xorl_bi_trunk_wrapped", False)
     assert all(getattr(layer.q_proj, "_xorl_bi_trunk_wrapped", False) for layer in model.layers)
-    assert not is_trunk_linear_contract_enabled(), "wrapping one model must not mutate process-global dispatch"
+    assert is_trunk_linear_contract_enabled(), "wrapping a model must arm RMSNorm dispatch for the same contract lane"
+
+    _assert_wrap_is_idempotent()
+    _assert_wrap_skips_routed_experts()
+    _assert_wrap_rejects_unsupported_module_types()
 
 
-@pytest.mark.cpu
-def test_wrap_is_idempotent():
+def _assert_wrap_is_idempotent():
     model = _TrunkModel(n_layers=1)
     first = wrap_trunk_linears_batch_invariant(model)
     assert sum(first.values()) == 7
@@ -90,8 +95,7 @@ def test_wrap_is_idempotent():
     assert second == {}, "re-wrap must be a no-op, not a double-wrap"
 
 
-@pytest.mark.cpu
-def test_wrap_skips_routed_experts():
+def _assert_wrap_skips_routed_experts():
     model = _TrunkModel(n_layers=1)
     experts = nn.ModuleList(
         nn.ModuleDict({"gate_proj": nn.Linear(HIDDEN, INTER, dtype=torch.bfloat16)}) for _ in range(2)
@@ -102,45 +106,39 @@ def test_wrap_skips_routed_experts():
     assert not getattr(model.layers[0].experts[0].gate_proj, "_xorl_bi_trunk_wrapped", False)
 
 
-@pytest.mark.cpu
-def test_wrap_raises_on_no_match():
-    with pytest.raises(RuntimeError, match="matched no trunk linears"):
-        wrap_trunk_linears_batch_invariant(nn.Linear(4, 4))
-
-
-@pytest.mark.cpu
-def test_wrap_raises_on_lora_wrapped_module():
-    model = _TrunkModel(n_layers=1)
-    model.layers[0].q_proj = LoraLinear(HIDDEN, HIDDEN, r=4, lora_alpha=8, bias=False, dtype=torch.bfloat16)
-    with pytest.raises(NotImplementedError, match="adapter-wrapped"):
-        wrap_trunk_linears_batch_invariant(model)
-
-
-@pytest.mark.cpu
-def test_wrap_raises_on_linear_subclass():
+def _assert_wrap_rejects_unsupported_module_types():
     class _FakeFP8Linear(nn.Linear):
         pass
 
-    model = _TrunkModel(n_layers=1)
-    model.layers[0].up_proj = _FakeFP8Linear(HIDDEN, INTER, bias=False, dtype=torch.bfloat16)
-    with pytest.raises(NotImplementedError, match="not a plain"):
-        wrap_trunk_linears_batch_invariant(model)
+    def lora_model():
+        model = _TrunkModel(n_layers=1)
+        model.layers[0].q_proj = LoraLinear(HIDDEN, HIDDEN, r=4, lora_alpha=8, bias=False, dtype=torch.bfloat16)
+        return model
+
+    def fp8_subclass_model():
+        model = _TrunkModel(n_layers=1)
+        model.layers[0].up_proj = _FakeFP8Linear(HIDDEN, INTER, bias=False, dtype=torch.bfloat16)
+        return model
+
+    def fp16_model():
+        # fp32 masters are allowed because mixed precision casts before forward;
+        # fp16 and other runtime operand dtypes are outside the contract.
+        model = _TrunkModel(n_layers=1)
+        model.layers[0].down_proj = nn.Linear(INTER, HIDDEN, bias=False, dtype=torch.float16)
+        return model
+
+    cases = [
+        (nn.Linear(4, 4), RuntimeError, "matched no trunk linears"),
+        (lora_model(), NotImplementedError, "adapter-wrapped"),
+        (fp8_subclass_model(), NotImplementedError, "not a plain"),
+        (fp16_model(), RuntimeError, "bf16-only"),
+    ]
+    for model, error_type, error_pattern in cases:
+        with pytest.raises(error_type, match=error_pattern):
+            wrap_trunk_linears_batch_invariant(model)
 
 
-@pytest.mark.cpu
-def test_wrap_raises_on_non_bf16_weight():
-    # fp32 is tolerated at wrap time (mixed-precision master; mp_policy casts to
-    # bf16 before forward and the runtime guard enforces bf16 GEMM operands), but
-    # fp16 and other dtypes are outside the contract.
-    model = _TrunkModel(n_layers=1)
-    model.layers[0].down_proj = nn.Linear(INTER, HIDDEN, bias=False, dtype=torch.float16)
-    with pytest.raises(RuntimeError, match="bf16-only"):
-        wrap_trunk_linears_batch_invariant(model)
-
-
-@requires_cuda
-@pytest.mark.gpu
-def test_wrap_raises_under_global_interpose():
+def _assert_wrap_rejects_global_interpose():
     model = _TrunkModel(n_layers=1)
     with set_batch_invariant_mode(True):
         with pytest.raises(RuntimeError, match="cannot be combined"):
@@ -159,19 +157,26 @@ def _wrapped_linear(bias=False, seed=0):
 
 @requires_cuda
 @pytest.mark.gpu
-@pytest.mark.parametrize("bias", [False, True])
-def test_forward_bitwise_matches_matmul_persistent(bias):
-    lin = _wrapped_linear(bias=bias)
-    x = torch.randn(4, 64, HIDDEN, device="cuda", dtype=torch.bfloat16)
-    with torch.no_grad():
-        out = lin(x)
-        ref = matmul_persistent(x.reshape(-1, HIDDEN), lin.weight.t(), bias=lin.bias)
-    assert torch.equal(out, ref.reshape(4, 64, HIDDEN))
+def test_forward_and_backward_bitwise_and_admission_policy():
+    for bias in (False, True):
+        lin = _wrapped_linear(bias=bias)
+        x = torch.randn(4, 64, HIDDEN, device="cuda", dtype=torch.bfloat16)
+        with torch.no_grad():
+            out = lin(x)
+            ref = matmul_persistent(x.reshape(-1, HIDDEN), lin.weight.t(), bias=lin.bias)
+        assert torch.equal(out, ref.reshape(4, 64, HIDDEN))
+
+    _assert_forward_matches_global_interpose_lane()
+    _assert_forward_is_batch_invariant()
+    _assert_global_interpose_mean_reduction_policy()
+    _assert_forward_rejects_non_bf16_input()
+    _assert_wrap_rejects_global_interpose()
+    _assert_backward_bitwise_matches_cublas_autograd_with_and_without_bias()
+    set_trunk_linear_contract(False)
+    _assert_global_interpose_gradient_policy()
 
 
-@requires_cuda
-@pytest.mark.gpu
-def test_forward_bitwise_matches_global_interpose_lane():
+def _assert_forward_matches_global_interpose_lane():
     # The wrapped forward must produce the SAME bits as F.linear under the global
     # aten::mm interpose (the serving/verification lane it replaces for training).
     lin = _wrapped_linear(bias=False, seed=1)
@@ -183,9 +188,7 @@ def test_forward_bitwise_matches_global_interpose_lane():
     assert torch.equal(out, ref)
 
 
-@requires_cuda
-@pytest.mark.gpu
-def test_forward_is_batch_invariant():
+def _assert_forward_is_batch_invariant():
     lin = _wrapped_linear(seed=2)
     x = torch.randn(300, HIDDEN, device="cuda", dtype=torch.bfloat16)
     with torch.no_grad():
@@ -194,47 +197,71 @@ def test_forward_is_batch_invariant():
     assert torch.equal(full[:7], sub)
 
 
-@requires_cuda
-@pytest.mark.gpu
-def test_forward_raises_on_non_bf16_input():
+def _assert_forward_rejects_non_bf16_input():
     lin = _wrapped_linear(seed=3)
     with pytest.raises(RuntimeError, match="bf16-only"):
         lin(torch.randn(8, HIDDEN, device="cuda", dtype=torch.float32))
 
 
+def _assert_global_interpose_mean_reduction_policy():
+    for shape, dtype in (
+        ((512,), torch.bfloat16),
+        ((512,), torch.float32),
+        ((33, 127), torch.bfloat16),
+        ((33, 127), torch.float32),
+    ):
+        torch.manual_seed(0)
+        x = torch.randn(shape, device="cuda", dtype=dtype)
+        reference = x.double().mean()
+        with set_batch_invariant_mode(True):
+            output = x.mean()
+        tolerance = 1e-2 if dtype is torch.bfloat16 else 1e-5
+        assert output.shape == torch.Size([])
+        assert abs(output.double().item() - reference.item()) < tolerance
+        assert abs(output.double().item() - x.double().sum().item()) > tolerance or x.numel() == 1
+
+    x = torch.randn(4, 8, 16, device="cuda", dtype=torch.bfloat16)
+    with set_batch_invariant_mode(True):
+        fp32_output = x.mean(dtype=torch.float32)
+        output_1d = x.mean(-1)
+        output_keepdim = x.mean(-1, keepdim=True)
+        output_2d = x.mean(dim=(0, 1))
+    assert fp32_output.dtype is torch.float32
+    assert abs(fp32_output.item() - x.double().mean().item()) < 1e-2
+    assert torch.equal(output_1d, mean_dim(x, 2))
+    assert torch.equal(output_keepdim, mean_dim(x, 2, keepdim=True))
+    assert torch.equal(output_2d, torch.sum(x, dim=(0, 1), dtype=torch.float32) / (x.shape[0] * x.shape[1]))
+
+
 # --------------------------------------------------------------------------- #
 # Backward contract (GPU): bitwise vs cuBLAS autograd
 # --------------------------------------------------------------------------- #
-@requires_cuda
-@pytest.mark.gpu
-@pytest.mark.parametrize("bias", [False, True])
-def test_backward_bitwise_matches_cublas_autograd(bias):
-    lin = _wrapped_linear(bias=bias, seed=4)
-    x0 = torch.randn(2, 96, HIDDEN, device="cuda", dtype=torch.bfloat16)
-    g_out = torch.randn(2, 96, HIDDEN, device="cuda", dtype=torch.bfloat16)
+def _assert_backward_bitwise_matches_cublas_autograd_with_and_without_bias():
+    for bias in (False, True):
+        lin = _wrapped_linear(bias=bias, seed=4)
+        x0 = torch.randn(2, 96, HIDDEN, device="cuda", dtype=torch.bfloat16)
+        g_out = torch.randn(2, 96, HIDDEN, device="cuda", dtype=torch.bfloat16)
 
-    x = x0.clone().requires_grad_(True)
-    out = lin(x)
-    out.backward(g_out)
+        x = x0.clone().requires_grad_(True)
+        out = lin(x)
+        out.backward(g_out)
 
-    x_ref = x0.clone().requires_grad_(True)
-    w_ref = lin.weight.detach().clone().requires_grad_(True)
-    b_ref = lin.bias.detach().clone().requires_grad_(True) if bias else None
-    out_ref = F.linear(x_ref, w_ref, b_ref)
-    out_ref.backward(g_out)
+        x_ref = x0.clone().requires_grad_(True)
+        w_ref = lin.weight.detach().clone().requires_grad_(True)
+        b_ref = lin.bias.detach().clone().requires_grad_(True) if bias else None
+        out_ref = F.linear(x_ref, w_ref, b_ref)
+        out_ref.backward(g_out)
 
-    assert torch.equal(x.grad, x_ref.grad), "grad_input must stay bitwise on the cuBLAS path"
-    assert torch.equal(lin.weight.grad, w_ref.grad), "grad_weight must stay bitwise on the cuBLAS path"
-    if bias:
-        assert torch.equal(lin.bias.grad, b_ref.grad)
+        assert torch.equal(x.grad, x_ref.grad), "grad_input must stay bitwise on the cuBLAS path"
+        assert torch.equal(lin.weight.grad, w_ref.grad), "grad_weight must stay bitwise on the cuBLAS path"
+        if bias:
+            assert torch.equal(lin.bias.grad, b_ref.grad)
 
 
 # --------------------------------------------------------------------------- #
 # The global interpose loud-fails on training forwards
 # --------------------------------------------------------------------------- #
-@requires_cuda
-@pytest.mark.gpu
-def test_global_interpose_raises_on_grad_requiring_inputs():
+def _assert_global_interpose_gradient_policy():
     x = torch.randn(32, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     w = torch.randn(HIDDEN, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     wn = torch.randn(HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True)
@@ -251,10 +278,11 @@ def test_global_interpose_raises_on_grad_requiring_inputs():
         with pytest.raises(RuntimeError, match="XORL_BI_TRUNK_LINEAR"):
             _ = x.float().mean(-1)
 
+    _assert_global_interpose_works_under_no_grad()
+    _assert_global_interpose_allows_grad_free_inputs()
 
-@requires_cuda
-@pytest.mark.gpu
-def test_global_interpose_still_works_under_no_grad():
+
+def _assert_global_interpose_works_under_no_grad():
     torch.manual_seed(5)
     x = torch.randn(32, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     w = torch.randn(HIDDEN, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True)
@@ -267,22 +295,7 @@ def test_global_interpose_still_works_under_no_grad():
         assert torch.equal(out_norm, rms_norm_batch_invariant(x, wn, eps=1e-6))
 
 
-@requires_cuda
-@pytest.mark.gpu
-def test_global_interpose_silent_before_now_loud():
-    # Regression pin for the guarded bug: without the guard, the aten::rms_norm
-    # override returned an output disconnected from the autograd graph (q/k-norm grads
-    # silently vanished). The op must now refuse instead of detaching.
-    x = torch.randn(16, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    wn = torch.randn(HIDDEN, device="cuda", dtype=torch.bfloat16)
-    with set_batch_invariant_mode(True):
-        with pytest.raises(RuntimeError, match="rms_norm"):
-            F.rms_norm(x, (HIDDEN,), wn, eps=1e-6)
-
-
-@requires_cuda
-@pytest.mark.gpu
-def test_global_interpose_allows_grad_free_inputs_in_grad_context():
+def _assert_global_interpose_allows_grad_free_inputs():
     # Verification flows that forward non-leaf, grad-free tensors inside a
     # grad-enabled context must keep working.
     x = torch.randn(32, HIDDEN, device="cuda", dtype=torch.bfloat16)

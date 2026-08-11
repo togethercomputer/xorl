@@ -22,12 +22,6 @@ class GradientSyncStats:
     gradient_bytes: int = 0
     reduced_bytes: int = 0
 
-    @property
-    def parameter_count(self) -> int:
-        """Backward-compatible alias for the configured parameter count."""
-
-        return self.configured_parameter_count
-
 
 def _wait_for_local_tensor(tensor: torch.Tensor) -> torch.Tensor:
     wait = getattr(tensor, "wait", None)
@@ -69,30 +63,6 @@ def _set_parameter_local_gradient(parameter: torch.Tensor, local_gradient: torch
         parameter.grad = local_gradient
 
 
-def synchronize_ep_replicated_gradient(gradient: torch.Tensor) -> torch.Tensor:
-    """Sum one replicated EP gradient across the EP group.
-
-    This hook remains available for small standalone callers. The production
-    model path uses the coalesced optimizer-boundary reducer below.
-    """
-
-    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-        return gradient
-
-    from .parallel_state import get_parallel_state  # noqa: PLC0415
-
-    parallel_state = get_parallel_state()
-    if not parallel_state.ep_enabled:
-        return gradient
-    ep_group = parallel_state.ep_group
-    if ep_group is None or torch.distributed.get_world_size(ep_group) <= 1:
-        return gradient
-
-    local_gradient = gradient.to_local() if hasattr(gradient, "to_local") else gradient
-    torch.distributed.all_reduce(local_gradient, group=ep_group)
-    return gradient
-
-
 @torch.no_grad()
 def synchronize_ep_replicated_gradients(
     model: torch.nn.Module,
@@ -111,11 +81,11 @@ def synchronize_ep_replicated_gradients(
     if not getattr(model, "_ep_replicated_gradient_sync_enabled", False):
         return GradientSyncStats()
     groups = getattr(model, "_ep_param_groups", {})
-    if "ep_replicated_gradient_sync" in groups:
-        parameters = list(groups["ep_replicated_gradient_sync"])
-    else:
-        # Compatibility for small callers constructing the older group shape.
-        parameters = list(groups.get("ep_replicated", ()))
+    if "ep_replicated_gradient_sync" not in groups:
+        raise RuntimeError(
+            "EP replicated-gradient synchronization is enabled without the ep_replicated_gradient_sync parameter group"
+        )
+    parameters = list(groups["ep_replicated_gradient_sync"])
     if not parameters:
         return GradientSyncStats()
     if not torch.distributed.is_available() or not torch.distributed.is_initialized():
@@ -242,15 +212,3 @@ def _all_reduce_gradient_bucket(
         gradient_bytes=gradient_numel * torch.float32.itemsize,
         reduced_bytes=flat.numel() * torch.float32.itemsize,
     )
-
-
-def register_ep_replicated_gradient_hooks(parameters: Iterable[torch.Tensor]) -> None:
-    """Install one EP-sum hook for standalone tests and diagnostics."""
-
-    for parameter in parameters:
-        if not parameter.requires_grad:
-            continue
-        if getattr(parameter, "_xorl_ep_replicated_gradient_hook", None) is not None:
-            continue
-        handle = parameter.register_hook(synchronize_ep_replicated_gradient)
-        parameter._xorl_ep_replicated_gradient_hook = handle

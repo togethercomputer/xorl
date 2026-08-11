@@ -80,7 +80,7 @@ def _tiny_gdn(**overrides) -> GatedDeltaNet:
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 class TestConvContractGPU:
-    def test_forward_bitwise_matches_serving_invocation_q35_shapes(self):
+    def test_forward_backward_parity_and_determinism_policy(self):
         device, dtype = torch.device("cuda"), torch.bfloat16
         convs = _make_convs(KEY_DIM, VALUE_DIM, device, dtype)
         torch.manual_seed(0)
@@ -95,7 +95,12 @@ class TestConvContractGPU:
         assert torch.equal(k, ref_k)
         assert torch.equal(v, ref_v)
 
-    def test_forward_bitwise_varlen_and_batch(self):
+        self._assert_forward_bitwise_varlen_and_batch()
+        self._assert_forward_determinism_double_run()
+        self._assert_backward_parity_and_determinism()
+        TestConvContractGPU()._assert_end_to_end_gdn_block_policy()
+
+    def _assert_forward_bitwise_varlen_and_batch(self):
         device, dtype = torch.device("cuda"), torch.bfloat16
         convs = _make_convs(KEY_DIM, VALUE_DIM, device, dtype)
         torch.manual_seed(1)
@@ -115,7 +120,7 @@ class TestConvContractGPU:
         ref, _ = _serving_reference(q_in, k_in, v_in, convs)
         assert torch.equal(torch.cat((q, k, v), dim=-1), ref)
 
-    def test_forward_determinism_double_run(self):
+    def _assert_forward_determinism_double_run(self):
         device, dtype = torch.device("cuda"), torch.bfloat16
         convs = _make_convs(256, 512, device, dtype)
         torch.manual_seed(2)
@@ -125,7 +130,7 @@ class TestConvContractGPU:
         for a, b in zip(first, second, strict=True):
             assert torch.equal(a, b)
 
-    def test_backward_matches_torch_depthwise_autograd(self):
+    def _assert_backward_parity_and_determinism(self):
         """Same grad_output through both lanes: differences isolate the backward composition."""
         device, dtype = torch.device("cuda"), torch.bfloat16
         convs = _make_convs(256, 512, device, dtype)
@@ -153,7 +158,9 @@ class TestConvContractGPU:
         for got, ref in zip(contract_grads, eager_grads, strict=True):
             torch.testing.assert_close(got, ref)
 
-    def test_backward_determinism_double_run(self):
+        self._assert_backward_determinism_double_run()
+
+    def _assert_backward_determinism_double_run(self):
         device, dtype = torch.device("cuda"), torch.bfloat16
         convs = _make_convs(256, 512, device, dtype)
 
@@ -171,7 +178,7 @@ class TestConvContractGPU:
         for a, b in zip(run(), run(), strict=True):
             assert torch.equal(a, b)
 
-    def test_end_to_end_gdn_block_grad_vs_eager(self):
+    def _assert_end_to_end_gdn_block_policy(self):
         device, dtype = torch.device("cuda"), torch.bfloat16
         torch.manual_seed(6)
         layer = _tiny_gdn().to(device=device, dtype=dtype)
@@ -194,7 +201,9 @@ class TestConvContractGPU:
         for name, ref in eager_grads.items():
             torch.testing.assert_close(contract_grads[name], ref, rtol=5e-2, atol=1e-2, msg=lambda m: f"{name}: {m}")
 
-    def test_end_to_end_gdn_block_determinism(self):
+        self._assert_end_to_end_gdn_block_determinism()
+
+    def _assert_end_to_end_gdn_block_determinism(self):
         device, dtype = torch.device("cuda"), torch.bfloat16
         torch.manual_seed(8)
         layer = _tiny_gdn(exact_contract=True).to(device=device, dtype=dtype)
@@ -235,14 +244,19 @@ class TestConvContractGPU:
 
 @pytest.mark.cpu
 class TestConvContractGuards:
-    def test_weight_pack_is_bitwise_neutral(self):
+    def test_weight_pack_routing_admission_and_state_lifecycle_policy(self, monkeypatch):
         convs = _make_convs(64, 128, torch.device("cpu"), torch.float32)
         packed = _pack_conv_weight(*(conv.weight for conv in convs))
         assert torch.equal(packed[:64], convs[0].weight.squeeze(1))
         assert torch.equal(packed[64:128], convs[1].weight.squeeze(1))
         assert torch.equal(packed[128:], convs[2].weight.squeeze(1))
 
-    def test_forward_routes_through_contract_when_armed(self, monkeypatch):
+        with monkeypatch.context() as case_patch:
+            self._assert_forward_routes_through_contract_when_armed(case_patch)
+        self._assert_contract_admission_policy()
+        self._assert_contract_state_lifecycle_policy()
+
+    def _assert_forward_routes_through_contract_when_armed(self, monkeypatch):
         calls = []
 
         def fake_contract(q_in, k_in, v_in, *convs, cu_seqlens=None):
@@ -263,30 +277,36 @@ class TestConvContractGuards:
         assert len(calls) == 1
         assert out.shape == (1, 8, 256)
 
-    def test_use_cache_raises(self):
-        layer = _tiny_gdn(exact_contract=True)
-        layer.eval()
-        with pytest.raises(RuntimeError, match="prefill only"):
+    def _assert_contract_admission_policy(self):
+        def use_cache():
+            layer = _tiny_gdn(exact_contract=True)
+            layer.eval()
             layer(torch.randn(1, 128, 256), use_cache=True)
 
-    def test_cp_context_raises(self):
-        layer = _tiny_gdn(exact_contract=True)
-        cp_context = SimpleNamespace(cu_seqlens=torch.tensor([0, 8]), group=object(), is_first_rank=True)
-        with pytest.raises(RuntimeError, match="does not support CP"):
-            layer(torch.randn(1, 8, 256), cp_context=cp_context)
+        def cp_context():
+            layer = _tiny_gdn(exact_contract=True)
+            context = SimpleNamespace(cu_seqlens=torch.tensor([0, 8]), group=object(), is_first_rank=True)
+            layer(torch.randn(1, 8, 256), cp_context=context)
 
-    def test_no_short_conv_raises(self):
-        layer = _tiny_gdn(use_short_conv=False, exact_contract=True)
-        with pytest.raises(RuntimeError, match="requires short convolution"):
-            layer(torch.randn(1, 8, 256))
+        def no_short_conv():
+            _tiny_gdn(use_short_conv=False, exact_contract=True)(torch.randn(1, 8, 256))
 
-    def test_conv_bias_raises(self):
-        convs = _make_convs(32, 64, torch.device("cpu"), torch.float32, bias=True)
-        inputs = [torch.randn(1, 8, dim) for dim in (32, 32, 64)]
-        with pytest.raises(NotImplementedError, match="bias"):
+        def conv_bias():
+            convs = _make_convs(32, 64, torch.device("cpu"), torch.float32, bias=True)
+            inputs = [torch.randn(1, 8, dim) for dim in (32, 32, 64)]
             causal_conv1d_qkv_contract(*inputs, *convs)
 
-    def test_exact_and_ordinary_modules_do_not_leak_contract_state(self):
+        cases = [
+            ("decode cache", use_cache, RuntimeError, "prefill only"),
+            ("context parallelism", cp_context, RuntimeError, "does not support CP"),
+            ("missing short convolution", no_short_conv, RuntimeError, "requires short convolution"),
+            ("convolution bias", conv_bias, NotImplementedError, "bias"),
+        ]
+        for _label, invoke, error_type, error_pattern in cases:
+            with pytest.raises(error_type, match=error_pattern):
+                invoke()
+
+    def _assert_contract_state_lifecycle_policy(self):
         seen = []
         exact = _tiny_gdn(exact_contract=True)
         ordinary = _tiny_gdn(exact_contract=False)
@@ -306,7 +326,9 @@ class TestConvContractGuards:
         assert seen == [True, False, True]
         assert not _is_gdn_contract_enabled()
 
-    def test_checkpoint_recompute_reestablishes_module_contract(self):
+        self._assert_checkpoint_recompute_reestablishes_module_contract()
+
+    def _assert_checkpoint_recompute_reestablishes_module_contract(self):
         seen = []
         exact = _tiny_gdn(exact_contract=True)
 

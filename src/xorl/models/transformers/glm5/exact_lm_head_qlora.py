@@ -562,13 +562,6 @@ class Glm52ExactTP16LmHeadSelectedLogprob(nn.Module):
         self.shard = expected
         self.tp_group = tp_group
 
-    def bind_tp_group(self, tp_group: dist.ProcessGroup) -> None:
-        """Bind the already-created XoRL lm-head-only TP process group."""
-
-        if tp_group is None:
-            raise ValueError("GLM-5.2 exact LM head requires an explicit TP process group")
-        self.tp_group = tp_group
-
     def _validate_tp_group(self) -> dist.ProcessGroup:
         group = self.tp_group
         if group is None:
@@ -686,18 +679,6 @@ class Glm52ExactTP16LmHeadSelectedLogprob(nn.Module):
             raise RuntimeError(f"GLM-5.2 exact LM-head operands must share one device, got {sorted(map(str, devices))}")
         if require_cuda and hidden_states.device.type != "cuda":
             raise RuntimeError("GLM-5.2 exact LM-head value forward requires CUDA and pinned S4 kernels")
-
-    def effective_factor_views(self, lora_A: Tensor, local_lora_B: Tensor) -> tuple[Tensor, Tensor]:
-        """Return the exact live BF16 bytes consumed by the S4 A/B kernels."""
-
-        if lora_A.dtype is not torch.float32 or tuple(lora_A.shape) != (1, GLM52_LM_HEAD_HIDDEN_SIZE):
-            raise TypeError("lora_A must be the official FP32 [1, 6144] master")
-        if local_lora_B.dtype is not torch.float32 or tuple(local_lora_B.shape) != (
-            GLM52_LM_HEAD_LOCAL_VOCAB_SIZE,
-            1,
-        ):
-            raise TypeError("local_lora_B must be the official FP32 [9680, 1] master")
-        return lora_A.to(torch.bfloat16).contiguous(), local_lora_B.to(torch.bfloat16).contiguous()
 
     def _exact_local_logits(
         self,

@@ -1,10 +1,9 @@
-# Alternative pyproject.toml that pins PyTorch 2.9.1 so that xorl, xorl-client,
-# and xorl-sglang can all be installed in the same environment.
+# Alternative uv profile that pins PyTorch 2.11.0 so that xorl, xorl-client,
+# and the exact SGLang kernel path can run in the same environment.
 #
 # Usage:
 #   cp pyproject.sglang.toml pyproject.toml
-#   uv sync                    # (uv)
-#   pip install -e .           # (conda/pip)
+#   uv sync
 
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
@@ -41,15 +40,13 @@ dependencies = [
   # P2P / Mooncake weight sync
   "mooncake-transfer-engine==0.3.9",
   "xorl-client @ git+https://github.com/togethercomputer/xorl-client.git",
-  # PyTorch 2.9.1 with CUDA 12.9 (compatible with xorl-sglang)
-  "torch @ https://download.pytorch.org/whl/cu129/torch-2.9.1%2Bcu129-cp312-cp312-manylinux_2_28_x86_64.whl",
-  "torchvision @ https://download.pytorch.org/whl/cu129/torchvision-0.24.1%2Bcu129-cp312-cp312-manylinux_2_28_x86_64.whl",
-  "triton @ https://download.pytorch.org/whl/triton-3.5.1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
-  # Flash Attention
-  "flash-attn-3 @ https://github.com/windreamer/flash-attention3-wheels/releases/download/2026.02.17-06dc5e7/flash_attn_3-3.0.0%2B20260216.cu129torch291cxx11abitrue.fec3a6-cp39-abi3-linux_x86_64.whl",
-  "flash-attn-cute @ git+https://github.com/Dao-AILab/flash-attention.git@5678dd909aca97f925957dab716022046fb1e44f#subdirectory=flash_attn/cute",
-  # Submodule
-  "sglang[all] @ file:submodules/xorl-sglang/python",
+  # Match the pinned SGLang ABI. Its dependency set supplies the compatible
+  # sglang-kernel, CUDA runtime, and Flash Attention packages.
+  "torch==2.11.0",
+  "torchvision==0.26.0",
+  "triton==3.6.0",
+  # Submodule (resolved through tool.uv.sources below)
+  "sglang",
 ]
 
 
@@ -79,6 +76,16 @@ test = [
 # NOTE 2: When updating this line, make sure to update Dockerfile under docker/ to the same
 #         version and release new docker images.
 required-version = ">=0.8.14"
+override-dependencies = [
+  # Pinned XoRL's Quack imports use the pre-4.6 CUTLASS API. Pinned SGLang's
+  # hash_topk, LoRA, and sgl_kernel paths are validated separately by the ABI
+  # smoke and do not require its newer Quack package.
+  "nvidia-cutlass-dsl==4.5.2",
+  "quack-kernels==0.5.0",
+]
+
+[tool.uv.sources]
+sglang = { path = "submodules/xorl-sglang/python", editable = true }
 
 
 [tool.setuptools.dynamic]

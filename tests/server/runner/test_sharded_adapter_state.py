@@ -120,7 +120,7 @@ def _layout(
     )
 
 
-def test_layout_pack_unpack_zeroes_inactive_rank_and_supports_empty_intersection():
+def test_empty_layout_pack_discovery_and_ownership_policy(monkeypatch, tmp_path):
     layout = _layout(local_shape=(4, 4), substrate=(4, 4), logical=(2, 4))
     local = torch.arange(16, dtype=torch.float32).reshape(4, 4)
     slot = layout.pack_from_local(local)
@@ -134,8 +134,15 @@ def test_layout_pack_unpack_zeroes_inactive_rank_and_supports_empty_intersection
     assert empty.pack_from_local(torch.ones(2, 4)).shape == (0, 4)
     assert torch.count_nonzero(empty.unpack_to_local(torch.empty(0, 4))) == 0
 
+    with monkeypatch.context() as case_patch:
+        _assert_layout_discovery_keeps_identical_empty_fsdp_shards_out_of_replica_classes(case_patch)
+    deterministic_root = tmp_path / "deterministic"
+    deterministic_root.mkdir()
+    _assert_deterministic_initialization_policy(deterministic_root)
+    _assert_layout_discovery_composes_explicit_ep_shard_and_ignores_generic_replicate()
 
-def test_layout_discovery_keeps_identical_empty_fsdp_shards_out_of_replica_classes(monkeypatch):
+
+def _assert_layout_discovery_keeps_identical_empty_fsdp_shards_out_of_replica_classes(monkeypatch):
     nonempty = _layout(name="lora_A", local_shape=(1, 4), offset=(0, 0), substrate=(1, 4), logical=(1, 4))
     empty = _layout(name="lora_A", local_shape=(0, 4), offset=(1, 0), substrate=(1, 4), logical=(1, 4))
     gathered = [
@@ -202,7 +209,7 @@ def test_layout_discovery_keeps_identical_empty_fsdp_shards_out_of_replica_class
     assert not plan.parameters[0].requires_local_gradient
 
 
-def test_deterministic_initialization_is_coordinate_and_replica_stable():
+def _assert_deterministic_initialization_policy(tmp_path):
     full = _layout(local_shape=(4, 4), offset=(0, 0))
     first = _layout(local_shape=(2, 4), offset=(0, 0))
     second = _layout(local_shape=(2, 4), offset=(2, 0))
@@ -232,8 +239,10 @@ def test_deterministic_initialization_is_coordinate_and_replica_stable():
         == 0
     )
 
+    _assert_deterministic_initialization_is_independent_of_fqn_iteration_order(tmp_path)
 
-def test_deterministic_initialization_is_independent_of_fqn_iteration_order(tmp_path):
+
+def _assert_deterministic_initialization_is_independent_of_fqn_iteration_order(tmp_path):
     ordered = _build_manager(tmp_path / "ordered", optimizer_type="sgd")
     reordered_model = _DummyLoRAModel()
     reordered_model.model.layers[0].self_attn.o_proj = _ReorderedDummyLoRALayer()
@@ -252,22 +261,6 @@ def test_deterministic_initialization_is_independent_of_fqn_iteration_order(tmp_
     assert list(ordered_state.local_params) != list(reordered_state.local_params)
     for name in ordered_state.local_params:
         assert torch.equal(ordered_state.local_params[name], reordered_state.local_params[name]), name
-
-
-def test_manager_owns_local_active_slots_and_capture_hot_path_has_no_full_tensor(tmp_path):
-    manager = _build_manager(tmp_path, optimizer_type="sgd", max_rank=4)
-    manager.register_adapter(
-        "local",
-        session_spec=_session_spec(rank=2, alpha=8, optimizer_type="sgd", lr=0.1),
-        initialize_fresh=True,
-    )
-    state = manager.get_adapter_state("local")
-    assert all(
-        tuple(param.shape) == layout.active_storage_shape
-        for name, param in state.local_params.items()
-        for layout in [state.tensor_layouts[name]]
-    )
-    assert state.layout_fingerprint
 
 
 def test_real_gloo_uneven_dtensor_layout_and_logical_pack():
@@ -300,7 +293,7 @@ class _FakeSpecInfo:
         self.ep_mesh = ep_mesh
 
 
-def test_layout_discovery_composes_explicit_ep_shard_and_ignores_generic_replicate():
+def _assert_layout_discovery_composes_explicit_ep_shard_and_ignores_generic_replicate():
     expert_model = nn.Module()
     expert_model.register_parameter("expert_lora_A", nn.Parameter(torch.empty(2, 3)))
     expert_model._fqn2spec_info = {

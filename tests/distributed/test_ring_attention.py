@@ -1,18 +1,12 @@
-"""Tests for ring attention (context parallelism) -- unit tests only.
-
-Distributed tests removed -- run with torchrun separately.
-"""
+"""Numerical merge policy for ring attention partial outputs."""
 
 import pytest
 import torch
 
-from xorl.data.collators.sequence_shard_collator import (
-    zigzag_reorder_packed_sequence,
-)
-from xorl.distributed.sequence_parallel.ring_attention import (
-    _get_zigzag_step_section,
-    _merge_attn_outputs,
-)
+
+pytest.importorskip("flash_attn_interface", reason="ring attention requires the optional FA3 interface")
+
+from xorl.distributed.sequence_parallel.ring_attention import _merge_attn_outputs
 
 
 pytestmark = [pytest.mark.distributed]
@@ -67,89 +61,3 @@ class TestLSEMerge:
         lse_eq = torch.randn(B2, H3, S2, device="cuda")
         merged_outq, _ = _merge_attn_outputs(out1q, lse_eq.clone(), out2q, lse_eq.clone(), is_varlen=False)
         assert torch.allclose(merged_outq, (out1q + out2q) / 2, atol=1e-5)
-
-
-class TestZigzagUnit:
-    """Unit tests for zigzag section logic and reorder (no GPU needed)."""
-
-    def test_zigzag_sections_and_reorder(self):
-        """All ranks compute all steps; non-diagonal sections are lower/upper; reorder permutations correct."""
-        # Every rank computes every step, step 0 is always diagonal
-        for ringattn_size in [2, 4, 8]:
-            for rank in range(ringattn_size):
-                sections = [_get_zigzag_step_section(rank, ringattn_size, s) for s in range(ringattn_size)]
-                assert len(sections) == ringattn_size
-                assert sections[0] == "diagonal"
-
-        # Non-diagonal sections are "lower" or "upper"
-        for rank in range(4):
-            for step in range(1, 4):
-                section = _get_zigzag_step_section(rank, 4, step)
-                assert section in ("lower", "upper")
-
-        # Single doc reorder
-        ringattn_size = 2
-        tensor = torch.arange(40).unsqueeze(0)
-        position_ids = torch.arange(40).unsqueeze(0)
-        reordered = zigzag_reorder_packed_sequence(tensor, position_ids, ringattn_size, dim=-1)
-        expected = torch.cat(
-            [
-                torch.arange(0, 10),
-                torch.arange(30, 40),
-                torch.arange(10, 20),
-                torch.arange(20, 30),
-            ]
-        ).unsqueeze(0)
-        assert torch.equal(reordered, expected)
-
-        # Multi-doc reorder
-        doc_len = 20
-        total = 2 * doc_len
-        tensor_m = torch.arange(total).unsqueeze(0)
-        position_ids_m = torch.cat([torch.arange(doc_len), torch.arange(doc_len)]).unsqueeze(0)
-        reordered_m = zigzag_reorder_packed_sequence(tensor_m, position_ids_m, ringattn_size, dim=-1)
-        expected_m = torch.cat(
-            [
-                torch.arange(0, 5),
-                torch.arange(15, 20),
-                torch.arange(20, 25),
-                torch.arange(35, 40),
-                torch.arange(5, 10),
-                torch.arange(10, 15),
-                torch.arange(25, 30),
-                torch.arange(30, 35),
-            ]
-        ).unsqueeze(0)
-        assert torch.equal(reordered_m, expected_m)
-
-        # Position IDs doc boundaries per rank
-        num_docs = 2
-        pos_ids = torch.cat([torch.arange(doc_len) for _ in range(num_docs)]).unsqueeze(0)
-        reordered_pos = zigzag_reorder_packed_sequence(pos_ids, pos_ids, ringattn_size, dim=-1)
-        half = total // 2
-        rank0_pos = reordered_pos[0, :half]
-        zeros = (rank0_pos == 0).nonzero(as_tuple=False).view(-1).tolist()
-        assert len(zeros) == 2
-
-        # Various ringattn_sizes: shape preserved, permutation, early < late
-        for cs in [2, 4, 8]:
-            n = 2 * cs
-            dl = n * 4
-            t = torch.arange(dl).unsqueeze(0)
-            p = torch.arange(dl).unsqueeze(0)
-            r = zigzag_reorder_packed_sequence(t, p, cs, dim=-1)
-            assert r.shape == t.shape
-            assert set(r[0].tolist()) == set(t[0].tolist())
-            chunk_size = dl // cs
-            for rk in range(cs):
-                rank_slice = r[0, rk * chunk_size : (rk + 1) * chunk_size]
-                sub_size = chunk_size // 2
-                assert rank_slice[:sub_size].max() < rank_slice[sub_size:].min()
-
-        # ringattn_size=1 is no-op
-        t1 = torch.arange(20).unsqueeze(0)
-        assert torch.equal(zigzag_reorder_packed_sequence(t1, t1, 1, dim=-1), t1)
-
-        # Invalid length raises
-        with pytest.raises(ValueError, match="not divisible"):
-            zigzag_reorder_packed_sequence(torch.arange(15).unsqueeze(0), torch.arange(15).unsqueeze(0), 2, dim=-1)

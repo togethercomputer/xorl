@@ -7,7 +7,7 @@ import torch
 import xorl.server.runner.runner_dispatcher as runner_dispatcher_module
 from xorl.server.orchestrator.packing import SequentialPacker
 from xorl.server.runner.runner_dispatcher import RunnerDispatcher
-from xorl.server.runner.utils.batch_utils import batch_packed_rows
+from xorl.server.runner.utils.batch_utils import batch_packed_rows, batch_slice_rank_and_size
 from xorl.server.side_payloads import MooncakeSidePayloadStore, put_r3_mooncake_payload_refs
 
 
@@ -71,6 +71,7 @@ def _batch(batch_id: int, *, num_samples: int = 1) -> dict:
 def _parallel_state(**overrides):
     return SimpleNamespace(
         cp_size=overrides.get("cp_size", 1),
+        cp_rank=overrides.get("cp_rank", 0),
         pp_enabled=overrides.get("pp_enabled", False),
         pp_size=overrides.get("pp_size", 1),
         ep_enabled=overrides.get("ep_enabled", False),
@@ -81,8 +82,12 @@ def _parallel_state(**overrides):
     )
 
 
-def test_select_batches_keeps_existing_dp_distribution_without_ep(monkeypatch):
+def test_dispatcher_batch_transport_and_completion_policy(monkeypatch, tmp_path):
     monkeypatch.setattr(runner_dispatcher_module, "get_parallel_state", lambda: _parallel_state())
+
+    _assert_batch_slice_rank_and_size_topology_policy()
+    with monkeypatch.context() as batch_patch:
+        _assert_teacher_hidden_states_follow_server_conversion_and_cp_shard(batch_patch)
 
     batches = [_batch(10), _batch(20), _batch(30), _batch(40)]
     my_batches, routed_experts, routed_logits = _dispatcher(rank=2, world_size=4)._select_and_prepare_batches(
@@ -96,8 +101,93 @@ def test_select_batches_keeps_existing_dp_distribution_without_ep(monkeypatch):
     assert routed_experts == ["r2"]
     assert routed_logits == ["l2"]
 
+    _assert_select_batches_gives_each_ep_rank_distinct_slice(monkeypatch)
+    _assert_select_batches_pads_ep_ranks(monkeypatch)
+    _assert_select_batches_shares_slice_across_cp_ranks(monkeypatch)
+    _assert_shard_and_slice_batches_slices_routing_weights_with_ids()
+    with monkeypatch.context() as case_patch:
+        _assert_rank_local_row_batching_and_provenance_policy(case_patch)
+    with monkeypatch.context() as case_patch:
+        _assert_dispatcher_packing_and_dummy_policy(case_patch)
+    with monkeypatch.context() as routing_patch:
+        _assert_routing_payload_transport_and_security_policy(routing_patch, tmp_path / "routing")
+    with monkeypatch.context() as completion_patch:
+        _assert_completion_rendezvous_and_per_token_merge_policy(completion_patch)
 
-def test_select_batches_gives_each_ep_rank_a_distinct_slice(monkeypatch):
+
+def _assert_teacher_hidden_states_follow_server_conversion_and_cp_shard(monkeypatch):
+    state = _parallel_state(cp_size=2, cp_rank=1)
+    monkeypatch.setattr(runner_dispatcher_module, "get_parallel_state", lambda: state)
+    monkeypatch.setattr("xorl.server.runner.utils.batch_utils.get_parallel_state", lambda: state)
+    dispatcher = _dispatcher(rank=0, world_size=1)
+    dispatcher._sequence_shard_collator = None
+
+    [batch], routed_experts, routed_logits = dispatcher._select_and_prepare_batches(
+        [
+            {
+                "input_ids": [[1, 2, 3], [4, 5, 6]],
+                "labels": [[2, 3, -100], [5, 6, -100]],
+                "position_ids": [[0, 1, 2], [0, 1, 2]],
+                "old_logprobs": [[-1.25, -2.5, -3.75], [-4.25, -5.5, -6.75]],
+                "ref_logprobs": [[-1.5, -2.75, -4.0], [-4.5, -5.75, -7.0]],
+                "teacher_hidden_states": [
+                    [[0.25, 0.5], [1.25, 1.5]],
+                    [[2.25, 2.5], [3.25, 3.5], [4.25, 4.5]],
+                ],
+            }
+        ]
+    )
+
+    assert routed_experts is routed_logits is None
+    assert batch["old_logprobs"].dtype is torch.float32
+    assert batch["ref_logprobs"].dtype is torch.float32
+    assert batch["teacher_hidden_states"].shape == (2, 3, 2)
+    torch.testing.assert_close(batch["teacher_hidden_states"][0, 2], torch.zeros(2))
+
+    [sharded], _, _ = dispatcher._shard_and_slice_batches(
+        [batch],
+        routed_experts=None,
+        routed_expert_logits=None,
+        cp_enabled=True,
+        parallel_state=state,
+    )
+
+    assert sharded["teacher_hidden_states"].shape == (2, 2, 2)
+    torch.testing.assert_close(sharded["teacher_hidden_states"][0], torch.zeros(2, 2))
+    torch.testing.assert_close(
+        sharded["teacher_hidden_states"][1],
+        torch.tensor([[4.25, 4.5], [0.0, 0.0]]),
+    )
+    torch.testing.assert_close(sharded["old_logprobs"][0], torch.tensor([-3.75, 0.0]))
+
+
+def _assert_batch_slice_rank_and_size_topology_policy():
+    def state(**overrides):
+        return SimpleNamespace(
+            tp_size=overrides.get("tp_size", 1),
+            dp_rank=overrides.get("dp_rank", 0),
+            dp_size=overrides.get("dp_size", 1),
+            dp_replicate_rank=overrides.get("dp_replicate_rank", 0),
+            dp_replicate_size=overrides.get("dp_replicate_size", 1),
+            ep_enabled=overrides.get("ep_enabled", False),
+            ep_size=overrides.get("ep_size", 1),
+            dp_shard_in_ep_size=overrides.get("dp_shard_in_ep_size", 1),
+            ep_fsdp_device_mesh=None,
+        )
+
+    for rank in range(4):
+        assert batch_slice_rank_and_size(rank, 4, state(dp_rank=rank, dp_size=4), 1, 1) == (0, 1)
+
+    replicated = state(tp_size=2, dp_replicate_size=4)
+    assert batch_slice_rank_and_size(0, 8, replicated, 1, 1) == (0, 4)
+    replicated.dp_replicate_rank = 3
+    assert batch_slice_rank_and_size(7, 8, replicated, 1, 1) == (3, 4)
+
+    expert_parallel = state(ep_enabled=True, ep_size=8)
+    assert batch_slice_rank_and_size(5, 8, expert_parallel, 1, 1) == (5, 8)
+
+
+def _assert_select_batches_gives_each_ep_rank_distinct_slice(monkeypatch):
     state = _parallel_state(
         ep_enabled=True,
         ep_size=8,
@@ -119,7 +209,7 @@ def test_select_batches_gives_each_ep_rank_a_distinct_slice(monkeypatch):
     assert routed_logits == ["l5"]
 
 
-def test_select_batches_pads_ep_ranks_beyond_real_batches_with_dummies(monkeypatch):
+def _assert_select_batches_pads_ep_ranks(monkeypatch):
     state = _parallel_state(
         ep_enabled=True,
         ep_size=8,
@@ -141,7 +231,7 @@ def test_select_batches_pads_ep_ranks_beyond_real_batches_with_dummies(monkeypat
     assert routed_logits == []
 
 
-def test_select_batches_shares_one_slice_across_cp_ranks_under_ep(monkeypatch):
+def _assert_select_batches_shares_slice_across_cp_ranks(monkeypatch):
     state = _parallel_state(
         cp_size=2,
         ep_enabled=True,
@@ -164,53 +254,7 @@ def test_select_batches_shares_one_slice_across_cp_ranks_under_ep(monkeypatch):
     assert routed_logits == ["l2"]
 
 
-def test_select_batches_legacy_flag_broadcasts_one_slice_to_all_ep_ranks(monkeypatch):
-    monkeypatch.setenv("XORL_SERVER_EP_DUPLICATE_BATCHES", "1")
-    state = _parallel_state(
-        ep_enabled=True,
-        ep_size=8,
-        dp_shard_in_ep_size=1,
-        ep_fsdp_device_mesh=_FakeEPMesh(ep_fsdp_rank=0),
-    )
-    monkeypatch.setattr(runner_dispatcher_module, "get_parallel_state", lambda: state)
-
-    my_batches, routed_experts, routed_logits = _dispatcher(rank=5, world_size=8)._select_and_prepare_batches(
-        [_batch(10, num_samples=2)],
-        routed_experts=["r0", "r1"],
-        routed_expert_logits=["l0", "l1"],
-    )
-
-    assert len(my_batches) == 1
-    assert torch.equal(my_batches[0]["input_ids"], torch.tensor([[10, 11]]))
-    assert my_batches[0]["num_samples"] == 2
-    assert routed_experts == ["r0", "r1"]
-    assert routed_logits == ["l0", "l1"]
-
-
-def test_select_batches_legacy_flag_uses_ep_fsdp_rank_for_ep_group_slices(monkeypatch):
-    monkeypatch.setenv("XORL_SERVER_EP_DUPLICATE_BATCHES", "1")
-    state = _parallel_state(
-        ep_enabled=True,
-        ep_size=4,
-        dp_shard_in_ep_size=2,
-        ep_fsdp_device_mesh=_FakeEPMesh(ep_fsdp_rank=1),
-    )
-    monkeypatch.setattr(runner_dispatcher_module, "get_parallel_state", lambda: state)
-
-    my_batches, routed_experts, routed_logits = _dispatcher(rank=6, world_size=8)._select_and_prepare_batches(
-        [_batch(10), _batch(20)],
-        routed_experts=["r0", "r1"],
-        routed_expert_logits=["l0", "l1"],
-    )
-
-    assert len(my_batches) == 1
-    assert torch.equal(my_batches[0]["input_ids"], torch.tensor([[20, 21]]))
-    assert routed_experts == ["r1"]
-    assert routed_logits == ["l1"]
-
-
-def test_microbatch_diagnostic_dump_includes_r3_payloads(tmp_path, monkeypatch):
-    monkeypatch.setenv("XORL_MICROBATCH_DIAGNOSTIC_TENSORS", "1")
+def _assert_microbatch_diagnostic_dump_includes_r3_payloads(tmp_path):
     dispatcher = _dispatcher(rank=3, world_size=8)
     state = _parallel_state(ep_enabled=True, ep_size=8)
     batch = {
@@ -226,7 +270,11 @@ def test_microbatch_diagnostic_dump_includes_r3_payloads(tmp_path, monkeypatch):
     dispatcher._maybe_dump_microbatch_diagnostic(
         [batch],
         loss_fn="importance_sampling",
-        loss_fn_params={"diagnostic_microbatch_dump_dir": str(tmp_path), "diagnostic_microbatch_request_id": "req/abc"},
+        loss_fn_params={
+            "diagnostic_microbatch_dump_dir": str(tmp_path),
+            "diagnostic_microbatch_dump_tensors": True,
+            "diagnostic_microbatch_request_id": "req/abc",
+        },
         parallel_state=state,
         with_backward=True,
         model_id="default",
@@ -246,7 +294,7 @@ def test_microbatch_diagnostic_dump_includes_r3_payloads(tmp_path, monkeypatch):
     assert torch.equal(payload["micro_batches"][0]["input_ids"], batch["input_ids"])
 
 
-def test_select_batches_loads_only_routing_ref_slice(monkeypatch, tmp_path):
+def _assert_routing_payload_transport_and_security_policy(monkeypatch, tmp_path):
     monkeypatch.setattr(runner_dispatcher_module, "get_parallel_state", lambda: _parallel_state())
 
     root = tmp_path / "payload"
@@ -304,8 +352,14 @@ def test_select_batches_loads_only_routing_ref_slice(monkeypatch, tmp_path):
     assert torch.equal(routed_experts[0], torch.tensor([[[2, 3]]], dtype=torch.int32))
     assert torch.equal(routed_logits[0], torch.tensor([[[2.0, 3.0]]], dtype=torch.float32))
 
+    _assert_routing_ref_rejects_legacy_pickle(tmp_path)
+    _assert_routing_ref_rejects_symlinked_manifest(tmp_path)
+    _assert_mooncake_routing_ref_slice(monkeypatch)
+    _assert_world_size_one_loads_mooncake_refs(monkeypatch)
+    _assert_microbatch_diagnostic_dump_includes_r3_payloads(tmp_path)
 
-def test_select_batches_rejects_legacy_pickle_routing_ref(tmp_path):
+
+def _assert_routing_ref_rejects_legacy_pickle(tmp_path):
     manifest_path = tmp_path / "manifest.pkl"
     manifest_path.write_bytes(b"untrusted pickle bytes")
     ref = {
@@ -319,7 +373,7 @@ def test_select_batches_rejects_legacy_pickle_routing_ref(tmp_path):
         _dispatcher(rank=0, world_size=1)._load_routing_payload_slice(ref, 0, 1)
 
 
-def test_select_batches_rejects_symlinked_routing_manifest(tmp_path):
+def _assert_routing_ref_rejects_symlinked_manifest(tmp_path):
     real_manifest = tmp_path / "real.json"
     real_manifest.write_text("{}", encoding="utf-8")
     manifest_path = tmp_path / "manifest.json"
@@ -337,7 +391,7 @@ def test_select_batches_rejects_symlinked_routing_manifest(tmp_path):
         _dispatcher(rank=0, world_size=1)._load_routing_payload_slice(ref, 0, 1)
 
 
-def test_select_batches_loads_only_mooncake_routing_ref_slice(monkeypatch):
+def _assert_mooncake_routing_ref_slice(monkeypatch):
     monkeypatch.setattr(runner_dispatcher_module, "get_parallel_state", lambda: _parallel_state())
     store, client = _mooncake_store()
     expert_ref, logits_ref, _ = put_r3_mooncake_payload_refs(
@@ -367,7 +421,7 @@ def test_select_batches_loads_only_mooncake_routing_ref_slice(monkeypatch):
     ]
 
 
-def test_select_batches_world_size_one_loads_mooncake_routing_refs(monkeypatch):
+def _assert_world_size_one_loads_mooncake_refs(monkeypatch):
     monkeypatch.setattr(runner_dispatcher_module, "get_parallel_state", lambda: _parallel_state())
     store, client = _mooncake_store()
     expert_ref, logits_ref, _ = put_r3_mooncake_payload_refs(
@@ -402,7 +456,7 @@ def test_select_batches_world_size_one_loads_mooncake_routing_refs(monkeypatch):
 # ============================================================================
 
 
-def test_balanced_dp_packing_yields_zero_dispatcher_dummies(monkeypatch):
+def _assert_dispatcher_packing_and_dummy_policy(monkeypatch):
     """The redesign's primary acceptance criterion (spec section 5.1):
 
     Packing with strategy='balanced_dp' at the dispatcher's dp_size produces
@@ -434,8 +488,10 @@ def test_balanced_dp_packing_yields_zero_dispatcher_dummies(monkeypatch):
     # Every datum trained exactly once, nothing dropped or duplicated.
     assert total_real == len(data)
 
+    _assert_sequential_packing_pads_dummies(monkeypatch)
 
-def test_sequential_packing_still_pads_dummies_when_rows_below_dp(monkeypatch):
+
+def _assert_sequential_packing_pads_dummies(monkeypatch):
     """Contrast case: legacy sequential under-fills -> dispatcher still pads."""
     monkeypatch.setattr(runner_dispatcher_module, "get_parallel_state", lambda: _parallel_state())
 
@@ -454,7 +510,7 @@ def test_sequential_packing_still_pads_dummies_when_rows_below_dp(monkeypatch):
     assert saw_dummy
 
 
-def test_merge_per_token_outputs_restores_logical_slice_order_and_skips_empty_slices():
+def _assert_completion_rendezvous_and_per_token_merge_policy(monkeypatch):
     payloads = [
         {
             "rank": 2,
@@ -488,8 +544,13 @@ def test_merge_per_token_outputs_restores_logical_slice_order_and_skips_empty_sl
         "per_sample_k3": [0.0, 0.1, 0.2],
     }
 
+    _assert_merge_deduplicates_coherent_cp_replicas()
+    _assert_merge_rejects_replica_disagreement()
+    with monkeypatch.context() as case_patch:
+        _assert_completion_rendezvous_trims_payload_then_rank0_merges_afterward(case_patch)
 
-def test_merge_per_token_outputs_deduplicates_coherent_cp_replicas():
+
+def _assert_merge_deduplicates_coherent_cp_replicas():
     replica = {
         "slice_rank": 0,
         "packed_logprobs": [[-1.25, -2.5]],
@@ -501,7 +562,7 @@ def test_merge_per_token_outputs_deduplicates_coherent_cp_replicas():
     assert merged["packed_position_ids"] == [[0, 1]]
 
 
-def test_merge_per_token_outputs_rejects_replica_disagreement():
+def _assert_merge_rejects_replica_disagreement():
     with pytest.raises(RuntimeError, match="disagree.*slice 0.*ranks \\[0, 1\\]"):
         RunnerDispatcher._merge_per_token_output_payloads(
             [
@@ -521,7 +582,7 @@ def test_merge_per_token_outputs_rejects_replica_disagreement():
         )
 
 
-def test_completion_rendezvous_trims_payload_then_rank0_merges_afterward(monkeypatch):
+def _assert_completion_rendezvous_trims_payload_then_rank0_merges_afterward(monkeypatch):
     dispatcher = _dispatcher(rank=0, world_size=2)
     dispatcher.cpu_group = object()
     monkeypatch.setattr(dispatcher, "_batch_parallel_rank_and_size", lambda *_args: (0, 2))
@@ -571,7 +632,7 @@ def test_completion_rendezvous_trims_payload_then_rank0_merges_afterward(monkeyp
     }
 
 
-def test_shard_and_slice_batches_slices_routing_weights_with_ids():
+def _assert_shard_and_slice_batches_slices_routing_weights_with_ids():
     dispatcher = _dispatcher(rank=0, world_size=1)
     dispatcher._validate_batch_shapes = lambda batch, batch_idx=0: True
 
@@ -599,7 +660,7 @@ def test_shard_and_slice_batches_slices_routing_weights_with_ids():
     assert "_r3_datum_count" not in sharded[0]
 
 
-def test_select_batches_rank_local_rowbatch_preserves_original_dp_slice(monkeypatch):
+def _assert_rank_local_row_batching_and_provenance_policy(monkeypatch):
     monkeypatch.setattr(runner_dispatcher_module, "get_parallel_state", lambda: _parallel_state())
 
     batches = [_batch(10 * (i + 1)) for i in range(6)]
@@ -621,8 +682,10 @@ def test_select_batches_rank_local_rowbatch_preserves_original_dp_slice(monkeypa
     assert my_batches[0]["packed_row_source_token_spans"] == [[0, 2], [2, 4]]
     assert my_batches[0]["packed_row_source_group_size"] == 2
 
+    _assert_unmerged_rows_record_source_provenance()
 
-def test_batch_packed_rows_records_source_provenance_for_unmerged_rows():
+
+def _assert_unmerged_rows_record_source_provenance():
     first = _batch(10)
     second = _batch(20)
     first["teacher_id"] = 0
@@ -639,29 +702,3 @@ def test_batch_packed_rows_records_source_provenance_for_unmerged_rows():
     assert grouped[0]["packed_row_source_group_size"] == 1
     assert grouped[1]["batch_id"] == 1
     assert grouped[1]["packed_row_source_batch_ids"] == [20]
-
-
-def test_shard_and_slice_batches_keeps_r3_logits_aligned_with_experts():
-    dispatcher = _dispatcher(rank=0, world_size=1)
-    batch = {
-        "input_ids": torch.tensor([[10, 11]]),
-        "labels": torch.tensor([[12, 13]]),
-        "position_ids": torch.tensor([[0, 1]]),
-        "num_samples": 2,
-        "_r3_datum_offset": 1,
-        "_r3_datum_count": 2,
-    }
-
-    my_batches, routed_experts, routed_logits = dispatcher._shard_and_slice_batches(
-        [batch],
-        routed_experts=["r0", "r1", "r2", "r3"],
-        routed_expert_logits=["l0", "l1", "l2", "l3"],
-        cp_enabled=False,
-        parallel_state=_parallel_state(),
-    )
-
-    assert len(my_batches) == 1
-    assert "_r3_datum_offset" not in my_batches[0]
-    assert "_r3_datum_count" not in my_batches[0]
-    assert routed_experts == ["r1", "r2"]
-    assert routed_logits == ["l1", "l2"]

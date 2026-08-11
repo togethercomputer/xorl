@@ -22,7 +22,6 @@ Stage switching lifecycle::
       model.forward()  # records         _pp_forward restores "replay_backward"
       set("replay_backward")             loss.backward()
       loss.backward()  # pop_backward      checkpoint recompute -> "replay_backward"
-      reset_all_backward()                 -> pop_backward
     set(None)                            set(None)
     clear_all()                          clear_all()
 """
@@ -129,12 +128,6 @@ class RoutingReplay:
         """Whether routing weights are pre-populated."""
         return len(self.top_weights_list) > 0
 
-    def reset_forward(self):
-        self.forward_index = 0
-
-    def reset_backward(self):
-        self.backward_index = 0
-
     def clear(self):
         self.forward_index = 0
         self.backward_index = 0
@@ -147,16 +140,6 @@ class RoutingReplay:
     def clear_all(cls):
         for inst in cls._instances:
             inst.clear()
-
-    @classmethod
-    def reset_all_forward(cls):
-        for inst in cls._instances:
-            inst.reset_forward()
-
-    @classmethod
-    def reset_all_backward(cls):
-        for inst in cls._instances:
-            inst.reset_backward()
 
 
 # ---------------------------------------------------------------------------

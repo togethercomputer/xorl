@@ -14,10 +14,8 @@ from xorl.distributed.canonical_moe import (
     LocalMoEContribution,
     OutputDistribution,
     ParallelPlan,
-    ParallelRole,
     canonical_moe_reduce_cp_sharded_v3,
     canonical_moe_reduce_packed_ep16_v2,
-    canonical_moe_reduce_reference,
     canonical_moe_reduce_v1,
     resolve_canonical_moe_transport,
 )
@@ -27,42 +25,18 @@ from xorl.distributed.parallel_state import init_ep_mesh_matrix
 pytestmark = [pytest.mark.distributed]
 
 
-def _explicit_tree(partials: torch.Tensor) -> torch.Tensor:
-    current = [partials[index] for index in range(partials.shape[0])]
-    while len(current) > 1:
-        current = [(current[index] + current[index + 1]).bfloat16() for index in range(0, len(current), 2)]
-    return current[0]
+def _canonical_moe_reference(partials: torch.Tensor, metadata: CanonicalMoEGraphMetadata) -> torch.Tensor:
+    level = [partials[index] for index in range(partials.shape[0])]
+    while len(level) > 1:
+        level = [(level[index] + level[index + 1]).to(torch.bfloat16) for index in range(0, len(level), 2)]
+    result = level[0]
+    result = result.clone()
+    result[~metadata.valid_mask] = 0
+    return result
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize("contributors", [2, 4, 8, 16])
-def test_reference_is_the_adjacent_bf16_tree(contributors: int):
-    rows = contributors + 2
-    values = torch.zeros((contributors, rows, 3), dtype=torch.bfloat16)
-    adversarial = torch.tensor(
-        [4096.0, -4096.0, 1.0, 1.0, 0.5, -0.5, 2.0, -2.0] * 2,
-        dtype=torch.bfloat16,
-    )
-    for ordinal in range(contributors):
-        values[ordinal, :, 0] = adversarial[ordinal]
-        values[ordinal, :, 1] = ordinal + 1
-        values[ordinal, :, 2] = torch.arange(rows)
-    metadata = CanonicalMoEGraphMetadata.build(
-        torch.arange(rows),
-        torch.arange(rows),
-        capacity=rows + 3,
-    )
-    padded = torch.zeros((contributors, metadata.capacity, 3), dtype=torch.bfloat16)
-    padded[:, :rows] = values
-
-    result = canonical_moe_reduce_reference(padded, metadata)
-    expected = _explicit_tree(padded)
-    expected[~metadata.valid_mask] = 0
-    assert torch.equal(result, expected)
-
-
-@pytest.mark.cpu
-def test_graph_metadata_has_deterministic_padding_and_capacity_guard():
+def test_graph_metadata_transport_and_parallel_plan_policy():
     metadata = CanonicalMoEGraphMetadata.build(
         torch.tensor([7, 3, 11], dtype=torch.int64),
         torch.tensor([17, 2, 25], dtype=torch.int64),
@@ -74,9 +48,11 @@ def test_graph_metadata_has_deterministic_padding_and_capacity_guard():
     with pytest.raises(ValueError, match="exceeds fixed capacity"):
         CanonicalMoEGraphMetadata.build(torch.arange(3), torch.arange(3), capacity=2)
 
+    _assert_transport_admission_policy()
+    _assert_exact_trainer_plan_and_fail_closed()
 
-@pytest.mark.cpu
-def test_transport_auto_promotes_only_admitted_cp_sharded_geometry():
+
+def _assert_transport_admission_policy():
     ep16 = ParallelPlan.glm52_trainer(world_size=16, pp_size=1, dp_size=1, contributor_count=16)
     assert (
         resolve_canonical_moe_transport(
@@ -114,42 +90,6 @@ def test_transport_auto_promotes_only_admitted_cp_sharded_geometry():
         is CanonicalMoETransport.DENSE_V1
     )
 
-
-@pytest.mark.cpu
-def test_internal_resolution_serves_cp_sharded_v3_on_the_admitted_geometry():
-    """The exact GLM path has no public transport knob: internal resolution
-    serves cp_sharded_v3 on the admitted eager EP16/CP16 consumer-sharded
-    geometry (the transport with the strongest certified performance
-    evidence) and the dense executable oracle elsewhere."""
-    ep16 = ParallelPlan.glm52_trainer(world_size=16, pp_size=1, dp_size=1, contributor_count=16)
-    assert (
-        resolve_canonical_moe_transport(
-            "auto",
-            plan=ep16,
-            capacity=4224,
-            local_rows=264,
-            graph_mode=False,
-            consumer_sharded_output=True,
-        )
-        is CanonicalMoETransport.CP_SHARDED_V3
-    )
-    ep8 = ParallelPlan.primitive(8)
-    assert (
-        resolve_canonical_moe_transport(
-            "auto",
-            plan=ep8,
-            capacity=4224,
-            local_rows=528,
-            graph_mode=False,
-            consumer_sharded_output=True,
-        )
-        is CanonicalMoETransport.DENSE_V1
-    )
-
-
-@pytest.mark.cpu
-def test_transport_explicit_modes_never_silently_fallback():
-    ep16 = ParallelPlan.glm52_trainer(world_size=16, pp_size=1, dp_size=1, contributor_count=16)
     assert (
         resolve_canonical_moe_transport(
             "dense_v1",
@@ -189,9 +129,6 @@ def test_transport_explicit_modes_never_silently_fallback():
             consumer_sharded_output=False,
         )
 
-
-@pytest.mark.cpu
-def test_packed_ep16_v2_fails_closed_outside_admitted_mode():
     metadata = CanonicalMoEGraphMetadata.build(torch.arange(16), torch.arange(16), capacity=16)
     contribution = LocalMoEContribution(
         torch.zeros((16, 2), dtype=torch.bfloat16),
@@ -222,15 +159,11 @@ def test_packed_ep16_v2_fails_closed_outside_admitted_mode():
         )
 
 
-@pytest.mark.cpu
-def test_exact_parallel_plans_hash_launcher_spelling_and_fail_closed():
+def _assert_exact_trainer_plan_and_fail_closed():
     trainer = ParallelPlan.glm52_trainer()
-    sampler = ParallelPlan.glm52_sampler(launcher_tp_size=8)
-    assert trainer.digest != sampler.digest
-    assert sampler.as_dict()["launcher_tp_size"] == 8
     assert trainer.pipeline_layer_ranges == ((0, 78),)
     assert trainer.combine_groups == (tuple(range(16)),)
-    assert all(trainer.logical_ordinal(physical_rank) == physical_rank for physical_rank in range(16))
+    assert trainer.logical_ordinals_by_group == (tuple(range(16)),)
     assert trainer.contract_version == CANONICAL_MOE_REDUCE_VERSION
 
     for kwargs in (
@@ -241,53 +174,35 @@ def test_exact_parallel_plans_hash_launcher_spelling_and_fail_closed():
         with pytest.raises(ValueError, match="Unsupported GLM-5.2 trainer topology"):
             ParallelPlan.glm52_trainer(**kwargs)
 
-    payload = sampler.as_dict()
-    payload["world_size"] = 16
-    payload["role"] = sampler.role
-    with pytest.raises(ValueError, match="partition|world|sampler topology"):
-        ParallelPlan(**payload)
-
-    payload = sampler.as_dict()
-    payload["role"] = ParallelRole.SAMPLER
-    payload["launcher_tp_size"] = 99
-    with pytest.raises(ValueError, match="launcher-level tp_size must be exactly 8"):
-        ParallelPlan(**payload)
-
-    payload = sampler.as_dict()
-    payload["role"] = ParallelRole.SAMPLER
-    payload["logical_ordinals_by_group"] = (tuple(reversed(range(8))),)
-    with pytest.raises(ValueError, match="identity logical contributor ordinals"):
-        ParallelPlan(**payload)
+    _assert_world32_cp_and_ep_group_alias_policy()
 
 
-@pytest.mark.cpu
-def test_world32_pp1_cp_and_ep_groups_alias_as_four_rank_octets():
-    main_mesh = torch.arange(32).view(4, 8)
-    ep_mesh = init_ep_mesh_matrix(ep_size=8, ep_fsdp_size=4, ep_intranode=True)
+def _assert_world32_cp_and_ep_group_alias_policy():
+    cases = (
+        (
+            8,
+            4,
+            tuple(tuple(range(start, start + 8)) for start in range(0, 32, 8)),
+            (0, 8, 16, 24),
+            (7, 15, 23, 31),
+        ),
+        (16, 2, (tuple(range(16)), tuple(range(16, 32))), (0, 16), (15, 31)),
+    )
+    for ep_size, ep_fsdp_size, expected_groups, first_fsdp_group, last_fsdp_group in cases:
+        main_mesh = torch.arange(32).view(ep_fsdp_size, ep_size)
+        ep_mesh = init_ep_mesh_matrix(
+            ep_size=ep_size,
+            ep_fsdp_size=ep_fsdp_size,
+            ep_intranode=True,
+        )
 
-    cp_groups = tuple(tuple(int(rank) for rank in row) for row in main_mesh)
-    ep_groups = tuple(tuple(int(rank) for rank in ep_mesh[:, column]) for column in range(4))
-    expert_fsdp_groups = tuple(tuple(int(rank) for rank in row) for row in ep_mesh)
+        cp_groups = tuple(tuple(int(rank) for rank in row) for row in main_mesh)
+        ep_groups = tuple(tuple(int(rank) for rank in ep_mesh[:, column]) for column in range(ep_fsdp_size))
+        expert_fsdp_groups = tuple(tuple(int(rank) for rank in row) for row in ep_mesh)
 
-    expected_octets = tuple(tuple(range(start, start + 8)) for start in range(0, 32, 8))
-    assert cp_groups == ep_groups == expected_octets
-    assert expert_fsdp_groups[0] == (0, 8, 16, 24)
-    assert expert_fsdp_groups[-1] == (7, 15, 23, 31)
-
-
-@pytest.mark.cpu
-def test_world32_pp1_cp16_and_ep16_groups_alias_as_two_rank_groups():
-    main_mesh = torch.arange(32).view(2, 16)
-    ep_mesh = init_ep_mesh_matrix(ep_size=16, ep_fsdp_size=2, ep_intranode=True)
-
-    cp_groups = tuple(tuple(int(rank) for rank in row) for row in main_mesh)
-    ep_groups = tuple(tuple(int(rank) for rank in ep_mesh[:, column]) for column in range(2))
-    expert_fsdp_groups = tuple(tuple(int(rank) for rank in row) for row in ep_mesh)
-
-    expected_groups = (tuple(range(16)), tuple(range(16, 32)))
-    assert cp_groups == ep_groups == expected_groups
-    assert expert_fsdp_groups[0] == (0, 16)
-    assert expert_fsdp_groups[-1] == (15, 31)
+        assert cp_groups == ep_groups == expected_groups
+        assert expert_fsdp_groups[0] == first_fsdp_group
+        assert expert_fsdp_groups[-1] == last_fsdp_group
 
 
 def _make_partials(world: int, capacity: int) -> torch.Tensor:
@@ -327,7 +242,7 @@ def _run_distributed_case() -> None:
     physical_stack = torch.stack(gathered)
     logical_to_physical = [mapping.index(logical) for logical in range(world)]
     logical_stack = physical_stack[logical_to_physical]
-    expected = canonical_moe_reduce_reference(logical_stack, metadata)
+    expected = _canonical_moe_reference(logical_stack, metadata)
 
     replicated = canonical_moe_reduce_v1(
         contribution,
@@ -615,13 +530,14 @@ def _run_packed_ep16_case() -> None:
 if __name__ != "__main__":
 
     @pytest.mark.cpu
-    @pytest.mark.parametrize("contributors", [2, 4, 8])
-    def test_distributed_transport_tree_distribution_chunking_and_backward(contributors: int):
-        result = run_distributed_script(__file__, num_gpus=contributors, timeout=180)
-        result.assert_success(f"canonical MoE primitive with {contributors} CPU contributors")
+    def test_distributed_transport_tree_distribution_chunking_and_backward():
+        for contributors in (2, 8):
+            result = run_distributed_script(__file__, num_gpus=contributors, timeout=180)
+            result.assert_success(f"canonical MoE primitive with {contributors} CPU contributors")
 
-    @pytest.mark.cpu
-    def test_packed_ep16_v2_matches_dense_v1_bitwise():
+        _assert_packed_ep16_v2_matches_dense_v1_bitwise()
+
+    def _assert_packed_ep16_v2_matches_dense_v1_bitwise():
         result = run_distributed_script(
             __file__,
             num_gpus=16,

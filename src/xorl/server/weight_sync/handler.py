@@ -91,11 +91,9 @@ def _env_int(name: str, default: int, *, minimum: int = 1) -> int:
 
 
 def _moe_bucket_size_bytes(sync_method: str) -> int:
-    """Default MoE bucket sizing is backend-specific; env vars are explicit overrides."""
+    """Default MoE bucket sizing is backend-specific; the env var is an explicit override."""
     default = _DEFAULT_P2P_MOE_BUCKET_BYTES if sync_method == "p2p" else _DEFAULT_MOE_BUCKET_BYTES
-    if "XORL_WEIGHT_SYNC_MOE_BUCKET_BYTES" in os.environ:
-        return _env_int("XORL_WEIGHT_SYNC_MOE_BUCKET_BYTES", default)
-    return _env_int("XORL_WEIGHT_SYNC_BUCKET_BYTES", default)
+    return _env_int("XORL_WEIGHT_SYNC_MOE_BUCKET_BYTES", default)
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -1119,25 +1117,6 @@ class WeightSyncHandler:
                 )
             if weight_version is not None:
                 _backend_config["weight_version"] = weight_version
-            if has_linear_attention_layers(model.config):
-                linear_num_key_heads = getattr(model.config, "linear_num_key_heads", None)
-                linear_key_head_dim = getattr(model.config, "linear_key_head_dim", None)
-                linear_num_value_heads = getattr(model.config, "linear_num_value_heads", None)
-                linear_value_head_dim = getattr(model.config, "linear_value_head_dim", None)
-                if all(
-                    value is not None
-                    for value in (
-                        linear_num_key_heads,
-                        linear_key_head_dim,
-                        linear_num_value_heads,
-                        linear_value_head_dim,
-                    )
-                ):
-                    _backend_config["qwen_linear_attention_dims"] = {
-                        "key_dim": int(linear_num_key_heads) * int(linear_key_head_dim),
-                        "value_dim": int(linear_num_value_heads) * int(linear_value_head_dim),
-                        "tp_size": max(int(ep.get("world_size", 1) or 1) for ep in endpoints) if endpoints else 1,
-                    }
             ib_device = _select_p2p_ib_device(self.rank, self.world_size)
             if ib_device:
                 _backend_config["ib_device"] = ib_device
@@ -3234,16 +3213,6 @@ class WeightSyncHandler:
         return os.environ.get("XORL_P2P_FP8_CPU_WORKSPACE_STREAMING", "1") != "0"
 
     @staticmethod
-    def _p2p_should_run_post_process_weights(quantization: Optional[Dict[str, Any]]) -> bool:
-        if not (quantization and quantization.get("quant_method") == "fp8"):
-            return False
-        if "XORL_P2P_RUN_POST_PROCESS_WEIGHTS" in os.environ:
-            return _env_bool("XORL_P2P_RUN_POST_PROCESS_WEIGHTS")
-        if "XORL_WEIGHT_SYNC_RUN_POST_PROCESS_WEIGHTS" in os.environ:
-            return _env_bool("XORL_WEIGHT_SYNC_RUN_POST_PROCESS_WEIGHTS")
-        return False
-
-    @staticmethod
     def _should_run_receiver_post_process_after_fp8_sync(
         sync_method: str,
         quantization: Optional[Dict[str, Any]],
@@ -3257,10 +3226,7 @@ class WeightSyncHandler:
         if sync_method == "sparse_delta":
             return bool(fp8_kv_cache_postprocess_required)
         if sync_method == "p2p":
-            return bool(
-                fp8_kv_cache_postprocess_required
-                or WeightSyncHandler._p2p_should_run_post_process_weights(quantization)
-            )
+            return bool(fp8_kv_cache_postprocess_required)
         return True
 
     @staticmethod

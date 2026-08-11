@@ -20,7 +20,7 @@ def _tiny_exact_head() -> Glm52ExactTP16LmHeadLoraLinear:
     return Glm52ExactTP16LmHeadLoraLinear.from_module(base, r=1, lora_alpha=1)
 
 
-def test_per_token_ce_routes_exact_head_before_generic_tp_and_fp32_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_exact_lm_head_loss_routing_weight_and_fsdp_policy(monkeypatch: pytest.MonkeyPatch) -> None:
     captures = {}
 
     def _fake_exact(hidden, weight, labels, **kwargs):
@@ -60,8 +60,15 @@ def test_per_token_ce_routes_exact_head_before_generic_tp_and_fp32_paths(monkeyp
     assert captures["weight"] is weight
     assert captures["labels"] is labels
 
+    with monkeypatch.context() as case_patch:
+        _assert_causallm_exact_head_admits_its_tp_group_and_rejects_z_loss(case_patch)
+    _assert_exact_head_weight_and_server_loss_selector_never_materialize_delta()
+    _assert_exact_head_fsdp_ignores_only_replicated_a()
 
-def test_causallm_exact_head_admits_its_tp_group_and_rejects_z_loss(monkeypatch: pytest.MonkeyPatch) -> None:
+
+def _assert_causallm_exact_head_admits_its_tp_group_and_rejects_z_loss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     causallm_impl = importlib.import_module("xorl.ops.loss.causallm_loss")
     lm_head = nn.Module()
     lm_head._glm52_exact_tp16_lm_head = True
@@ -101,7 +108,7 @@ def test_causallm_exact_head_admits_its_tp_group_and_rejects_z_loss(monkeypatch:
         )
 
 
-def test_exact_head_weight_and_server_loss_selector_never_materialize_delta() -> None:
+def _assert_exact_head_weight_and_server_loss_selector_never_materialize_delta() -> None:
     lm_head = _tiny_exact_head()
     lm_head._xorl_fsdp_sharded_lm_head_loss = True
     assert get_lm_head_weight(lm_head, fsdp_sharded_loss=True) is lm_head.weight
@@ -112,7 +119,7 @@ def test_exact_head_weight_and_server_loss_selector_never_materialize_delta() ->
     assert runner._get_loss_lm_head_module(lm_head) is lm_head
 
 
-def test_exact_head_fsdp_ignores_only_replicated_a() -> None:
+def _assert_exact_head_fsdp_ignores_only_replicated_a() -> None:
     lm_head = _tiny_exact_head()
     lm_head._glm52_exact_replicated_parameter_names = ("lora_A",)
 

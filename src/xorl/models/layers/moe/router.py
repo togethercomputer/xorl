@@ -8,7 +8,6 @@ import torch.nn.functional as F
 
 
 _SYNTHETIC_ROUTING_ENV = "XORL_MOE_SYNTHETIC_ROUTING"
-_ROUTER_TOPK_POLICY_ENV = "XORL_MOE_ROUTER_TOPK_POLICY"
 
 
 def balanced_synthetic_routing(
@@ -35,36 +34,6 @@ def _synthetic_routing_mode() -> str | None:
     if mode in {"balanced", "round_robin"}:
         return "balanced"
     raise ValueError(f"{_SYNTHETIC_ROUTING_ENV} must be unset or 'balanced', got {mode!r}")
-
-
-def _router_topk_policy() -> str:
-    policy = os.environ.get(_ROUTER_TOPK_POLICY_ENV, "").strip().lower()
-    if policy in {"", "0", "false", "no", "off", "default", "softmax"}:
-        return "default"
-    if policy in {"logits", "stable_low_id", "tie_low_id", "tie_high_id"}:
-        return policy
-    raise ValueError(
-        f"{_ROUTER_TOPK_POLICY_ENV} must be unset/default, logits, stable_low_id, "
-        f"tie_low_id, or tie_high_id; got {policy!r}"
-    )
-
-
-def _topk_indices_with_policy(scores: torch.Tensor, top_k: int, policy: str | None = None) -> torch.Tensor:
-    policy = _router_topk_policy() if policy is None else policy
-    if policy == "default":
-        return torch.topk(scores, top_k, dim=-1).indices
-    if policy == "stable_low_id":
-        return torch.argsort(scores.float(), dim=-1, descending=True, stable=True)[:, :top_k]
-
-    if policy == "tie_low_id":
-        expert_id = torch.arange(scores.shape[-1], dtype=torch.float32, device=scores.device)
-        scores = scores.float() - expert_id * 1e-7
-    elif policy == "tie_high_id":
-        expert_id = torch.arange(scores.shape[-1], dtype=torch.float32, device=scores.device)
-        scores = scores.float() + expert_id * 1e-7
-    else:
-        scores = scores.float()
-    return torch.topk(scores, top_k, dim=-1).indices
 
 
 def _balanced_selected_experts(router_logits: torch.Tensor, num_experts: int, top_k: int) -> torch.Tensor:
@@ -154,7 +123,6 @@ class TopKRouter(nn.Module):
         # Exact model programs are structural and must not be redirected by
         # process-wide diagnostic environment variables.
         self.synthetic_routing_mode = None if exact_batch_invariant else _synthetic_routing_mode()
-        self.topk_policy = "default" if exact_batch_invariant else _router_topk_policy()
         # ``tid2eid`` is a frozen post-load buffer — validate bounds once and
         # remember the storage object so the hot path doesn't pay device->host
         # sync per forward.
@@ -237,12 +205,7 @@ class TopKRouter(nn.Module):
                 input_dtype,
             )
         routing_weights = F.softmax(router_logits, dim=1, dtype=torch.float)
-        topk_policy = self.topk_policy
-        if topk_policy == "default":
-            routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
-        else:
-            selected_experts = _topk_indices_with_policy(router_logits, self.top_k, topk_policy)
-            routing_weights = torch.gather(routing_weights, 1, selected_experts)
+        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
         if self._exact_batch_invariant:
             # Exact router contract: fixed-order renorm + cast so the top-k weights
             # are bit-identical to SGLang's batch-invariant path (the stock
@@ -291,7 +254,7 @@ class TopKRouter(nn.Module):
                 scores_for_routing = scores + expert_bias
             else:
                 scores_for_routing = scores
-            selected_experts = _topk_indices_with_policy(scores_for_routing, self.top_k, self.topk_policy)
+            selected_experts = torch.topk(scores_for_routing, self.top_k, dim=-1).indices
 
         routing_weights = torch.gather(scores, dim=1, index=selected_experts)
         # V4 paths always renormalize.

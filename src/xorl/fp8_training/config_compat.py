@@ -29,69 +29,6 @@ def _as_bool(value: Any, *, field_name: str) -> bool:
     raise UnsupportedFP8ConfigError(f"{field_name} must be a boolean, got {value!r}")
 
 
-def normalize_fp8_training_config(config: Mapping[str, Any], *, context: str = "train") -> dict[str, Any]:
-    """Normalize NeMo-style ``fp8_cfg`` onto XoRL-native FP8 training fields.
-
-    XoRL intentionally supports only native block-FP8 compute training with
-    full-precision master parameters. TransformerEngine-only recipes are
-    rejected here with targeted messages before model construction starts.
-    """
-
-    normalized = dict(config)
-    fp8_cfg = normalized.get("fp8_cfg")
-    if fp8_cfg is None:
-        return normalized
-    if not isinstance(fp8_cfg, Mapping):
-        raise UnsupportedFP8ConfigError(f"{context}.fp8_cfg must be a mapping, got {type(fp8_cfg).__name__}")
-
-    enabled = _as_bool(fp8_cfg.get("enabled", False), field_name=f"{context}.fp8_cfg.enabled")
-    if not enabled:
-        return normalized
-
-    raw_fp8 = str(fp8_cfg.get("fp8", "e4m3")).strip().lower()
-    if raw_fp8 != "e4m3":
-        raise UnsupportedFP8ConfigError(
-            f"Unsupported {context}.fp8_cfg.fp8={fp8_cfg.get('fp8')!r}. "
-            "XoRL native FP8 training supports E4M3 block-FP8 only; "
-            "'hybrid' is a TransformerEngine recipe and is not implemented."
-        )
-
-    raw_recipe = str(fp8_cfg.get("fp8_recipe", "blockwise")).strip().lower()
-    if raw_recipe != "blockwise":
-        raise UnsupportedFP8ConfigError(
-            f"Unsupported {context}.fp8_cfg.fp8_recipe={fp8_cfg.get('fp8_recipe')!r}. "
-            "XoRL native FP8 training supports blockwise FP8 only; "
-            "TransformerEngine tensorwise and MXFP8 recipes are not implemented."
-        )
-
-    fp8_param = fp8_cfg.get("fp8_param", False)
-    if _as_bool(fp8_param, field_name=f"{context}.fp8_cfg.fp8_param"):
-        raise UnsupportedFP8ConfigError(
-            f"Unsupported {context}.fp8_cfg.fp8_param=true. XoRL keeps BF16/FP32 master parameters and does not "
-            "store trainable parameters, optimizer state, or DCP checkpoints in FP8."
-        )
-
-    normalized["enable_fp8_training"] = True
-    return normalized
-
-
-def extract_nemo_fp8_cfg(config: Mapping[str, Any]) -> dict[str, Any] | None:
-    """Return ``policy.megatron_cfg.fp8_cfg`` when a NeMo-style config is provided."""
-
-    policy = config.get("policy")
-    if not isinstance(policy, Mapping):
-        return None
-    megatron_cfg = policy.get("megatron_cfg")
-    if not isinstance(megatron_cfg, Mapping):
-        return None
-    fp8_cfg = megatron_cfg.get("fp8_cfg")
-    if fp8_cfg is None:
-        return None
-    if not isinstance(fp8_cfg, Mapping):
-        raise UnsupportedFP8ConfigError("policy.megatron_cfg.fp8_cfg must be a mapping")
-    return dict(fp8_cfg)
-
-
 def validate_external_fp8_runtime_config(config: Mapping[str, Any], *, context: str = "config") -> None:
     """Reject non-XoRL low-precision runtime knobs in XoRL configs."""
 

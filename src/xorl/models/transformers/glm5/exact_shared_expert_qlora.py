@@ -419,23 +419,6 @@ class Glm52ExactTP16SharedExpertBlockFP8QLoRA(nn.Module):
             down_B=effective_down_B.unsqueeze(0).contiguous(),
         )
 
-    def physical_factor_views(self, contributor_ordinal: int) -> Glm52SharedExpertPhysicalFactors:
-        """Derive one live SGLang slot view from the FP32 logical masters."""
-
-        self._validate_factor_state()
-        effective = tuple(
-            factor.to(torch.bfloat16).contiguous()
-            for factor in (
-                self.gate_proj.lora_A,
-                self.gate_proj.lora_B,
-                self.up_proj.lora_A,
-                self.up_proj.lora_B,
-                self.down_proj.lora_A,
-                self.down_proj.lora_B,
-            )
-        )
-        return self._physical_factor_views_from_effective(*effective, contributor_ordinal)
-
     @staticmethod
     def _partition_base_state(
         projection: NativeBlockFP8Linear,

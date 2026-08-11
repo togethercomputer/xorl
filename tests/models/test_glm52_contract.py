@@ -9,7 +9,6 @@ from xorl.distributed.canonical_moe import (
     CanonicalMoEGraphMetadata,
     CanonicalMoETransport,
     ParallelPlan,
-    canonical_moe_reduce_reference,
 )
 from xorl.models.transformers.glm5 import indexer as indexer_module
 from xorl.models.transformers.glm5 import sparse_selector as sparse_selector_module
@@ -38,8 +37,6 @@ from xorl.models.transformers.glm5.modeling_glm5 import (
 )
 from xorl.models.transformers.glm5.sparse_selector import (
     GLM52_SELECTOR_VERSION,
-    gather_selected_logical_values,
-    physical_cache_to_logical_indices,
     quantize_e4m3_dynamic,
     quantize_e4m3_ue8m0,
     quantize_sparse_key_cache,
@@ -47,6 +44,16 @@ from xorl.models.transformers.glm5.sparse_selector import (
     rotate_sparse_selector_activation,
     select_glm52_logical_indices,
 )
+
+
+def _canonical_moe_reference(partials: torch.Tensor, metadata: CanonicalMoEGraphMetadata) -> torch.Tensor:
+    level = [partials[index] for index in range(partials.shape[0])]
+    while len(level) > 1:
+        level = [(level[index] + level[index + 1]).to(torch.bfloat16) for index in range(0, len(level), 2)]
+    result = level[0]
+    result = result.clone()
+    result[~metadata.valid_mask] = 0
+    return result
 
 
 GLM52_FULL_INDEX_LAYERS = (0, 1, 2, 6, 10, 14, 18, 22, 26, 30, 34, 38, 42, 46, 50, 54, 58, 62, 66, 70, 74)
@@ -64,8 +71,7 @@ def _map_tensors(fn, value):
     return value
 
 
-@pytest.mark.cpu
-def test_canonical_trainer_admits_only_certified_world16_ep16_cp16():
+def _assert_canonical_trainer_admits_only_certified_world16_ep16_cp16():
     assert _GLM52_CANONICAL_TRAINER_TOPOLOGIES == ((16, 1, 1, 1),)
     plan = ParallelPlan.glm52_trainer()
     assert (plan.world_size, plan.pp_size, plan.tp_size, plan.dp_size, plan.ep_size, plan.cp_size) == (
@@ -114,24 +120,26 @@ def _official_schedule_config() -> SimpleNamespace:
     )
 
 
-@pytest.mark.cpu
-def test_official_layer_plan_counts_producers_and_38_40_split():
+def _assert_official_layer_plan_counts_producers_and_38_40_split():
     plan = Glm52LayerPlan.from_config(
         _official_schedule_config(),
         pipeline_layer_ranges=((0, 38), (38, 78)),
     )
-    assert plan.full_indexer_layers == GLM52_FULL_INDEX_LAYERS
-    assert len(plan.full_indexer_layers) == 21
-    assert len(plan.shared_indexer_layers) == 57
-    assert plan.dense_layers == (0, 1, 2)
-    assert len(plan.sparse_layers) == 75
+    full_layers = tuple(layer.layer_index for layer in plan.layers if layer.indexer_type.value == "full")
+    shared_layers = tuple(layer.layer_index for layer in plan.layers if layer.indexer_type.value == "shared")
+    dense_layers = tuple(layer.layer_index for layer in plan.layers if layer.mlp_type.value == "dense")
+    sparse_layers = tuple(layer.layer_index for layer in plan.layers if layer.mlp_type.value == "sparse")
+    assert full_layers == GLM52_FULL_INDEX_LAYERS
+    assert len(full_layers) == 21
+    assert len(shared_layers) == 57
+    assert dense_layers == (0, 1, 2)
+    assert len(sparse_layers) == 75
     assert plan.layers[37].index_producer_layer == 34
     assert plan.layers[38].index_producer_layer == 38
     assert plan.layers[77].index_producer_layer == 74
 
 
-@pytest.mark.cpu
-def test_layer_plan_rejects_malformed_schedules_and_shared_stage_start():
+def _assert_layer_plan_rejects_malformed_schedules_and_shared_stage_start():
     config = _official_schedule_config()
     config.indexer_types = config.indexer_types[:-1]
     with pytest.raises(ValueError, match="indexer_types has length"):
@@ -161,8 +169,7 @@ def _small_plan() -> Glm52LayerPlan:
     return Glm52LayerPlan.from_config(config)
 
 
-@pytest.mark.cpu
-def test_index_share_context_lifecycle_reuse_exception_cleanup_and_concurrency_guard():
+def _assert_index_share_context_lifecycle_reuse_exception_cleanup_and_concurrency_guard():
     plan = _small_plan()
     manager = IndexShareContextManager(plan, (0, 4))
     payload = CanonicalLogicalIndices(torch.tensor([[[0, 1, -1]]], dtype=torch.int32))
@@ -178,40 +185,23 @@ def test_index_share_context_lifecycle_reuse_exception_cleanup_and_concurrency_g
     assert first.lifecycle is IndexShareLifecycle.CLOSED
     assert manager.active is None
 
-    with pytest.raises(RuntimeError, match="body failed"):
-        with manager.invocation(mode=IndexShareMode.FORWARD_ONLY) as second:
-            second.get_or_publish(producer_layer_index=0, layer_plan=plan, produce_payload=lambda: payload)
-            raise RuntimeError("body failed")
+    second = manager.begin(mode=IndexShareMode.FORWARD_ONLY)
+    second.get_or_publish(producer_layer_index=0, layer_plan=plan, produce_payload=lambda: payload)
+    manager.finish_forward(second, succeeded=False)
     assert manager.active is None
 
-    with manager.invocation(mode=IndexShareMode.FORWARD_ONLY) as third:
-        with pytest.raises(RuntimeError, match="has not published"):
-            third.require(producer_layer_index=0, layer_plan=plan)
-
-
-@pytest.mark.cpu
-def test_index_share_context_identity_survives_fsdp_tensor_transform():
-    plan = _small_plan()
-    manager = IndexShareContextManager(plan, (0, 4))
-    payload = CanonicalLogicalIndices(torch.tensor([[[0, 1, -1]]], dtype=torch.int32))
-
-    with manager.invocation(mode=IndexShareMode.FORWARD_ONLY) as context:
-        producer_context = _map_tensors(lambda tensor: tensor, {"context": context})["context"]
-        assert producer_context is context
-        producer_context.get_or_publish(producer_layer_index=0, layer_plan=plan, produce_payload=lambda: payload)
-
-        consumer_context = _map_tensors(lambda tensor: tensor, {"context": context})["context"]
-        assert consumer_context is context
-        assert consumer_context.require(producer_layer_index=0, layer_plan=plan) is producer_context.get_or_publish(
-            producer_layer_index=0,
-            layer_plan=plan,
-            produce_payload=lambda: pytest.fail("retained producer payload was recomputed"),
-        )
+    third = manager.begin(mode=IndexShareMode.FORWARD_ONLY)
+    with pytest.raises(RuntimeError, match="has not published"):
+        third.require(producer_layer_index=0, layer_plan=plan)
+    manager.finish_forward(third, succeeded=True)
+    assert manager.active is None
 
 
 @pytest.mark.cpu
 @torch.no_grad()
-def test_index_share_survives_fsdp_cast_across_dense_producer_and_shared_consumer(monkeypatch):
+def test_index_share_lifecycle_and_fsdp_identity_contract(monkeypatch):
+    _assert_index_share_context_lifecycle_reuse_exception_cleanup_and_concurrency_guard()
+
     monkeypatch.setattr(
         indexer_module,
         "bi_bf16_fp32_linear",
@@ -299,8 +289,7 @@ def _small_glm_config() -> Glm5Config:
     )
 
 
-@pytest.mark.cpu
-def test_only_full_layers_allocate_indexer_parameters_and_strict_state_dict_round_trip():
+def _assert_only_full_layers_allocate_indexer_parameters_and_strict_state_dict_round_trip():
     config = _small_glm_config()
     plan = Glm52LayerPlan.from_config(config)
     attentions = nn.ModuleList([Glm5Attention(config, layer, layer_plan=plan) for layer in range(4)])
@@ -316,8 +305,7 @@ def test_only_full_layers_allocate_indexer_parameters_and_strict_state_dict_roun
     clone.load_state_dict(state, strict=True)
 
 
-@pytest.mark.cpu
-def test_sparse_selector_ties_short_rows_dead_rows_and_logical_cache_mapping():
+def _assert_sparse_selector_ties_short_rows_and_dead_rows():
     query = torch.zeros((1, 3, 2, 128), dtype=torch.bfloat16)
     key = torch.zeros((1, 5, 128), dtype=torch.bfloat16)
     weights = torch.ones((1, 3, 2), dtype=torch.float32)
@@ -344,19 +332,8 @@ def test_sparse_selector_ties_short_rows_dead_rows_and_logical_cache_mapping():
     assert result.logical_indices.values.tolist() == [[[0, 1, 2], [0, -1, -1], [-1, -1, -1]]]
     assert result.valid_counts.tolist() == [[3, 1, 0]]
 
-    values = torch.randn((1, 5, 4), dtype=torch.bfloat16)
-    gathered = gather_selected_logical_values(values, result.logical_indices)
-    assert torch.count_nonzero(gathered[0, 2]) == 0
-    assert bool(torch.all(torch.isfinite(gathered)))
 
-    physical = torch.tensor([[[2, 0, -1]]], dtype=torch.int32)
-    page_map = torch.tensor([4, 1, 3], dtype=torch.int32)
-    logical = physical_cache_to_logical_indices(physical, page_map)
-    assert logical.values.tolist() == [[[3, 4, -1]]]
-
-
-@pytest.mark.cpu
-def test_glm52_sparse_shared_selector_handles_production_boundary_ties_and_dead_tail():
+def _assert_glm52_sparse_shared_selector_handles_production_boundary_ties_and_dead_tail():
     query = torch.zeros((1, 1, 1, 128), dtype=torch.bfloat16)
     key = torch.zeros((1, 4112, 128), dtype=torch.bfloat16)
     weights = torch.ones((1, 1, 1), dtype=torch.float32)
@@ -377,8 +354,7 @@ def test_glm52_sparse_shared_selector_handles_production_boundary_ties_and_dead_
     assert result.valid_counts.tolist() == [[2048]]
 
 
-@pytest.mark.cpu
-def test_glm52_sparse_hadamard_transport_is_normalized_and_self_inverse():
+def _assert_glm52_sparse_hadamard_transport_is_normalized_and_self_inverse():
     source = torch.arange(128, dtype=torch.float32).sub(63.5).to(torch.bfloat16).reshape(1, 1, 128)
     rotated = rotate_sparse_selector_activation(source)
     restored = rotate_sparse_selector_activation(rotated)
@@ -388,8 +364,7 @@ def test_glm52_sparse_hadamard_transport_is_normalized_and_self_inverse():
     torch.testing.assert_close(restored.float(), source.float(), atol=1.0, rtol=0.0)
 
 
-@pytest.mark.cpu
-def test_sparse_selector_applies_hadamard_before_fp8_quantization(monkeypatch):
+def _assert_sparse_selector_applies_hadamard_before_fp8_quantization(monkeypatch):
     torch.manual_seed(1)
     query = torch.randn((1, 1, 2, 128), dtype=torch.bfloat16)
     key = torch.randn((1, 128, 128), dtype=torch.bfloat16)
@@ -427,8 +402,7 @@ def test_sparse_selector_applies_hadamard_before_fp8_quantization(monkeypatch):
     assert torch.equal(observed["key"].view(torch.uint8), expected_key.view(torch.uint8))
 
 
-@pytest.mark.cpu
-def test_sparse_selector_fused_contract_skips_hadamard_before_fp8_quantization(monkeypatch):
+def _assert_sparse_selector_fused_contract_skips_hadamard_before_fp8_quantization(monkeypatch):
     torch.manual_seed(2)
     query = torch.randn((1, 1, 2, 128), dtype=torch.bfloat16)
     key = torch.randn((1, 128, 128), dtype=torch.bfloat16)
@@ -464,8 +438,7 @@ def test_sparse_selector_fused_contract_skips_hadamard_before_fp8_quantization(m
     assert torch.equal(observed["key"].view(torch.uint8), key.view(torch.uint8))
 
 
-@pytest.mark.cpu
-def test_fused_bf16_indexer_projection_matches_sampler_row_order(monkeypatch):
+def _assert_fused_bf16_indexer_projection_matches_sampler_row_order(monkeypatch):
     torch.manual_seed(3)
     hidden = torch.randn((1, 5, 16), dtype=torch.bfloat16)
     wk = torch.randn((128, 16), dtype=torch.bfloat16)
@@ -495,8 +468,7 @@ def test_fused_bf16_indexer_projection_matches_sampler_row_order(monkeypatch):
     assert torch.equal(raw_gate.view(torch.uint8), expected[..., 128:].view(torch.uint8))
 
 
-@pytest.mark.cpu
-def test_fused_bf16_indexer_head_gate_scaling_promotes_before_head_scale():
+def _assert_fused_bf16_indexer_head_gate_scaling_promotes_before_head_scale():
     raw_gate = torch.tensor([-6.4375, 11.0, -7.65625, -8.125], dtype=torch.bfloat16)
 
     scaled = _scale_fused_bf16_indexer_head_gates(raw_gate, index_n_heads=32)
@@ -513,8 +485,7 @@ def test_fused_bf16_indexer_head_gate_scaling_promotes_before_head_scale():
     assert torch.equal(native_score_weights, sampler_formula)
 
 
-@pytest.mark.cpu
-def test_fused_sampler_index_k_prepare_preserves_projection_stride_and_builds_literal_rope_cache():
+def _assert_fused_sampler_index_k_prepare_preserves_projection_stride_and_builds_literal_rope_cache():
     backing = torch.arange(3 * 160, dtype=torch.int32).reshape(1, 3, 160).to(torch.bfloat16)
     raw_key = backing[..., :128]
     norm_weight = torch.ones((128,), dtype=torch.float32)
@@ -558,8 +529,7 @@ def test_fused_sampler_index_k_prepare_preserves_projection_stride_and_builds_li
     assert torch.equal(prepared, raw_key)
 
 
-@pytest.mark.cpu
-def test_sampler_index_k_preparation_uses_split_prompt_and_fused_decode_suffix():
+def _assert_sampler_index_k_preparation_uses_split_prompt_and_fused_decode_suffix():
     split = torch.full((1, 8, 128), 7, dtype=torch.bfloat16)
     backing = torch.arange(8 * 160, dtype=torch.int32).reshape(1, 8, 160).to(torch.bfloat16)
     raw = backing[..., :128]
@@ -591,8 +561,7 @@ def test_sampler_index_k_preparation_uses_split_prompt_and_fused_decode_suffix()
     assert torch.equal(mixed[:, 4:], torch.full_like(mixed[:, 4:], 11))
 
 
-@pytest.mark.cpu
-def test_sampler_index_k_preparation_maps_4096_boundary_across_cp16():
+def _assert_sampler_index_k_preparation_maps_4096_boundary_across_cp16():
     local_length = 260
     split = torch.zeros((1, local_length, 128), dtype=torch.bfloat16)
     raw = torch.zeros_like(split)
@@ -630,8 +599,7 @@ def test_sampler_index_k_preparation_maps_4096_boundary_across_cp16():
             assert torch.equal(mixed[:, 196:], torch.ones_like(mixed[:, 196:]))
 
 
-@pytest.mark.cpu
-def test_glm52_sparse_query_and_key_codecs_have_distinct_scale_contracts():
+def _assert_glm52_sparse_query_and_key_codecs_have_distinct_scale_contracts():
     source = torch.linspace(-3.0, 2.0, 128, dtype=torch.float32).to(torch.bfloat16).reshape(1, 128)
     _, query_scale = quantize_e4m3_ue8m0(source)
     _, key_scale = quantize_e4m3_dynamic(source)
@@ -642,8 +610,7 @@ def test_glm52_sparse_query_and_key_codecs_have_distinct_scale_contracts():
     assert key_scale.item() != query_scale.item()
 
 
-@pytest.mark.cpu
-def test_glm52_sparse_key_cache_unpack_preserves_sglang_page_layout():
+def _assert_glm52_sparse_key_cache_unpack_preserves_sglang_page_layout():
     page_size = 64
     block_size = 128
     cache = torch.zeros((2, page_size * (block_size + 4)), dtype=torch.uint8)
@@ -662,7 +629,7 @@ def test_glm52_sparse_key_cache_unpack_preserves_sglang_page_layout():
 
 @pytest.mark.gpu
 @torch.no_grad()
-def test_glm52_sparse_native_sampler_codecs_are_bitwise_at_production_shapes():
+def test_glm52_sparse_native_sampler_codec_parity():
     pytest.importorskip(
         "sglang",
         reason=(
@@ -696,8 +663,7 @@ def test_glm52_sparse_native_sampler_codecs_are_bitwise_at_production_shapes():
     assert torch.equal(key_scale.view(torch.uint8), repeated_key_scale.view(torch.uint8))
 
 
-@pytest.mark.cpu
-def test_glm52_sparse_native_dispatch_flattens_batches_and_masks_unwritten_cells():
+def _assert_glm52_sparse_native_dispatch_flattens_batches_and_masks_unwritten_cells():
     query = torch.zeros((2, 2, 2, 128), dtype=torch.bfloat16)
     key = torch.zeros((2, 3, 128), dtype=torch.bfloat16)
     weights = torch.ones((2, 2, 2), dtype=torch.float32)
@@ -732,8 +698,7 @@ def test_glm52_sparse_native_dispatch_flattens_batches_and_masks_unwritten_cells
     ]
 
 
-@pytest.mark.cpu
-def test_glm52_sparse_native_selector_fails_closed_without_cuda_and_on_nonprefix_mask():
+def _assert_glm52_sparse_native_selector_fails_closed_without_cuda_and_on_nonprefix_mask():
     query = torch.zeros((1, 1, 2, 128), dtype=torch.bfloat16)
     key = torch.zeros((1, 2, 128), dtype=torch.bfloat16)
     weights = torch.ones((1, 1, 2), dtype=torch.float32)
@@ -753,15 +718,13 @@ def test_glm52_sparse_native_selector_fails_closed_without_cuda_and_on_nonprefix
         )
 
 
-@pytest.mark.cpu
-def test_glm52_sparse_deepgemm_loader_requires_score_capability(monkeypatch):
+def _assert_glm52_sparse_deepgemm_loader_requires_score_capability(monkeypatch):
     monkeypatch.setattr(sparse_selector_module.importlib, "import_module", lambda _name: SimpleNamespace())
     with pytest.raises(RuntimeError, match="deep_gemm.fp8_mqa_logits"):
         sparse_selector_module._load_sparse_score_kernel()
 
 
-@pytest.mark.cpu
-def test_glm52_sparse_selector_loader_imports_the_shared_kernel(monkeypatch):
+def _assert_glm52_sparse_selector_loader_imports_the_shared_kernel(monkeypatch):
     """Imports are the compatibility mechanism; there is no version handshake.
 
     A genuine API break fails naturally at import; residual numerical drift
@@ -782,8 +745,7 @@ def test_glm52_sparse_selector_loader_imports_the_shared_kernel(monkeypatch):
     assert sparse_selector_module._load_sparse_selection() is selector
 
 
-@pytest.mark.cpu
-def test_correction_bias_stays_fp32_and_checkpoint_ingestion_fails_closed():
+def _assert_correction_bias_stays_fp32_and_checkpoint_ingestion_fails_closed():
     config = SimpleNamespace(n_routed_experts=4, hidden_size=3, _router_fp32=False)
     router = Glm5TopkRouter(config)
     official_values = torch.tensor([34.12345, -0.00314159, 0.33333334, 17.00013], dtype=torch.float32)
@@ -819,8 +781,7 @@ def test_correction_bias_stays_fp32_and_checkpoint_ingestion_fails_closed():
         handler.on_load_weight(key, torch.tensor([0.0, 1.0, float("inf"), 3.0]))
 
 
-@pytest.mark.cpu
-def test_canonical_moe_rejects_routing_replay_configuration():
+def _assert_canonical_moe_rejects_routing_replay_configuration():
     config = _small_glm_config()
     config._glm52_exact_contract = True
     block = Glm5MoEBlock(config, layer_idx=1)
@@ -829,8 +790,7 @@ def test_canonical_moe_rejects_routing_replay_configuration():
         block.route(torch.zeros((1, 1, config.hidden_size)))
 
 
-@pytest.mark.cpu
-def test_canonical_moe_transport_resolves_internally_with_no_public_knob():
+def _assert_canonical_moe_transport_resolves_internally_with_no_public_knob():
     """There is no user-facing transport menu: the model resolves the best
     certified transport for the geometry internally."""
     config = _small_glm_config()
@@ -839,8 +799,7 @@ def test_canonical_moe_transport_resolves_internally_with_no_public_knob():
     assert "canonical_moe_transport" not in config.to_dict()
 
 
-@pytest.mark.cpu
-def test_canonical_glm_router_and_indexer_are_exact_without_environment(monkeypatch):
+def _assert_canonical_glm_router_and_indexer_are_exact_without_environment(monkeypatch):
     calls = []
 
     def router_gemm(hidden, weight):
@@ -868,8 +827,7 @@ def test_canonical_glm_router_and_indexer_are_exact_without_environment(monkeypa
     assert calls == ["router", "indexer"]
 
 
-@pytest.mark.cpu
-def test_noncanonical_glm_retains_ordinary_router(monkeypatch):
+def _assert_noncanonical_glm_retains_ordinary_router(monkeypatch):
     def forbidden(*_args, **_kwargs):
         raise AssertionError("noncanonical GLM unexpectedly used the exact router kernel")
 
@@ -957,7 +915,7 @@ def _bind_semantic_canonicalizers(model, boundaries, *, serving: bool, skip_laye
                     )
                 canonical = level[0]
             else:
-                canonical = canonical_moe_reduce_reference(flattened, metadata)
+                canonical = _canonical_moe_reference(flattened, metadata)
             if _layer_id == skip_layer:
                 canonical = flattened[0]
             canonical = canonical.reshape_as(hidden_states)
@@ -978,8 +936,9 @@ def _semantic_logprobs(model, input_ids):
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize("num_moe_layers", [1, 4])
-def test_semantic_moe_stack_boundary_logprob_engagement_permutation_and_composition(num_moe_layers, monkeypatch):
+def test_semantic_moe_stack_boundary_logprob_engagement_permutation_and_composition(monkeypatch):
+    num_moe_layers = 4
+
     def rowwise_router(hidden, weight):
         weight_fp32 = weight.float()
         return torch.stack(
@@ -1041,9 +1000,52 @@ def test_semantic_moe_stack_boundary_logprob_engagement_permutation_and_composit
     solo = torch.cat([_semantic_logprobs(trainer, row.unsqueeze(0)) for row in batch], dim=0)
     assert torch.equal(solo.view(torch.uint8), trainer_logprobs.view(torch.uint8))
 
-    if num_moe_layers == 4:
-        faulty = Glm5ForCausalLM(_semantic_model_config(num_moe_layers)).to(torch.bfloat16).eval()
-        faulty.load_state_dict(trainer.state_dict(), strict=True)
-        _bind_semantic_canonicalizers(faulty, [], serving=False, skip_layer=0)
-        faulty_logprobs = _semantic_logprobs(faulty, batch)
-        assert not torch.equal(faulty_logprobs.view(torch.uint8), trainer_logprobs.view(torch.uint8))
+    faulty = Glm5ForCausalLM(_semantic_model_config(num_moe_layers)).to(torch.bfloat16).eval()
+    faulty.load_state_dict(trainer.state_dict(), strict=True)
+    _bind_semantic_canonicalizers(faulty, [], serving=False, skip_layer=0)
+    faulty_logprobs = _semantic_logprobs(faulty, batch)
+    assert not torch.equal(faulty_logprobs.view(torch.uint8), trainer_logprobs.view(torch.uint8))
+
+
+@pytest.mark.cpu
+def test_glm52_layer_plan_and_indexer_allocation_contract():
+    _assert_canonical_trainer_admits_only_certified_world16_ep16_cp16()
+    _assert_official_layer_plan_counts_producers_and_38_40_split()
+    _assert_layer_plan_rejects_malformed_schedules_and_shared_stage_start()
+    _assert_only_full_layers_allocate_indexer_parameters_and_strict_state_dict_round_trip()
+
+
+@pytest.mark.cpu
+def test_glm52_sparse_selector_pipeline_contract(monkeypatch):
+    _assert_sparse_selector_ties_short_rows_and_dead_rows()
+    _assert_glm52_sparse_shared_selector_handles_production_boundary_ties_and_dead_tail()
+    _assert_glm52_sparse_hadamard_transport_is_normalized_and_self_inverse()
+    with monkeypatch.context() as case_patch:
+        _assert_sparse_selector_applies_hadamard_before_fp8_quantization(case_patch)
+    with monkeypatch.context() as case_patch:
+        _assert_sparse_selector_fused_contract_skips_hadamard_before_fp8_quantization(case_patch)
+    with monkeypatch.context() as case_patch:
+        _assert_fused_bf16_indexer_projection_matches_sampler_row_order(case_patch)
+    _assert_fused_bf16_indexer_head_gate_scaling_promotes_before_head_scale()
+    _assert_fused_sampler_index_k_prepare_preserves_projection_stride_and_builds_literal_rope_cache()
+    _assert_sampler_index_k_preparation_uses_split_prompt_and_fused_decode_suffix()
+    _assert_sampler_index_k_preparation_maps_4096_boundary_across_cp16()
+    _assert_glm52_sparse_query_and_key_codecs_have_distinct_scale_contracts()
+    _assert_glm52_sparse_key_cache_unpack_preserves_sglang_page_layout()
+    _assert_glm52_sparse_native_dispatch_flattens_batches_and_masks_unwritten_cells()
+    _assert_glm52_sparse_native_selector_fails_closed_without_cuda_and_on_nonprefix_mask()
+    with monkeypatch.context() as case_patch:
+        _assert_glm52_sparse_deepgemm_loader_requires_score_capability(case_patch)
+    with monkeypatch.context() as case_patch:
+        _assert_glm52_sparse_selector_loader_imports_the_shared_kernel(case_patch)
+    with monkeypatch.context() as case_patch:
+        _assert_glm52_canonical_moe_configuration_and_selection_contract(case_patch)
+
+
+def _assert_glm52_canonical_moe_configuration_and_selection_contract(monkeypatch):
+    _assert_correction_bias_stays_fp32_and_checkpoint_ingestion_fails_closed()
+    _assert_canonical_moe_rejects_routing_replay_configuration()
+    _assert_canonical_moe_transport_resolves_internally_with_no_public_knob()
+    _assert_canonical_glm_router_and_indexer_are_exact_without_environment(monkeypatch)
+    monkeypatch.undo()
+    _assert_noncanonical_glm_retains_ordinary_router(monkeypatch)

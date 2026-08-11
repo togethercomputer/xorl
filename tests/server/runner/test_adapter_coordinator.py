@@ -1,29 +1,20 @@
 """Tests for multi-rank adapter load coordination."""
 
 import asyncio
-import importlib.util
 import json
 import time
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 import torch
 from safetensors.torch import save_file as save_safetensors_file
 
+import xorl.server.runner.adapters.adapter_coordinator as adapter_coordinator_module
 from xorl.lora.utils import convert_peft_lora_state_dict
 from xorl.server.protocol.operations import AdapterStateData, RegisterAdapterData, RegisterSessionData
+from xorl.server.runner.adapters.adapter_coordinator import AdapterCoordinator
 from xorl.server.runner.adapters.sharded_state import AdapterTensorLayout, pack_logical_tensor
-
-
-_MODULE_PATH = (
-    Path(__file__).resolve().parents[3] / "src" / "xorl" / "server" / "runner" / "adapters" / "adapter_coordinator.py"
-)
-_SPEC = importlib.util.spec_from_file_location("xorl_test_adapter_coordinator", _MODULE_PATH)
-assert _SPEC is not None and _SPEC.loader is not None
-_MODULE = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(_MODULE)
-AdapterCoordinator = _MODULE.AdapterCoordinator
 
 
 pytestmark = [pytest.mark.cpu, pytest.mark.server]
@@ -37,11 +28,6 @@ class _FakeAdapterState:
         self.local_params = {}
         self.tensor_layouts = {}
         self.last_access_time = time.time()
-
-    @property
-    def lora_params(self):
-        """Keep older assertions readable while the fake follows the local-state API."""
-        return self.local_params
 
 
 class _FakeAdapterManager:
@@ -155,7 +141,7 @@ class _FakeTrainer:
         return {"success": True, "model_id": model_id, "path": path}
 
 
-def test_auto_load_if_evicted_loads_adapter_state_on_non_rank0(tmp_path):
+def test_adapter_load_lifecycle_and_transport_policy(tmp_path, monkeypatch):
     checkpoint_dir = tmp_path / "adapters"
     evicted_path = checkpoint_dir / "evicted" / "policy-a"
     evicted_path.mkdir(parents=True)
@@ -164,7 +150,6 @@ def test_auto_load_if_evicted_loads_adapter_state_on_non_rank0(tmp_path):
     trainer.register_session("policy-a", trainer._session_spec(1e-5), materialize=False)
     coordinator = AdapterCoordinator(trainer=trainer, rank=1, world_size=2, cpu_group=None)
     coordinator.broadcast_adapter_state = Mock()
-    coordinator.broadcast_adapter_optimizer_state = Mock()
 
     was_auto_loaded, checkpoint_path = coordinator.auto_load_if_evicted("policy-a")
 
@@ -180,10 +165,31 @@ def test_auto_load_if_evicted_loads_adapter_state_on_non_rank0(tmp_path):
         }
     ]
     coordinator.broadcast_adapter_state.assert_not_called()
-    coordinator.broadcast_adapter_optimizer_state.assert_not_called()
+
+    for name, assertion in (
+        ("fresh", _assert_auto_load_broadcasts_fresh_adapter),
+        ("materialize-failure", _assert_auto_load_syncs_materialization_failure),
+        ("fresh-disabled", _assert_auto_load_rejects_missing_checkpoint_when_fresh_disabled),
+        ("restore-failure", _assert_auto_load_rolls_back_when_restore_fails),
+    ):
+        case_root = tmp_path / name
+        case_root.mkdir()
+        assertion(case_root)
+
+    explicit_root = tmp_path / "explicit-load"
+    explicit_root.mkdir()
+    _assert_handle_load_adapter_state_and_path_admission_policy(explicit_root)
+    with monkeypatch.context() as case_patch:
+        _assert_rank0_broadcast_load_policy(case_patch, tmp_path / "rank0-broadcast")
+    registration_root = tmp_path / "registration"
+    registration_root.mkdir()
+    _assert_adapter_registration_policy(registration_root)
+    save_root = tmp_path / "save"
+    save_root.mkdir()
+    _assert_handle_save_adapter_state_requires_evicted_checkpoint(save_root)
 
 
-def test_auto_load_if_evicted_broadcasts_fresh_adapter_without_checkpoint(tmp_path):
+def _assert_auto_load_broadcasts_fresh_adapter(tmp_path):
     checkpoint_dir = tmp_path / "adapters"
     checkpoint_dir.mkdir()
 
@@ -191,7 +197,6 @@ def test_auto_load_if_evicted_broadcasts_fresh_adapter_without_checkpoint(tmp_pa
     trainer.register_session("policy-new", trainer._session_spec(1e-5), materialize=False)
     coordinator = AdapterCoordinator(trainer=trainer, rank=1, world_size=2, cpu_group=None)
     coordinator.broadcast_adapter_state = Mock()
-    coordinator.broadcast_adapter_optimizer_state = Mock()
 
     was_auto_loaded, checkpoint_path = coordinator.auto_load_if_evicted("policy-new")
 
@@ -200,10 +205,9 @@ def test_auto_load_if_evicted_broadcasts_fresh_adapter_without_checkpoint(tmp_pa
     assert trainer.register_calls == [("policy-new", 1e-5)]
     assert trainer.load_calls == []
     coordinator.broadcast_adapter_state.assert_called_once_with("policy-new", 1e-5)
-    coordinator.broadcast_adapter_optimizer_state.assert_not_called()
 
 
-def test_auto_load_if_evicted_syncs_fresh_materialization_failure_before_broadcast(tmp_path):
+def _assert_auto_load_syncs_materialization_failure(tmp_path):
     checkpoint_dir = tmp_path / "adapters"
     checkpoint_dir.mkdir()
 
@@ -225,7 +229,7 @@ def test_auto_load_if_evicted_syncs_fresh_materialization_failure_before_broadca
     coordinator.broadcast_adapter_state.assert_not_called()
 
 
-def test_auto_load_if_evicted_rejects_missing_checkpoint_when_fresh_materialization_disabled(tmp_path):
+def _assert_auto_load_rejects_missing_checkpoint_when_fresh_disabled(tmp_path):
     checkpoint_dir = tmp_path / "adapters"
     checkpoint_dir.mkdir()
 
@@ -241,7 +245,7 @@ def test_auto_load_if_evicted_rejects_missing_checkpoint_when_fresh_materializat
     coordinator.broadcast_adapter_state.assert_not_called()
 
 
-def test_auto_load_if_evicted_rolls_back_fresh_adapter_when_restore_fails(tmp_path):
+def _assert_auto_load_rolls_back_when_restore_fails(tmp_path):
     checkpoint_dir = tmp_path / "adapters"
     evicted_path = checkpoint_dir / "evicted" / "policy-bad"
     evicted_path.mkdir(parents=True)
@@ -261,7 +265,7 @@ def test_auto_load_if_evicted_rolls_back_fresh_adapter_when_restore_fails(tmp_pa
     coordinator.broadcast_adapter_state.assert_not_called()
 
 
-def test_handle_load_adapter_state_loads_optimizer_on_non_rank0(tmp_path):
+def _assert_handle_load_adapter_state_and_path_admission_policy(tmp_path):
     checkpoint_dir = tmp_path / "adapters"
     checkpoint_dir.mkdir()
     adapter_path = tmp_path / "checkpoint"
@@ -271,7 +275,6 @@ def test_handle_load_adapter_state_loads_optimizer_on_non_rank0(tmp_path):
     trainer.register_session("policy-b", trainer._session_spec(3e-5), materialize=False)
     coordinator = AdapterCoordinator(trainer=trainer, rank=1, world_size=2, cpu_group=None)
     coordinator.broadcast_adapter_state = Mock()
-    coordinator.broadcast_adapter_optimizer_state = Mock()
 
     payload = AdapterStateData(
         model_id="policy-b",
@@ -293,10 +296,17 @@ def test_handle_load_adapter_state_loads_optimizer_on_non_rank0(tmp_path):
         }
     ]
     coordinator.broadcast_adapter_state.assert_not_called()
-    coordinator.broadcast_adapter_optimizer_state.assert_not_called()
+
+    path_root = tmp_path / "path-admission"
+    path_root.mkdir()
+    _assert_adapter_state_paths_stay_within_output_root(path_root)
+
+    failure_root = tmp_path / "failure"
+    failure_root.mkdir()
+    _assert_handle_load_adapter_state_failure_policy(failure_root)
 
 
-def test_handle_load_adapter_state_rejects_path_outside_output_root(tmp_path):
+def _assert_adapter_state_paths_stay_within_output_root(tmp_path):
     checkpoint_dir = tmp_path / "output" / "adapters"
     checkpoint_dir.mkdir(parents=True)
     trainer = _FakeTrainer(checkpoint_dir)
@@ -317,18 +327,26 @@ def test_handle_load_adapter_state_rejects_path_outside_output_root(tmp_path):
     assert trainer.register_calls == []
     assert trainer.load_calls == []
 
-
-def test_find_evicted_checkpoint_rejects_model_id_path_traversal(tmp_path):
-    checkpoint_dir = tmp_path / "output" / "adapters"
-    checkpoint_dir.mkdir(parents=True)
-    trainer = _FakeTrainer(checkpoint_dir)
-    coordinator = AdapterCoordinator(trainer=trainer, rank=0, world_size=1, cpu_group=None)
-
     with pytest.raises(ValueError, match="must be inside the server output directory"):
         coordinator._find_evicted_checkpoint("../../../outside")
 
+    trainer.register_lora_adapter("policy-save", 4e-5)
+    with pytest.raises(RuntimeError, match="must be inside the server output directory"):
+        asyncio.run(
+            coordinator.handle_save_adapter_state(
+                {
+                    "payload": AdapterStateData(
+                        model_id="policy-save",
+                        path=str(tmp_path / "outside" / "save-target"),
+                        save_optimizer=True,
+                    )
+                }
+            )
+        )
+    assert trainer.save_calls == []
 
-def test_auto_load_if_evicted_uses_rank0_broadcast_mode_on_non_rank0(tmp_path):
+
+def _assert_rank0_broadcast_load_policy(monkeypatch, tmp_path):
     checkpoint_dir = tmp_path / "adapters"
     evicted_path = checkpoint_dir / "evicted" / "policy-c"
     evicted_path.mkdir(parents=True)
@@ -340,7 +358,6 @@ def test_auto_load_if_evicted_uses_rank0_broadcast_mode_on_non_rank0(tmp_path):
         return_value={"success": True, "model_id": "policy-c", "step": 0}
     )
     coordinator.broadcast_adapter_state = Mock()
-    coordinator.broadcast_adapter_optimizer_state = Mock()
 
     was_auto_loaded, checkpoint_path = coordinator.auto_load_if_evicted("policy-c")
 
@@ -350,10 +367,17 @@ def test_auto_load_if_evicted_uses_rank0_broadcast_mode_on_non_rank0(tmp_path):
     assert trainer.load_calls == []
     coordinator._restore_rank0_broadcast_adapter_state.assert_called_once()
     coordinator.broadcast_adapter_state.assert_not_called()
-    coordinator.broadcast_adapter_optimizer_state.assert_not_called()
+
+    handle_root = tmp_path / "handle-load"
+    handle_root.mkdir()
+    _assert_handle_load_uses_rank0_broadcast_mode(handle_root)
+
+    sharded_root = tmp_path / "sharded-restore"
+    sharded_root.mkdir()
+    _assert_rank0_broadcast_sharded_restore_policy(monkeypatch, sharded_root)
 
 
-def test_handle_load_adapter_state_uses_rank0_broadcast_mode_on_non_rank0(tmp_path):
+def _assert_handle_load_uses_rank0_broadcast_mode(tmp_path):
     checkpoint_dir = tmp_path / "adapters"
     checkpoint_dir.mkdir()
     adapter_path = tmp_path / "checkpoint"
@@ -366,7 +390,6 @@ def test_handle_load_adapter_state_uses_rank0_broadcast_mode_on_non_rank0(tmp_pa
         return_value={"success": True, "model_id": "policy-d", "step": 0}
     )
     coordinator.broadcast_adapter_state = Mock()
-    coordinator.broadcast_adapter_optimizer_state = Mock()
 
     payload = AdapterStateData(
         model_id="policy-d",
@@ -382,10 +405,9 @@ def test_handle_load_adapter_state_uses_rank0_broadcast_mode_on_non_rank0(tmp_pa
     assert trainer.load_calls == []
     coordinator._restore_rank0_broadcast_adapter_state.assert_called_once()
     coordinator.broadcast_adapter_state.assert_not_called()
-    coordinator.broadcast_adapter_optimizer_state.assert_not_called()
 
 
-def test_rank0_broadcast_ep_sharded_restore_slices_full_checkpoint_tensor(monkeypatch, tmp_path):
+def _assert_rank0_broadcast_sharded_restore_policy(monkeypatch, tmp_path):
     checkpoint_dir = tmp_path / "adapters"
     checkpoint_dir.mkdir()
     adapter_path = tmp_path / "checkpoint"
@@ -429,14 +451,13 @@ def test_rank0_broadcast_ep_sharded_restore_slices_full_checkpoint_tensor(monkey
         )
     }
     monkeypatch.setattr(
-        _MODULE.dist,
+        adapter_coordinator_module.dist,
         "broadcast_object_list",
         lambda payload, src=0, group=None: None,
     )
 
     coordinator = AdapterCoordinator(trainer=trainer, rank=0, world_size=2, cpu_group=None)
     coordinator.broadcast_adapter_state = Mock()
-    coordinator.broadcast_adapter_optimizer_state = Mock()
 
     result = coordinator._restore_adapter_state(
         model_id="policy-ep",
@@ -448,15 +469,21 @@ def test_rank0_broadcast_ep_sharded_restore_slices_full_checkpoint_tensor(monkey
 
     assert result["success"] is True
     assert result["step"] == 11
-    assert torch.equal(state.lora_params[param_name].detach(), full_tensor[2:4])
+    assert torch.equal(state.local_params[param_name].detach(), full_tensor[2:4])
     assert state.global_forward_backward_step == 13
     assert state.lr == 3e-5
     assert trainer.load_calls == []
     coordinator.broadcast_adapter_state.assert_not_called()
-    coordinator.broadcast_adapter_optimizer_state.assert_not_called()
+
+    mismatch_root = tmp_path / "session-mismatch"
+    mismatch_root.mkdir()
+    _assert_rank0_broadcast_restore_rejects_session_spec_mismatch(monkeypatch, mismatch_root)
+    optimizer_root = tmp_path / "optimizer-rejection"
+    optimizer_root.mkdir()
+    _assert_rank0_broadcast_optimizer_rejection_is_transactional(monkeypatch, optimizer_root)
 
 
-def test_rank0_broadcast_ep_sharded_restore_rejects_session_spec_mismatch(monkeypatch, tmp_path):
+def _assert_rank0_broadcast_restore_rejects_session_spec_mismatch(monkeypatch, tmp_path):
     checkpoint_dir = tmp_path / "adapters"
     checkpoint_dir.mkdir()
     adapter_path = tmp_path / "checkpoint"
@@ -504,7 +531,7 @@ def test_rank0_broadcast_ep_sharded_restore_rejects_session_spec_mismatch(monkey
         )
     }
     monkeypatch.setattr(
-        _MODULE.dist,
+        adapter_coordinator_module.dist,
         "broadcast_object_list",
         lambda payload, src=0, group=None: None,
     )
@@ -519,10 +546,10 @@ def test_rank0_broadcast_ep_sharded_restore_rejects_session_spec_mismatch(monkey
             lr=None,
         )
 
-    assert torch.equal(state.lora_params[param_name].detach(), original_tensor)
+    assert torch.equal(state.local_params[param_name].detach(), original_tensor)
 
 
-def test_rank0_broadcast_optimizer_rejection_is_transactional(monkeypatch, tmp_path):
+def _assert_rank0_broadcast_optimizer_rejection_is_transactional(monkeypatch, tmp_path):
     checkpoint_dir = tmp_path / "adapters"
     checkpoint_dir.mkdir()
     trainer = _FakeTrainer(checkpoint_dir, adapter_state_load_mode="rank0_broadcast")
@@ -552,7 +579,7 @@ def test_rank0_broadcast_optimizer_rejection_is_transactional(monkeypatch, tmp_p
     assert state.last_access_time == original_last_access
 
 
-def test_handle_load_adapter_state_rolls_back_new_adapter_on_cross_rank_restore_error(tmp_path):
+def _assert_handle_load_adapter_state_failure_policy(tmp_path):
     checkpoint_dir = tmp_path / "adapters"
     checkpoint_dir.mkdir()
     adapter_path = tmp_path / "checkpoint"
@@ -562,7 +589,6 @@ def test_handle_load_adapter_state_rolls_back_new_adapter_on_cross_rank_restore_
     trainer.register_session("policy-sync-fail", trainer._session_spec(2e-5), materialize=False)
     coordinator = AdapterCoordinator(trainer=trainer, rank=1, world_size=2, cpu_group=None)
     coordinator.broadcast_adapter_state = Mock()
-    coordinator.broadcast_adapter_optimizer_state = Mock()
     coordinator._sync_collective_error = Mock(side_effect=[None, None, "rank 0: Adapter state restore failed"])
 
     payload = AdapterStateData(
@@ -581,10 +607,16 @@ def test_handle_load_adapter_state_rolls_back_new_adapter_on_cross_rank_restore_
     assert trainer.register_calls == [("policy-sync-fail", 2e-5)]
     assert not trainer.adapter_manager.has_adapter("policy-sync-fail")
     coordinator.broadcast_adapter_state.assert_not_called()
-    coordinator.broadcast_adapter_optimizer_state.assert_not_called()
+
+    pp_root = tmp_path / "pipeline-rejection"
+    pp_root.mkdir()
+    _assert_handle_load_rejects_pipeline_multi_adapter_lora(pp_root)
+    session_root = tmp_path / "session-rollback"
+    session_root.mkdir()
+    _assert_handle_load_rolls_back_auto_registered_session(session_root)
 
 
-def test_handle_load_adapter_state_rejects_pipeline_parallel_multi_adapter_lora(tmp_path):
+def _assert_handle_load_rejects_pipeline_multi_adapter_lora(tmp_path):
     checkpoint_dir = tmp_path / "adapters"
     checkpoint_dir.mkdir()
     adapter_path = tmp_path / "checkpoint"
@@ -615,7 +647,7 @@ def test_handle_load_adapter_state_rejects_pipeline_parallel_multi_adapter_lora(
     assert trainer.load_calls == []
 
 
-def test_handle_load_adapter_state_rolls_back_auto_registered_session_on_failure(tmp_path):
+def _assert_handle_load_rolls_back_auto_registered_session(tmp_path):
     checkpoint_dir = tmp_path / "adapters"
     checkpoint_dir.mkdir()
     adapter_path = tmp_path / "checkpoint"
@@ -644,7 +676,7 @@ def test_handle_load_adapter_state_rolls_back_auto_registered_session_on_failure
     coordinator.broadcast_adapter_state.assert_not_called()
 
 
-def test_handle_register_adapter_broadcasts_fresh_adapter_state(tmp_path):
+def _assert_adapter_registration_policy(tmp_path):
     checkpoint_dir = tmp_path / "adapters"
     checkpoint_dir.mkdir()
 
@@ -653,19 +685,7 @@ def test_handle_register_adapter_broadcasts_fresh_adapter_state(tmp_path):
     coordinator.broadcast_adapter_state = Mock()
 
     result = asyncio.run(coordinator.handle_register_adapter({"payload": RegisterAdapterData("policy-e", 4e-5)}))
-
     assert result == {}
-    assert trainer.register_calls == [("policy-e", 4e-5)]
-    coordinator.broadcast_adapter_state.assert_called_once_with("policy-e", 4e-5)
-
-
-def test_handle_register_session_materializes_and_broadcasts(tmp_path):
-    checkpoint_dir = tmp_path / "adapters"
-    checkpoint_dir.mkdir()
-
-    trainer = _FakeTrainer(checkpoint_dir)
-    coordinator = AdapterCoordinator(trainer=trainer, rank=1, world_size=2, cpu_group=None)
-    coordinator.broadcast_adapter_state = Mock()
 
     session_spec = trainer._session_spec(5e-5)
     result = asyncio.run(
@@ -676,11 +696,21 @@ def test_handle_register_session_materializes_and_broadcasts(tmp_path):
 
     assert result == {}
     assert trainer.lora_session_specs["policy-f"] == session_spec
-    assert trainer.register_calls == [("policy-f", 5e-5)]
-    coordinator.broadcast_adapter_state.assert_called_once_with("policy-f", 5e-5)
+    assert trainer.register_calls == [("policy-e", 4e-5), ("policy-f", 5e-5)]
+    assert coordinator.broadcast_adapter_state.call_args_list == [
+        call("policy-e", 4e-5),
+        call("policy-f", 5e-5),
+    ]
+
+    rollback_root = tmp_path / "rollback"
+    rollback_root.mkdir()
+    _assert_register_session_rolls_back_on_cross_rank_failure(rollback_root)
+    worker_root = tmp_path / "worker-failure"
+    worker_root.mkdir()
+    _assert_register_session_raises_on_worker_failure(worker_root)
 
 
-def test_handle_register_session_rolls_back_new_state_on_cross_rank_failure(tmp_path):
+def _assert_register_session_rolls_back_on_cross_rank_failure(tmp_path):
     checkpoint_dir = tmp_path / "adapters"
     checkpoint_dir.mkdir()
 
@@ -702,7 +732,7 @@ def test_handle_register_session_rolls_back_new_state_on_cross_rank_failure(tmp_
     coordinator.broadcast_adapter_state.assert_not_called()
 
 
-def test_handle_register_session_raises_when_worker_registration_fails(tmp_path):
+def _assert_register_session_raises_on_worker_failure(tmp_path):
     checkpoint_dir = tmp_path / "adapters"
     checkpoint_dir.mkdir()
 
@@ -728,7 +758,7 @@ def test_handle_register_session_raises_when_worker_registration_fails(tmp_path)
         )
 
 
-def test_handle_save_adapter_state_requires_evicted_checkpoint(tmp_path):
+def _assert_handle_save_adapter_state_requires_evicted_checkpoint(tmp_path):
     checkpoint_dir = tmp_path / "adapters"
     checkpoint_dir.mkdir()
 
@@ -750,27 +780,4 @@ def test_handle_save_adapter_state_requires_evicted_checkpoint(tmp_path):
         )
 
     assert trainer.register_calls == []
-    assert trainer.save_calls == []
-
-
-def test_handle_save_adapter_state_rejects_path_outside_output_root(tmp_path):
-    checkpoint_dir = tmp_path / "output" / "adapters"
-    checkpoint_dir.mkdir(parents=True)
-    trainer = _FakeTrainer(checkpoint_dir)
-    trainer.register_lora_adapter("policy-save", 4e-5)
-    coordinator = AdapterCoordinator(trainer=trainer, rank=0, world_size=1, cpu_group=None)
-
-    with pytest.raises(RuntimeError, match="must be inside the server output directory"):
-        asyncio.run(
-            coordinator.handle_save_adapter_state(
-                {
-                    "payload": AdapterStateData(
-                        model_id="policy-save",
-                        path=str(tmp_path / "outside" / "save-target"),
-                        save_optimizer=True,
-                    )
-                }
-            )
-        )
-
     assert trainer.save_calls == []

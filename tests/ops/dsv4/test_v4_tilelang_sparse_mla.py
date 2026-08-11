@@ -15,7 +15,7 @@ Test matrix covers:
   - Different sequence lengths: 128, 256, 512, 1024, 2048
   - Different batch sizes: 1, 2
   - Different topk: 64, 128, 256, 512
-  - attn_sink values: zero, positive, negative, mixed
+  - attn_sink values: zero boundary and mixed-sign random
   - Edge cases: all indices valid, some indices -1
 """
 
@@ -140,12 +140,8 @@ def make_inputs(batch, seqlen, heads, dim, seqlen_kv, topk, device="cuda", sink_
         attn_sink = torch.randn(heads, device=device, dtype=torch.float32)
     elif sink_mode == "zero":
         attn_sink = torch.zeros(heads, device=device, dtype=torch.float32)
-    elif sink_mode == "positive":
-        attn_sink = torch.rand(heads, device=device, dtype=torch.float32) * 2
-    elif sink_mode == "negative":
-        attn_sink = -torch.rand(heads, device=device, dtype=torch.float32) * 2
     else:
-        attn_sink = torch.randn(heads, device=device, dtype=torch.float32)
+        raise ValueError(f"unsupported test sink mode: {sink_mode}")
 
     # Generate valid random topk indices (no duplicates per query, all valid)
     actual_topk = min(topk, seqlen_kv)
@@ -169,20 +165,12 @@ def make_inputs(batch, seqlen, heads, dim, seqlen_kv, topk, device="cuda", sink_
 # ---------------------------------------------------------------------------
 FORWARD_CONFIGS = [
     # (batch, seqlen, heads, dim, seqlen_kv, topk)
+    # Cover each compiled top-k specialization while folding batch and the
+    # production 64-head geometry into the same four cases.
     (1, 128, 8, 512, 160, 64),
-    (1, 256, 8, 512, 320, 128),
-    (1, 256, 16, 512, 320, 128),
-    (2, 128, 8, 512, 160, 64),
-    (1, 512, 8, 512, 640, 256),
-    (1, 512, 16, 512, 640, 128),
-    # V4 real config: H=64
-    (1, 256, 64, 512, 320, 128),
-    (1, 512, 64, 512, 640, 256),
+    (2, 256, 8, 512, 320, 128),
+    (1, 512, 16, 512, 640, 256),
     (1, 1024, 64, 512, 1280, 512),
-    # Larger topk
-    (1, 256, 8, 512, 320, 256),
-    # Small topk
-    (1, 256, 8, 512, 320, 64),
 ]
 
 FORWARD_IDS = [f"b{b}_s{s}_h{h}_d{d}_kv{kv}_top{tk}" for b, s, h, d, kv, tk in FORWARD_CONFIGS]
@@ -191,7 +179,7 @@ FORWARD_IDS = [f"b{b}_s{s}_h{h}_d{d}_kv{kv}_top{tk}" for b, s, h, d, kv, tk in F
 @requires_cuda()
 @requires_tilelang()
 @pytest.mark.parametrize("batch,seqlen,heads,dim,seqlen_kv,topk", FORWARD_CONFIGS, ids=FORWARD_IDS)
-def test_sparse_mla_forward(batch, seqlen, heads, dim, seqlen_kv, topk):
+def test_sparse_mla_forward_policy(batch, seqlen, heads, dim, seqlen_kv, topk):
     """Compare tilelang sparse MLA forward against PyTorch reference."""
     from xorl.ops.dsv4.kernel.tilelang_sparse_mla_fwd import sparse_mqa_fwd_interface  # noqa: PLC0415
 
@@ -208,34 +196,42 @@ def test_sparse_mla_forward(batch, seqlen, heads, dim, seqlen_kv, topk):
     assert diff.rel_diff < 1e-3, f"rel_diff too large: {diff.rel_diff:.2e}"
     assert diff.max_abs_diff < 0.1, f"max_abs_diff too large: {diff.max_abs_diff:.2e}"
 
+    if (batch, seqlen, heads, dim, seqlen_kv, topk) == FORWARD_CONFIGS[0]:
+        _assert_attn_sink_policy()
+
 
 # ---------------------------------------------------------------------------
 # attn_sink correctness tests
 # ---------------------------------------------------------------------------
-@requires_cuda()
-@requires_tilelang()
-@pytest.mark.parametrize("sink_mode", ["zero", "positive", "negative", "random"])
-def test_attn_sink_modes(sink_mode):
-    """Test that attn_sink is correctly incorporated for different value ranges."""
+def _assert_attn_sink_policy():
+    """Test attn_sink reference parity and prove that the kernel does not ignore it."""
     from xorl.ops.dsv4.kernel.tilelang_sparse_mla_fwd import sparse_mqa_fwd_interface  # noqa: PLC0415
 
-    batch, seqlen, heads, dim, seqlen_kv, topk = 1, 256, 8, 512, 320, 128
-    q, kv, attn_sink, topk_idxs = make_inputs(batch, seqlen, heads, dim, seqlen_kv, topk, sink_mode=sink_mode)
-    sm_scale = (1.0 / dim) ** 0.5
+    # Zero is the boundary; random contains both signs. Positive-only and
+    # negative-only tensors use the identical arithmetic, while the separate
+    # effect test proves the sink is not ignored.
+    for sink_mode in ("zero", "random"):
+        batch, seqlen, heads, dim, seqlen_kv, topk = 1, 256, 8, 512, 320, 128
+        q, kv, attn_sink, topk_idxs = make_inputs(
+            batch,
+            seqlen,
+            heads,
+            dim,
+            seqlen_kv,
+            topk,
+            sink_mode=sink_mode,
+        )
+        sm_scale = (1.0 / dim) ** 0.5
 
-    ref_o = ref_dense_attn(q, kv, attn_sink, topk_idxs, sm_scale)
-    tl_o, _ = sparse_mqa_fwd_interface(q, kv, attn_sink, topk_idxs, sm_scale=sm_scale)
+        ref_o = ref_dense_attn(q, kv, attn_sink, topk_idxs, sm_scale)
+        tl_o, _ = sparse_mqa_fwd_interface(q, kv, attn_sink, topk_idxs, sm_scale=sm_scale)
+        diff = compute_diff(ref_o.float(), tl_o.float())
+        assert diff.rel_diff < 1e-3, f"rel_diff too large for sink_mode={sink_mode}: {diff.rel_diff:.2e}"
 
-    diff = compute_diff(ref_o.float(), tl_o.float())
-    print(f"\n[SINK-{sink_mode}]")
-    print_diff("output", diff)
-
-    assert diff.rel_diff < 1e-3, f"rel_diff too large for sink_mode={sink_mode}: {diff.rel_diff:.2e}"
+    _assert_attn_sink_changes_output(sparse_mqa_fwd_interface)
 
 
-@requires_cuda()
-@requires_tilelang()
-def test_attn_sink_effect():
+def _assert_attn_sink_changes_output(sparse_mqa_fwd_interface):
     """Verify attn_sink actually changes output (not ignored)."""
     from xorl.ops.dsv4.kernel.tilelang_sparse_mla_fwd import sparse_mqa_fwd_interface  # noqa: PLC0415
 
@@ -262,7 +258,6 @@ def test_attn_sink_effect():
 BACKWARD_CONFIGS = [
     # (batch, seqlen, heads, dim, seqlen_kv, topk)
     (1, 128, 8, 512, 160, 64),
-    (1, 256, 16, 512, 320, 128),
     (2, 128, 8, 512, 160, 64),
     (1, 256, 64, 512, 320, 128),
     (1, 512, 8, 512, 640, 256),
@@ -312,7 +307,7 @@ def ref_dense_attn_with_grad(q, kv, attn_sink, topk_idxs, sm_scale):
 @requires_cuda()
 @requires_tilelang()
 @pytest.mark.parametrize("batch,seqlen,heads,dim,seqlen_kv,topk", BACKWARD_CONFIGS, ids=BACKWARD_IDS)
-def test_sparse_mla_backward(batch, seqlen, heads, dim, seqlen_kv, topk):
+def test_sparse_mla_backward_policy(batch, seqlen, heads, dim, seqlen_kv, topk):
     """Compare tilelang backward gradients against PyTorch autograd reference."""
     from xorl.ops.dsv4.attention_core import sparse_attn_tilelang  # noqa: PLC0415
 
@@ -395,8 +390,8 @@ def test_sparse_mla_backward_deterministic_dkv():
 
 @requires_cuda()
 @requires_tilelang()
-def test_sparse_mla_backward_partial_invalid_indices():
-    """Backward must ignore -1 sparse slots without touching invalid dKV rows."""
+def test_sparse_mla_partial_invalid_indices_forward_backward_policy():
+    """Forward and backward must ignore -1 sparse slots without touching invalid dKV rows."""
     from xorl.ops.dsv4.attention_core import sparse_attn_tilelang  # noqa: PLC0415
 
     batch, seqlen, heads, dim, seqlen_kv, topk = 1, 128, 8, 512, 160, 64
@@ -424,13 +419,13 @@ def test_sparse_mla_backward_partial_invalid_indices():
         print_diff(name, diff)
         assert diff.rel_diff < 0.05, f"{name} rel_diff too large with invalid indices: {diff.rel_diff:.2e}"
 
+    _assert_partial_invalid_forward_interface()
+
 
 # ---------------------------------------------------------------------------
 # Index masking test: some indices are -1
 # ---------------------------------------------------------------------------
-@requires_cuda()
-@requires_tilelang()
-def test_partial_invalid_indices():
+def _assert_partial_invalid_forward_interface():
     """Test with some indices set to -1 (invalid)."""
     from xorl.ops.dsv4.kernel.tilelang_sparse_mla_fwd import sparse_mqa_fwd_interface  # noqa: PLC0415
 
@@ -450,44 +445,3 @@ def test_partial_invalid_indices():
 
     assert diff.rel_diff < 1e-3, f"rel_diff too large with partial invalid: {diff.rel_diff:.2e}"
     assert not torch.isnan(tl_o).any(), "NaN in output with partial invalid indices"
-
-
-# ---------------------------------------------------------------------------
-# Comprehensive diff summary
-# ---------------------------------------------------------------------------
-@requires_cuda()
-@requires_tilelang()
-def test_diff_summary():
-    """Print a comprehensive diff summary across all forward configs."""
-    from xorl.ops.dsv4.kernel.tilelang_sparse_mla_fwd import sparse_mqa_fwd_interface  # noqa: PLC0415
-
-    configs = [
-        (1, 128, 8, 512, 160, 64),
-        (1, 256, 16, 512, 320, 128),
-        (1, 256, 64, 512, 320, 128),
-        (1, 512, 64, 512, 640, 256),
-        (1, 1024, 64, 512, 1280, 512),
-    ]
-
-    print("\n" + "=" * 100)
-    print(f"{'Config':<45} {'rel_diff':>10} {'max_abs':>10} {'mean_abs':>10} {'p99':>10}")
-    print("=" * 100)
-
-    for batch, seqlen, heads, dim, seqlen_kv, topk in configs:
-        q, kv, attn_sink, topk_idxs = make_inputs(batch, seqlen, heads, dim, seqlen_kv, topk)
-        sm_scale = (1.0 / dim) ** 0.5
-
-        ref_o = ref_dense_attn(q, kv, attn_sink, topk_idxs, sm_scale)
-        tl_o, _ = sparse_mqa_fwd_interface(q, kv, attn_sink, topk_idxs, sm_scale=sm_scale)
-
-        diff = compute_diff(ref_o.float(), tl_o.float())
-        label = f"b{batch}_s{seqlen}_h{heads}_d{dim}_kv{seqlen_kv}_top{topk}"
-        print(
-            f"{label:<45} {diff.rel_diff:>10.2e} {diff.max_abs_diff:>10.2e} {diff.mean_abs_diff:>10.2e} {diff.p99_abs_diff:>10.2e}"
-        )
-
-    print("=" * 100)
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])

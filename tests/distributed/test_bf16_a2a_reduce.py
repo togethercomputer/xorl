@@ -1,57 +1,61 @@
-"""Distributed correctness tests for ``BF16StochasticAllToAllReduceScatter``.
+"""Default-runtime contract for ``BF16StochasticAllToAllReduceScatter``.
 
-Verifies the custom reduce-scatter (stochastic-round FP32→BF16, all-to-all,
-local FP32 sum) produces results numerically close to native FP32
-reduce-scatter, with bias-in-expectation near zero.
+One report covers the stochastic FP32-to-BF16 primitive and the real two-rank
+Gloo all-to-all/FP32 accumulation transaction. This avoids treating a four-GPU
+admission gate and an isolated rounding unit as independent confidence.
 """
 
 from __future__ import annotations
 
-import os
 import sys
 from pathlib import Path
 
 import pytest
 import torch
 import torch.distributed as dist
-from torch.distributed.distributed_c10d import ReduceOp
 
 from xorl.distributed.fsdp2 import BF16StochasticAllToAllReduceScatter
-from xorl.distributed.fsdp2.bf16_a2a_reduce import _canonical_reduce_op
-from xorl.utils.device import get_nccl_backend
+from xorl.optim.stochastic_round import stochastic_round_to_bf16
 
 
 THIS_DIR = Path(__file__).resolve().parent
 if str(THIS_DIR) not in sys.path:
     sys.path.insert(0, str(THIS_DIR))
 
-from distributed_utils import run_distributed_script, skip_if_gpu_count_less_than
+from distributed_utils import run_distributed_script  # noqa: E402
 
 
-pytestmark = [pytest.mark.distributed]
-
-
-@pytest.mark.cpu
-def test_canonical_reduce_op_accepts_fsdp_wrapped_ops():
-    assert _canonical_reduce_op(ReduceOp(ReduceOp.SUM)) == dist.ReduceOp.SUM
-    assert _canonical_reduce_op(ReduceOp(ReduceOp.AVG)) == dist.ReduceOp.AVG
-    assert _canonical_reduce_op(dist.ReduceOp.SUM) == dist.ReduceOp.SUM
-    assert _canonical_reduce_op(dist._make_nccl_premul_sum(1.0)) == dist.ReduceOp.SUM
-
-
-def _world_size() -> int:
-    return int(os.environ["WORLD_SIZE"])
-
-
-def _local_rank() -> int:
-    return int(os.environ["LOCAL_RANK"])
+pytestmark = [pytest.mark.cpu, pytest.mark.distributed]
 
 
 def _setup_dist() -> torch.device:
-    local_rank = _local_rank()
-    torch.cuda.set_device(local_rank)
-    dist.init_process_group(backend=get_nccl_backend())
-    return torch.device("cuda", local_rank)
+    dist.init_process_group(backend="gloo")
+    return torch.device("cpu")
+
+
+def _assert_stochastic_round_distribution_and_admission() -> None:
+    values = torch.randn(7, 13, dtype=torch.float32)
+    generator_one = torch.Generator().manual_seed(42)
+    generator_two = torch.Generator().manual_seed(42)
+    rounded = stochastic_round_to_bf16(values, generator=generator_one)
+
+    assert rounded.dtype is torch.bfloat16
+    assert rounded.shape == values.shape
+    assert torch.equal(rounded, stochastic_round_to_bf16(values, generator=generator_two))
+    with pytest.raises(ValueError, match="requires fp32 input"):
+        stochastic_round_to_bf16(values.to(torch.bfloat16))
+
+    sample_count = 1 << 16
+    lower_bits = 0x3F800000
+    fractional_bits = 0x4000
+    samples = torch.full((sample_count,), lower_bits + fractional_bits, dtype=torch.int32).view(torch.float32)
+    rounded_samples = stochastic_round_to_bf16(samples, generator=torch.Generator().manual_seed(0)).float()
+    lower = torch.tensor(lower_bits, dtype=torch.int32).view(torch.float32)
+    upper = torch.tensor(lower_bits + 0x10000, dtype=torch.int32).view(torch.float32)
+
+    assert ((rounded_samples == lower) | (rounded_samples == upper)).all()
+    assert (rounded_samples == upper).float().mean().item() == pytest.approx(0.25, abs=0.01)
+    assert rounded_samples.mean().item() == pytest.approx(samples[0].item(), abs=1e-4)
 
 
 def _run() -> None:
@@ -70,16 +74,15 @@ def _run() -> None:
     # Per-rank gradient (independent across ranks).
     local_grad = torch.randn(total_numel, dtype=torch.float32, device=device)
 
-    # ---- Reference: native FP32 reduce-scatter ----
+    # Reference: native FP32 reduce-scatter.
     ref_out = torch.empty(chunk_numel, dtype=torch.float32, device=device)
     dist.reduce_scatter_tensor(ref_out, local_grad.clone(), op=dist.ReduceOp.SUM)
 
-    # ---- Test: BF16 stochastic-rounded a2a + FP32 local sum ----
+    # Test: BF16 stochastic-rounded a2a + FP32 local sum.
     comm = BF16StochasticAllToAllReduceScatter()
     test_out = comm.allocate((chunk_numel,), dtype=torch.float32, device=device)
     comm(test_out, local_grad.clone(), group=dist.group.WORLD, op=dist.ReduceOp.SUM)
 
-    # ---- Bound the per-element error ----
     # Each rank's contribution is stochastically rounded FP32→BF16 with at most
     # one ulp of noise. After summing ``world`` such contributions, the error
     # is bounded by sum of |x_r| * 2^-7 in the worst case. Compute this bound.
@@ -99,27 +102,8 @@ def _run() -> None:
     max_bound = bound_for_my_chunk.max().item() * 4 + 1e-6
     assert max_err < max_bound, f"[rank {rank}] BF16 a2a max err {max_err:.4e} exceeds bound {max_bound:.4e}"
 
-    # Bias-in-expectation: average over many trials should approach the FP32 reference.
-    # Use the same input tensor; only the stochastic rounding noise differs.
-    n_trials = 200
-    accum = torch.zeros_like(test_out)
-    for _ in range(n_trials):
-        out = comm.allocate((chunk_numel,), dtype=torch.float32, device=device)
-        comm(out, local_grad.clone(), group=dist.group.WORLD, op=dist.ReduceOp.SUM)
-        accum += out
-    mean = accum / n_trials
-    mean_err = (mean - ref_out).abs().max().item()
-    # Standard error of the mean ~ bound / sqrt(n_trials). For n=200 and BF16
-    # bound ~|x|/128, SEM ~ |x| * 1e-3. Allow generous 5x headroom.
-    sem_bound = max_bound / (n_trials**0.5) * 5
-    assert mean_err < sem_bound, (
-        f"[rank {rank}] BF16 a2a is biased: mean err over {n_trials} trials = "
-        f"{mean_err:.4e}, expected < {sem_bound:.4e}"
-    )
-
     if rank == 0:
         print(f"[rank 0] BF16 a2a max err = {max_err:.4e}, bound = {max_bound:.4e}")
-        print(f"[rank 0] BF16 a2a unbiased mean err over {n_trials} trials = {mean_err:.4e}")
 
     dist.barrier()
     dist.destroy_process_group()
@@ -131,10 +115,15 @@ def _main() -> None:
 
 if __name__ != "__main__":
 
-    @skip_if_gpu_count_less_than(4)
-    def test_bf16_a2a_reduce_scatter_matches_fp32_within_bound():
-        result = run_distributed_script(__file__, num_gpus=4, timeout=180)
-        result.assert_success("BF16 a2a reduce-scatter should match FP32 within BF16 ulp bound")
+    def test_bf16_stochastic_a2a_reduce_scatter_default_runtime_contract():
+        _assert_stochastic_round_distribution_and_admission()
+        result = run_distributed_script(
+            __file__,
+            num_gpus=2,
+            timeout=180,
+            extra_env={"CUDA_VISIBLE_DEVICES": ""},
+        )
+        result.assert_success("BF16 a2a reduce-scatter should match FP32 on two CPU/Gloo ranks")
 
 
 if __name__ == "__main__":

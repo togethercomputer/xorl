@@ -6,50 +6,12 @@ import pytest
 import torch
 
 from xorl.models.layers.moe.experts import (
-    _group_gemm_same_nk_fp32_accumulator,
-    _scale_moe_grad_by_fp32_routing,
     _SglangFusedExpertsEPTrainFunction,
     _SglangFusedExpertsTrainFunction,
 )
 
 
 pytestmark = [pytest.mark.cpu]
-
-
-def test_fp32_routing_scale_rounds_only_after_multiply():
-    grad_output = torch.tensor([[1.234375]], dtype=torch.bfloat16)
-    routing = torch.tensor([2.99991e-5], dtype=torch.float32)
-
-    expected = (grad_output.float() * routing[:, None]).to(torch.bfloat16)
-    old_bf16_score_path = grad_output * routing.to(torch.bfloat16)[:, None]
-    actual = _scale_moe_grad_by_fp32_routing(grad_output, routing)
-
-    assert torch.equal(actual, expected)
-    assert not torch.equal(actual, old_bf16_score_path), "stimulus must detect a pre-multiply BF16 score cast"
-
-
-def test_fp32_accumulator_helper_requests_fresh_fp32_output():
-    seen = {}
-
-    def fake_group_gemm_same_nk(*, a, b, cumsum_M, max_M, output_dtype):
-        seen.update(cumsum_M=cumsum_M, max_M=max_M, output_dtype=output_dtype)
-        return (a.float() @ b[0].float()).to(output_dtype)
-
-    a = torch.tensor([[1.0, 1.0]], dtype=torch.bfloat16)
-    b = torch.tensor([[[1.0], [2**-8]]], dtype=torch.bfloat16)
-    cumsum = torch.tensor([1], dtype=torch.int32)
-    actual = _group_gemm_same_nk_fp32_accumulator(
-        fake_group_gemm_same_nk,
-        a=a,
-        b=b,
-        cumsum_M=cumsum,
-        max_M=1,
-    )
-
-    assert seen["output_dtype"] is torch.float32
-    assert actual.dtype is torch.float32
-    assert actual.item() == 1.00390625
-    assert actual.item() != actual.to(torch.bfloat16).item()
 
 
 @pytest.fixture()
@@ -177,8 +139,14 @@ def _assert_gradients_equal(actual, expected):
         assert torch.equal(left, right), f"{label} mismatch:\nactual={left}\nexpected={right}"
 
 
-@pytest.mark.parametrize("filter_expert", [False, True])
-def test_local_backward_matches_fp32_routing_oracle_with_int32_ids(eager_grouped_moe, filter_expert):
+def test_local_and_ep_backward_match_fp32_routing_oracle(eager_grouped_moe):
+    del eager_grouped_moe
+    for filter_expert in (False, True):
+        _assert_local_backward_matches_fp32_routing_oracle_with_int32_ids(filter_expert)
+    _assert_ep_backward_matches_fp32_routing_oracle()
+
+
+def _assert_local_backward_matches_fp32_routing_oracle_with_int32_ids(filter_expert):
     hidden = torch.ones(2, 1, dtype=torch.bfloat16)
     routing = torch.tensor([[2.99991e-5, 0.5009], [0.33331, 0.77771]], dtype=torch.float32)
     selected = torch.tensor([[0, 1], [1, 0]], dtype=torch.int32)
@@ -216,7 +184,7 @@ def test_local_backward_matches_fp32_routing_oracle_with_int32_ids(eager_grouped
         assert custom[1].grad[0, 1].item() == 0.0
 
 
-def test_ep_backward_matches_fp32_routing_oracle(eager_grouped_moe):
+def _assert_ep_backward_matches_fp32_routing_oracle():
     hidden = torch.ones(4, 1, dtype=torch.bfloat16)
     routing = torch.tensor([2.99991e-5, 0.5009, 0.33331, 0.77771], dtype=torch.float32)
     selected = torch.tensor([[0], [0], [1], [1]], dtype=torch.int32)

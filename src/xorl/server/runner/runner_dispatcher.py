@@ -1039,7 +1039,7 @@ class RunnerDispatcher:
         routed_expert_logits: Optional[List[Any]] = None,
     ) -> None:
         params = loss_fn_params or {}
-        dump_dir = params.get("diagnostic_microbatch_dump_dir") or os.getenv("XORL_MICROBATCH_DIAGNOSTIC_DIR")
+        dump_dir = params.get("diagnostic_microbatch_dump_dir")
         if not dump_dir:
             return
 
@@ -1119,9 +1119,7 @@ class RunnerDispatcher:
         summary_path = out_dir / f"microbatch_{safe_request_id}_rank{self.rank:05d}.json"
         summary_path.write_text(json.dumps(summary, sort_keys=True, indent=2) + "\n", encoding="utf-8")
 
-        dump_tensors = bool(params.get("diagnostic_microbatch_dump_tensors", False)) or os.getenv(
-            "XORL_MICROBATCH_DIAGNOSTIC_TENSORS", "0"
-        ).strip().lower() in {"1", "true", "yes"}
+        dump_tensors = bool(params.get("diagnostic_microbatch_dump_tensors", False))
         if dump_tensors:
             tensor_path = out_dir / f"microbatch_{safe_request_id}_rank{self.rank:05d}.pt"
             torch.save(
@@ -1144,19 +1142,6 @@ class RunnerDispatcher:
         target_tokens are set to -100 (IGNORE_INDEX) so cross-entropy loss = 0 and
         gradient_accumulate_loss produces grad_scale = 0 (local_valid_tokens = 0).
         """
-        min_tokens_raw = os.getenv("XORL_SERVER_MINIMAL_DUMMY_BATCH_TOKENS", "").strip()
-        if min_tokens_raw:
-            try:
-                min_tokens = int(min_tokens_raw)
-            except ValueError:
-                min_tokens = 0
-            if min_tokens > 0:
-                return RunnerDispatcher._create_minimal_dummy_batch(src_batch, min_tokens)
-
-        return RunnerDispatcher._create_legacy_dummy_batch(src_batch)
-
-    @staticmethod
-    def _create_legacy_dummy_batch(src_batch: Dict[str, Any]) -> Dict[str, Any]:
         _LABEL_KEYS = {"labels", "target_tokens"}
         dummy_batch = {}
         for key, value in src_batch.items():
@@ -1175,66 +1160,6 @@ class RunnerDispatcher:
         return dummy_batch
 
     @staticmethod
-    def _create_minimal_dummy_batch(src_batch: Dict[str, Any], min_tokens: int) -> Dict[str, Any]:
-        """Create a short zero-loss dummy batch for empty data-slice ranks.
-
-        This keeps collective participation uniform while avoiding cloned full
-        OPRD rows on ranks that have no real samples. The OPRD trainer-side
-        teacher forward falls back to this short student sequence when
-        teacher_input_ids/teacher_kept_indices are absent.
-        """
-        input_ids = src_batch.get("input_ids")
-        if not isinstance(input_ids, torch.Tensor) or input_ids.dim() < 1:
-            return RunnerDispatcher._create_legacy_dummy_batch(src_batch)
-
-        seq_len = int(input_ids.shape[-1])
-        if seq_len <= 0:
-            return RunnerDispatcher._create_legacy_dummy_batch(src_batch)
-        keep = max(1, min(int(min_tokens), seq_len))
-
-        label_keys = {"labels", "target_tokens"}
-        drop_keys = {
-            "cu_seq_lens_q",
-            "cu_seq_lens_k",
-            "max_length_q",
-            "max_length_k",
-            "_original_position_ids",
-            "teacher_input_ids",
-            "teacher_kept_indices",
-            "teacher_position_ids",
-            "teacher_cache_indices",
-            "teacher_cache_local_indices",
-            "teacher_cache_base",
-        }
-
-        dummy_batch: Dict[str, Any] = {}
-        for key, value in src_batch.items():
-            if key in drop_keys:
-                continue
-            if isinstance(value, torch.Tensor):
-                if key in label_keys:
-                    if value.dim() >= 1 and int(value.shape[-1]) == seq_len:
-                        dummy_batch[key] = torch.full_like(value[..., :keep], -100)
-                    else:
-                        dummy_batch[key] = torch.full_like(value, -100)
-                elif key == "position_ids" and value.dim() >= 1 and int(value.shape[-1]) == seq_len:
-                    shape = value.shape[:-1] + (keep,)
-                    pos = torch.arange(keep, dtype=value.dtype, device=value.device)
-                    dummy_batch[key] = pos.reshape((1,) * (len(shape) - 1) + (keep,)).expand(shape).clone()
-                elif key == "attention_mask" and value.dim() >= 1 and int(value.shape[-1]) == seq_len:
-                    dummy_batch[key] = torch.ones_like(value[..., :keep])
-                elif value.dim() >= 1 and int(value.shape[-1]) == seq_len:
-                    dummy_batch[key] = value[..., :keep].clone()
-                else:
-                    dummy_batch[key] = value.clone()
-            else:
-                dummy_batch[key] = value
-
-        dummy_batch["num_samples"] = 0
-        dummy_batch["_r3_sample_lengths"] = []
-        return dummy_batch
-
-    @staticmethod
     def _dp_batch_range(dp_rank: int, base_count: int, remainder: int):
         """Return (start_idx, count) for a DP rank under balanced distribution.
 
@@ -1250,10 +1175,8 @@ class RunnerDispatcher:
         """Return the logical data slice rank/size for request batch dispatch.
 
         Every logical data replica gets a distinct slice; FSDP, CP/SP, TP, and
-        same-stage ranks share that slice. EP groups no
-        longer duplicate a slice across their ranks unless the legacy
-        XORL_SERVER_EP_DUPLICATE_BATCHES rollback switch is set — see
-        batch_slice_rank_and_size for the correctness argument.
+        same-stage ranks share that slice. EP ranks receive distinct slices;
+        see batch_slice_rank_and_size for the correctness argument.
         """
         return batch_slice_rank_and_size(self.rank, self.world_size, parallel_state, cp_size, pp_size)
 

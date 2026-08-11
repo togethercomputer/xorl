@@ -272,7 +272,6 @@ class BenchmarkBehaviorPoint:
     fsdp_reduce_dtype: str | None = None
     ce_mode: str | None = None
     moe_implementation: str | None = None
-    moe_checkpoint_method: str | None = None
     muon_momentum: float | None = None
     muon_update_dtype: str | None = None
     attention_backend: str | None = None

@@ -50,68 +50,51 @@ def _reject_if_called(name: str):
     return reject
 
 
-def test_exact_dense_composite_rejects_legacy_merged_weight_sync_at_entry() -> None:
-    handler = WeightSyncHandler.__new__(WeightSyncHandler)
-    handler.trainer = SimpleNamespace(model=_module(), adapter_manager=object())
-
-    with pytest.raises(RuntimeError, match="factor-only adapter synchronization"):
-        handler._prepare_lora_adapter_for_sync("policy")
-
-
-def test_exact_dense_composite_rejects_collective_merge_and_raw_parameter_extraction() -> None:
+def _assert_factor_only_sync_guards(module: nn.Module, prefix: str) -> None:
     handler = WeightSyncHandler.__new__(WeightSyncHandler)
     handler.rank = 0
-    module = _module()
-
-    with pytest.raises(RuntimeError, match="cannot enter QLoRA merged-weight collectives"):
-        handler._qlora_collective_ops(module, "model.layers.0.mlp", collect_results=True)
-    with pytest.raises(RuntimeError, match="cannot be extracted by legacy merged-weight sync"):
-        WeightSyncHandler._extract_params_for_sync(module, "model.layers.0.mlp", object)
-
-
-def test_exact_attention_projection_uses_the_same_factor_only_sync_guard() -> None:
-    handler = WeightSyncHandler.__new__(WeightSyncHandler)
-    module = _ordinary_exact_projection()
     handler.trainer = SimpleNamespace(model=module, adapter_manager=object())
-    handler.rank = 0
 
     with pytest.raises(RuntimeError, match="factor-only adapter synchronization"):
         handler._prepare_lora_adapter_for_sync("policy")
     with pytest.raises(RuntimeError, match="cannot enter QLoRA merged-weight collectives"):
-        handler._qlora_collective_ops(module, "model.layers.0.self_attn.q_a_proj", collect_results=True)
+        handler._qlora_collective_ops(module, prefix, collect_results=True)
     with pytest.raises(RuntimeError, match="cannot be extracted by legacy merged-weight sync"):
-        WeightSyncHandler._extract_params_for_sync(module, "model.layers.0.self_attn.q_a_proj", object)
+        WeightSyncHandler._extract_params_for_sync(module, prefix, object)
 
 
-def test_exact_lm_head_rejects_legacy_sync_before_adapter_or_backend_work(monkeypatch) -> None:
-    handler = WeightSyncHandler.__new__(WeightSyncHandler)
-    handler.rank = 0
-    handler.trainer = SimpleNamespace(model=_exact_lm_head_model(), adapter_manager=None)
-    monkeypatch.setattr(handler, "_prepare_lora_adapter_for_sync", _reject_if_called("adapter preparation"))
-    monkeypatch.setattr(handler, "_sync_weights", _reject_if_called("streaming weight sync"))
-    monkeypatch.setattr(handler, "_sync_sparse_delta_paths", _reject_if_called("sparse-delta sync"))
+def test_exact_factor_only_sync_and_publication_policy(monkeypatch, tmp_path) -> None:
+    for module, prefix in (
+        (_module(), "model.layers.0.mlp"),
+        (_ordinary_exact_projection(), "model.layers.0.self_attn.q_a_proj"),
+    ):
+        _assert_factor_only_sync_guards(module, prefix)
 
-    with pytest.raises(RuntimeError, match="factor-only adapter publication"):
-        asyncio.run(handler.handle_sync_inference_weights({"payload": SyncWeightsData()}))
-
-
-def test_exact_lm_head_rejects_prepacked_sparse_delta_before_any_sync_side_effect(monkeypatch) -> None:
-    handler = WeightSyncHandler.__new__(WeightSyncHandler)
-    handler.rank = 0
-    handler.trainer = SimpleNamespace(model=_exact_lm_head_model(), adapter_manager=None)
-    monkeypatch.setattr(handler, "_prepare_lora_adapter_for_sync", _reject_if_called("adapter preparation"))
-    monkeypatch.setattr(handler, "_sync_weights", _reject_if_called("streaming weight sync"))
-    monkeypatch.setattr(handler, "_sync_sparse_delta_paths", _reject_if_called("sparse-delta sync"))
-    payload = SyncWeightsData(
-        sync_method="sparse_delta",
-        sparse_delta_paths=["exact-lm-head-delta.packed"],
+    payloads = (
+        (SyncWeightsData(), "factor-only adapter publication"),
+        (
+            SyncWeightsData(
+                sync_method="sparse_delta",
+                sparse_delta_paths=["exact-lm-head-delta.packed"],
+            ),
+            "including prepacked sparse-delta sync",
+        ),
     )
+    for payload, error in payloads:
+        handler = WeightSyncHandler.__new__(WeightSyncHandler)
+        handler.rank = 0
+        handler.trainer = SimpleNamespace(model=_exact_lm_head_model(), adapter_manager=None)
+        monkeypatch.setattr(handler, "_prepare_lora_adapter_for_sync", _reject_if_called("adapter preparation"))
+        monkeypatch.setattr(handler, "_sync_weights", _reject_if_called("streaming weight sync"))
+        monkeypatch.setattr(handler, "_sync_sparse_delta_paths", _reject_if_called("sparse-delta sync"))
 
-    with pytest.raises(RuntimeError, match="including prepacked sparse-delta sync"):
-        asyncio.run(handler.handle_sync_inference_weights({"payload": payload}))
+        with pytest.raises(RuntimeError, match=error):
+            asyncio.run(handler.handle_sync_inference_weights({"payload": payload}))
+
+    _assert_exact_lm_head_publication_preserves_separate_factor_bytes(tmp_path)
 
 
-def test_exact_lm_head_publication_preserves_separate_factor_bytes(tmp_path) -> None:
+def _assert_exact_lm_head_publication_preserves_separate_factor_bytes(tmp_path) -> None:
     model = _exact_lm_head_model()
     with torch.no_grad():
         model.lm_head.lora_A.copy_(torch.arange(model.lm_head.lora_A.numel()).reshape_as(model.lm_head.lora_A))

@@ -608,16 +608,6 @@ class AdapterState:
     lr: float = 1e-5
     last_access_time: float = field(default_factory=time.time)  # For LRU eviction
 
-    @property
-    def lora_params(self) -> Dict[str, nn.Parameter]:
-        """Deprecated local-only view retained for external compatibility.
-
-        This is intentionally not a logical/full tensor API.  Internal code
-        must use ``local_params`` and ``tensor_layouts`` explicitly.
-        """
-
-        return self.local_params
-
 
 class LoRAAdapterManager:
     """
@@ -2112,28 +2102,6 @@ class LoRAAdapterManager:
             scratch.staged_numerator_scale = None
             scratch.staged_parameter_fqns = ()
             scratch.staged_numerators.clear()
-
-    def capture_gradient_numerators(
-        self,
-        model_id: str,
-        *,
-        denominator: float,
-        numerator_scale: float = 1.0,
-        backward_completed: bool,
-    ) -> tuple[int, int]:
-        """Stage and immediately commit one capture for direct manager callers."""
-
-        try:
-            self.stage_gradient_numerators(
-                model_id,
-                denominator=denominator,
-                numerator_scale=numerator_scale,
-                backward_completed=backward_completed,
-            )
-            return self.commit_gradient_capture(model_id)
-        except BaseException:
-            self.abort_gradient_capture(model_id)
-            raise
 
     def prepare_forward(self, model_id: str) -> None:
         """

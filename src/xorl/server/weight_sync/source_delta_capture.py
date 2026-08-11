@@ -21,7 +21,6 @@ import torch
 from xorl.server.weight_sync.sparse_delta_files import (
     SparseTensorUpdate,
     _render_rank_filename,
-    prepare_delta_encoding_runtime,
     write_sparse_delta_file,
 )
 
@@ -212,79 +211,6 @@ def write_sparse_source_delta_global_manifest(
     _write_json(manifest_path, global_manifest)
     global_manifest["manifest_path"] = str(manifest_path)
     return global_manifest
-
-
-def load_sparse_source_delta_inputs(
-    manifest_path: str | Path,
-    *,
-    delta_encoding_path: str | None = None,
-    use_native_extension: bool = False,
-    tag: str | None = "enc",
-    include_empty: bool = False,
-) -> list[tuple[Any, Any]]:
-    """Load source-rank packed files as ``(StoreKey, EncodedDelta)`` inputs.
-
-    The returned tensors are cloned out of the mmap so callers can close files
-    before running the translation engine.
-    When ``include_empty`` is true, the returned inputs also include encoded
-    empty tensors for manifest entries with ``nnz == 0``. Translation plans for
-    sharded source layouts need those empty shards to know the input is
-    complete.
-    """
-
-    prepare_delta_encoding_runtime(
-        delta_encoding_path=delta_encoding_path,
-        use_native_extension=use_native_extension,
-    )
-
-    from delta_encoding.encoding.compression import encode  # noqa: PLC0415
-    from delta_encoding.encoding.packed import MmapPackedFile  # noqa: PLC0415
-    from delta_encoding.encoding.types import EncodedDelta  # noqa: PLC0415
-    from delta_encoding.ops.types import StoreKey  # noqa: PLC0415
-
-    manifest = json.loads(Path(manifest_path).read_text())
-    if manifest.get("format") != GLOBAL_MANIFEST_VERSION:
-        raise ValueError(f"Unsupported sparse source-delta manifest format: {manifest.get('format')!r}")
-
-    inputs: list[tuple[Any, Any]] = []
-    seen: set[tuple[int, str]] = set()
-    for rank_manifest in manifest.get("ranks", []):
-        packed_path = rank_manifest.get("packed_path")
-        if not packed_path:
-            continue
-        rank = int(rank_manifest["rank"])
-        with MmapPackedFile(packed_path) as packed:
-            for entry in packed.entries:
-                key = StoreKey(entry.name, rank=rank)
-                if tag:
-                    key = key.tag(tag)
-                encoded = EncodedDelta(
-                    packed.flat_deltas_view(entry).clone(),
-                    packed.values_view(entry).clone(),
-                    tuple(entry.shape),
-                )
-                inputs.append((key, encoded))
-                seen.add((rank, entry.name))
-
-    if include_empty:
-        for rank_manifest in manifest.get("ranks", []):
-            rank = int(rank_manifest["rank"])
-            for tensor in rank_manifest.get("tensors", []):
-                name = str(tensor["name"])
-                if (rank, name) in seen or int(tensor.get("nnz", 0)) != 0:
-                    continue
-                key = StoreKey(name, rank=rank)
-                if tag:
-                    key = key.tag(tag)
-                dtype = _dtype_from_name(tensor.get("dtype") or rank_manifest.get("capture_dtype") or "bfloat16")
-                shape = tuple(int(dim) for dim in tensor["shape"])
-                encoded = encode(
-                    torch.empty(0, dtype=torch.int32),
-                    torch.empty(0, dtype=dtype),
-                    shape,
-                )
-                inputs.append((key, encoded))
-    return inputs
 
 
 def resolve_sparse_delta_capture_output_dir(

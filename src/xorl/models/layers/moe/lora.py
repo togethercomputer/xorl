@@ -333,10 +333,6 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
     # Merged-forward exact-model contract lane
     # ------------------------------------------------------------------
 
-    def sglang_moe_tp_sim_enabled(self, parallel_state) -> bool:
-        """TP-sim is outside the LoRA merged-forward envelope."""
-        return False
-
     def sglang_fused_experts_auto_supported(self) -> bool:
         """Auto-default eligibility mirror of :meth:`MoEExperts.sglang_fused_experts_auto_supported`:
         under the exact model program the adapted experts fold their delta
@@ -347,9 +343,6 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
             and self.hidden_act in {"silu", "gelu", "gelu_tanh"}
             and self.swiglu_limit == 0.0
         )
-
-    def invalidate_merged_weight_cache(self) -> None:
-        self._merged_weight_cache = {}
 
     def _merged_weight_key(self) -> tuple:
         params = (

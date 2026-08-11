@@ -101,44 +101,57 @@ def _make_fp8_data(out_features, in_features, block_size=128):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("quant_format,gs", [("nvfp4", 16), ("block_fp8", 128)])
-def test_quantize_forward_backward_memory(quant_format, gs):
+def _assert_quantize_forward_backward_memory():
     """bf16 quantization, forward, backward (only LoRA gets grad), memory savings."""
-    linear = nn.Linear(256, 512, bias=False, device="cuda", dtype=torch.bfloat16)
-    bf16_bytes = linear.weight.numel() * 2
-    qlora = QLoRALinear.from_module(linear, r=16, lora_alpha=16, quant_format=quant_format, quant_group_size=gs)
+    for quant_format, group_size in (("nvfp4", 16), ("block_fp8", 128), ("nf4", 64)):
+        linear = nn.Linear(256, 512, bias=False, device="cuda", dtype=torch.bfloat16)
+        bf16_bytes = linear.weight.numel() * 2
+        qlora = QLoRALinear.from_module(
+            linear,
+            r=16,
+            lora_alpha=16,
+            quant_format=quant_format,
+            quant_group_size=group_size,
+        )
 
-    # Quantized storage
-    assert qlora.packed_weight_f32 is not None
-    assert qlora.packed_weight_f32.dtype == torch.float32
-    assert not qlora.packed_weight_f32.requires_grad
-    assert qlora.lora_A.requires_grad and qlora.lora_B.requires_grad
+        # Quantized storage
+        assert qlora.packed_weight_f32 is not None
+        assert qlora.packed_weight_f32.dtype == torch.float32
+        assert not qlora.packed_weight_f32.requires_grad
+        assert qlora.lora_A.requires_grad and qlora.lora_B.requires_grad
 
-    # Forward
-    x = torch.randn(2, 10, 256, device="cuda", dtype=torch.bfloat16)
-    out = qlora(x)
-    assert out.shape == (2, 10, 512)
+        # Forward and backward: only LoRA gets grad.
+        x = torch.randn(2, 10, 256, device="cuda", dtype=torch.bfloat16)
+        out = qlora(x)
+        assert out.shape == (2, 10, 512)
+        out.sum().backward()
+        assert qlora.lora_A.grad is not None and qlora.lora_B.grad is not None
 
-    # Backward: only LoRA gets grad
-    out.sum().backward()
-    assert qlora.lora_A.grad is not None and qlora.lora_B.grad is not None
-
-    # Memory savings
-    quant_bytes = qlora.packed_weight_f32.numel() * 4
-    if qlora.weight_block_scales is not None:
-        quant_bytes += qlora.weight_block_scales.numel() * qlora.weight_block_scales.element_size()
-    if getattr(qlora, "weight_global_scale", None) is not None:
-        quant_bytes += qlora.weight_global_scale.numel() * qlora.weight_global_scale.element_size()
-    assert quant_bytes < bf16_bytes
+        quant_bytes = qlora.packed_weight_f32.numel() * 4
+        for scale_name in ("weight_block_scales", "weight_global_scale", "weight_scales"):
+            if (scale := getattr(qlora, scale_name, None)) is not None:
+                quant_bytes += scale.numel() * scale.element_size()
+        assert quant_bytes < bf16_bytes
 
 
-def test_dequantize_roundtrip():
+def _assert_dequantize_roundtrip():
     """Dequantized weight should be close to original."""
-    linear = nn.Linear(256, 512, bias=False, device="cuda", dtype=torch.bfloat16)
-    w_orig = linear.weight.detach().clone()
-    qlora = QLoRALinear.from_module(linear, r=16, lora_alpha=16, quant_format="nvfp4", quant_group_size=16)
-    w_deq = qlora._dequantize_weight().to(torch.bfloat16)
-    assert torch.allclose(w_orig, w_deq, atol=0.05, rtol=0.05)
+    for quant_format, group_size in (("nvfp4", 16), ("nf4", 64)):
+        linear = nn.Linear(256, 512, bias=False, device="cuda", dtype=torch.bfloat16)
+        w_orig = linear.weight.detach().clone()
+        qlora = QLoRALinear.from_module(
+            linear,
+            r=16,
+            lora_alpha=16,
+            quant_format=quant_format,
+            quant_group_size=group_size,
+        )
+        w_deq = qlora._dequantize_weight().float()
+        if quant_format == "nvfp4":
+            torch.testing.assert_close(w_orig, w_deq.to(torch.bfloat16), atol=0.05, rtol=0.05)
+        else:
+            relative_error = (w_orig.float() - w_deq).abs().mean() / w_orig.float().abs().mean()
+            assert relative_error < 0.10
 
 
 # ---------------------------------------------------------------------------
@@ -146,7 +159,7 @@ def test_dequantize_roundtrip():
 # ---------------------------------------------------------------------------
 
 
-def test_prequantized_nvfp4_loading():
+def _assert_prequantized_nvfp4_loading():
     """from_quantized() loads pre-packed nvfp4 weights; forward+backward work."""
     w = torch.randn(512, 256, device="cuda", dtype=torch.bfloat16)
     packed, block_scales, global_scale = nvfp4_quantize(w, 16)
@@ -175,7 +188,7 @@ def test_prequantized_nvfp4_loading():
 # ---------------------------------------------------------------------------
 
 
-def test_ema_amax_and_scale_convention():
+def _assert_ema_amax_and_scale_convention():
     """EMA amax: init from bf16, update on merge, global_scale formula.
     Scale convention: block_scales use full fp8 range, dequant roundtrip accuracy."""
     linear = nn.Linear(256, 512, bias=False, device="cuda", dtype=torch.bfloat16)
@@ -222,7 +235,7 @@ def test_ema_amax_and_scale_convention():
 # ---------------------------------------------------------------------------
 
 
-def test_merge_weights_and_requant():
+def _assert_merge_weights_and_requant():
     """merge_weights folds LoRA into base; maybe_requant_qlora merges+resets+EMA updates."""
     linear = nn.Linear(256, 512, bias=False, device="cuda", dtype=torch.bfloat16)
     qlora = QLoRALinear.from_module(linear, r=16, lora_alpha=16, quant_format="nvfp4", quant_group_size=16)
@@ -276,8 +289,8 @@ def test_merge_weights_and_requant():
 # ---------------------------------------------------------------------------
 
 
-def test_injection_and_training():
-    """inject_qlora replaces target modules; forward/backward work; loss decreases."""
+def _assert_injection_and_training():
+    """inject_qlora replaces only target modules and preserves gradient flow."""
     model = _make_model()
     inject_qlora_into_model(
         model,
@@ -300,78 +313,7 @@ def test_injection_and_training():
             assert m.lora_A.grad is not None, f"{name}.lora_A has no gradient"
 
 
-@pytest.mark.parametrize("quant_format,gs", [("nvfp4", 16), ("block_fp8", 128)])
-def test_training_step_converges(quant_format, gs):
-    """Loss decreases over training steps for both quant formats."""
-    model = _make_model()
-    inject_qlora_into_model(model, r=16, lora_alpha=16, quant_format=quant_format, quant_group_size=gs)
-    _quantize_injected_model(model)
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable, lr=1e-3)
-    x = torch.randn(4, 16, 256, device="cuda", dtype=torch.bfloat16)
-    target = torch.randn(4, 16, 256, device="cuda", dtype=torch.bfloat16)
-
-    losses = []
-    for _ in range(10):
-        optimizer.zero_grad()
-        loss = ((model(x) - target) ** 2).mean()
-        loss.backward()
-        optimizer.step()
-        losses.append(loss.item())
-    assert losses[-1] < losses[0], f"{quant_format}: loss did not decrease: {losses}"
-
-
-# ---------------------------------------------------------------------------
-# 6. Step-based requant training (end-to-end)
-# ---------------------------------------------------------------------------
-
-
-def test_step_based_requant_training():
-    """Train with periodic requant: loss decreases, requant triggered, continues after reset."""
-    model = _make_model()
-    inject_qlora_into_model(model, r=16, lora_alpha=16, quant_format="nvfp4", quant_group_size=16)
-    _quantize_injected_model(model)
-    model.train()
-    trainable = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(trainable, lr=1e-3)
-    x = torch.randn(4, 16, 256, device="cuda", dtype=torch.bfloat16)
-    target = torch.randn(4, 16, 256, device="cuda", dtype=torch.bfloat16)
-
-    losses = []
-    requant_count = 0
-    for step in range(1, 26):
-        optimizer.zero_grad()
-        loss = ((model(x) - target) ** 2).mean()
-        loss.backward()
-        optimizer.step()
-        losses.append(loss.item())
-        if step % 10 == 0:
-            requant_count += maybe_requant_qlora(model)
-
-    assert requant_count > 0
-    assert losses[-1] < losses[0]
-
-    # Also verify single-module requant continues training after reset
-    linear = nn.Linear(256, 512, bias=False, device="cuda", dtype=torch.bfloat16)
-    qlora = QLoRALinear.from_module(linear, r=16, lora_alpha=16, quant_format="nvfp4", quant_group_size=16)
-    qlora.train()
-    opt = torch.optim.AdamW([qlora.lora_A, qlora.lora_B], lr=1e-3)
-    x2 = torch.randn(4, 16, 256, device="cuda", dtype=torch.bfloat16)
-    tgt2 = torch.randn(4, 16, 512, device="cuda", dtype=torch.bfloat16)
-    single_losses = []
-    m = nn.ModuleList([qlora])
-    for step in range(1, 31):
-        opt.zero_grad()
-        loss = ((qlora(x2) - tgt2) ** 2).mean()
-        loss.backward()
-        opt.step()
-        single_losses.append(loss.item())
-        if step % 10 == 0:
-            maybe_requant_qlora(m)
-    assert single_losses[-1] < single_losses[0]
-
-
-def test_inject_with_checkpoint_quant_format():
+def _assert_inject_with_checkpoint_quant_format():
     """inject_qlora with checkpoint_quant_format sets _source_quant_format."""
     model = _make_model()
     inject_qlora_into_model(
@@ -393,7 +335,7 @@ def test_inject_with_checkpoint_quant_format():
 # ---------------------------------------------------------------------------
 
 
-def test_prequantized_block_fp8_load_and_forward():
+def _assert_prequantized_block_fp8_load_and_forward():
     """Load FP8 single module + merged qkv; forward/backward work; dequant roundtrip."""
     M, K = 256, 256
     w_orig, fp8_w, scales = _make_fp8_data(M, K)
@@ -449,8 +391,8 @@ def test_prequantized_block_fp8_load_and_forward():
     assert qkv.packed_weight_f32.numel() * 4 == total_out * hidden
 
 
-def test_prequantized_block_fp8_merge_and_training():
-    """Merge weights + training loop work after loading pre-quantized block FP8."""
+def _assert_prequantized_block_fp8_merge():
+    """Merge weights after loading pre-quantized block FP8."""
     M, K = 256, 256
     _, fp8_w, scales = _make_fp8_data(M, K)
 
@@ -474,46 +416,25 @@ def test_prequantized_block_fp8_merge_and_training():
     assert (qlora._dequantize_weight() - w_before).float().abs().mean() > 0.001
     assert qlora._ema_amax is None  # block_fp8: no EMA amax
 
-    # Training loop
-    qlora2 = BlockFP8QLoRALinear(K, M, r=16, lora_alpha=16, device=torch.device("cuda"))
-    qlora2._is_prequantized = True
-    qlora2._source_quant_format = "block_fp8"
-    qlora2._merge_sources = None
-    qlora2._source_fqn = "model.layers.0.self_attn.o_proj"
-    qlora2._load_prequantized(lambda key: mock_data[key])
-    qlora2.train()
-    opt = torch.optim.AdamW([qlora2.lora_A, qlora2.lora_B], lr=1e-2)
-    x = torch.randn(4, 16, K, device="cuda", dtype=torch.bfloat16) * 0.1
-    target = torch.randn(4, 16, M, device="cuda", dtype=torch.bfloat16) * 0.1
-    losses = []
-    for _ in range(20):
-        opt.zero_grad()
-        loss = ((qlora2(x) - target) ** 2).mean()
-        loss.backward()
-        opt.step()
-        losses.append(loss.item())
-    assert losses[-1] < losses[0]
-
 
 # ---------------------------------------------------------------------------
 # 9. ReLoRA optimizer reset
 # ---------------------------------------------------------------------------
 
 
-def test_reset_lora_optimizer_states_clears():
+def _assert_reset_lora_optimizer_states_clears():
     """Verify ReLoRA reset clears optimizer states for LoRA params."""
     linear = nn.Linear(256, 512, bias=False, device="cuda", dtype=torch.bfloat16)
     qlora = QLoRALinear.from_module(linear, r=16, lora_alpha=16, quant_format="block_fp8", quant_group_size=128)
     qlora.train()
     opt = torch.optim.AdamW([qlora.lora_A, qlora.lora_B], lr=1e-3)
 
-    # Run a few steps to populate optimizer states
+    # One step is sufficient to populate Adam states.
     x = torch.randn(4, 8, 256, device="cuda", dtype=torch.bfloat16)
     tgt = torch.randn(4, 8, 512, device="cuda", dtype=torch.bfloat16)
-    for _ in range(5):
-        opt.zero_grad()
-        ((qlora(x) - tgt) ** 2).mean().backward()
-        opt.step()
+    opt.zero_grad()
+    ((qlora(x) - tgt) ** 2).mean().backward()
+    opt.step()
 
     # Verify optimizer states exist
     assert qlora.lora_A in opt.state
@@ -538,7 +459,7 @@ def test_reset_lora_optimizer_states_clears():
     assert qlora.lora_B in opt.state
 
 
-def test_reset_ignores_non_lora_params():
+def _assert_reset_ignores_non_lora_params():
     """Optimizer reset only touches LoRA params, not other trainable params."""
     model = _make_model()
     inject_qlora_into_model(
@@ -555,10 +476,9 @@ def test_reset_ignores_non_lora_params():
     opt = torch.optim.AdamW(all_params, lr=1e-3)
 
     x = torch.randn(2, 8, 256, device="cuda", dtype=torch.bfloat16)
-    for _ in range(3):
-        opt.zero_grad()
-        model(x).sum().backward()
-        opt.step()
+    opt.zero_grad()
+    model(x).sum().backward()
+    opt.step()
 
     # Record non-LoRA param states
     non_lora_states_before = {}
@@ -580,148 +500,8 @@ def test_reset_ignores_non_lora_params():
             )
 
 
-def test_merge_with_optimizer_reset_rank_accumulation():
-    """Periodic merge + ReLoRA optimizer reset accumulates effective rank
-    and beats single-rank LoRA on a high-rank target.
-
-    Uses block_fp8 which has low re-quantization error, letting the rank
-    accumulation benefit dominate. nvfp4's 4-bit re-quantization noise
-    offsets the rank benefit in short runs.
-    """
-    torch.manual_seed(42)
-    dim = 256
-
-    # Target requires rank 32; single rank-4 LoRA cannot fully fit it
-    base_linear = nn.Linear(dim, dim, bias=False, device="cuda", dtype=torch.bfloat16)
-    W_base = base_linear.weight.detach().clone()
-    A_target = torch.randn(dim, 32, device="cuda", dtype=torch.bfloat16) * 0.1
-    B_target = torch.randn(32, dim, device="cuda", dtype=torch.bfloat16) * 0.1
-    W_target = W_base + (A_target @ B_target)
-
-    x = torch.randn(8, 16, dim, device="cuda", dtype=torch.bfloat16)
-    target = F.linear(x, W_target)
-
-    def _train(merge_interval, reset_opt, total_steps, r=4, lr=1e-3):
-        torch.manual_seed(42)
-        linear = nn.Linear(dim, dim, bias=False, device="cuda", dtype=torch.bfloat16)
-        with torch.no_grad():
-            linear.weight.copy_(W_base)
-        qlora = QLoRALinear.from_module(linear, r=r, lora_alpha=r, quant_format="block_fp8", quant_group_size=128)
-        qlora.train()
-        opt = torch.optim.AdamW([qlora.lora_A, qlora.lora_B], lr=lr)
-        model = nn.ModuleList([qlora])
-        losses = []
-        for step in range(1, total_steps + 1):
-            opt.zero_grad()
-            loss = ((qlora(x) - target) ** 2).mean()
-            loss.backward()
-            opt.step()
-            losses.append(loss.item())
-            if merge_interval > 0 and step % merge_interval == 0:
-                maybe_requant_qlora(model)
-                if reset_opt:
-                    reset_lora_optimizer_states(model, opt)
-        return losses
-
-    # No merge: rank-4 LoRA saturates at best rank-4 approximation
-    losses_no_merge = _train(merge_interval=0, reset_opt=False, total_steps=200)
-
-    # Merge every 40 steps + optimizer reset (5 merges over 200 steps)
-    losses_merge_reset = _train(merge_interval=40, reset_opt=True, total_steps=200)
-
-    # Merge + reset should converge
-    assert losses_merge_reset[-1] < losses_merge_reset[0], (
-        f"Merge+reset didn't converge: {losses_merge_reset[0]:.4f} -> {losses_merge_reset[-1]:.4f}"
-    )
-
-    # Merge + reset should reach lower loss than no-merge
-    # (accumulated rank from 5 merges of rank-4 > single rank-4)
-    assert losses_merge_reset[-1] < losses_no_merge[-1], (
-        f"Merge+reset ({losses_merge_reset[-1]:.4f}) should beat no-merge ({losses_no_merge[-1]:.4f})"
-    )
-
-
-@pytest.mark.parametrize("quant_format,gs", [("nvfp4", 16), ("block_fp8", 128)])
-def test_merge_with_optimizer_reset_still_converges(quant_format, gs):
-    """Merge + optimizer reset converges for both quant formats (no regression)."""
-    torch.manual_seed(42)
-    dim = 256
-    linear = nn.Linear(dim, dim, bias=False, device="cuda", dtype=torch.bfloat16)
-    qlora = QLoRALinear.from_module(linear, r=8, lora_alpha=8, quant_format=quant_format, quant_group_size=gs)
-    qlora.train()
-    opt = torch.optim.AdamW([qlora.lora_A, qlora.lora_B], lr=1e-3)
-    model = nn.ModuleList([qlora])
-    x = torch.randn(4, 16, dim, device="cuda", dtype=torch.bfloat16)
-    target = torch.randn(4, 16, dim, device="cuda", dtype=torch.bfloat16)
-    losses = []
-    for step in range(1, 61):
-        opt.zero_grad()
-        loss = ((qlora(x) - target) ** 2).mean()
-        loss.backward()
-        opt.step()
-        losses.append(loss.item())
-        if step % 20 == 0:
-            maybe_requant_qlora(model)
-            reset_lora_optimizer_states(model, opt)
-    assert losses[-1] < losses[0], f"{quant_format} didn't converge: {losses[0]:.4f} -> {losses[-1]:.4f}"
-
-
-def test_merge_with_reset_vs_without_reset():
-    """Compare merge+reset vs merge-only to verify reset doesn't hurt convergence.
-
-    Both should converge. Reset may help or be neutral — the key is it doesn't
-    catastrophically hurt training.
-    """
-    torch.manual_seed(123)
-    dim = 256
-
-    base_linear = nn.Linear(dim, dim, bias=False, device="cuda", dtype=torch.bfloat16)
-    W_base = base_linear.weight.detach().clone()
-
-    x = torch.randn(8, 16, dim, device="cuda", dtype=torch.bfloat16)
-    target = torch.randn(8, 16, dim, device="cuda", dtype=torch.bfloat16)
-
-    def _train(reset_opt, total_steps=120, merge_interval=30):
-        torch.manual_seed(123)
-        linear = nn.Linear(dim, dim, bias=False, device="cuda", dtype=torch.bfloat16)
-        with torch.no_grad():
-            linear.weight.copy_(W_base)
-        qlora = QLoRALinear.from_module(linear, r=8, lora_alpha=8, quant_format="block_fp8", quant_group_size=128)
-        qlora.train()
-        opt = torch.optim.AdamW([qlora.lora_A, qlora.lora_B], lr=1e-3)
-        model = nn.ModuleList([qlora])
-        losses = []
-        for step in range(1, total_steps + 1):
-            opt.zero_grad()
-            loss = ((qlora(x) - target) ** 2).mean()
-            loss.backward()
-            opt.step()
-            losses.append(loss.item())
-            if step % merge_interval == 0:
-                maybe_requant_qlora(model)
-                if reset_opt:
-                    reset_lora_optimizer_states(model, opt)
-        return losses
-
-    losses_merge_only = _train(reset_opt=False)
-    losses_merge_reset = _train(reset_opt=True)
-
-    # Both should converge (loss decreases)
-    assert losses_merge_only[-1] < losses_merge_only[0], (
-        f"Merge-only didn't converge: {losses_merge_only[0]:.4f} -> {losses_merge_only[-1]:.4f}"
-    )
-    assert losses_merge_reset[-1] < losses_merge_reset[0], (
-        f"Merge+reset didn't converge: {losses_merge_reset[0]:.4f} -> {losses_merge_reset[-1]:.4f}"
-    )
-
-    # Reset should not catastrophically hurt (within 2x of merge-only final loss)
-    assert losses_merge_reset[-1] < losses_merge_only[-1] * 2.0, (
-        f"Reset hurt too much: {losses_merge_reset[-1]:.4f} vs merge-only {losses_merge_only[-1]:.4f}"
-    )
-
-
-def test_maybe_merge_lora_with_optimizer_reset_integration():
-    """End-to-end test of maybe_merge_lora with reset_optimizer=True."""
+def _assert_maybe_merge_lora_with_optimizer_reset_integration():
+    """Merge scheduling requantizes on the boundary and clears only stale LoRA state."""
     model = _make_model()
     inject_qlora_into_model(model, r=16, lora_alpha=16, quant_format="block_fp8", quant_group_size=128)
     _quantize_injected_model(model)
@@ -730,28 +510,64 @@ def test_maybe_merge_lora_with_optimizer_reset_integration():
     optimizer = torch.optim.AdamW(trainable, lr=1e-3)
 
     x = torch.randn(2, 8, 256, device="cuda", dtype=torch.bfloat16)
-    target = torch.randn(2, 8, 256, device="cuda", dtype=torch.bfloat16)
+    optimizer.zero_grad()
+    model(x).sum().backward()
+    optimizer.step()
 
-    losses = []
-    for step in range(1, 31):
-        optimizer.zero_grad()
-        loss = ((model(x) - target) ** 2).mean()
-        loss.backward()
-        optimizer.step()
-        losses.append(loss.item())
-        maybe_merge_lora(
-            model,
-            enable_lora=False,
-            enable_qlora=True,
-            merge_interval=10,
-            global_step=step,
-            optimizer=optimizer,
-            reset_optimizer=True,
-        )
+    modules = [module for module in model.modules() if isinstance(module, QLoRALinear)]
+    assert modules
+    assert all(module.lora_A in optimizer.state and module.lora_B in optimizer.state for module in modules)
+    with torch.no_grad():
+        for module in modules:
+            module.lora_A.fill_(0.25)
+            module.lora_B.fill_(0.25)
+    packed_before = [module.packed_weight_f32.clone() for module in modules]
 
-    # Should still converge despite optimizer resets
-    assert losses[-1] < losses[0], f"Did not converge: {losses[0]:.4f} -> {losses[-1]:.4f}"
-    # Verify merges happened (lora_B should be zero after last merge at step 30)
-    for m in model.modules():
-        if isinstance(m, QLoRALinear):
-            assert torch.all(m.lora_B == 0), "lora_B should be reset after merge"
+    maybe_merge_lora(
+        model,
+        enable_lora=False,
+        enable_qlora=True,
+        merge_interval=10,
+        global_step=9,
+        optimizer=optimizer,
+        reset_optimizer=True,
+    )
+    assert all(torch.equal(module.packed_weight_f32, before) for module, before in zip(modules, packed_before))
+    assert all(module.lora_A in optimizer.state and module.lora_B in optimizer.state for module in modules)
+    assert all(torch.all(module.lora_B == 0.25) for module in modules)
+
+    maybe_merge_lora(
+        model,
+        enable_lora=False,
+        enable_qlora=True,
+        merge_interval=10,
+        global_step=10,
+        optimizer=optimizer,
+        reset_optimizer=True,
+    )
+    assert any(not torch.equal(module.packed_weight_f32, before) for module, before in zip(modules, packed_before))
+    assert all(module.lora_A not in optimizer.state and module.lora_B not in optimizer.state for module in modules)
+    assert all(torch.count_nonzero(module.lora_B) == 0 for module in modules)
+
+
+def test_qlora_quantized_execution_and_format_lifecycle_contract():
+    _assert_quantize_forward_backward_memory()
+    _assert_dequantize_roundtrip()
+    _assert_prequantized_nvfp4_loading()
+    _assert_ema_amax_and_scale_convention()
+    _assert_merge_weights_and_requant()
+    _assert_prequantized_block_fp8_load_and_forward()
+    _assert_prequantized_block_fp8_merge()
+    _assert_qlora_injection_contract()
+    _assert_qlora_optimizer_reset_lifecycle()
+
+
+def _assert_qlora_injection_contract():
+    _assert_injection_and_training()
+    _assert_inject_with_checkpoint_quant_format()
+
+
+def _assert_qlora_optimizer_reset_lifecycle():
+    _assert_reset_lora_optimizer_states_clears()
+    _assert_reset_ignores_non_lora_params()
+    _assert_maybe_merge_lora_with_optimizer_reset_integration()

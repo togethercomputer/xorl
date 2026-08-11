@@ -14,6 +14,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from tests._helpers import stage_and_commit_gradient_capture
 from xorl.lora import LoraLinear
 from xorl.server.runner.adapters import manager as adapter_manager_module
 from xorl.server.runner.adapters.gradient_ownership import GradientScaleState
@@ -61,7 +62,7 @@ def _register(manager: LoRAAdapterManager, model_id: str, lr: float = 1e-2) -> N
 def _fill_params(manager: LoRAAdapterManager, model_id: str, seed: int) -> None:
     generator = torch.Generator().manual_seed(seed)
     state = manager.get_adapter_state(model_id)
-    for param in state.lora_params.values():
+    for param in state.local_params.values():
         param.data.copy_(torch.randn(param.shape, generator=generator, dtype=param.dtype))
 
 
@@ -78,7 +79,7 @@ def _apply_step(manager: LoRAAdapterManager, model_id: str, seed: int, lr: float
             dtype=parameter.dtype,
             device=parameter.device,
         )
-    manager.capture_gradient_numerators(model_id, denominator=1.0, backward_completed=True)
+    stage_and_commit_gradient_capture(manager, model_id, denominator=1.0)
     manager.optim_step(model_id, lr=lr)
 
 
@@ -146,7 +147,7 @@ def _load_through_public_runner(
     runner.load_adapter_state(model_id, path, load_optimizer=True, lr=lr)
 
 
-def test_adapter_optimizer_parameter_map_is_canonical_ordered():
+def _assert_adapter_optimizer_parameter_identity_policy():
     parameters = {
         "_orig_mod.z.lora_B": torch.nn.Parameter(torch.ones(2)),
         "a.lora_A": torch.nn.Parameter(torch.ones(2)),
@@ -154,8 +155,11 @@ def test_adapter_optimizer_parameter_map_is_canonical_ordered():
     ordered = LoRAAdapterManager._optimizer_parameter_map(parameters)
     assert list(ordered) == ["a.lora_A", "_orig_mod.z.lora_B"]
 
+    _assert_adapter_optimizer_fingerprint_ignores_wrappers()
+    _assert_live_optimizer_binding_rejects_noncanonical_parameter_object()
 
-def test_adapter_optimizer_fingerprint_is_canonical_and_ignores_wrappers():
+
+def _assert_adapter_optimizer_fingerprint_ignores_wrappers():
     first = {
         "_orig_mod.z.lora_B": torch.nn.Parameter(torch.ones(2)),
         "a.lora_A": torch.nn.Parameter(torch.ones(2)),
@@ -167,7 +171,7 @@ def test_adapter_optimizer_fingerprint_is_canonical_and_ignores_wrappers():
     assert _adapter_param_structure_fingerprint(first) == _adapter_param_structure_fingerprint(equivalent)
 
 
-def test_transaction_snapshot_recursively_clones_tensor_state_to_cpu():
+def _assert_transaction_snapshot_recursively_clones_tensor_state_to_cpu():
     source = torch.arange(4, dtype=torch.float32)
     snapshot = _clone_state_to_cpu(
         {
@@ -186,7 +190,7 @@ def test_transaction_snapshot_recursively_clones_tensor_state_to_cpu():
     assert snapshot["scalar"] == 3
 
 
-def test_live_optimizer_binding_rejects_noncanonical_parameter_object_before_state_read():
+def _assert_live_optimizer_binding_rejects_noncanonical_parameter_object():
     name = "layer.lora_A"
     layout = _one_dimensional_layout(name, offset=0, size=4, logical_size=4)
     state = _target_adapter_state(name, layout)
@@ -197,7 +201,25 @@ def test_live_optimizer_binding_rejects_noncanonical_parameter_object_before_sta
         adapter_manager_module._validate_live_optimizer_binding(state)
 
 
-def test_collective_failure_after_optimizer_mutation_is_fatal_without_rollback(monkeypatch):
+def test_optimizer_checkpoint_resume_policy(tmp_path: Path, monkeypatch):
+    with monkeypatch.context() as identity_patch:
+        _assert_optimizer_identity_snapshot_and_collective_failure_policy(identity_patch)
+
+    resume_root = tmp_path / "resume"
+    resume_root.mkdir()
+    with monkeypatch.context() as resume_patch:
+        _assert_optimizer_checkpoint_save_resume_and_artifact_admission_policy(resume_root, resume_patch)
+
+    reshard_root = tmp_path / "reshard"
+    reshard_root.mkdir()
+    with monkeypatch.context() as reshard_patch:
+        _assert_optimizer_logical_reshard_policy(reshard_root, reshard_patch)
+
+
+def _assert_optimizer_identity_snapshot_and_collective_failure_policy(monkeypatch):
+    _assert_adapter_optimizer_parameter_identity_policy()
+    _assert_transaction_snapshot_recursively_clones_tensor_state_to_cpu()
+
     resident = {"state": {0: {"exp_avg": torch.tensor([1.0])}}, "param_groups": [{"params": [0]}]}
     target = {"state": {0: {"exp_avg": torch.tensor([2.0])}}, "param_groups": [{"params": [0]}]}
 
@@ -231,7 +253,7 @@ def test_collective_failure_after_optimizer_mutation_is_fatal_without_rollback(m
     assert _same_optimizer_value(optimizer.value, target)
 
 
-def test_save_writes_sharded_optimizer_with_manifest(tmp_path: Path):
+def _assert_optimizer_checkpoint_save_resume_and_artifact_admission_policy(tmp_path: Path, monkeypatch):
     manager = _build_manager(tmp_path)
     _register(manager, "resume-a")
     _apply_step(manager, "resume-a", seed=1)
@@ -253,18 +275,18 @@ def test_save_writes_sharded_optimizer_with_manifest(tmp_path: Path):
         if param.numel() > 0
     )
     state = manager.get_adapter_state("resume-a")
-    assert manifest["per_rank_param_structure_sha256"] == [_adapter_param_structure_fingerprint(state.lora_params)]
+    assert manifest["per_rank_param_structure_sha256"] == [_adapter_param_structure_fingerprint(state.local_params)]
+
+    _assert_manifest_identity_contract_policy(tmp_path / "identity")
+    _assert_resume_matches_uninterrupted_run_bitwise(tmp_path / "roundtrip")
+    _assert_optimizer_checkpoint_artifact_admission_policy(tmp_path / "artifact-admission", monkeypatch)
 
 
-@pytest.mark.parametrize(
-    ("manifest_update", "error_match"),
-    [
-        ({"session_rank": 2}, "saved for session_rank"),
-        ({"per_rank_layout_fingerprint": ["0" * 64]}, "Layout fingerprint does not match descriptors"),
-        ({"per_rank_optimizer_parameter_order": [["wrong.fqn"]]}, "different optimizer parameter order"),
-    ],
-)
-def test_manifest_identity_contract_refuses_incompatible_optimizer_shards(tmp_path, manifest_update, error_match):
+def _assert_manifest_identity_contract_refuses_incompatible_optimizer_shards(
+    tmp_path,
+    manifest_update,
+    error_match,
+):
     source = _build_manager(tmp_path / "source")
     _register(source, "resume-contract")
     _apply_step(source, "resume-contract", seed=3)
@@ -281,7 +303,22 @@ def test_manifest_identity_contract_refuses_incompatible_optimizer_shards(tmp_pa
         target.load_adapter_state(model_id="resume-contract", path=path, load_optimizer=True)
 
 
-def test_load_restores_optimizer_moments_and_step_bitwise(tmp_path: Path):
+def _assert_manifest_identity_contract_policy(tmp_path):
+    for index, (manifest_update, error_match) in enumerate(
+        (
+            ({"session_rank": 2}, "saved for session_rank"),
+            ({"per_rank_layout_fingerprint": ["0" * 64]}, "Layout fingerprint does not match descriptors"),
+            ({"per_rank_optimizer_parameter_order": [["wrong.fqn"]]}, "different optimizer parameter order"),
+        )
+    ):
+        _assert_manifest_identity_contract_refuses_incompatible_optimizer_shards(
+            tmp_path / f"manifest-{index}",
+            manifest_update,
+            error_match,
+        )
+
+
+def _assert_load_restores_optimizer_moments_and_step_bitwise(tmp_path: Path):
     source = _build_manager(tmp_path)
     _register(source, "resume-b")
     _fill_params(source, "resume-b", seed=7)
@@ -300,7 +337,7 @@ def test_load_restores_optimizer_moments_and_step_bitwise(tmp_path: Path):
         assert torch.equal(target_moments[key], tensor), f"moment mismatch: {key}"
 
 
-def test_resume_matches_uninterrupted_run_bitwise(tmp_path: Path):
+def _assert_resume_matches_uninterrupted_run_bitwise(tmp_path: Path):
     torch.use_deterministic_algorithms(True)
     try:
         uninterrupted = _build_manager(tmp_path / "full")
@@ -323,8 +360,8 @@ def test_resume_matches_uninterrupted_run_bitwise(tmp_path: Path):
 
         full_state = uninterrupted.get_adapter_state("resume-c")
         resumed_state = resumed.get_adapter_state("resume-c")
-        for name, param in full_state.lora_params.items():
-            assert torch.equal(resumed_state.lora_params[name].data, param.data), (
+        for name, param in full_state.local_params.items():
+            assert torch.equal(resumed_state.local_params[name].data, param.data), (
                 f"resumed weights diverge from uninterrupted run: {name}"
             )
         full_moments = _moment_tensors(uninterrupted, "resume-c")
@@ -334,8 +371,12 @@ def test_resume_matches_uninterrupted_run_bitwise(tmp_path: Path):
     finally:
         torch.use_deterministic_algorithms(False)
 
+    _assert_weights_only_resume_diverges(tmp_path / "weights-only-control")
+    _assert_load_restores_optimizer_moments_and_step_bitwise(tmp_path / "immediate-load")
+    _assert_public_scheduled_lr_load_after_evict_matches_uninterrupted_next_step(tmp_path / "public")
 
-def test_public_scheduled_lr_load_after_evict_matches_uninterrupted_next_step(tmp_path: Path):
+
+def _assert_public_scheduled_lr_load_after_evict_matches_uninterrupted_next_step(tmp_path: Path):
     """Scheduled LR state is mutable metadata, not restore identity."""
 
     torch.use_deterministic_algorithms(True)
@@ -380,8 +421,10 @@ def test_public_scheduled_lr_load_after_evict_matches_uninterrupted_next_step(tm
     finally:
         torch.use_deterministic_algorithms(False)
 
+    _assert_public_lr_override_restore_matches_uninterrupted_next_step(tmp_path / "override")
 
-def test_public_lr_override_restore_matches_uninterrupted_next_step(tmp_path: Path):
+
+def _assert_public_lr_override_restore_matches_uninterrupted_next_step(tmp_path: Path):
     torch.use_deterministic_algorithms(True)
     try:
         source_runner, source = _build_public_runner(tmp_path / "source")
@@ -423,7 +466,7 @@ def test_public_lr_override_restore_matches_uninterrupted_next_step(tmp_path: Pa
         torch.use_deterministic_algorithms(False)
 
 
-def test_weights_only_resume_would_diverge(tmp_path: Path):
+def _assert_weights_only_resume_diverges(tmp_path: Path):
     """Control: without optimizer state the continuation differs, proving the
     bitwise equality above is a real signal and not step-invariance."""
     full = _build_manager(tmp_path / "full")
@@ -445,15 +488,15 @@ def test_weights_only_resume_would_diverge(tmp_path: Path):
 
     diverged = any(
         not torch.equal(
-            weights_only.get_adapter_state("resume-d").lora_params[name].data,
+            weights_only.get_adapter_state("resume-d").local_params[name].data,
             param.data,
         )
-        for name, param in full.get_adapter_state("resume-d").lora_params.items()
+        for name, param in full.get_adapter_state("resume-d").local_params.items()
     )
     assert diverged, "weights-only resume unexpectedly matched the moment-resumed run"
 
 
-def test_legacy_pickle_checkpoint_is_always_refused(tmp_path: Path, monkeypatch):
+def _assert_optimizer_checkpoint_artifact_admission_policy(tmp_path: Path, monkeypatch):
     source = _build_manager(tmp_path)
     _register(source, "resume-e")
     _apply_step(source, "resume-e", seed=3)
@@ -476,8 +519,12 @@ def test_legacy_pickle_checkpoint_is_always_refused(tmp_path: Path, monkeypatch)
         target.load_adapter_state(model_id="resume-e", path=path, load_optimizer=True)
     target.load_adapter_state(model_id="resume-e", path=path, load_optimizer=False)
 
+    _assert_optimizer_shard_without_manifest_is_refused(tmp_path / "no-manifest")
+    _assert_declared_optimizer_without_artifacts_is_refused(tmp_path / "no-artifacts")
+    _assert_incomplete_optimizer_restore_does_not_mutate_resident_adapter(tmp_path / "resident")
 
-def test_optimizer_shard_without_manifest_is_refused(tmp_path: Path):
+
+def _assert_optimizer_shard_without_manifest_is_refused(tmp_path: Path):
     source = _build_manager(tmp_path)
     _register(source, "resume-incomplete")
     _apply_step(source, "resume-incomplete", seed=3)
@@ -490,7 +537,7 @@ def test_optimizer_shard_without_manifest_is_refused(tmp_path: Path):
     assert not target.has_adapter("resume-incomplete")
 
 
-def test_declared_optimizer_checkpoint_without_artifacts_is_refused(tmp_path: Path):
+def _assert_declared_optimizer_without_artifacts_is_refused(tmp_path: Path):
     source = _build_manager(tmp_path)
     _register(source, "resume-missing")
     path = source.save_adapter_state("resume-missing")["path"]
@@ -503,7 +550,7 @@ def test_declared_optimizer_checkpoint_without_artifacts_is_refused(tmp_path: Pa
     assert not target.has_adapter("resume-missing")
 
 
-def test_incomplete_optimizer_restore_does_not_mutate_resident_adapter(tmp_path: Path):
+def _assert_incomplete_optimizer_restore_does_not_mutate_resident_adapter(tmp_path: Path):
     source = _build_manager(tmp_path / "source")
     _register(source, "resume-resident")
     _fill_params(source, "resume-resident", seed=41)
@@ -517,10 +564,10 @@ def test_incomplete_optimizer_restore_does_not_mutate_resident_adapter(tmp_path:
     _fill_params(target, "resume-resident", seed=47)
     _apply_step(target, "resume-resident", seed=53)
     resident_state = target.get_adapter_state("resume-resident")
-    resident_weights = {name: param.detach().clone() for name, param in resident_state.lora_params.items()}
+    resident_weights = {name: param.detach().clone() for name, param in resident_state.local_params.items()}
     resident_moments = {name: tensor.clone() for name, tensor in _moment_tensors(target, "resume-resident").items()}
     assert any(
-        not torch.equal(param, source.get_adapter_state("resume-resident").lora_params[name])
+        not torch.equal(param, source.get_adapter_state("resume-resident").local_params[name])
         for name, param in resident_weights.items()
     )
 
@@ -530,14 +577,14 @@ def test_incomplete_optimizer_restore_does_not_mutate_resident_adapter(tmp_path:
     assert target.has_adapter("resume-resident")
     restored_state = target.get_adapter_state("resume-resident")
     for name, tensor in resident_weights.items():
-        assert torch.equal(restored_state.lora_params[name], tensor)
+        assert torch.equal(restored_state.local_params[name], tensor)
     restored_moments = _moment_tensors(target, "resume-resident")
     assert restored_moments.keys() == resident_moments.keys()
     for name, tensor in resident_moments.items():
         assert torch.equal(restored_moments[name], tensor)
 
 
-def test_world_size_mismatch_refused(tmp_path: Path):
+def _assert_world_size_mismatch_is_refused(tmp_path: Path):
     source = _build_manager(tmp_path)
     _register(source, "resume-f")
     _apply_step(source, "resume-f", seed=5)
@@ -666,7 +713,7 @@ def _target_adapter_state(name: str, layout: AdapterTensorLayout) -> AdapterStat
     )
 
 
-def test_world_size_change_reshards_adam_rectangles_exactly(tmp_path: Path, monkeypatch):
+def _assert_optimizer_logical_reshard_policy(tmp_path: Path, monkeypatch):
     name = "layer.lora_A"
     source_layouts = [
         _one_dimensional_layout(name, offset=0, size=2, logical_size=4),
@@ -688,8 +735,13 @@ def test_world_size_change_reshards_adam_rectangles_exactly(tmp_path: Path, monk
     assert torch.equal(target.optimizer.state[parameter]["exp_avg_sq"], torch.tensor([1.0, 4.0, 9.0, 16.0]))
     assert target.optimizer.state[parameter]["step"].item() == 8
 
+    _assert_multidimensional_disjoint_rectangles_reshard(tmp_path / "multidimensional", monkeypatch)
+    _assert_replicated_rectangle_is_sliced(tmp_path / "replicated", monkeypatch)
+    _assert_same_world_layout_change_uses_logical_reshard(tmp_path / "same-world", monkeypatch)
+    _assert_optimizer_reshard_rejects_invalid_sources_without_mutation(tmp_path / "invalid", monkeypatch)
 
-def test_world_size_change_refuses_divergent_replicated_moments(tmp_path: Path, monkeypatch):
+
+def _assert_divergent_replicated_moments_are_refused(tmp_path: Path, monkeypatch):
     name = "layer.lora_A"
     replicated = _one_dimensional_layout(name, offset=0, size=4, logical_size=4)
     _write_two_rank_optimizer_checkpoint(
@@ -705,7 +757,7 @@ def test_world_size_change_refuses_divergent_replicated_moments(tmp_path: Path, 
         load_adapter_optimizer_shards(target, str(tmp_path), torch.device("cpu"))
 
 
-def test_topology_change_reshards_multidimensional_disjoint_rectangles(tmp_path: Path, monkeypatch):
+def _assert_multidimensional_disjoint_rectangles_reshard(tmp_path: Path, monkeypatch):
     name = "layer.lora_A"
     source_layouts = [
         _two_dimensional_layout(name, offset=(0, 0), shape=(2, 4), logical_shape=(4, 4)),
@@ -734,7 +786,7 @@ def test_topology_change_reshards_multidimensional_disjoint_rectangles(tmp_path:
     )
 
 
-def test_topology_change_slices_replicated_rectangle(tmp_path: Path, monkeypatch):
+def _assert_replicated_rectangle_is_sliced(tmp_path: Path, monkeypatch):
     name = "layer.lora_A"
     replicated = _two_dimensional_layout(name, offset=(0, 0), shape=(4, 4), logical_shape=(4, 4))
     source = torch.arange(16, dtype=torch.float32).reshape(4, 4)
@@ -754,7 +806,7 @@ def test_topology_change_slices_replicated_rectangle(tmp_path: Path, monkeypatch
     torch.testing.assert_close(target.optimizer.state[parameter]["exp_avg"], source[2:4, 1:3], rtol=0, atol=0)
 
 
-def test_same_world_layout_change_uses_logical_reshard(tmp_path: Path, monkeypatch):
+def _assert_same_world_layout_change_uses_logical_reshard(tmp_path: Path, monkeypatch):
     name = "layer.lora_A"
     source_layouts = [
         _one_dimensional_layout(name, offset=0, size=2, logical_size=4),
@@ -777,8 +829,11 @@ def test_same_world_layout_change_uses_logical_reshard(tmp_path: Path, monkeypat
     )
 
 
-@pytest.mark.parametrize("defect", ["hole", "overlap", "dtype", "logical_shape", "step"])
-def test_topology_change_rejects_invalid_source_without_mutation(tmp_path: Path, monkeypatch, defect: str):
+def _assert_topology_change_rejects_invalid_source_without_mutation(
+    tmp_path: Path,
+    monkeypatch,
+    defect: str,
+):
     name = "layer.lora_A"
     layouts = [
         _one_dimensional_layout(name, offset=0, size=2, logical_size=4),
@@ -825,7 +880,22 @@ def test_topology_change_rejects_invalid_source_without_mutation(tmp_path: Path,
     assert _same_optimizer_value(before, after)
 
 
-def test_topology_change_rejects_rank_without_active_optimizer_parameters(tmp_path: Path):
+def _assert_optimizer_reshard_rejects_invalid_sources_without_mutation(tmp_path: Path, monkeypatch):
+    for defect in ("hole", "overlap", "dtype", "logical_shape", "step"):
+        _assert_topology_change_rejects_invalid_source_without_mutation(
+            tmp_path / defect,
+            monkeypatch,
+            defect,
+        )
+
+    _assert_world_size_mismatch_is_refused(tmp_path / "world-size")
+    _assert_divergent_replicated_moments_are_refused(tmp_path / "replicated", monkeypatch)
+    _assert_rank_without_active_optimizer_parameters_is_rejected(tmp_path / "empty-rank")
+    _assert_staged_optimizer_rejection_preserves_resident_state(tmp_path / "staged")
+    _assert_parameter_structure_mismatch_is_refused(tmp_path / "parameter-structure")
+
+
+def _assert_rank_without_active_optimizer_parameters_is_rejected(tmp_path: Path):
     manifest = {
         "world_size": 1,
         "per_rank_layout_descriptors": [[]],
@@ -844,8 +914,7 @@ def test_topology_change_rejects_rank_without_active_optimizer_parameters(tmp_pa
         _reshard_adapter_optimizer_state(state, str(tmp_path), manifest, rank=0, world=1)
 
 
-@pytest.mark.parametrize("defect", ["group_metadata", "state_shape"])
-def test_staged_optimizer_contract_is_validated_before_resident_mutation(tmp_path: Path, defect: str):
+def _assert_staged_optimizer_contract_is_validated_before_resident_mutation(tmp_path: Path, defect: str):
     source = _build_manager(tmp_path / "source")
     _register(source, "staged-contract")
     _apply_step(source, "staged-contract", seed=17)
@@ -874,7 +943,12 @@ def test_staged_optimizer_contract_is_validated_before_resident_mutation(tmp_pat
     assert _same_optimizer_value(before, resident.optimizer.state_dict())
 
 
-def test_param_structure_mismatch_refused(tmp_path: Path):
+def _assert_staged_optimizer_rejection_preserves_resident_state(tmp_path: Path):
+    for defect in ("group_metadata", "state_shape"):
+        _assert_staged_optimizer_contract_is_validated_before_resident_mutation(tmp_path / defect, defect)
+
+
+def _assert_parameter_structure_mismatch_is_refused(tmp_path: Path):
     source = _build_manager(tmp_path)
     _register(source, "resume-g")
     _apply_step(source, "resume-g", seed=9)

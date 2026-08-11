@@ -770,7 +770,6 @@ class P2PTransportBackend(WeightTransportBackend):
         super().__init__(config)
         # backend_config carries optional Mooncake engine setup overrides.
         be_cfg = config.backend_config or {}
-        self._qwen_linear_attention_dims: Dict[str, Any] = dict(be_cfg.get("qwen_linear_attention_dims") or {})
         self._engine = None  # MooncakeTransferEngine (lazy-imported)
         # tensor_map[name] -> list of receiver locator dicts.
         self._tensor_map: Dict[str, List[Dict[str, Any]]] = {}
@@ -990,58 +989,18 @@ class P2PTransportBackend(WeightTransportBackend):
                     continue
         return endpoint_indices
 
-    @staticmethod
-    def _copy_locator_list_for_scatter(
-        locators: List[Dict[str, Any]],
-        copy_mode: str,
-    ) -> List[Dict[str, Any]]:
-        if copy_mode == "deep":
-            return [dict(loc) for loc in locators]
-        if copy_mode == "none":
-            return locators
-        # Default: keep an independent list per scatter payload without
-        # duplicating every immutable locator dict. Nonzero ranks copy the
-        # dicts again when adopting/merging prepared state.
-        return list(locators)
-
-    @staticmethod
-    def _scatter_locator_copy_mode() -> str:
-        if "XORL_P2P_SCATTER_REUSE_LOCATORS" in os.environ:
-            if _env_flag("XORL_P2P_SCATTER_REUSE_LOCATORS", False):
-                return "none"
-            if "XORL_P2P_SCATTER_COPY_MODE" not in os.environ:
-                return "list"
-        raw_mode = os.environ.get("XORL_P2P_SCATTER_COPY_MODE")
-        if raw_mode is None:
-            # Fast path: locator lists/dicts are read-only after SGLang prepare,
-            # and scatter_object_list serializes each recipient payload anyway.
-            return "none"
-        raw = raw_mode.strip().lower()
-        if raw in {"deep", "dict", "dicts"}:
-            return "deep"
-        if raw in {"list", "shallow", "lists"}:
-            return "list"
-        if raw in {"none", "reuse"}:
-            return "none"
-        logger.warning("[P2P] invalid XORL_P2P_SCATTER_COPY_MODE=%r; using reuse", raw_mode)
-        return "none"
-
     def _filter_tensor_map_for_sender(
         self,
         tensor_map: Dict[str, List[Dict[str, Any]]],
         sender_rank: int,
         *,
         experts_per_ep: Optional[int] = None,
-        locator_copy_mode: str = "list",
     ) -> Dict[str, List[Dict[str, Any]]]:
         sender_ep_rank = self._sender_ep_ranks.get(int(sender_rank))
         if experts_per_ep is None:
             experts_per_ep = self._experts_per_ep(tensor_map, self._direct_ep_size)
         if sender_ep_rank is None or experts_per_ep is None:
-            return {
-                name: self._copy_locator_list_for_scatter(locators, locator_copy_mode)
-                for name, locators in tensor_map.items()
-            }
+            return dict(tensor_map)
 
         keep_dense = int(sender_rank) == 0
         filtered: Dict[str, List[Dict[str, Any]]] = {}
@@ -1055,7 +1014,9 @@ class P2PTransportBackend(WeightTransportBackend):
                     continue
             elif expert_idx // experts_per_ep != sender_ep_rank:
                 continue
-            filtered[name] = self._copy_locator_list_for_scatter(locators, locator_copy_mode)
+            # Prepared locators are immutable here. scatter_object_list
+            # serializes each recipient payload before a nonzero rank adopts it.
+            filtered[name] = locators
         return filtered
 
     def should_extract_dense_params_on_rank(self, rank: int) -> bool:
@@ -1134,7 +1095,6 @@ class P2PTransportBackend(WeightTransportBackend):
             kind = "tensor_map_with_infos"
 
         experts_per_ep = self._experts_per_ep(self._tensor_map, self._direct_ep_size)
-        locator_copy_mode = self._scatter_locator_copy_mode()
         payloads: List[Any] = []
         for sender_rank in self.sender_rank_order:
             if int(sender_rank) == 0:
@@ -1144,7 +1104,6 @@ class P2PTransportBackend(WeightTransportBackend):
                 self._tensor_map,
                 sender_rank,
                 experts_per_ep=experts_per_ep,
-                locator_copy_mode=locator_copy_mode,
             )
             if kind == "merge_tensor_map":
                 payloads.append(
@@ -1378,11 +1337,7 @@ class P2PTransportBackend(WeightTransportBackend):
         # re-arming the receiver's Mooncake buffers (the receiver honors p2p_invalidate_cache
         # via _invalidate_p2p_cache()). Restored from the pre-merge baseline (baf6dcce).
         cache_invalidation_mode = str(cfg.backend_config.get("cache_invalidation_mode", "auto") or "auto").lower()
-        invalidate_receiver_cache = (
-            cache_invalidation_mode != "none"
-            and not request_cached_prepare
-            and _env_flag("XORL_P2P_INVALIDATE_RECEIVER_CACHE_ON_COLD_PREPARE", True)
-        )
+        invalidate_receiver_cache = cache_invalidation_mode != "none" and not request_cached_prepare
         self._last_prepare_returned_tensor_map = False
         self._last_prepare_tensor_map_endpoint_indices = set()
         num_endpoints = len(cfg.endpoints)
@@ -1946,7 +1901,7 @@ class P2PTransportBackend(WeightTransportBackend):
                 if self._rank_filter is not None and not self._rank_filter(loc):
                     continue
                 locators_for_rank += 1
-                src_view = self._slice_source_for_locator(name, tensor, loc, self._qwen_linear_attention_dims)
+                src_view = self._slice_source_for_locator(name, tensor, loc)
                 if src_view is None:
                     skipped_errors.append(f"{name!r}: receiver locator is incompatible with source tensor")
                     continue
@@ -2610,7 +2565,6 @@ class P2PTransportBackend(WeightTransportBackend):
         name: str,
         full_tensor: torch.Tensor,
         loc: Dict[str, Any],
-        qwen_linear_attention_dims: Optional[Dict[str, Any]] = None,
     ) -> Optional[torch.Tensor]:
         """Extract the sub-region of the trainer's full HF tensor that
         corresponds to a single receiver locator.
@@ -2627,17 +2581,6 @@ class P2PTransportBackend(WeightTransportBackend):
             return P2PTransportBackend._normalize_sliced_source_for_locator(name, full_tensor, loc)
 
         full_shape = loc.get("full_shape")
-        fused_linear_view = P2PTransportBackend._slice_qwen_linear_attention_fused_param(
-            name,
-            full_tensor,
-            loc,
-            full_shape,
-            slc,
-            qwen_linear_attention_dims,
-        )
-        if fused_linear_view is not None:
-            return P2PTransportBackend._normalize_sliced_source_for_locator(name, fused_linear_view, loc)
-
         if full_shape is not None and list(full_tensor.shape) != list(full_shape):
             local_view = P2PTransportBackend._slice_qwen35_linear_attention_local_param(
                 name,
@@ -2657,85 +2600,6 @@ class P2PTransportBackend(WeightTransportBackend):
 
         index: Tuple[slice, ...] = tuple(slice(int(s[0]), int(s[1])) for s in slc)
         return P2PTransportBackend._normalize_sliced_source_for_locator(name, full_tensor[index], loc)
-
-    @staticmethod
-    def _slice_qwen_linear_attention_fused_param(
-        name: str,
-        full_tensor: torch.Tensor,
-        loc: Dict[str, Any],
-        full_shape: Any,
-        slc: Any,
-        qwen_linear_attention_dims: Optional[Dict[str, Any]],
-    ) -> Optional[torch.Tensor]:
-        # This combined Q|K|V cat has no matching receiver locator. SGLang's
-        # p2p_qwen35_linear_attn_qkvz_locators emits SEPARATE contiguous Q/K/V
-        # locators for in_proj_qkv.weight (and conv1d.weight), each a plain
-        # contiguous row-range that the generic full_tensor[slc] path in
-        # _slice_source_for_locator matches exactly. The fused-cat path is an
-        # orphaned trainer-side divergence from the glm5 rebase (955191dd) with
-        # no receiver counterpart — when it fires its output is the wrong shape
-        # for a per-Q/K/V locator. Bypassed by default; returning None makes the
-        # caller fall through to the canonical contiguous slice. Set
-        # XORL_P2P_DISABLE_QWEN_LINEAR_ATTN_FUSED_SLICE=0 only for a receiver that
-        # genuinely expects the fused combined layout.
-        if _env_flag("XORL_P2P_DISABLE_QWEN_LINEAR_ATTN_FUSED_SLICE", True):
-            return None
-        if not (
-            ".linear_attn." in name
-            and (name.endswith(".in_proj_qkv.weight") or name.endswith(".conv1d.weight"))
-            and full_shape is not None
-            and list(full_tensor.shape) == list(full_shape)
-            and isinstance(qwen_linear_attention_dims, dict)
-        ):
-            return None
-
-        try:
-            key_dim = int(qwen_linear_attention_dims["key_dim"])
-            value_dim = int(qwen_linear_attention_dims["value_dim"])
-        except (KeyError, TypeError, ValueError):
-            return None
-        if key_dim <= 0 or value_dim <= 0:
-            return None
-
-        total_rows = 2 * key_dim + value_dim
-        if full_tensor.ndim < 1 or int(full_tensor.shape[0]) != total_rows:
-            return None
-
-        try:
-            tp_rank = int(loc.get("tp_rank", 0))
-        except (TypeError, ValueError):
-            return None
-
-        tp_size = 0
-        try:
-            tp_size = int(qwen_linear_attention_dims.get("tp_size") or 0)
-        except (TypeError, ValueError):
-            tp_size = 0
-        if tp_size <= 0 and slc:
-            try:
-                local_rows = int(slc[0][1]) - int(slc[0][0])
-            except (TypeError, ValueError, IndexError):
-                local_rows = 0
-            if local_rows > 0 and total_rows % local_rows == 0:
-                tp_size = total_rows // local_rows
-        if tp_size <= 0 or tp_rank < 0 or tp_rank >= tp_size:
-            return None
-        if key_dim % tp_size != 0 or value_dim % tp_size != 0:
-            return None
-
-        key_chunk = key_dim // tp_size
-        value_chunk = value_dim // tp_size
-        q_start = tp_rank * key_chunk
-        k_start = key_dim + tp_rank * key_chunk
-        v_start = 2 * key_dim + tp_rank * value_chunk
-        return torch.cat(
-            [
-                full_tensor.narrow(0, q_start, key_chunk),
-                full_tensor.narrow(0, k_start, key_chunk),
-                full_tensor.narrow(0, v_start, value_chunk),
-            ],
-            dim=0,
-        ).contiguous()
 
     @staticmethod
     def _normalize_source_for_locator(

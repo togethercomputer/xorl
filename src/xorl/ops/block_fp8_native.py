@@ -85,35 +85,6 @@ def unpack_float32_as_fp8(packed: torch.Tensor, shape: tuple[int, ...]) -> torch
     return packed.contiguous().view(torch.uint8).view(_FP8_DTYPE).reshape(shape)
 
 
-def validate_native_fp8_state_metadata(
-    module: nn.Module,
-    metadata: dict[str, tuple[torch.dtype, tuple[int, ...]]],
-    *,
-    prefix: str = "",
-) -> None:
-    """Fail before DCP load if serialized dtype/shape metadata can cast bytes.
-
-    DCP callers must build ``metadata`` from the checkpoint reader before
-    invoking ``set_model_state_dict``.  State-dict hooks below cover ordinary
-    ``load_state_dict``; this preflight covers loaders that copy shards without
-    calling module hooks.
-    """
-
-    expected = {
-        f"{prefix}{name}": (parameter.dtype, tuple(parameter.shape))
-        for name, parameter in module.named_parameters()
-        if "packed_weight_f32" in name or name.endswith("weight_scale_inv")
-    }
-    missing = sorted(set(expected) - set(metadata))
-    mismatched = {
-        name: (metadata[name], contract)
-        for name, contract in expected.items()
-        if name in metadata and metadata[name] != contract
-    }
-    if missing or mismatched:
-        raise ValueError(f"Native FP8 DCP metadata mismatch: missing={missing[:8]} mismatched={mismatched}")
-
-
 def validate_native_fp8_dcp_checkpoint(
     checkpoint_path: str,
     expected_state: dict[str, torch.Tensor],
@@ -370,5 +341,4 @@ __all__ = [
     "pack_fp8_as_float32",
     "unpack_float32_as_fp8",
     "validate_native_fp8_dcp_checkpoint",
-    "validate_native_fp8_state_metadata",
 ]

@@ -32,7 +32,7 @@ def _fp8_values(shape):
     return (((values % 31) - 15).to(torch.float32).reshape(shape)).to(torch.float8_e4m3fn)
 
 
-def test_hf_config_preserves_quantization_metadata_and_roundtrips():
+def _assert_hf_config_preserves_quantization_metadata_and_roundtrips():
     hf_config = SimpleNamespace(
         hidden_size=256,
         intermediate_size=512,
@@ -50,20 +50,17 @@ def test_hf_config_preserves_quantization_metadata_and_roundtrips():
     assert validate_glm52_native_fp8_config(restored.quantization_config)["weight_block_size"] == [128, 128]
 
 
-@pytest.mark.parametrize(
-    "field,value",
-    [
+def _assert_native_config_rejects_nonofficial_contract():
+    for field, value in (
         ("quant_method", "int8"),
         ("fmt", "e5m2"),
         ("activation_scheme", "static"),
         ("weight_block_size", [64, 128]),
-    ],
-)
-def test_native_config_rejects_nonofficial_contract(field, value):
-    config = dict(OFFICIAL_QUANT_CONFIG)
-    config[field] = value
-    with pytest.raises(ValueError, match="Unsupported"):
-        validate_glm52_native_fp8_config(config)
+    ):
+        config = dict(OFFICIAL_QUANT_CONFIG)
+        config[field] = value
+        with pytest.raises(ValueError, match="Unsupported"):
+            validate_glm52_native_fp8_config(config)
 
 
 class _TinyNativeModel(nn.Module):
@@ -72,7 +69,7 @@ class _TinyNativeModel(nn.Module):
         self.proj = NativeBlockFP8Linear(256, 384)
 
 
-def test_pair_buffer_emits_exact_dcp_visible_parameter_names_and_bytes():
+def _assert_pair_buffer_emits_exact_dcp_visible_parameter_names_and_bytes():
     model = _TinyNativeModel()
     buffer = NativeBlockFP8PairBuffer(model, {"official.proj": "proj"})
     weight = _fp8_values((384, 256))
@@ -89,7 +86,7 @@ def test_pair_buffer_emits_exact_dcp_visible_parameter_names_and_bytes():
     assert set(model.state_dict()) == {"proj.packed_weight_f32", "proj.weight_scale_inv"}
 
 
-def test_pair_buffer_fails_closed_on_missing_duplicate_and_bad_scale():
+def _assert_pair_buffer_fails_closed_on_missing_duplicate_and_bad_scale():
     model = _TinyNativeModel()
     weight = _fp8_values((384, 256))
     scale = torch.ones(3, 2, dtype=torch.float32)
@@ -110,7 +107,7 @@ def test_pair_buffer_fails_closed_on_missing_duplicate_and_bad_scale():
         bad_scale.try_consume("official.proj.weight_scale_inv", scale.to(torch.bfloat16))
 
 
-def test_pair_buffer_rejects_noninjective_target_mapping():
+def _assert_pair_buffer_rejects_noninjective_target_mapping():
     model = _TinyNativeModel()
     with pytest.raises(ValueError, match="duplicate targets"):
         NativeBlockFP8PairBuffer(
@@ -156,7 +153,7 @@ def _tiny_native_config():
     )
 
 
-def test_model_replaces_only_quantized_dense_shared_and_expert_modules():
+def _assert_model_replaces_only_quantized_dense_shared_and_expert_modules():
     model = Glm5ForCausalLM(_tiny_native_config())
     modules = dict(model.named_modules())
 
@@ -173,7 +170,7 @@ def test_model_replaces_only_quantized_dense_shared_and_expert_modules():
     )
 
 
-def test_sparse_mla_native_kv_weight_uses_module_forward_and_preserves_layout():
+def _assert_sparse_mla_native_kv_weight_uses_module_forward_and_preserves_layout():
     class MaterializingNativeLinear(NativeBlockFP8Linear):
         def __init__(self):
             super().__init__(4, 16)
@@ -203,7 +200,7 @@ def test_sparse_mla_native_kv_weight_uses_module_forward_and_preserves_layout():
     assert torch.equal(w_vc, expected[:, 4:])
 
 
-def test_canonical_router_uses_serving_dispatch_and_defers_routed_scale(monkeypatch):
+def test_canonical_router_and_native_expert_runtime_policy(monkeypatch):
     model = Glm5ForCausalLM(_tiny_native_config())
     block = model.model.layers[1].mlp
     hidden = torch.linspace(-1, 1, steps=2 * block.config.hidden_size, dtype=torch.bfloat16).reshape(
@@ -245,6 +242,8 @@ def test_canonical_router_uses_serving_dispatch_and_defers_routed_scale(monkeypa
         "routed_scaling_factor": 2.5,
     }
 
+    _assert_glm_expert_state_is_frozen_exact_and_scoring_only()
+
 
 class _TinyExpertModel(nn.Module):
     def __init__(self, num_experts=4):
@@ -255,7 +254,7 @@ class _TinyExpertModel(nn.Module):
         self.model.layers[0].mlp.experts = Glm52NativeBlockFP8Experts(num_experts, 256, 128)
 
 
-def test_glm_expert_state_is_frozen_exact_and_scoring_only():
+def _assert_glm_expert_state_is_frozen_exact_and_scoring_only():
     module = Glm52NativeBlockFP8Experts(2, 256, 128)
     gate_up = _fp8_values((2, 256, 256))
     gate_up_scale = torch.arange(8, dtype=torch.float32).reshape(2, 2, 2) / 11
@@ -277,7 +276,7 @@ def test_glm_expert_state_is_frozen_exact_and_scoring_only():
         module(hidden.detach(), routing)
 
 
-def test_expert_pair_buffer_fuses_local_gate_up_down_bytes_and_scales():
+def _assert_expert_pair_buffer_fuses_local_gate_up_down_bytes_and_scales():
     model = _TinyExpertModel()
     buffer = NativeBlockFP8ExpertPairBuffer(model, ep_rank=1, ep_size=2, num_experts=4)
     pieces = {}
@@ -321,14 +320,14 @@ def test_expert_pair_buffer_fuses_local_gate_up_down_bytes_and_scales():
     assert result[next(k for k in result if k.endswith("gate_up_weight_scale_inv"))].dtype is torch.float32
 
 
-def test_expert_pair_buffer_rejects_bad_rank_and_target_count():
+def _assert_expert_pair_buffer_rejects_bad_rank_and_target_count():
     with pytest.raises(ValueError, match="Invalid"):
         NativeBlockFP8ExpertPairBuffer(_TinyExpertModel(), ep_rank=2, ep_size=2, num_experts=4)
     with pytest.raises(ValueError, match="declares 2 experts"):
         NativeBlockFP8ExpertPairBuffer(_TinyExpertModel(num_experts=2), ep_rank=0, ep_size=2, num_experts=4)
 
 
-def test_grouped_dense_and_expert_handlers_own_disjoint_native_pair_families():
+def _assert_grouped_dense_and_expert_handlers_own_disjoint_native_pair_families():
     model = Glm5ForCausalLM(_tiny_native_config())
     dense_handler = model.get_checkpoint_handler(
         ep_rank=0,
@@ -402,3 +401,16 @@ def test_grouped_dense_and_expert_handlers_own_disjoint_native_pair_families():
     assert expert_skip is not None
     assert expert_skip("model.layers.1.mlp.experts.2.gate_proj.weight")
     assert not expert_skip("model.layers.1.mlp.experts.1.gate_proj.weight")
+
+
+def test_glm52_native_fp8_configuration_model_buffer_and_checkpoint_contract():
+    _assert_hf_config_preserves_quantization_metadata_and_roundtrips()
+    _assert_native_config_rejects_nonofficial_contract()
+    _assert_model_replaces_only_quantized_dense_shared_and_expert_modules()
+    _assert_sparse_mla_native_kv_weight_uses_module_forward_and_preserves_layout()
+    _assert_pair_buffer_emits_exact_dcp_visible_parameter_names_and_bytes()
+    _assert_pair_buffer_fails_closed_on_missing_duplicate_and_bad_scale()
+    _assert_pair_buffer_rejects_noninjective_target_mapping()
+    _assert_expert_pair_buffer_fuses_local_gate_up_down_bytes_and_scales()
+    _assert_expert_pair_buffer_rejects_bad_rank_and_target_count()
+    _assert_grouped_dense_and_expert_handlers_own_disjoint_native_pair_families()

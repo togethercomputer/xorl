@@ -1,6 +1,5 @@
 """Tests for checkpoint-manager save failure handling."""
 
-import importlib.util
 import json
 from pathlib import Path
 
@@ -8,16 +7,10 @@ import pytest
 import torch
 import torch.nn as nn
 
+import xorl.server.runner.checkpoint.manager as checkpoint_manager_module
 from xorl.server.runner.adapters.manager import LoRAAdapterManager
+from xorl.server.runner.checkpoint.manager import CheckpointManager
 from xorl.server.session_spec import normalize_session_spec
-
-
-_MODULE_PATH = Path(__file__).resolve().parents[3] / "src" / "xorl" / "server" / "runner" / "checkpoint" / "manager.py"
-_SPEC = importlib.util.spec_from_file_location("xorl_test_checkpoint_manager", _MODULE_PATH)
-assert _SPEC is not None and _SPEC.loader is not None
-_MODULE = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(_MODULE)
-CheckpointManager = _MODULE.CheckpointManager
 
 
 pytestmark = [pytest.mark.cpu, pytest.mark.server]
@@ -53,10 +46,6 @@ class _FakeAdapterState:
                 "optimizer_kwargs": {},
             },
         }
-
-    @property
-    def lora_params(self):
-        return self.local_params
 
 
 class _FakeAdapterManager:
@@ -176,7 +165,20 @@ def _build_fast_save_manager(tmp_path: Path) -> CheckpointManager:
     return manager
 
 
-def test_save_adapter_state_raises_before_barrier_when_rank0_write_fails(monkeypatch, tmp_path):
+def test_checkpoint_save_admission_failure_and_live_adapter_state_policy(monkeypatch, tmp_path):
+    with monkeypatch.context() as failure_patch:
+        _assert_checkpoint_save_failure_and_factor_only_admission_policy(failure_patch, tmp_path)
+    with monkeypatch.context() as live_state_patch:
+        _assert_lora_save_uses_live_dense_and_moe_adapter_state(live_state_patch, tmp_path)
+
+
+def _assert_checkpoint_save_failure_and_factor_only_admission_policy(monkeypatch, tmp_path):
+    with monkeypatch.context() as case_patch:
+        _assert_exact_active_lora_rejects_full_snapshot_paths_before_downstream_work(
+            case_patch,
+            tmp_path / "factor-only",
+        )
+
     manager = _build_checkpoint_manager()
     manager._save_lora_weights = lambda path, model_id, **kwargs: None
     manager._sync_collective_error = lambda error: error
@@ -186,24 +188,37 @@ def test_save_adapter_state_raises_before_barrier_when_rank0_write_fails(monkeyp
 
     monkeypatch.setattr(manager, "_write_adapter_training_artifacts", _fail_write)
     monkeypatch.setattr(
-        _MODULE.dist, "barrier", lambda: (_ for _ in ()).throw(AssertionError("barrier should not run"))
+        checkpoint_manager_module.dist,
+        "barrier",
+        lambda: (_ for _ in ()).throw(AssertionError("barrier should not run")),
     )
 
     with pytest.raises(RuntimeError, match="Adapter state save failed: disk full"):
         manager.save_adapter_state("policy-a", path=str(tmp_path / "adapter-save"), save_optimizer=True)
 
+    manager = _build_checkpoint_manager()
+    manager._sync_collective_error = lambda error: error
 
-def test_exact_active_lora_rejects_full_snapshot_paths_before_downstream_work(monkeypatch, tmp_path):
+    def _fail_save(*args, **kwargs):
+        raise PermissionError("peft write failed")
+
+    monkeypatch.setattr(manager, "_save_lora_weights", _fail_save)
+
+    with pytest.raises(RuntimeError, match="LoRA-only save failed: peft write failed"):
+        manager.save_lora_only(str(tmp_path / "adapter-export"), model_id="policy-a")
+
+
+def _assert_exact_active_lora_rejects_full_snapshot_paths_before_downstream_work(monkeypatch, tmp_path):
     manager = object.__new__(CheckpointManager)
     manager.model = nn.Sequential(_ExactActiveLoRAComponent())
 
     monkeypatch.setattr(
-        _MODULE,
+        checkpoint_manager_module,
         "get_parallel_state",
         lambda: (_ for _ in ()).throw(AssertionError("parallel-state resolution must not run")),
     )
     monkeypatch.setattr(
-        _MODULE,
+        checkpoint_manager_module,
         "ckpt_to_state_dict",
         lambda **_kwargs: (_ for _ in ()).throw(AssertionError("checkpoint conversion must not run")),
     )
@@ -212,50 +227,12 @@ def test_exact_active_lora_rejects_full_snapshot_paths_before_downstream_work(mo
         manager.save_full_weights(str(tmp_path / "full"))
     with pytest.raises(RuntimeError, match="factor-only adapter publication"):
         manager.save_weights_for_sampler(str(tmp_path / "checkpoint"), str(tmp_path / "sampler"))
+    ordinary_manager = object.__new__(CheckpointManager)
+    ordinary_manager.model = nn.Linear(2, 2)
+    ordinary_manager._require_factor_only_exact_active_lora("ordinary save")
 
 
-def test_factor_only_snapshot_guard_leaves_ordinary_models_unrestricted():
-    manager = object.__new__(CheckpointManager)
-    manager.model = nn.Linear(2, 2)
-
-    manager._require_factor_only_exact_active_lora("ordinary save")
-
-
-def test_save_adapter_state_requests_dtype_preserving_lora_checkpoint(monkeypatch, tmp_path):
-    manager = _build_checkpoint_manager()
-    captured = {}
-
-    def _capture_save_lora_weights(path, model_id, **kwargs):
-        captured["path"] = path
-        captured["model_id"] = model_id
-        captured.update(kwargs)
-
-    monkeypatch.setattr(manager, "_save_lora_weights", _capture_save_lora_weights)
-    monkeypatch.setattr(manager, "_write_adapter_training_artifacts", lambda *args, **kwargs: None)
-
-    manager.save_adapter_state("policy-a", path=str(tmp_path / "adapter-save"), save_optimizer=True)
-
-    assert captured["model_id"] == "policy-a"
-    assert captured["preserve_lora_dtype"] is True
-
-
-def test_save_lora_only_raises_before_barrier_when_rank0_write_fails(monkeypatch, tmp_path):
-    manager = _build_checkpoint_manager()
-    manager._sync_collective_error = lambda error: error
-
-    def _fail_save(*args, **kwargs):
-        raise PermissionError("peft write failed")
-
-    monkeypatch.setattr(manager, "_save_lora_weights", _fail_save)
-    monkeypatch.setattr(
-        _MODULE.dist, "barrier", lambda: (_ for _ in ()).throw(AssertionError("barrier should not run"))
-    )
-
-    with pytest.raises(RuntimeError, match="LoRA-only save failed: peft write failed"):
-        manager.save_lora_only(str(tmp_path / "adapter-export"), model_id="policy-a")
-
-
-def test_fast_lora_save_uses_live_adapter_target_modules_not_requested_config(tmp_path):
+def _assert_lora_save_uses_live_dense_and_moe_adapter_state(monkeypatch, tmp_path):
     manager = _build_fast_save_manager(tmp_path)
 
     export_dir = tmp_path / "adapter-export"
@@ -265,8 +242,11 @@ def test_fast_lora_save_uses_live_adapter_target_modules_not_requested_config(tm
 
     assert sorted(adapter_config["target_modules"]) == ["o_proj"]
 
+    with monkeypatch.context() as case_patch:
+        _assert_moe_lora_save_uses_collective_state_and_resolved_targets(case_patch, tmp_path / "moe")
 
-def test_moe_lora_save_uses_collective_gather_even_with_adapter_manager(monkeypatch, tmp_path):
+
+def _assert_moe_lora_save_uses_collective_state_and_resolved_targets(monkeypatch, tmp_path):
     manager = _build_checkpoint_manager()
     manager.model = nn.Module()
     manager.model_config = {"model_path": "Qwen/Qwen3-8B"}
@@ -288,7 +268,7 @@ def test_moe_lora_save_uses_collective_gather_even_with_adapter_manager(monkeypa
     def _capture_save_lora_checkpoint(**kwargs):
         captured.update(kwargs)
 
-    monkeypatch.setattr(_MODULE, "save_lora_checkpoint", _capture_save_lora_checkpoint)
+    monkeypatch.setattr(checkpoint_manager_module, "save_lora_checkpoint", _capture_save_lora_checkpoint)
 
     manager._save_lora_weights(str(tmp_path / "moe-export"), "policy-a")
 
@@ -305,8 +285,6 @@ def test_moe_lora_save_uses_collective_gather_even_with_adapter_manager(monkeypa
     )
     assert captured["r"] == 4
 
-
-def test_moe_lora_save_uses_resolved_target_modules_for_detection(monkeypatch, tmp_path):
     manager = _build_checkpoint_manager()
 
     class _ModelWithStackedMoELoRA:
@@ -330,7 +308,7 @@ def test_moe_lora_save_uses_resolved_target_modules_for_detection(monkeypatch, t
     def _capture_save_lora_checkpoint(**kwargs):
         captured.update(kwargs)
 
-    monkeypatch.setattr(_MODULE, "save_lora_checkpoint", _capture_save_lora_checkpoint)
+    monkeypatch.setattr(checkpoint_manager_module, "save_lora_checkpoint", _capture_save_lora_checkpoint)
 
     manager._save_lora_weights(str(tmp_path / "moe-export"), "policy-a")
 
@@ -340,60 +318,3 @@ def test_moe_lora_save_uses_resolved_target_modules_for_detection(monkeypatch, t
         collective_state["model.layers.0.mlp.experts.gate_proj_lora_A"],
     )
     assert captured["r"] == 4
-
-
-def test_lora_save_forwards_export_format(monkeypatch, tmp_path):
-    manager = object.__new__(CheckpointManager)
-    manager.rank = 0
-    manager.local_rank = 0
-    manager.model = nn.Module()
-    manager.model_config = {"model_path": "Qwen/Qwen3-8B"}
-    manager._adapter_manager = None
-    manager.lora_target_modules = ["gate_proj", "up_proj", "down_proj"]
-    manager.lora_alpha_value = 16
-    manager.lora_config = {
-        "enable_lora": True,
-        "moe_hybrid_shared_lora": True,
-        "lora_rank": 4,
-        "lora_alpha": 16,
-        "lora_export_format": "sglang_shared_outer",
-    }
-
-    monkeypatch.setattr(_MODULE, "get_lora_state_dict", lambda model: {})
-
-    captured = {}
-
-    def _capture_save_lora_checkpoint(**kwargs):
-        captured.update(kwargs)
-
-    monkeypatch.setattr(_MODULE, "save_lora_checkpoint", _capture_save_lora_checkpoint)
-
-    manager._save_lora_weights(str(tmp_path / "sglang-export"), "default")
-
-    assert captured["lora_export_format"] == "sglang_shared_outer"
-
-
-def test_adapter_training_artifacts_include_strict_target_manifest(tmp_path):
-    manager = _build_checkpoint_manager()
-    manifest = {
-        "schema_version": 1,
-        "config_rank": 4,
-        "config_alpha": 16.0,
-        "target_modules": ["o_proj"],
-        "expected_modules": [{"pattern": "model.layers.*.self_attn.o_proj", "count": 1, "rank": 4}],
-        "allow_unlisted": False,
-        "source_lora_key_fingerprint": "a" * 64,
-        "source_lora_shape_fingerprint": "b" * 64,
-    }
-    manager.lora_config["lora_target_manifest"] = manifest
-
-    manager._write_adapter_training_artifacts(
-        str(tmp_path),
-        "policy-a",
-        manager._adapter_manager.get_adapter_state("policy-a"),
-        save_optimizer=True,
-    )
-
-    metadata = json.loads((tmp_path / "metadata.json").read_text())
-    assert metadata["optimizer_format"] == "sharded_v3"
-    assert json.loads((tmp_path / "lora_target_manifest.json").read_text()) == manifest

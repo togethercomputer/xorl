@@ -62,11 +62,6 @@ def test_with_dataset(fake_text_dataset):
     sample = fake_text_dataset[0]
     assert sample["input_ids"].shape == (128,)
 
-def test_with_packed_dataset(fake_packed_dataset):
-    # FakePackedDataset: 100 samples, 3 packed seqs each, position_ids included
-    sample = fake_packed_dataset[0]
-    assert "position_ids" in sample
-
 def test_with_collator_input(sample_features):
     # List of 2 dicts with input_ids, attention_mask, labels (len=5)
     assert len(sample_features) == 2

@@ -92,7 +92,6 @@ def _apply_qwen35_gdn_exact(model: torch.nn.Module) -> dict[str, int]:
             module._exact_batch_invariant_router = is_moe
             module.router._exact_batch_invariant = is_moe
             module.router.synthetic_routing_mode = None
-            module.router.topk_policy = "default"
 
     if not norm_modules:
         raise RuntimeError("Exact Qwen model construction produced no resolved zero-centered RMSNorm modules.")

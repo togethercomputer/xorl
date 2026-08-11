@@ -1,16 +1,13 @@
-from typing import Any, Callable, Dict, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, Sequence
 
 
 class CollatePipeline:
-    def __init__(self, data_collators: Optional[Union[Callable, List[Callable]]] = None):
+    def __init__(self, data_collators: Sequence[Callable]):
         """
         Args:
-            data_collators: a list of data collators or a single data collator
+            data_collators: collators to apply in order
         """
-
-        if not isinstance(data_collators, (list, tuple)):
-            data_collators = [data_collators]
-        self.data_collators = data_collators
+        self.data_collators = list(data_collators)
 
     def __call__(self, batch: Sequence[Dict[str, Any]]):
         """

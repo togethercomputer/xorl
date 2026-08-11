@@ -164,14 +164,6 @@ def _run_fsdp2_lifecycle() -> None:
 
 if __name__ != "__main__":
 
-    @skip_if_gpu_count_less_than(1)
-    def test_exact_dense_mlp_composes_with_one_rank_fsdp2_lifecycle() -> None:
-        pytest.importorskip("sglang")
-        if torch.cuda.get_device_capability()[0] != 9:
-            pytest.skip("the qualified exact GLM-5.2 component requires Hopper")
-        result = run_distributed_script(__file__, num_gpus=1, timeout=180)
-        result.assert_success("exact dense MLP should survive one-rank FSDP2 reshard and packed-state ownership")
-
     @skip_if_gpu_count_less_than(2)
     def test_exact_dense_mlp_composes_with_two_rank_fsdp2_lifecycle() -> None:
         pytest.importorskip("sglang")

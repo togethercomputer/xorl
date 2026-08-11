@@ -19,7 +19,6 @@ such as Qwen3-8B use the trainer's qwen3/qwen2 dense-decoder path.
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from typing import Any
 
 
@@ -1310,50 +1309,6 @@ def build_model_analytical_coverage(
         "memory_residual_attribution": attribution,
         "communication_ledger": comm,
     }
-
-
-def reference_counter_total_flops(
-    metadata: ModelMetadata,
-    topology: Topology,
-    *,
-    seq_len: int | None = None,
-    batch_seqlens: list[int] | None = None,
-) -> float | None:
-    """Total FLOPs from the *actual* trainer ``XorlFlopsCounter`` (transcription ground truth).
-
-    Returns None if xorl is not importable. Used by tests to assert the analytical ledger reproduces
-    the trainer's convention EXACTLY, which is the only honest validation of FLOPs (they are a logged
-    convention, not a hardware measurement).
-    """
-    seq = _seq_len(topology, seq_len)
-    if seq is None and not batch_seqlens:
-        return None
-    try:
-        from xorl.utils.count_flops import XorlFlopsCounter  # noqa: PLC0415 (lazy: xorl optional/heavy)
-    except Exception:  # pragma: no cover - xorl not importable in this context
-        return None
-    cfg = SimpleNamespace(
-        model_type="qwen3_moe" if metadata.moe_intermediate_size is not None else "qwen3",
-        hidden_size=metadata.hidden_size,
-        vocab_size=metadata.vocab_size,
-        intermediate_size=metadata.intermediate_size,
-        moe_intermediate_size=metadata.moe_intermediate_size,
-        num_hidden_layers=metadata.num_hidden_layers,
-        num_key_value_heads=metadata.num_key_value_heads,
-        num_attention_heads=metadata.num_attention_heads,
-        num_experts=metadata.num_experts,
-        num_experts_per_tok=metadata.top_k,
-        head_dim=metadata.head_dim,
-    )
-    counter = XorlFlopsCounter(cfg, gradient_checkpointing_enabled=False)
-    if batch_seqlens is None:
-        batch_seqlens = [seq] * topology.global_batch_size
-    tokens_sum = sum(batch_seqlens)
-    if cfg.model_type == "qwen3_moe":
-        tflops = counter._estimate_qwen3_moe_flops(tokens_sum, batch_seqlens, delta_time=1.0)
-    else:
-        tflops = counter._estimate_qwen2_flops(tokens_sum, batch_seqlens, delta_time=1.0)
-    return float(tflops) * 1e12
 
 
 def hardware_flops_ledger(ledger: dict[str, Any], train: dict[str, Any]) -> dict[str, Any]:

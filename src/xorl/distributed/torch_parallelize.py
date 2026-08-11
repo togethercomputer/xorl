@@ -273,22 +273,6 @@ def _sequence_parallel_fully_folded_into_fsdp(parallel_state) -> bool:
     )
 
 
-def _coerce_optional_bool_config(value: Any, *, name: str) -> Optional[bool]:
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, int) and value in (0, 1):
-        return bool(value)
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized in {"1", "true", "yes", "y", "on"}:
-            return True
-        if normalized in {"0", "false", "no", "n", "off"}:
-            return False
-    raise ValueError(f"{name} must be a boolean value, got {value!r}.")
-
-
 def _configure_manual_fsdp_prefetch(
     blocks: List["nn.Module"],
     *,
@@ -341,17 +325,14 @@ def parallelize_model_fsdp2(
     4. Result: Expert params [32,H/fsdp_size,I], regular params use standard FSDP2
     """
     parallel_state = get_parallel_state()
-    enable_manual_forward_prefetch = _coerce_optional_bool_config(
-        kwargs.pop("enable_forward_prefetch", True),
-        name="enable_forward_prefetch",
-    )
-    if enable_manual_forward_prefetch is None:
-        enable_manual_forward_prefetch = True
+    enable_manual_forward_prefetch = kwargs.pop("enable_forward_prefetch", True)
+    if not isinstance(enable_manual_forward_prefetch, bool):
+        raise ValueError(f"enable_forward_prefetch must be a boolean value, got {enable_manual_forward_prefetch!r}.")
     enable_manual_backward_prefetch_arg = kwargs.pop("enable_backward_prefetch", None)
-    enable_manual_backward_prefetch_arg = _coerce_optional_bool_config(
-        enable_manual_backward_prefetch_arg,
-        name="enable_backward_prefetch",
-    )
+    if enable_manual_backward_prefetch_arg is not None and not isinstance(enable_manual_backward_prefetch_arg, bool):
+        raise ValueError(
+            f"enable_backward_prefetch must be a boolean value, got {enable_manual_backward_prefetch_arg!r}."
+        )
     enable_manual_backward_prefetch = (
         enable_manual_forward_prefetch
         if enable_manual_backward_prefetch_arg is None

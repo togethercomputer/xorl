@@ -43,7 +43,10 @@ def _build_packed(seqs):
     }
 
 
-def test_detect_groups_shared_and_singleton():
+def test_repack_and_remap_preserve_groups_layout_and_loss_fields():
+    no_shared_prefix = _build_packed([([1, 2], [3, 4]), ([5, 6], [7, 8])])
+    assert shared_prefix_repack_batch(no_shared_prefix) is None
+
     seqs = [
         ([10, 11, 12], [20, 21]),
         ([10, 11, 12], [22, 23, 24]),
@@ -55,20 +58,6 @@ def test_detect_groups_shared_and_singleton():
     assert groups == [[0, 1, 2], [3]]
     assert prompt_lens == [3, 3, 3, 2]
 
-
-def test_no_shared_prefix_returns_none():
-    b = _build_packed([([1, 2], [3, 4]), ([5, 6], [7, 8])])
-    assert shared_prefix_repack_batch(b) is None
-
-
-def test_repack_layout_and_compression():
-    seqs = [
-        ([10, 11, 12], [20, 21]),
-        ([10, 11, 12], [22, 23, 24]),
-        ([10, 11, 12], [25]),
-        ([30, 31], [40, 41, 42]),
-    ]
-    b = _build_packed(seqs)
     out = shared_prefix_repack_batch(b)
     assert out is not None
     ctx: SharedPrefixContext = out["shared_prefix_context"]
@@ -91,16 +80,6 @@ def test_repack_layout_and_compression():
     # every decoded token participates in cross (both groups have P>=2)
     assert ctx.cross_local_idx.tolist() == list(range(13))
 
-
-def test_repack_loss_fields_and_token_roundtrip():
-    seqs = [
-        ([10, 11, 12], [20, 21]),
-        ([10, 11, 12], [22, 23, 24]),
-        ([30, 31], [40, 41, 42]),
-    ]
-    b = _build_packed(seqs)
-    out = shared_prefix_repack_batch(b)
-    ctx = out["shared_prefix_context"]
     orig_ids = b["input_ids"].squeeze(0)
     rep_ids = out["input_ids"].squeeze(0)
 
@@ -115,17 +94,6 @@ def test_repack_loss_fields_and_token_roundtrip():
     # cu_seq_lens dropped (shared-prefix backend drives attention from the context)
     assert "cu_seq_lens_q" not in out
 
-
-def test_remap_to_original_round_trips():
-    seqs = [
-        ([10, 11, 12], [20, 21]),
-        ([10, 11, 12], [22, 23, 24]),
-        ([30, 31], [40, 41, 42]),
-    ]
-    b = _build_packed(seqs)
-    out = shared_prefix_repack_batch(b)
-    ctx = out["shared_prefix_context"]
-
     # a per-token tensor in repacked order, remapped back to original layout
     rep = torch.arange(ctx.repacked_len, dtype=torch.float32).unsqueeze(0)
     orig = shared_prefix_remap_to_original(rep, ctx, fill=-1.0)
@@ -135,8 +103,10 @@ def test_remap_to_original_round_trips():
     interior = [i for i in range(ctx.orig_len) if i not in set(ctx.dec_orig_idx.tolist())]
     assert all(orig.squeeze(0)[i].item() == -1.0 for i in interior)
 
+    _assert_p_equals_one_group_has_empty_shared_block()
 
-def test_p_equals_one_group_has_empty_shared_block():
+
+def _assert_p_equals_one_group_has_empty_shared_block():
     # prompt is a single token shared by 2 members -> shared block empty, cross skipped
     seqs = [([7], [20, 21]), ([7], [22, 23])]
     b = _build_packed(seqs)

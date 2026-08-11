@@ -83,10 +83,6 @@ def block_fp8_quantize(
     return y, s
 
 
-# Backward-compat alias
-block_fp8_quant = block_fp8_quantize
-
-
 # ---------------------------------------------------------------------------
 # 1D dequantization kernel + wrapper
 # ---------------------------------------------------------------------------
@@ -128,10 +124,6 @@ def block_fp8_dequantize(y: torch.Tensor, s: torch.Tensor, block_size: int = 128
 
     _block_fp8_dequantize_kernel[grid](y, s, x, BLOCK_SIZE=block_size)
     return x
-
-
-# Backward-compat alias
-block_fp8_dequant = block_fp8_dequantize
 
 
 # ---------------------------------------------------------------------------

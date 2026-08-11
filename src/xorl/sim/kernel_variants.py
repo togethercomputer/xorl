@@ -67,31 +67,6 @@ def rank_kernel_variants(
     }
 
 
-def compare_kernel_variants(
-    baseline: KernelVariantMeasurement | dict[str, Any],
-    candidate: KernelVariantMeasurement | dict[str, Any],
-) -> dict[str, Any]:
-    base = _measurement(baseline)
-    other = _measurement(candidate)
-    if (base.family, base.workload) != (other.family, other.workload):
-        raise ValueError("kernel variants must share one family and one workload")
-    return {
-        "family": base.family,
-        "workload": base.workload,
-        "baseline": base.variant,
-        "candidate": other.variant,
-        "latency_delta_ms": round(other.latency_ms - base.latency_ms, 6),
-        "latency_delta_percent": round((other.latency_ms / base.latency_ms - 1.0) * 100.0, 6),
-        "speedup": round(base.latency_ms / other.latency_ms, 6),
-        "peak_memory_delta_gb": (
-            round(other.peak_memory_gb - base.peak_memory_gb, 6)
-            if base.peak_memory_gb is not None and other.peak_memory_gb is not None
-            else None
-        ),
-        "candidate_promotable": other.promotable,
-    }
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("measurements", type=Path, help="JSON list of kernel-variant measurements")

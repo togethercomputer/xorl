@@ -57,7 +57,7 @@ def _pattern(
     )
 
 
-def test_absorbed_kv_b_contract_keeps_one_frozen_native_base_and_two_logical_masters() -> None:
+def test_absorbed_kv_b_cpu_state_and_admission_policy() -> None:
     module = _module()
 
     assert isinstance(module, NativeBlockFP8Linear)
@@ -101,8 +101,11 @@ def test_absorbed_kv_b_contract_keeps_one_frozen_native_base_and_two_logical_mas
     with pytest.raises(ValueError, match="only rank=1 and alpha=1"):
         module.set_runtime_lora_config(1, 2)
 
+    _assert_absorbed_kv_b_dtype_move_preserves_native_bytes_master_values_and_identity()
+    _assert_absorbed_kv_b_rejects_direct_projection_and_castable_factor_state()
 
-def test_absorbed_kv_b_dtype_move_preserves_native_bytes_master_values_and_identity() -> None:
+
+def _assert_absorbed_kv_b_dtype_move_preserves_native_bytes_master_values_and_identity() -> None:
     module = _module()
     with torch.no_grad():
         module.packed_weight_f32.copy_(
@@ -123,7 +126,7 @@ def test_absorbed_kv_b_dtype_move_preserves_native_bytes_master_values_and_ident
         assert torch.equal(parameter, expected[name])
 
 
-def test_absorbed_kv_b_rejects_direct_projection_and_castable_factor_state() -> None:
+def _assert_absorbed_kv_b_rejects_direct_projection_and_castable_factor_state() -> None:
     module = _module()
 
     with pytest.raises(RuntimeError, match="cannot run as a direct projection"):

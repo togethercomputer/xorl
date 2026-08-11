@@ -14,11 +14,8 @@ first training steps and in the qualification replays.
 
 from __future__ import annotations
 
-import hashlib
-import json
 from dataclasses import dataclass
 from enum import Enum, IntEnum
-from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -32,7 +29,6 @@ GLM52_NUM_LAYERS = 78
 
 class ParallelRole(str, Enum):
     TRAINER = "trainer"
-    SAMPLER = "sampler"
     PRIMITIVE_TEST = "primitive_test"
 
 
@@ -161,7 +157,6 @@ class ParallelPlan:
     logical_ordinals_by_group: tuple[tuple[int, ...], ...]
     pipeline_layer_ranges: tuple[tuple[int, int], ...]
     cp_ep_aliases: tuple[tuple[int, int], ...]
-    launcher_tp_size: int | None = None
     contract_version: str = CANONICAL_MOE_REDUCE_VERSION
 
     def __post_init__(self) -> None:
@@ -239,29 +234,6 @@ class ParallelPlan:
                 raise ValueError("GLM-5.2 trainer combine groups must be contiguous groups of cp_size physical ranks")
             if self.logical_ordinals_by_group != (expected_ordinals,) * len(expected_groups):
                 raise ValueError("GLM-5.2 trainer requires identity logical contributor ordinals in every group")
-            if self.launcher_tp_size is not None:
-                raise ValueError("Trainer ParallelPlan does not accept a launcher_tp_size alias")
-        elif self.role is ParallelRole.SAMPLER:
-            expected = (8, 1, 1, 1, 8, 8, 1)
-            actual = (
-                self.world_size,
-                self.pp_size,
-                self.tp_size,
-                self.dp_size,
-                self.cp_size,
-                self.ep_size,
-                self.effective_dense_tp,
-            )
-            if actual != expected:
-                raise ValueError(f"GLM-5.2 sampler topology must be {expected}, got {actual}")
-            if self.pipeline_layer_ranges != ((0, 78),):
-                raise ValueError("GLM-5.2 sampler must own all 78 layers in one pipeline stage")
-            if self.combine_groups != (tuple(range(8)),):
-                raise ValueError("GLM-5.2 sampler combine group must contain physical ranks 0..7")
-            if self.logical_ordinals_by_group != (expected_ordinals,):
-                raise ValueError("GLM-5.2 sampler requires identity logical contributor ordinals")
-            if self.launcher_tp_size != 8:
-                raise ValueError("GLM-5.2 sampler launcher-level tp_size must be exactly 8")
         elif self.role is ParallelRole.PRIMITIVE_TEST:
             if self.world_size != self.cp_size or len(self.combine_groups) != 1:
                 raise ValueError("Primitive plans use one combine group spanning the test world")
@@ -300,25 +272,6 @@ class ParallelPlan:
         )
 
     @classmethod
-    def glm52_sampler(cls, *, launcher_tp_size: int) -> ParallelPlan:
-        identity = tuple(range(8))
-        return cls(
-            role=ParallelRole.SAMPLER,
-            world_size=8,
-            pp_size=1,
-            tp_size=1,
-            dp_size=1,
-            cp_size=8,
-            ep_size=8,
-            effective_dense_tp=1,
-            combine_groups=(identity,),
-            logical_ordinals_by_group=(identity,),
-            pipeline_layer_ranges=((0, 78),),
-            cp_ep_aliases=tuple((rank, rank) for rank in identity),
-            launcher_tp_size=launcher_tp_size,
-        )
-
-    @classmethod
     def primitive(
         cls,
         contributor_count: int,
@@ -347,34 +300,6 @@ class ParallelPlan:
         if len(matches) != 1:
             raise ValueError(f"Physical rank {physical_global_rank} does not belong to exactly one combine group")
         return matches[0]
-
-    def logical_ordinal(self, physical_global_rank: int) -> int:
-        group_index = self.group_index_for_physical_rank(physical_global_rank)
-        group = self.combine_groups[group_index]
-        return self.logical_ordinals_by_group[group_index][group.index(physical_global_rank)]
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "contract_version": self.contract_version,
-            "role": self.role.value,
-            "world_size": self.world_size,
-            "pp_size": self.pp_size,
-            "tp_size": self.tp_size,
-            "dp_size": self.dp_size,
-            "cp_size": self.cp_size,
-            "ep_size": self.ep_size,
-            "effective_dense_tp": self.effective_dense_tp,
-            "launcher_tp_size": self.launcher_tp_size,
-            "combine_groups": self.combine_groups,
-            "logical_ordinals_by_group": self.logical_ordinals_by_group,
-            "pipeline_layer_ranges": self.pipeline_layer_ranges,
-            "cp_ep_aliases": self.cp_ep_aliases,
-        }
-
-    @property
-    def digest(self) -> str:
-        payload = json.dumps(self.as_dict(), sort_keys=True, separators=(",", ":")).encode()
-        return hashlib.sha256(payload).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -532,23 +457,6 @@ def _adjacent_pairwise_bf16(partials: torch.Tensor) -> torch.Tensor:
     while len(level) > 1:
         level = [(level[index] + level[index + 1]).to(torch.bfloat16) for index in range(0, len(level), 2)]
     return level[0]
-
-
-def canonical_moe_reduce_reference(
-    partials_by_logical_ordinal: torch.Tensor,
-    metadata: CanonicalMoEGraphMetadata,
-) -> torch.Tensor:
-    """Executable, non-communicating reference used by independent tests."""
-    if partials_by_logical_ordinal.ndim < 3:
-        raise ValueError("Reference partials must have contributor, row, and payload dimensions")
-    if partials_by_logical_ordinal.shape[1] != metadata.capacity:
-        raise ValueError("Reference partial row count must equal metadata capacity")
-    result = _adjacent_pairwise_bf16(partials_by_logical_ordinal)
-    return torch.where(
-        metadata.valid_mask.view(-1, *([1] * (result.ndim - 1))),
-        result,
-        torch.zeros_like(result),
-    )
 
 
 def _transport_and_fold(
@@ -974,7 +882,6 @@ __all__ = [
     "OutputDistribution",
     "ParallelPlan",
     "ParallelRole",
-    "canonical_moe_reduce_reference",
     "canonical_moe_reduce_packed_ep16_v2",
     "canonical_moe_reduce_cp_sharded_v3",
     "canonical_moe_reduce_v1",

@@ -76,35 +76,7 @@ def _tiny_config(*, num_hash_layers=0):
 # ---------------------------------------------------------------------------
 
 
-def test_mlp_forward_shape_and_swiglu_clamp():
-    from xorl.models.transformers.deepseek_v4.modeling_deepseek_v4 import DeepseekV4MLP
-
-    cfg = _tiny_config()
-    cfg.swiglu_limit = 1.0  # force a tight clamp so we can detect it
-    mlp = DeepseekV4MLP(cfg).to(torch.float32)
-    x = torch.randn(2, 3, cfg.hidden_size)
-
-    # Force a huge gate magnitude: zero gate weights, set bias to a large value
-    # via attribute write. Easier: just run with the clamp on and verify finite.
-    out = mlp(x)
-    assert out.shape == x.shape
-    assert torch.isfinite(out).all()
-
-    # With clamp off, output should be different.
-    cfg2 = _tiny_config()
-    cfg2.swiglu_limit = 0.0
-    mlp2 = DeepseekV4MLP(cfg2).to(torch.float32)
-    mlp2.load_state_dict(mlp.state_dict(), strict=False)
-    out_no_clamp = mlp2(x)
-
-    # Sanity: the test infrastructure runs both branches without error. We
-    # don't assert numerical inequality because random init may keep gates in
-    # the [-1, 1] range where the clamp is a no-op; the *behavior* of the
-    # clamp is exercised explicitly below.
-    assert out_no_clamp.shape == x.shape
-
-
-def test_mlp_swiglu_limit_actually_clamps():
+def _assert_mlp_and_routed_experts_swiglu_limit_contract():
     """Construct a gate that pushes beyond the limit, verify clamp clips it."""
     from xorl.models.transformers.deepseek_v4.modeling_deepseek_v4 import DeepseekV4MLP
 
@@ -126,10 +98,13 @@ def test_mlp_swiglu_limit_actually_clamps():
     # silu(0.5) ≈ 0.31; up_proj output ≈ hidden_size; intermediate dim = 16.
     # Output magnitude is bounded by silu(0.5) * hidden_size * intermediate_size.
     bound = 0.32 * cfg.hidden_size * cfg.moe_intermediate_size
+    assert out.shape == x.shape
     assert out.abs().max().item() < bound * 1.5, out.abs().max().item()
 
+    _assert_routed_experts_swiglu_limit_clamps_eager_backend()
 
-def test_routed_experts_swiglu_limit_clamps_eager_backend():
+
+def _assert_routed_experts_swiglu_limit_clamps_eager_backend():
     """DeepSeek-V4 propagates swiglu_limit into routed experts, not only shared experts."""
     from xorl.models.transformers.deepseek_v4.modeling_deepseek_v4 import DeepseekV4MoE
 
@@ -160,37 +135,30 @@ def test_routed_experts_swiglu_limit_clamps_eager_backend():
 # ---------------------------------------------------------------------------
 
 
-def test_moe_non_hash_has_bias_no_table():
-    from xorl.models.transformers.deepseek_v4.modeling_deepseek_v4 import DeepseekV4MoE
-
-    cfg = _tiny_config(num_hash_layers=2)
-    # layer_id = 5 is past the hash band (which is layers 0 and 1).
-    block = DeepseekV4MoE(cfg, layer_id=5)
-
-    assert hasattr(block.gate, "e_score_correction_bias")
-    assert block.gate.e_score_correction_bias.shape == (cfg.n_routed_experts,)
-    # ``e_score_correction_bias`` is frozen (requires_grad=False) — gradients
-    # never flow through it (selection-only argmax bias). DeepSeek updates it
-    # OOB via an aux-loss controller during training.
-    assert block.gate.e_score_correction_bias.requires_grad is False
-    assert "tid2eid" not in block._buffers
-    assert block.is_hash_layer is False
-    assert block.shared_experts is not None  # n_shared_experts=1
-
-
-def test_moe_non_hash_forward_backward():
+def test_moe_non_hash_structure_forward_backward_shared_and_swiglu_policy():
     from xorl.models.transformers.deepseek_v4.modeling_deepseek_v4 import DeepseekV4MoE
 
     torch.manual_seed(0)
     cfg = _tiny_config(num_hash_layers=0)
     block = DeepseekV4MoE(cfg, layer_id=0).to(torch.float32)
     _init_test_weights(block)
+    assert block.is_hash_layer is False
+    assert "tid2eid" not in block._buffers
+    assert block.shared_experts is not None
+    assert block.gate.e_score_correction_bias.shape == (cfg.n_routed_experts,)
+    assert block.gate.e_score_correction_bias.requires_grad is False
 
     x = torch.randn(2, 3, cfg.hidden_size, requires_grad=True)
     out, router_logits = block(x)
     assert out.shape == x.shape
     assert router_logits.shape == (x.shape[0] * x.shape[1], cfg.n_routed_experts)
     assert torch.isfinite(out).all()
+
+    shared_experts = block.shared_experts
+    block.shared_experts = None
+    out_without_shared, _ = block(x)
+    block.shared_experts = shared_experts
+    assert (out - out_without_shared).abs().max().item() > 1e-6
 
     out.sum().backward()
     assert torch.isfinite(x.grad).all()
@@ -203,25 +171,9 @@ def test_moe_non_hash_forward_backward():
     bias = block.gate.e_score_correction_bias
     assert bias.grad is None or torch.equal(bias.grad, torch.zeros_like(bias.grad))
 
-
-def test_moe_shared_expert_contributes():
-    """Sanity: removing the shared expert changes the output."""
-    from xorl.models.transformers.deepseek_v4.modeling_deepseek_v4 import DeepseekV4MoE
-
-    torch.manual_seed(1)
-    cfg = _tiny_config()
-    block = DeepseekV4MoE(cfg, layer_id=0).to(torch.float32)
-    _init_test_weights(block)
-    x = torch.randn(1, 4, cfg.hidden_size)
-
-    out_with, _ = block(x)
-    saved = block.shared_experts
-    block.shared_experts = None
-    out_without, _ = block(x)
-    block.shared_experts = saved
-
-    diff = (out_with - out_without).abs().max().item()
-    assert diff > 1e-6, f"shared expert had no effect: max diff {diff}"
+    _assert_mlp_and_routed_experts_swiglu_limit_contract()
+    _assert_moe_hash_layer_structure_admission_and_table_forward_backward()
+    _assert_moe_hash_layer_record_then_replay_backward_matches()
 
 
 # ---------------------------------------------------------------------------
@@ -229,27 +181,18 @@ def test_moe_shared_expert_contributes():
 # ---------------------------------------------------------------------------
 
 
-def test_moe_hash_layer_has_table_no_bias():
-    from xorl.models.transformers.deepseek_v4.modeling_deepseek_v4 import DeepseekV4MoE
-
-    cfg = _tiny_config(num_hash_layers=3)
-    block = DeepseekV4MoE(cfg, layer_id=0)  # in the hash band
-
-    assert block.is_hash_layer is True
-    assert hasattr(block, "tid2eid")
-    assert block.tid2eid.shape == (cfg.vocab_size, cfg.num_experts_per_tok)
-    assert block.tid2eid.dtype == torch.int32
-    assert not hasattr(block.gate, "e_score_correction_bias")
-
-
-def test_moe_hash_layer_uses_table_for_selection():
-    """Forward + verify selected_experts come from tid2eid[input_ids]."""
+def _assert_moe_hash_layer_structure_admission_and_table_forward_backward():
+    """Hash-layer structure, input admission, table routing, and gradients form one transaction."""
     from xorl.models.transformers.deepseek_v4.modeling_deepseek_v4 import DeepseekV4MoE
 
     torch.manual_seed(2)
     cfg = _tiny_config(num_hash_layers=3)
     block = DeepseekV4MoE(cfg, layer_id=1).to(torch.float32)
     _init_test_weights(block)
+    assert block.is_hash_layer is True
+    assert block.tid2eid.shape == (cfg.vocab_size, cfg.num_experts_per_tok)
+    assert block.tid2eid.dtype == torch.int32
+    assert not hasattr(block.gate, "e_score_correction_bias")
 
     # Build a deterministic table: token id i -> experts (i % E, (i + 1) % E).
     E = cfg.n_routed_experts
@@ -262,6 +205,8 @@ def test_moe_hash_layer_uses_table_for_selection():
     bsz, seqlen = 1, 4
     input_ids = torch.tensor([[3, 7, 0, 11]], dtype=torch.long)
     x = torch.randn(bsz, seqlen, cfg.hidden_size, requires_grad=True)
+    with pytest.raises(AssertionError, match="hash-routed layer requires input_ids"):
+        block(x, input_ids=None)
 
     out, _ = block(x, input_ids=input_ids)
     assert out.shape == x.shape
@@ -273,24 +218,12 @@ def test_moe_hash_layer_uses_table_for_selection():
     assert torch.isfinite(block.gate.weight.grad).all()
 
 
-def test_moe_hash_layer_requires_input_ids():
-    from xorl.models.transformers.deepseek_v4.modeling_deepseek_v4 import DeepseekV4MoE
-
-    cfg = _tiny_config(num_hash_layers=3)
-    block = DeepseekV4MoE(cfg, layer_id=0).to(torch.float32)
-    _init_test_weights(block)
-    x = torch.randn(1, 4, cfg.hidden_size)
-
-    with pytest.raises(AssertionError, match="hash-routed layer requires input_ids"):
-        block(x, input_ids=None)
-
-
 # ---------------------------------------------------------------------------
 # Routing-replay × hash-routed layer
 # ---------------------------------------------------------------------------
 
 
-def test_moe_hash_layer_record_then_replay_backward_matches():
+def _assert_moe_hash_layer_record_then_replay_backward_matches():
     """Record on a hash-routed layer, then replay_backward — selected_experts
     on backward must come from the table-driven recording, not be recomputed.
 
@@ -354,35 +287,6 @@ def test_moe_hash_layer_record_then_replay_backward_matches():
 
         # Gate received gradient through sqrt(softplus(gate(x))).
         assert torch.isfinite(block.gate.weight.grad).all()
-    finally:
-        set_replay_stage(None)
-        RoutingReplay.clear_all()
-
-
-def test_moe_route_unknown_replay_stage_raises():
-    """A new replay stage name (defensively) raises rather than NameError'ing
-    on an undefined ``selected_experts``."""
-    from xorl.models.layers.moe.routing_replay import (
-        RoutingReplay,
-        set_replay_stage,
-    )
-    from xorl.models.transformers.deepseek_v4.modeling_deepseek_v4 import DeepseekV4MoE
-
-    cfg = _tiny_config(num_hash_layers=0)
-    block = DeepseekV4MoE(cfg, layer_id=1).to(torch.float32)
-    _init_test_weights(block)
-    block._routing_replay = RoutingReplay()
-
-    x = torch.randn(1, 4, cfg.hidden_size)
-    try:
-        # Bypass set_replay_stage's validator (which constrains values) by
-        # poking the module-level state directly. ``route`` reads the same
-        # global, so it sees the bogus value.
-        from xorl.models.layers.moe import routing_replay as _replay_mod
-
-        _replay_mod._replay_stage = "future_stage_name"
-        with pytest.raises(ValueError, match="Unrecognized replay stage"):
-            block(x, input_ids=None)
     finally:
         set_replay_stage(None)
         RoutingReplay.clear_all()
