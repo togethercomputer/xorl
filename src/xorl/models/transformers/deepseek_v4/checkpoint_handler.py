@@ -530,19 +530,11 @@ def load_hf_state_dict_into_model(
                 t = _dequantize_fp8_block(t, hf_state_dict[scale_key], out_dtype=target_dtype)
                 summary.fp8_dequantized += 1
 
-        # APE hotfix undo for C4 layers (compressor.ape and indexer.compressor.ape).
-        if (
-            xorl_name.endswith(".compressor.ape")
-            and m is not None
-            and _is_compress_ratio_4(int(m.group(1)), compress_ratios)
-        ):
-            expected_hd = (
-                indexer_compressor_head_dim
-                if xorl_name.endswith(".indexer.compressor.ape")
-                else attn_compressor_head_dim
-            )
-            t = _undo_ape_hotfix(t, expected_head_dim=expected_hd)
-            summary.ape_unhotfixed += 1
+        # The HF checkpoint ships compressor.ape in the natural layout;
+        # the serving model applies its own hotfix permutation at load and
+        # the exact C4 path re-applies it before the compress kernel.
+        # Un-doing a hotfix that was never applied fed the kernel a
+        # permuted table (2026-08-11 C4 base-ruler divergence).
 
         _copy_into(model_params, model_buffers, xorl_name, t)
         filled.add(xorl_name)
@@ -842,18 +834,8 @@ class DeepseekV4CheckpointHandler(CheckpointHandler):
             self.summary.loaded += 1
             return results
         t = self._maybe_dequant(weight, scale)
-        if (
-            xorl_name.endswith(".compressor.ape")
-            and m is not None
-            and _is_compress_ratio_4(int(m.group(1)), self.compress_ratios)
-        ):
-            expected_hd = (
-                self.indexer_compressor_head_dim
-                if xorl_name.endswith(".indexer.compressor.ape")
-                else self.attn_compressor_head_dim
-            )
-            t = _undo_ape_hotfix(t, expected_head_dim=expected_hd)
-            self.summary.ape_unhotfixed += 1
+        # compressor.ape ships in the natural layout; see the note in
+        # load_hf_state_dict_into_model. No hotfix undo.
 
         self.summary.loaded += 1
         results.append((xorl_name, t))
@@ -1066,19 +1048,8 @@ def stream_load_hf_directory_into_model(
             return
 
         t = _maybe_dequant(weight, scale)
-
-        if (
-            xorl_name.endswith(".compressor.ape")
-            and m is not None
-            and _is_compress_ratio_4(int(m.group(1)), compress_ratios)
-        ):
-            expected_hd = (
-                indexer_compressor_head_dim
-                if xorl_name.endswith(".indexer.compressor.ape")
-                else attn_compressor_head_dim
-            )
-            t = _undo_ape_hotfix(t, expected_head_dim=expected_hd)
-            summary.ape_unhotfixed += 1
+        # compressor.ape ships in the natural layout; see the note in
+        # load_hf_state_dict_into_model. No hotfix undo.
 
         _copy_into(model_params, model_buffers, xorl_name, t)
         filled.add(xorl_name)

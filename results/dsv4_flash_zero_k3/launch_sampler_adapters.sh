@@ -1,21 +1,17 @@
 #!/usr/bin/env bash
-# DSV4-Flash exact-lane sampler in tensor-dump RCA mode (base, no adapter).
+# DSV4-Flash exact-lane sampler with the three qualification adapters
+# preloaded (zero / distinguishable nonzero / perturbed negative control).
 set -uo pipefail
 
 REPO=/home/apanda/xorl-oss-dsv4-flash-lora-zero-k3-20260810
+RD="$REPO/results/dsv4_flash_zero_k3"
 SNAP=/shared/huggingface/hub/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/60d8d70770c6776ff598c94bb586a859a38244f1
 cd "$REPO/submodules/xorl-sglang"
 
-# JIT cache: run on pod-local /dev/shm (weka rename visibility loses Triton's
-# concurrent-compile lock race across the 8 DP schedulers), seeded from the
-# lane's weka snapshot so reaped pods don't pay a cold compile.
-WEKA_CACHE="$REPO/results/dsv4_flash_zero_k3/jit-cache-snapshot"
+WEKA_CACHE="$RD/jit-cache-snapshot"
 export SGLANG_CACHE_DIR=/dev/shm/sglang-cache
 mkdir -p "$SGLANG_CACHE_DIR"
 [ -d "$WEKA_CACHE" ] && cp -r "$WEKA_CACHE/." "$SGLANG_CACHE_DIR/" 2>/dev/null
-export SGLANG_DEBUG_TENSOR_DUMP_PARENT_MODULES=1
-export SGLANG_DSV4_DEBUG_ATTENTION_BOUNDARIES=1
-export SGLANG_DEBUG_ROUTER_GEMM_TRACE=1
 export SGLANG_OPT_FUSE_WQA_WKV=0
 export SGLANG_SIMULATE_UNIFORM_EXPERTS=0
 export SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS=0
@@ -29,6 +25,6 @@ exec .venv/bin/python -m sglang.launch_server \
   --tp-size 8 --dp-size 8 --ep-size 8 \
   --enable-dp-attention \
   --enable-lora \
+  --lora-paths zero="$RD/adapter_zero" nonzero="$RD/adapter_nonzero" perturbed="$RD/adapter_nonzero_perturbed" \
   --trust-remote-code \
-  --debug-tensor-dump-output-folder "$REPO/results/dsv4_flash_zero_k3/dumps/sampler_base" \
   --host 127.0.0.1 --port 30000
