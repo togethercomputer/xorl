@@ -2,10 +2,12 @@ from functools import partial
 from typing import Callable, Literal, Optional, Tuple, Unpack
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from xorl.distributed.parallel_state import get_parallel_state
 from xorl.distributed.sequence_parallel.strategy import get_cp_strategy
+from xorl.lora.fold import lora_merged_forward_enabled
 from xorl.models.base import XorlPreTrainedModel
 from xorl.models.checkpoint_handlers.buffers import (
     checkpoint_has_per_expert_weights,
@@ -92,12 +94,61 @@ class Qwen3_5MoeMLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False, device=device, dtype=dtype)
         del self.gate_up_proj
 
+    @staticmethod
+    def _linear_with_contract(module: nn.Linear, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        if getattr(module, "_xorl_bi_trunk_wrapped", False):
+            from xorl.ops.batch_invariant_ops import _BatchInvariantTrunkLinearFn  # noqa: PLC0415
+
+            return _BatchInvariantTrunkLinearFn.apply(x, weight, module.bias)
+        return F.linear(x, weight, module.bias)
+
+    def _gate_up_weights_for_forward(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return independently folded gate/up weights for the fused base GEMM."""
+        if not hasattr(self, "gate_up_proj"):
+            raise RuntimeError("Fused gate/up weights requested after unfuse_for_tp()")
+        gate_base, up_base = self.gate_up_proj.weight.split(self.intermediate_size, dim=0)
+        gate_adapter = getattr(self, "gate_proj", None)
+        up_adapter = getattr(self, "up_proj", None)
+        gate_weight = (
+            gate_adapter.merged_weight_for_forward(gate_base)
+            if gate_adapter is not None and lora_merged_forward_enabled(gate_adapter)
+            else gate_base
+        )
+        up_weight = (
+            up_adapter.merged_weight_for_forward(up_base)
+            if up_adapter is not None and lora_merged_forward_enabled(up_adapter)
+            else up_base
+        )
+        return gate_weight, up_weight
+
+    def _project_gate_up(self, x: torch.Tensor) -> torch.Tensor:
+        gate_adapter = getattr(self, "gate_proj", None)
+        up_adapter = getattr(self, "up_proj", None)
+        if gate_adapter is None and up_adapter is None:
+            return self.gate_up_proj(x)
+
+        adapters = tuple(adapter for adapter in (gate_adapter, up_adapter) if adapter is not None)
+        merged = tuple(lora_merged_forward_enabled(adapter) for adapter in adapters)
+        if any(merged):
+            if not all(merged):
+                raise RuntimeError("Qwen shared-expert gate/up adapters must select merged forward together")
+            gate_weight, up_weight = self._gate_up_weights_for_forward()
+            return self._linear_with_contract(self.gate_up_proj, x, torch.cat((gate_weight, up_weight), dim=0))
+
+        gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
+        if gate_adapter is not None:
+            gate = gate + gate_adapter(x).to(gate.dtype)
+        if up_adapter is not None:
+            up = up + up_adapter(x).to(up.dtype)
+        return torch.cat((gate, up), dim=-1)
+
     def forward(self, x):
         if hasattr(self, "gate_up_proj"):
+            gate_up = self._project_gate_up(x)
             if self._use_fused_silu:
-                x = fused_silu_and_mul(self.gate_up_proj(x))
+                x = fused_silu_and_mul(gate_up)
             else:
-                gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
+                gate, up = gate_up.chunk(2, dim=-1)
                 x = self.act_fn(gate) * up
         else:
             gate = self.gate_proj(x)
@@ -431,8 +482,12 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
         ).to(torch.bfloat16)
         self._capture_diagnostic_component("moe_native_routed", routed)
 
-        w_gu = self.shared_expert.gate_up_proj.weight  # [2I, H], gate rows first
-        w_down = self.shared_expert.down_proj.weight  # [H, I]
+        gate_weight, up_weight = self.shared_expert._gate_up_weights_for_forward()
+        w_gu = torch.cat((gate_weight, up_weight), dim=0)  # [2I, H], gate rows first
+        down_proj = self.shared_expert.down_proj
+        w_down = (
+            down_proj.merged_weight_for_forward() if lora_merged_forward_enabled(down_proj) else down_proj.weight
+        )  # [H, I]
         shard = inter // ep_size
         lo_s = ep_rank * shard
         # Retain the decomposed gate only when operand diagnostics request it.

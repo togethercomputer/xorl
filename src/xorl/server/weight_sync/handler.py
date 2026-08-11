@@ -4175,6 +4175,7 @@ class WeightSyncHandler:
         # (LoraDeltaLinear, start, end) row-slice of the fused delta to fold into it.
         lora_param_names = set()
         fused_gdn_base_deltas = {}
+        qwen_shared_gate_up_deltas = {}
         for mname, mod in lora_modules.items():
             prefix = f"{mname}." if mname else ""
             if isinstance(mod, QLoRALinear):
@@ -4204,6 +4205,9 @@ class WeightSyncHandler:
                         )
                 elif gdn_leaf == "out_proj":
                     fused_gdn_base_deltas[f"{gdn_parent_name}.o_proj"] = (mod, 0, mod.out_features)
+                elif gdn_leaf in {"gate_proj", "up_proj"} and hasattr(gdn_parent, "gate_up_proj"):
+                    base_name = f"{gdn_parent_name}.gate_up_proj"
+                    qwen_shared_gate_up_deltas.setdefault(base_name, {})[gdn_leaf] = mod
                 else:
                     raise RuntimeError(f"Unexpected fused-GDN LoRA leaf {gdn_leaf!r} for {mname}")
             elif isinstance(mod, LoraLinear):
@@ -4253,6 +4257,37 @@ class WeightSyncHandler:
             #   parent module "self_attn.q_proj" is the LoraLinear
             parent_name = ".".join(pname.split(".")[:-1])
             param_leaf = pname.split(".")[-1]  # e.g. "weight", "gate_proj"
+
+            # Qwen shared experts retain one fused gate_up base GEMM while
+            # training independent logical gate/up factors. Publish the
+            # exact concatenation used by Qwen3_5MoeMLP and the ordered EP
+            # combine, never either raw factor set.
+            shared_gate_up = qwen_shared_gate_up_deltas.get(parent_name)
+            if shared_gate_up is not None and param_leaf == "weight":
+                missing = {"gate_proj", "up_proj"} - set(shared_gate_up)
+                if missing:
+                    raise RuntimeError(
+                        f"Qwen shared-expert {full_name} has incomplete gate/up LoRA factors: missing {sorted(missing)}"
+                    )
+                if param.shape[0] % 2:
+                    raise RuntimeError(f"Qwen shared-expert {full_name} has odd fused output size {param.shape[0]}")
+                gate_base, up_base = param.data.chunk(2, dim=0)
+                folded_parts = []
+                for leaf, base in (("gate_proj", gate_base), ("up_proj", up_base)):
+                    delta_module = shared_gate_up[leaf]
+                    if lora_merged_forward_enabled(delta_module):
+                        folded = delta_module._merged_weight(base).to(dtype=torch.bfloat16)
+                    else:
+                        delta = delta_module.get_delta_weight()
+                        if tuple(delta.shape) != tuple(base.shape):
+                            raise RuntimeError(
+                                f"Qwen shared-expert {leaf} delta for {full_name} has shape "
+                                f"{tuple(delta.shape)}, expected {tuple(base.shape)}"
+                            )
+                        folded = base.to(dtype=torch.bfloat16) + delta.to(dtype=torch.bfloat16)
+                    folded_parts.append(folded)
+                buffer.append((full_name, torch.cat(folded_parts, dim=0).clone()))
+                continue
 
             # Fused-GDN fold: this base projection (q/k/v/g/o_proj) gets the
             # corresponding row-slice of the fused in_proj_qkvz / out_proj delta.

@@ -1539,6 +1539,22 @@ class ModelRunner:
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
             )
+        elif model_type in {
+            "qwen3_5",
+            "qwen3_5_text",
+            "qwen3_5_moe",
+            "qwen3_5_moe_text",
+            "xorl_qwen3_5",
+            "xorl_qwen3_5_moe",
+        }:
+            target_modules = []
+            if train_attn:
+                # GDN's g_proj is the serving in_proj_z surface.
+                target_modules.extend(["q_proj", "k_proj", "v_proj", "g_proj", "o_proj"])
+            if train_mlp:
+                target_modules.extend(["gate_proj", "up_proj", "down_proj"])
+            if train_unembed:
+                target_modules.append("lm_head")
         else:
             target_modules = []
             if train_attn:

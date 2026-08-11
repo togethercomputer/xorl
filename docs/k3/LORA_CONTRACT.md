@@ -27,6 +27,18 @@ autograd differentiates the fold into the trainable factors.
 The resolver owns this choice through module state; there is no public
 `XORL_LORA_MERGED_FORWARD` launch flag on the architecture-selected path.
 
+Qwen3.5/3.6 training defaults keep the GDN input as four
+independent rank-r adapters: `q_proj`, `k_proj`, `v_proj`, and `g_proj` (the
+trainer name for serving's `in_proj_z`). The optional River/SGLang-shaped
+`in_proj_qkvz` adapter remains available only when explicitly targeted.
+
+On Qwen3.6 MoE layers, `gate_proj`, `up_proj`, and `down_proj` also cover every
+shared expert. Gate and up own independent factors even though their frozen
+base remains one fused `gate_up_proj` tensor. The trainer folds those logical
+factors into the fused GEMM, the ordered EP combine consumes the same folded
+weights, and weight synchronization publishes only the corresponding fused
+base-weight bytes. Gate and up must therefore be selected together.
+
 ## GLM-5.2: native-FP8 base plus active rank-1 LoRA
 
 Folding adapters into GLM's native-FP8 expert base would require FP8
@@ -56,6 +68,8 @@ forward contract and replay gate.
 
 ```bash
 pytest tests/models/test_lora_merged_forward.py -q
+pytest tests/models/test_qwen35_lora_projection_topology.py -q
+pytest tests/e2e/qwen3_5/test_lora_projection_topology.py -q  # one GPU
 pytest tests/models/test_glm52_exact_qlora.py -q
 pytest tests/models/test_glm52_exact_gate_up_qlora.py -q
 pytest tests/models/test_glm52_exact_shared_expert_qlora.py -q

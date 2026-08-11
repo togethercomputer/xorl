@@ -1,5 +1,5 @@
 # Server-side configuration for XORL Training Server
-# Qwen3.5-35B-A3B LoRA (bf16 base + LoRA rank 32)
+# Qwen3.5/Qwen3.6-35B-A3B projection-topology LoRA (bf16 base + LoRA rank 16)
 #
 # 1 node (8 GPUs): EP=8, Ulysses SP=8, FSDP shard=1
 #
@@ -41,9 +41,11 @@ sample_packing_sequence_len: 32768
 enable_packing: true
 
 enable_lora: true
-lora_rank: 32
-lora_alpha: 32
-lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+lora_rank: 16
+lora_alpha: 16
+# GDN q/k/v/z are four independent factors (g_proj is in_proj_z), and
+# gate/up/down includes every fused-base shared expert.
+lora_target_modules: ["q_proj", "k_proj", "v_proj", "g_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
 skip_initial_checkpoint: true
 # bi_fused = K3 lm-head contract CE (fp32-class, tp1, no z-loss); requires tree >= 09a5ae3d3 (older trees silently ran eager for bi_fused)
