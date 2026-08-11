@@ -37,6 +37,15 @@ dependencies = [
   "uvicorn",
   "pyzmq",
   "msgpack",
+  # Required to import the pinned SGLang tree's pure-Triton kernel wrappers
+  # used by exact native FP8/MXFP4 trainer forwards. sglang-kernel is
+  # deliberately NOT listed here: its compiled extension is built against the
+  # pinned SGLang torch (2.11) ABI and cannot load under this profile's torch.
+  # DSV4 exact-kernel training and serving run in the isolated torch-2.11
+  # combined environment at submodules/xorl-sglang/.venv instead.
+  "msgspec==0.21.1",
+  "xgrammar==0.2.1",
+  "compressed-tensors==0.17.1",
   "fastapi",
   # P2P / Mooncake weight sync
   "mooncake-transfer-engine==0.3.9",

@@ -50,6 +50,36 @@ def _reject_if_called(name: str):
     return reject
 
 
+def _dsv4_exact_stub() -> nn.Module:
+    model = nn.Module()
+    model.config = SimpleNamespace(_dsv4_flash_exact_active_lora=True)
+    model.projection = nn.Linear(2, 2, bias=False)
+    model.projection._dsv4_flash_exact_active_lora_component = True
+    return model
+
+
+def test_dsv4_exact_active_lora_rejects_every_legacy_merge_entry(monkeypatch) -> None:
+    model = _dsv4_exact_stub()
+    handler = WeightSyncHandler.__new__(WeightSyncHandler)
+    handler.rank = 0
+    handler.trainer = SimpleNamespace(model=model, adapter_manager=object())
+
+    with pytest.raises(RuntimeError, match="all 948 factors"):
+        handler._prepare_lora_adapter_for_sync("policy")
+    with pytest.raises(RuntimeError, match="cannot enter merged-weight collectives"):
+        handler._qlora_collective_ops(model.projection, "model.layers.0.self_attn.wq_a", collect_results=True)
+    with pytest.raises(RuntimeError, match="cannot be extracted by legacy merged-weight sync"):
+        WeightSyncHandler._extract_params_for_sync(
+            model.projection, "model.layers.0.self_attn.wq_a", object
+        )
+
+    monkeypatch.setattr(handler, "_prepare_lora_adapter_for_sync", _reject_if_called("adapter preparation"))
+    monkeypatch.setattr(handler, "_sync_weights", _reject_if_called("streaming weight sync"))
+    monkeypatch.setattr(handler, "_sync_sparse_delta_paths", _reject_if_called("sparse-delta sync"))
+    with pytest.raises(RuntimeError, match="dsv4_expert_banks"):
+        asyncio.run(handler.handle_sync_inference_weights({"payload": SyncWeightsData()}))
+
+
 def test_exact_dense_composite_rejects_legacy_merged_weight_sync_at_entry() -> None:
     handler = WeightSyncHandler.__new__(WeightSyncHandler)
     handler.trainer = SimpleNamespace(model=_module(), adapter_manager=object())

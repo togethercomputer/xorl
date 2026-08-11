@@ -68,6 +68,7 @@ from xorl.lora.fold import lora_merged_forward_enabled
 from xorl.models import resolve_cross_entropy_mode
 from xorl.models.layers.moe.routing_replay import set_replay_stage
 from xorl.models.transformers.deepseek_v3.support import deepseek_v3_default_lora_targets
+from xorl.models.transformers.deepseek_v4.exact_contract import DSV4_FLASH_REQUIRED_TARGET_MODULES
 from xorl.models.transformers.glm5.index_share import IndexShareMode
 from xorl.models.transformers.glm5.support import glm5_default_lora_targets
 from xorl.ops.batch_invariant_ops import enable_batch_invariant_mode, get_batch_invariant_ops
@@ -841,17 +842,21 @@ class ModelRunner:
                         expert_guard_by_parameter_id[id(parameter)] = dict(expert_guard)
                     if expert_contract is not None:
                         expert_contract_by_parameter_id[id(parameter)] = expert_contract
-                    if getattr(module, "_glm52_exact_tp16_lm_head", False):
+                    exact_glm_head = bool(getattr(module, "_glm52_exact_tp16_lm_head", False))
+                    exact_dsv4_head = bool(getattr(module, "_dsv4_exact_tp8_lm_head", False))
+                    if exact_glm_head or exact_dsv4_head:
                         exact_op = getattr(module, "_glm52_exact_selected_logprob", None)
+                        if exact_dsv4_head:
+                            exact_op = getattr(module, "_dsv4_exact_selected_logprob", None)
                         contract_version = getattr(exact_op, "contract_version", None)
                         if not isinstance(contract_version, str) or not contract_version:
                             raise AdapterGradientOwnershipError(
-                                "Exact GLM-5.2 lm-head factors require a selected-logprob contract version"
+                                "Exact lm-head factors require a selected-logprob contract version"
                             )
                         exact_lm_head_guard_by_parameter_id[id(parameter)] = {
                             "exact_lm_head_contract": contract_version,
                             "exact_lm_head_factor": local_name,
-                            "exact_lm_head_tp_size": 16,
+                            "exact_lm_head_tp_size": 16 if exact_glm_head else 8,
                             "exact_lm_head_vjp_tp_completed": True,
                         }
                     if direct:
@@ -1518,6 +1523,12 @@ class ModelRunner:
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
             )
+        elif model_type == "deepseek_v4":
+            if not (train_attn and train_mlp and train_unembed):
+                raise ValueError(
+                    "DSV4-Flash exact active-LoRA requires train_attn, train_mlp, and train_unembed all enabled"
+                )
+            target_modules = sorted(DSV4_FLASH_REQUIRED_TARGET_MODULES)
         elif model_type in {"glm_moe_dsa", "xorl_glm5"}:
             target_modules = glm5_default_lora_targets(
                 train_attn=train_attn,
@@ -1797,7 +1808,9 @@ class ModelRunner:
         """Get lm_head weight, merging LoRA delta on-the-fly if needed."""
         lm_head = self.model.lm_head
         if isinstance(lm_head, LoraLinear):
-            if getattr(lm_head, "_glm52_exact_tp16_lm_head", False):
+            if getattr(lm_head, "_glm52_exact_tp16_lm_head", False) or getattr(
+                lm_head, "_dsv4_exact_tp8_lm_head", False
+            ):
                 # The exact selected-logprob op consumes the physical local
                 # base shard plus live A/B factors. Materializing B@A here
                 # would both duplicate TP16 state and change the value program.
@@ -1837,7 +1850,10 @@ class ModelRunner:
     def _get_loss_lm_head_module(lm_head):
         """Return a module that owns the loss projection, when one is required."""
 
-        if lm_head is not None and getattr(lm_head, "_glm52_exact_tp16_lm_head", False):
+        if lm_head is not None and (
+            getattr(lm_head, "_glm52_exact_tp16_lm_head", False)
+            or getattr(lm_head, "_dsv4_exact_tp8_lm_head", False)
+        ):
             return lm_head
         return ModelRunner._get_fp8_lm_head_module(lm_head)
 
@@ -2262,7 +2278,17 @@ class ModelRunner:
         def capture(layer_idx: int, name: str, value: Any) -> None:
             tensor = self._first_tensor(value)
             if tensor is not None:
+                # Some exact DSV4 components finish on communication/custom
+                # streams and return a tensor before the default stream has a
+                # dependency on the producer.  Diagnostic snapshots are
+                # intentionally cold-path: fence the device on both sides of
+                # the clone so a later allocator reuse cannot turn the saved
+                # component into stale/uninitialised bytes.
+                if tensor.device.type == "cuda":
+                    torch.cuda.synchronize(tensor.device)
                 snapshot = tensor.detach().clone()
+                if tensor.device.type == "cuda":
+                    torch.cuda.synchronize(tensor.device)
                 captures.append(
                     {
                         "capture_index": len(captures),
@@ -7358,6 +7384,17 @@ class ModelRunner:
 
         return result
 
+    def _reshard_exact_forward_only_lm_head(self) -> None:
+        """Restore FP32 masters after the external no-grad vocab projection."""
+
+        if not getattr(self.model.config, "_dsv4_flash_exact_mode", False):
+            return
+        lm_head = getattr(self.model, "lm_head", None)
+        reshard = getattr(lm_head, "reshard", None)
+        if not callable(reshard):
+            raise RuntimeError("Exact DSV4-Flash forward-only replay requires an FSDP-managed lm_head")
+        reshard()
+
     # FSDP2 unshard hooks require version counters; no_grad keeps this path
     # forward-only without disabling those counters.
     @torch.no_grad()
@@ -7410,6 +7447,12 @@ class ModelRunner:
                 r3_enabled=r3_enabled,
                 model_id=model_id,
             )
+
+        # The lm head is called by compute_loss outside the root model. In a
+        # no-grad pass FSDP2 leaves its BF16 compute view materialized, so
+        # explicitly restore the sharded FP32 adapter masters before the next
+        # adapter switch. Backward owns this transition in training passes.
+        self._reshard_exact_forward_only_lm_head()
 
         if self._adapter_manager is not None:
             result["step"] = self._adapter_manager.get_adapter_state(model_id).global_forward_backward_step

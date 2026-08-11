@@ -126,6 +126,23 @@ def compute_per_token_ce(
             tp_group=tp_group,
         )
 
+    if lm_head is not None and getattr(lm_head, "_dsv4_exact_tp8_lm_head", False):
+        from xorl.models.transformers.deepseek_v4.exact_lm_head import (  # noqa: PLC0415
+            dsv4_exact_lm_head_per_token_ce,
+        )
+
+        return dsv4_exact_lm_head_per_token_ce(
+            hidden_states_flat,
+            weight,
+            labels_flat,
+            lm_head=lm_head,
+            ignore_index=ignore_index,
+            ce_mode=ce_mode,
+            lm_head_fp32=lm_head_fp32,
+            logprob_temperature=logprob_temperature,
+            tp_group=tp_group,
+        )
+
     # ``lm_head_fp32`` takes precedence over the FP8 lm_head module: an FP32
     # lm_head means the projection must NOT be FP8-quantized, so route to the
     # raw-weight FP32 path below rather than calling ``FP8Linear.forward``. The

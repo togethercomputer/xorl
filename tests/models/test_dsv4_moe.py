@@ -169,6 +169,8 @@ def test_moe_non_hash_has_bias_no_table():
 
     assert hasattr(block.gate, "e_score_correction_bias")
     assert block.gate.e_score_correction_bias.shape == (cfg.n_routed_experts,)
+    assert block.gate.e_score_correction_bias.dtype is torch.float32
+    assert block.gate.e_score_correction_bias._keep_fp32 is True
     # ``e_score_correction_bias`` is frozen (requires_grad=False) — gradients
     # never flow through it (selection-only argmax bias). DeepSeek updates it
     # OOB via an aux-loss controller during training.
@@ -283,6 +285,46 @@ def test_moe_hash_layer_requires_input_ids():
 
     with pytest.raises(AssertionError, match="hash-routed layer requires input_ids"):
         block(x, input_ids=None)
+
+
+def test_exact_hash_route_disables_unarmed_pdl(monkeypatch):
+    import sys
+    from types import ModuleType
+
+    from xorl.models.transformers.deepseek_v4.modeling_deepseek_v4 import DeepseekV4MoE
+
+    cfg = _tiny_config(num_hash_layers=3)
+    block = DeepseekV4MoE(cfg, layer_id=0).to(torch.bfloat16)
+    _init_test_weights(block)
+    block._dsv4_exact_native = True
+    block.train_router = False
+    calls = []
+
+    def fake_hash_topk(**kwargs):
+        calls.append(kwargs)
+        rows = kwargs["router_logits"].shape[0]
+        return torch.full((rows, 2), 0.5), torch.zeros(rows, 2, dtype=torch.int32)
+
+    module_names = (
+        "sglang",
+        "sglang.kernels",
+        "sglang.kernels.ops",
+        "sglang.kernels.ops.attention",
+        "sglang.kernels.ops.attention.dsv4",
+    )
+    for module_name in module_names:
+        module = ModuleType(module_name)
+        if module_name != module_names[-1]:
+            module.__path__ = []
+        monkeypatch.setitem(sys.modules, module_name, module)
+    sys.modules[module_names[-1]].hash_topk = fake_hash_topk
+    block.route(
+        torch.ones(3, cfg.hidden_size, dtype=torch.bfloat16),
+        input_ids=torch.tensor([1, 2, 3]),
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["use_pdl"] is False
 
 
 # ---------------------------------------------------------------------------

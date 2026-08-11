@@ -32,7 +32,10 @@ from xorl.distributed.parallel_state import get_parallel_state
 from xorl.lora.target_manifest import load_lora_target_manifest
 from xorl.lora.utils import get_lora_state_dict, save_lora_checkpoint
 from xorl.models import save_model_weights
-from xorl.models.exact_contract import contains_glm52_exact_active_lora_component
+from xorl.models.exact_contract import (
+    contains_dsv4_exact_active_lora_component,
+    contains_glm52_exact_active_lora_component,
+)
 from xorl.server.runner.adapters.manager import save_adapter_optimizer_shards
 from xorl.server.session_spec import write_session_spec
 from xorl.utils import helper
@@ -285,6 +288,12 @@ class CheckpointManager:
             self._require_collective_adapter_publication(model_id, strict=False)
 
     def _require_factor_only_exact_active_lora(self, operation: str) -> None:
+        if contains_dsv4_exact_active_lora_component(self.model):
+            raise RuntimeError(
+                "DSV4-Flash exact active-LoRA requires factor-only adapter publication; "
+                f"{operation} cannot materialize a merged/full-weight snapshot. Export all 948 factors "
+                "as dsv4_expert_banks and load a fresh sampler adapter version."
+            )
         if contains_glm52_exact_active_lora_component(self.model):
             raise RuntimeError(
                 "GLM-5.2 exact active-LoRA composites require factor-only adapter publication; "

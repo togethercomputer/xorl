@@ -46,7 +46,10 @@ from xorl.lora.fold import lora_merged_forward_enabled
 from xorl.lora.modules.base import LoraModule
 from xorl.lora.modules.delta_linear import LoraDeltaLinear
 from xorl.lora.modules.linear import LoraLinear
-from xorl.models.exact_contract import contains_glm52_exact_active_lora_component
+from xorl.models.exact_contract import (
+    contains_dsv4_exact_active_lora_component,
+    contains_glm52_exact_active_lora_component,
+)
 from xorl.models.layers.moe.experts import MoEExperts
 from xorl.models.layers.moe.lora import MoEExpertsLoRA
 from xorl.models.transformers.nemotron_h.checkpoint_handler import (
@@ -468,6 +471,12 @@ class WeightSyncHandler:
             return None
 
         model = getattr(self.trainer, "model", None)
+        if contains_dsv4_exact_active_lora_component(model):
+            raise RuntimeError(
+                "DSV4-Flash exact active-LoRA requires complete factor-only adapter publication; "
+                "legacy merged full-weight synchronization is not admitted. Export all 948 factors "
+                "as dsv4_expert_banks and load a fresh sampler adapter version."
+            )
         if contains_glm52_exact_active_lora_component(model):
             raise RuntimeError(
                 "GLM-5.2 exact active-LoRA composites require a complete factor-only adapter synchronization "
@@ -716,6 +725,12 @@ class WeightSyncHandler:
         logger.info(f"Rank {self.rank}: [WeightSync] Starting sync_inference_weights")
 
         model = getattr(self.trainer, "model", None)
+        if contains_dsv4_exact_active_lora_component(model):
+            raise RuntimeError(
+                "DSV4-Flash exact active-LoRA requires factor-only adapter publication; "
+                "legacy merged/full-weight synchronization, including prepacked sparse-delta sync, is not admitted. "
+                "Export all 948 factors as dsv4_expert_banks and load a fresh sampler adapter version."
+            )
         if contains_glm52_exact_active_lora_component(model):
             raise RuntimeError(
                 "GLM-5.2 exact active-LoRA composites require factor-only adapter publication; "
@@ -2056,6 +2071,11 @@ class WeightSyncHandler:
         """
         if collect_results is None:
             collect_results = self.rank == 0
+        if contains_dsv4_exact_active_lora_component(fsdp_mod):
+            raise RuntimeError(
+                "DSV4-Flash exact active-LoRA cannot enter merged-weight collectives; "
+                "export all 948 factors as dsv4_expert_banks"
+            )
         if contains_glm52_exact_active_lora_component(fsdp_mod):
             raise RuntimeError(
                 "GLM-5.2 exact active-LoRA composites cannot enter QLoRA merged-weight collectives; "
@@ -4124,6 +4144,11 @@ class WeightSyncHandler:
         """
         buffer = []
 
+        if contains_dsv4_exact_active_lora_component(fsdp_mod):
+            raise RuntimeError(
+                "DSV4-Flash exact active-LoRA factors cannot be extracted by legacy merged-weight sync; "
+                "export all 948 factors as dsv4_expert_banks"
+            )
         if contains_glm52_exact_active_lora_component(fsdp_mod):
             raise RuntimeError(
                 "GLM-5.2 exact active-LoRA composite internals cannot be extracted by legacy merged-weight sync; "

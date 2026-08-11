@@ -7,7 +7,9 @@ from torch import nn
 from xorl.distributed.torch_parallelize import (
     _coerce_optional_bool_config,
     _configure_manual_fsdp_prefetch,
+    _exact_lm_head_replicated_params,
     _expert_mixed_precision_policy,
+    _fsdp_kwargs_for_module,
     _resolve_fsdp_reduce_dtype,
     _sequence_parallel_fully_folded_into_fsdp,
     _topmost_modules_matching,
@@ -48,6 +50,30 @@ def test_mixed_precision_ignored_selection_stops_at_topmost_matching_unit() -> N
     selected = _topmost_modules_matching(root, (_Protected,))
 
     assert selected == [root.composite, root.ordinary.protected]
+
+
+def test_explicit_full_precision_module_drops_only_its_fsdp_mp_policy() -> None:
+    protected = nn.Module()
+    protected.fsdp_requires_full_precision = True
+    policy = object()
+    original = {"mesh": "mesh", "mp_policy": policy, "reshard_after_forward": True}
+
+    assert _fsdp_kwargs_for_module(original, protected) == {
+        "mesh": "mesh",
+        "reshard_after_forward": True,
+    }
+    assert _fsdp_kwargs_for_module(original, nn.Module()) == original
+    assert original["mp_policy"] is policy
+
+
+def test_dsv4_exact_lm_head_replicates_only_fp32_a() -> None:
+    head = nn.Module()
+    head.lora_A = nn.Parameter(torch.empty(1, 8, dtype=torch.float32))
+    head.lora_B = nn.Parameter(torch.empty(16, 1, dtype=torch.float32))
+    head._dsv4_exact_tp8_lm_head = True
+    head._dsv4_exact_replicated_parameter_names = ("lora_A",)
+
+    assert _exact_lm_head_replicated_params(head) == {head.lora_A}
 
 
 def test_exact_shared_expert_is_one_topmost_full_precision_fsdp_unit() -> None:

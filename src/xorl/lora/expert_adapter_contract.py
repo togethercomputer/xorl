@@ -17,6 +17,7 @@ from xorl.distributed.gradient_reduction import GradientReductionDomain
 
 
 EXPERT_PROJECTION_ROLES = frozenset({"gate_proj", "up_proj", "down_proj"})
+DSV4_CLAMPED_SWIGLU_LORA_PROGRAM = "dsv4_gate_only_clamped_swiglu_v1"
 
 
 def validate_gated_silu_expert_adapter_semantics(module: Any) -> None:
@@ -29,16 +30,30 @@ def validate_gated_silu_expert_adapter_semantics(module: Any) -> None:
             "The generic expert-LoRA wrapper requires explicit expert semantic properties; "
             f"missing={missing_properties}"
         )
-    if (
+    base_semantics_mismatch = (
         not bool(module.gated)
         or module.hidden_act != "silu"
-        or float(module.swiglu_limit) != 0.0
         or module.gate_up_bias is not None
         or module.down_bias is not None
-    ):
+    )
+    swiglu_limit = float(module.swiglu_limit)
+    if base_semantics_mismatch:
         raise NotImplementedError(
             "The generic expert-LoRA wrapper cannot preserve non-gated, non-SiLU, clamped, "
             "or expert-bias semantics; use a model-specific expert-LoRA implementation"
+        )
+    if swiglu_limit == 0.0:
+        return
+    model_program = getattr(module, "expert_lora_semantics", None)
+    implementation = getattr(module, "moe_implementation", None)
+    if (
+        model_program != DSV4_CLAMPED_SWIGLU_LORA_PROGRAM
+        or swiglu_limit != 10.0
+        or implementation not in {"eager", "triton"}
+    ):
+        raise NotImplementedError(
+            "Clamped expert LoRA requires the model-specific DSV4 gate-only "
+            "clamp program at swiglu_limit=10 with eager or triton compute"
         )
 
 

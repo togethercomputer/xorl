@@ -142,6 +142,12 @@ class LoraLinear(LoraModule, nn.Linear):
         lora_linear.weight.requires_grad = False
         if lora_linear.bias is not None:
             lora_linear.bias.requires_grad = False
+        native_base_payload = linear._modules.get("native_base_payload")
+        if native_base_payload is not None:
+            lora_linear.add_module(
+                "native_base_payload",
+                native_base_payload,
+            )
 
         return lora_linear
 
@@ -236,6 +242,13 @@ class LoraLinear(LoraModule, nn.Linear):
         Returns:
             Output tensor of shape [..., out_features]
         """
+        if "native_base_payload" in self._modules:
+            from xorl.models.transformers.deepseek_v4.native_payload import (  # noqa: PLC0415
+                dsv4_native_block_fp8_lora,
+            )
+
+            return dsv4_native_block_fp8_lora(x, self)
+
         if lora_merged_forward_enabled(self):
             # Merged-forward contract lane: the base kernel runs on the folded
             # weight (identical to a serving engine that received W'), and the

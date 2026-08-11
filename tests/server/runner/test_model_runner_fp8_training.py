@@ -254,3 +254,34 @@ def test_model_runner_causallm_loss_returns_raw_token_sum():
 
     assert loss.item() == pytest.approx(2 * math.log(2.0))
     assert per_token_outputs["loss"].reshape(-1).tolist() == pytest.approx([math.log(2.0), math.log(2.0)])
+
+
+def test_dsv4_forward_only_reshards_external_lm_head_compute_view() -> None:
+    class _Head:
+        def __init__(self):
+            self.calls = 0
+
+        def reshard(self):
+            self.calls += 1
+
+    runner = object.__new__(ModelRunner)
+    head = _Head()
+    runner.model = SimpleNamespace(
+        config=SimpleNamespace(_dsv4_flash_exact_mode=True),
+        lm_head=head,
+    )
+
+    runner._reshard_exact_forward_only_lm_head()
+
+    assert head.calls == 1
+
+
+def test_dsv4_forward_only_requires_fsdp_managed_lm_head() -> None:
+    runner = object.__new__(ModelRunner)
+    runner.model = SimpleNamespace(
+        config=SimpleNamespace(_dsv4_flash_exact_mode=True),
+        lm_head=nn.Module(),
+    )
+
+    with pytest.raises(RuntimeError, match="FSDP-managed lm_head"):
+        runner._reshard_exact_forward_only_lm_head()

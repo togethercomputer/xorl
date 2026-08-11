@@ -47,8 +47,28 @@ def contains_glm52_exact_active_lora_component(module: object | None) -> bool:
     return any(bool(getattr(candidate, "_glm52_exact_active_lora_component", False)) for candidate in iter_modules())
 
 
+def contains_dsv4_exact_active_lora_component(module: object | None) -> bool:
+    """Return whether a module tree belongs to the exact DSV4 active-LoRA program."""
+
+    if module is None:
+        return False
+    if bool(getattr(module, "_dsv4_flash_exact_active_lora_component", False)):
+        return True
+    config = getattr(module, "config", None)
+    if bool(getattr(config, "_dsv4_flash_exact_active_lora", False)):
+        return True
+    iter_modules = getattr(module, "modules", None)
+    if not callable(iter_modules):
+        return False
+    return any(
+        bool(getattr(candidate, "_dsv4_flash_exact_active_lora_component", False))
+        for candidate in iter_modules()
+    )
+
+
 __all__ = [
     "GLM52_EXACT_ACTIVE_LORA_FLAGS",
+    "contains_dsv4_exact_active_lora_component",
     "contains_glm52_exact_active_lora_component",
     "glm52_exact_active_lora_enabled",
     "glm52_exact_forward_enabled",

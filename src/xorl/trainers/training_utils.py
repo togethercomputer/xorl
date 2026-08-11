@@ -118,7 +118,10 @@ def sync_lm_head_tp_parameters(
         if lm_head_tp_group is not None and dist.get_world_size(lm_head_tp_group) > 1:
             exact_src = _group_root_rank(lm_head_tp_group)
             for module in model.modules():
-                if not getattr(module, "_glm52_exact_tp16_lm_head", False):
+                if not (
+                    getattr(module, "_glm52_exact_tp16_lm_head", False)
+                    or getattr(module, "_dsv4_exact_tp8_lm_head", False)
+                ):
                     continue
                 parameter = getattr(module, "lora_A", None)
                 if parameter is None or (DTensor is not None and isinstance(parameter, DTensor)):

@@ -1,0 +1,265 @@
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+
+from xorl.models.auto import resolve_cross_entropy_mode
+from xorl.models.transformers.deepseek_v4 import DeepseekV4Config
+from xorl.models.transformers.deepseek_v4.exact_contract import (
+    DSV4_FLASH_COMPRESS_RATIOS,
+    DSV4_FLASH_LOGICAL_FACTOR_COUNT,
+    DSV4_FLASH_NON_ROUTED_LOGICAL_PROJECTION_COUNT,
+    DSV4_FLASH_RCA_TRAINING_TOPOLOGY,
+    DSV4_FLASH_REQUIRED_TARGET_MODULES,
+    DSV4_FLASH_ROUTED_BANK_COUNT,
+    DSV4_FLASH_TARGET_ENTITY_COUNT,
+    bind_dsv4_flash_adapter_inventory,
+    build_dsv4_flash_adapter_inventory,
+    validate_dsv4_flash_adapter_program,
+    validate_dsv4_flash_official_geometry,
+    validate_dsv4_flash_training_topology,
+)
+from xorl.models.transformers.deepseek_v4.exact_lm_head import (
+    DSV4_LM_HEAD_LOCAL_VOCAB_SIZE,
+    DSV4_LM_HEAD_TP_SIZE,
+    DSV4_LM_HEAD_VOCAB_SIZE,
+    Dsv4ExactTP8LmHeadLoraLinear,
+    dsv4_lm_head_shard,
+)
+from xorl.ops.dsv4.exact_attention import _hybrid_prefill_indices
+
+
+pytestmark = pytest.mark.cpu
+
+
+def _official_config() -> DeepseekV4Config:
+    config = DeepseekV4Config(
+        architectures=["DeepseekV4ForCausalLM"],
+        vocab_size=129280,
+        hidden_size=4096,
+        num_hidden_layers=43,
+        num_attention_heads=64,
+        num_key_value_heads=1,
+        head_dim=512,
+        qk_rope_head_dim=64,
+        q_lora_rank=1024,
+        o_groups=8,
+        o_lora_rank=1024,
+        sliding_window=128,
+        index_n_heads=64,
+        index_head_dim=128,
+        index_topk=512,
+        moe_intermediate_size=2048,
+        n_routed_experts=256,
+        n_shared_experts=1,
+        num_experts_per_tok=6,
+        num_hash_layers=3,
+        hc_mult=4,
+        hc_sinkhorn_iters=20,
+        hc_eps=1e-6,
+        compress_rope_theta=160000,
+        compress_ratios=list(DSV4_FLASH_COMPRESS_RATIOS),
+        routed_scaling_factor=1.5,
+        scoring_func="sqrtsoftplus",
+        topk_method="noaux_tc",
+        norm_topk_prob=True,
+        hidden_act="silu",
+        swiglu_limit=10.0,
+        attention_bias=False,
+        attention_dropout=0.0,
+        rms_norm_eps=1e-6,
+        tie_word_embeddings=False,
+        expert_dtype="fp4",
+        num_nextn_predict_layers=1,
+        quantization_config={
+            "quant_method": "fp8",
+            "activation_scheme": "dynamic",
+            "fmt": "e4m3",
+            "scale_fmt": "ue8m0",
+            "weight_block_size": [128, 128],
+        },
+        rope_scaling={
+            "type": "yarn",
+            "factor": 16.0,
+            "original_max_position_embeddings": 65536,
+            "beta_fast": 32.0,
+            "beta_slow": 1.0,
+        },
+    )
+    return config
+
+
+def test_official_geometry_and_rca_topology_are_fail_closed() -> None:
+    config = _official_config()
+    validate_dsv4_flash_official_geometry(config)
+
+    config.quantization_config = SimpleNamespace(**config.quantization_config)
+    config.rope_scaling = SimpleNamespace(**config.rope_scaling)
+    validate_dsv4_flash_official_geometry(config)
+
+    topology = SimpleNamespace(**vars(DSV4_FLASH_RCA_TRAINING_TOPOLOGY))
+    assert validate_dsv4_flash_training_topology(topology) == DSV4_FLASH_RCA_TRAINING_TOPOLOGY
+
+    topology.tp_size = 8
+    with pytest.raises(ValueError, match="byte-proxy candidate"):
+        validate_dsv4_flash_training_topology(topology)
+
+    config.compress_ratios[2] = 128
+    with pytest.raises(ValueError, match="C0/C4/C128 schedule"):
+        validate_dsv4_flash_official_geometry(config)
+
+
+@pytest.mark.parametrize(
+    ("model_type", "architectures"),
+    [
+        ("deepseek_v4", ["OtherForCausalLM"]),
+        ("other", ["DeepseekV4ForCausalLM"]),
+    ],
+)
+def test_official_geometry_requires_both_model_identifiers(model_type: str, architectures: list[str]) -> None:
+    config = _official_config()
+    config.model_type = model_type
+    config.architectures = architectures
+    with pytest.raises(ValueError, match="model_type='deepseek_v4'"):
+        validate_dsv4_flash_official_geometry(config)
+
+
+def test_adapter_program_rejects_partial_targets_and_non_rank_one() -> None:
+    validate_dsv4_flash_adapter_program(
+        adapter_rank=1,
+        adapter_alpha=1,
+        target_modules=DSV4_FLASH_REQUIRED_TARGET_MODULES,
+    )
+    with pytest.raises(ValueError, match="rank-1/alpha-1"):
+        validate_dsv4_flash_adapter_program(adapter_rank=2, adapter_alpha=1)
+    with pytest.raises(ValueError, match="target_modules mismatch"):
+        validate_dsv4_flash_adapter_program(
+            adapter_rank=1,
+            adapter_alpha=1,
+            target_modules=DSV4_FLASH_REQUIRED_TARGET_MODULES - {"lm_head"},
+        )
+
+
+def test_exact_loss_mode_rejects_non_tp_aware_bi_fused_path() -> None:
+    config = _official_config()
+    config._dsv4_flash_exact_mode = True
+
+    assert resolve_cross_entropy_mode(config, None) == "compiled"
+    assert resolve_cross_entropy_mode(config, "compiled") == "compiled"
+    with pytest.raises(ValueError, match="requires ce_mode='compiled'"):
+        resolve_cross_entropy_mode(config, "bi_fused")
+
+
+def test_inventory_derives_exact_345_non_routed_43_banks_and_948_factors() -> None:
+    inventory = build_dsv4_flash_adapter_inventory(_official_config())
+
+    assert len(inventory.targets) == DSV4_FLASH_TARGET_ENTITY_COUNT == 388
+    assert len(inventory.factors) == DSV4_FLASH_LOGICAL_FACTOR_COUNT == 948
+    assert (
+        sum(target.kind == "native_mxfp4_routed_bank" for target in inventory.targets) == DSV4_FLASH_ROUTED_BANK_COUNT
+    )
+    assert DSV4_FLASH_ROUTED_BANK_COUNT == 43
+    assert len(inventory.targets) - DSV4_FLASH_ROUTED_BANK_COUNT == DSV4_FLASH_NON_ROUTED_LOGICAL_PROJECTION_COUNT
+    assert DSV4_FLASH_NON_ROUTED_LOGICAL_PROJECTION_COUNT == 345
+    assert {factor.dtype for factor in inventory.factors} == {torch.float32}
+    assert inventory.role_counts == {
+        "attention.wkv": 43,
+        "attention.wo_a": 43,
+        "attention.wo_b": 43,
+        "attention.wq_a": 43,
+        "attention.wq_b": 43,
+        "output.lm_head": 1,
+        "routed_expert.bank": 43,
+        "shared_expert.down_proj": 43,
+        "shared_expert.gate_proj": 43,
+        "shared_expert.up_proj": 43,
+    }
+
+
+def test_inventory_shapes_cover_fused_attention_experts_and_lm_head() -> None:
+    inventory = build_dsv4_flash_adapter_inventory(_official_config())
+    by_name = {factor.name: factor for factor in inventory.factors}
+
+    prefix = "model.layers.0"
+    assert by_name[f"{prefix}.self_attn.wq_a.lora_A"].shape == (1, 4096)
+    assert by_name[f"{prefix}.self_attn.wq_a.lora_B"].shape == (1024, 1)
+    assert by_name[f"{prefix}.self_attn.wkv.lora_B"].shape == (512, 1)
+    assert by_name[f"{prefix}.self_attn.wq_b.lora_B"].shape == (32768, 1)
+    assert by_name[f"{prefix}.self_attn.wo_a.lora_A"].shape == (1, 4096)
+    assert by_name[f"{prefix}.self_attn.wo_a.lora_B"].shape == (8192, 1)
+    assert by_name[f"{prefix}.mlp.experts.gate_proj_lora_A"].shape == (256, 4096, 1)
+    assert by_name[f"{prefix}.mlp.experts.down_proj_lora_B"].shape == (256, 1, 4096)
+    assert by_name["lm_head.lora_A"].shape == (1, 4096)
+    assert by_name["lm_head.lora_B"].shape == (129280, 1)
+
+
+def test_live_inventory_requires_every_fp32_trainable_factor() -> None:
+    config = _official_config()
+    inventory = build_dsv4_flash_adapter_inventory(config)
+
+    class _LiveAdapter:
+        def __init__(self):
+            self.config = config
+            self._parameters = {
+                factor.name: torch.nn.Parameter(torch.empty(factor.shape, dtype=torch.float32, device="meta"))
+                for factor in inventory.factors
+            }
+
+        def named_parameters(self):
+            return iter(self._parameters.items())
+
+    live = _LiveAdapter()
+    assert bind_dsv4_flash_adapter_inventory(live) == inventory
+    assert live._dsv4_adapter_inventory == inventory
+
+    live._parameters.pop(next(iter(live._parameters)))
+    with pytest.raises(RuntimeError, match="complete 948-factor"):
+        bind_dsv4_flash_adapter_inventory(live)
+
+
+def test_exact_lm_head_uses_eight_contiguous_physical_vocab_shards() -> None:
+    assert DSV4_LM_HEAD_TP_SIZE == 8
+    assert DSV4_LM_HEAD_LOCAL_VOCAB_SIZE == 16160
+    shards = [dsv4_lm_head_shard(rank) for rank in range(DSV4_LM_HEAD_TP_SIZE)]
+    assert [shard.vocab_start for shard in shards] == [rank * 16160 for rank in range(8)]
+    assert [shard.vocab_end for shard in shards] == [(rank + 1) * 16160 for rank in range(8)]
+    assert shards[-1].vocab_end == DSV4_LM_HEAD_VOCAB_SIZE
+    with pytest.raises(ValueError, match=r"\[0, 7\]"):
+        dsv4_lm_head_shard(8)
+
+
+def test_exact_lm_head_rejects_ordinary_full_weight_value_paths() -> None:
+    head = Dsv4ExactTP8LmHeadLoraLinear(
+        4096,
+        DSV4_LM_HEAD_VOCAB_SIZE,
+        r=1,
+        lora_alpha=1,
+        device="meta",
+        dtype=torch.bfloat16,
+    )
+    with pytest.raises(RuntimeError, match="selected-logprob"):
+        head(torch.empty(1, 4096, device="meta", dtype=torch.bfloat16))
+    with pytest.raises(RuntimeError, match="selected-logprob"):
+        head.get_delta_weight()
+
+
+def test_exact_c4_short_prefill_uses_compact_prefix_then_swa_order() -> None:
+    indices, lengths, capacity = _hybrid_prefill_indices(10, 4, torch.device("cpu"))
+
+    assert capacity == 2
+    assert lengths.tolist() == [1, 2, 3, 5, 6, 7, 8, 10, 11, 12]
+    assert indices[3, :5].tolist() == [0, 2, 3, 4, 5]
+    assert indices[7, :10].tolist() == [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    assert indices[9, :12].tolist() == [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    assert torch.all(indices[:, 12:] == -1)
+
+
+def test_exact_c128_short_prefill_reserves_ignored_cache_slot() -> None:
+    indices, lengths, capacity = _hybrid_prefill_indices(10, 128, torch.device("cpu"))
+
+    assert capacity == 1
+    assert lengths.tolist() == list(range(1, 11))
+    assert indices[9, :10].tolist() == list(range(1, 11))
+    assert torch.all(indices[:, 10:] == -1)

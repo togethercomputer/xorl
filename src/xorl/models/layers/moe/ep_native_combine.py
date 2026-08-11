@@ -97,6 +97,44 @@ def max_rows_for_ep_combine(local_rows: int, device: torch.device, group) -> int
     return int(rows.item())
 
 
+def row_counts_for_ep_combine(local_rows: int, device: torch.device, group) -> tuple[int, ...]:
+    """Gather the live (unpadded) row count in EP rank order."""
+
+    local = torch.tensor([local_rows], dtype=torch.int64, device=device)
+    world_size = dist.get_world_size(group)
+    gathered = torch.empty(world_size, dtype=torch.int64, device=device)
+    dist.all_gather_into_tensor(gathered, local, group=group)
+    counts = tuple(int(value) for value in gathered.cpu().tolist())
+    if any(value < 0 for value in counts):
+        raise RuntimeError(f"EP native combine received negative row counts: {counts}")
+    return counts
+
+
+def compact_rank_padded_rows(
+    gathered: torch.Tensor,
+    *,
+    padded_rows: int,
+    row_counts: tuple[int, ...],
+) -> torch.Tensor:
+    """Remove per-rank right padding from an equal-count all-gather."""
+
+    if padded_rows < 0 or any(count > padded_rows for count in row_counts):
+        raise ValueError(f"Invalid compact-row geometry: padded_rows={padded_rows}, row_counts={row_counts}")
+    expected_rows = len(row_counts) * padded_rows
+    if gathered.shape[0] != expected_rows:
+        raise ValueError(
+            f"Gathered row count {gathered.shape[0]} does not match {len(row_counts)}*{padded_rows}"
+        )
+    pieces = [
+        gathered[rank * padded_rows : rank * padded_rows + count]
+        for rank, count in enumerate(row_counts)
+        if count
+    ]
+    if pieces:
+        return torch.cat(pieces, dim=0)
+    return gathered[:0]
+
+
 def gather_tokens_for_ep_combine(x: torch.Tensor, group, padded_rows: int | None = None) -> torch.Tensor:
     """Autograd token gather with EP-uniform row padding.
 
@@ -194,4 +232,40 @@ def exchange_and_chain_sum(partial: torch.Tensor, group, ep_size: int) -> torch.
     acc = exchanged[(ep_size - 1) * rows : ep_size * rows]
     for s in range(ep_size - 2, -1, -1):
         acc = acc + exchanged[s * rows : (s + 1) * rows]
+    return acc
+
+
+def exchange_variable_and_chain_sum(
+    partial: torch.Tensor,
+    group,
+    row_counts: tuple[int, ...],
+    local_rank: int,
+) -> torch.Tensor:
+    """Variable-row equivalent of :func:`exchange_and_chain_sum`.
+
+    ``partial`` contains every rank's live rows in destination-rank order.
+    Raw all-to-all returns this destination's rows from each source rank; the
+    final BF16 chain retains the serving contributor order.
+    """
+
+    from xorl.distributed.moe.comm import _AllToAll  # noqa: PLC0415
+
+    ep_size = len(row_counts)
+    if not 0 <= local_rank < ep_size:
+        raise ValueError(f"EP local rank {local_rank} is outside [0, {ep_size})")
+    total_rows = sum(row_counts)
+    if partial.shape[0] != total_rows:
+        raise ValueError(f"Partial rows {partial.shape[0]} do not match live row total {total_rows}")
+    local_rows = row_counts[local_rank]
+    exchanged = _AllToAll.apply(
+        group,
+        partial.contiguous(),
+        [local_rows] * ep_size,
+        list(row_counts),
+    )
+    if local_rows == 0:
+        return exchanged[:0]
+    acc = exchanged[(ep_size - 1) * local_rows : ep_size * local_rows]
+    for source_rank in range(ep_size - 2, -1, -1):
+        acc = acc + exchanged[source_rank * local_rows : (source_rank + 1) * local_rows]
     return acc

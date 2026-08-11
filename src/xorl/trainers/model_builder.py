@@ -56,6 +56,7 @@ class TrainingModelResult:
     checkpoint_quant_format: Optional[str] = None
     exclude_modules: Set[str] = field(default_factory=set)
     glm52_adapter_inventory: Any = None
+    dsv4_adapter_inventory: Any = None
 
 
 def resolve_training_model_dtype(
@@ -259,9 +260,11 @@ def build_training_model(
         sparse_mla_backend=sparse_mla_backend,
         flash_attention_deterministic=flash_attention_deterministic,
         server_training=server_training,
+        enable_lora=enable_lora,
         block_fp8_qlora_training=block_fp8_qlora_training,
         lora_rank=lora_rank,
         lora_alpha=lora_alpha,
+        lora_target_modules=lora_target_modules,
         init_device=init_device,
     )
 
@@ -413,6 +416,32 @@ def build_training_model(
         enable_qlora=enable_qlora,
         enable_mixed_precision=enable_mixed_precision,
     )
+    if getattr(model.config, "_dsv4_flash_exact_active_lora", False):
+        from xorl.models.transformers.deepseek_v4.exact_contract import (  # noqa: PLC0415
+            bind_dsv4_flash_adapter_inventory,
+        )
+        from xorl.models.transformers.deepseek_v4.exact_lm_head import (  # noqa: PLC0415
+            bind_dsv4_exact_lm_head,
+        )
+
+        bind_dsv4_exact_lm_head(model)
+        inventory = bind_dsv4_flash_adapter_inventory(model)
+        lm_head = getattr(model, "lm_head", None)
+        if lm_head is None or getattr(lm_head, "lora_A", None) is None or getattr(lm_head, "lora_B", None) is None:
+            raise RuntimeError("The exact DSV4-Flash adapter requires a complete lm_head LoRA module")
+        logger.info_rank0(
+            "Bound complete DSV4-Flash adapter inventory: "
+            f"{len(inventory.targets)} targets, {len(inventory.factors)} FP32 factors"
+        )
+        from xorl.models.transformers.deepseek_v4.native_payload import (  # noqa: PLC0415
+            strip_dsv4_dequantized_base_parameters,
+        )
+
+        dense_bases, routed_bases = strip_dsv4_dequantized_base_parameters(model)
+        logger.info_rank0(
+            "Stripped dequantized DSV4 base placeholders before FSDP: "
+            f"{dense_bases} dense linears, {routed_bases} routed banks"
+        )
 
     # ------------------------------------------------------------------
     # 5. Exact model contract / legacy scoped trunk contract (must precede FSDP2)
@@ -552,6 +581,7 @@ def build_training_model(
         checkpoint_quant_format=checkpoint_quant_format,
         exclude_modules=exclude_modules,
         glm52_adapter_inventory=getattr(model, "_glm52_adapter_inventory", None),
+        dsv4_adapter_inventory=getattr(model, "_dsv4_adapter_inventory", None),
     )
 
 

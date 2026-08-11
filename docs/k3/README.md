@@ -14,6 +14,7 @@ cluster-specific launch records, and promotion manifests.
 - [MoE experts](moe-serving-expert-kernel.md): serving-value forwards with trainer-owned backward.
 - [Contract selection](DEFAULTS_AND_PARETO.md): architecture-selected support envelopes.
 - [Qwen3.5 family](QWEN35_GDN_ZERO_K3_RUNBOOK.md): supported dense and MoE geometries.
+- [DSV4-Flash](DSV4_FLASH_LORA_ZERO_K3_PLAN.md): scoped active-LoRA zero-K3 program and qualification gates.
 
 ## Rules
 

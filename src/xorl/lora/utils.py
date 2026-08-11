@@ -99,7 +99,32 @@ _MOE_SGLANG_SHARED_OUTER_PATTERN = re.compile(r"(.*)\.mlp\.experts\.(w1|w2|w3)\.
 _PROJ_TO_SGLANG_W = {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"}
 _SGLANG_W_TO_PROJ = {v: k for k, v in _PROJ_TO_SGLANG_W.items()}
 
-LORA_EXPORT_FORMATS = ("peft", "sglang_shared_outer")
+LORA_EXPORT_FORMATS = ("peft", "sglang_shared_outer", "dsv4_expert_banks")
+
+
+def dsv4_expert_bank_export_key_and_tensor(
+    name: str,
+    tensor: torch.Tensor,
+) -> tuple[str, torch.Tensor]:
+    """Map one trainer factor into the exact SGLang DSV4 adapter layout."""
+
+    match = _MOE_LORA_PATTERN.match(name)
+    if match is not None:
+        prefix, projection, factor = match.groups()
+        slot = _PROJ_TO_SGLANG_W[projection]
+        key = (
+            f"{_PEFT_BASE_MODEL_PREFIX}{prefix}.mlp.experts.{slot}."
+            f"lora_{factor}.weight"
+        )
+        return key, tensor.transpose(-2, -1).contiguous()
+
+    if "lm_head.lora_A" in name:
+        name = name.replace("lm_head.lora_A", "lm_head.lora_embedding_A")
+    elif "lm_head.lora_B" in name:
+        name = name.replace("lm_head.lora_B", "lm_head.lora_embedding_B")
+    elif name.endswith(".lora_A") or name.endswith(".lora_B"):
+        name += ".weight"
+    return f"{_PEFT_BASE_MODEL_PREFIX}{name}", tensor
 
 
 @dataclass(frozen=True)
@@ -196,6 +221,30 @@ def _find_target_modules(
             continue
 
     return matched_paths
+
+
+def _restrict_dsv4_flash_exact_target_paths(
+    model: nn.Module,
+    target_paths: List[str],
+) -> List[str]:
+    """Keep only the frozen exact DSV4-Flash physical adapter surface.
+
+    Leaf-name matching is intentionally insufficient for this architecture:
+    both the attention compressor and the DSA indexer contain an internal
+    ``wkv`` projection, but those selector/trunk components are frozen.  The
+    exact inventory is the single source of truth for adapted physical paths.
+    """
+
+    config = getattr(model, "config", None)
+    if not getattr(config, "_dsv4_flash_exact_active_lora", False):
+        return target_paths
+
+    from xorl.models.transformers.deepseek_v4.exact_contract import (  # noqa: PLC0415
+        build_dsv4_flash_adapter_inventory,
+    )
+
+    allowed = build_dsv4_flash_adapter_inventory(config).target_names
+    return [path for path in target_paths if path in allowed]
 
 
 def _manifest_allows_module_path(path: str, manifest: Optional[dict]) -> bool:
@@ -334,6 +383,7 @@ def inject_lora_into_model(
 
     # Find all matching modules
     target_paths = _find_target_modules(model, target_modules)
+    target_paths = _restrict_dsv4_flash_exact_target_paths(model, target_paths)
     target_paths = [path for path in target_paths if _manifest_allows_module_path(path, loaded_manifest)]
 
     if not target_paths and fused_gdn_count == 0:
@@ -939,9 +989,10 @@ def save_lora_checkpoint(
             inference backends. Ignored when
             ``lora_export_format="sglang_shared_outer"``.
         lora_export_format: On-disk layout for MoE expert LoRA. ``"peft"``
-            (default) un-stacks the 3D tensors into per-expert 2D keys. Pass
-            ``"sglang_shared_outer"`` to emit SGLang's stacked 3D shared_outer
-            layout directly (requires ``moe_hybrid_shared_lora=True``).
+            (default) un-stacks the 3D tensors into per-expert 2D keys.
+            ``"sglang_shared_outer"`` emits SGLang's stacked hybrid-shared
+            layout. ``"dsv4_expert_banks"`` emits the exact per-expert bank
+            layout for the official DSV4-Flash contract.
         preserve_lora_dtype: Keep LoRA tensor dtypes in the safetensors file
             instead of exporting bf16 weights. Use this for training-resume
             checkpoints; keep the default bf16 export for inference adapters.
@@ -957,6 +1008,11 @@ def save_lora_checkpoint(
             "lora_export_format='sglang_shared_outer' requires moe_hybrid_shared_lora=True "
             "(shared_outer only makes sense for hybrid-shared MoE LoRA)."
         )
+    if lora_export_format == "dsv4_expert_banks" and moe_hybrid_shared_lora:
+        raise ValueError(
+            "lora_export_format='dsv4_expert_banks' requires per-expert A/B "
+            "factors (moe_hybrid_shared_lora=False)"
+        )
 
     os.makedirs(save_path, exist_ok=True)
 
@@ -965,6 +1021,36 @@ def save_lora_checkpoint(
         lora_state_dict = get_lora_state_dict(model)
     else:
         lora_state_dict = slice_lora_state_dict_to_active_rank(model, lora_state_dict)
+
+    if lora_export_format == "dsv4_expert_banks":
+        from xorl.models.transformers.deepseek_v4.exact_contract import (  # noqa: PLC0415
+            DSV4_FLASH_LOGICAL_FACTOR_COUNT,
+        )
+
+        inventory = getattr(model, "_dsv4_adapter_inventory", None)
+        config = getattr(model, "config", None)
+        if not getattr(config, "_dsv4_flash_exact_active_lora", False) or inventory is None:
+            raise ValueError(
+                "dsv4_expert_banks export requires a bound exact DSV4-Flash "
+                "active-LoRA model"
+            )
+        expected = {factor.name: factor for factor in inventory.factors}
+        missing = sorted(set(expected) - set(lora_state_dict))
+        extra = sorted(set(lora_state_dict) - set(expected))
+        if len(expected) != DSV4_FLASH_LOGICAL_FACTOR_COUNT or missing or extra:
+            raise ValueError(
+                "dsv4_expert_banks export requires the complete 948-factor "
+                f"inventory: expected={len(expected)}, missing={missing[:8]}, extra={extra[:8]}"
+            )
+        mismatched = [
+            f"{name}: {tuple(lora_state_dict[name].shape)} != {spec.shape}"
+            for name, spec in expected.items()
+            if tuple(lora_state_dict[name].shape) != spec.shape
+        ]
+        if mismatched:
+            raise ValueError(
+                "dsv4_expert_banks factor shape mismatch: " + ", ".join(mismatched[:8])
+            )
 
     def _prepare_lora_tensor(tensor: torch.Tensor) -> torch.Tensor:
         tensor = tensor.detach().cpu().contiguous()
@@ -1064,7 +1150,22 @@ def save_lora_checkpoint(
 
     for key, value in lora_state_dict.items():
         # Check if this is a stacked MoE LoRA parameter
-        if _is_moe_lora_param(key):
+        if lora_export_format == "dsv4_expert_banks":
+            peft_key, out_tensor = dsv4_expert_bank_export_key_and_tensor(
+                key,
+                value,
+            )
+            peft_state_dict[peft_key] = _prepare_lora_tensor(out_tensor)
+            if _is_moe_lora_param(key):
+                match = _MOE_LORA_PATTERN.match(key)
+                assert match is not None
+                detected_modules.add(match.group(2))
+                if detected_r is None and match.group(3) == "A":
+                    detected_r = value.shape[2]
+            elif detected_r is None and key.endswith(".lora_A"):
+                detected_r = value.shape[0]
+        # Check if this is a stacked MoE LoRA parameter
+        elif _is_moe_lora_param(key):
             if lora_export_format == "sglang_shared_outer":
                 peft_key, out_tensor = _sglang_shared_outer_moe_weight(key, value)
                 peft_state_dict[peft_key] = out_tensor
@@ -1148,6 +1249,24 @@ def save_lora_checkpoint(
         # on-disk, so mirror the flag here so SGLang doesn't mis-classify it as
         # per_expert (which would reject loading under --lora-moe-format hybrid_shared).
         adapter_config["moe_hybrid_shared_lora"] = True
+    elif lora_export_format == "dsv4_expert_banks":
+        adapter_config["_sglang_lora_format"] = "dsv4_expert_banks"
+        adapter_config["moe_hybrid_shared_lora"] = False
+        adapter_config["target_modules"] = sorted(
+            {
+                "down_proj",
+                "gate_proj",
+                "lm_head",
+                "self_attn.wq_b",
+                "up_proj",
+                "wkv",
+                "wo_a",
+                "wo_b",
+                "wq_a",
+            }
+        )
+        adapter_config["use_dora"] = False
+        adapter_config["use_rslora"] = False
     else:
         adapter_config["moe_hybrid_shared_lora"] = moe_hybrid_shared_lora
 
