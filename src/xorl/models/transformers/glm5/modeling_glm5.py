@@ -1172,7 +1172,6 @@ class Glm5MoEBlock(MoEBlock):
                 group=group,
                 output_distribution=OutputDistribution.REPLICATED_CANONICAL,
                 physical_global_rank=dist.get_rank(),
-                chunk_rows=int(getattr(self.config, "_glm52_canonical_moe_chunk_rows", capacity)),
                 graph_mode=False,
             )
         if resolved_transport is CanonicalMoETransport.CP_SHARDED_V3:

@@ -29,6 +29,12 @@ CANONICAL_MOE_FOLD_VERSION = "canonical_moe_fold_v1"
 CANONICAL_MOE_PACKED_EP16_TRANSPORT_VERSION = "packed_ep16_v2"
 CANONICAL_MOE_CP_SHARDED_TRANSPORT_VERSION = "cp_sharded_v3"
 GLM52_NUM_LAYERS = 78
+# Dense transport expands each row across the complete contributor axis.  Keep
+# its transient send/receive tensors bounded even when DP-owned rows make the
+# logical capacity much larger than the per-rank sequence.  Chunk boundaries
+# do not participate in the arithmetic contract: every row still sees the
+# complete logical-contributor tree before any completed bytes are copied.
+CANONICAL_MOE_DENSE_MAX_CHUNK_ROWS = 4096
 
 
 class ParallelRole(str, Enum):
@@ -826,6 +832,21 @@ class _CanonicalMoECPShardedV3(torch.autograd.Function):
         return flat_grad, None, None, None
 
 
+def _resolve_transport_chunk_rows(
+    capacity: int,
+    requested_chunk_rows: int | None,
+    transport: CanonicalMoETransport,
+) -> int:
+    effective_chunk_rows = (
+        min(capacity, CANONICAL_MOE_DENSE_MAX_CHUNK_ROWS) if requested_chunk_rows is None else requested_chunk_rows
+    )
+    if effective_chunk_rows <= 0:
+        raise ValueError("chunk_rows must be positive")
+    if transport is CanonicalMoETransport.PACKED_EP16_V2:
+        return capacity
+    return effective_chunk_rows
+
+
 def _canonical_moe_reduce(
     contribution: LocalMoEContribution,
     *,
@@ -855,9 +876,11 @@ def _canonical_moe_reduce(
 
     physical_global_rank = dist.get_rank() if physical_global_rank is None else physical_global_rank
     runtime = _validate_runtime_plan(plan, group, physical_global_rank)
-    effective_chunk_rows = contribution.metadata.capacity if chunk_rows is None else chunk_rows
-    if effective_chunk_rows <= 0:
-        raise ValueError("chunk_rows must be positive")
+    effective_chunk_rows = _resolve_transport_chunk_rows(
+        contribution.metadata.capacity,
+        chunk_rows,
+        transport,
+    )
     if transport is CanonicalMoETransport.PACKED_EP16_V2:
         # Dense-v1 chunks the 16x-expanded owner slots to bound its allocation.
         # Packed-v2's full-capacity send is already only one payload tensor, and
@@ -865,7 +888,7 @@ def _canonical_moe_reduce(
         # source-grouped order: an arbitrary subrange need not contain a
         # balanced number of logical owners even though the complete capacity
         # does. Keep one equal-split A2A over the complete logical row set.
-        effective_chunk_rows = contribution.metadata.capacity
+        assert effective_chunk_rows == contribution.metadata.capacity
 
     tensor = _CanonicalMoEReduce.apply(
         contribution.tensor,
