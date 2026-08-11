@@ -957,12 +957,12 @@ class DeepseekV4MoE(MoEBlock):
 
         from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
 
-        # Architecture-scoped combine: DSV4 reproduces the pinned NCCL-tree
-        # contributor order, NOT the Qwen/GLM canonical adjacent-pair fold.
-        # See dsv4_native_combine's module docstring before unifying.
+        # Unified combine: DSV4 folds partials with the same canonical
+        # adjacent-pair BF16 tree as Qwen/GLM; only the variable-row
+        # transport remains DSV4-specific (see dsv4_native_combine).
         from xorl.models.layers.moe.dsv4_native_combine import (  # noqa: PLC0415
             compact_rank_padded_rows,
-            exchange_variable_and_nccl_tree_chain_sum,
+            exchange_variable_and_canonical_fold,
             gather_ids_for_ep_combine,
             gather_tokens_for_ep_combine,
             row_counts_for_ep_combine,
@@ -1070,7 +1070,7 @@ class DeepseekV4MoE(MoEBlock):
         )
         validate_lora_metadata("routed/shared join")
         self._capture_diagnostic_component("moe_native_local_partial", local_partial)
-        combined = exchange_variable_and_nccl_tree_chain_sum(
+        combined = exchange_variable_and_canonical_fold(
             local_partial,
             ep_group,
             row_counts,

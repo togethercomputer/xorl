@@ -1,18 +1,14 @@
-"""DSV4-Flash architecture-scoped EP combine (NCCL-tree contributor order)."""
+"""DSV4-Flash EP combine: variable-row transport + shared canonical fold."""
 
 import pytest
 import torch
 
+from xorl.distributed.canonical_moe import canonical_moe_fold_v1
 from xorl.models.layers.moe.dsv4_native_combine import (
     compact_rank_padded_rows,
-    dsv4_nccl_tree_chain_order,
-    exchange_variable_and_nccl_tree_chain_sum,
+    exchange_variable_and_canonical_fold,
     validate_dsv4_native_ep_combine_size,
 )
-
-
-def test_dsv4_chain_order_is_the_captured_nccl_tree_order():
-    assert dsv4_nccl_tree_chain_order(8) == (1, 2, 3, 4, 5, 6, 7, 0)
 
 
 def test_dsv4_combine_rejects_unvalidated_ep_sizes():
@@ -26,36 +22,69 @@ def test_compact_rank_padded_rows_retains_only_live_prefixes():
     assert torch.equal(compact, torch.stack((gathered[0], gathered[1], gathered[4])))
 
 
-def test_variable_exchange_uses_nccl_tree_contributor_order(monkeypatch):
-    """The chain must seed at rank 1, add ranks 2..N-1, and add rank 0 LAST.
+def test_variable_exchange_applies_the_shared_canonical_fold(monkeypatch):
+    """EP8 arrivals in rank order must reduce via canonical_moe_fold_v1."""
 
-    This is the captured bitwise behavior of the DSV4 serving contract's
-    pinned NCCL tree all-reduce; it intentionally differs from the Qwen/GLM
-    canonical adjacent-pair fold and from Qwen's reverse-rank chain.
+    import xorl.distributed.moe.comm as comm  # noqa: PLC0415
+
+    ep_size = 8
+    local_rows = 3
+    row_counts = (local_rows,) * ep_size
+    partial = torch.randn(sum(row_counts), 4, dtype=torch.bfloat16)
+    torch.manual_seed(20260811)
+    exchanged = torch.randn(ep_size * local_rows, 4, dtype=torch.bfloat16)
+
+    def fake_apply(group, value, output_splits, input_splits):
+        assert group == "group"
+        assert output_splits == [local_rows] * ep_size
+        assert input_splits == list(row_counts)
+        return exchanged
+
+    monkeypatch.setattr(comm._AllToAll, "apply", fake_apply)
+    result = exchange_variable_and_canonical_fold(partial, "group", row_counts, local_rank=0)
+    expected = canonical_moe_fold_v1(exchanged.reshape(ep_size, local_rows, 4))
+    assert torch.equal(result, expected)
+
+
+def test_canonical_fold_diverges_from_the_retired_nccl_chain(monkeypatch):
+    """Witness input where adjacent-pair fold != the old [1..N-1,0] BF16 chain.
+
+    Guards the byte contract of the unification: the combine really is the
+    balanced tree, not any left-associative chain. The chain (seed rank 1,
+    then 2, 3, 0) forms 1.0+1.0=2.0 first, and each later +2**-7 is a
+    round-to-even no-op (half-ulp tie at magnitude 2.0), landing on 2.0.
+    The fold pairs (0,1) and (2,3) into 1.0078125 each — exact at magnitude
+    1.0 where the ulp is 2**-7 — and lands on 2.015625.
     """
 
     import xorl.distributed.moe.comm as comm  # noqa: PLC0415
     import xorl.models.layers.moe.dsv4_native_combine as combine_module  # noqa: PLC0415
 
-    monkeypatch.setattr(
-        combine_module, "validate_dsv4_native_ep_combine_size", lambda ep_size: None
+    monkeypatch.setattr(combine_module, "validate_dsv4_native_ep_combine_size", lambda ep_size: None)
+
+    row_counts = (1, 1, 1, 1)
+    partial = torch.zeros(4, 2, dtype=torch.bfloat16)
+    blocks = torch.tensor(
+        [[2**-7, 2**-7], [1.0, 1.0], [1.0, 1.0], [2**-7, 2**-7]],
+        dtype=torch.bfloat16,
     )
-    monkeypatch.setattr(
-        combine_module,
-        "dsv4_nccl_tree_chain_order",
-        lambda ep_size: (*range(1, ep_size), 0),
-    )
+    monkeypatch.setattr(comm._AllToAll, "apply", lambda *args: blocks)
 
-    partial = torch.arange(6, dtype=torch.bfloat16).reshape(3, 2)
+    result = exchange_variable_and_canonical_fold(partial, "group", row_counts, local_rank=0)
+    assert torch.equal(result, torch.full((1, 2), 2.015625, dtype=torch.bfloat16))
 
-    def fake_apply(group, value, output_splits, input_splits):
-        assert group == "group"
-        assert value is partial
-        assert output_splits == [2, 2, 2]
-        assert input_splits == [2, 0, 1]
-        return torch.cat((value[:2], value[:2] + 10, value[:2] + 20), dim=0)
+    chain = blocks[1]
+    for source_rank in (2, 3, 0):
+        chain = chain + blocks[source_rank]
+    assert torch.equal(chain, torch.full((2,), 2.0, dtype=torch.bfloat16))
+    assert not torch.equal(result[0], chain)
 
-    monkeypatch.setattr(comm._AllToAll, "apply", fake_apply)
-    result = exchange_variable_and_nccl_tree_chain_sum(partial, "group", (2, 0, 1), local_rank=0)
-    # Seed rank 1 (+10), add rank 2 (+20), add rank 0 last.
-    assert torch.equal(result, ((partial[:2] + 10) + (partial[:2] + 20)) + partial[:2])
+
+def test_variable_exchange_returns_empty_for_zero_local_rows(monkeypatch):
+    import xorl.distributed.moe.comm as comm  # noqa: PLC0415
+
+    row_counts = (0, 2, 2, 2, 2, 2, 2, 2)
+    partial = torch.randn(sum(row_counts), 4, dtype=torch.bfloat16)
+    monkeypatch.setattr(comm._AllToAll, "apply", lambda *args: partial.new_zeros((0, 4)))
+    result = exchange_variable_and_canonical_fold(partial, "group", row_counts, local_rank=0)
+    assert result.shape == (0, 4)
