@@ -1357,6 +1357,8 @@ class ModelRunner:
             enable_lora=lora_enabled,
             lora_rank=self.lora_config.get("max_lora_rank", self.lora_config.get("lora_rank", 32)),
             lora_alpha=self.lora_config.get("lora_alpha", 16),
+            lora_b_init_std=self.lora_config.get("lora_b_init_std", 0.0),
+            lora_b_init_seed=self.lora_config.get("lora_b_init_seed", 0),
             lora_target_modules=construction_target_modules,
             lora_target_manifest=self.lora_config.get("lora_target_manifest"),
             moe_hybrid_shared_lora=self.lora_config.get("moe_hybrid_shared_lora", False),

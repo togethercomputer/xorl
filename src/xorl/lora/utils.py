@@ -5,6 +5,7 @@ Functions for injecting LoRA into models and managing LoRA state dicts.
 """
 
 import fnmatch
+import hashlib
 import json
 import logging
 import os
@@ -100,6 +101,40 @@ _PROJ_TO_SGLANG_W = {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"}
 _SGLANG_W_TO_PROJ = {v: k for k, v in _PROJ_TO_SGLANG_W.items()}
 
 LORA_EXPORT_FORMATS = ("peft", "sglang_shared_outer")
+
+
+@torch.no_grad()
+def initialize_lora_b_nonzero(
+    model: nn.Module,
+    *,
+    std: float = 0.0,
+    seed: int = 0,
+) -> int:
+    """Optionally replace zero LoRA-B initialization with deterministic noise.
+
+    ``std=0`` is the default no-op. Each fully-qualified parameter gets its own
+    stable seed, so replicated DTensor parameters receive identical bytes on
+    every rank without depending on Python's randomized hash.
+    """
+    if std < 0.0:
+        raise ValueError(f"lora_b_init_std must be nonnegative, got {std}")
+    if std == 0.0:
+        return 0
+
+    initialized = 0
+    for name, parameter in model.named_parameters():
+        if "lora_B" not in name:
+            continue
+        local = parameter.to_local() if isinstance(parameter, DTensor) else parameter
+        digest = hashlib.sha256(f"{seed}:{name}".encode()).digest()
+        parameter_seed = int.from_bytes(digest[:8], "little") & ((1 << 63) - 1)
+        generator = torch.Generator(device=local.device).manual_seed(parameter_seed)
+        local.normal_(mean=0.0, std=std, generator=generator)
+        initialized += 1
+    if initialized == 0:
+        raise RuntimeError("nonzero LoRA-B initialization requested but no lora_B parameters were found")
+    logger.info("Initialized %d LoRA-B parameters with deterministic normal std=%g seed=%d", initialized, std, seed)
+    return initialized
 
 
 @dataclass(frozen=True)

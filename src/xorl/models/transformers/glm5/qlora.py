@@ -498,6 +498,8 @@ def _replace_exact_lm_head_target(
         vocab_end=shard.vocab_end,
         padded_vocab_start=shard.padded_vocab_start,
         padded_vocab_end=shard.padded_vocab_end,
+        rank=adapter_rank,
+        lora_alpha=adapter_alpha,
         tp_group=tp_group,
     )
     replacement._glm52_exact_replicated_parameter_names = ("lora_A",)
@@ -737,11 +739,19 @@ def prepare_glm52_block_fp8_qlora(
             exact_lm_head_component,
         )
     )
-    if exact_component_enabled and (adapter_rank, adapter_alpha) != (1, 1):
-        raise ValueError(
-            "GLM-5.2 exact active-LoRA component requires adapter_rank=1 and adapter_alpha=1; "
-            f"got rank={adapter_rank}, alpha={adapter_alpha}"
+    if exact_component_enabled:
+        from xorl.models.transformers.glm5.exact_lora_contract import (  # noqa: PLC0415
+            glm52_exact_lora_scaling,
         )
+
+        try:
+            glm52_exact_lora_scaling(adapter_rank, adapter_alpha)
+        except ValueError as exc:
+            raise ValueError(
+                "GLM-5.2 exact active-LoRA component requires adapter_rank=1 and adapter_alpha=1 "
+                "or adapter_rank=16 and adapter_alpha=32; "
+                f"got rank={adapter_rank}, alpha={adapter_alpha}"
+            ) from exc
     targets = _expected_targets(model, config)
     excluded = quantization_config["modules_to_not_convert"]
     accidentally_excluded = sorted(

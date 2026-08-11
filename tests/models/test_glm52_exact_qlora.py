@@ -50,9 +50,9 @@ def test_exact_tp1_wrapper_admits_only_rank1_alpha1_without_bias_or_aqn() -> Non
     with pytest.raises(ValueError, match="rejects adaptive quantization noise"):
         Glm52ExactTP1BlockFP8QLoRALinear(8, 6, enable_aqn=True)
     module.set_runtime_lora_config(1, 1)
-    with pytest.raises(ValueError, match="only lora_rank=1 and lora_alpha=1"):
+    with pytest.raises(ValueError, match="rank=1 and alpha=1"):
         module.set_runtime_lora_config(1, 2)
-    with pytest.raises(ValueError, match="only lora_rank=1 and lora_alpha=1"):
+    with pytest.raises(ValueError, match="rank=1 and alpha=1"):
         module.set_runtime_lora_config(2, 1)
 
 

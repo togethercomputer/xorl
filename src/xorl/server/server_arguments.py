@@ -1038,6 +1038,16 @@ class ServerArguments:
 
     lora_alpha: int = field(default=16, metadata={"help": "LoRA alpha scaling parameter"})
 
+    lora_b_init_std: float = field(
+        default=0.0,
+        metadata={"help": "Optional deterministic normal initialization std for LoRA-B; zero preserves the standard no-op init"},
+    )
+
+    lora_b_init_seed: int = field(
+        default=0,
+        metadata={"help": "Seed for deterministic nonzero LoRA-B initialization"},
+    )
+
     adapter_gradient_ownership_bucket_bytes: int = field(
         default=64 * 1024 * 1024,
         metadata={"help": "Maximum bytes in one adapter-gradient residual-transport bucket"},
@@ -1239,8 +1249,12 @@ class ServerArguments:
             raise ValueError(
                 f"max_lora_rank ({self.max_lora_rank}) must be >= lora_rank ({self.lora_rank}) for the default session"
             )
+        if self.lora_b_init_std < 0.0:
+            raise ValueError(f"lora_b_init_std must be nonnegative, got {self.lora_b_init_std}")
+        if self.lora_b_init_std and not (self.enable_lora or self.enable_qlora):
+            raise ValueError("lora_b_init_std requires LoRA or QLoRA")
         if self.block_fp8_qlora_training:
-            exact_active_lora = (self.lora_rank, self.lora_alpha) == (1, 1)
+            exact_active_lora = (self.lora_rank, self.lora_alpha) in ((1, 1), (16, 32))
             requirements = {
                 "enable_lora": (self.enable_lora, True),
                 "enable_qlora": (self.enable_qlora, True),
@@ -1256,7 +1270,7 @@ class ServerArguments:
             if exact_active_lora:
                 requirements.update(
                     {
-                        "max_lora_rank": (self.max_lora_rank, 1),
+                        "max_lora_rank": (self.max_lora_rank, self.lora_rank),
                         "tensor_parallel_size": (self.tensor_parallel_size, 1),
                         "pipeline_parallel_size": (self.pipeline_parallel_size, 1),
                         "expert_parallel_size": (self.expert_parallel_size, 16),
@@ -1538,6 +1552,8 @@ class ServerArguments:
                 "max_lora_rank": self.max_lora_rank,
                 "lora_alpha": self.lora_alpha,
                 "lora_target_modules": self.lora_target_modules,
+                "lora_b_init_std": self.lora_b_init_std,
+                "lora_b_init_seed": self.lora_b_init_seed,
                 "lora_target_manifest": self.lora_target_manifest,
                 "moe_hybrid_shared_lora": self.moe_hybrid_shared_lora,
                 "lora_export_format": self.lora_export_format,

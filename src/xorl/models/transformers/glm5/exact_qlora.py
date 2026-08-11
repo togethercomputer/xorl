@@ -1,4 +1,4 @@
-"""Exact-value rank-1 QLoRA primitives for the canonical GLM-5.2 trainer.
+"""Exact-value QLoRA primitives for the canonical GLM-5.2 trainer.
 
 The forward below deliberately uses the same public SGLang block-FP8 and
 dynamic-LoRA kernels as serving.  Autograd is supplied separately by the
@@ -16,15 +16,16 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from xorl.models.transformers.glm5.exact_lora_contract import glm52_exact_lora_scaling
 from xorl.ops.block_fp8_native import _sglang_native_block_fp8_linear_value
 from xorl.qlora.modules.block_fp8_linear import BlockFP8QLoRALinear
 
 
-GLM52_EXACT_TP1_QLORA_CONTRACT_VERSION = "glm52_exact_tp1_rank1_qlora_v1"
+GLM52_EXACT_TP1_QLORA_CONTRACT_VERSION = "glm52_exact_tp1_qlora_v2"
 
 
 @lru_cache(maxsize=64)
-def _single_adapter_batch_info(device_index: int, rows: int):
+def _single_adapter_batch_info(device_index: int, rows: int, rank: int, scaling: float):
     """Cache immutable production-graph-shaped metadata across all TP1 layers."""
 
     from sglang.srt.lora.utils import LoRABatchInfo  # noqa: PLC0415
@@ -36,8 +37,8 @@ def _single_adapter_batch_info(device_index: int, rows: int):
         num_segments=1,
         seg_indptr=torch.tensor([0, rows], dtype=torch.int32, device=device),
         weight_indices=torch.zeros(1, dtype=torch.int32, device=device),
-        lora_ranks=torch.ones(1, dtype=torch.int32, device=device),
-        scalings=torch.ones(1, dtype=torch.float32, device=device),
+        lora_ranks=torch.full((1,), rank, dtype=torch.int32, device=device),
+        scalings=torch.full((1,), scaling, dtype=torch.float32, device=device),
         max_len=rows,
         seg_lens=torch.tensor([rows], dtype=torch.int32, device=device),
         permutation=None,
@@ -82,11 +83,11 @@ class _Glm52ExactTP1QLoRAFunction(torch.autograd.Function):
 
 
 class Glm52ExactTP1BlockFP8QLoRALinear(BlockFP8QLoRALinear):
-    """Canonical GLM-5.2 TP1 block-FP8 linear with active rank-1 LoRA.
+    """Canonical GLM-5.2 TP1 block-FP8 linear with active exact LoRA.
 
     This wrapper is intentionally narrower than :class:`BlockFP8QLoRALinear`.
-    It admits only the rank-1/alpha-1, bias-free, non-AQN tuple certified by the
-    exact active-LoRA contract.  TP-sharded shared experts and the LM head have
+    It admits only the certified rank/alpha tuples, with bias and AQN disabled.
+    TP-sharded shared experts and the LM head have
     different physical programs and must use their own wrappers.
     """
 
@@ -109,10 +110,7 @@ class Glm52ExactTP1BlockFP8QLoRALinear(BlockFP8QLoRALinear):
         enable_aqn: bool = False,
         aqn_alpha: float = 1.0,
     ) -> None:
-        if r != 1 or lora_alpha != 1:
-            raise ValueError(
-                f"GLM-5.2 exact TP1 QLoRA requires rank=1 and alpha=1; received rank={r}, alpha={lora_alpha}"
-            )
+        glm52_exact_lora_scaling(r, lora_alpha)
         if bias:
             raise ValueError("GLM-5.2 exact TP1 block-FP8 projections are bias-free")
         if enable_aqn:
@@ -155,14 +153,9 @@ class Glm52ExactTP1BlockFP8QLoRALinear(BlockFP8QLoRALinear):
         return result
 
     def set_runtime_lora_config(self, lora_rank: int, lora_alpha: int) -> None:
-        if (lora_rank, lora_alpha) != (1, 1):
-            raise ValueError(
-                "GLM-5.2 exact TP1 QLoRA runtime admits only lora_rank=1 and lora_alpha=1; "
-                f"got rank={lora_rank}, alpha={lora_alpha}"
-            )
-        self.active_r = 1
-        self.active_lora_alpha = 1
-        self.scaling = 1.0
+        self.scaling = glm52_exact_lora_scaling(lora_rank, lora_alpha)
+        self.active_r = lora_rank
+        self.active_lora_alpha = lora_alpha
 
     @classmethod
     def from_module(
@@ -187,8 +180,13 @@ class Glm52ExactTP1BlockFP8QLoRALinear(BlockFP8QLoRALinear):
         return replacement
 
     def _validate_engaged_contract(self, input: Tensor) -> None:
-        if self.active_r != 1 or self.active_lora_alpha != 1 or self._active_scaling() != 1.0:
-            raise RuntimeError("GLM-5.2 exact TP1 QLoRA runtime requires active rank=1, alpha=1, scaling=1")
+        expected_scaling = glm52_exact_lora_scaling(self.r, self.lora_alpha)
+        if (
+            self.active_r != self.r
+            or self.active_lora_alpha != self.lora_alpha
+            or self._active_scaling() != expected_scaling
+        ):
+            raise RuntimeError("GLM-5.2 exact TP1 QLoRA runtime adapter contract was mutated")
         if self.lora_A.dtype is not torch.float32 or self.lora_B.dtype is not torch.float32:
             raise TypeError("GLM-5.2 exact TP1 QLoRA master factors must remain FP32")
         if self.enable_aqn:
@@ -240,7 +238,7 @@ class Glm52ExactTP1BlockFP8QLoRALinear(BlockFP8QLoRALinear):
             scales,
         )
 
-        batch_info = _single_adapter_batch_info(input.device.index, rows)
+        batch_info = _single_adapter_batch_info(input.device.index, rows, self.r, self.scaling)
         lora_a_output = sgemm_lora_a_fwd(
             input_2d,
             effective_A.unsqueeze(0),
@@ -290,7 +288,7 @@ class Glm52ExactTP1BlockFP8QLoRALinear(BlockFP8QLoRALinear):
             reference_input = input.float().detach().requires_grad_(need_input)
             reference_A = effective_A.float().detach().requires_grad_(need_A)
             reference_B = effective_B.float().detach().requires_grad_(need_B)
-            lora_output = F.linear(
+            lora_output = self.scaling * F.linear(
                 F.linear(reference_input, reference_A),
                 reference_B,
             )

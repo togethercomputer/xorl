@@ -31,11 +31,12 @@ from xorl.lora.expert_adapter_contract import (
 )
 from xorl.models.layers.moe.backend import expert_adapter_backend_contract
 from xorl.models.layers.moe.experts import MoEExperts
+from xorl.models.transformers.glm5.exact_lora_contract import glm52_exact_lora_scaling
 from xorl.models.transformers.glm5.native_fp8 import Glm52NativeBlockFP8Experts
 from xorl.ops.block_fp8_native import pack_fp8_as_float32
 
 
-GLM52_EXACT_EP16_ROUTED_QLORA_CONTRACT_VERSION = "glm52_exact_ep16_routed_rank1_qlora_v1"
+GLM52_EXACT_EP16_ROUTED_QLORA_CONTRACT_VERSION = "glm52_exact_ep16_routed_qlora_v2"
 GLM52_ROUTED_GLOBAL_EXPERTS = 256
 GLM52_ROUTED_EP_SIZE = 16
 GLM52_ROUTED_LOCAL_EXPERTS = 16
@@ -185,10 +186,8 @@ class Glm52ExactEP16BlockFP8QLoRARoutedExperts(Glm52NativeBlockFP8Experts):
             or self.num_experts != GLM52_ROUTED_GLOBAL_EXPERTS
             or self.num_local_experts != GLM52_ROUTED_LOCAL_EXPERTS
             or self.moe_tp_size != 1
-            or self.r != 1
-            or self.active_r != 1
-            or self.lora_alpha != 1
-            or self.active_lora_alpha != 1
+            or self.active_r != self.r
+            or self.active_lora_alpha != self.lora_alpha
             or self.ep_dispatch != "alltoall"
             or self.hybrid_shared is not True
         ):
@@ -237,10 +236,7 @@ class Glm52ExactEP16BlockFP8QLoRARoutedExperts(Glm52NativeBlockFP8Experts):
         hidden_act: str = "silu",
         device: torch.device | str | None = None,
     ) -> None:
-        if (r, lora_alpha) != (1, 1):
-            raise ValueError(
-                f"GLM-5.2 exact routed experts require rank=1 and alpha=1; got rank={r}, alpha={lora_alpha}"
-            )
+        scaling = glm52_exact_lora_scaling(r, lora_alpha)
         if (num_experts, ep_size, num_local_experts) != (
             GLM52_ROUTED_GLOBAL_EXPERTS,
             GLM52_ROUTED_EP_SIZE,
@@ -273,23 +269,23 @@ class Glm52ExactEP16BlockFP8QLoRARoutedExperts(Glm52NativeBlockFP8Experts):
         self.expert_offset = ep_rank * self.num_local_experts
         self.moe_tp_size = 1
         self.ep_dispatch = "alltoall"
-        self.r = self.active_r = 1
-        self.lora_alpha = self.active_lora_alpha = 1
-        self.scaling = 1.0
+        self.r = self.active_r = r
+        self.lora_alpha = self.active_lora_alpha = lora_alpha
+        self.scaling = scaling
         self.max_loras_per_batch = GLM52_ROUTED_MAX_LORAS_PER_BATCH
 
-        self.gate_proj_lora_A = nn.Parameter(torch.empty((1, hidden_size, 1), dtype=torch.float32, device=device))
+        self.gate_proj_lora_A = nn.Parameter(torch.empty((1, hidden_size, r), dtype=torch.float32, device=device))
         self.gate_proj_lora_B = nn.Parameter(
-            torch.empty((num_experts, 1, intermediate_size), dtype=torch.float32, device=device)
+            torch.empty((num_experts, r, intermediate_size), dtype=torch.float32, device=device)
         )
-        self.up_proj_lora_A = nn.Parameter(torch.empty((1, hidden_size, 1), dtype=torch.float32, device=device))
+        self.up_proj_lora_A = nn.Parameter(torch.empty((1, hidden_size, r), dtype=torch.float32, device=device))
         self.up_proj_lora_B = nn.Parameter(
-            torch.empty((num_experts, 1, intermediate_size), dtype=torch.float32, device=device)
+            torch.empty((num_experts, r, intermediate_size), dtype=torch.float32, device=device)
         )
         self.down_proj_lora_A = nn.Parameter(
-            torch.empty((num_experts, intermediate_size, 1), dtype=torch.float32, device=device)
+            torch.empty((num_experts, intermediate_size, r), dtype=torch.float32, device=device)
         )
-        self.down_proj_lora_B = nn.Parameter(torch.empty((1, 1, hidden_size), dtype=torch.float32, device=device))
+        self.down_proj_lora_B = nn.Parameter(torch.empty((1, r, hidden_size), dtype=torch.float32, device=device))
         self.reset_lora_parameters()
 
     def reset_lora_parameters(self) -> None:
@@ -332,13 +328,9 @@ class Glm52ExactEP16BlockFP8QLoRARoutedExperts(Glm52NativeBlockFP8Experts):
         return result
 
     def set_runtime_lora_config(self, lora_rank: int, lora_alpha: int) -> None:
-        if (lora_rank, lora_alpha) != (1, 1):
-            raise ValueError(
-                "GLM-5.2 exact routed runtime admits only lora_rank=1 and lora_alpha=1; "
-                f"got rank={lora_rank}, alpha={lora_alpha}"
-            )
-        self.active_r = self.active_lora_alpha = 1
-        self.scaling = 1.0
+        self.scaling = glm52_exact_lora_scaling(lora_rank, lora_alpha)
+        self.active_r = lora_rank
+        self.active_lora_alpha = lora_alpha
 
     def load_prequantized(self, gate_up, gate_up_scale_inv, down, down_scale_inv) -> None:
         """Load the already-localized sixteen-expert official source slice."""
@@ -399,8 +391,12 @@ class Glm52ExactEP16BlockFP8QLoRARoutedExperts(Glm52NativeBlockFP8Experts):
             raise RuntimeError("GLM-5.2 exact routed experts require canonical alltoall and reject DeepEP")
         if (self.num_experts, self.ep_size, self.num_local_experts, self.moe_tp_size) != (256, 16, 16, 1):
             raise RuntimeError("GLM-5.2 exact routed EP16/MoE-TP1 topology was mutated")
-        if (self.r, self.active_r, self.lora_alpha, self.active_lora_alpha, self.scaling) != (1, 1, 1, 1, 1.0):
-            raise RuntimeError("GLM-5.2 exact routed experts require rank=1, alpha=1, and scaling=1")
+        if (
+            self.active_r != self.r
+            or self.active_lora_alpha != self.lora_alpha
+            or self.scaling != glm52_exact_lora_scaling(self.r, self.lora_alpha)
+        ):
+            raise RuntimeError("GLM-5.2 exact routed expert adapter contract was mutated")
         if hidden.device.type != "cuda":
             raise RuntimeError("GLM-5.2 exact routed expert values require CUDA and pinned SGLang kernels")
         if hidden.ndim != 2 or hidden.dtype is not torch.bfloat16 or hidden.shape[1] != self.hidden_size:
@@ -427,14 +423,14 @@ class Glm52ExactEP16BlockFP8QLoRARoutedExperts(Glm52NativeBlockFP8Experts):
             raise ValueError("GLM-5.2 local IDs admit only the -1 sentinel or slots [0, 15]")
 
         shared_factor_shapes = {
-            "gate_proj_lora_A": (1, self.hidden_size, 1),
-            "up_proj_lora_A": (1, self.hidden_size, 1),
-            "down_proj_lora_B": (1, 1, self.hidden_size),
+            "gate_proj_lora_A": (1, self.hidden_size, self.r),
+            "up_proj_lora_A": (1, self.hidden_size, self.r),
+            "down_proj_lora_B": (1, self.r, self.hidden_size),
         }
         expert_factor_shapes = {
-            "gate_proj_lora_B": (1, self.intermediate_size),
-            "up_proj_lora_B": (1, self.intermediate_size),
-            "down_proj_lora_A": (self.intermediate_size, 1),
+            "gate_proj_lora_B": (self.r, self.intermediate_size),
+            "up_proj_lora_B": (self.r, self.intermediate_size),
+            "down_proj_lora_A": (self.intermediate_size, self.r),
         }
         factor_names = set(shared_factor_shapes) | set(expert_factor_shapes)
         for name, shape in shared_factor_shapes.items():
@@ -473,25 +469,27 @@ class Glm52ExactEP16BlockFP8QLoRARoutedExperts(Glm52NativeBlockFP8Experts):
 
         slots = self.max_loras_per_batch
         device = gate_A.device
-        gate_up_A = torch.zeros((slots, 1, 2, self.hidden_size), dtype=torch.bfloat16, device=device)
+        gate_up_A = torch.zeros((slots, 1, 2 * self.r, self.hidden_size), dtype=torch.bfloat16, device=device)
         gate_up_B = torch.zeros(
-            (slots, self.num_local_experts, 2 * self.intermediate_size, 1),
+            (slots, self.num_local_experts, 2 * self.intermediate_size, self.r),
             dtype=torch.bfloat16,
             device=device,
         )
         down_A_buffer = torch.zeros(
-            (slots, self.num_local_experts, 1, self.intermediate_size),
+            (slots, self.num_local_experts, self.r, self.intermediate_size),
             dtype=torch.bfloat16,
             device=device,
         )
-        down_B_buffer = torch.zeros((slots, 1, self.hidden_size, 1), dtype=torch.bfloat16, device=device)
+        down_B_buffer = torch.zeros((slots, 1, self.hidden_size, self.r), dtype=torch.bfloat16, device=device)
         local_gate_B = self._owner_local_factor(gate_B, name="gate_proj_lora_B")
         local_up_B = self._owner_local_factor(up_B, name="up_proj_lora_B")
         local_down_A = self._owner_local_factor(down_A, name="down_proj_lora_A")
         gate_up_A[0, 0].copy_(torch.cat((gate_A.transpose(1, 2), up_A.transpose(1, 2)), dim=1)[0])
-        gate_up_B[0].copy_(torch.cat((local_gate_B.transpose(1, 2), local_up_B.transpose(1, 2)), dim=1))
+        gate_up_B[0].copy_(
+            self.scaling * torch.cat((local_gate_B.transpose(1, 2), local_up_B.transpose(1, 2)), dim=1)
+        )
         down_A_buffer[0].copy_(local_down_A.transpose(1, 2))
-        down_B_buffer[0, 0].copy_(down_B.transpose(1, 2)[0])
+        down_B_buffer[0, 0].copy_(self.scaling * down_B.transpose(1, 2)[0])
         return {
             "gate_up_lora_a_weights": gate_up_A,
             "gate_up_lora_b_weights": gate_up_B,
@@ -511,7 +509,7 @@ class Glm52ExactEP16BlockFP8QLoRARoutedExperts(Glm52NativeBlockFP8Experts):
 
         device = physical["gate_up_lora_a_weights"].device
         ranks = torch.zeros(self.max_loras_per_batch, dtype=torch.int32, device=device)
-        ranks[0] = 1
+        ranks[0] = self.r
         enabled = torch.zeros_like(ranks)
         enabled[0] = 1
         return LoRAInfo(
@@ -521,7 +519,7 @@ class Glm52ExactEP16BlockFP8QLoRARoutedExperts(Glm52NativeBlockFP8Experts):
             lora_ranks=ranks,
             adapter_enabled=enabled,
             token_lora_mapping=torch.zeros(rows, dtype=torch.int32, device=device),
-            max_lora_rank=1,
+            max_lora_rank=self.r,
             num_experts=self.num_experts,
             has_active_lora=True,
             experts_shared_outer_loras=True,
@@ -699,11 +697,11 @@ class Glm52ExactEP16BlockFP8QLoRARoutedExperts(Glm52NativeBlockFP8Experts):
             expert_input_bf16 = expert_input_fp32.to(torch.bfloat16)
             base_gate_up = F.linear(expert_input_bf16, gate_up_weight[local_expert])
             base_gate, base_up = base_gate_up.split(self.intermediate_size, dim=-1)
-            gate_lora = F.linear(
+            gate_lora = self.scaling * F.linear(
                 F.linear(expert_input_fp32, gate_A[0].transpose(0, 1)),
                 local_gate_B[local_expert].transpose(0, 1),
             )
-            up_lora = F.linear(
+            up_lora = self.scaling * F.linear(
                 F.linear(expert_input_fp32, up_A[0].transpose(0, 1)),
                 local_up_B[local_expert].transpose(0, 1),
             )
@@ -711,7 +709,7 @@ class Glm52ExactEP16BlockFP8QLoRARoutedExperts(Glm52NativeBlockFP8Experts):
             up = (base_up.float() + up_lora).to(torch.bfloat16)
             activated = F.silu(gate.float()).to(torch.bfloat16) * up
             base_down = F.linear(activated, down_weight[local_expert])
-            down_lora = F.linear(
+            down_lora = self.scaling * F.linear(
                 F.linear(activated.float(), local_down_A[local_expert].transpose(0, 1)),
                 down_B[0].transpose(0, 1),
             )

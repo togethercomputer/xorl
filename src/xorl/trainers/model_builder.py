@@ -129,6 +129,8 @@ def build_training_model(
     enable_lora: bool = False,
     lora_rank: int = 32,
     lora_alpha: int = 16,
+    lora_b_init_std: float = 0.0,
+    lora_b_init_seed: int = 0,
     lora_target_modules: Optional[List[str]] = None,
     lora_target_manifest: Optional[dict[str, Any] | str] = None,
     moe_hybrid_shared_lora: bool = False,
@@ -517,6 +519,14 @@ def build_training_model(
         for part in all_parts:
             for param in part.parameters():
                 param.requires_grad = True
+
+    if lora_b_init_std:
+        if not (enable_lora or enable_qlora):
+            raise ValueError("lora_b_init_std requires LoRA or QLoRA")
+        from xorl.lora.utils import initialize_lora_b_nonzero  # noqa: PLC0415
+
+        for part in all_parts:
+            initialize_lora_b_nonzero(part, std=lora_b_init_std, seed=lora_b_init_seed)
 
     # Optionally freeze MoE router
     if freeze_router:

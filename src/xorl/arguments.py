@@ -1865,6 +1865,14 @@ class LoRAArguments:
         default=16,
         metadata={"help": "LoRA alpha for scaling"},
     )
+    lora_b_init_std: float = field(
+        default=0.0,
+        metadata={"help": "Optional deterministic normal initialization std for LoRA-B"},
+    )
+    lora_b_init_seed: int = field(
+        default=0,
+        metadata={"help": "Seed for deterministic nonzero LoRA-B initialization"},
+    )
     lora_target_modules: Optional[List[str]] = field(
         default=None,
         metadata={"help": "Modules to apply LoRA to. If None, uses default linear projections."},

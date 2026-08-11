@@ -1042,6 +1042,18 @@ class Trainer:
                 self.ps.lm_head_tp_group,
             )
 
+        if args.lora.lora_b_init_std:
+            if not (args.lora.enable_lora or args.lora.enable_qlora):
+                raise ValueError("lora_b_init_std requires LoRA or QLoRA")
+            from xorl.lora.utils import initialize_lora_b_nonzero  # noqa: PLC0415
+
+            for part in self._all_model_parts():
+                initialize_lora_b_nonzero(
+                    part,
+                    std=args.lora.lora_b_init_std,
+                    seed=args.lora.lora_b_init_seed,
+                )
+
     def _all_model_parts(self) -> List[torch.nn.Module]:
         """All local model chunks: PP virtual stages own several, else just self.model."""
         return list(self.model_parts) if self.pp_enabled else [self.model]

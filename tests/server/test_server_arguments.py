@@ -649,18 +649,32 @@ def _exact_glm52_rank1_server_config(tmp_path):
     }
 
 
-def test_load_server_arguments_admits_exact_glm52_rank1_world16_tuple(tmp_path):
+@pytest.mark.parametrize(("rank", "alpha"), ((1, 1), (16, 32)))
+def test_load_server_arguments_admits_exact_glm52_world16_tuples(tmp_path, rank, alpha):
+    payload = _exact_glm52_rank1_server_config(tmp_path)
+    payload["lora"].update(lora_rank=rank, max_lora_rank=rank, lora_alpha=alpha)
     config_path = tmp_path / "server_config.yaml"
-    config_path.write_text(yaml.safe_dump(_exact_glm52_rank1_server_config(tmp_path)), encoding="utf-8")
+    config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
 
     args = load_server_arguments(str(config_path))
 
-    assert (args.lora_rank, args.max_lora_rank, args.lora_alpha) == (1, 1, 1)
+    assert (args.lora_rank, args.max_lora_rank, args.lora_alpha) == (rank, rank, alpha)
     assert args.ep_dispatch == "alltoall"
     assert (args.expert_parallel_size, args.ulysses_parallel_size) == (16, 16)
     assert args.lm_head_tensor_parallel_size == 16
     assert args.fsdp_sharded_lm_head_loss is True
     assert args.get_total_gpus() == 16
+
+
+def test_load_server_arguments_threads_nonzero_lora_b_initialization(tmp_path):
+    payload = _exact_glm52_rank1_server_config(tmp_path)
+    payload["lora"].update(lora_b_init_std=0.001, lora_b_init_seed=1616)
+    config_path = tmp_path / "server_config.yaml"
+    config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    args = load_server_arguments(str(config_path))
+    assert args.to_config_dict()["lora"]["lora_b_init_std"] == 0.001
+    assert args.to_config_dict()["lora"]["lora_b_init_seed"] == 1616
 
 
 def test_load_server_arguments_rejects_rank1_exact_lane_with_non_tp16_lm_head(tmp_path):

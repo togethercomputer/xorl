@@ -95,9 +95,9 @@ def test_fused_gate_up_contract_is_one_native_leaf_with_four_logical_fp32_factor
     with pytest.raises(RuntimeError, match="explicit gate/up pair"):
         Glm52ExactTP1FusedGateUpBlockFP8QLoRA.from_linear(nn.Linear(8, 128, bias=False))
     module.set_runtime_lora_config(1, 1)
-    with pytest.raises(ValueError, match="only lora_rank=1 and lora_alpha=1"):
+    with pytest.raises(ValueError, match="rank=1 and alpha=1"):
         module.set_runtime_lora_config(1, 2)
-    with pytest.raises(ValueError, match="only lora_rank=1 and lora_alpha=1"):
+    with pytest.raises(ValueError, match="rank=1 and alpha=1"):
         module.set_runtime_lora_config(2, 1)
 
 

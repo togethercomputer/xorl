@@ -98,7 +98,7 @@ def test_absorbed_kv_b_contract_keeps_one_frozen_native_base_and_two_logical_mas
     with pytest.raises(ValueError, match="only effective TP1"):
         Glm52ExactTP1AbsorbedKvBBlockFP8QLoRA(tp_size=2)
     module.set_runtime_lora_config(1, 1)
-    with pytest.raises(ValueError, match="only rank=1 and alpha=1"):
+    with pytest.raises(ValueError, match="rank=1 and alpha=1"):
         module.set_runtime_lora_config(1, 2)
 
 

@@ -202,7 +202,7 @@ def test_routed_bank_contract_is_strict_rank_local_ep16_moe_tp1() -> None:
     with pytest.raises(ValueError, match=r"in \[0, 15\]"):
         Glm52ExactEP16BlockFP8QLoRARoutedExperts(_HIDDEN, _INTERMEDIATE, ep_rank=16)
     module.set_runtime_lora_config(1, 1)
-    with pytest.raises(ValueError, match="only lora_rank=1"):
+    with pytest.raises(ValueError, match="rank=1 and alpha=1"):
         module.set_runtime_lora_config(1, 2)
 
 

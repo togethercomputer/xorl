@@ -177,7 +177,7 @@ def test_dense_mlp_runtime_rank_alpha_contract_is_atomic_and_fails_before_forwar
         module.down_proj.active_r,
         module.down_proj.active_lora_alpha,
     )
-    with pytest.raises(ValueError, match="runtime requires rank=1 and alpha=1"):
+    with pytest.raises(ValueError, match="rank=1 and alpha=1"):
         module.set_runtime_lora_config(2, 2)
     assert (
         module.active_r,
@@ -188,11 +188,11 @@ def test_dense_mlp_runtime_rank_alpha_contract_is_atomic_and_fails_before_forwar
 
     input = torch.zeros(1, 8, dtype=torch.bfloat16)
     module.down_proj.active_lora_alpha = 2
-    with pytest.raises(RuntimeError, match="gate, up, and down before forward"):
+    with pytest.raises(RuntimeError, match="one consistent adapter contract"):
         module(input)
     module.set_runtime_lora_config(1, 1)
     module.active_r = 2
-    with pytest.raises(RuntimeError, match="gate, up, and down before forward"):
+    with pytest.raises(RuntimeError, match="one consistent adapter contract"):
         module(input)
 
 
