@@ -175,6 +175,8 @@ ZMQ communication between the launcher, workers, and API server.
 | `enable_lora` | `false` | Enable LoRA adapters. |
 | `lora_rank` | `32` | LoRA rank (`r`). Default is 32 for server (vs 16 for local). |
 | `lora_alpha` | `16` | LoRA scaling factor. |
+| `lora_b_init_std` | `0.0` | Optional deterministic normal initialization standard deviation for LoRA-B. `0.0` keeps the standard zero-B/no-op initialization. |
+| `lora_b_init_seed` | `0` | Seed for opt-in nonzero LoRA-B initialization. |
 | `lora_target_modules` | `null` | Module names to inject LoRA into. `null` = default for architecture. |
 | `moe_hybrid_shared_lora` | `false` | Share `lora_A` for gate/up projections and `lora_B` for down projections across experts. |
 | `enable_qlora` | `false` | Quantize base weights and train LoRA adapters on top. |

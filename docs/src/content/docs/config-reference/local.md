@@ -251,6 +251,8 @@ Each entry in `datasets` (or `test_datasets`) is a dict:
 | `enable_lora` | `false` | Enable LoRA fine-tuning. |
 | `lora_rank` | `16` | LoRA rank (`r`). |
 | `lora_alpha` | `16` | LoRA scaling factor (`alpha`). Effective scale = `alpha / rank`. |
+| `lora_b_init_std` | `0.0` | Optional deterministic normal initialization standard deviation for LoRA-B. `0.0` keeps the standard zero-B/no-op initialization. |
+| `lora_b_init_seed` | `0` | Seed for opt-in nonzero LoRA-B initialization. |
 | `lora_target_modules` | `null` | Module names to inject LoRA into. `null` = default linear projections for the architecture. |
 | `save_lora_only` | `false` | Only save LoRA adapter weights in HF checkpoints (not the full model). |
 | `enable_qlora` | `false` | Quantize base weights and train LoRA on top. Implies `enable_lora: true`. |

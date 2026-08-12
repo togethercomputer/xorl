@@ -35,6 +35,9 @@ python examples/server/password_memorization/run_password_test.py \
 | `--sync-quant` | fp8 | Sync quantization: `fp8` or `none` |
 | `--train-url` | `http://localhost:6000` | Training server URL |
 | `--infer-url` | `http://localhost:30000` | Inference endpoint URL |
+| `--run-baseline` | `false` | Run pre-training inference. Restart or clear the inference endpoint afterward before using this example's no-flush sync |
+
+This runner deliberately demonstrates a narrow no-flush update: use a freshly started, dedicated inference endpoint, allow no concurrent traffic, keep `--run-baseline` disabled, and perform the one weight update before the endpoint's first generation. Under those conditions no old-version KV or prefix-cache state exists to cross the version boundary. If any pre-sync generation has occurred, restart or clear the endpoint cache first.
 
 ## Weight sync pipeline
 

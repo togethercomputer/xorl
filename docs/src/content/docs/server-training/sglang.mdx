@@ -22,7 +22,7 @@ The XoRL RL integration requires the following capabilities from its pinned infe
 
 ## What Was Modified
 
-The pinned xorl-sglang `main` branch carries the XoRL integration. The exact diff against upstream changes as the fork is rebased, so this page describes stable integration surfaces instead of line or file counts.
+The xorl-sglang revision pinned by this checkout carries the XoRL integration. Its branch provenance changes while the coordinated PR stack is reviewed and rebased, so this page describes stable integration surfaces instead of assuming the pin matches `main` or quoting line/file counts.
 
 ### 1. Weight Update Endpoints and Protocol
 
@@ -101,7 +101,7 @@ Two additional fixes on top of the upstream merge:
 
 ### KV Cache Flush on Weight Update
 
-The pinned receiver does not associate KV or prefix-cache entries with `weight_version`; that value is control-plane metadata only. Invalidate cached state after every online weight update that may be followed by cache reuse. Select `cache_invalidation_mode: flush` with `pause_mode: retract` (or `abort` when dropping requests is acceptable). Do not carry cached state across an update with `cache_invalidation_mode: none` or `pause_mode: in_place`. See the [weight-sync overview](/xorl/server-training/weight-sync/overview/) for the safe request.
+The pinned receiver does not associate KV or prefix-cache entries with `weight_version`; that value is control-plane metadata only. The safety invariant is that no cached or in-flight state computed under one version is consumed under another. Flushing with `pause_mode: retract` is the general enforcement mechanism. A no-flush update is valid only when external orchestration proves the endpoint has no in-flight work and no old-version entry that can be reused. See the [weight-sync overview](/xorl/server-training/weight-sync/overview/) for both cases.
 
 ---
 

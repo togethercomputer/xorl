@@ -81,10 +81,10 @@ For a linear layer with weight matrix **W₀** ∈ ℝ^(d×k), LoRA adds a train
   <text x="646" y="101" text-anchor="middle" font-size="12" fill="#1e3a8a" font-family="sans-serif">W·x</text>
 
 
-  <text x="350" y="180" text-anchor="middle" font-size="10" fill="#64748b" font-family="sans-serif">B initialized to zeros → ΔW = 0 at start of training. Training starts from the exact pretrained model behavior.</text>
+  <text x="350" y="180" text-anchor="middle" font-size="10" fill="#64748b" font-family="sans-serif">Default: B = 0 and ΔW = 0. Opt-in nonzero B initialization starts with an adapter delta.</text>
 </svg>
 
-**A** is initialized with Kaiming uniform, **B** with zeros — so the initial LoRA output is exactly zero and training starts from the pretrained model's behavior.
+By default, **A** uses Kaiming uniform initialization and **B** is zero, so the initial LoRA output is exactly zero and training starts from the pretrained model's behavior. Set `lora_b_init_std` above zero to opt into deterministic normal initialization of **B** (using `lora_b_init_seed`); that mode intentionally starts with a nonzero adapter delta.
 
 ## Basic Configuration
 
@@ -118,6 +118,8 @@ For QKV-fused models (default `merge_qkv: true`), target the fused projection na
 | `enable_lora` | `false` | Enable LoRA injection |
 | `lora_rank` | `16` | Rank r of the low-rank decomposition |
 | `lora_alpha` | `16` | Scaling factor; effective scale = alpha/rank. Examples may override it to `32`. |
+| `lora_b_init_std` | `0.0` | Standard deviation for optional deterministic normal LoRA-B initialization. `0.0` preserves the standard no-op start. |
+| `lora_b_init_seed` | `0` | Seed used by opt-in nonzero LoRA-B initialization. |
 | `lora_target_modules` | `null` | List of module name patterns to inject LoRA into |
 | `save_lora_only` | `false` | Save only LoRA weights in checkpoints |
 

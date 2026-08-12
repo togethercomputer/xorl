@@ -62,7 +62,7 @@ python run_password_test.py --model Qwen/Qwen3-8B --steps 48 --lr 5e-5 --sync-qu
 | `--infer-url` | http://localhost:30000 | Inference endpoint URL(s), space-separated |
 | `--master-address` | localhost | Master address for NCCL weight sync |
 | `--log-interval` | 16 | Print loss every N steps |
-| `--run-baseline` | false | Run a pre-training inference check before weight sync |
+| `--run-baseline` | false | Run a pre-training inference check. This seeds old-version cache state, so restart/clear the isolated inference endpoint before the no-flush sync |
 | `--sync-wait-timeout` | 120 | Seconds to wait for inference endpoints to report the new `weight_version` |
 
 ---
@@ -155,4 +155,5 @@ FP8 re-quantization uses block-wise e4m3 with `weight_block_size=[128, 128]`, co
 - **30B MoE with EP**: cosine LR schedule is important — constant LR causes loss oscillation around ~1.0.
 - **NF4**: quantizes bf16 weights on-the-fly; no pre-quantized checkpoint needed.
 - **Password e2e validation**: `run_password_test.py` now waits for the async `create_model` future and for each inference endpoint to report the requested `weight_version` before running post-sync recall checks.
-- **Baseline queries**: the script skips baseline inference by default to avoid seeding radix-cache entries for the exact prompts later used in the no-flush post-sync validation. Pass `--run-baseline` if you explicitly want that pre-training check.
+- **No-flush scope**: this example intentionally uses the REST no-flush defaults. That is safe only for a freshly started, dedicated inference endpoint with no concurrent traffic: the default path performs no pre-sync generation, then makes one weight update before its first generation. If the endpoint has served any earlier request, restart or clear its cache before running the sync.
+- **Baseline queries**: the script skips baseline inference by default because those exact prompts could seed old-version radix-cache entries. `--run-baseline` is diagnostic only; restart or clear the isolated inference endpoint after the baseline and before the weight sync.
