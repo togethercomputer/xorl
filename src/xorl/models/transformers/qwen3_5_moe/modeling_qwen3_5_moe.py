@@ -43,7 +43,7 @@ from xorl.models.transformers.qwen3_5_shared import (
     has_linear_attention_layers,
     qwen3_5_apply_rotary_pos_emb,
 )
-from xorl.ops.fused_silu_and_mul import fused_silu_and_mul
+from xorl.ops.fused_silu_and_mul import exact_fp32_silu_and_mul, fused_silu_and_mul
 from xorl.ops.linear_attention import GatedDeltaNet
 from xorl.ops.linear_attention.ops.cp import build_linear_attention_cp_context
 from xorl.utils import logging
@@ -84,7 +84,18 @@ class Qwen3_5MoeMLP(nn.Module):
         self.gate_up_proj = nn.Linear(self.hidden_size, 2 * self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
-        self._use_fused_silu = config.hidden_act == "silu" and not getattr(config, "_activation_native", False)
+        activation_native = getattr(config, "_activation_native", False)
+        if getattr(config, "_qwen35_exact_contract", False):
+            activation_native = False
+        self._use_fused_silu = config.hidden_act == "silu" and not activation_native
+        # One-round FP32 SwiGLU is scoped to the exact contract (serving-paired
+        # program); every other caller keeps the historical two-round bytes.
+        self._exact_one_round = bool(getattr(config, "_qwen35_exact_contract", False))
+
+    def _fused_act(self, gate_up):
+        if self._exact_one_round:
+            return exact_fp32_silu_and_mul(gate_up)
+        return fused_silu_and_mul(gate_up)
 
     def unfuse_for_tp(self):
         device = self.gate_up_proj.weight.device
@@ -145,12 +156,17 @@ class Qwen3_5MoeMLP(nn.Module):
         if hasattr(self, "gate_up_proj"):
             gate_up = self._project_gate_up(x)
             if self._use_fused_silu:
-                x = fused_silu_and_mul(gate_up)
+                x = self._fused_act(gate_up)
             else:
                 gate, up = gate_up.chunk(2, dim=-1)
                 x = self.act_fn(gate) * up
         else:
-            x = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+            gate = self.gate_proj(x)
+            up = self.up_proj(x)
+            if self._use_fused_silu:
+                x = self._fused_act(torch.cat([gate, up], dim=-1))
+            else:
+                x = self.act_fn(gate) * up
         return self.down_proj(x)
 
 
@@ -494,8 +510,9 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
         w_slice = torch.cat((w_gu[lo_s : lo_s + shard], w_gu[inter + lo_s : inter + lo_s + shard]), dim=0)
         gate_up = _BatchInvariantTrunkLinearFn.apply(gathered, w_slice, None)
         self._capture_diagnostic_component("moe_native_shared_gate_up", gate_up)
-        gate, up = gate_up.chunk(2, dim=-1)
-        act = F.silu(gate) * up  # torch-native bf16 (serving's BI-ops lane; NOT the fused kernel)
+        # Exact serving-value path: one-round FP32, paired with serving's
+        # fp32_silu_and_mul (in-scope for the exact contract by construction).
+        act = exact_fp32_silu_and_mul(gate_up)
         self._capture_diagnostic_component("moe_native_shared_act", act)
         down = _BatchInvariantTrunkLinearFn.apply(act, w_down[:, lo_s : lo_s + shard].contiguous(), None)
         self._capture_diagnostic_component("moe_native_shared_down", down)
