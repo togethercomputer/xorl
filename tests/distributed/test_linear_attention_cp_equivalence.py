@@ -96,6 +96,9 @@ def _run_cp_equivalence() -> None:
     reference_layer = _build_test_layer(device)
     cp_layer = _build_test_layer(device)
     cp_layer.load_state_dict(reference_layer.state_dict())
+    reference_layer.train()
+    cp_layer.train()
+    cp_layer.configure_exact_cp_parameter_gradient_scale(world_size)
 
     torch.manual_seed(1)
     full_hidden_states = torch.randn(1, total_tokens, hidden_size, device=device, dtype=torch.bfloat16)
@@ -142,7 +145,28 @@ def _run_cp_equivalence() -> None:
     if rank == 0:
         torch.testing.assert_close(gathered_cp_output, reference_output.detach(), atol=0, rtol=0)
         torch.testing.assert_close(gathered_cp_input_grad, reference_input.grad.detach(), atol=0, rtol=0)
-        print("linear-attention CP equivalence passed")
+
+    reference_parameters = dict(reference_layer.named_parameters())
+    cp_parameters = dict(cp_layer.named_parameters())
+    assert reference_parameters.keys() == cp_parameters.keys()
+    for name, reference_parameter in reference_parameters.items():
+        cp_gradient = cp_parameters[name].grad
+        assert cp_gradient is not None, name
+        # This is the explicit synchronization used when the exact CP module is
+        # not folded into the CP-aware FSDP mesh.  The hook must assign each CP
+        # rank 1 / world_size ownership before this sum.
+        dist.all_reduce(cp_gradient)
+        assert reference_parameter.grad is not None, name
+        torch.testing.assert_close(
+            cp_gradient,
+            reference_parameter.grad,
+            atol=2e-5,
+            rtol=2e-5,
+            msg=f"exact CP/FSDP parameter gradient mismatch for {name}",
+        )
+
+    if rank == 0:
+        print("linear-attention exact CP output, input-gradient, and reduced parameter-gradient equivalence passed")
 
 
 def _main() -> None:

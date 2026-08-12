@@ -47,18 +47,19 @@ def _apply_qwen35_gdn_exact(model: torch.nn.Module) -> dict[str, int]:
         raise ValueError(f"Unsupported exact Qwen RMSNorm family: {rmsnorm_family!r}")
     if rmsnorm_family == "v2" and getattr(config, "_rmsnorm_mode", None) != "sglang_fused":
         raise RuntimeError("The exact Qwen families-v2 RMSNorm program requires rmsnorm_mode='sglang_fused'.")
+    from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
+
+    ps = get_parallel_state()
     is_moe = getattr(config, "model_type", None) in {
         "xorl_qwen3_5_moe",
         "qwen3_5_moe",
         "qwen3_5_moe_text",
     }
     if is_moe:
-        from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
         from xorl.models.layers.moe.ep_native_combine import (  # noqa: PLC0415
             validate_qwen35_native_ep_combine_size,
         )
 
-        ps = get_parallel_state()
         if not ps.ep_enabled:
             raise ValueError("Exact Qwen3.5-MoE server training requires expert parallelism")
         validate_qwen35_native_ep_combine_size(ps.ep_size)
@@ -66,6 +67,7 @@ def _apply_qwen35_gdn_exact(model: torch.nn.Module) -> dict[str, int]:
     from xorl.lora.modules.base import LoraModule  # noqa: PLC0415
     from xorl.ops.batch_invariant_ops import wrap_trunk_linears_batch_invariant  # noqa: PLC0415
     from xorl.ops.bi_families_v2 import _select_qwen35_families_v1  # noqa: PLC0415
+    from xorl.ops.linear_attention import GatedDeltaNet  # noqa: PLC0415
 
     # RMSNorm uses the qualified v2 tree. The LM-head/LSE remains on its
     # separately qualified v1 program; that selector does not control norms.
@@ -78,6 +80,8 @@ def _apply_qwen35_gdn_exact(model: torch.nn.Module) -> dict[str, int]:
         # wrapper validates and composes with those modules.
         if isinstance(module, LoraModule):
             module.exact_merged_forward = True
+        if isinstance(module, GatedDeltaNet) and module.exact_contract:
+            module.configure_exact_cp_parameter_gradient_scale(ps.ulysses_size)
         if hasattr(module, "rmsnorm_family"):
             norm_modules.append(module)
             if module.rmsnorm_family != rmsnorm_family:

@@ -79,6 +79,8 @@ class GatedDeltaNet(nn.Module):
         self.num_v_heads = num_v_heads if num_v_heads is not None else num_heads
         self.exact_contract = exact_contract
         self.exact_merged_forward = exact_contract
+        self._exact_cp_gradient_scale_world_size = 1
+        self._exact_cp_gradient_scale_handles: tuple[torch.utils.hooks.RemovableHandle, ...] = ()
 
         self.head_k_dim = head_dim
         self.head_v_dim = int(self.head_dim * self.expand_v)
@@ -153,6 +155,38 @@ class GatedDeltaNet(nn.Module):
         else:
             self.o_norm = RMSNorm(self.head_v_dim, eps=norm_eps, dtype=torch.float32)
         self.o_proj = nn.Linear(self.value_dim, hidden_size, bias=False)
+
+    def configure_exact_cp_parameter_gradient_scale(self, world_size: int) -> None:
+        """Compensate replicated exact-GDN parameter gradients before CP reduction.
+
+        Exact CP reconstructs and executes the full sequence on every rank so
+        forward values remain byte-identical to the unsharded serving program.
+        The scatter backward consequently reconstructs the full upstream
+        gradient on every rank as well. Input gradients are correctly sliced by
+        the paired all-gather backward, but every GDN parameter receives the
+        same full gradient. FSDP or the explicit SP synchronizer then sums those
+        replicas, so pre-scale only parameter gradients by the CP world size.
+        """
+        world_size = int(world_size)
+        if world_size < 1:
+            raise ValueError(f"Exact GDN CP world size must be positive, got {world_size}")
+        configured = self._exact_cp_gradient_scale_world_size
+        if self._exact_cp_gradient_scale_handles:
+            if configured != world_size:
+                raise RuntimeError(
+                    "Exact GDN CP parameter-gradient scale is already configured for "
+                    f"world_size={configured}, not {world_size}"
+                )
+            return
+        self._exact_cp_gradient_scale_world_size = world_size
+        if world_size == 1:
+            return
+        scale = 1.0 / world_size
+        self._exact_cp_gradient_scale_handles = tuple(
+            parameter.register_hook(lambda gradient, scale=scale: gradient.mul(scale))
+            for parameter in self.parameters()
+            if parameter.requires_grad
+        )
 
     def _apply(self, fn, recurse: bool = True):
         module = super()._apply(fn, recurse=recurse)
@@ -278,6 +312,12 @@ class GatedDeltaNet(nn.Module):
             if _is_gdn_contract_enabled():
                 if cp_context.group is None or cp_context.global_cu_seqlens is None:
                     raise ValueError("Exact Qwen3.5 GDN CP requires the Ulysses group and global cu_seqlens metadata.")
+                cp_world_size = torch.distributed.get_world_size(cp_context.group)
+                if self.training and self._exact_cp_gradient_scale_world_size != cp_world_size:
+                    raise RuntimeError(
+                        "Exact Qwen3.5 GDN CP parameter-gradient ownership is not configured: "
+                        f"expected world_size={cp_world_size}, got {self._exact_cp_gradient_scale_world_size}"
+                    )
                 # Native FLA CP is mathematically equivalent but changes the chunk/state
                 # association at shard boundaries.  The exact trainer-serving contract
                 # instead reconstructs the original packed sequence, executes precisely
