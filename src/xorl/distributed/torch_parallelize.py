@@ -911,6 +911,11 @@ def build_parallelize_model(
             module_names_per_stage=module_names_per_stage,
             always_keep_fqns=pp_config.get("always_keep_fqns"),
             stage_style=stage_style,
+            # The byte contract validates the ACTUAL parameter reality per
+            # stage; uniform-fp32 masters are admitted only under a genuine
+            # bf16 mixed-precision compute intent (declared here, verified at
+            # the wire by the runtime dtype assertions in _pp_forward).
+            expects_bf16_mixed_precision=bool(enable_mixed_precision),
         )
         logger.info_rank0(f"Model split into {num_stages} PP stages ({pp_virtual_stages} per rank, {stage_style})")
 

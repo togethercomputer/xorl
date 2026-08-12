@@ -471,6 +471,16 @@ def make_pp_loss_fn(ce_mode: str = "compiled", lm_head=None):
             return _pp_quack_linear_ce_sum(hidden, labels, lm_head=lm_head)
 
         return _quack_loss
+    if ce_mode == "bi_fused":
+        # Exact lanes fail closed instead of silently training through a
+        # different head program: the PP loss variants above are not the
+        # bi_fused batch-invariant lm-head value program. PP supports bi_fused
+        # only on the forward/scoring surface (forward_only_pp +
+        # causallm_loss_function).
+        raise NotImplementedError(
+            "ce_mode='bi_fused' has no pipeline-parallel training-loss path yet; "
+            "refusing to substitute a different lm-head program under PP."
+        )
     raise ValueError(f"Unknown ce_mode: {ce_mode!r} (expected 'eager', 'compiled', or 'quack_linear')")
 
 
