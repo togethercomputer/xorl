@@ -148,10 +148,8 @@ def test_removed_field_inventory_allows_unrelated_unknown_fields():
     assert reject_removed_configuration_fields(payload, context="test config") is payload
 
 
-_SHIPPED_MOE_LORA_CONFIGS = (
-    "examples/server/configs/lora/qwen3_5_35b_a3b_lora.yaml",
-    "examples/server/configs/lora/qwen3_coder_30b_a3b_lora.yaml",
-)
+_SHIPPED_EXACT_QWEN35_MOE_LORA_CONFIG = "examples/server/configs/lora/qwen3_5_35b_a3b_lora.yaml"
+_SHIPPED_MOE_LORA_CONFIGS = ("examples/server/configs/lora/qwen3_coder_30b_a3b_lora.yaml",)
 _SHIPPED_QWEN_MOE_QLORA_CONFIGS = (
     "examples/server/configs/qlora/qwen3_235b_a22b_qlora_nf4.yaml",
     "examples/server/configs/qlora/qwen3_235b_a22b_qlora_nvfp4.yaml",
@@ -166,7 +164,11 @@ def clean_shipped_adapter_arguments():
     """Parse shipped configs in a clean process, outside this module's launcher stubs."""
 
     root = Path(__file__).resolve().parents[2]
-    relative_paths = _SHIPPED_MOE_LORA_CONFIGS + _SHIPPED_QWEN_MOE_QLORA_CONFIGS
+    relative_paths = (
+        _SHIPPED_EXACT_QWEN35_MOE_LORA_CONFIG,
+        *_SHIPPED_MOE_LORA_CONFIGS,
+        *_SHIPPED_QWEN_MOE_QLORA_CONFIGS,
+    )
     script = """
 import json
 import sys
@@ -176,7 +178,10 @@ result = {}
 for path in sys.argv[1:]:
     args = load_server_arguments(path)
     result[path] = {
+        "attn_implementation": args.attn_implementation,
         "moe_implementation": args.moe_implementation,
+        "ep_dispatch": args.ep_dispatch,
+        "deepep_async_combine": args.deepep_async_combine,
         "moe_hybrid_shared_lora": args.moe_hybrid_shared_lora,
         "lora_target_modules": args.lora_target_modules,
     }
@@ -209,6 +214,48 @@ def test_shipped_moe_lora_examples_restore_certified_quack(relative_path, clean_
     parsed = clean_shipped_adapter_arguments[relative_path]
     assert config["moe_implementation"] == parsed["moe_implementation"] == "quack"
     assert config.get("moe_hybrid_shared_lora", False) is parsed["moe_hybrid_shared_lora"] is False
+
+
+def test_shipped_exact_qwen35_lora_backends_pass_exact_admission(clean_shipped_adapter_arguments):
+    from xorl.models.auto import (  # noqa: PLC0415
+        _validate_exact_qwen35_moe_program,
+        resolve_model_numerical_program,
+    )
+
+    relative_path = _SHIPPED_EXACT_QWEN35_MOE_LORA_CONFIG
+    config_path = Path(__file__).resolve().parents[2] / relative_path
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    parsed = clean_shipped_adapter_arguments[relative_path]
+    exact_config = types.SimpleNamespace(
+        _qwen35_exact_contract=True,
+        model_type="qwen3_5_moe",
+    )
+
+    _validate_exact_qwen35_moe_program(
+        exact_config,
+        moe_implementation=parsed["moe_implementation"],
+        ep_dispatch=parsed["ep_dispatch"],
+        deepep_async_combine=parsed["deepep_async_combine"],
+    )
+    numerical_program = resolve_model_numerical_program(
+        exact_config,
+        attn_implementation=parsed["attn_implementation"],
+        non_glm_attn_default="flash_attention_4",
+        router_fp32=raw.get("router_fp32"),
+        lm_head_fp32=raw.get("lm_head_fp32"),
+        rmsnorm_mode=raw.get("rmsnorm_mode"),
+        activation_native=raw.get("activation_native", False),
+        rope_native=raw.get("rope_native"),
+        rope_class_b=raw.get("rope_class_b"),
+        attention_cast_bf16=raw.get("attention_cast_bf16", False),
+        sparse_mla_enabled=raw.get("sparse_mla_enabled"),
+        sparse_mla_backend=raw.get("sparse_mla_backend"),
+        qwen35_rmsnorm_family=raw.get("qwen35_rmsnorm_family"),
+    )
+
+    assert parsed["attn_implementation"] == numerical_program.attn_implementation == "flash_attention_4"
+    assert parsed["moe_implementation"] == "triton"
+    assert parsed["ep_dispatch"] == "alltoall"
 
 
 @pytest.mark.parametrize(
