@@ -437,16 +437,6 @@ def load_hf_state_dict_into_model(
         :class:`LoadSummary` with counts + lists of unmapped / missing names.
     """
     config = model.config
-    compress_ratios = config.compress_ratios
-    # Compressor head_dim drives the APE hotfix shape; pass it down so
-    # ``_undo_ape_hotfix`` can sanity-check the inferred reshape against
-    # the model's actual config rather than trusting tensor shape alone.
-    # The two compressors live at different head_dims:
-    #   .self_attn.compressor.ape          -> config.head_dim
-    #   .self_attn.indexer.compressor.ape  -> config.index_head_dim
-    attn_compressor_head_dim = config.head_dim
-    indexer_compressor_head_dim = getattr(config, "index_head_dim", config.head_dim)
-
     summary = LoadSummary()
 
     # First pass: collect per-layer expert tensors so we can fuse them.
@@ -931,9 +921,6 @@ def stream_load_hf_directory_into_model(
 
     hf_dir = Path(hf_dir)
     config = model.config
-    compress_ratios = config.compress_ratios
-    attn_compressor_head_dim = config.head_dim
-    indexer_compressor_head_dim = getattr(config, "index_head_dim", config.head_dim)
     summary = LoadSummary()
 
     with (hf_dir / "model.safetensors.index.json").open() as f:
