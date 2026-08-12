@@ -276,6 +276,16 @@ def test_dsv4_forward_only_reshards_external_lm_head_compute_view() -> None:
     assert head.calls == 1
 
 
+def test_exact_dsv4_auto_selects_complete_bank_adapter_export() -> None:
+    runner = object.__new__(ModelRunner)
+    runner.model_config_obj = SimpleNamespace(_dsv4_flash_exact_active_lora=True)
+    runner.lora_config = {"lora_export_format": "peft"}
+
+    runner._select_exact_dsv4_lora_export_format()
+
+    assert runner.lora_config["lora_export_format"] == "dsv4_expert_banks"
+
+
 def test_dsv4_forward_only_requires_fsdp_managed_lm_head() -> None:
     runner = object.__new__(ModelRunner)
     runner.model = SimpleNamespace(
@@ -285,3 +295,35 @@ def test_dsv4_forward_only_requires_fsdp_managed_lm_head() -> None:
 
     with pytest.raises(RuntimeError, match="FSDP-managed lm_head"):
         runner._reshard_exact_forward_only_lm_head()
+
+
+def test_dsv4_forward_only_reshards_lm_head_when_forward_fails() -> None:
+    class _Head:
+        def __init__(self):
+            self.calls = 0
+
+        def reshard(self):
+            self.calls += 1
+
+    runner = object.__new__(ModelRunner)
+    head = _Head()
+    runner.model = SimpleNamespace(
+        config=SimpleNamespace(_dsv4_flash_exact_mode=True, vocab_size=2),
+        lm_head=head,
+    )
+    runner.is_sleeping = False
+    runner.lora_config = {"enable_lora": False}
+    runner._adapter_manager = None
+    runner._active_session_id = None
+    runner.pp_enabled = False
+    runner._routing_handler = SimpleNamespace(setup=lambda *_args, **_kwargs: False)
+
+    def fail_forward(*_args, **_kwargs):
+        raise ValueError("forward failed")
+
+    runner._forward_loop = fail_forward
+
+    with pytest.raises(ValueError, match="forward failed"):
+        runner.forward([{"input_ids": torch.tensor([[0]])}])
+
+    assert head.calls == 1

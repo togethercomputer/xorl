@@ -11,10 +11,23 @@ from xorl.models.transformers.deepseek_v4.native_payload import (
     Dsv4NativeBlockFp8Linear,
     Dsv4NativeBlockFp8Payload,
     Dsv4NativeMxfp4ExpertPayload,
+    _build_dsv4_moe_runner_config,
     _dequantize_native_block_fp8,
     _validate_single_adapter_batch_info,
     attach_dsv4_native_payloads,
 )
+
+
+def test_exact_dsv4_moe_runner_enables_serving_chunk_contract():
+    config = _build_dsv4_moe_runner_config(
+        SimpleNamespace,
+        local_experts=32,
+        hidden_size=64,
+        intermediate_size=32,
+        top_k=8,
+    )
+
+    assert config.dsv4_exact_mode is True
 
 
 def test_dense_native_payload_round_trips_exact_e4m3_and_e8m0_bytes():

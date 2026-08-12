@@ -793,6 +793,32 @@ def _dsv4_moe_lora_info(
     )
 
 
+def _build_dsv4_moe_runner_config(
+    config_cls,
+    *,
+    local_experts: int,
+    hidden_size: int,
+    intermediate_size: int,
+    top_k: int,
+) -> object:
+    """Freeze the trainer-side serving runner contract for exact DSV4."""
+    return config_cls(
+        num_experts=256,
+        num_local_experts=local_experts,
+        hidden_size=hidden_size,
+        intermediate_size_per_partition=intermediate_size,
+        layer_id=0,
+        top_k=top_k,
+        params_dtype=torch.bfloat16,
+        activation="silu",
+        is_gated=True,
+        routed_scaling_factor=1.5,
+        swiglu_limit=10.0,
+        inplace=False,
+        dsv4_exact_mode=True,
+    )
+
+
 def _dsv4_native_mxfp4_forward(
     hidden_states: torch.Tensor,
     routing_weights: torch.Tensor,
@@ -854,19 +880,12 @@ def _dsv4_native_mxfp4_forward(
         expert_map=expert_map,
         global_num_experts=256,
     )
-    config = MoeRunnerConfig(
-        num_experts=256,
-        num_local_experts=local_experts,
+    config = _build_dsv4_moe_runner_config(
+        MoeRunnerConfig,
+        local_experts=local_experts,
         hidden_size=payload.hidden_size,
-        intermediate_size_per_partition=payload.intermediate_size,
-        layer_id=0,
+        intermediate_size=payload.intermediate_size,
         top_k=selected_experts.shape[1],
-        params_dtype=torch.bfloat16,
-        activation="silu",
-        is_gated=True,
-        routed_scaling_factor=1.5,
-        swiglu_limit=10.0,
-        inplace=False,
     )
     dispatch = StandardDispatchOutput(
         hidden_states=run_hidden_states,

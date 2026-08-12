@@ -301,6 +301,18 @@ class CheckpointManager:
                 "adapter and start a fresh sampler adapter lifecycle."
             )
 
+    def _resolve_lora_export_format(self, *, moe_hybrid: bool = False) -> str:
+        """Resolve the configured adapter format and enforce exact DSV4 banks."""
+        export_format = self.lora_config.get(
+            "lora_export_format",
+            "sglang_shared_outer" if moe_hybrid else "peft",
+        )
+        if contains_dsv4_exact_active_lora_component(self.model) and export_format != "dsv4_expert_banks":
+            raise RuntimeError(
+                "DSV4-Flash exact active-LoRA publication requires lora_export_format='dsv4_expert_banks'"
+            )
+        return export_format
+
     @staticmethod
     def _infer_lora_rank_dim(name: str, tensor: torch.Tensor) -> Optional[int]:
         """Infer which tensor dimension stores LoRA rank for dense and MoE LoRA params."""
@@ -366,7 +378,7 @@ class CheckpointManager:
             target_modules, lora_alpha = self._get_lora_save_config()
             adapter_session_spec = None
             adapter_rank = self.lora_config.get("lora_rank", 32)
-            lora_export_format = self.lora_config.get("lora_export_format", "peft")
+            lora_export_format = self._resolve_lora_export_format()
             if self._adapter_manager is not None and model_id in self._adapter_manager.adapters:
                 adapter_session_spec = self._adapter_manager.get_adapter_session_spec(model_id)
                 adapter_rank = adapter_session_spec["lora_config"]["lora_rank"]
@@ -416,10 +428,7 @@ class CheckpointManager:
                 # configured export format through (falls back to shared_outer when
                 # hybrid-shared MoE LoRA is enabled, else PEFT).
                 moe_hybrid = self.lora_config.get("moe_hybrid_shared_lora", False)
-                export_format = self.lora_config.get(
-                    "lora_export_format",
-                    "sglang_shared_outer" if moe_hybrid else "peft",
-                )
+                export_format = self._resolve_lora_export_format(moe_hybrid=moe_hybrid)
                 save_lora_checkpoint(
                     model=self.model,
                     save_path=save_path,

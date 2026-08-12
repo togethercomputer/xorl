@@ -1441,13 +1441,14 @@ class ModelRunner:
         )
 
         self.model = result.model
+        self.model_config_obj = result.model_config
+        self._select_exact_dsv4_lora_export_format()
         if getattr(get_parallel_state(), "lm_head_tp_size", 1) > 1:
             sync_lm_head_tp_parameters(
                 self.model,
                 get_parallel_state().lm_head_tp_replica_group,
                 get_parallel_state().lm_head_tp_group,
             )
-        self.model_config_obj = result.model_config
         numerical_program = self.model_config_obj._resolved_numerical_program
         self.model_config.update(
             {
@@ -1549,6 +1550,15 @@ class ModelRunner:
         if not target_modules:
             raise ValueError("At least one of train_mlp, train_attn, or train_unembed must be True")
         return target_modules
+
+    def _select_exact_dsv4_lora_export_format(self) -> None:
+        """Select the complete-bank serving artifact for exact DSV4 adapters."""
+        if getattr(self.model_config_obj, "_dsv4_flash_exact_active_lora", False):
+            # Exact DSV4 checkpoints are serving artifacts, not ordinary PEFT
+            # adapters. Select the only loader-compatible complete-bank format
+            # before the checkpoint manager and session specs retain this
+            # shared configuration.
+            self.lora_config["lora_export_format"] = "dsv4_expert_banks"
 
     def _validate_multi_adapter_lora_config(self) -> None:
         """Reject LoRA features that are not supported by the multi-adapter server path."""
@@ -7561,30 +7571,30 @@ class ModelRunner:
         else:
             r3_enabled = self._routing_handler.setup(micro_batches, routed_experts, routed_expert_logits)
 
-        if self.pp_enabled:
-            # Forward-only must run the pipeline schedule — calling self.model(...)
-            # would execute only this rank's first stage.
-            try:
+        try:
+            if self.pp_enabled:
+                # Forward-only must run the pipeline schedule — calling self.model(...)
+                # would execute only this rank's first stage.
                 result = self._pp_forward_only_loop(micro_batches, loss_fn, loss_fn_params, r3_enabled=r3_enabled)
                 result.pop("_pp_raw_per_token_logprobs", None)
-            finally:
-                if r3_enabled:
-                    self._routing_handler.cleanup()
-        else:
-            result = self._forward_loop(
-                micro_batches,
-                loss_fn,
-                loss_fn_params,
-                compute_backward=False,
-                r3_enabled=r3_enabled,
-                model_id=model_id,
-            )
-
-        # The lm head is called by compute_loss outside the root model. In a
-        # no-grad pass FSDP2 leaves its BF16 compute view materialized, so
-        # explicitly restore the sharded FP32 adapter masters before the next
-        # adapter switch. Backward owns this transition in training passes.
-        self._reshard_exact_forward_only_lm_head()
+            else:
+                result = self._forward_loop(
+                    micro_batches,
+                    loss_fn,
+                    loss_fn_params,
+                    compute_backward=False,
+                    r3_enabled=r3_enabled,
+                    model_id=model_id,
+                )
+        finally:
+            if self.pp_enabled and r3_enabled:
+                self._routing_handler.cleanup()
+            # The lm head is called by compute_loss outside the root model. In
+            # a no-grad pass FSDP2 leaves its BF16 compute view materialized,
+            # so restore the sharded FP32 adapter masters even when the
+            # forward/loss path raises. Backward owns this transition in
+            # training passes.
+            self._reshard_exact_forward_only_lm_head()
 
         if self._adapter_manager is not None:
             result["step"] = self._adapter_manager.get_adapter_state(model_id).global_forward_backward_step

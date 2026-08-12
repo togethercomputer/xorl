@@ -110,6 +110,10 @@ class _ExactActiveLoRAComponent(nn.Module):
     _glm52_exact_active_lora_component = True
 
 
+class _Dsv4ExactActiveLoRAComponent(nn.Module):
+    _dsv4_flash_exact_active_lora_component = True
+
+
 def _build_checkpoint_manager() -> CheckpointManager:
     manager = object.__new__(CheckpointManager)
     manager.rank = 0
@@ -219,6 +223,15 @@ def test_factor_only_snapshot_guard_leaves_ordinary_models_unrestricted():
     manager.model = nn.Linear(2, 2)
 
     manager._require_factor_only_exact_active_lora("ordinary save")
+
+
+def test_exact_dsv4_adapter_export_rejects_non_bank_format():
+    manager = object.__new__(CheckpointManager)
+    manager.model = nn.Sequential(_Dsv4ExactActiveLoRAComponent())
+    manager.lora_config = {"lora_export_format": "peft"}
+
+    with pytest.raises(RuntimeError, match="dsv4_expert_banks"):
+        manager._resolve_lora_export_format()
 
 
 @pytest.mark.parametrize("rank", [0, 1])
