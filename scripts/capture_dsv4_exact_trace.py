@@ -6,18 +6,39 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import ipaddress
 import json
 import subprocess
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import numpy as np
 import requests
 from transformers import AutoTokenizer
 
 
+def _loopback_base_url(value: str) -> str:
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("endpoint URL must use http or https")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("endpoint URL must not contain credentials")
+    if parsed.query or parsed.fragment or parsed.path not in {"", "/"}:
+        raise ValueError("endpoint URL must be an origin without a path, query, or fragment")
+    try:
+        host = ipaddress.ip_address(parsed.hostname or "")
+        parsed.port
+    except ValueError as error:
+        raise ValueError("endpoint URL must use a valid loopback IP address and port") from error
+    if not host.is_loopback:
+        raise ValueError("endpoint URL must use a loopback IP address")
+    return value.rstrip("/")
+
+
 def _post(url: str, payload: dict[str, Any]) -> dict[str, Any]:
+    url = _loopback_base_url(url)
     response = requests.post(f"{url.rstrip('/')}/generate", json=payload, timeout=900)
     response.raise_for_status()
     return response.json()
@@ -70,7 +91,13 @@ def main() -> int:
 
     repo = Path(__file__).resolve().parents[1]
     model_path = Path(args.model_path).resolve()
-    tokenizer = AutoTokenizer.from_pretrained(str(model_path), trust_remote_code=True, local_files_only=True)
+    if not model_path.is_dir():
+        parser.error("--model-path must name an existing local model directory")
+    try:
+        base_url = _loopback_base_url(args.url)
+    except ValueError as error:
+        parser.error(str(error))
+    tokenizer = AutoTokenizer.from_pretrained(str(model_path), local_files_only=True)
     if args.prompt_ids_json:
         prompt_ids = [int(token) for token in json.loads(args.prompt_ids_json)]
     else:
@@ -89,7 +116,7 @@ def main() -> int:
     captures: list[dict[str, Any]] = []
     for repetition in range(args.repetitions):
         generation = _post(
-            args.url,
+            base_url,
             {
                 **common,
                 "input_ids": prompt_ids,
@@ -111,7 +138,7 @@ def main() -> int:
 
         full_ids = prompt_ids + output_ids
         score = _post(
-            args.url,
+            base_url,
             {
                 **common,
                 "input_ids": full_ids,

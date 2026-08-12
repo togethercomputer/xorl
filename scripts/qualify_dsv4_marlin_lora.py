@@ -9,14 +9,40 @@ import hashlib
 import json
 from pathlib import Path
 
+import numpy as np
 import torch
 
 
 GROUP_SIZE = 32
+MAX_SELECTED_EXPERTS_BYTES = 64 * 1024 * 1024
 
 
 def _digest(tensor: torch.Tensor) -> str:
     return hashlib.sha256(tensor.detach().cpu().contiguous().view(torch.uint8).numpy()).hexdigest()
+
+
+def _load_selected_experts(
+    path: Path,
+    *,
+    tokens: int,
+    top_k: int,
+    global_num_experts: int,
+) -> torch.Tensor:
+    resolved = path.expanduser().resolve(strict=True)
+    if not resolved.is_file() or resolved.suffix != ".npy":
+        raise ValueError("captured selected experts must be a local .npy file")
+    if resolved.stat().st_size > MAX_SELECTED_EXPERTS_BYTES:
+        raise ValueError("captured selected experts file exceeds the 64 MiB safety limit")
+    with resolved.open("rb") as handle:
+        captured = np.load(handle, allow_pickle=False)
+    if not isinstance(captured, np.ndarray) or captured.dtype.kind not in {"i", "u"}:
+        raise ValueError("captured selected experts must be an integer NumPy array")
+    if captured.ndim != 2 or captured.shape[1] != top_k or captured.shape[0] < 1:
+        raise ValueError(f"captured selected experts must have shape [rows, {top_k}], got {tuple(captured.shape)}")
+    captured = captured[:tokens].astype(np.int64, copy=False)
+    if np.any(captured < -1) or np.any(captured >= global_num_experts):
+        raise ValueError("captured selected expert IDs must be -1 or fall within the global expert range")
+    return torch.from_numpy(np.ascontiguousarray(captured))
 
 
 def _make_native_mxfp4(*, experts: int, hidden: int, intermediate: int):
@@ -198,14 +224,12 @@ def qualify(
             topk_ids.fill_(-1)
             topk_ids[:, :hot_experts] = torch.arange(hot_experts, dtype=torch.int32, device="cuda")
         if selected_experts_path is not None:
-            captured = torch.load(selected_experts_path, map_location="cpu", weights_only=True)
-            if isinstance(captured, dict):
-                captured = captured["model.layers.0.router_selected_experts"]
-            captured = captured.to(torch.int64)
-            if captured.ndim != 2 or captured.shape[1] != top_k:
-                raise ValueError(f"captured selected experts must have shape [tokens, 6], got {tuple(captured.shape)}")
-            if captured.shape[0] > tokens:
-                captured = captured[:tokens]
+            captured = _load_selected_experts(
+                selected_experts_path,
+                tokens=tokens,
+                top_k=top_k,
+                global_num_experts=global_num_experts,
+            )
             local_start = ep_rank * experts
             localized = captured - local_start
             localized = torch.where(
@@ -415,7 +439,11 @@ def main() -> None:
     parser.add_argument("--tokens", type=int, default=4)
     parser.add_argument("--hot-experts", type=int, default=0)
     parser.add_argument("--force-block-size-m", type=int)
-    parser.add_argument("--selected-experts-path", type=Path)
+    parser.add_argument(
+        "--selected-experts-path",
+        type=Path,
+        help="local .npy integer array with shape [rows, top_k]",
+    )
     parser.add_argument("--ep-rank", type=int, default=0)
     parser.add_argument("--repeats", type=int, default=2)
     args = parser.parse_args()

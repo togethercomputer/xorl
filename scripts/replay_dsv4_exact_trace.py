@@ -6,18 +6,38 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import ipaddress
 import json
 import struct
 import subprocess
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import numpy as np
 import requests
 
 
 IGNORE_INDEX = -100
+
+
+def _loopback_base_url(value: str) -> str:
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"}:
+        raise ValueError("endpoint URL must use http or https")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("endpoint URL must not contain credentials")
+    if parsed.query or parsed.fragment or parsed.path not in {"", "/"}:
+        raise ValueError("endpoint URL must be an origin without a path, query, or fragment")
+    try:
+        host = ipaddress.ip_address(parsed.hostname or "")
+        parsed.port
+    except ValueError as error:
+        raise ValueError("endpoint URL must use a valid loopback IP address and port") from error
+    if not host.is_loopback:
+        raise ValueError("endpoint URL must use a loopback IP address")
+    return value.rstrip("/")
 
 
 def _git(path: Path, *args: str) -> str:
@@ -37,6 +57,7 @@ def _submit_forward(
     loss_fn_params: dict[str, Any] | None,
     timeout: float,
 ) -> dict[str, Any]:
+    url = _loopback_base_url(url)
     body: dict[str, Any] = {
         "model_id": model_id,
         "forward_input": {
@@ -143,6 +164,10 @@ def main() -> int:
     args = parser.parse_args()
     if args.repetitions < 1:
         parser.error("repetitions must be at least one")
+    try:
+        base_url = _loopback_base_url(args.url)
+    except ValueError as error:
+        parser.error(str(error))
 
     trace_path = Path(args.trace).resolve()
     trace = json.loads(trace_path.read_text())
@@ -172,7 +197,7 @@ def main() -> int:
                 "diagnostic_hidden_component_path"
             ].format(repetition=repetition)
         result = _submit_forward(
-            args.url,
+            base_url,
             model_id=args.model_id,
             input_ids=input_ids,
             labels=labels,
