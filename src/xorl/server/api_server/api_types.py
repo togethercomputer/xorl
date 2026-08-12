@@ -883,6 +883,10 @@ class InferenceEndpointServerInfo(BaseModel):
         default=None, description="Whether the endpoint reports static FP8 KV-cache scale state"
     )
     cache_epoch: Optional[Any] = Field(default=None, description="Receiver cache epoch/version, if reported")
+    radix_cache_enabled: Optional[bool] = Field(
+        default=None,
+        description="Whether the endpoint serves with the radix prefix cache enabled (derived from disable_radix_cache)",
+    )
     enable_lora: Optional[bool] = Field(default=None, description="Whether LoRA is enabled")
     max_lora_rank: Optional[int] = Field(default=None, description="Maximum LoRA rank supported")
     version: Optional[str] = Field(default=None, description="SGLang version")

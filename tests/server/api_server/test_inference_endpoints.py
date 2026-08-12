@@ -830,6 +830,70 @@ class TestInferenceEndpointRegistration:
         assert captured_request["request"].payload.sync_method == "p2p"
 
 
+class TestSyncCacheInvalidationPolicy:
+    """Guards the stale-policy prefix-reuse bug class on the client side.
+
+    A weight sync whose cache_invalidation_mode="auto" used to flush only
+    FP8-KV endpoints; a BF16-KV endpoint serving with the radix prefix cache
+    enabled kept pre-sync KV in its tree, and the next prefix hit returned
+    stale-policy decision logprobs (measured on a live endpoint: every
+    compared decision logprob byte-divergent after a 1% weight step). The
+    engine-side mandatory flush covers exact-RL lanes; this client rule is
+    the belt-and-braces for any radix-enabled endpoint.
+    """
+
+    @staticmethod
+    def _server_with_endpoint(info: InferenceEndpointServerInfo | None) -> APIServer:
+        server = APIServer(
+            engine_input_addr="tcp://127.0.0.1:17002",
+            engine_output_addr="tcp://127.0.0.1:17003",
+        )
+        endpoint = InferenceEndpoint(host="8.8.8.8", port=30000)
+        endpoint.server_info = info
+        server.inference_endpoints = [endpoint]
+        return server
+
+    @staticmethod
+    def _request(**overrides) -> SyncInferenceWeightsRequest:
+        return SyncInferenceWeightsRequest(
+            model_id="policy-a",
+            master_address="train.example",
+            **overrides,
+        )
+
+    def test_auto_mode_flushes_radix_enabled_bf16_endpoint(self):
+        server = self._server_with_endpoint(
+            InferenceEndpointServerInfo(radix_cache_enabled=True, kv_cache_dtype="bfloat16")
+        )
+        behavior = server._resolve_sync_cache_behavior(self._request(), quantization=None)
+        assert behavior["flush_cache"] is True
+        assert behavior["radix_cache_enabled"] is True
+
+    def test_auto_mode_keeps_client_flag_when_radix_disabled(self):
+        server = self._server_with_endpoint(
+            InferenceEndpointServerInfo(radix_cache_enabled=False, kv_cache_dtype="bfloat16")
+        )
+        behavior = server._resolve_sync_cache_behavior(self._request(), quantization=None)
+        assert behavior["flush_cache"] is False
+        assert behavior["radix_cache_enabled"] is False
+
+    def test_explicit_none_mode_still_opts_out(self):
+        server = self._server_with_endpoint(
+            InferenceEndpointServerInfo(radix_cache_enabled=True, kv_cache_dtype="bfloat16")
+        )
+        behavior = server._resolve_sync_cache_behavior(
+            self._request(cache_invalidation_mode="none"), quantization=None
+        )
+        assert behavior["flush_cache"] is False
+
+    def test_radix_state_parsed_from_disable_radix_cache(self):
+        parse = APIServer._server_info_radix_cache_enabled
+        assert parse({"disable_radix_cache": False}) is True
+        assert parse({"disable_radix_cache": True}) is False
+        assert parse({"radix_cache_enabled": "true"}) is True
+        assert parse({}) is None
+
+
 class TestQuantizationConfigNormalization:
     """Test FP8 quantization-config auto-detection + name normalization."""
 
