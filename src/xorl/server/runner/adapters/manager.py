@@ -1753,6 +1753,13 @@ class LoRAAdapterManager:
         local_params: Dict[str, nn.Parameter] = {}
         base_seed = self._base_initialization_seed(session_spec)
         lora_b_init_std = self._lora_b_initialization_std(session_spec)
+        session_lora = session_spec.get("lora_config", {})
+        lora_b_init_seed = int(
+            session_lora.get(
+                "lora_b_init_seed",
+                self.lora_config.get("lora_b_init_seed", base_seed),
+            )
+        )
         for name in self._lora_param_names:
             model_param = named_params[name]
             layout = layouts[name]
@@ -1760,11 +1767,13 @@ class LoRAAdapterManager:
                 initialize_fresh and model_id == "default" and self._is_lora_b(name) and lora_b_init_std > 0.0
             )
             if initialize_fresh and not preserve_initialized_lora_b:
+                is_lora_b = self._is_lora_b(name)
                 new_tensor = deterministic_local_initialization(
                     layout,
-                    base_seed=base_seed,
+                    base_seed=lora_b_init_seed if is_lora_b else base_seed,
                     session_identity=model_id,
-                    is_lora_b=self._is_lora_b(name),
+                    is_lora_b=is_lora_b,
+                    lora_b_std=lora_b_init_std,
                 ).to(device=self.device, dtype=layout.dtype)
             else:
                 raw_model_param = model_param.data if isinstance(model_param, nn.Parameter) else model_param
@@ -1776,10 +1785,13 @@ class LoRAAdapterManager:
                 local_model_tensor = wait_for_local_tensor(local_model_tensor)
                 new_tensor = layout.pack_from_local(local_model_tensor).to(device=self.device, dtype=layout.dtype)
                 if preserve_initialized_lora_b and new_tensor.numel() and torch.count_nonzero(new_tensor).item() == 0:
-                    raise RuntimeError(
-                        "lora_b_init_std is nonzero but the model-side LoRA-B initialization is still all-zero; "
-                        "initialize model LoRA-B parameters before registering the default adapter"
-                    )
+                    new_tensor = deterministic_local_initialization(
+                        layout,
+                        base_seed=lora_b_init_seed,
+                        session_identity=model_id,
+                        is_lora_b=True,
+                        lora_b_std=lora_b_init_std,
+                    ).to(device=self.device, dtype=layout.dtype)
             local_params[name] = nn.Parameter(new_tensor, requires_grad=True)
 
         # Build optimizer for this adapter using the session's optimizer contract.

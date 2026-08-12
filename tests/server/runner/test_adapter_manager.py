@@ -225,6 +225,33 @@ def test_fresh_adapter_slots_honor_nonzero_lora_b_initialization(tmp_path):
     assert torch.equal(model_b, slot)
 
 
+@pytest.mark.parametrize("model_id", ["default", "policy"])
+def test_fresh_adapter_slots_initialize_nonzero_lora_b_after_deferred_materialization(
+    tmp_path, model_id
+):
+    model = _DummyLoRAModel(max_rank=4)
+    assert torch.count_nonzero(model.model.layers[0].self_attn.o_proj.lora_B) == 0
+    manager = _IntegratedTestAdapterManager(
+        model,
+        device=torch.device("cpu"),
+        checkpoint_dir=str(tmp_path / "adapters"),
+        auto_save_on_eviction=False,
+        optimizer_type="sgd",
+        lora_config={
+            "lora_rank": 4,
+            "lora_alpha": 16,
+            "lora_b_init_std": 1e-3,
+            "lora_b_init_seed": 1616,
+        },
+    )
+
+    manager.register_adapter(model_id, lr=0.1, initialize_fresh=True)
+    slot = manager.get_adapter_state(model_id).local_params[
+        "model.layers.0.self_attn.o_proj.lora_B"
+    ]
+    assert torch.count_nonzero(slot) == slot.numel()
+
+
 def test_exact_glm_session_rank_alpha_drift_fails_at_registration(tmp_path):
     manager = LoRAAdapterManager(
         _DummyExactGlmLoRAModel(rank=4, alpha=16),

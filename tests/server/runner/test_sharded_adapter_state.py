@@ -233,6 +233,30 @@ def test_deterministic_initialization_is_coordinate_and_replica_stable():
     )
 
 
+def test_nonzero_lora_b_initialization_is_coordinate_and_replica_stable():
+    full = _layout(local_shape=(4, 4), offset=(0, 0))
+    first = _layout(local_shape=(2, 4), offset=(0, 0))
+    second = _layout(local_shape=(2, 4), offset=(2, 0))
+
+    full_values = deterministic_local_initialization(
+        full, base_seed=1616, session_identity="policy", is_lora_b=True, lora_b_std=1e-3
+    )
+    sharded_values = torch.cat(
+        [
+            deterministic_local_initialization(
+                first, base_seed=1616, session_identity="policy", is_lora_b=True, lora_b_std=1e-3
+            ),
+            deterministic_local_initialization(
+                second, base_seed=1616, session_identity="policy", is_lora_b=True, lora_b_std=1e-3
+            ),
+        ],
+        dim=0,
+    )
+
+    assert torch.equal(full_values, sharded_values)
+    assert torch.count_nonzero(full_values) > 0
+
+
 def test_deterministic_initialization_is_independent_of_fqn_iteration_order(tmp_path):
     ordered = _build_manager(tmp_path / "ordered", optimizer_type="sgd")
     reordered_model = _DummyLoRAModel()

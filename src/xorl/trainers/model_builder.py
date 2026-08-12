@@ -10,6 +10,7 @@ from typing import Any, Callable, List, Optional, Set
 
 import torch
 import torch.nn as nn
+from torch.distributed._tensor import DTensor
 
 from xorl.distributed.parallel_state import get_parallel_state
 from xorl.distributed.torch_parallelize import build_parallelize_model as _parallelize
@@ -546,6 +547,15 @@ def build_training_model(
         from xorl.lora.utils import initialize_lora_b_nonzero  # noqa: PLC0415
 
         for part in all_parts:
+            local_parameters = [
+                parameter.to_local() if isinstance(parameter, DTensor) else parameter
+                for parameter in part.parameters()
+            ]
+            if any(parameter.is_meta for parameter in local_parameters):
+                logger.info_rank0(
+                    "Deferring nonzero LoRA-B initialization until post-DCP adapter materialization"
+                )
+                continue
             initialize_lora_b_nonzero(part, std=lora_b_init_std, seed=lora_b_init_seed)
 
     # Optionally freeze MoE router
