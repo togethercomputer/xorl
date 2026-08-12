@@ -734,19 +734,28 @@ class CheckpointManager:
         # extract_model_weights() returns the complete CPU state only on rank 0.
         # Let that rank write without save_model_weights()'s per-shard distributed
         # barriers; non-writer ranks have no shard map with which to rendezvous.
-        # The manager's barrier below is the single collective completion point.
-        if self.rank == 0:
-            save_model_weights(
-                output_dir=output_path,
-                state_dict=state_dict,
-                global_rank=None,
-                save_dtype=dtype,
-                checkpoint_handler=checkpoint_handler,
-            )
+        # Coordinate rank-local I/O failures before the completion barrier so a
+        # writer exception cannot strand every peer there.
+        local_error = None
+        try:
+            if self.rank == 0:
+                save_model_weights(
+                    output_dir=output_path,
+                    state_dict=state_dict,
+                    global_rank=None,
+                    save_dtype=dtype,
+                    checkpoint_handler=checkpoint_handler,
+                )
 
-        # Copy config files from base model (server-specific)
-        if self.rank == 0 and base_model_path and os.path.isdir(base_model_path):
-            self._copy_model_configs(output_path, base_model_path)
+                if base_model_path and os.path.isdir(base_model_path):
+                    self._copy_model_configs(output_path, base_model_path)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to save full weights to %s: %s", output_path, exc, exc_info=True)
+            local_error = str(exc)
+
+        synced_error = self._sync_collective_error(local_error)
+        if synced_error:
+            raise RuntimeError(f"Full-weight save failed: {synced_error}")
 
         save_time = time.time() - start_time
 

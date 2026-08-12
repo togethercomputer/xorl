@@ -426,6 +426,26 @@ def build_training_model(
         from xorl.ops.bi_families_v2 import _select_glm52_families_v2  # noqa: PLC0415
 
         _select_glm52_families_v2()
+    elif getattr(model.config, "_qwen3_dense_exact_contract", False):
+        from xorl.lora.modules.base import LoraModule  # noqa: PLC0415
+        from xorl.ops.batch_invariant_ops import wrap_trunk_linears_batch_invariant  # noqa: PLC0415
+        from xorl.ops.bi_families_v2 import _select_qwen3_dense_families_v2  # noqa: PLC0415
+
+        # Foundation construction initially wraps plain projections, but TP
+        # unfusing and LoRA/QLoRA injection replace those module objects. The
+        # exact program must therefore be installed at the final pre-FSDP
+        # module boundary. Plain LoRA composes through the canonical fold;
+        # unsupported QLoRA projection types fail closed in the wrapper.
+        _select_qwen3_dense_families_v2()
+        for module in model.modules():
+            if isinstance(module, LoraModule):
+                module.exact_merged_forward = True
+        wrapped = wrap_trunk_linears_batch_invariant(model)
+        pattern = ", ".join(f"{name}x{count}" for name, count in sorted(wrapped.items()))
+        logger.info_rank0(
+            "Exact dense Qwen3 trainer path reinstalled after projection replacement"
+            + (f": {pattern}" if pattern else " (existing wrappers retained)")
+        )
 
     apply_exact_qwen = getattr(model, "_apply_qwen35_gdn_exact", None)
     if server_training and callable(apply_exact_qwen):

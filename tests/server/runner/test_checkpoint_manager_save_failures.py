@@ -249,6 +249,37 @@ def test_single_writer_full_weight_save_has_one_collective_completion(monkeypatc
         assert result == {"status": "skipped", "reason": "non-rank-0"}
 
 
+@pytest.mark.parametrize("rank", [0, 1])
+def test_single_writer_full_weight_save_syncs_writer_failure_before_barrier(monkeypatch, tmp_path, rank):
+    manager = object.__new__(CheckpointManager)
+    manager.rank = rank
+    manager.model = nn.Linear(2, 2)
+    manager.extract_full_weights_with_ep = lambda: {"weight": torch.ones(2, 2)} if rank == 0 else {}
+    local_errors = []
+
+    def _fail_writer(**_kwargs):
+        raise PermissionError("disk full")
+
+    def _sync_error(local_error):
+        local_errors.append(local_error)
+        return "rank 0: disk full"
+
+    manager._sync_collective_error = _sync_error
+    monkeypatch.setattr(_MODULE, "save_model_weights", _fail_writer)
+    monkeypatch.setattr(
+        _MODULE.dist, "barrier", lambda: (_ for _ in ()).throw(AssertionError("barrier should not run"))
+    )
+
+    with pytest.raises(RuntimeError, match="Full-weight save failed: rank 0: disk full"):
+        manager._save_full_weights_single_writer(
+            str(tmp_path / "full"),
+            "bfloat16",
+            base_model_path=None,
+        )
+
+    assert local_errors == (["disk full"] if rank == 0 else [None])
+
+
 def test_save_adapter_state_requests_dtype_preserving_lora_checkpoint(monkeypatch, tmp_path):
     manager = _build_checkpoint_manager()
     captured = {}

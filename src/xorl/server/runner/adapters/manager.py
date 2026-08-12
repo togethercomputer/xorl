@@ -1370,6 +1370,59 @@ class LoRAAdapterManager:
                     return int(source[key])
         return 0
 
+    def _lora_b_initialization_std(self, session_spec: Dict[str, Any]) -> float:
+        """Resolve the fresh-slot LoRA-B initialization contract."""
+
+        session_lora = session_spec.get("lora_config", {})
+        std = float(session_lora.get("lora_b_init_std", self.lora_config.get("lora_b_init_std", 0.0)))
+        if std < 0.0:
+            raise ValueError(f"lora_b_init_std must be nonnegative, got {std}")
+        return std
+
+    def _validate_exact_glm_session_contract(self, session_spec: Dict[str, Any]) -> None:
+        """Reject runtime rank/alpha changes unsupported by exact GLM components."""
+
+        construction_contracts: set[tuple[int, int]] = set()
+        component_names: list[str] = []
+        for module in self.model.modules():
+            if not (
+                getattr(module, "_glm52_exact_active_lora_component", False)
+                or getattr(module, "_glm52_exact_tp16_lm_head", False)
+            ):
+                continue
+            rank = getattr(module, "r", getattr(module, "max_lora_rank", None))
+            alpha = getattr(module, "lora_alpha", None)
+            if rank is None or alpha is None:
+                # Logical child projections carry the exact marker for
+                # publication/gradient policy, while their owning composite
+                # carries the immutable adapter shape and runtime setter.
+                if callable(getattr(module, "set_runtime_lora_config", None)):
+                    raise RuntimeError(
+                        "Exact GLM-5.2 active-LoRA runtime component does not expose its immutable "
+                        f"construction rank/alpha: {type(module).__qualname__}"
+                    )
+                continue
+            construction_contracts.add((int(rank), int(alpha)))
+            component_names.append(type(module).__qualname__)
+
+        if not construction_contracts:
+            return
+        if len(construction_contracts) != 1:
+            raise RuntimeError(
+                "Exact GLM-5.2 active-LoRA components disagree on construction rank/alpha: "
+                f"{sorted(construction_contracts)!r} across {sorted(set(component_names))!r}"
+            )
+
+        construction_rank, construction_alpha = next(iter(construction_contracts))
+        requested = (self._session_rank(session_spec), self._session_alpha(session_spec))
+        if requested != (construction_rank, construction_alpha):
+            raise ValueError(
+                "Exact GLM-5.2 active-LoRA sessions cannot mutate construction-time rank/alpha: "
+                f"requested rank={requested[0]}, alpha={requested[1]}; "
+                f"model rank={construction_rank}, alpha={construction_alpha}. "
+                "Restart with a model substrate built for the requested session contract."
+            )
+
     def _validate_session_rank_against_model_capacity(self, session_spec: Dict[str, Any]) -> None:
         """Reject session specs whose runtime rank exceeds the live model capacity."""
         session_rank = self._session_rank(session_spec)
@@ -1672,6 +1725,7 @@ class LoRAAdapterManager:
             if effective_lr is not None:
                 session_spec["optimizer_config"]["learning_rate"] = effective_lr
 
+        self._validate_exact_glm_session_contract(session_spec)
         self._validate_session_rank_against_model_capacity(session_spec)
         session_rank = self._session_rank(session_spec)
         session_alpha = self._session_alpha(session_spec)
@@ -1698,10 +1752,14 @@ class LoRAAdapterManager:
         named_params = dict(self.model.named_parameters())
         local_params: Dict[str, nn.Parameter] = {}
         base_seed = self._base_initialization_seed(session_spec)
+        lora_b_init_std = self._lora_b_initialization_std(session_spec)
         for name in self._lora_param_names:
             model_param = named_params[name]
             layout = layouts[name]
-            if initialize_fresh:
+            preserve_initialized_lora_b = (
+                initialize_fresh and model_id == "default" and self._is_lora_b(name) and lora_b_init_std > 0.0
+            )
+            if initialize_fresh and not preserve_initialized_lora_b:
                 new_tensor = deterministic_local_initialization(
                     layout,
                     base_seed=base_seed,
@@ -1717,6 +1775,11 @@ class LoRAAdapterManager:
                 )
                 local_model_tensor = wait_for_local_tensor(local_model_tensor)
                 new_tensor = layout.pack_from_local(local_model_tensor).to(device=self.device, dtype=layout.dtype)
+                if preserve_initialized_lora_b and new_tensor.numel() and torch.count_nonzero(new_tensor).item() == 0:
+                    raise RuntimeError(
+                        "lora_b_init_std is nonzero but the model-side LoRA-B initialization is still all-zero; "
+                        "initialize model LoRA-B parameters before registering the default adapter"
+                    )
             local_params[name] = nn.Parameter(new_tensor, requires_grad=True)
 
         # Build optimizer for this adapter using the session's optimizer contract.

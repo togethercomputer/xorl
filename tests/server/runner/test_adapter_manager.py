@@ -70,6 +70,21 @@ class _DummyLoRAModel(nn.Module):
         self.model.layers[0].self_attn.o_proj = _DummyLoRALayer(max_rank=max_rank)
 
 
+class _DummyExactGlmLoRALayer(_DummyLoRALayer):
+    _glm52_exact_active_lora_component = True
+
+    def __init__(self, *, rank: int = 4, alpha: int = 16) -> None:
+        super().__init__(max_rank=rank)
+        self.r = rank
+        self.lora_alpha = alpha
+
+
+class _DummyExactGlmLoRAModel(_DummyLoRAModel):
+    def __init__(self, *, rank: int = 4, alpha: int = 16) -> None:
+        super().__init__(max_rank=rank)
+        self.model.layers[0].self_attn.o_proj = _DummyExactGlmLoRALayer(rank=rank, alpha=alpha)
+
+
 class _IntegratedTestAdapterManager(LoRAAdapterManager):
     """Test harness that models ModelRunner's mandatory registration compile."""
 
@@ -181,6 +196,49 @@ def test_register_adapter_uses_shared_optimizer_factory_and_checkpoint_dir(tmp_p
     assert metadata["optimizer"]["weight_decay"] == pytest.approx(0.25)
     assert metadata["optimizer"]["betas"] == [0.9, 0.95]
     assert metadata["optimizer"]["eps"] == pytest.approx(1e-8)
+
+
+def test_fresh_adapter_slots_honor_nonzero_lora_b_initialization(tmp_path):
+    from xorl.lora.utils import initialize_lora_b_nonzero
+
+    model = _DummyLoRAModel(max_rank=4)
+    initialize_lora_b_nonzero(model, std=1e-3, seed=29)
+    initialized_b = model.model.layers[0].self_attn.o_proj.lora_B.detach().clone()
+    manager = _IntegratedTestAdapterManager(
+        model,
+        device=torch.device("cpu"),
+        checkpoint_dir=str(tmp_path / "adapters"),
+        auto_save_on_eviction=False,
+        optimizer_type="sgd",
+        lora_config={"lora_rank": 4, "lora_alpha": 16, "lora_b_init_std": 1e-3, "lora_b_init_seed": 29},
+    )
+
+    manager.register_adapter("default", lr=0.1, initialize_fresh=True)
+    state = manager.get_adapter_state("default")
+    slot = state.local_params["model.layers.0.self_attn.o_proj.lora_B"]
+    assert torch.count_nonzero(slot) == slot.numel()
+    assert torch.equal(slot, initialized_b)
+
+    model.model.layers[0].self_attn.o_proj.lora_B.data.zero_()
+    manager.prepare_forward("default")
+    model_b = manager.model.model.layers[0].self_attn.o_proj.lora_B
+    assert torch.equal(model_b, slot)
+
+
+def test_exact_glm_session_rank_alpha_drift_fails_at_registration(tmp_path):
+    manager = LoRAAdapterManager(
+        _DummyExactGlmLoRAModel(rank=4, alpha=16),
+        device=torch.device("cpu"),
+        checkpoint_dir=str(tmp_path / "adapters"),
+        auto_save_on_eviction=False,
+        optimizer_type="sgd",
+    )
+    incompatible = _session_spec(rank=2, alpha=8, optimizer_type="sgd", lr=0.1)
+
+    with pytest.raises(ValueError, match="cannot mutate construction-time rank/alpha"):
+        manager.register_adapter("policy-glm", session_spec=incompatible, initialize_fresh=True)
+
+    assert not manager.has_adapter("policy-glm")
 
 
 def test_compile_gradient_ownership_plan_is_explicit_and_rejects_pending_reconfiguration(tmp_path):
