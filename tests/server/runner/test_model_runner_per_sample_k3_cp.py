@@ -11,7 +11,7 @@ def test_per_sample_k3_reassembles_ulysses_tokens_before_packed_means(monkeypatc
     monkeypatch.setattr(
         model_runner_module,
         "get_parallel_state",
-        lambda: SimpleNamespace(cp_enabled=True, sp_group=group),
+        lambda: SimpleNamespace(cp_enabled=True, sp_group=group, ringattn_size=1),
     )
 
     full_k3 = torch.tensor([[1.0, 2.0, 3.0, 4.0, 6.0, 8.0]])
@@ -37,6 +37,37 @@ def test_per_sample_k3_reassembles_ulysses_tokens_before_packed_means(monkeypatc
     assert torch.equal(valid, full_valid.view(-1))
     assert torch.equal(positions, torch.tensor([0, 1, 2, 3, 0, 1]))
     assert ModelRunner._compute_per_sample_k3(k3, valid, positions) == [2.5, 6.0]
+
+
+def test_per_sample_k3_restores_ring_zigzag_before_sample_association(monkeypatch):
+    group = object()
+    monkeypatch.setattr(
+        model_runner_module,
+        "get_parallel_state",
+        lambda: SimpleNamespace(cp_enabled=True, sp_group=group, cp_size=2, ringattn_size=2),
+    )
+
+    # Original token order contains two four-token samples. Ring-2 zigzag order
+    # is [doc0:0,3, doc1:0,3, doc0:1,2, doc1:1,2]. Keeping the original
+    # position_ids alongside these gathered values would mix the two samples.
+    zigzag_k3 = torch.tensor([[1.0, 1.0, 10.0, 10.0, 1.0, 1.0, 10.0, 10.0]])
+    zigzag_valid = torch.ones_like(zigzag_k3, dtype=torch.uint8)
+
+    def fake_gather(value, *, gather_dim, padding_dim, unpad_dim_size, group):
+        assert (gather_dim, padding_dim, unpad_dim_size) == (-1, -1, 8)
+        return zigzag_valid if value.dtype == torch.uint8 else zigzag_k3
+
+    monkeypatch.setattr(model_runner_module, "gather_outputs", fake_gather)
+
+    k3, valid, positions = ModelRunner._gather_per_sample_k3_inputs(
+        torch.tensor([1.0, 1.0, 10.0, 10.0]),
+        torch.ones(4, dtype=torch.bool),
+        torch.tensor([[0, 1, 2, 3, 0, 1, 2, 3]]),
+    )
+
+    assert torch.equal(k3, torch.tensor([1.0, 1.0, 1.0, 1.0, 10.0, 10.0, 10.0, 10.0]))
+    assert valid.all()
+    assert ModelRunner._compute_per_sample_k3(k3, valid, positions) == [1.0, 10.0]
 
 
 def test_per_sample_k3_non_cp_preserves_local_inputs(monkeypatch):

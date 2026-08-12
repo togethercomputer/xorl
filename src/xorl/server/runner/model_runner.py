@@ -40,6 +40,7 @@ except ImportError:  # pragma: no cover - DTensor-enabled torch provides this.
     compute_local_shape_and_global_offset = None
 
 from xorl.checkpoint import build_checkpointer
+from xorl.data.collators.sequence_shard_collator import zigzag_restore_packed_sequence
 from xorl.data.constants import IGNORE_INDEX
 from xorl.distillation import (
     MooncakeHiddenStore,
@@ -6161,20 +6162,67 @@ class ModelRunner:
         local_tokens = k3_values.numel() // batch_size
         original_seq_len = int(position_ids.shape[-1])
         group = ps.sp_group
+        ringattn_size = int(getattr(ps, "ringattn_size", 1))
+        if ringattn_size > 1:
+            cp_size = int(getattr(ps, "cp_size", 0))
+            if cp_size <= 0:
+                raise RuntimeError("Ring-attention K3 reassembly requires a positive CP size")
+            gathered_seq_len = local_tokens * cp_size
+            if gathered_seq_len < original_seq_len:
+                raise RuntimeError(
+                    "Ring-attention K3 shards are shorter than the original packed sequence: "
+                    f"gathered={gathered_seq_len}, original={original_seq_len}"
+                )
+        else:
+            gathered_seq_len = original_seq_len
         full_k3 = gather_outputs(
             k3_values.reshape(batch_size, local_tokens),
             gather_dim=-1,
             padding_dim=-1,
-            unpad_dim_size=original_seq_len,
+            unpad_dim_size=gathered_seq_len,
             group=group,
         )
         full_valid = gather_outputs(
             valid_mask.reshape(batch_size, local_tokens).to(dtype=torch.uint8),
             gather_dim=-1,
             padding_dim=-1,
-            unpad_dim_size=original_seq_len,
+            unpad_dim_size=gathered_seq_len,
             group=group,
         ).bool()
+        if ringattn_size > 1:
+            pad_length = gathered_seq_len - original_seq_len
+            if pad_length:
+                pad_positions = (
+                    torch.arange(pad_length, device=position_ids.device, dtype=position_ids.dtype) % 1024
+                ).view(1, -1)
+                pad_positions = pad_positions.expand(batch_size, -1)
+                padded_position_ids = torch.cat((position_ids, pad_positions), dim=-1)
+            else:
+                padded_position_ids = position_ids
+            full_k3 = torch.cat(
+                [
+                    zigzag_restore_packed_sequence(
+                        full_k3[row : row + 1],
+                        padded_position_ids[row : row + 1],
+                        ringattn_size,
+                        dim=-1,
+                    )
+                    for row in range(batch_size)
+                ],
+                dim=0,
+            )[:, :original_seq_len]
+            full_valid = torch.cat(
+                [
+                    zigzag_restore_packed_sequence(
+                        full_valid[row : row + 1],
+                        padded_position_ids[row : row + 1],
+                        ringattn_size,
+                        dim=-1,
+                    )
+                    for row in range(batch_size)
+                ],
+                dim=0,
+            )[:, :original_seq_len]
         if full_k3.shape != position_ids.shape or full_valid.shape != position_ids.shape:
             raise RuntimeError(
                 "Per-sample K3 CP reassembly did not recover the original packed shape: "

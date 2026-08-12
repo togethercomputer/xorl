@@ -80,6 +80,36 @@ def zigzag_reorder_packed_sequence(
     return torch.cat(all_parts, dim=dim)
 
 
+def zigzag_restore_packed_sequence(
+    tensor: torch.Tensor,
+    position_ids: torch.Tensor,
+    ringattn_size: int,
+    dim: int = -1,
+) -> torch.Tensor:
+    """Restore one zigzag-reordered packed row to original token order."""
+    if ringattn_size <= 1:
+        return tensor
+    if dim < 0:
+        dim += tensor.ndim
+    seq_len = tensor.size(dim)
+    if position_ids.numel() != seq_len:
+        raise ValueError(
+            "Zigzag restoration requires one packed position-id row matching the tensor sequence length, "
+            f"got position_ids={tuple(position_ids.shape)} and tensor={tuple(tensor.shape)}"
+        )
+    index_shape = [1] * tensor.ndim
+    index_shape[dim] = seq_len
+    original_indices = torch.arange(seq_len, device=tensor.device, dtype=torch.long).view(index_shape)
+    reordered_indices = zigzag_reorder_packed_sequence(
+        original_indices,
+        position_ids.to(device=tensor.device),
+        ringattn_size,
+        dim=dim,
+    )
+    inverse_indices = reordered_indices.argsort(dim=dim).expand_as(tensor)
+    return tensor.gather(dim, inverse_indices)
+
+
 @dataclass
 class TextSequenceShardCollator(DataCollator):
     """
