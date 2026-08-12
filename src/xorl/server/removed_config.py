@@ -14,6 +14,13 @@ _ZORL_REMOVAL_MIGRATION = "ZORL was removed; remove this field and migrate train
 _FP8_CFG_MIGRATION = (
     "NeMo fp8_cfg translation was removed; set enable_fp8_training and the native fp8_training_* fields explicitly"
 )
+_R3_EXTERNALIZE_MIGRATION = (
+    "the externalize_r3_payloads compatibility alias was removed; set r3_payload_transport='mooncake' explicitly"
+)
+_R3_KEEP_MIGRATION = (
+    "the keep_r3_payloads compatibility alias was removed; set r3_payload_keep=true explicitly "
+    "with r3_payload_transport='mooncake' or 'filesystem'"
+)
 
 
 # One inventory is shared by YAML loading, CLI overrides, and public request
@@ -32,6 +39,8 @@ REMOVED_CONFIGURATION_FIELDS: dict[str, str] = {
     "zorl": _ZORL_REMOVAL_MIGRATION,
     "zorl_config": _ZORL_REMOVAL_MIGRATION,
     "fp8_cfg": _FP8_CFG_MIGRATION,
+    "externalize_r3_payloads": _R3_EXTERNALIZE_MIGRATION,
+    "keep_r3_payloads": _R3_KEEP_MIGRATION,
 }
 
 

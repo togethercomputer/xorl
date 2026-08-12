@@ -42,6 +42,16 @@ def _assert_yaml_rejects_removed_fields_before_filtering(tmp_path):
             {"model": {"model_path": "Qwen/Qwen3-8B"}, "train": {"fp8_cfg": {"enabled": True}}},
             "train.fp8_cfg.*native fp8_training",
         ),
+        (
+            "nested R3 externalization alias",
+            {"model": {"model_path": "Qwen/Qwen3-8B"}, "train": {"externalize_r3_payloads": True}},
+            "train.externalize_r3_payloads.*r3_payload_transport='mooncake'",
+        ),
+        (
+            "nested R3 retention alias",
+            {"model": {"model_path": "Qwen/Qwen3-8B"}, "train": {"keep_r3_payloads": True}},
+            "train.keep_r3_payloads.*r3_payload_keep=true",
+        ),
     ]
 
     for label, payload, error_pattern in cases:
@@ -59,6 +69,9 @@ def _assert_load_server_arguments_rejects_removed_cli_override(tmp_path):
             str(config_path),
             overrides={"adapter_gradient_ownership_shadow_canary": True},
         )
+
+    with pytest.raises(ValueError, match="keep_r3_payloads.*r3_payload_keep=true"):
+        load_server_arguments(str(config_path), overrides={"keep_r3_payloads": True})
 
 
 def _assert_removed_field_inventory_allows_unrelated_unknown_fields():
@@ -1023,6 +1036,9 @@ def _assert_server_override_parse_and_validation_policy():
 
     with pytest.raises(ValueError, match="enable_zorl.*ZORL was removed"):
         validate_server_overrides({"enable_zorl": True})
+
+    with pytest.raises(ValueError, match="externalize_r3_payloads.*r3_payload_transport='mooncake'"):
+        validate_server_overrides({"externalize_r3_payloads": True})
 
 
 def test_server_runtime_configuration_round_trip(tmp_path):
