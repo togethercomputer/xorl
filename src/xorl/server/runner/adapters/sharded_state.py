@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections import defaultdict
 from dataclasses import dataclass, replace
 from typing import Any, Mapping, Optional
@@ -575,9 +576,35 @@ def deterministic_local_initialization(
     base_seed: int,
     session_identity: str,
     is_lora_b: bool,
+    lora_b_std: float = 0.0,
 ) -> torch.Tensor:
     if is_lora_b:
-        return torch.zeros(layout.active_storage_shape, dtype=layout.dtype)
+        if lora_b_std < 0.0:
+            raise ValueError(f"lora_b_std must be nonnegative, got {lora_b_std}")
+        if lora_b_std == 0.0:
+            return torch.zeros(layout.active_storage_shape, dtype=layout.dtype)
+        shape = layout.active_storage_shape
+        if any(size == 0 for size in shape):
+            return torch.empty(shape, dtype=layout.dtype)
+        starts = layout.active_global_offset
+        strides: list[int] = []
+        stride = 1
+        for size in reversed(layout.logical_shape):
+            strides.append(stride)
+            stride *= size
+        strides.reverse()
+        linear = torch.zeros(shape, dtype=torch.int64)
+        for dim, (size, start, logical_stride) in enumerate(zip(shape, starts, strides, strict=True)):
+            view_shape = [1] * len(shape)
+            view_shape[dim] = size
+            linear = linear + (torch.arange(size, dtype=torch.int64).reshape(view_shape) + start) * logical_stride
+        seed = stable_seed(base_seed, session_identity, layout.fqn)
+        mantissa1 = _stable_uint64(linear, seed) & ((1 << 53) - 1)
+        mantissa2 = _stable_uint64(linear, seed ^ 0x5DEECE66D) & ((1 << 53) - 1)
+        uniform1 = (mantissa1.to(torch.float64) + 0.5) / float(1 << 53)
+        uniform2 = (mantissa2.to(torch.float64) + 0.5) / float(1 << 53)
+        normal = torch.sqrt(-2.0 * torch.log(uniform1)) * torch.cos(2.0 * math.pi * uniform2)
+        return (normal * lora_b_std).to(dtype=layout.dtype)
     return deterministic_kaiming_uniform(
         layout,
         base_seed=base_seed,

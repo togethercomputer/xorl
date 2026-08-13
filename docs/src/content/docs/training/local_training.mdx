@@ -257,14 +257,14 @@ train:
 | Method | Backward recomputes | Peak memory | Speed |
 |--------|---------------------|------------|-------|
 | `recompute_full_layer` | entire decoder layer (attn + MoE dispatch + expert + combine) | **lowest** | baseline |
-| `recompute_before_dispatch` | recompute attn+router, keep dispatch+expert+combine | moderate | **+25-34%** |
-| `no_recompute` | nothing recomputed | highest | max throughput |
+| `recompute_before_dispatch` | recompute attn+router, keep dispatch+expert+combine | moderate | avoids replaying expert communication |
+| `no_recompute` | nothing recomputed | highest | avoids recompute work |
 
 ### When to use each
 
-- **`recompute_full_layer`** (default): required for long sequences (128k+) where activations exceed GPU memory.
-- **`recompute_before_dispatch`**: best tradeoff when memory allows. Recomputes attention and router but avoids recomputing MoE dispatch/combine, which is especially expensive at multi-node (InfiniBand). +24.5% at 1-node, +33.4% at 2-node.
-- **`no_recompute`**: maximum throughput, highest memory usage. Use for short sequences where activations fit in GPU memory.
+- **`recompute_full_layer`** (default): retains the least activation state; start here for memory-constrained or long-context runs.
+- **`recompute_before_dispatch`**: retains more state but avoids recomputing MoE dispatch, expert compute, and combine. Benchmark it when expert communication is material and the retained state fits.
+- **`no_recompute`**: retains the most activation state and avoids recompute work. Use only after a shape-matched fit and throughput check.
 
 ```yaml
 # Maximum throughput (short seq, memory permits):

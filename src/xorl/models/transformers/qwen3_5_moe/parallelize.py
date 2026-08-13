@@ -3,7 +3,6 @@
 from torch.distributed._tensor import Shard
 
 from ....distributed.parallel_plan import ParallelPlan
-from ...layers.moe import MoEBlock
 
 
 # TP plan for the base model (Qwen3_5MoeModel).
@@ -30,15 +29,17 @@ def unfuse_for_tp(model):
     """Unfuse fused projections for tensor parallelism compatibility.
 
     For ALL layers: splits ``qkv_proj`` -> ``q_proj / k_proj / v_proj`` in attention.
-    For DENSE layers only: splits ``gate_up_proj`` -> ``gate_proj / up_proj`` in MLP.
-    MoE layers (``MoEBlock``) are left untouched - their expert weights
-    are not TP-sharded.
+    For DENSE layers and each MoE block's shared expert: splits ``gate_up_proj`` ->
+    ``gate_proj / up_proj``. Routed expert weights are left fused - they are not
+    TP-sharded.
     """
     for layer in model.model.layers:
         if getattr(layer, "self_attn", None) is not None and hasattr(layer.self_attn, "unfuse_for_tp"):
             layer.self_attn.unfuse_for_tp()
-        # Only unfuse dense MLP layers, not MoE blocks
-        if not isinstance(layer.mlp, MoEBlock):
+        # An MoE block exposes a shared expert; a dense MLP is the thing to unfuse.
+        if hasattr(layer.mlp, "shared_expert"):
+            layer.mlp.shared_expert.unfuse_for_tp()
+        else:
             layer.mlp.unfuse_for_tp()
     model._unfused_for_tp = True
     # Override HF config's TP plan (may contain incompatible styles like

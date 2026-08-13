@@ -472,7 +472,6 @@ def test_strict_load_ignores_nonpersistent_rope_buffers():
 def test_end_to_end_synthetic_load_with_c4_layer():
     """C4 layer load exercises the indexer mapping + APE hotfix path."""
     from xorl.models.transformers.deepseek_v4 import DeepseekV4ForCausalLM, load_hf_state_dict_into_model
-    from xorl.models.transformers.deepseek_v4.checkpoint_handler import _undo_ape_hotfix
 
     cfg = _tiny_config(compress_ratios=[0, 4])
     model = DeepseekV4ForCausalLM(cfg, moe_implementation="eager").to(torch.float32)
@@ -482,17 +481,20 @@ def test_end_to_end_synthetic_load_with_c4_layer():
 
     # Apply the miles forward hotfix to both C4 ``ape`` tensors so we're
     # simulating what the real HF disk format looks like.
-    sd["layers.1.attn.compressor.ape"] = _miles_apply_ape_hotfix(torch.randn(4, 2 * cfg.head_dim, dtype=torch.float32))
-    sd["layers.1.attn.indexer.compressor.ape"] = _miles_apply_ape_hotfix(
-        torch.randn(4, 2 * cfg.index_head_dim, dtype=torch.float32)
-    )
+    # The HF checkpoint ships ape in the NATURAL layout: the serving model
+    # applies its own hotfix permutation at load, and the trainer's exact C4
+    # path re-applies it before the compress kernel. The loader must pass the
+    # checkpoint bytes through untouched (an "undo" of a hotfix that was
+    # never applied would feed the kernel a permuted table).
+    sd["layers.1.attn.compressor.ape"] = torch.randn(4, 2 * cfg.head_dim, dtype=torch.float32)
+    sd["layers.1.attn.indexer.compressor.ape"] = torch.randn(4, 2 * cfg.index_head_dim, dtype=torch.float32)
 
-    expected_compressor_ape = _undo_ape_hotfix(sd["layers.1.attn.compressor.ape"])
-    expected_indexer_ape = _undo_ape_hotfix(sd["layers.1.attn.indexer.compressor.ape"])
+    expected_compressor_ape = sd["layers.1.attn.compressor.ape"]
+    expected_indexer_ape = sd["layers.1.attn.indexer.compressor.ape"]
 
     summary = load_hf_state_dict_into_model(model, sd, strict=False, dequantize_fp8=False, target_dtype=torch.bfloat16)
 
-    assert summary.ape_unhotfixed == 2  # one for compressor, one for indexer.compressor
+    assert summary.ape_unhotfixed == 0
     assert summary.experts_fused == cfg.num_hidden_layers
 
     torch.testing.assert_close(model.model.layers[1].self_attn.compressor.ape, expected_compressor_ape)

@@ -31,13 +31,13 @@ XoRL is a distributed training framework designed for large language models with
 - **Local** — `torchrun`-based training for offline SFT and pretraining
 - **Server** — REST API-driven training for online RL loops where [xorl-client](https://github.com/togethercomputer/xorl-client) drives the training loop and [xorl-sglang](https://github.com/togethercomputer/xorl-sglang) serves inference
 
-**Parallelism strategies** — mix and match freely:
+**Parallelism strategies** — compose across validated combinations; some adapter, virtual-pipeline, and weight-sync combinations have explicit restrictions:
 
 | Strategy | Description |
 |---|---|
 | FSDP2 | Fully sharded data parallelism (PyTorch native) |
 | Tensor Parallel | Column/row weight sharding across GPUs |
-| Pipeline Parallel | Interleaved 1F1B schedule across stages |
+| Pipeline Parallel | Six schedules, including 1F1B, interleaved 1F1B, zero-bubble, and V-style variants |
 | Context Parallel | Ring attention + Ulysses sequence parallel |
 | Expert Parallel | MoE expert sharding via [DeepEP](https://github.com/deepseek-ai/DeepEP) |
 
@@ -74,22 +74,21 @@ pip install -e .
 The repo includes two git submodules under `submodules/` (needed for server / online RL training):
 
 - **[xorl-client](https://github.com/togethercomputer/xorl-client)** — Lightweight Python SDK (no PyTorch dependency) for driving the xorl training server. Provides `ServiceClient`, `TrainingClient`, `SamplingClient`, and `RestClient` with async-first `APIFuture` semantics, automatic request ordering, and Tinker API compatibility.
-- **[xorl-sglang](https://github.com/togethercomputer/xorl-sglang)** — XoRL's fork of [SGLang](https://github.com/sgl-project/sglang) with NCCL-based weight sync endpoints, MoE routing data export (R3), and numerical alignment flags for online RL.
+- **[xorl-sglang](https://github.com/togethercomputer/xorl-sglang)** — XoRL's fork of [SGLang](https://github.com/sgl-project/sglang) with NCCL and P2P weight sync, MoE route export (R3), and architecture-resolved numerical programs for online RL. The pinned revision does not include the sparse-delta receiver.
 
-Install individually:
+The default install already includes `xorl-client` from its public repository. To develop the client submodule in place, install its editable checkout:
 
 ```bash
 pip install -e submodules/xorl-client
-pip install -e "submodules/xorl-sglang/python[all]"
 ```
 
-Or use the bundled `pyproject.sglang.toml` which pins PyTorch to 2.9.1 (required by sglang) and installs everything together:
+Do not install the xorl-sglang submodule into the default PyTorch 2.12 environment. For a single environment containing XoRL, xorl-client, and xorl-sglang, use the alternate `pyproject.sglang.toml` profile, which pins the compatible PyTorch 2.11/CUDA 13 stack:
 
 **uv:**
 ```bash
 cp pyproject.sglang.toml pyproject.toml
-uv sync
-source .venv/bin/activate
+UV_PROJECT_ENVIRONMENT=.venv-sglang uv sync
+source .venv-sglang/bin/activate
 ```
 
 **conda:**
@@ -97,10 +96,10 @@ source .venv/bin/activate
 conda create -n xorl-sglang python=3.12
 conda activate xorl-sglang
 cp pyproject.sglang.toml pyproject.toml
-pip install -e .
+pip install -e . -e "submodules/xorl-sglang/python[all]"
 ```
 
-> **Note:** The default `pyproject.toml` uses PyTorch 2.10.0. sglang requires PyTorch 2.9.1, so the two cannot coexist in the same environment unless you use `pyproject.sglang.toml`.
+> **Note:** Copying the alternate manifest replaces the tracked `pyproject.toml`; `uv sync` also generates the ignored local `uv.lock` for this profile. Do this in a clean checkout, restore `pyproject.toml`, and do not add the generated lock with unrelated changes. The separate `.venv-sglang` keeps this profile isolated from the default `.venv`. The default profile uses PyTorch 2.12.1/CUDA 13.2 and Triton 3.7.1, while the combined profile uses PyTorch 2.11/CUDA 13 and Triton 3.6.0. Both use FlashAttention 4.
 
 See the [installation guide](https://togethercomputer.github.io/xorl/getting-started/installation/) for full setup including optional dependencies (DeepEP, Flash Attention).
 
@@ -135,6 +134,8 @@ See the [quick start guide](https://togethercomputer.github.io/xorl/getting-star
 | Qwen3-MoE | Mixture-of-Experts | `Qwen/Qwen3-30B-A3B`, `Qwen/Qwen3-235B-A22B`, ... |
 | Qwen3.5 | Dense | `Qwen/Qwen3.5-7B`, ... |
 | Qwen3.5-MoE | Mixture-of-Experts | `Qwen/Qwen3.5-35B-A3B`, `Qwen/Qwen3.5-397B-A17B`, ... |
+| GLM-5 | Mixture-of-Experts | `zai-org/GLM-5.2-FP8` |
+| DeepSeek V4 | Hybrid-attention MoE | `deepseek-ai/DeepSeek-V4-Flash` |
 
 Models are loaded directly from HuggingFace checkpoints — no preprocessing needed. See the [supported models](https://togethercomputer.github.io/xorl/models/) page for details.
 

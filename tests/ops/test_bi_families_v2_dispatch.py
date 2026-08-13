@@ -12,7 +12,8 @@ import torch
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
-SHIPPED_H = (2048, 3840, 4096)
+# Qwen3.6, dense Qwen3, and GLM-5.2 representative hidden sizes.
+SHIPPED_H = (2048, 3840, 4096, 6144)
 DEEP_H = 16384
 
 
@@ -36,7 +37,7 @@ def _split_spy(monkeypatch, v2):
 
 
 @requires_cuda
-def test_dispatch_keeps_shipped_hidden_sizes_on_the_fused_realization(monkeypatch):
+def test_dispatch_keeps_residual_shipped_hidden_sizes_on_the_fused_realization(monkeypatch):
     from xorl.ops import bi_families_v2 as v2
 
     calls = _split_spy(monkeypatch, v2)
@@ -45,6 +46,31 @@ def test_dispatch_keeps_shipped_hidden_sizes_on_the_fused_realization(monkeypatc
             x, w = _payload(m, h)
             v2.rms_norm_v2(x, w, 1e-6, residual=torch.zeros_like(x))
     assert calls == [], f"split realization ran at shipped hidden sizes: {calls}"
+
+
+@requires_cuda
+def test_dispatch_routes_no_residual_shipped_hidden_sizes_to_split_on_hopper(monkeypatch):
+    if torch.cuda.get_device_capability() != (9, 0):
+        pytest.skip("Hopper-specific dispatch policy")
+
+    from xorl.ops import bi_families_v2 as v2
+
+    calls = _split_spy(monkeypatch, v2)
+    expected = []
+    for h in SHIPPED_H:
+        for m in (1, 32, 512):
+            x, w = _payload(m, h)
+            v2.rms_norm_v2(x, w, 1e-6)
+            expected.append(x.shape)
+    assert calls == expected
+
+
+def test_no_residual_non_hopper_retains_shape_crossover():
+    from xorl.ops import bi_families_v2 as v2
+
+    assert v2._v2_norm_use_split(8, 12, has_residual=False, is_hopper=False)
+    assert not v2._v2_norm_use_split(16, 12, has_residual=False, is_hopper=False)
+    assert not v2._v2_norm_use_split(8, 4, has_residual=False, is_hopper=False)
 
 
 @requires_cuda

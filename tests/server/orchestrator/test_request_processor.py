@@ -629,6 +629,11 @@ async def test_optim_and_checkpoint_operations(processor):
             "learning_rate": kwargs["lr"],
             "optim_step_time": 0.125,
             "optim_empty_cache_skipped": True,
+            "glm52_fullparam_publish": {
+                "published": True,
+                "step": 3,
+                "manifest_checksum": "manifest-3",
+            },
         }
 
     processor.backend.optim_step = _optim_step_with_cleanup_metrics
@@ -646,6 +651,11 @@ async def test_optim_and_checkpoint_operations(processor):
     assert output.outputs[0]["learning_rate"] == 0.001
     assert output.outputs[0]["optim_step_time"] == pytest.approx(0.125)
     assert output.outputs[0]["optim_empty_cache_skipped"] is True
+    assert output.outputs[0]["glm52_fullparam_publish"] == {
+        "published": True,
+        "step": 3,
+        "manifest_checksum": "manifest-3",
+    }
 
     processor.backend.optim_step = original_optim_step
 

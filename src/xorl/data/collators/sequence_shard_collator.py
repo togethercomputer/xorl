@@ -1,5 +1,6 @@
+import logging
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, List, Tuple
 
 import torch
 
@@ -8,6 +9,82 @@ from ...distributed.parallel_state import get_parallel_state
 from ...utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_position_ids
 from .base_collator import DataCollator
 from .packing_concat_collator import add_flash_attention_kwargs_from_position_ids
+
+
+logger = logging.getLogger("xorl.gdn_cp_collator")
+_alignment_engagement_logged = False
+
+# The GDN chunk kernels operate on a 64-token grid per document. The exact-CP
+# collator contract keeps every shard cut on every crossing document's own
+# grid by 64-aligning every document start via inter-document pad-docs and
+# making the per-rank shard length a multiple of 64.
+GDN_CP_CHUNK = 64
+
+
+def find_document_boundaries(position_ids_row: torch.Tensor) -> List[int]:
+    """Document boundaries of a packed stream from position-id resets."""
+    pos = position_ids_row.reshape(-1)
+    starts = (pos == 0).nonzero(as_tuple=False).reshape(-1).tolist()
+    if not starts or starts[0] != 0:
+        starts = [0, *starts]
+    return [*starts, pos.numel()]
+
+
+def gdn_cp_alignment_segments(doc_bounds: List[int], chunk: int = GDN_CP_CHUNK) -> List[Tuple[str, int, int]]:
+    """C2 splice plan: ('pad', 0, gap) and ('doc', start, end) segments such
+    that every document START in the spliced stream is a multiple of `chunk`,
+    and the stream END is too (so C1 tail pad-docs also start on the grid).
+
+    Pure function of the document layout so admission checks and the collator
+    use the same splice plan.
+    """
+    segments: List[Tuple[str, int, int]] = []
+    out_len = 0
+    for start, end in zip(doc_bounds[:-1], doc_bounds[1:]):
+        gap = (-out_len) % chunk
+        if gap:
+            segments.append(("pad", 0, gap))
+            out_len += gap
+        segments.append(("doc", start, end))
+        out_len += end - start
+    tail_gap = (-out_len) % chunk
+    if tail_gap:
+        segments.append(("pad", 0, tail_gap))
+    return segments
+
+
+def gdn_cp_spliced_length(segments: List[Tuple[str, int, int]]) -> int:
+    return sum(end - start if kind == "doc" else end for kind, start, end in segments)
+
+
+def apply_alignment_segments(
+    tensor: torch.Tensor,
+    segments: List[Tuple[str, int, int]],
+    dim: int,
+    pad_value: float | int = 0,
+    sequential_positions: bool = False,
+) -> torch.Tensor:
+    """Splice a token-aligned tensor along `dim` per the C2 plan. Pad segments
+    are filled with `pad_value`, or with `arange(gap)` when
+    `sequential_positions` (each inter-document pad is its own document)."""
+    if dim < 0:
+        dim = tensor.ndim + dim
+    pieces: List[torch.Tensor] = []
+    for kind, start, end in segments:
+        if kind == "doc":
+            pieces.append(tensor.narrow(dim, start, end - start))
+        else:
+            gap = end
+            shape = list(tensor.shape)
+            shape[dim] = gap
+            if sequential_positions:
+                seq = torch.arange(gap, device=tensor.device, dtype=tensor.dtype)
+                view = [1] * tensor.ndim
+                view[dim] = gap
+                pieces.append(seq.view(view).expand(shape).contiguous())
+            else:
+                pieces.append(torch.full(shape, fill_value=pad_value, dtype=tensor.dtype, device=tensor.device))
+    return torch.cat(pieces, dim=dim)
 
 
 def zigzag_reorder_packed_sequence(
@@ -80,6 +157,36 @@ def zigzag_reorder_packed_sequence(
     return torch.cat(all_parts, dim=dim)
 
 
+def zigzag_restore_packed_sequence(
+    tensor: torch.Tensor,
+    position_ids: torch.Tensor,
+    ringattn_size: int,
+    dim: int = -1,
+) -> torch.Tensor:
+    """Restore one zigzag-reordered packed row to original token order."""
+    if ringattn_size <= 1:
+        return tensor
+    if dim < 0:
+        dim += tensor.ndim
+    seq_len = tensor.size(dim)
+    if position_ids.numel() != seq_len:
+        raise ValueError(
+            "Zigzag restoration requires one packed position-id row matching the tensor sequence length, "
+            f"got position_ids={tuple(position_ids.shape)} and tensor={tuple(tensor.shape)}"
+        )
+    index_shape = [1] * tensor.ndim
+    index_shape[dim] = seq_len
+    original_indices = torch.arange(seq_len, device=tensor.device, dtype=torch.long).view(index_shape)
+    reordered_indices = zigzag_reorder_packed_sequence(
+        original_indices,
+        position_ids.to(device=tensor.device),
+        ringattn_size,
+        dim=dim,
+    )
+    inverse_indices = reordered_indices.argsort(dim=dim).expand_as(tensor)
+    return tensor.gather(dim, inverse_indices)
+
+
 @dataclass
 class TextSequenceShardCollator(DataCollator):
     """
@@ -92,15 +199,27 @@ class TextSequenceShardCollator(DataCollator):
         fa_max_length_bucket: If > 0, round the flash-attn max_length up to a multiple of this value
             (upper bound only; correctness via cu_seqlens) to avoid torch.compile recompiling on ragged
             packs. 0 = off.
+        gdn_exact_cp_align: Engage the exact-GDN CP alignment contract:
+            64-align every document start via inter-document pad-docs and pad
+            the packed total to a multiple of 64 * cp_size, so every shard cut
+            lands on each crossing document's 64-token chunk grid.
+            Incompatible with ring attention.
     """
 
     pad_token_id: int = 0
     fa_max_length_bucket: int = 0
+    gdn_exact_cp_align: bool = False
 
     def __post_init__(self):
         self.cp_size = get_parallel_state().cp_size
         self.cp_rank = get_parallel_state().cp_rank
         self.ringattn_size = get_parallel_state().ringattn_size
+        if self.gdn_exact_cp_align and self.ringattn_size > 1:
+            raise ValueError(
+                "gdn_exact_cp_align is incompatible with ring attention "
+                "because zigzag reorder breaks the per-document 64-token "
+                "chunk grid. Fail closed.",
+            )
 
     def sp_slice(self, tensor: "torch.Tensor", dim: int = -1) -> "torch.Tensor":
         """
@@ -177,21 +296,53 @@ class TextSequenceShardCollator(DataCollator):
             f"Got input_ids: {input_ids.shape}, position_ids: {position_ids.shape}"
         )
 
-        # Sanity check: verify the first non-ignore label matches shifted input_ids
-        # This ensures data is properly shifted without being too strict about all positions
-        # (chat data may have labels[i] != input_ids[i+1] at turn boundaries)
+        # Sanity check: verify the first comparable non-ignore label matches
+        # shifted input_ids. A supervised token at the tail of one packed
+        # document has no same-document input_ids[i+1]: the next packed token
+        # belongs to a different document and position_ids resets to zero.
+        # Skip those boundaries while retaining the fail-closed check wherever
+        # a same-document successor is present.
         valid_mask = labels != IGNORE_INDEX
-        if valid_mask.any():
-            # Find first non-ignore position
-            first_valid_idx = valid_mask.nonzero(as_tuple=True)[1][0].item()
-            if first_valid_idx < labels.shape[1] - 1:  # Ensure we can check i+1
-                first_label = labels[0, first_valid_idx].item()
-                next_input = input_ids[0, first_valid_idx + 1].item()
+        if labels.shape[1] > 1:
+            same_document_successor = position_ids[:, 1:] == position_ids[:, :-1] + 1
+            comparable = valid_mask[:, :-1] & same_document_successor
+            if comparable.any():
+                batch_idx, first_valid_idx = comparable.nonzero(as_tuple=False)[0].tolist()
+                first_label = labels[batch_idx, first_valid_idx].item()
+                next_input = input_ids[batch_idx, first_valid_idx + 1].item()
                 assert first_label == next_input, (
-                    f"Data shift check failed: first non-ignore label should equal next input_id. "
-                    f"labels[{first_valid_idx}]={first_label}, input_ids[{first_valid_idx + 1}]={next_input}. "
+                    f"Data shift check failed: first comparable non-ignore label should equal next input_id. "
+                    f"labels[{batch_idx}, {first_valid_idx}]={first_label}, "
+                    f"input_ids[{batch_idx}, {first_valid_idx + 1}]={next_input}. "
                     f"This suggests data is not properly shifted."
                 )
+
+        # C2 (exact-GDN CP alignment): splice inter-document pad-docs so every
+        # document start (and the stream end) sits on the 64-token chunk grid.
+        # Runs BEFORE the _original_position_ids capture: after splicing, the
+        # spliced stream IS the stream the model consumes (minus C1 tail pads),
+        # so token-aligned consumers must see the spliced layout.
+        alignment_segments = None
+        if self.gdn_exact_cp_align:
+            doc_bounds = find_document_boundaries(position_ids[0])
+            alignment_segments = gdn_cp_alignment_segments(doc_bounds)
+            inserted = gdn_cp_spliced_length(alignment_segments) - input_ids.size(-1)
+            input_ids = apply_alignment_segments(input_ids, alignment_segments, -1, self.pad_token_id)
+            labels = apply_alignment_segments(labels, alignment_segments, -1, IGNORE_INDEX)
+            position_ids = apply_alignment_segments(position_ids, alignment_segments, -1, sequential_positions=True)
+            if "attention_mask" in batch:
+                batch["attention_mask"] = apply_alignment_segments(batch["attention_mask"], alignment_segments, -1, 1)
+            # The pre-splice layout no longer matches the model's stream.
+            batch["_original_position_ids"] = position_ids.clone()
+            global _alignment_engagement_logged
+            if not _alignment_engagement_logged:
+                logger.info(
+                    "gdn-cp collator alignment engaged: +%d pad tokens on the first batch "
+                    "(%.3f%% of the spliced stream)",
+                    inserted,
+                    100.0 * inserted / max(1, position_ids.size(-1)),
+                )
+                _alignment_engagement_logged = True
 
         # Store original position_ids before padding for unpacking per-token outputs later
         if "_original_position_ids" not in batch:
@@ -201,7 +352,11 @@ class TextSequenceShardCollator(DataCollator):
         # With zigzag, each doc must be divisible by 2*ringattn_size sub-chunks,
         # and each sub-chunk must be divisible by ulysses_size. So total
         # sequence must be divisible by 2*ringattn_size*ulysses_size = 2*cp_size.
+        # C1 (exact-GDN CP alignment): the per-rank shard length must also be a
+        # multiple of the 64-token chunk grid.
         pad_multiple = 2 * self.cp_size if self.ringattn_size > 1 else self.cp_size
+        if self.gdn_exact_cp_align:
+            pad_multiple = GDN_CP_CHUNK * self.cp_size
         seq_length = input_ids.size(-1)
         cp_chunk_size = (seq_length + pad_multiple - 1) // pad_multiple * pad_multiple // self.cp_size
         pad_length = cp_chunk_size * self.cp_size - seq_length
@@ -289,6 +444,8 @@ class TextSequenceShardCollator(DataCollator):
 
                 # Determine pad value: IGNORE_INDEX for target_tokens, 0 for others
                 pad_value = IGNORE_INDEX if field == "target_tokens" else 0.0
+                if alignment_segments is not None:
+                    field_tensor = apply_alignment_segments(field_tensor, alignment_segments, seq_dim, pad_value)
                 field_tensor = self.sp_padding(field_tensor, dim=seq_dim, pad_value=pad_value, pad_length=pad_length)
                 if self.ringattn_size > 1:
                     field_tensor = zigzag_reorder_packed_sequence(
@@ -315,5 +472,31 @@ class TextSequenceShardCollator(DataCollator):
             batch["max_length_k"] = max_k
         else:
             add_flash_attention_kwargs_from_position_ids(batch, max_length_bucket=self.fa_max_length_bucket)
+
+        # Defense in depth for the exact-GDN CP contract: every shard cut must
+        # land on the 64-token chunk grid of whichever document it crosses
+        # (real doc or pad-doc — the GDN kernels cannot tell them apart).
+        # NOTE: pad-doc STARTS are unaligned by construction (they fill the
+        # gap up to the next 64-multiple) — that is fine precisely because a
+        # sub-64 gap pad can never contain a 64-multiple cut in its interior.
+        # Fail closed — a violated grid means byte-broken GDN handoffs.
+        if self.gdn_exact_cp_align:
+            if cp_chunk_size % GDN_CP_CHUNK != 0:
+                raise AssertionError(
+                    f"gdn_exact_cp_align postcondition violated: shard length "
+                    f"{cp_chunk_size} is not a multiple of {GDN_CP_CHUNK}",
+                )
+            bounds = find_document_boundaries(position_ids[0])
+            cuts = [cp_chunk_size * r for r in range(1, self.cp_size)]
+            bad = []
+            for cut in cuts:
+                doc_start = max(s for s in bounds[:-1] if s <= cut)
+                if cut != doc_start and (cut - doc_start) % GDN_CP_CHUNK != 0:
+                    bad.append((cut, doc_start))
+            if bad:
+                raise AssertionError(
+                    "gdn_exact_cp_align postcondition violated: shard cuts off "
+                    f"the crossing document's 64-token grid: {bad[:4]}",
+                )
 
         return batch

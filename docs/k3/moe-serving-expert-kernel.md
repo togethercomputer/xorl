@@ -20,8 +20,10 @@ Unsupported activation, bias, layout, or distribution combinations fail rather
 than falling back to the ordinary grouped-GEMM forward.
 
 Architecture-selected Qwen MoE uses this principle together with its qualified
-EP8 dispatch and ordered combine. The resolver, rather than a user-provided
-component flag, owns the production choice.
+EP8 dispatch and `canonical_moe_fold_v1`. Transport restores logical
+contributor order; the fold then evaluates a BF16-rounded adjacent-pair tree.
+The resolver, rather than a user-provided component flag, owns the production
+choice.
 
 ## GLM-5.2 native-FP8 experts
 
@@ -35,8 +37,9 @@ Active rank-1 LoRA uses the same SGLang MoE hooks in both engines. Its shrink
 and expand GEMMs have fixed rank-aware blocks and no split-K partial merge.
 Trainer-only autograd supplies factor and activation gradients.
 
-EP dispatch and the 16-rank ordered combine remain explicit parts of the GLM
-contract; local expert equality alone does not qualify the distributed model.
+EP dispatch and the same 16-leaf logical adjacent-pair fold remain explicit
+parts of the GLM contract; local expert equality alone does not qualify the
+distributed model.
 
 ## Verification
 

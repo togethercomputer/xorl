@@ -70,8 +70,15 @@ class ParallelPlan:
     def apply(self, model: nn.Module, ep_fsdp_mesh: DeviceMesh, already_local: bool = False):
         """Apply EP sharding to model parameters.
 
-        Three dispatch paths per matched expert param:
+        Dispatch paths per matched expert param:
 
+        - **Load-presliced** (owner module carries
+          ``_xorl_ep_load_presliced[param_name]``, recorded by the checkpoint
+          load's ``_shrink_expert_params_for_ep``): the load already sliced
+          this tensor to its EP-local shape with real bytes — EP application
+          is a VERIFIED no-op (annotate ``spec_info`` only), and any
+          inconsistency (ep_size mismatch, meta storage, wrong dim size,
+          force-shard) fails closed so the tensor can never be sliced twice.
         - **Meta tensor** (``param.is_meta``): replace the meta param with a
           new meta param whose shape is sliced to the EP-local size along
           ``shard.dim``. ``to_empty()`` later allocates only the EP-local
@@ -152,6 +159,61 @@ class ParallelPlan:
                                     f"EP force-shard parameter {fqn} has dim {shard.dim} size "
                                     f"{param.size(shard.dim)}; expected {expected_global_size} or {expected_local_size}"
                                 )
+
+                        # Load-presliced parameters: the checkpoint load's EP
+                        # pre-shrink + EP-aware filtered loading already put
+                        # this tensor at its EP-local shape with REAL bytes
+                        # (recorded on the owner module by
+                        # _shrink_expert_params_for_ep).  That load is the ONE
+                        # EP slicing site for such tensors; here EP application
+                        # is a VERIFIED no-op — annotate spec_info, never
+                        # slice.  Every mismatch fails closed because falling
+                        # through to the real-slice branch below would slice
+                        # the tensor a second time
+                        # (16 % ep_size == 0 passes the divisibility assert),
+                        # leaving one wrong-identity expert row per rank.
+                        presliced = (getattr(owner, "_xorl_ep_load_presliced", None) or {}).get(local_name)
+                        if presliced is not None:
+                            load_global_rows, load_ep_size = (int(value) for value in presliced)
+                            if force_shard:
+                                raise ValueError(
+                                    f"EP parameter {fqn} was already EP-sliced at checkpoint load "
+                                    f"({load_global_rows} rows / ep_size={load_ep_size}); force-shard "
+                                    "would slice it a second time"
+                                )
+                            if load_ep_size != ep_size:
+                                raise ValueError(
+                                    f"EP parameter {fqn} was EP-sliced at checkpoint load for "
+                                    f"ep_size={load_ep_size} but EP is being applied with ep_size={ep_size}; "
+                                    "the load-time and wrap-time EP worlds must be identical"
+                                )
+                            if param.is_meta:
+                                raise ValueError(
+                                    f"EP parameter {fqn} is recorded as load-presliced but is still a meta "
+                                    "tensor — the pre-shrunk checkpoint bytes were never materialized; "
+                                    "refusing to guess whether the shape was sliced once or twice"
+                                )
+                            expected_local = load_global_rows // ep_size
+                            if param.size(shard.dim) != expected_local:
+                                raise ValueError(
+                                    f"EP parameter {fqn} was EP-pre-sliced at checkpoint load "
+                                    f"({load_global_rows} -> {expected_local} rows along dim {shard.dim} for "
+                                    f"ep_size={ep_size}) but arrives at EP application with dim size "
+                                    f"{param.size(shard.dim)}; slicing here would apply EP twice — refusing "
+                                    "the corrupt construction"
+                                )
+                            param.spec_info = SpecInfo(
+                                ep_fsdp_mesh=ep_fsdp_mesh,
+                                placement=shard,
+                                fqn=fqn,
+                                gradient_reduction=gradient_reduction,
+                            )
+                            fqn2spec_info[fqn] = param.spec_info
+                            logger.debug_rank0(
+                                f"EP verified load-presliced parameter: {fqn} {list(param.shape)} "
+                                f"(dim={shard.dim}, ep_size={ep_size})"
+                            )
+                            break
 
                         # An undeclared singleton expert axis is a shared LoRA
                         # factor. Explicit owner dispositions are validated

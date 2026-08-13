@@ -10,7 +10,7 @@ construction and rejects incompatible overrides.
 | Model lane | Admitted trainer topology | Contract ownership |
 |---|---|---|
 | Qwen3.5 dense | single rank | model resolver selects GDN, RoPE, RMSNorm, trunk, and head arithmetic |
-| Qwen3.6-35B-A3B | WORLD8/DP8/EP8 or WORLD16/DP16/EP8 | model resolver additionally selects router, expert forward, and ordered EP combine |
+| Qwen3.6-35B-A3B | WORLD8/DP8/EP8 or WORLD16/DP16/EP8 | model resolver additionally selects router, expert forward, and the canonical logical adjacent-pair EP fold |
 | GLM-5.2 native FP8 | WORLD16/PP1/TP1/DP1/EP16/CP16 | model resolver selects sparse MLA, native-FP8 projections, routed/shared experts, head, and distributed combine |
 
 On the paired serving engine, `--rl-on-policy-target xorl` selects the matching
@@ -25,7 +25,8 @@ The selected program owns all bit-relevant choices together:
 - attention/GDN backend and state handling;
 - router arithmetic and selected-expert ordering;
 - expert projection, activation, routing-weight, and local-combine arithmetic;
-- distributed expert combine; and
+- distributed expert transport and the versioned logical adjacent-pair BF16
+  fold; and
 - LM-head projection and vocabulary normalization.
 
 ## LoRA programs

@@ -42,6 +42,13 @@ from xorl.models.layers.moe.routing_replay import get_replay_stage, is_r3_mode, 
 
 from ..utils import logging
 from .parallel_state import get_parallel_state
+from .pp_byte_contract import (
+    PP_EXACT_REQUIRED_METADATA,
+    PPByteContractError,
+    assert_pp_wire_dtype,
+    engage_pp_byte_contract,
+    validate_pp_exact_microbatch_metadata,
+)
 
 
 logger = logging.get_logger(__name__)
@@ -352,6 +359,30 @@ def _pp_forward(self, x):
             if position_ids is not None:
                 position_ids = position_ids.to(x.device)
             extra_kwargs = {k: v.to(x.device) if isinstance(v, torch.Tensor) else v for k, v in metadata.items()}
+        if getattr(self, "_pp_exact_boundary_contract", False):
+            # Exact lanes fail closed on INCOMPLETE metadata, not just absent
+            # position_ids: a fabricated positional fallback changes bytes
+            # silently, and a missing cu_seq_lens_* silently
+            # merges packed documents into one attention span — a silent
+            # numerics change with no downstream error.
+            missing = [
+                name
+                for name in PP_EXACT_REQUIRED_METADATA
+                if (position_ids is None if name == "position_ids" else name not in extra_kwargs)
+            ]
+            if missing:
+                raise PPByteContractError(
+                    f"PP byte contract: scheduled stage forward is missing required per-microbatch "
+                    f"varlen metadata {missing}; exact value programs require the complete set "
+                    f"{list(PP_EXACT_REQUIRED_METADATA)} (silent fallbacks/merges are not admitted)"
+                )
+            # Presence is not enough: a present-but-None (or malformed)
+            # cu_seq_lens_* still reaches the single-document fallback.
+            validate_pp_exact_microbatch_metadata(x, position_ids, extra_kwargs)
+            if not self._pp_is_first:
+                # The received wire bytes must be bf16 regardless of what any
+                # config declared (resolved reality, not metadata).
+                assert_pp_wire_dtype(x, where="received inter-stage hidden state")
 
     # Fallback: generate sequential position_ids covering the full SP range
     # so that RoPE embeddings have a large enough cache.
@@ -383,6 +414,12 @@ def _pp_forward(self, x):
     set_replay_stage(old_stage)
 
     hidden_states = outputs.last_hidden_state
+
+    if getattr(self, "_pp_exact_boundary_contract", False) and in_scheduled_forward:
+        # The emitted wire bytes must be bf16 regardless of what any config
+        # declared: a bf16-declared model computing in fp32 is caught here at
+        # its first scheduled forward (resolved reality, not metadata).
+        assert_pp_wire_dtype(hidden_states, where="emitted stage hidden state")
 
     if self._pp_is_last:
         # When the loss fn applies lm_head (fused quack_linear CE), return HIDDEN
@@ -454,6 +491,7 @@ def pipeline_module_split(
     module_names_per_stage: List[List[str]],
     always_keep_fqns: Optional[List[str]] = None,
     stage_style: str = "single",
+    expects_bf16_mixed_precision: bool = False,
 ) -> tuple:
     """
     Split a model into pipeline stages based on specified module FQN names.
@@ -536,6 +574,21 @@ def pipeline_module_split(
         logger.info(f"PP rank {pp_rank} built stage {stage_idx} with modules {module_names}")
         stages.append(stage)
         model_parts.append(model)
+
+    # Exact value programs additionally require the fail-closed byte-boundary
+    # contract (no-op for generic models): certified family, cuts only at
+    # decoder-layer rounding boundaries, preserved global layer identity, and
+    # metadata fail-closed marking.
+    engage_pp_byte_contract(
+        whole_model,
+        module_names_per_stage=module_names_per_stage,
+        stage_ids=stage_ids,
+        model_parts=model_parts,
+        # Uniform-fp32 masters are admitted only when the caller genuinely
+        # intends bf16 mixed-precision compute (production full-weight path);
+        # the declaration is validated against the actual parameter reality.
+        expects_bf16_mixed_precision=expects_bf16_mixed_precision,
+    )
 
     return stages, model_parts
 

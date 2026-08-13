@@ -7,6 +7,7 @@ device management, parallelism, etc.), excluding client-side training
 parameters like batch size, epochs, and optimizer settings.
 """
 
+import math
 import sys
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional, Union
@@ -370,12 +371,49 @@ class ServerArguments:
             )
         },
     )
+    glm52_fullparam_fp8_training: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable GLM-5.2 full-parameter block-FP8 training: dense MLPs, scoped routed-expert banks, "
+                "and ALL routers train through FP32 masters with per-step quantized byte caches; everything "
+                "else is frozen by the fail-closed admission. Exclusive full-weight mode; requires "
+                "glm52_fullparam_trainable_expert_layers, freeze_router=False, ep_dispatch='alltoall', "
+                "moe_implementation='triton', and the qualified WORLD16/EP16/Ulysses16 CUDA topology."
+            )
+        },
+    )
+
+    glm52_fullparam_trainable_expert_layers: Optional[List[int]] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Explicit expert-bank training scope for glm52_fullparam_fp8_training (sparse layer indices). "
+                "Required and non-empty when the mode is on because full-scope FP32 expert masters may exceed "
+                "the available memory; the scope is never implicit. Out-of-scope layers keep frozen native "
+                "banks; their routers still train."
+            )
+        },
+    )
+
+    glm52_fullparam_publish_dir: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Shared-filesystem root for GLM-5.2 full-param step publication. When set, each optimizer "
+                "step writes per-rank checksummed payloads and one rank-0 combined manifest for atomic "
+                "SGLang checkpoint materialization. Requires glm52_fullparam_fp8_training."
+            )
+        },
+    )
+
     enable_qarl: bool = field(
         default=False,
         metadata={
             "help": (
-                "Enable experimental dense full-weight QARL fake quantization. Initial support uses dynamic "
-                "E4M3 fake quantization with full-precision master parameters and STE gradients."
+                "Enable experimental full-weight QARL fake quantization with full-precision master parameters "
+                "and STE gradients. E4M3 supports dense nn.Linear modules; NVFP4 also supports MoE expert "
+                "containers."
             )
         },
     )
@@ -383,8 +421,9 @@ class ServerArguments:
         default=None,
         metadata={
             "help": (
-                "QARL quantization config or alias. Initial support accepts null, 'FP8_DEFAULT_CFG', 'fp8', "
-                "or a dict with format/quant_method=e4m3/fp8_e4m3 plus optional weight/activation booleans."
+                "QARL quantization config or alias. Accepts null, 'FP8_DEFAULT_CFG', 'fp8', 'fp8_e4m3', "
+                "'e4m3', or 'nvfp4', plus dictionaries for those formats. NVFP4 defaults to weight-only, "
+                "dynamic group-size-16 fake quantization."
             )
         },
     )
@@ -406,23 +445,17 @@ class ServerArguments:
     )
     qarl_target_modules: Optional[List[str]] = field(
         default=None,
-        metadata={"help": "Optional short nn.Linear module names to wrap with QARL fake quantization."},
+        metadata={
+            "help": (
+                "Optional short names, FQNs, or globs to wrap with QARL fake quantization. NVFP4 targets may "
+                "also match MoE expert containers."
+            )
+        },
     )
     qarl_exclude_modules: Optional[List[str]] = field(
         default=None,
         metadata={"help": "Optional short names, FQNs, or globs to keep out of QARL fake quantization."},
     )
-    fp8_cfg: Optional[Dict[str, Any]] = field(
-        default=None,
-        metadata={
-            "help": (
-                "Optional compatibility alias for NeMo-style FP8 configs. Supported values are "
-                "{enabled: true, fp8: e4m3, fp8_recipe: blockwise, fp8_param: false}; "
-                "TransformerEngine-only recipes are rejected."
-            )
-        },
-    )
-
     fp8_training_num_first_layers_bf16: int = field(
         default=0,
         metadata={"help": "Number of initial decoder layers to keep in BF16 when FP8 training is enabled."},
@@ -679,6 +712,14 @@ class ServerArguments:
         metadata={"help": "Default weight decay for the server's implicit/default training session."},
     )
 
+    max_grad_norm: float = field(
+        default=1.0,
+        metadata={
+            "help": "Maximum gradient norm for the server's implicit/default training session. "
+            "A finite value <= 0 disables clipping."
+        },
+    )
+
     adam_betas: Optional[List[float]] = field(
         default=None,
         metadata={
@@ -882,18 +923,6 @@ class ServerArguments:
         },
     )
 
-    externalize_r3_payloads: bool = field(
-        default=False,
-        metadata={
-            "help": ("Deprecated alias for r3_payload_transport='mooncake'. Kept only for PR-426 compatibility.")
-        },
-    )
-
-    keep_r3_payloads: bool = field(
-        default=False,
-        metadata={"help": "Deprecated alias for r3_payload_keep."},
-    )
-
     storage_limit: str = field(
         default="10TB",
         metadata={
@@ -1038,6 +1067,18 @@ class ServerArguments:
 
     lora_alpha: int = field(default=16, metadata={"help": "LoRA alpha scaling parameter"})
 
+    lora_b_init_std: float = field(
+        default=0.0,
+        metadata={
+            "help": "Optional deterministic normal initialization std for LoRA-B; zero preserves the standard no-op init"
+        },
+    )
+
+    lora_b_init_seed: int = field(
+        default=0,
+        metadata={"help": "Seed for deterministic nonzero LoRA-B initialization"},
+    )
+
     adapter_gradient_ownership_bucket_bytes: int = field(
         default=64 * 1024 * 1024,
         metadata={"help": "Maximum bytes in one adapter-gradient residual-transport bucket"},
@@ -1058,6 +1099,14 @@ class ServerArguments:
         },
     )
 
+    unfuse_for_lora: bool = field(
+        default=False,
+        metadata={
+            "help": "Replace supported fused projections with split projections before plain LoRA injection. "
+            "Use only when the architecture lacks fused-base logical LoRA support."
+        },
+    )
+
     moe_hybrid_shared_lora: bool = field(
         default=False,
         metadata={
@@ -1068,7 +1117,7 @@ class ServerArguments:
     lora_export_format: str = field(
         default="peft",
         metadata={
-            "help": "On-disk layout for MoE LoRA export. 'peft' (default) writes per-expert keys in PEFT orientation. 'sglang_shared_outer' writes stacked 3D tensors under experts.w{1,2,3} in SGLang's shared_outer format (requires moe_hybrid_shared_lora=True)."
+            "help": "On-disk layout for MoE LoRA export. 'peft' (default) writes per-expert keys in PEFT orientation. 'sglang_shared_outer' writes stacked 3D tensors under experts.w{1,2,3} in SGLang's shared_outer format (requires moe_hybrid_shared_lora=True). 'dsv4_expert_banks' writes the complete exact DSV4-Flash stacked expert banks (requires its exact active-LoRA contract)."
         },
     )
 
@@ -1135,7 +1184,8 @@ class ServerArguments:
             "'nccl_broadcast' (rank-0 broadcast via SGLang update_weights_from_distributed); "
             "'p2p' (RDMA one-sided writes via Mooncake TransferEngine into SGLang's "
             "registered param memory; requires --enable-rdma-weight-updates on the SGLang side); "
-            "'sparse_delta' (experimental packed sparse files via SGLang update_weights_from_sparse_delta)"
+            "'sparse_delta' is accepted by XoRL but unavailable with the pinned xorl-sglang "
+            "revision because its update_weights_from_sparse_delta receiver is absent"
         },
     )
     receiver_kv_cache_dtype: Optional[Literal["auto", "fp8", "fp8_e4m3"]] = field(
@@ -1182,6 +1232,19 @@ class ServerArguments:
     def __post_init__(self):
         """Validate and set defaults."""
         from xorl.fp8_training.config_compat import normalize_fp8_training_config  # noqa: PLC0415
+
+        if isinstance(self.max_grad_norm, bool):
+            raise ValueError("max_grad_norm must be a finite number; use a value <= 0 to disable clipping")
+        try:
+            self.max_grad_norm = float(self.max_grad_norm)
+        except (TypeError, ValueError) as error:
+            raise ValueError("max_grad_norm must be a finite number; use a value <= 0 to disable clipping") from error
+        if not math.isfinite(self.max_grad_norm):
+            raise ValueError("max_grad_norm must be a finite number; use a value <= 0 to disable clipping")
+        if self.unfuse_for_lora and not self.enable_lora:
+            raise ValueError("unfuse_for_lora requires enable_lora=True")
+        if self.unfuse_for_lora and self.enable_qlora:
+            raise ValueError("unfuse_for_lora is not supported with QLoRA")
         from xorl.qarl import normalize_qarl_quant_cfg, qarl_unsupported_scope_reason  # noqa: PLC0415
         from xorl.server.orchestrator.packing import ON_OVERSIZED_MODES, PACKING_STRATEGIES  # noqa: PLC0415
 
@@ -1196,15 +1259,6 @@ class ServerArguments:
             )
         if self.pad_to_multiple_of < 1:
             raise ValueError(f"pad_to_multiple_of must be >= 1, got {self.pad_to_multiple_of}")
-        if self.externalize_r3_payloads:
-            if self.r3_payload_transport not in {"inline", "mooncake"}:
-                raise ValueError(
-                    "externalize_r3_payloads=True is a deprecated alias for "
-                    "r3_payload_transport='mooncake' and cannot be combined with filesystem transport"
-                )
-            self.r3_payload_transport = "mooncake"
-        if self.keep_r3_payloads:
-            self.r3_payload_keep = True
         if self.r3_payload_transport == "inline":
             if self.r3_payload_dir:
                 raise ValueError("r3_payload_dir requires r3_payload_transport='filesystem'")
@@ -1233,14 +1287,90 @@ class ServerArguments:
             raise ValueError("enable_fp8_training is a full-weight mode and cannot be combined with LoRA or QLoRA")
         if self.enable_qarl and (self.enable_lora or self.enable_qlora):
             raise ValueError("enable_qarl is a full-weight mode and cannot be combined with LoRA or QLoRA")
+        if self.glm52_fullparam_fp8_training:
+            if self.enable_lora or self.enable_qlora or self.enable_fp8_training or self.enable_qarl:
+                raise ValueError(
+                    "glm52_fullparam_fp8_training is an exclusive full-weight mode and cannot be combined "
+                    "with LoRA, QLoRA, enable_fp8_training, or enable_qarl"
+                )
+            scope = self.glm52_fullparam_trainable_expert_layers
+            if not scope:
+                raise ValueError(
+                    "glm52_fullparam_fp8_training requires a non-empty "
+                    "glm52_fullparam_trainable_expert_layers scope (never an implicit train-everything)"
+                )
+            if len(set(scope)) != len(scope) or any(int(layer) != layer or layer < 0 for layer in scope):
+                raise ValueError(
+                    f"glm52_fullparam_trainable_expert_layers must be unique non-negative layer indices, got {scope!r}"
+                )
+            if not self.enable_mixed_precision:
+                raise ValueError(
+                    "glm52_fullparam_fp8_training requires enable_mixed_precision=True for the qualified BF16 build"
+                )
+            # This lane owns FP32 masters inside admitted components. A generic
+            # whole-model fp32 upcast would corrupt the checkpoint-native BF16
+            # construction before those components are installed.
+            self.skip_param_upcast = True
+            requirements = {
+                "freeze_router": (self.freeze_router, False),
+                "merge_qkv": (self.merge_qkv, True),
+                "moe_implementation": (self.moe_implementation, "triton"),
+                "ep_dispatch": (self.ep_dispatch, "alltoall"),
+            }
+            mismatches = [
+                f"{name}={actual!r} (requires {expected!r})"
+                for name, (actual, expected) in requirements.items()
+                if actual != expected
+            ]
+            if mismatches:
+                raise ValueError(
+                    "GLM-5.2 full-param block-FP8 training rejects unsupported configuration: " + ", ".join(mismatches)
+                )
+            from xorl.models.transformers.glm5.support import (  # noqa: PLC0415
+                validate_glm52_fullparam_runtime_topology,
+            )
+
+            validate_glm52_fullparam_runtime_topology(
+                init_device=self.init_device,
+                data_parallel_mode=self.data_parallel_mode,
+                tensor_parallel_size=self.tensor_parallel_size,
+                pipeline_parallel_size=self.pipeline_parallel_size,
+                expert_parallel_size=self.expert_parallel_size,
+                ringattn_parallel_size=self.ringattn_parallel_size,
+                ulysses_parallel_size=self.ulysses_parallel_size,
+                data_parallel_replicate_size=self.data_parallel_replicate_size,
+                data_parallel_shard_size=self.data_parallel_shard_size,
+                cp_fsdp_mode=self.cp_fsdp_mode,
+                lm_head_tensor_parallel_size=self.lm_head_tensor_parallel_size,
+                fsdp_sharded_lm_head_loss=self.fsdp_sharded_lm_head_loss,
+                enable_full_shard=self.enable_full_shard,
+                reshard_after_forward=self.reshard_after_forward,
+            )
+        elif self.glm52_fullparam_trainable_expert_layers is not None:
+            raise ValueError(
+                "glm52_fullparam_trainable_expert_layers is only meaningful with glm52_fullparam_fp8_training=True"
+            )
+        elif self.glm52_fullparam_publish_dir is not None:
+            raise ValueError("glm52_fullparam_publish_dir is only meaningful with glm52_fullparam_fp8_training=True")
+        if self.glm52_fullparam_publish_dir is not None and not str(self.glm52_fullparam_publish_dir).strip():
+            raise ValueError("glm52_fullparam_publish_dir must be a non-empty path when set")
         if self.max_lora_rank is None:
             self.max_lora_rank = self.lora_rank
         if self.max_lora_rank < self.lora_rank:
             raise ValueError(
                 f"max_lora_rank ({self.max_lora_rank}) must be >= lora_rank ({self.lora_rank}) for the default session"
             )
+        if self.lora_b_init_std < 0.0:
+            raise ValueError(f"lora_b_init_std must be nonnegative, got {self.lora_b_init_std}")
+        if self.lora_b_init_std and not (self.enable_lora or self.enable_qlora):
+            raise ValueError("lora_b_init_std requires LoRA or QLoRA")
         if self.block_fp8_qlora_training:
-            exact_active_lora = (self.lora_rank, self.lora_alpha) == (1, 1)
+            from xorl.models.transformers.glm5.exact_lora_contract import (  # noqa: PLC0415
+                glm52_exact_lora_scaling,
+            )
+
+            glm52_exact_lora_scaling(self.lora_rank, self.lora_alpha)
+            exact_active_lora = self.ep_dispatch == "alltoall"
             requirements = {
                 "enable_lora": (self.enable_lora, True),
                 "enable_qlora": (self.enable_qlora, True),
@@ -1256,15 +1386,13 @@ class ServerArguments:
             if exact_active_lora:
                 requirements.update(
                     {
-                        "max_lora_rank": (self.max_lora_rank, 1),
+                        "max_lora_rank": (self.max_lora_rank, self.lora_rank),
                         "tensor_parallel_size": (self.tensor_parallel_size, 1),
                         "pipeline_parallel_size": (self.pipeline_parallel_size, 1),
                         "expert_parallel_size": (self.expert_parallel_size, 16),
-                        "ulysses_parallel_size": (self.ulysses_parallel_size, 16),
                         "ringattn_parallel_size": (self.ringattn_parallel_size, 1),
                         "lm_head_tensor_parallel_size": (self.lm_head_tensor_parallel_size, 16),
                         "data_parallel_replicate_size": (self.data_parallel_replicate_size, 1),
-                        "data_parallel_shard_size": (self.data_parallel_shard_size, 1),
                         "data_parallel_mode": (self.data_parallel_mode, "fsdp2"),
                         "cp_fsdp_mode": (self.cp_fsdp_mode, "all"),
                         "fsdp_sharded_lm_head_loss": (self.fsdp_sharded_lm_head_loss, True),
@@ -1277,6 +1405,17 @@ class ServerArguments:
             ]
             if mismatches:
                 raise ValueError("GLM-5.2 block-FP8 QLoRA rejects unsupported configuration: " + ", ".join(mismatches))
+            if exact_active_lora and (
+                self.ulysses_parallel_size,
+                self.data_parallel_shard_size,
+            ) not in {(16, 1), (1, 16)}:
+                raise ValueError(
+                    "GLM-5.2 exact active-LoRA admits exactly one WORLD16 row owner: "
+                    "CP-owned (ulysses_parallel_size=16, data_parallel_shard_size=1) or "
+                    "DP-owned (ulysses_parallel_size=1, data_parallel_shard_size=16); got "
+                    f"ulysses_parallel_size={self.ulysses_parallel_size}, "
+                    f"data_parallel_shard_size={self.data_parallel_shard_size}"
+                )
             if self.lora_target_modules is not None or self.lora_target_manifest is not None:
                 raise ValueError("GLM-5.2 block-FP8 QLoRA uses its complete deterministic target set")
             if self.qlora_exclude_modules is not None:
@@ -1440,6 +1579,9 @@ class ServerArguments:
                 "skip_param_upcast": self.skip_param_upcast,
                 "enable_fp8_training": self.enable_fp8_training,
                 "enable_qarl": self.enable_qarl,
+                "glm52_fullparam_fp8_training": self.glm52_fullparam_fp8_training,
+                "glm52_fullparam_trainable_expert_layers": self.glm52_fullparam_trainable_expert_layers,
+                "glm52_fullparam_publish_dir": self.glm52_fullparam_publish_dir,
                 "qarl_quant_cfg": self.qarl_quant_cfg,
                 "qarl_calib_data": self.qarl_calib_data,
                 "qarl_calib_size": self.qarl_calib_size,
@@ -1447,7 +1589,6 @@ class ServerArguments:
                 "qarl_sync_format": self.qarl_sync_format,
                 "qarl_target_modules": self.qarl_target_modules,
                 "qarl_exclude_modules": self.qarl_exclude_modules,
-                "fp8_cfg": self.fp8_cfg,
                 "fp8_training_num_first_layers_bf16": self.fp8_training_num_first_layers_bf16,
                 "fp8_training_num_last_layers_bf16": self.fp8_training_num_last_layers_bf16,
                 "fp8_training_allow_blackwell": self.fp8_training_allow_blackwell,
@@ -1484,6 +1625,7 @@ class ServerArguments:
                 "optimizer": self.optimizer,
                 "lr": self.lr,
                 "weight_decay": self.weight_decay,
+                "max_grad_norm": self.max_grad_norm,
                 "adam_betas": self.adam_betas,
                 "adam_eps": self.adam_eps,
                 "optimizer_dtype": self.optimizer_dtype,
@@ -1538,7 +1680,10 @@ class ServerArguments:
                 "max_lora_rank": self.max_lora_rank,
                 "lora_alpha": self.lora_alpha,
                 "lora_target_modules": self.lora_target_modules,
+                "lora_b_init_std": self.lora_b_init_std,
+                "lora_b_init_seed": self.lora_b_init_seed,
                 "lora_target_manifest": self.lora_target_manifest,
+                "unfuse_for_lora": self.unfuse_for_lora,
                 "moe_hybrid_shared_lora": self.moe_hybrid_shared_lora,
                 "lora_export_format": self.lora_export_format,
                 "enable_qlora": self.enable_qlora,

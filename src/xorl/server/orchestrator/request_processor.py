@@ -960,7 +960,7 @@ class RequestProcessor:
                 "step": result.get("step", 0),
                 "execution_time": result.get("execution_time", 0.0),
             }
-            for key in ("optim_step_time", "optim_empty_cache_skipped"):
+            for key in ("optim_step_time", "optim_empty_cache_skipped", "glm52_fullparam_publish"):
                 if key in result:
                     output_dict[key] = result[key]
             if result.get("auto_loaded"):

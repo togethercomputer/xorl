@@ -153,7 +153,7 @@ def test_glm52_exact_moe_construction_preserves_complete_global_inventory_and_so
             assert projection._source_quant_format == "block_fp8"
             assert projection._is_prequantized is True
             assert projection._merge_sources is None
-            assert projection._qlora_expected_skip_keys == {"weight", "weight_scale_inv"}
+            assert projection._qlora_expected_skip_keys == {"weight"}
 
         routed_fqn = f"model.layers.{layer_idx}.mlp.experts"
         routed = model.get_submodule(routed_fqn)
@@ -348,8 +348,8 @@ def test_glm52_exact_lm_head_rejects_non_world16_before_mutation(monkeypatch: py
     assert not any("lora_" in name for name, _ in model.named_parameters())
 
 
-@pytest.mark.parametrize(("rank", "alpha"), ((16, 16), (1, 2), (2, 1)))
-def test_glm52_exact_moe_construction_rejects_non_rank1_alpha1_before_mutation(
+@pytest.mark.parametrize(("rank", "alpha"), ((0, 1), (1, 0), (-2, 1)))
+def test_glm52_exact_moe_construction_rejects_nonpositive_rank_or_alpha_before_mutation(
     monkeypatch: pytest.MonkeyPatch,
     rank: int,
     alpha: int,
@@ -358,7 +358,7 @@ def test_glm52_exact_moe_construction_rejects_non_rank1_alpha1_before_mutation(
     config = _exact_moe_config()
     model = _meta_model(config)
 
-    with pytest.raises(ValueError, match="requires adapter_rank=1 and adapter_alpha=1"):
+    with pytest.raises(ValueError, match="must be positive"):
         prepare_glm52_block_fp8_qlora(model, config, adapter_rank=rank, adapter_alpha=alpha)
 
     assert not any("lora_" in name for name, _ in model.named_parameters())

@@ -9,11 +9,16 @@ values numerically would corrupt the embedded bytes.
 
 from __future__ import annotations
 
+import logging
+
 import torch
 from torch import nn
 
 
+logger = logging.getLogger(__name__)
+
 NATIVE_BLOCK_FP8_CONTRACT_VERSION = "xorl_native_block_fp8_sglang_v1"
+NATIVE_BLOCK_FP8_FROZEN_DGRAD_CONTRACT_VERSION = "xorl_native_block_fp8_frozen_dgrad_v1"
 _FP8_DTYPE = torch.float8_e4m3fn
 
 
@@ -163,6 +168,51 @@ def _validate_state_dict_contract(
             )
 
 
+class _NativeBlockFP8FrozenDgradFunction(torch.autograd.Function):
+    """Exact-value forward with the frozen-trunk activation backward.
+
+    Forward: the UNCHANGED SGLang W8A8 dispatch on the module's frozen bytes
+    (byte-identical to the scoring-only path — the value program is not
+    touched).  Backward: dgrad only, ``grad_output @ dequant(cache)`` in the
+    declared BF16 linear program — the same base-branch treatment the
+    trainable full-param composites and the exact QLoRA surrogate apply to
+    quantized bytes.  There is deliberately NO wgrad and NO master/cache
+    mutation: the trunk is frozen, so the only gradient this boundary may
+    produce is the activation gradient that lets upstream trainable
+    parameters learn.
+    """
+
+    @staticmethod
+    def forward(ctx, input: torch.Tensor, module, out_start: int, out_end: int, in_start: int, in_end: int):
+        weight = module.fp8_weight()[out_start:out_end, in_start:in_end].contiguous()
+        scale = module.weight_scale_inv[
+            out_start // 128 : (out_end + 127) // 128,
+            in_start // 128 : (in_end + 127) // 128,
+        ].contiguous()
+        output = _sglang_native_block_fp8_linear_value(
+            input,
+            weight,
+            scale,
+            block_size=module.block_size,
+        )
+        ctx.module = module
+        ctx.ranges = (out_start, out_end, in_start, in_end)
+        # dgrad needs only the frozen weight slice (recovered in backward from
+        # the frozen module); the input is deliberately NOT saved — there is
+        # no wgrad at a frozen boundary.
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        out_start, out_end, in_start, in_end = ctx.ranges
+        grad_input = ctx.module._frozen_activation_dgrad(
+            grad_output,
+            output_range=(out_start, out_end),
+            input_range=(in_start, in_end),
+        )
+        return grad_input, None, None, None, None, None
+
+
 class NativeBlockFP8Linear(nn.Module):
     """Frozen W8A8 block-FP8 linear whose base weight is never dequantized.
 
@@ -173,6 +223,13 @@ class NativeBlockFP8Linear(nn.Module):
 
     fsdp_requires_full_precision = True
     contract_version = NATIVE_BLOCK_FP8_CONTRACT_VERSION
+    frozen_dgrad_contract_version = NATIVE_BLOCK_FP8_FROZEN_DGRAD_CONTRACT_VERSION
+    # Fail-closed default: the scoring-only lanes never admit an activation
+    # backward.  A training admission that OWNS the trainable-set semantics
+    # (the GLM-5.2 full-param admission) must opt in per module via
+    # :meth:`enable_frozen_activation_dgrad`.
+    _frozen_dgrad_admitted = False
+    _frozen_dgrad_engagement_logged = False
 
     def __init__(
         self,
@@ -289,6 +346,57 @@ class NativeBlockFP8Linear(nn.Module):
             (self.out_features, self.in_features),
         )
 
+    def enable_frozen_activation_dgrad(self) -> None:
+        """Admit the validated frozen-trunk activation backward.
+
+        Idempotent per module.  The forward VALUE program is byte-unchanged;
+        only the refusal on grad-requiring inputs is replaced by the checked
+        BF16 dequant-program dgrad (no wgrad, no master/cache mutation —
+        frozen means frozen).  Only a trainable-set admission that must
+        backpropagate THROUGH this frozen module may call this; scoring-only
+        lanes keep the fail-closed refusal.
+        """
+
+        self._frozen_dgrad_admitted = True
+        cls = NativeBlockFP8Linear
+        if not cls._frozen_dgrad_engagement_logged:
+            cls._frozen_dgrad_engagement_logged = True
+            logger.info(
+                "Native block-FP8 frozen-trunk activation dgrad engaged: contract=%s "
+                "(forward bytes unchanged; dgrad = grad_output @ dequant(cache) in the "
+                "declared BF16 program; wgrad none; frozen bytes immutable)",
+                self.frozen_dgrad_contract_version,
+            )
+
+    def _frozen_activation_dgrad(
+        self,
+        grad_output: torch.Tensor,
+        *,
+        output_range: tuple[int, int],
+        input_range: tuple[int, int],
+    ) -> torch.Tensor:
+        """dgrad through the dequantized frozen bytes in the BF16 program.
+
+        Dequantization is the same program point the trainable composites'
+        surrogate uses (``block_fp8_dequantize_gkn`` -> FP32 -> one explicit
+        BF16 rounding); the GEMM is the declared BF16 linear backward
+        ``grad_output @ W``.  Gated bitwise against the reference
+        dequant-matmul autograd (tests/ops/test_block_fp8_frozen_dgrad.py).
+        """
+
+        from xorl.ops.quantize import block_fp8_dequantize_gkn  # noqa: PLC0415
+
+        out_start, out_end = output_range
+        in_start, in_end = input_range
+        weight = self.fp8_weight()[out_start:out_end, in_start:in_end].contiguous()
+        scale = self.weight_scale_inv[
+            out_start // 128 : (out_end + 127) // 128,
+            in_start // 128 : (in_end + 127) // 128,
+        ].contiguous()
+        dequantized = block_fp8_dequantize_gkn(weight, scale, 128).to(torch.float32).to(torch.bfloat16)
+        grad_2d = grad_output.reshape(-1, out_end - out_start).to(torch.bfloat16)
+        return grad_2d.matmul(dequantized).reshape(*grad_output.shape[:-1], in_end - in_start)
+
     @staticmethod
     def _validate_partition(value: tuple[int, int] | None, size: int, name: str) -> tuple[int, int]:
         if value is None:
@@ -315,7 +423,8 @@ class NativeBlockFP8Linear(nn.Module):
 
         if self.packed_weight_f32.requires_grad or self.weight_scale_inv.requires_grad:
             raise RuntimeError("Native block-FP8 base weights and scales must remain frozen")
-        if torch.is_grad_enabled() and input.requires_grad:
+        grad_engaged = torch.is_grad_enabled() and input.requires_grad
+        if grad_engaged and not self._frozen_dgrad_admitted:
             raise RuntimeError(
                 "Native block-FP8 phase-one forward is scoring-only; activation backward requires a validated kernel"
             )
@@ -325,6 +434,10 @@ class NativeBlockFP8Linear(nn.Module):
             raise ValueError(
                 f"Native block-FP8 input width {input.shape[-1]} does not match selected range {in_start}:{in_end}"
             )
+        if grad_engaged:
+            # Same slicing + same kernel inside the autograd boundary; the
+            # value bytes are identical to the scoring-only path below.
+            return _NativeBlockFP8FrozenDgradFunction.apply(input, self, out_start, out_end, in_start, in_end)
         weight = self.fp8_weight()[out_start:out_end, in_start:in_end].contiguous()
         scale = self.weight_scale_inv[
             out_start // 128 : (out_end + 127) // 128,
@@ -366,6 +479,7 @@ class NativeBlockFP8Linear(nn.Module):
 
 __all__ = [
     "NATIVE_BLOCK_FP8_CONTRACT_VERSION",
+    "NATIVE_BLOCK_FP8_FROZEN_DGRAD_CONTRACT_VERSION",
     "NativeBlockFP8Linear",
     "pack_fp8_as_float32",
     "unpack_float32_as_fp8",

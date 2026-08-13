@@ -65,6 +65,18 @@ def test_clip_gradients_disabled_when_nonpositive(max_grad_norm):
     assert torch.equal(model.weight.grad, torch.ones_like(model.weight.grad))
 
 
+def test_missing_clip_threshold_fails_closed():
+    model = TinyModule()
+    model.weight.grad = torch.ones_like(model.weight)
+    with pytest.raises(ValueError, match="max_grad_norm must be configured"):
+        get_effective_grad_clip_value(None, use_distsignsgd=False)
+    with pytest.raises(ValueError, match="max_grad_norm must be configured"):
+        get_effective_grad_clip_value(None, use_distsignsgd=True)
+    with pytest.raises(ValueError, match="max_grad_norm must be configured"):
+        clip_gradients(model, None)
+    assert torch.equal(model.weight.grad, torch.ones_like(model.weight.grad))
+
+
 def test_get_distsign_grad_scale_factor_returns_mean_vote_scale():
     assert get_distsign_grad_scale_factor(8) == pytest.approx(0.125)
 

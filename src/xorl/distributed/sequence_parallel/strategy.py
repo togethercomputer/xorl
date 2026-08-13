@@ -179,12 +179,26 @@ class UlyssesSyncStrategy(CPStrategy):
         # Model-specific QKV projection (MHA, MLA, etc.)
         q, k, v = module._project_qkv(hidden_states, position_embeddings)
 
+        # Fail closed BEFORE any collective: an uneven Q-head split does not
+        # reliably error downstream (the 4-D all_to_all path allocates every
+        # receive buffer from the first split's shape and would silently
+        # mis-size them; the 3-D path fails with an opaque reshape error).
+        q_head_num = q.shape[2]
+        if q_head_num % self.ulysses_size != 0:
+            raise ValueError(
+                f"Ulysses requires num_attention_heads ({q_head_num}) to be divisible by "
+                f"ulysses_size ({self.ulysses_size}); an uneven head split cannot be "
+                f"scattered byte-safely"
+            )
+
         # GQA expand if ulysses_size > num_kv_heads
         kv_head_num = k.shape[2]
         if self.ulysses_size > kv_head_num:
-            assert self.ulysses_size % kv_head_num == 0, (
-                f"ulysses_size ({self.ulysses_size}) must be divisible by num_key_value_heads ({kv_head_num})"
-            )
+            if self.ulysses_size % kv_head_num != 0:
+                raise ValueError(
+                    f"ulysses_size ({self.ulysses_size}) must be divisible by "
+                    f"num_key_value_heads ({kv_head_num}) for GQA replication"
+                )
             n_repeat = self.ulysses_size // kv_head_num
             # repeat_kv expects [batch, num_heads, seq, head_dim]
             k = k.transpose(1, 2)
@@ -482,7 +496,7 @@ class HybridUlyssesRingStrategy(CPStrategy):
 _NOOP = NoopStrategy()
 
 
-def get_cp_strategy(num_kv_heads: Optional[int] = None) -> CPStrategy:
+def get_cp_strategy(num_kv_heads: Optional[int] = None, variant: str = "auto") -> CPStrategy:
     """Resolve the SP strategy from the current ParallelState.
 
     Returns a singleton NoopStrategy when SP is disabled, or the
@@ -495,16 +509,30 @@ def get_cp_strategy(num_kv_heads: Optional[int] = None) -> CPStrategy:
     3. Ring only (ringattn_size > 1)
 
     Args:
-        num_kv_heads: Number of key-value heads in the model.  Required when
-            Ulysses SP is enabled to choose between sync and async variants.
+        num_kv_heads: Number of key-value heads in the model.  Used by the
+            ``"auto"`` variant when Ulysses SP is enabled to choose between
+            sync and async variants.
+        variant: ``"auto"`` keeps the historical heuristic; ``"sync"`` /
+            ``"async"`` select the Ulysses variant EXPLICITLY. The choice is
+            bit-relevant: the sync variant applies RoPE BEFORE the
+            head-scattering all-to-all on sequence-sliced tables, the async
+            variant AFTER it on full-length tables — flipping the variant
+            silently relocates RoPE relative to the exchange. Exact lanes
+            pin the variant instead of relying on whether a call site
+            happens to pass ``num_kv_heads``.
     """
     from ...distributed.parallel_state import get_parallel_state  # noqa: PLC0415
+
+    if variant not in ("auto", "sync", "async"):
+        raise ValueError(f"Unknown CP strategy variant {variant!r}; expected 'auto', 'sync', or 'async'")
 
     ps = get_parallel_state()
     if not ps.cp_enabled:
         return _NOOP
 
     if ps.ulysses_enabled and ps.ringattn_enabled:
+        if variant != "auto":
+            raise NotImplementedError(f"Explicit Ulysses variant {variant!r} is not supported with hybrid Ulysses+Ring")
         # Hybrid Ulysses + Ring
         return HybridUlyssesRingStrategy(
             ulysses_group=ps.ulysses_group,
@@ -513,6 +541,10 @@ def get_cp_strategy(num_kv_heads: Optional[int] = None) -> CPStrategy:
         )
 
     if ps.ulysses_enabled:
+        if variant == "sync":
+            return UlyssesSyncStrategy(group=ps.ulysses_group, ulysses_size=ps.ulysses_size)
+        if variant == "async":
+            return UlyssesAsyncStrategy(group=ps.ulysses_group, ulysses_size=ps.ulysses_size)
         if num_kv_heads is not None and ps.ulysses_size <= num_kv_heads:
             return UlyssesAsyncStrategy(group=ps.ulysses_group, ulysses_size=ps.ulysses_size)
         else:

@@ -312,9 +312,9 @@ for overlapped expert computation.
 `DeepEPBuffer` wraps a `deep_ep.Buffer` object.  The buffer is lazily initialized on the
 first dispatch call.  Key initialization parameters:
 
-- **`buffer_size_gb`** (default 2.0 GB) — NVLink staging buffer.  If DeepEP provides
-  config hints for the given `ep_size`, the buffer is sized automatically via
-  `config.get_nvl_buffer_size_hint(hidden_bytes, num_ranks)`.
+- **`buffer_size_gb`** (default 2.0 GB) — minimum NVLink buffer allocation. If DeepEP
+  provides config hints for the given `ep_size`, XoRL takes the maximum of this value
+  and the dispatch/combine NVLink size hints. Internode configs also supply an RDMA hint.
 - **`num_sms`** (default 20) — number of SMs allocated to the communication kernels via
   `Buffer.set_num_sms()`.  Fewer SMs leave more for overlapped compute.
 - **`low_latency_mode`** — reserved for inference use cases.
@@ -731,8 +731,7 @@ the `permuted_tokens` tensor (already in expert-sorted order after dispatch) and
 DeepEP dispatch backends.
 
 The `moe_implementation` field in the model config block controls the kernel selection.
-For Qwen3 MoE models, `"triton"` and `"quack"` are the recommended production choices;
-DeepEP dispatch pairs well with `"quack"`.
+For Qwen3 MoE models, `"eager"`, `"triton"`, `"native"`, and `"quack"` all have registered EP compute paths, with different capability and performance boundaries. Select the backend using the intended dtype, adapter, compile, and topology checks; benchmark DeepEP and AllToAll with the same expert backend.
 
 ---
 
@@ -743,7 +742,7 @@ DeepEP dispatch pairs well with `"quack"`.
 | `num_experts % ep_size == 0` | Asserted in `ParallelPlan.apply()` for each expert parameter |
 | `ranks_per_stage % ep_size == 0` | Asserted in `init_parallel_state()` |
 | EP with `init_device: cpu` is not supported | Checked in `TrainingArgs.__post_init__()` |
-| EP + `eager` moe_implementation is undefined | No error raised, but produces wrong results with `ep_size > 1`; do not combine |
+| The selected expert backend must expose an EP compute path for the requested features | Registered in `EP_EXPERT_COMPUTE` and specialized capability registries; eager EP is supported, but optional features can have narrower backend coverage |
 | DeepEP requires `deep_ep` package installed | `check_deepep_available()` raises `ImportError` with install instructions |
 | Routing replay requires both `ep_size > 1` AND `moe_recomputed=True` | Checked in trainer and direct train CLI |
 | EP groups must not span PP stage boundaries | Asserted via `ranks_per_stage % ep_size == 0` and per-stage mesh slicing |
@@ -789,7 +788,7 @@ train:
 Result: EP=8 and Ulysses-SP=8 on the same 8 GPUs.  DeepEP handles dispatch with 48 SMs
 allocated to communication, leaving the remaining SMs for Quack expert kernels.
 
-### EP + PP — Qwen3-30B-A3B on 16 GPUs
+### EP + PP — Qwen3-30B-A3B on 8 GPUs
 
 ```yaml
 # examples/local/dummy/configs/full/qwen3_30b_a3b_pp2_ep4_muon.yaml
@@ -802,9 +801,9 @@ train:
   expert_parallel_size: 4
 ```
 
-`world_size = PP × DP_shard = 2 × 4 = 8` per stage (16 GPUs total, 8 ranks per stage).
-EP=4 is folded onto each stage's 8 ranks: `ep_fsdp_size = 8 / 4 = 2`. Each EP group's
-experts are further FSDP-sharded across 2 ranks within the same stage.
+`world_size = PP × DP_shard = 2 × 4 = 8` GPUs total, with 4 ranks per stage.
+EP=4 spans the 4 ranks in each stage, so `ep_fsdp_size = 4 / 4 = 1`; expert weights are
+EP-owned and are not further FSDP-sharded within a stage.
 
 ### EP + PP + ring-attn — Qwen3-30B-A3B on 8 GPUs
 
@@ -835,7 +834,7 @@ ranks.
 |---|---|---|---|
 | `moe_implementation` | `str \| None` | `None` | MoE compute kernel: `"eager"`, `"triton"`, `"native"`, `"quack"`. `None` inherits from model class default. |
 | `ep_dispatch` | `str` | `"alltoall"` | EP token dispatch strategy: `"alltoall"` or `"deepep"`. |
-| `deepep_buffer_size_gb` | `float` | `2.0` | NVLink staging buffer size in GB for DeepEP. |
+| `deepep_buffer_size_gb` | `float` | `2.0` | Minimum NVLink buffer allocation in GB. Supported DeepEP configs can raise it using dispatch/combine size hints; multi-node paths reject values above 2.0 GB because of the receiver buffer limit. |
 | `deepep_num_sms` | `int` | `20` | SMs allocated to DeepEP communication kernels (must be even). Lower values leave more for expert compute. |
 | `deepep_async_combine` | `bool` | `False` | Overlap DeepEP combine with next layer's compute. Currently gated off in code; requires `XORL_DEEPEP_UNSAFE_ASYNC_COMBINE=1` (see [Async combine overlap](#async-combine-overlap)). |
 

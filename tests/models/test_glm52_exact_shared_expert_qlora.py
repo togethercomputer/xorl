@@ -12,6 +12,7 @@ from xorl.models.transformers.glm5.exact_shared_expert_qlora import (
     GLM52_EXACT_TP16_SHARED_EXPERT_QLORA_CONTRACT_VERSION,
     Glm52ExactTP16SharedExpertBlockFP8QLoRA,
 )
+from xorl.ops.fused_silu_and_mul import exact_fp32_silu_and_mul
 
 
 def _pattern(
@@ -69,8 +70,8 @@ def _load_base(module: Glm52ExactTP16SharedExpertBlockFP8QLoRA) -> None:
         ({"hidden_size": 4096}, "hidden_size=6144"),
         ({"intermediate_size": 4096}, "intermediate_size=2048"),
         ({"tp_size": 8}, "requires TP16"),
-        ({"r": 2}, "rank=1 and alpha=1"),
-        ({"lora_alpha": 2}, "rank=1 and alpha=1"),
+        ({"r": 0}, "positive integer rank"),
+        ({"lora_alpha": 0}, "positive integer alpha"),
         ({"bias": True}, "bias-free"),
         ({"enable_aqn": True}, "rejects adaptive quantization noise"),
     ],
@@ -128,7 +129,7 @@ def test_shared_expert_checkpoint_sources_are_canonical_and_immutable() -> None:
         assert projection._source_quant_format == "block_fp8"
         assert projection._is_prequantized is True
         assert projection._merge_sources is None
-        assert projection._qlora_expected_skip_keys == {"weight", "weight_scale_inv"}
+        assert projection._qlora_expected_skip_keys == {"weight"}
     module.bind_checkpoint_sources(prefix)
     with pytest.raises(RuntimeError, match="immutable once bound"):
         module.bind_checkpoint_sources("model.layers.4.mlp.shared_experts")
@@ -332,7 +333,9 @@ def _manual_local_vjp(
     )
     with torch.enable_grad(), torch.autocast(device_type="cuda", enabled=False):
         gate_up_input = exact_gate_up.detach().requires_grad_(True)
-        activation = F.silu(gate_up_input[:, :128]) * gate_up_input[:, 128:]
+        # Mirror the module's VJP reference: differentiate the one-round FP32
+        # SwiGLU program the forward now emits.
+        activation = exact_fp32_silu_and_mul(gate_up_input)
         (gate_up_grad,) = torch.autograd.grad(
             activation,
             gate_up_input,
@@ -376,6 +379,7 @@ def test_official_shared_expert_actual_operands_fold_and_surrogate_vjp() -> None
     from sglang.kernels.ops.gemm.gate_up_lora_b import gate_up_lora_b_fwd
     from sglang.kernels.ops.gemm.sgemm_lora_a import sgemm_lora_a_fwd
     from sglang.kernels.ops.gemm.sgemm_lora_b import sgemm_lora_b_fwd
+    from sglang.srt.batch_invariant_ops.bi_silu_and_mul import fp32_silu_and_mul
     from sglang.srt.distributed.canonical_moe import (
         CanonicalRowSlots,
     )
@@ -437,7 +441,9 @@ def test_official_shared_expert_actual_operands_fold_and_surrogate_vjp() -> None
         128,
         base_output=raw_gate_up_base.clone(),
     )
-    raw_activated = F.silu(raw_gate_up[:, :128]) * raw_gate_up[:, 128:]
+    # Serving's exact mode resolves SiluAndMul.forward_exact to the one-round
+    # FP32 SwiGLU (xorl-sglang f10b907d8); the raw oracle uses serving's op.
+    raw_activated = fp32_silu_and_mul(raw_gate_up)
     raw_down_base = triton_w8a8_block_fp8_linear(
         raw_activated,
         base.down_weight,

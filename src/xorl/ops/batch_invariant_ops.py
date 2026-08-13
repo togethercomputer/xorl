@@ -1332,8 +1332,7 @@ def sglang_rms_norm_batch_invariant(
 #
 # Two batch-invariant RMSNorm kernel families coexist, and they disagree at
 # 1 ulp on rare bf16 boundary values (~2/524288 at [4096, 128]), so silently
-# swapping one for the other seeds K3 divergence that amplifies downstream
-# (the 2026-07-04 norm-seed incident: 2.99e-5 K3 from five such seeds).
+# swapping one for the other seeds K3 divergence that amplifies downstream.
 # Each family is pinned to the serving site-class that executes it:
 #   - "serving_no_residual" (family-1): the looped ``tl.sum`` + ``1.0/tl.sqrt``
 #     kernel (``rms_norm_batch_invariant``), what SGLang dispatches when
@@ -2028,6 +2027,7 @@ def wrap_trunk_linears_batch_invariant(
 
     from xorl.lora.fold import lora_merged_forward_enabled  # noqa: PLC0415
     from xorl.lora.modules.base import LoraModule  # noqa: PLC0415
+    from xorl.lora.modules.delta_linear import LoraDeltaLinear  # noqa: PLC0415
     from xorl.lora.modules.linear import LoraLinear  # noqa: PLC0415
 
     if is_batch_invariant_mode_enabled():
@@ -2053,6 +2053,13 @@ def wrap_trunk_linears_batch_invariant(
         if leaf not in names:
             continue
         if ".experts." in f".{module_name}.":
+            continue
+        if isinstance(module, LoraDeltaLinear) and module_name.endswith(
+            (".mlp.shared_expert.gate_proj", ".mlp.shared_expert.up_proj")
+        ):
+            # These are factor-only children of the fused gate_up_proj.  The
+            # parent base GEMM is wrapped and Qwen3_5MoeMLP folds both logical
+            # projections into that one contracted call.
             continue
         if type(module) is LoraLinear and lora_merged_forward_enabled(module):
             # Merged-forward contract lane: the adapted linear serves and trains

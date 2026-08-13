@@ -14,11 +14,12 @@ from torch import Tensor
 from xorl.models.transformers.glm5.exact_gate_up_qlora import (
     Glm52ExactTP1FusedGateUpBlockFP8QLoRA,
 )
+from xorl.models.transformers.glm5.exact_lora_contract import glm52_exact_lora_scaling
 from xorl.models.transformers.glm5.exact_qlora import Glm52ExactTP1BlockFP8QLoRALinear
-from xorl.ops.fused_silu_and_mul import fused_silu_and_mul
+from xorl.ops.fused_silu_and_mul import exact_fp32_silu_and_mul
 
 
-GLM52_EXACT_TP1_DENSE_MLP_CONTRACT_VERSION = "glm52_exact_tp1_dense_mlp_rank1_qlora_v1"
+GLM52_EXACT_TP1_DENSE_MLP_CONTRACT_VERSION = "glm52_exact_tp1_dense_mlp_qlora_v2"
 
 
 class Glm52ExactTP1DenseMLP(Glm52ExactTP1FusedGateUpBlockFP8QLoRA):
@@ -98,15 +99,10 @@ class Glm52ExactTP1DenseMLP(Glm52ExactTP1FusedGateUpBlockFP8QLoRA):
     def set_runtime_lora_config(self, lora_rank: int, lora_alpha: int) -> None:
         """Keep all three logical projections on the sole admitted adapter row."""
 
-        if lora_rank != 1 or lora_alpha != 1:
-            raise ValueError(
-                "GLM-5.2 exact TP1 dense MLP runtime requires rank=1 and alpha=1; "
-                f"received rank={lora_rank}, alpha={lora_alpha}"
-            )
-        self.active_r = 1
-        self.active_lora_alpha = 1
-        self.scaling = 1.0
-        self.down_proj.set_runtime_lora_config(1, 1)
+        self.scaling = glm52_exact_lora_scaling(lora_rank, lora_alpha)
+        self.active_r = lora_rank
+        self.active_lora_alpha = lora_alpha
+        self.down_proj.set_runtime_lora_config(lora_rank, lora_alpha)
 
     def _validate_dense_mlp_runtime_contract(self) -> None:
         gate_up_contract = (
@@ -123,16 +119,18 @@ class Glm52ExactTP1DenseMLP(Glm52ExactTP1FusedGateUpBlockFP8QLoRA):
             self.down_proj.active_lora_alpha,
             self.down_proj._active_scaling(),
         )
-        expected = (1, 1, 1, 1, 1.0)
+        expected = (self.r, self.r, self.lora_alpha, self.lora_alpha, self.scaling)
         if gate_up_contract != expected or down_contract != expected:
             raise RuntimeError(
-                "GLM-5.2 exact TP1 dense MLP requires rank=1, alpha=1, scaling=1 for gate, up, and down before forward"
+                "GLM-5.2 exact TP1 dense MLP requires one consistent adapter contract for gate, up, and down"
             )
 
     def forward(self, input: Tensor) -> Tensor:
         self._validate_dense_mlp_runtime_contract()
         gate_up = Glm52ExactTP1FusedGateUpBlockFP8QLoRA.forward(self, input)
-        activated = fused_silu_and_mul(gate_up)
+        # Serving's exact mode computes the one-round FP32 SwiGLU
+        # (SiluAndMul.forward_exact, xorl-sglang f10b907d8).
+        activated = exact_fp32_silu_and_mul(gate_up)
         return self.down_proj(activated)
 
 

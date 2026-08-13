@@ -1,8 +1,8 @@
 """Shared model build + LoRA/QLoRA injection + FSDP parallelization pipeline.
 
-Both the offline Trainer and the server ModelRunner call build_training_model()
-so that every feature (QLoRA, TP, DeepEP, …) is supported in both paths
-without reimplementation.
+The server ModelRunner calls build_training_model() so that every feature
+(QLoRA, TP, DeepEP, …) is supported without reimplementation. The offline Trainer
+builds its model directly and shares the individual helpers here instead.
 """
 
 from dataclasses import dataclass, field
@@ -10,6 +10,7 @@ from typing import Any, Callable, List, Optional, Set
 
 import torch
 import torch.nn as nn
+from torch.distributed._tensor import DTensor
 
 from xorl.distributed.parallel_state import get_parallel_state
 from xorl.distributed.torch_parallelize import build_parallelize_model as _parallelize
@@ -22,7 +23,7 @@ from xorl.models.transformers.deepseek_v3.support import (
     freeze_deepseek_v3_router_parameters,
     validate_deepseek_v3_training_mode,
 )
-from xorl.models.transformers.glm5.support import validate_glm5_training_mode
+from xorl.models.transformers.glm5.support import is_glm5_config, validate_glm5_training_mode
 from xorl.qlora import (
     detect_prequantized_block_fp8,
     detect_prequantized_nvfp4,
@@ -56,6 +57,8 @@ class TrainingModelResult:
     checkpoint_quant_format: Optional[str] = None
     exclude_modules: Set[str] = field(default_factory=set)
     glm52_adapter_inventory: Any = None
+    dsv4_adapter_inventory: Any = None
+    glm52_fullparam_admission_report: Any = None
 
 
 def resolve_training_model_dtype(
@@ -106,6 +109,86 @@ def maybe_upcast_trainable_adapter_params(
     logger.info_rank0("Upcast trainable LoRA params to float32")
 
 
+def maybe_unfuse_projections(
+    model: nn.Module,
+    *,
+    unfuse_for_lora: bool,
+    enable_lora: bool,
+    enable_qlora: bool,
+) -> None:
+    """Split fused ``qkv_proj`` / ``gate_up_proj`` into per-projection modules.
+
+    LoRA selects modules by name, so a projection the model stores fused is invisible
+    to it: ``q_proj`` / ``gate_proj`` and friends match nothing and are skipped,
+    leaving those weights adapted by nothing. Unfusing first turns them into real
+    modules, which also leaves every parameter name matching the HuggingFace
+    checkpoint, so weights load with no merge buffer.
+
+    Must run before LoRA injection and before weights are loaded: the underlying
+    ``unfuse_for_tp`` allocates fresh ``nn.Linear``s without copying from the fused
+    weight, so the checkpoint is what fills them.
+
+    Args:
+        model: Model to unfuse, in place.
+        unfuse_for_lora: Whether to unfuse at all. False is a no-op. Defaults off
+            wherever it is plumbed: weight sync canonicalizes trainer parameters to
+            the fused names, so serving an unfused model needs its own verification.
+        enable_lora: Whether plain LoRA is enabled for this run.
+        enable_qlora: Whether QLoRA is enabled for this run.
+
+    Raises:
+        ValueError: If unfusing is requested without plain LoRA, where it would only
+            cost throughput, or together with QLoRA, which targets the fused names.
+        NotImplementedError: If the architecture cannot unfuse its projections.
+    """
+    if not unfuse_for_lora:
+        return
+
+    if enable_qlora:
+        # inject_qlora_into_model defaults its targets to the fused names
+        # ("qkv_proj", "gate_up_proj"). On an unfused model those match nothing while
+        # "o_proj"/"down_proj" still do, so injection succeeds with q/k/v/gate/up left
+        # unquantized and unadapted, and the packed checkpoint weights are then
+        # dispatched into plain bf16 parameters. Refuse rather than half-apply.
+        raise ValueError(
+            "unfuse_for_lora is not supported with QLoRA: QLoRA targets the fused module "
+            "names, so unfusing would leave q/k/v and gate/up both unquantized and "
+            "unadapted. Disable one of the two."
+        )
+
+    if not enable_lora:
+        raise ValueError(
+            "unfuse_for_lora requires enable_lora: without LoRA it only splits the fused "
+            "GEMMs and gives up the fused SiLU-and-mul kernel, costing throughput for no "
+            "benefit."
+        )
+
+    if not hasattr(model, "unfuse_for_tp"):
+        raise NotImplementedError(
+            f"{type(model).__name__} cannot unfuse its projections, so LoRA would silently "
+            "skip every fused target. Either implement unfuse_for_tp() on the architecture, "
+            "or set unfuse_for_lora=false and target the fused names (qkv_proj, gate_up_proj) "
+            "directly."
+        )
+
+    # unfuse_for_tp does two things: module surgery, which is what we want, and a
+    # config.base_model_tp_plan rewrite, which we do not. The Trainer keeps a reference
+    # to this config object and save_pretrained's it into every exported checkpoint, so
+    # leaving the plan behind ships a config.json advertising TP styles that are not HF
+    # ParallelInterface names. The write is always spurious here: this path requires
+    # LoRA, and TP + LoRA is rejected outright.
+    had_plan = "base_model_tp_plan" in model.config.__dict__
+    previous_plan = model.config.__dict__.get("base_model_tp_plan")
+
+    model.unfuse_for_tp()
+
+    if had_plan:
+        model.config.base_model_tp_plan = previous_plan
+    else:
+        model.config.__dict__.pop("base_model_tp_plan", None)
+    logger.info_rank0("Unfused qkv_proj / gate_up_proj so LoRA can adapt them")
+
+
 def build_training_model(
     *,
     # --- Model ---
@@ -129,9 +212,12 @@ def build_training_model(
     enable_lora: bool = False,
     lora_rank: int = 32,
     lora_alpha: int = 16,
+    lora_b_init_std: float = 0.0,
+    lora_b_init_seed: int = 0,
     lora_target_modules: Optional[List[str]] = None,
     lora_target_manifest: Optional[dict[str, Any] | str] = None,
     moe_hybrid_shared_lora: bool = False,
+    unfuse_for_lora: bool = False,
     # --- QLoRA ---
     enable_qlora: bool = False,
     block_fp8_qlora_training: bool = False,
@@ -139,6 +225,16 @@ def build_training_model(
     quant_group_size: int = 16,
     qlora_exclude_modules: Optional[List[str]] = None,
     # --- Parallelization ---
+    data_parallel_mode: Optional[str] = "fsdp2",
+    tensor_parallel_size: int = 1,
+    pipeline_parallel_size: int = 1,
+    expert_parallel_size: int = 1,
+    ringattn_parallel_size: int = 1,
+    ulysses_parallel_size: int = 1,
+    data_parallel_replicate_size: int = 1,
+    data_parallel_shard_size: int = 1,
+    cp_fsdp_mode: str = "all",
+    lm_head_tensor_parallel_size: int = 1,
     enable_full_shard: bool = True,
     enable_mixed_precision: bool = True,
     enable_gradient_checkpointing: bool = True,
@@ -157,6 +253,8 @@ def build_training_model(
     skip_param_upcast: bool = False,
     enable_fp8_training: bool = False,
     enable_qarl: bool = False,
+    glm52_fullparam_fp8_training: bool = False,
+    glm52_fullparam_trainable_expert_layers: Optional[List[int]] = None,
     qarl_quant_cfg: Optional[dict[str, Any] | str] = None,
     qarl_calib_data: Optional[str] = None,
     qarl_calib_size: int = 0,
@@ -208,7 +306,7 @@ def build_training_model(
     the server ModelRunner.  The steps mirror the original Trainer lifecycle::
 
         1. build_foundation_model()
-        2. Unfuse QKV (for TP)
+        2. Unfuse projections (QKV for TP, or both for LoRA)
         3. QLoRA or LoRA injection
         4. LoRA + mixed-precision: upcast trainable params to fp32
         5. Exact model-program setup (pre-FSDP2) + save optimizer pre-hook
@@ -227,6 +325,68 @@ def build_training_model(
         )
     if block_fp8_qlora_training and (not enable_lora or not enable_qlora):
         raise ValueError("block_fp8_qlora_training=True requires enable_lora=True and enable_qlora=True")
+    if glm52_fullparam_fp8_training:
+        if enable_lora or enable_qlora or enable_fp8_training or enable_qarl:
+            raise ValueError(
+                "glm52_fullparam_fp8_training is an exclusive full-weight mode and cannot be combined "
+                "with LoRA, QLoRA, enable_fp8_training, or enable_qarl"
+            )
+        if not glm52_fullparam_trainable_expert_layers:
+            raise ValueError(
+                "glm52_fullparam_fp8_training requires a non-empty glm52_fullparam_trainable_expert_layers "
+                "scope (the admission never inherits an implicit train-everything default)"
+            )
+        scope = glm52_fullparam_trainable_expert_layers
+        if len(set(scope)) != len(scope) or any(int(layer) != layer or layer < 0 for layer in scope):
+            raise ValueError(
+                f"glm52_fullparam_trainable_expert_layers must be unique non-negative layer indices, got {scope!r}"
+            )
+        if not enable_mixed_precision:
+            raise ValueError(
+                "glm52_fullparam_fp8_training requires enable_mixed_precision=True for the qualified BF16 build"
+            )
+        if torch_dtype != "bfloat16":
+            raise ValueError(f"glm52_fullparam_fp8_training requires torch_dtype='bfloat16', got {torch_dtype!r}")
+        mode_requirements = {
+            "freeze_router": (freeze_router, False),
+            "merge_qkv": (merge_qkv, True),
+            "moe_implementation": (moe_implementation, "triton"),
+            "ep_dispatch": (ep_dispatch, "alltoall"),
+        }
+        mode_mismatches = [
+            f"{name}={actual!r} (requires {expected!r})"
+            for name, (actual, expected) in mode_requirements.items()
+            if actual != expected
+        ]
+        if mode_mismatches:
+            raise ValueError(
+                "GLM-5.2 full-param block-FP8 training rejects unsupported configuration: " + ", ".join(mode_mismatches)
+            )
+        skip_param_upcast = True
+        from xorl.models.transformers.glm5.support import (  # noqa: PLC0415
+            validate_glm52_fullparam_runtime_topology,
+        )
+
+        validate_glm52_fullparam_runtime_topology(
+            init_device=init_device,
+            data_parallel_mode=data_parallel_mode,
+            tensor_parallel_size=tensor_parallel_size,
+            pipeline_parallel_size=pipeline_parallel_size,
+            expert_parallel_size=expert_parallel_size,
+            ringattn_parallel_size=ringattn_parallel_size,
+            ulysses_parallel_size=ulysses_parallel_size,
+            data_parallel_replicate_size=data_parallel_replicate_size,
+            data_parallel_shard_size=data_parallel_shard_size,
+            cp_fsdp_mode=cp_fsdp_mode,
+            lm_head_tensor_parallel_size=lm_head_tensor_parallel_size,
+            fsdp_sharded_lm_head_loss=fsdp_sharded_lm_head_loss,
+            enable_full_shard=enable_full_shard,
+            reshard_after_forward=reshard_after_forward,
+        )
+    elif glm52_fullparam_trainable_expert_layers is not None:
+        raise ValueError(
+            "glm52_fullparam_trainable_expert_layers is only meaningful with glm52_fullparam_fp8_training=True"
+        )
 
     # ------------------------------------------------------------------
     # 1. Build foundation model
@@ -259,9 +419,12 @@ def build_training_model(
         sparse_mla_backend=sparse_mla_backend,
         flash_attention_deterministic=flash_attention_deterministic,
         server_training=server_training,
+        enable_lora=enable_lora,
         block_fp8_qlora_training=block_fp8_qlora_training,
+        glm52_fullparam_fp8_training=glm52_fullparam_fp8_training,
         lora_rank=lora_rank,
         lora_alpha=lora_alpha,
+        lora_target_modules=lora_target_modules,
         init_device=init_device,
     )
 
@@ -292,13 +455,26 @@ def build_training_model(
         moe_implementation=moe_implementation,
         ep_dispatch=ep_dispatch,
         moe_hybrid_shared_lora=moe_hybrid_shared_lora,
+        glm52_fullparam_fp8_training=glm52_fullparam_fp8_training,
     )
+    if glm52_fullparam_fp8_training and not is_glm5_config(model_config):
+        raise ValueError("glm52_fullparam_fp8_training requires a GLM-5.2 model config")
     helper.print_device_mem_info("VRAM usage after building model")
 
     # ------------------------------------------------------------------
-    # 2. Unfuse QKV if merge_qkv=False (needed for TP)
+    # 2. Unfuse projections — for LoRA coverage, or QKV-only for TP
     # ------------------------------------------------------------------
-    if not merge_qkv:
+    # Ordering matters: both forms must precede LoRA injection (step 3) and weight
+    # loading (inside step 6), because unfusing allocates fresh Linears without
+    # copying from the fused weight.
+    maybe_unfuse_projections(
+        model,
+        unfuse_for_lora=unfuse_for_lora,
+        enable_lora=enable_lora,
+        enable_qlora=enable_qlora,
+    )
+
+    if not merge_qkv and not unfuse_for_lora:
         for layer in model.model.layers:
             if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "unfuse_for_tp"):
                 layer.self_attn.unfuse_for_tp()
@@ -413,6 +589,32 @@ def build_training_model(
         enable_qlora=enable_qlora,
         enable_mixed_precision=enable_mixed_precision,
     )
+    if getattr(model.config, "_dsv4_flash_exact_active_lora", False):
+        from xorl.models.transformers.deepseek_v4.exact_contract import (  # noqa: PLC0415
+            bind_dsv4_flash_adapter_inventory,
+        )
+        from xorl.models.transformers.deepseek_v4.exact_lm_head import (  # noqa: PLC0415
+            bind_dsv4_exact_lm_head,
+        )
+
+        bind_dsv4_exact_lm_head(model)
+        inventory = bind_dsv4_flash_adapter_inventory(model)
+        lm_head = getattr(model, "lm_head", None)
+        if lm_head is None or getattr(lm_head, "lora_A", None) is None or getattr(lm_head, "lora_B", None) is None:
+            raise RuntimeError("The exact DSV4-Flash adapter requires a complete lm_head LoRA module")
+        logger.info_rank0(
+            "Bound complete DSV4-Flash adapter inventory: "
+            f"{len(inventory.targets)} targets, {len(inventory.factors)} FP32 factors"
+        )
+        from xorl.models.transformers.deepseek_v4.native_payload import (  # noqa: PLC0415
+            strip_dsv4_dequantized_base_parameters,
+        )
+
+        dense_bases, routed_bases = strip_dsv4_dequantized_base_parameters(model)
+        logger.info_rank0(
+            "Stripped dequantized DSV4 base placeholders before FSDP: "
+            f"{dense_bases} dense linears, {routed_bases} routed banks"
+        )
 
     # ------------------------------------------------------------------
     # 5. Exact model contract / legacy scoped trunk contract (must precede FSDP2)
@@ -424,6 +626,26 @@ def build_training_model(
         from xorl.ops.bi_families_v2 import _select_glm52_families_v2  # noqa: PLC0415
 
         _select_glm52_families_v2()
+    elif getattr(model.config, "_qwen3_dense_exact_contract", False):
+        from xorl.lora.modules.base import LoraModule  # noqa: PLC0415
+        from xorl.ops.batch_invariant_ops import wrap_trunk_linears_batch_invariant  # noqa: PLC0415
+        from xorl.ops.bi_families_v2 import _select_qwen3_dense_families_v2  # noqa: PLC0415
+
+        # Foundation construction initially wraps plain projections, but TP
+        # unfusing and LoRA/QLoRA injection replace those module objects. The
+        # exact program must therefore be installed at the final pre-FSDP
+        # module boundary. Plain LoRA composes through the canonical fold;
+        # unsupported QLoRA projection types fail closed in the wrapper.
+        _select_qwen3_dense_families_v2()
+        for module in model.modules():
+            if isinstance(module, LoraModule):
+                module.exact_merged_forward = True
+        wrapped = wrap_trunk_linears_batch_invariant(model)
+        pattern = ", ".join(f"{name}x{count}" for name, count in sorted(wrapped.items()))
+        logger.info_rank0(
+            "Exact dense Qwen3 trainer path reinstalled after projection replacement"
+            + (f": {pattern}" if pattern else " (existing wrappers retained)")
+        )
 
     apply_exact_qwen = getattr(model, "_apply_qwen35_gdn_exact", None)
     if server_training and callable(apply_exact_qwen):
@@ -431,6 +653,25 @@ def build_training_model(
         pattern = ", ".join(f"{name}x{count}" for name, count in sorted(wrapped.items()))
         logger.info_rank0(
             f"Exact Qwen3.5-family trainer path: wrapped {sum(wrapped.values())} trunk linears; {pattern}"
+        )
+
+    # GLM-5.2 full-param block-FP8 admission (fail closed; must precede FSDP2:
+    # it swaps composites in and decides the complete trainable set).
+    glm52_fullparam_admission_report = None
+    if glm52_fullparam_fp8_training:
+        if get_parallel_state().pp_enabled:
+            raise ValueError(
+                "glm52_fullparam_fp8_training does not support pipeline parallelism: splitting the "
+                "model would break the admission's whole-model allowlist/refresh/publication walks"
+            )
+        from xorl.models.transformers.glm5.exact_fullparam_admission import (  # noqa: PLC0415
+            prepare_glm52_fullparam_training,
+        )
+
+        glm52_fullparam_admission_report = prepare_glm52_fullparam_training(
+            model,
+            model.config,
+            trainable_expert_layers=tuple(glm52_fullparam_trainable_expert_layers),
         )
     # ------------------------------------------------------------------
     # 5b. Save optimizer pre-hook (some models register hooks)
@@ -457,6 +698,7 @@ def build_training_model(
         enable_forward_prefetch=enable_forward_prefetch,
         enable_backward_prefetch=enable_backward_prefetch,
         load_weights_mode=load_weights_mode,
+        glm52_fullparam_fp8_training=glm52_fullparam_fp8_training,
         pp_schedule=effective_pp_schedule,
         pp_virtual_stages=pp_virtual_stages,
         pp_input_weight=pp_input_weight,
@@ -512,11 +754,43 @@ def build_training_model(
         for part in all_parts:
             freeze_base_parameters(part)
         logger.info_rank0("Base model parameters frozen, only LoRA parameters trainable")
+    elif glm52_fullparam_fp8_training:
+        # The admission decided the complete trainable set BEFORE FSDP2; a
+        # blanket re-enable here would silently train the indexer/kv_b.
+        # Re-assert the allowlist instead of touching requires_grad.
+        from xorl.models.transformers.glm5.exact_fullparam_admission import (  # noqa: PLC0415
+            assert_glm52_fullparam_allowlist,
+            rebind_glm52_fullparam_master_identities,
+        )
+
+        for part in all_parts:
+            # The FSDP2 wrap replaced master storage (plain -> DTensor); the
+            # pre-wrap freshness bindings can never match again. Re-stamp the
+            # identities WITHOUT touching cache bytes. Initial caches must
+            # remain checkpoint-identical; a refresh here would swap in
+            # Q(master) scales.
+            rebound = rebind_glm52_fullparam_master_identities(part)
+            logger.info_rank0(f"GLM-5.2 full-param: re-bound {rebound} master identities to the wrapped storage")
+            assert_glm52_fullparam_allowlist(part)
     else:
         # Full-weights: all params trainable
         for part in all_parts:
             for param in part.parameters():
                 param.requires_grad = True
+
+    if lora_b_init_std:
+        if not (enable_lora or enable_qlora):
+            raise ValueError("lora_b_init_std requires LoRA or QLoRA")
+        from xorl.lora.utils import initialize_lora_b_nonzero  # noqa: PLC0415
+
+        for part in all_parts:
+            local_parameters = [
+                parameter.to_local() if isinstance(parameter, DTensor) else parameter for parameter in part.parameters()
+            ]
+            if any(parameter.is_meta for parameter in local_parameters):
+                logger.info_rank0("Deferring nonzero LoRA-B initialization until post-DCP adapter materialization")
+                continue
+            initialize_lora_b_nonzero(part, std=lora_b_init_std, seed=lora_b_init_seed)
 
     # Optionally freeze MoE router
     if freeze_router:
@@ -552,6 +826,8 @@ def build_training_model(
         checkpoint_quant_format=checkpoint_quant_format,
         exclude_modules=exclude_modules,
         glm52_adapter_inventory=getattr(model, "_glm52_adapter_inventory", None),
+        dsv4_adapter_inventory=getattr(model, "_dsv4_adapter_inventory", None),
+        glm52_fullparam_admission_report=glm52_fullparam_admission_report,
     )
 
 

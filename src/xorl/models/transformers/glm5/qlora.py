@@ -347,6 +347,7 @@ def _replace_exact_attention_target(
             device=original.weight.device,
             tp_size=1,
         )
+        source_only_keys = {"weight"}
     else:
         replacement = Glm52ExactTP1BlockFP8QLoRALinear(
             in_features=target.in_features,
@@ -357,11 +358,12 @@ def _replace_exact_attention_target(
             device=original.weight.device,
             enable_aqn=False,
         )
+        source_only_keys = {"weight", "weight_scale_inv"}
     replacement._is_prequantized = True
     replacement._source_quant_format = "block_fp8"
     replacement._source_fqn = target.name
     replacement._merge_sources = None
-    replacement._qlora_expected_skip_keys = {"weight", "weight_scale_inv"}
+    replacement._qlora_expected_skip_keys = source_only_keys
     _set_submodule(model, target.name, replacement)
 
 
@@ -498,6 +500,8 @@ def _replace_exact_lm_head_target(
         vocab_end=shard.vocab_end,
         padded_vocab_start=shard.padded_vocab_start,
         padded_vocab_end=shard.padded_vocab_end,
+        rank=adapter_rank,
+        lora_alpha=adapter_alpha,
         tp_group=tp_group,
     )
     replacement._glm52_exact_replicated_parameter_names = ("lora_A",)
@@ -737,11 +741,19 @@ def prepare_glm52_block_fp8_qlora(
             exact_lm_head_component,
         )
     )
-    if exact_component_enabled and (adapter_rank, adapter_alpha) != (1, 1):
-        raise ValueError(
-            "GLM-5.2 exact active-LoRA component requires adapter_rank=1 and adapter_alpha=1; "
-            f"got rank={adapter_rank}, alpha={adapter_alpha}"
+    if exact_component_enabled:
+        from xorl.models.transformers.glm5.exact_lora_contract import (  # noqa: PLC0415
+            glm52_exact_lora_scaling,
         )
+
+        try:
+            glm52_exact_lora_scaling(adapter_rank, adapter_alpha)
+        except ValueError as exc:
+            raise ValueError(
+                "GLM-5.2 exact active-LoRA component requires positive integer "
+                "adapter_rank and adapter_alpha; "
+                f"got rank={adapter_rank}, alpha={adapter_alpha}"
+            ) from exc
     targets = _expected_targets(model, config)
     excluded = quantization_config["modules_to_not_convert"]
     accidentally_excluded = sorted(

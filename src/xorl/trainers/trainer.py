@@ -68,6 +68,7 @@ from xorl.qlora import (
 )
 from xorl.qlora.utils import _deregister_qlora_weights_from_fsdp
 from xorl.trainers.model_builder import (
+    maybe_unfuse_projections,
     maybe_upcast_trainable_adapter_params,
     resolve_training_model_dtype,
     should_skip_generic_param_upcast,
@@ -760,8 +761,16 @@ class Trainer:
         )
         helper.print_device_mem_info("VRAM usage after building model")
 
-        # Unfuse QKV for tensor parallelism
-        if not args.model.merge_qkv:
+        # Unfuse projections — for LoRA coverage, or QKV-only for tensor parallelism.
+        # Both must precede LoRA injection below and the weight load in _parallelize.
+        maybe_unfuse_projections(
+            self.model,
+            unfuse_for_lora=args.lora.unfuse_for_lora,
+            enable_lora=args.lora.enable_lora,
+            enable_qlora=args.lora.enable_qlora,
+        )
+
+        if not args.model.merge_qkv and not args.lora.unfuse_for_lora:
             for layer in self.model.model.layers:
                 if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "unfuse_for_tp"):
                     layer.self_attn.unfuse_for_tp()
@@ -1041,6 +1050,18 @@ class Trainer:
                 self.ps.lm_head_tp_replica_group,
                 self.ps.lm_head_tp_group,
             )
+
+        if args.lora.lora_b_init_std:
+            if not (args.lora.enable_lora or args.lora.enable_qlora):
+                raise ValueError("lora_b_init_std requires LoRA or QLoRA")
+            from xorl.lora.utils import initialize_lora_b_nonzero  # noqa: PLC0415
+
+            for part in self._all_model_parts():
+                initialize_lora_b_nonzero(
+                    part,
+                    std=args.lora.lora_b_init_std,
+                    seed=args.lora.lora_b_init_seed,
+                )
 
     def _all_model_parts(self) -> List[torch.nn.Module]:
         """All local model chunks: PP virtual stages own several, else just self.model."""

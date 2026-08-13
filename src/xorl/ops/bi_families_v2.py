@@ -46,6 +46,12 @@ def _select_glm52_families_v2() -> None:
     _EXACT_FAMILIES_VERSION = "v2"
 
 
+def _select_qwen3_dense_families_v2() -> None:
+    """Pin exact dense Qwen3 to the shared v2 norm and lm-head trees."""
+    global _EXACT_FAMILIES_VERSION
+    _EXACT_FAMILIES_VERSION = "v2"
+
+
 def _select_nonexact_families() -> None:
     """Restore the pre-existing family selection for an ordinary model."""
     global _EXACT_FAMILIES_VERSION
@@ -125,9 +131,9 @@ def _rms_norm_v2_kernel(
     x * inv_rms * w (left-to-right, fp32 weight-mul) -> single cast at store.
     Tree is a function of n_cols alone => batch-invariant by construction.
 
-    This fused one-launch form serves nearly every shipped shape, where launch
-    count dominates and the monolithic wide tree has the best ILP; shapes with
-    few rows over many tiles dispatch to the bit-identical split realization
+    For the residual specialization, this fused one-launch form serves nearly
+    every shipped shape. Few rows over many tiles, and the compiler-spilling
+    no-residual specialization, dispatch to the bit-identical split realization
     below (see ``_v2_norm_use_split``), which factorizes the same tree into
     per-TILE trees + a partials tree (adjacent pairing preserves contiguity at
     every level => identical bits; cross-structure gates + frozen goldens).
@@ -247,7 +253,12 @@ def rms_norm_v2(
     if residual is not None:
         assert residual.shape == x.shape and residual.stride(1) == 1
         assert residual.dtype == torch.bfloat16
-    if _v2_norm_use_split(rows, triton.cdiv(H, V2_NORM_TILE)):
+    if _v2_norm_use_split(
+        rows,
+        triton.cdiv(H, V2_NORM_TILE),
+        has_residual=residual is not None,
+        is_hopper=torch.cuda.get_device_capability(x.device) == (9, 0),
+    ):
         return _rms_norm_v2_split(x, weight, eps, residual, zero_centered)
     return _rms_norm_v2_fused(x, weight, eps, residual, zero_centered)
 
@@ -789,23 +800,38 @@ def head_v2_selected_logprob_from_logits(
 #
 # It pays three launches and an HBM round-trip for the partials, and buys
 # rows*n_tiles-way parallelism where the fused grid=(rows,) has only rows-way.
-# That trade only pays at few rows over many tiles; the fused form wins
-# everywhere else, prefill included (see _v2_norm_use_split for the measured
-# boundary).
+# For the residual specialization, that trade pays at few rows over many tiles.
+# The no-residual fused specialization currently spills on Hopper, so it always
+# uses the split form (see _v2_norm_use_split for the measured boundary).
 
-V2_NORM_SPLIT_MIN_TILES = 10  # fewest tiles at which the split realization ever wins
+V2_NORM_SPLIT_MIN_TILES = 10  # no-residual crossover on non-Hopper devices
+V2_NORM_RESIDUAL_SPLIT_MIN_TILES = 13  # keeps all shipped hidden sizes (at most 12 tiles) fused
 
 
-def _v2_norm_use_split(rows: int, n_tiles: int) -> bool:
-    """Structure switch (perf-only, NOT bit-relevant): split wins at few rows over
-    many tiles, where the fused ``grid=(rows,)`` cannot fill the GPU.
+def _v2_norm_use_split(
+    rows: int,
+    n_tiles: int,
+    *,
+    has_residual: bool = True,
+    is_hopper: bool = False,
+) -> bool:
+    """Structure switch (perf-only, NOT bit-relevant).
+
+    The no-residual fused specialization spills on Hopper, while the split
+    realization is bit-identical and avoids that register-pressure cliff.
+    Other architectures and the residual specialization retain the measured
+    few-rows/many-tiles switch, where the fused ``grid=(rows,)`` cannot fill
+    the GPU.
 
     ``n_tiles`` must be the split kernel's 512-wide tile count, not the fused
     kernel's 4096-wide chunk count. The threshold is a Hopper performance
     policy. Both realizations compute the same tree, so retuning it may change
     speed only; the fused-versus-split equality gate must still pass.
     """
-    return n_tiles >= V2_NORM_SPLIT_MIN_TILES and rows <= n_tiles
+    if is_hopper and not has_residual:
+        return True
+    min_tiles = V2_NORM_RESIDUAL_SPLIT_MIN_TILES if has_residual else V2_NORM_SPLIT_MIN_TILES
+    return n_tiles >= min_tiles and rows <= n_tiles
 
 
 @triton.jit

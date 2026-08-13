@@ -53,12 +53,12 @@ The output is written to `docs/dist/`.
 
 ## Deployment
 
-Docs are deployed automatically to GitHub Pages when changes under `docs/` are pushed to the `qingyang/docs` branch. The workflow is defined in `.github/workflows/docs.yml`.
+Docs are deployed automatically to GitHub Pages when changes under `docs/` are pushed to `main`. The workflow is defined in `.github/workflows/docs.yml`.
 
 To trigger a deployment manually without pushing a new commit:
 
 ```bash
-gh workflow run docs.yml --repo togethercomputer/xorl --ref qingyang/docs
+gh workflow run docs.yml --repo togethercomputer/xorl --ref main
 ```
 
 To watch the deployment progress:

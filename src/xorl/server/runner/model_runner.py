@@ -40,6 +40,7 @@ except ImportError:  # pragma: no cover - DTensor-enabled torch provides this.
     compute_local_shape_and_global_offset = None
 
 from xorl.checkpoint import build_checkpointer
+from xorl.data.collators.sequence_shard_collator import zigzag_restore_packed_sequence
 from xorl.data.constants import IGNORE_INDEX
 from xorl.distillation import (
     MooncakeHiddenStore,
@@ -68,6 +69,7 @@ from xorl.lora.fold import lora_merged_forward_enabled
 from xorl.models import resolve_cross_entropy_mode
 from xorl.models.layers.moe.routing_replay import set_replay_stage
 from xorl.models.transformers.deepseek_v3.support import deepseek_v3_default_lora_targets
+from xorl.models.transformers.deepseek_v4.exact_contract import DSV4_FLASH_REQUIRED_TARGET_MODULES
 from xorl.models.transformers.glm5.index_share import IndexShareMode
 from xorl.models.transformers.glm5.support import glm5_default_lora_targets
 from xorl.ops.batch_invariant_ops import enable_batch_invariant_mode, get_batch_invariant_ops
@@ -147,6 +149,10 @@ from xorl.utils.seqlen_pos_transform_utils import pos2culen
 
 
 logger = logging.getLogger(__name__)
+
+
+class FullParamOptimizerMutationFailure(RuntimeError):
+    """Fatal failure after a full-parameter optimizer mutation may have begun."""
 
 
 def _truthy_flag(value: Any) -> bool:
@@ -841,17 +847,21 @@ class ModelRunner:
                         expert_guard_by_parameter_id[id(parameter)] = dict(expert_guard)
                     if expert_contract is not None:
                         expert_contract_by_parameter_id[id(parameter)] = expert_contract
-                    if getattr(module, "_glm52_exact_tp16_lm_head", False):
+                    exact_glm_head = bool(getattr(module, "_glm52_exact_tp16_lm_head", False))
+                    exact_dsv4_head = bool(getattr(module, "_dsv4_exact_tp8_lm_head", False))
+                    if exact_glm_head or exact_dsv4_head:
                         exact_op = getattr(module, "_glm52_exact_selected_logprob", None)
+                        if exact_dsv4_head:
+                            exact_op = getattr(module, "_dsv4_exact_selected_logprob", None)
                         contract_version = getattr(exact_op, "contract_version", None)
                         if not isinstance(contract_version, str) or not contract_version:
                             raise AdapterGradientOwnershipError(
-                                "Exact GLM-5.2 lm-head factors require a selected-logprob contract version"
+                                "Exact lm-head factors require a selected-logprob contract version"
                             )
                         exact_lm_head_guard_by_parameter_id[id(parameter)] = {
                             "exact_lm_head_contract": contract_version,
                             "exact_lm_head_factor": local_name,
-                            "exact_lm_head_tp_size": 16,
+                            "exact_lm_head_tp_size": 16 if exact_glm_head else 8,
                             "exact_lm_head_vjp_tp_completed": True,
                         }
                     if direct:
@@ -1133,6 +1143,11 @@ class ModelRunner:
 
     def _check_not_sleeping(self, operation: str) -> None:
         """Raise if the model is in sleep mode (CPU-offloaded)."""
+        if getattr(self, "_glm52_fullparam_poisoned", False):
+            raise FullParamOptimizerMutationFailure(
+                f"Cannot perform {operation}: the full-parameter session failed after optimizer mutation; "
+                "restart from the last committed checkpoint"
+            )
         if self.is_sleeping:
             raise RuntimeError(f"Cannot perform {operation}: model is in sleep mode. Call wake_up first.")
 
@@ -1357,8 +1372,11 @@ class ModelRunner:
             enable_lora=lora_enabled,
             lora_rank=self.lora_config.get("max_lora_rank", self.lora_config.get("lora_rank", 32)),
             lora_alpha=self.lora_config.get("lora_alpha", 16),
+            lora_b_init_std=self.lora_config.get("lora_b_init_std", 0.0),
+            lora_b_init_seed=self.lora_config.get("lora_b_init_seed", 0),
             lora_target_modules=construction_target_modules,
             lora_target_manifest=self.lora_config.get("lora_target_manifest"),
+            unfuse_for_lora=self.lora_config.get("unfuse_for_lora", False),
             moe_hybrid_shared_lora=self.lora_config.get("moe_hybrid_shared_lora", False),
             enable_qlora=enable_qlora,
             block_fp8_qlora_training=block_fp8_qlora_training,
@@ -1371,6 +1389,18 @@ class ModelRunner:
             skip_param_upcast=self.train_config.get("skip_param_upcast", False),
             enable_fp8_training=self.train_config.get("enable_fp8_training", False),
             enable_qarl=self.train_config.get("enable_qarl", False),
+            glm52_fullparam_fp8_training=self.train_config.get("glm52_fullparam_fp8_training", False),
+            glm52_fullparam_trainable_expert_layers=self.train_config.get("glm52_fullparam_trainable_expert_layers"),
+            data_parallel_mode=self.train_config.get("data_parallel_mode", "fsdp2"),
+            tensor_parallel_size=self.train_config.get("tensor_parallel_size", 1),
+            pipeline_parallel_size=self.train_config.get("pipeline_parallel_size", 1),
+            expert_parallel_size=self.train_config.get("expert_parallel_size", 1),
+            ringattn_parallel_size=self.train_config.get("ringattn_parallel_size", 1),
+            ulysses_parallel_size=self.train_config.get("ulysses_parallel_size", 1),
+            data_parallel_replicate_size=self.train_config.get("data_parallel_replicate_size", 1),
+            data_parallel_shard_size=self.train_config.get("data_parallel_shard_size", 1),
+            cp_fsdp_mode=self.train_config.get("cp_fsdp_mode", "all"),
+            lm_head_tensor_parallel_size=self.train_config.get("lm_head_tensor_parallel_size", 1),
             qarl_quant_cfg=self.train_config.get("qarl_quant_cfg"),
             qarl_calib_data=self.train_config.get("qarl_calib_data"),
             qarl_calib_size=self.train_config.get("qarl_calib_size", 0),
@@ -1433,13 +1463,14 @@ class ModelRunner:
         )
 
         self.model = result.model
+        self.model_config_obj = result.model_config
+        self._select_exact_dsv4_lora_export_format()
         if getattr(get_parallel_state(), "lm_head_tp_size", 1) > 1:
             sync_lm_head_tp_parameters(
                 self.model,
                 get_parallel_state().lm_head_tp_replica_group,
                 get_parallel_state().lm_head_tp_group,
             )
-        self.model_config_obj = result.model_config
         numerical_program = self.model_config_obj._resolved_numerical_program
         self.model_config.update(
             {
@@ -1469,6 +1500,7 @@ class ModelRunner:
         self.checkpoint_quant_format = result.checkpoint_quant_format
         self.exclude_modules = result.exclude_modules
         self.glm52_adapter_inventory = getattr(result, "glm52_adapter_inventory", None)
+        self.glm52_fullparam_admission_report = getattr(result, "glm52_fullparam_admission_report", None)
 
         # Save LoRA metadata for checkpoint manager
         if lora_enabled or enable_qlora:
@@ -1518,12 +1550,34 @@ class ModelRunner:
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
             )
+        elif model_type == "deepseek_v4":
+            if not (train_attn and train_mlp and train_unembed):
+                raise ValueError(
+                    "DSV4-Flash exact active-LoRA requires train_attn, train_mlp, and train_unembed all enabled"
+                )
+            target_modules = sorted(DSV4_FLASH_REQUIRED_TARGET_MODULES)
         elif model_type in {"glm_moe_dsa", "xorl_glm5"}:
             target_modules = glm5_default_lora_targets(
                 train_attn=train_attn,
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
             )
+        elif model_type in {
+            "qwen3_5",
+            "qwen3_5_text",
+            "qwen3_5_moe",
+            "qwen3_5_moe_text",
+            "xorl_qwen3_5",
+            "xorl_qwen3_5_moe",
+        }:
+            target_modules = []
+            if train_attn:
+                # GDN's g_proj is the serving in_proj_z surface.
+                target_modules.extend(["q_proj", "k_proj", "v_proj", "g_proj", "o_proj"])
+            if train_mlp:
+                target_modules.extend(["gate_proj", "up_proj", "down_proj"])
+            if train_unembed:
+                target_modules.append("lm_head")
         else:
             target_modules = []
             if train_attn:
@@ -1535,6 +1589,15 @@ class ModelRunner:
         if not target_modules:
             raise ValueError("At least one of train_mlp, train_attn, or train_unembed must be True")
         return target_modules
+
+    def _select_exact_dsv4_lora_export_format(self) -> None:
+        """Select the complete-bank serving artifact for exact DSV4 adapters."""
+        if getattr(self.model_config_obj, "_dsv4_flash_exact_active_lora", False):
+            # Exact DSV4 checkpoints are serving artifacts, not ordinary PEFT
+            # adapters. Select the only loader-compatible complete-bank format
+            # before the checkpoint manager and session specs retain this
+            # shared configuration.
+            self.lora_config["lora_export_format"] = "dsv4_expert_banks"
 
     def _validate_multi_adapter_lora_config(self) -> None:
         """Reject LoRA features that are not supported by the multi-adapter server path."""
@@ -1797,7 +1860,9 @@ class ModelRunner:
         """Get lm_head weight, merging LoRA delta on-the-fly if needed."""
         lm_head = self.model.lm_head
         if isinstance(lm_head, LoraLinear):
-            if getattr(lm_head, "_glm52_exact_tp16_lm_head", False):
+            if getattr(lm_head, "_glm52_exact_tp16_lm_head", False) or getattr(
+                lm_head, "_dsv4_exact_tp8_lm_head", False
+            ):
                 # The exact selected-logprob op consumes the physical local
                 # base shard plus live A/B factors. Materializing B@A here
                 # would both duplicate TP16 state and change the value program.
@@ -1837,7 +1902,9 @@ class ModelRunner:
     def _get_loss_lm_head_module(lm_head):
         """Return a module that owns the loss projection, when one is required."""
 
-        if lm_head is not None and getattr(lm_head, "_glm52_exact_tp16_lm_head", False):
+        if lm_head is not None and (
+            getattr(lm_head, "_glm52_exact_tp16_lm_head", False) or getattr(lm_head, "_dsv4_exact_tp8_lm_head", False)
+        ):
             return lm_head
         return ModelRunner._get_fp8_lm_head_module(lm_head)
 
@@ -2250,6 +2317,8 @@ class ModelRunner:
             "gdn_beta": 70,
             "gdn_scan_out": 71,
             "gdn_normed": 72,
+            "hc_head_output": 95,
+            "final_norm": 96,
         }
 
         layer_output_overrides = self._load_diagnostic_layer_output_overrides()
@@ -2262,7 +2331,17 @@ class ModelRunner:
         def capture(layer_idx: int, name: str, value: Any) -> None:
             tensor = self._first_tensor(value)
             if tensor is not None:
+                # Some exact DSV4 components finish on communication/custom
+                # streams and return a tensor before the default stream has a
+                # dependency on the producer.  Diagnostic snapshots are
+                # intentionally cold-path: fence the device on both sides of
+                # the clone so a later allocator reuse cannot turn the saved
+                # component into stale/uninitialised bytes.
+                if tensor.device.type == "cuda":
+                    torch.cuda.synchronize(tensor.device)
                 snapshot = tensor.detach().clone()
+                if tensor.device.type == "cuda":
+                    torch.cuda.synchronize(tensor.device)
                 captures.append(
                     {
                         "capture_index": len(captures),
@@ -2488,6 +2567,14 @@ class ModelRunner:
                     restore_handle = _AttributeRestoreHandle(mlp, "_shared_expert")
                     setattr(mlp, "_shared_expert", wrapped_shared_expert)
                     handles.append(restore_handle)
+
+        # Model-level tail components (post-layer stream reduction + final
+        # norm) recorded under pseudo-layer -1 when the model exposes the
+        # capture seam (DSV4 exact tail localization).
+        if hasattr(type(model), "_capture_diagnostic_component"):
+            restore_handle = _AttributeRestoreHandle(model, "_diagnostic_capture_component")
+            model._diagnostic_capture_component = lambda name, value: capture(-1, name, value)
+            handles.append(restore_handle)
 
         return captures, handles
 
@@ -5421,11 +5508,22 @@ class ModelRunner:
         for module in model.modules():
             if hasattr(module, "_diagnostic_past_key_value"):
                 delattr(module, "_diagnostic_past_key_value")
+            # DSV4 exact decode-cache carry: drop the carried serving caches
+            # (paged FP8 raw/compressed keys + compressor kv-score ring) and
+            # the per-segment position-offset stamp.
+            for carry_attribute in ("_dsv4_decode_state", "_dsv4_decode_carry_offset"):
+                if carry_attribute in module.__dict__:
+                    del module.__dict__[carry_attribute]
 
     @staticmethod
     def _diagnostic_decode_cache_lengths(model: nn.Module) -> list[int]:
         lengths: list[tuple[int, int]] = []
         for module in model.modules():
+            dsv4_state = module.__dict__.get("_dsv4_decode_state")
+            if dsv4_state is not None:
+                layer_idx = int(getattr(module, "layer_id", len(lengths)))
+                lengths.append((layer_idx, int(dsv4_state.num_tokens)))
+                continue
             past = getattr(module, "_diagnostic_past_key_value", None)
             if past is None:
                 continue
@@ -5484,6 +5582,14 @@ class ModelRunner:
 
         first_valid = int(bounds[0].item())
         last_valid = -int(bounds[1].item())
+        dsv4_exact_decode_carry = bool(getattr(getattr(self.model, "config", None), "_dsv4_flash_exact_mode", False))
+        # DSV4 exact mode replays each decode decision exactly as serving does:
+        # an M=1 segment over carried per-layer attention state (paged FP8
+        # raw/compressed key caches + compressor kv-score ring), seeded by the
+        # prefill segment. Trunk kernels are not row-count invariant (e.g. the
+        # mHC pre kernel buckets n_splits by token count), so a full-prefix
+        # recompute drifts from the original bytes at some segment lengths;
+        # M=1 segments keep every trunk op serving-shaped.
         segments = [(0, first_valid + 1), *((pos, pos + 1) for pos in range(first_valid + 1, last_valid + 1))]
 
         past_key_values = []
@@ -5505,6 +5611,13 @@ class ModelRunner:
                     device=input_ids.device,
                 )
                 segment_position_ids = torch.arange(start, end, device=input_ids.device, dtype=torch.long).unsqueeze(0)
+                # Serving idle DP ranks contribute zero rows to the EP-gathered
+                # expert batch, and the Marlin MoE kernels are not row-count
+                # invariant. Dummy ranks (no valid labels) must therefore
+                # declare zero live tokens so the gathered population matches
+                # the serving forward exactly.
+                dummy_rank_kwargs = {} if local_has_valid else {"num_samples": 0}
+                carry_kwargs = {"decode_cache_carry": True} if dsv4_exact_decode_carry else {}
                 outputs = self.model(
                     input_ids=segment_input_ids,
                     attention_mask=segment_attention_mask,
@@ -5512,6 +5625,8 @@ class ModelRunner:
                     past_key_values=past_key_values,
                     output_hidden_states=diagnostic_hidden_states,
                     diagnostic_decode_cache=True,
+                    **dummy_rank_kwargs,
+                    **carry_kwargs,
                     **self._index_share_forward_kwargs(IndexShareMode.FORWARD_ONLY),
                 )
                 returned_past_key_values = getattr(outputs, "past_key_values", None)
@@ -6130,6 +6245,105 @@ class ModelRunner:
     # =========================================================================
 
     @staticmethod
+    def _gather_per_sample_k3_inputs(
+        k3_values: torch.Tensor,
+        valid_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Reassemble tokenwise K3 inputs before detecting packed samples.
+
+        Ulysses ranks own contiguous token shards. Computing sample boundaries
+        and means on each shard independently both splits samples at rank
+        boundaries and produces a different number of observer rows per rank.
+        Reassemble the tokenwise values first so every CP replica emits the same
+        full packed-sample result at the completion rendezvous.
+        """
+        position_ids = position_ids.view(1, -1) if position_ids.ndim == 1 else position_ids
+        batch_size = int(position_ids.shape[0])
+        if batch_size <= 0 or k3_values.numel() % batch_size != 0 or valid_mask.numel() != k3_values.numel():
+            raise ValueError(
+                "Per-sample K3 inputs have incompatible shapes: "
+                f"k3={tuple(k3_values.shape)}, valid={tuple(valid_mask.shape)}, "
+                f"position_ids={tuple(position_ids.shape)}"
+            )
+
+        ps = get_parallel_state()
+        if not ps.cp_enabled:
+            return k3_values.view(-1), valid_mask.view(-1), position_ids.reshape(-1)
+
+        local_tokens = k3_values.numel() // batch_size
+        original_seq_len = int(position_ids.shape[-1])
+        group = ps.sp_group
+        ringattn_size = int(getattr(ps, "ringattn_size", 1))
+        if ringattn_size > 1:
+            cp_size = int(getattr(ps, "cp_size", 0))
+            if cp_size <= 0:
+                raise RuntimeError("Ring-attention K3 reassembly requires a positive CP size")
+            gathered_seq_len = local_tokens * cp_size
+            if gathered_seq_len < original_seq_len:
+                raise RuntimeError(
+                    "Ring-attention K3 shards are shorter than the original packed sequence: "
+                    f"gathered={gathered_seq_len}, original={original_seq_len}"
+                )
+        else:
+            gathered_seq_len = original_seq_len
+        full_k3 = gather_outputs(
+            k3_values.reshape(batch_size, local_tokens),
+            gather_dim=-1,
+            padding_dim=-1,
+            unpad_dim_size=gathered_seq_len,
+            group=group,
+        )
+        full_valid = gather_outputs(
+            valid_mask.reshape(batch_size, local_tokens).to(dtype=torch.uint8),
+            gather_dim=-1,
+            padding_dim=-1,
+            unpad_dim_size=gathered_seq_len,
+            group=group,
+        ).bool()
+        if ringattn_size > 1:
+            pad_length = gathered_seq_len - original_seq_len
+            if pad_length:
+                pad_positions = (
+                    torch.arange(pad_length, device=position_ids.device, dtype=position_ids.dtype) % 1024
+                ).view(1, -1)
+                pad_positions = pad_positions.expand(batch_size, -1)
+                padded_position_ids = torch.cat((position_ids, pad_positions), dim=-1)
+            else:
+                padded_position_ids = position_ids
+            full_k3 = torch.cat(
+                [
+                    zigzag_restore_packed_sequence(
+                        full_k3[row : row + 1],
+                        padded_position_ids[row : row + 1],
+                        ringattn_size,
+                        dim=-1,
+                    )
+                    for row in range(batch_size)
+                ],
+                dim=0,
+            )[:, :original_seq_len]
+            full_valid = torch.cat(
+                [
+                    zigzag_restore_packed_sequence(
+                        full_valid[row : row + 1],
+                        padded_position_ids[row : row + 1],
+                        ringattn_size,
+                        dim=-1,
+                    )
+                    for row in range(batch_size)
+                ],
+                dim=0,
+            )[:, :original_seq_len]
+        if full_k3.shape != position_ids.shape or full_valid.shape != position_ids.shape:
+            raise RuntimeError(
+                "Per-sample K3 CP reassembly did not recover the original packed shape: "
+                f"k3={tuple(full_k3.shape)}, valid={tuple(full_valid.shape)}, "
+                f"position_ids={tuple(position_ids.shape)}"
+            )
+        return full_k3.reshape(-1), full_valid.reshape(-1), position_ids.reshape(-1)
+
+    @staticmethod
     def _compute_per_sample_k3(
         k3_values: torch.Tensor,
         valid_mask: torch.Tensor,
@@ -6437,20 +6651,13 @@ class ModelRunner:
                         )
                         log_ratio = new_lp - old_lp
                         k3_vals = (torch.exp(log_ratio) - log_ratio - 1.0).masked_fill(~_valid, 0.0)
-                        # position_ids and _original_position_ids are both kept
-                        # unsharded (full packed sequence length) for cu_seq_lens.
-                        # Slice to match local token count (k3_vals length) using
-                        # the Ulysses/CP shard boundaries.
                         _pos = micro_batch.get("_original_position_ids", micro_batch.get("position_ids"))
                         if _pos is not None:
-                            _pos_flat = _pos.view(-1)
-                            local_len = k3_vals.shape[0]
-                            if _pos_flat.shape[0] > local_len:
-                                # Slice position_ids to this rank's Ulysses shard
-                                ps = get_parallel_state()
-                                cp_rank = ps.ulysses_rank if ps.ulysses_enabled else 0
-                                start = cp_rank * local_len
-                                _pos_flat = _pos_flat[start : start + local_len]
+                            k3_vals, _valid, _pos_flat = self._gather_per_sample_k3_inputs(
+                                k3_vals,
+                                _valid,
+                                _pos,
+                            )
                             deferred_k3.append(
                                 {
                                     "k3_values": k3_vals.cpu(),
@@ -7358,6 +7565,17 @@ class ModelRunner:
 
         return result
 
+    def _reshard_exact_forward_only_lm_head(self) -> None:
+        """Restore FP32 masters after the external no-grad vocab projection."""
+
+        if not getattr(self.model.config, "_dsv4_flash_exact_mode", False):
+            return
+        lm_head = getattr(self.model, "lm_head", None)
+        reshard = getattr(lm_head, "reshard", None)
+        if not callable(reshard):
+            raise RuntimeError("Exact DSV4-Flash forward-only replay requires an FSDP-managed lm_head")
+        reshard()
+
     # FSDP2 unshard hooks require version counters; no_grad keeps this path
     # forward-only without disabling those counters.
     @torch.no_grad()
@@ -7392,24 +7610,30 @@ class ModelRunner:
         else:
             r3_enabled = self._routing_handler.setup(micro_batches, routed_experts, routed_expert_logits)
 
-        if self.pp_enabled:
-            # Forward-only must run the pipeline schedule — calling self.model(...)
-            # would execute only this rank's first stage.
-            try:
+        try:
+            if self.pp_enabled:
+                # Forward-only must run the pipeline schedule — calling self.model(...)
+                # would execute only this rank's first stage.
                 result = self._pp_forward_only_loop(micro_batches, loss_fn, loss_fn_params, r3_enabled=r3_enabled)
                 result.pop("_pp_raw_per_token_logprobs", None)
-            finally:
-                if r3_enabled:
-                    self._routing_handler.cleanup()
-        else:
-            result = self._forward_loop(
-                micro_batches,
-                loss_fn,
-                loss_fn_params,
-                compute_backward=False,
-                r3_enabled=r3_enabled,
-                model_id=model_id,
-            )
+            else:
+                result = self._forward_loop(
+                    micro_batches,
+                    loss_fn,
+                    loss_fn_params,
+                    compute_backward=False,
+                    r3_enabled=r3_enabled,
+                    model_id=model_id,
+                )
+        finally:
+            if self.pp_enabled and r3_enabled:
+                self._routing_handler.cleanup()
+            # The lm head is called by compute_loss outside the root model. In
+            # a no-grad pass FSDP2 leaves its BF16 compute view materialized,
+            # so restore the sharded FP32 adapter masters even when the
+            # forward/loss path raises. Backward owns this transition in
+            # training passes.
+            self._reshard_exact_forward_only_lm_head()
 
         if self._adapter_manager is not None:
             result["step"] = self._adapter_manager.get_adapter_state(model_id).global_forward_backward_step
@@ -7488,6 +7712,8 @@ class ModelRunner:
         start_time = time.time()
         skip_optim_empty_cache = False
         adapter_mutated = False
+        glm52_fullparam_mutation_started = False
+        glm52_fullparam_publish_receipt = None
         capture_config = dict(sparse_delta_capture or {})
         capture_snapshots: dict[str, torch.Tensor] | None = None
         capture_snapshot_s = 0.0
@@ -7498,8 +7724,9 @@ class ModelRunner:
             capture_snapshots = snapshot_sparse_delta_tensors(self.model, capture_config)
             capture_snapshot_s = time.perf_counter() - t_capture
 
-        # A missing/non-positive threshold means disabled clipping, but the
-        # adapter manager still computes and reports the real logical norm.
+        # A non-positive threshold means disabled clipping. The adapter manager
+        # retains its legacy missing-threshold behavior, while the single-model
+        # path below rejects a missing threshold before optimizer mutation.
         clip_value = gradient_clip if gradient_clip is not None else self.train_config.get("max_grad_norm")
 
         # Pop accumulated valid tokens for this model_id (deferred normalization)
@@ -7595,31 +7822,59 @@ class ModelRunner:
                 pp_group=ps.pp_group if self.pp_enabled else None,
             )
 
-            # Optimizer step
-            self.optimizer.step()
-            # Fused/foreach optimizer kernels can still be reading gradients when
-            # Python reaches zero_grad/empty_cache. Synchronize before releasing
-            # grad storage to avoid allocator reuse while those kernels are live.
-            synchronize()
+            # Once an optimizer kernel has been launched, any exception may
+            # follow a partial mutation.  The exact full-parameter lane must
+            # therefore classify the entire remaining command as fatal, not
+            # only cache refresh/publication failures.
+            glm52_fullparam_mutation_started = bool(self.train_config.get("glm52_fullparam_fp8_training"))
             try:
-                self.optimizer.zero_grad(set_to_none=True)
-            except TypeError:
-                # MultiOptimizer (Muon) doesn't support set_to_none kwarg
-                self.optimizer.zero_grad()
-            for part in self.model_parts if self.pp_enabled else [self.model]:
-                part.zero_grad(set_to_none=True)
-            skip_optim_empty_cache = _skip_empty_cache_after_optim_step(self.train_config)
-            if skip_optim_empty_cache:
-                logger.debug("Skipping torch.cuda.empty_cache() after optimizer step")
-            else:
-                torch.cuda.empty_cache()
+                self.optimizer.step()
+                # Fused/foreach optimizer kernels can still be reading gradients when
+                # Python reaches zero_grad/empty_cache. Synchronize before releasing
+                # grad storage to avoid allocator reuse while those kernels are live.
+                synchronize()
+                try:
+                    self.optimizer.zero_grad(set_to_none=True)
+                except TypeError:
+                    # MultiOptimizer (Muon) doesn't support set_to_none kwarg
+                    self.optimizer.zero_grad()
+                for part in self.model_parts if self.pp_enabled else [self.model]:
+                    part.zero_grad(set_to_none=True)
+                skip_optim_empty_cache = _skip_empty_cache_after_optim_step(self.train_config)
+                if skip_optim_empty_cache:
+                    logger.debug("Skipping torch.cuda.empty_cache() after optimizer step")
+                else:
+                    torch.cuda.empty_cache()
 
-            self.global_step += 1
-            current_step = self.global_step
-            current_lr = self.optimizer.param_groups[0]["lr"]
+                self.global_step += 1
+                current_step = self.global_step
+                current_lr = self.optimizer.param_groups[0]["lr"]
 
-            # Collect mean grad_norm across data parallel group for logging
-            grad_norm = all_reduce(grad_norm, group=ps.fsdp_group)
+                # Collect mean grad_norm across data parallel group for logging
+                grad_norm = all_reduce(grad_norm, group=ps.fsdp_group)
+
+                # GLM-5.2 full-param step boundary: refresh every admitted cache
+                # from post-step masters on every rank and, when configured,
+                # publish one checksummed all-rank payload. Failures propagate;
+                # callers never receive a successful step with partial bytes.
+                if glm52_fullparam_mutation_started:
+                    from xorl.server.weight_sync.glm52_fullparam_step_publish import (  # noqa: PLC0415
+                        glm52_fullparam_step_boundary,
+                    )
+
+                    glm52_fullparam_publish_receipt = glm52_fullparam_step_boundary(
+                        self.model,
+                        step=current_step,
+                        publish_root=self.train_config.get("glm52_fullparam_publish_dir"),
+                        rank=self.rank,
+                        world_size=self.world_size,
+                    )
+            except FullParamOptimizerMutationFailure:
+                raise
+            except BaseException as error:
+                if glm52_fullparam_mutation_started:
+                    self._raise_fullparam_post_mutation_failure(error)
+                raise
 
         try:
             # Periodic merge for the shared-optimizer path still belongs after
@@ -7636,6 +7891,8 @@ class ModelRunner:
                 "model_id": model_id,
                 "optim_empty_cache_skipped": skip_optim_empty_cache,
             }
+            if glm52_fullparam_publish_receipt is not None:
+                result["glm52_fullparam_publish"] = glm52_fullparam_publish_receipt
             if capture_snapshots is not None:
                 capture_result = write_sparse_source_delta_rank(
                     model=self.model,
@@ -7665,12 +7922,27 @@ class ModelRunner:
 
             synchronize()
             return result
-        except (AdapterGradientMutationFailure, KeyboardInterrupt):
+        except (AdapterGradientMutationFailure, FullParamOptimizerMutationFailure):
+            raise
+        except KeyboardInterrupt as error:
+            if glm52_fullparam_mutation_started:
+                self._raise_fullparam_post_mutation_failure(error)
             raise
         except BaseException as error:
+            if glm52_fullparam_mutation_started:
+                self._raise_fullparam_post_mutation_failure(error)
             if adapter_mutated:
                 self._raise_adapter_post_mutation_failure(model_id, error)
             raise
+
+    def _raise_fullparam_post_mutation_failure(self, error: BaseException) -> None:
+        """Poison and classify every failure after a full-param step may mutate."""
+
+        self._glm52_fullparam_poisoned = True
+        raise FullParamOptimizerMutationFailure(
+            "GLM-5.2 full-parameter optimizer handling failed after optimizer mutation may have started; "
+            "publish nothing and restart from the last committed checkpoint"
+        ) from error
 
     def _raise_adapter_post_mutation_failure(self, model_id: str, error: BaseException) -> None:
         """Poison an adapter and classify any post-step tail failure as fatal."""
@@ -7715,6 +7987,17 @@ class ModelRunner:
         """Sync state back from checkpoint manager after load operations."""
         self.global_step = self._checkpoint_mgr.global_step
         self.global_forward_backward_step = self._checkpoint_mgr.global_forward_backward_step
+        if self.train_config.get("glm52_fullparam_fp8_training"):
+            # CheckpointManager.load_state uses the strict full-model DCP
+            # transaction and this hook runs only after it returns.  DCP has
+            # restored coherent master+cache pairs but bumped each master's
+            # tensor version; rebind freshness without requantizing away the
+            # checkpoint's serving bytes.
+            from xorl.models.transformers.glm5.exact_fullparam_admission import (  # noqa: PLC0415
+                restore_glm52_fullparam_master_identities,
+            )
+
+            restore_glm52_fullparam_master_identities(self.model)
         if getattr(get_parallel_state(), "lm_head_tp_size", 1) > 1:
             sync_lm_head_tp_parameters(
                 self.model,

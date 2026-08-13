@@ -324,12 +324,26 @@ class GatedDeltaNet(nn.Module):
             raise RuntimeError("Exact Qwen3.5 GDN requires short convolution")
 
         if self.use_short_conv and _is_gdn_contract_enabled():
-            if cp_context is not None:
-                raise RuntimeError("Exact Qwen3.5 GDN does not support CP yet (conv prefix exchange)")
             if use_cache or last_state is not None:
                 raise RuntimeError(
                     "Exact Qwen3.5 trainer GDN supports packed prefill only, not recurrent cache updates"
                 )
+            if cp_context is None:
+                # Fail-closed backstop against the ring/silent-skip fail-open:
+                # build_linear_attention_cp_context returns None for ring>1
+                # and for missing metadata — an exact GDN layer must never
+                # run U1 math on sequence-sharded rows.
+                from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
+
+                ps = get_parallel_state()
+                if ps.ulysses_size > 1 or ps.ringattn_size > 1:
+                    raise RuntimeError(
+                        "Exact Qwen3.5 GDN: sequence parallelism is active "
+                        f"(ulysses={ps.ulysses_size}, ring={ps.ringattn_size}) but no "
+                        "cp_context reached the layer. Ring is unsupported (contract C4) "
+                        "and a missing Ulysses context would silently break bytes. "
+                        "Fail closed.",
+                    )
             q, k, v = causal_conv1d_qkv_contract(
                 q_input,
                 k_input,
@@ -338,6 +352,7 @@ class GatedDeltaNet(nn.Module):
                 self.k_conv1d,
                 self.v_conv1d,
                 cu_seqlens=cu_seqlens,
+                cp_context=cp_context,
             )
             conv_state_q = conv_state_k = conv_state_v = None
         elif self.use_short_conv:

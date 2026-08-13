@@ -95,7 +95,7 @@ from xorl.server.runner.adapters.gradient_finalizer import (
     AdapterGradientMutationFailure,
 )
 from xorl.server.runner.adapters.gradient_ownership import AdapterGradientUniformRejection
-from xorl.server.runner.model_runner import ModelRunner
+from xorl.server.runner.model_runner import FullParamOptimizerMutationFailure, ModelRunner
 from xorl.server.runner.utils import (
     Rank0Protocol,
     apply_sequence_sharding,
@@ -417,7 +417,11 @@ class RunnerDispatcher:
                     # or the explicit whole-epoch abort command.
                     logger.warning(f"Rank {self.rank}: Uniform command rejection: {uniform_error}")
                     self._worker_error = None
-                except (AdapterGradientCollectiveFailure, AdapterGradientMutationFailure) as fatal_error:
+                except (
+                    AdapterGradientCollectiveFailure,
+                    AdapterGradientMutationFailure,
+                    FullParamOptimizerMutationFailure,
+                ) as fatal_error:
                     self._terminate_after_adapter_gradient_failure(fatal_error)
                 except Exception as cmd_error:
                     # Log gracefully - only include traceback for unexpected errors
@@ -445,7 +449,11 @@ class RunnerDispatcher:
                                 )
                             logger.warning(f"Rank {self.rank}: Cross-rank error detected: {cross_rank_error}")
                         self._worker_error = None
-                    except (AdapterGradientCollectiveFailure, AdapterGradientMutationFailure) as fatal_error:
+                    except (
+                        AdapterGradientCollectiveFailure,
+                        AdapterGradientMutationFailure,
+                        FullParamOptimizerMutationFailure,
+                    ) as fatal_error:
                         self._terminate_after_adapter_gradient_failure(fatal_error)
                     except Exception as sync_error:
                         self._worker_error = None
@@ -618,7 +626,11 @@ class RunnerDispatcher:
                 request_id=request.message_id, success=True, result=result, execution_time=time.time() - start_time
             )
 
-        except (AdapterGradientCollectiveFailure, AdapterGradientMutationFailure) as fatal_error:
+        except (
+            AdapterGradientCollectiveFailure,
+            AdapterGradientMutationFailure,
+            FullParamOptimizerMutationFailure,
+        ) as fatal_error:
             self._terminate_after_adapter_gradient_failure(fatal_error)
         except AdapterGradientUniformRejection as uniform_error:
             return RunnerResponse(
@@ -652,7 +664,7 @@ class RunnerDispatcher:
         """Terminate this worker after a collective or post-mutation failure."""
 
         logger.critical(
-            "Rank %s: fatal adapter-gradient failure; terminating distributed worker: %s",
+            "Rank %s: fatal optimizer/gradient failure; terminating distributed worker: %s",
             self.rank,
             error,
             exc_info=True,
@@ -1887,6 +1899,13 @@ class RunnerDispatcher:
         except (AdapterGradientCollectiveFailure, AdapterGradientMutationFailure):
             raise
         except BaseException as error:
+            train_config = getattr(self.trainer, "train_config", {})
+            if isinstance(train_config, dict) and train_config.get("glm52_fullparam_fp8_training"):
+                self.trainer._glm52_fullparam_poisoned = True
+                raise FullParamOptimizerMutationFailure(
+                    "Full-parameter optimizer handler tail failed after mutation; "
+                    "publish nothing and restart from checkpoint"
+                ) from error
             self._poison_adapter_after_mutation(model_id)
             raise AdapterGradientMutationFailure(
                 "Optimizer handler tail failed after adapter mutation; publish nothing and restart from checkpoint"

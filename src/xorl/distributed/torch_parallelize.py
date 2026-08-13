@@ -67,14 +67,17 @@ def _topmost_modules_matching(root: "nn.Module", classes: tuple[type, ...]) -> l
 def _exact_lm_head_replicated_params(lm_head: "nn.Module | None") -> set[nn.Parameter]:
     """Return exact-head factors that must remain replicated over vocab TP."""
 
-    if lm_head is None or not getattr(lm_head, "_glm52_exact_tp16_lm_head", False):
+    exact_glm = bool(lm_head is not None and getattr(lm_head, "_glm52_exact_tp16_lm_head", False))
+    exact_dsv4 = bool(lm_head is not None and getattr(lm_head, "_dsv4_exact_tp8_lm_head", False))
+    if not exact_glm and not exact_dsv4:
         return set()
-    names = tuple(getattr(lm_head, "_glm52_exact_replicated_parameter_names", ()))
+    names_attr = "_glm52_exact_replicated_parameter_names" if exact_glm else "_dsv4_exact_replicated_parameter_names"
+    names = tuple(getattr(lm_head, names_attr, ()))
     if names != ("lora_A",):
-        raise RuntimeError("The exact GLM-5.2 lm head must declare only lora_A as TP16-replicated")
+        raise RuntimeError("An exact vocabulary-parallel lm head must declare only lora_A as replicated")
     parameter = getattr(lm_head, "lora_A", None)
     if not isinstance(parameter, nn.Parameter) or parameter.dtype is not torch.float32:
-        raise RuntimeError("The exact GLM-5.2 lm-head lora_A must be an FP32 Parameter")
+        raise RuntimeError("An exact vocabulary-parallel lm-head lora_A must be an FP32 Parameter")
     return {parameter}
 
 
@@ -157,13 +160,19 @@ def _expert_mixed_precision_policy(ep_fsdp_mesh_size: int, reduce_dtype: torch.d
     return _bf16_mixed_precision_policy(reduce_dtype=reduce_dtype)
 
 
+def _fsdp_kwargs_for_module(fsdp_kwargs: dict, module: nn.Module) -> dict:
+    """Apply a module's explicit full-precision FSDP boundary."""
+
+    module_kwargs = dict(fsdp_kwargs)
+    if getattr(module, "fsdp_requires_full_precision", False):
+        module_kwargs.pop("mp_policy", None)
+    return module_kwargs
+
+
 def _expert_fsdp_kwargs_for_module(expert_fsdp_kwargs: dict, experts_mod: nn.Module) -> dict:
     """Keep frozen byte-packed expert state sharded without numerically casting it."""
 
-    module_kwargs = dict(expert_fsdp_kwargs)
-    if getattr(experts_mod, "fsdp_requires_full_precision", False):
-        module_kwargs.pop("mp_policy", None)
-    return module_kwargs
+    return _fsdp_kwargs_for_module(expert_fsdp_kwargs, experts_mod)
 
 
 def _load_model_weights(
@@ -485,6 +494,7 @@ def parallelize_model_fsdp2(
     # | -- layers (declared in model.modules_to_ignore_in_mixed_precision) that need to apply fully_shard separately due to different mp policy as the decoder layer
     #      (e.g., some models requires MoE TopK gate layer to have parameters in higher FP32 precision in forward).
     fsdp_wrapped_experts: List["nn.Module"] = []
+    preserve_dsv4_fp32 = bool(getattr(model.config, "_dsv4_flash_exact_mode", False))
     for layer_fqn, layer_mod, experts_mod in layer_pairs:
         # register all the FSDPModule inside this decoder layer for the convenience of manual prefetching configuration
         layer_mod._fsdp_modules = []
@@ -510,6 +520,10 @@ def parallelize_model_fsdp2(
         layer_fsdp_kwargs = dict(fsdp_kwargs)
         if enable_mixed_precision:
             layer_fsdp_kwargs["mp_policy"] = decoder_mp_policy
+        if preserve_dsv4_fp32:
+            keep_fp32_params = {param for param in layer_mod.parameters() if getattr(param, "_keep_fp32", False)}
+            if keep_fp32_params:
+                layer_fsdp_kwargs["ignored_params"] = keep_fp32_params
         if parallel_state.ep_enabled and experts_mod is not None and getattr(experts_mod, "_skip_fsdp", False):
             # _skip_fsdp params are excluded from FSDP, so they receive no automatic
             # gradient all-reduce across eFSDP replicas.  When ep_fsdp_size > 1 the
@@ -524,7 +538,9 @@ def parallelize_model_fsdp2(
                 f"which would cause weight divergence. Use ep_fsdp_size=1 or remove "
                 f"_skip_fsdp (wrap experts with FSDP instead)."
             )
-            layer_fsdp_kwargs["ignored_params"] = set(experts_mod.parameters())
+            layer_fsdp_kwargs["ignored_params"] = set(layer_fsdp_kwargs.get("ignored_params", ())) | set(
+                experts_mod.parameters()
+            )
         fully_shard(layer_mod, **layer_fsdp_kwargs)
         layer_mod._fsdp_modules.append(layer_mod)
         logger.debug_rank0(f"{layer_fqn=}, {layer_mod._fsdp_modules=}")
@@ -541,12 +557,15 @@ def parallelize_model_fsdp2(
         norm_mod = getattr(base_model, "norm_f", None)
     lm_head_mod = getattr(model, "lm_head", None)
     lm_head_tp = getattr(parallel_state, "lm_head_tp_size", 1) > 1
-    exact_lm_head = bool(lm_head_mod is not None and getattr(lm_head_mod, "_glm52_exact_tp16_lm_head", False))
-    if exact_lm_head and not fsdp_sharded_lm_head_loss:
+    exact_glm_lm_head = bool(lm_head_mod is not None and getattr(lm_head_mod, "_glm52_exact_tp16_lm_head", False))
+    exact_dsv4_lm_head = bool(lm_head_mod is not None and getattr(lm_head_mod, "_dsv4_exact_tp8_lm_head", False))
+    if exact_glm_lm_head and not fsdp_sharded_lm_head_loss:
         raise RuntimeError("The exact GLM-5.2 lm head requires fsdp_sharded_lm_head_loss=true")
-    if exact_lm_head and getattr(parallel_state, "lm_head_tp_size", 1) != 16:
+    if exact_glm_lm_head and getattr(parallel_state, "lm_head_tp_size", 1) != 16:
         raise RuntimeError("The exact GLM-5.2 lm head requires lm_head_tensor_parallel_size=16")
-    if fsdp_sharded_lm_head_loss:
+    if exact_dsv4_lm_head and getattr(parallel_state, "lm_head_tp_size", 1) != 8:
+        raise RuntimeError("The exact DSV4-Flash lm head requires lm_head_tensor_parallel_size=8")
+    if fsdp_sharded_lm_head_loss or exact_dsv4_lm_head:
         if pp_enabled:
             raise NotImplementedError("fsdp_sharded_lm_head_loss is not supported with pipeline parallelism.")
         if parallel_state.tp_enabled:
@@ -588,7 +607,7 @@ def parallelize_model_fsdp2(
             # lm-head-only TP: shard the lm_head over its dedicated per-module mesh
             # (Shard(0) over lm_head_tp vocab rows, replicate over DP x cp_replica),
             # NOT the model's FSDP mesh. The body keeps the normal fsdp_mesh.
-            lm_head_fsdp_kwargs = dict(fsdp_kwargs)
+            lm_head_fsdp_kwargs = _fsdp_kwargs_for_module(fsdp_kwargs, lm_head_mod)
             lm_head_fsdp_kwargs["mesh"] = parallel_state.lm_head_mesh
             exact_replicated_params = _exact_lm_head_replicated_params(lm_head_mod)
             if exact_replicated_params:
@@ -621,6 +640,8 @@ def parallelize_model_fsdp2(
         if experts_mod is not None and getattr(experts_mod, "_skip_fsdp", False):
             root_ignored_params.update(experts_mod.parameters())
     root_ignored_params.update(_exact_lm_head_replicated_params(lm_head_mod))
+    if preserve_dsv4_fp32:
+        root_ignored_params.update(param for param in model.parameters() if getattr(param, "_keep_fp32", False))
     if root_ignored_params:
         root_fsdp_kwargs = dict(fsdp_kwargs)
         root_fsdp_kwargs["ignored_params"] = root_ignored_params
@@ -707,35 +728,51 @@ def parallelize_model_fsdp2(
             "Expected 'reduce_scatter' or 'bf16_a2a_fp32_sum'."
         )
 
-    # Handle meta initialization for FSDP2 (fallback if pre-load not done)
-    assert kwargs.get("init_device") == "meta", "Please use init_device: meta for FSDP2"
-
-    weight_device = get_device_type()
-
-    # skip_weight_loading: Used when caller will handle weight loading separately
-    # after this function returns.
-    if kwargs.get("skip_weight_loading"):
-        logger.info_rank0("Skipping weight loading in parallelize_model_fsdp2 (caller will handle)")
-    elif weights_path is None:
-        model.to_empty(device=weight_device)
-        with torch.no_grad():
-            model.init_weights()
-            # Re-initialize LoRA params — init_weights() only handles nn.Linear,
-            # and reset_lora_parameters() was a no-op on meta tensors during __init__
-            for m in model.modules():
-                if hasattr(m, "reset_lora_parameters"):
-                    m.reset_lora_parameters()
+    if kwargs.get("glm52_fullparam_fp8_training"):
+        # GLM-5.2 full-param block-FP8 training: the admission consumed REAL
+        # checkpoint bytes before wrapping, seeding FP32 masters and the
+        # forward byte caches, so this
+        # mode builds on init_device='cuda' and the post-wrap meta
+        # materialization / weight loading below must not run — a reload here
+        # would sever the admission's recorded master/cache identities.
+        # Wrapping real CUDA parameters with fully_shard is validated by the
+        # component FSDP2 test.
+        if kwargs.get("init_device") != "cuda":
+            raise ValueError(
+                "glm52_fullparam_fp8_training requires init_device='cuda': the admission "
+                "seeds masters and byte caches from real checkpoint bytes before FSDP2 wrapping"
+            )
+        logger.info_rank0("GLM-5.2 full-param: post-wrap weight loading skipped (weights consumed at admission)")
     else:
-        logger.info_rank0("starting to load model weights...")
-        load_weights_mode = kwargs.get("load_weights_mode", "grouped")
-        _load_model_weights(
-            model,
-            weights_path,
-            load_weights_mode=load_weights_mode,
-            weight_device=weight_device,
-            dtensor_factory=distribute_tensor,
-            strict_weight_loading=bool(kwargs.get("strict_weight_loading", False)),
-        )
+        # Handle meta initialization for FSDP2 (fallback if pre-load not done)
+        assert kwargs.get("init_device") == "meta", "Please use init_device: meta for FSDP2"
+
+        weight_device = get_device_type()
+
+        # skip_weight_loading: Used when caller will handle weight loading separately
+        # after this function returns.
+        if kwargs.get("skip_weight_loading"):
+            logger.info_rank0("Skipping weight loading in parallelize_model_fsdp2 (caller will handle)")
+        elif weights_path is None:
+            model.to_empty(device=weight_device)
+            with torch.no_grad():
+                model.init_weights()
+                # Re-initialize LoRA params — init_weights() only handles nn.Linear,
+                # and reset_lora_parameters() was a no-op on meta tensors during __init__
+                for m in model.modules():
+                    if hasattr(m, "reset_lora_parameters"):
+                        m.reset_lora_parameters()
+        else:
+            logger.info_rank0("starting to load model weights...")
+            load_weights_mode = kwargs.get("load_weights_mode", "grouped")
+            _load_model_weights(
+                model,
+                weights_path,
+                load_weights_mode=load_weights_mode,
+                weight_device=weight_device,
+                dtensor_factory=distribute_tensor,
+                strict_weight_loading=bool(kwargs.get("strict_weight_loading", False)),
+            )
 
     # Build EP param groups now (torchtitan eFSDP design: track groups at wrap time,
     # not just at optimizer build time, so grad clipping works regardless of optimizer
@@ -930,6 +967,11 @@ def build_parallelize_model(
             module_names_per_stage=module_names_per_stage,
             always_keep_fqns=pp_config.get("always_keep_fqns"),
             stage_style=stage_style,
+            # The byte contract validates the ACTUAL parameter reality per
+            # stage; uniform-fp32 masters are admitted only under a genuine
+            # bf16 mixed-precision compute intent (declared here, verified at
+            # the wire by the runtime dtype assertions in _pp_forward).
+            expects_bf16_mixed_precision=bool(enable_mixed_precision),
         )
         logger.info_rank0(f"Model split into {num_stages} PP stages ({pp_virtual_stages} per rank, {stage_style})")
 
@@ -967,7 +1009,11 @@ def build_parallelize_model(
                     if any(isinstance(m, LoraLinear) for m in model_part.modules()):
                         raise NotImplementedError("Tensor parallelism + LoRA is not currently supported.")
 
-                # Unfuse fused projections (qkv_proj, gate_up_proj) for TP compatibility
+                # Unfuse fused projections (qkv_proj, gate_up_proj) for TP compatibility.
+                # Skip when the model is already unfused: unfuse_for_tp deletes the fused
+                # module, so a second call raises AttributeError. Reachable only for a
+                # MoE-only adapter set, whose MoEExpertsLoRA the LoraLinear check above
+                # does not catch; any LoraLinear is rejected before this point.
                 if hasattr(model_part, "unfuse_for_tp") and not getattr(model_part, "_unfused_for_tp", False):
                     if i == 0:
                         logger.info_rank0("Unfusing projections for tensor parallelism...")
@@ -1117,7 +1163,11 @@ def build_parallelize_model(
         if any(isinstance(m, LoraLinear) for m in model.modules()):
             raise NotImplementedError("Tensor parallelism + LoRA is not currently supported.")
 
-        # Unfuse fused projections (qkv_proj, gate_up_proj) for TP compatibility
+        # Unfuse fused projections (qkv_proj, gate_up_proj) for TP compatibility.
+        # Skip when the model is already unfused: unfuse_for_tp deletes the fused
+        # module, so a second call raises AttributeError. Reachable only for a
+        # MoE-only adapter set, whose MoEExpertsLoRA the LoraLinear check above
+        # does not catch; any LoraLinear is rejected before this point.
         if hasattr(model, "unfuse_for_tp") and not getattr(model, "_unfused_for_tp", False):
             logger.info_rank0("Unfusing projections for tensor parallelism...")
             model.unfuse_for_tp()

@@ -81,10 +81,10 @@ For a linear layer with weight matrix **W₀** ∈ ℝ^(d×k), LoRA adds a train
   <text x="646" y="101" text-anchor="middle" font-size="12" fill="#1e3a8a" font-family="sans-serif">W·x</text>
 
 
-  <text x="350" y="180" text-anchor="middle" font-size="10" fill="#64748b" font-family="sans-serif">B initialized to zeros → ΔW = 0 at start of training. Training starts from the exact pretrained model behavior.</text>
+  <text x="350" y="180" text-anchor="middle" font-size="10" fill="#64748b" font-family="sans-serif">Default: B = 0 and ΔW = 0. Opt-in nonzero B initialization starts with an adapter delta.</text>
 </svg>
 
-**A** is initialized with Kaiming uniform, **B** with zeros — so the initial LoRA output is exactly zero and training starts from the pretrained model's behavior.
+By default, **A** uses Kaiming uniform initialization and **B** is zero, so the initial LoRA output is exactly zero and training starts from the pretrained model's behavior. Set `lora_b_init_std` above zero to opt into deterministic normal initialization of **B** (using `lora_b_init_seed`); that mode intentionally starts with a nonzero adapter delta.
 
 ## Basic Configuration
 
@@ -106,10 +106,69 @@ lora:
   save_lora_only: true       # checkpoint only LoRA weights, not base model
 ```
 
-For QKV-fused models (default `merge_qkv: true`), target the fused projection names:
+## Fused projections
+
+Many architectures store input-side projections fused: attention as `qkv_proj` and
+the dense or shared MLP as `gate_up_proj`. xorl audits the requested target set and
+fails injection if any target is unmatched.
+
+For supported fused modules, split target names automatically create independent
+logical adapters while retaining the fused base projection. Dynamic LoRA adds each
+adapter to its corresponding output slice. Exact merged-forward mode canonically
+folds each adapter into that slice and still runs one fused GEMM. Checkpoint and
+weight-sync keys remain the standard split names:
+
+```yaml
+  lora_target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+```
+
+This is the default path for Qwen2, Qwen3, Qwen3 MoE, Qwen3.5, Llama, OLMo2, and
+GLM-4 MoE projections implemented by xorl.
+
+**Target the fused names.** Adapts each fused module as one target, at no throughput
+cost. One `lora_A` is shared across the halves, so this is a more constrained
+parameterization than two independent adapters, and the exported adapter carries fused
+key names — which do not line up with a HuggingFace base that stores them split:
+
 ```yaml
   lora_target_modules: [qkv_proj, gate_up_proj, down_proj, o_proj]
 ```
+
+**Unfuse before injection.** This explicit fallback is for an architecture whose
+fused modules do not implement logical adapters, such as GPT-OSS attention. It splits
+the modules into real `q_proj`/`k_proj`/`v_proj` and
+`gate_proj`/`up_proj` before injection. It requires `enable_lora` and is rejected
+with `enable_qlora`:
+
+```yaml
+lora:
+  enable_lora: true
+  unfuse_for_lora: true
+  lora_target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+```
+
+Unfusing changes both performance and floating-point operation order. Requalify
+trainer-to-sampler equality before using it in a workflow that depends on exact
+logprobs.
+
+The layout is fixed for a run's lifetime. Toggling the flag between runs renames
+`mlp.gate_up_proj.*` to `mlp.gate_proj.*` / `mlp.up_proj.*`, which checkpoint
+validation rejects with "Checkpoint incompatible with model" — resuming requires the
+same setting the checkpoint was written with.
+
+### Audited architecture defaults
+
+| Family | Default plain-LoRA scope | Projection handling |
+|---|---|---|
+| Qwen2, Qwen3, Qwen3 MoE, Llama, OLMo2, GLM-4 MoE | Attention and MLP | Independent logical adapters retain fused qkv and gate/up bases |
+| Qwen3.5 dense and MoE | Attention, GDN `g_proj`, MLP, routed experts | Separate GDN/full-attention projections plus fused-base logical gate/up adapters |
+| DeepSeek V3, Kimi K2/K2.5, GLM-5 | MLA attention and MLP | Architecture-specific separate projections and expert adapters |
+| DeepSeek V4 | Attention only | Audited MLA/DSA projection names; routed-expert LoRA is not a generic default |
+| GPT-OSS | Attention only | Set `unfuse_for_lora: true` for split q/k/v targets |
+| MiniMax M3, Nemotron-H | Attention only | Separate attention projections; expert LoRA is not a generic default |
+
+Unknown model families have no guessed default. Set `lora_target_modules` explicitly
+after auditing their projection and expert semantics.
 
 ## Key Parameters
 
@@ -117,8 +176,11 @@ For QKV-fused models (default `merge_qkv: true`), target the fused projection na
 |---|---|---|
 | `enable_lora` | `false` | Enable LoRA injection |
 | `lora_rank` | `16` | Rank r of the low-rank decomposition |
-| `lora_alpha` | `32` | Scaling factor; effective LR scale = alpha/rank |
+| `lora_alpha` | `16` | Scaling factor; effective scale = alpha/rank. Examples may override it to `32`. |
+| `lora_b_init_std` | `0.0` | Standard deviation for optional deterministic normal LoRA-B initialization. `0.0` preserves the standard no-op start. |
+| `lora_b_init_seed` | `0` | Seed used by opt-in nonzero LoRA-B initialization. |
 | `lora_target_modules` | `null` | List of module name patterns to inject LoRA into |
+| `unfuse_for_lora` | `false` | Explicitly split supported fused projections before injection; use only when fused-base logical adapters are unavailable |
 | `save_lora_only` | `false` | Save only LoRA weights in checkpoints |
 
 ## LoRA with MoE Models
@@ -130,8 +192,8 @@ lora:
   enable_lora: true
   lora_rank: 16
   lora_alpha: 32
-  lora_target_modules: [qkv_proj, gate_up_proj, down_proj, o_proj]
-  # Expert layers are included automatically when targeting gate_up_proj/down_proj
+  lora_target_modules: [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj]
+  # gate/up/down also select routed experts on supported MoE families
 ```
 
 ## Checkpoint Behavior

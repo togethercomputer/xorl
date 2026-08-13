@@ -6,7 +6,7 @@ weight.  Forward values come from the pinned public SGLang kernels in serving
 order:
 
 1. BF16 hidden/base-weight operands -> FP32 local base logits;
-2. literal segmented rank-one A SGEMM -> BF16 intermediate;
+2. literal segmented low-rank A SGEMM -> BF16 intermediate;
 3. literal segmented B SGEMM -> BF16 delta rounding and fused add/store into
    the FP32 base-logit buffer;
 4. rank-order TP16 vocabulary all-gather; and
@@ -31,9 +31,10 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from xorl.lora.modules.linear import LoraLinear
+from xorl.models.transformers.glm5.exact_lora_contract import glm52_exact_lora_scaling
 
 
-GLM52_EXACT_TP16_LM_HEAD_CONTRACT_VERSION = "glm52_exact_tp16_lm_head_rank1_qlora_v1"
+GLM52_EXACT_TP16_LM_HEAD_CONTRACT_VERSION = "glm52_exact_tp16_lm_head_qlora_v2"
 
 GLM52_LM_HEAD_VOCAB_SIZE = 154_880
 GLM52_LM_HEAD_HIDDEN_SIZE = 6_144
@@ -114,8 +115,8 @@ def glm52_lm_head_shard(tp_rank: int) -> Glm52LmHeadShard:
 
 
 @lru_cache(maxsize=64)
-def _single_adapter_lm_head_batch_info(device_index: int, rows: int) -> Any:
-    """One active rank-one adapter, in the metadata format used by S4."""
+def _single_adapter_lm_head_batch_info(device_index: int, rows: int, rank: int = 1, scaling: float = 1.0) -> Any:
+    """One active exact adapter, in the metadata format used by S4."""
 
     from sglang.srt.lora.utils import LoRABatchInfo  # noqa: PLC0415
 
@@ -126,8 +127,8 @@ def _single_adapter_lm_head_batch_info(device_index: int, rows: int) -> Any:
         num_segments=1,
         seg_indptr=torch.tensor([0, rows], dtype=torch.int32, device=device),
         weight_indices=torch.zeros(1, dtype=torch.int32, device=device),
-        lora_ranks=torch.ones(1, dtype=torch.int32, device=device),
-        scalings=torch.ones(1, dtype=torch.float32, device=device),
+        lora_ranks=torch.full((1,), rank, dtype=torch.int32, device=device),
+        scalings=torch.full((1,), scaling, dtype=torch.float32, device=device),
         max_len=rows,
         seg_lens=torch.tensor([rows], dtype=torch.int32, device=device),
         permutation=None,
@@ -247,11 +248,12 @@ def _local_qlora_surrogate_logits(
     local_weight: Tensor,
     effective_A: Tensor,
     effective_B: Tensor,
+    scaling: float = 1.0,
 ) -> Tensor:
     """Existing QLoRA value formulation used only to define the VJP oracle."""
 
     base = F.linear(hidden, local_weight)
-    delta = F.linear(F.linear(hidden.float(), effective_A.float()), effective_B.float())
+    delta = scaling * F.linear(F.linear(hidden.float(), effective_A.float()), effective_B.float())
     return (base + delta.to(base.dtype)).float()
 
 
@@ -262,6 +264,7 @@ def _local_qlora_surrogate_vjp(
     effective_B: Tensor,
     grad_local_logits: Tensor,
     *,
+    scaling: float = 1.0,
     needs_input_grad: tuple[bool, bool, bool],
 ) -> tuple[Tensor | None, Tensor | None, Tensor | None]:
     """FP32 local ``dHidden/dA/dB`` for the declared hybrid QLoRA oracle."""
@@ -292,7 +295,7 @@ def _local_qlora_surrogate_vjp(
         lora_hidden = hidden.float().detach().requires_grad_(need_hidden)
         reference_A = effective_A.float().detach().requires_grad_(need_A)
         reference_B = effective_B.float().detach().requires_grad_(need_B)
-        lora_logits = F.linear(F.linear(lora_hidden, reference_A), reference_B)
+        lora_logits = scaling * F.linear(F.linear(lora_hidden, reference_A), reference_B)
 
         requested: list[Tensor] = []
         labels: list[str] = []
@@ -526,9 +529,6 @@ class Glm52ExactTP16LmHeadSelectedLogprob(nn.Module):
 
     contract_version = GLM52_EXACT_TP16_LM_HEAD_CONTRACT_VERSION
     _glm52_exact_active_lora_component = True
-    max_lora_rank = 1
-    lora_alpha = 1
-    scaling = 1.0
 
     def __init__(
         self,
@@ -538,6 +538,8 @@ class Glm52ExactTP16LmHeadSelectedLogprob(nn.Module):
         vocab_end: int,
         padded_vocab_start: int,
         padded_vocab_end: int,
+        rank: int = 1,
+        lora_alpha: int = 1,
         tp_group: dist.ProcessGroup | None = None,
     ) -> None:
         super().__init__()
@@ -561,6 +563,9 @@ class Glm52ExactTP16LmHeadSelectedLogprob(nn.Module):
             raise ValueError(f"GLM-5.2 LM-head shard range/order mismatch: got {actual}, expected {expected}")
         self.shard = expected
         self.tp_group = tp_group
+        self.max_lora_rank = rank
+        self.lora_alpha = lora_alpha
+        self.scaling = glm52_exact_lora_scaling(rank, lora_alpha)
 
     def bind_tp_group(self, tp_group: dist.ProcessGroup) -> None:
         """Bind the already-created XoRL lm-head-only TP process group."""
@@ -631,8 +636,8 @@ class Glm52ExactTP16LmHeadSelectedLogprob(nn.Module):
             raise ValueError("GLM-5.2 exact LM head does not admit an empty row set")
 
         expected_weight_shape = (GLM52_LM_HEAD_LOCAL_VOCAB_SIZE, GLM52_LM_HEAD_HIDDEN_SIZE)
-        expected_A_shape = (1, GLM52_LM_HEAD_HIDDEN_SIZE)
-        expected_B_shape = (GLM52_LM_HEAD_LOCAL_VOCAB_SIZE, 1)
+        expected_A_shape = (self.max_lora_rank, GLM52_LM_HEAD_HIDDEN_SIZE)
+        expected_B_shape = (GLM52_LM_HEAD_LOCAL_VOCAB_SIZE, self.max_lora_rank)
         for name, value, shape in (
             ("local_weight", local_weight, expected_weight_shape),
             ("lora_A", lora_A, expected_A_shape),
@@ -665,7 +670,7 @@ class Glm52ExactTP16LmHeadSelectedLogprob(nn.Module):
         expected_strides = {
             "local_weight": (GLM52_LM_HEAD_HIDDEN_SIZE, 1),
             "lora_A": (GLM52_LM_HEAD_HIDDEN_SIZE, 1),
-            "local_lora_B": (1, 1),
+            "local_lora_B": (self.max_lora_rank, 1),
         }
         for name, value in (
             ("local_weight", local_weight),
@@ -690,13 +695,16 @@ class Glm52ExactTP16LmHeadSelectedLogprob(nn.Module):
     def effective_factor_views(self, lora_A: Tensor, local_lora_B: Tensor) -> tuple[Tensor, Tensor]:
         """Return the exact live BF16 bytes consumed by the S4 A/B kernels."""
 
-        if lora_A.dtype is not torch.float32 or tuple(lora_A.shape) != (1, GLM52_LM_HEAD_HIDDEN_SIZE):
-            raise TypeError("lora_A must be the official FP32 [1, 6144] master")
+        if lora_A.dtype is not torch.float32 or tuple(lora_A.shape) != (
+            self.max_lora_rank,
+            GLM52_LM_HEAD_HIDDEN_SIZE,
+        ):
+            raise TypeError("lora_A must be the configured FP32 [rank, 6144] master")
         if local_lora_B.dtype is not torch.float32 or tuple(local_lora_B.shape) != (
             GLM52_LM_HEAD_LOCAL_VOCAB_SIZE,
-            1,
+            self.max_lora_rank,
         ):
-            raise TypeError("local_lora_B must be the official FP32 [9680, 1] master")
+            raise TypeError("local_lora_B must be the configured FP32 [9680, rank] master")
         return lora_A.to(torch.bfloat16).contiguous(), local_lora_B.to(torch.bfloat16).contiguous()
 
     def _exact_local_logits(
@@ -714,9 +722,9 @@ class Glm52ExactTP16LmHeadSelectedLogprob(nn.Module):
             raise TypeError("Exact local LM-head base operands must be BF16")
         if effective_A.dtype is not torch.bfloat16 or effective_B.dtype is not torch.bfloat16:
             raise TypeError("Exact local LM-head effective factors must be BF16")
-        if tuple(effective_A.shape) != (1, GLM52_LM_HEAD_HIDDEN_SIZE) or tuple(effective_B.shape) != (
+        if tuple(effective_A.shape) != (self.max_lora_rank, GLM52_LM_HEAD_HIDDEN_SIZE) or tuple(effective_B.shape) != (
             GLM52_LM_HEAD_LOCAL_VOCAB_SIZE,
-            1,
+            self.max_lora_rank,
         ):
             raise ValueError("Exact local LM-head effective factor shapes do not match the official shard")
         if any(not value.is_contiguous() for value in (hidden_2d, local_weight, effective_A, effective_B)):
@@ -736,10 +744,13 @@ class Glm52ExactTP16LmHeadSelectedLogprob(nn.Module):
             GLM52_LM_HEAD_LOCAL_VOCAB_SIZE,
         ):
             raise RuntimeError("Pinned exact v2 base LM-head kernel returned an invalid local-logit buffer")
-        batch_info = _single_adapter_lm_head_batch_info(hidden_2d.device.index, rows)
+        batch_info = _single_adapter_lm_head_batch_info(hidden_2d.device.index, rows, self.max_lora_rank, self.scaling)
         lora_a_output = sgemm_lora_a_fwd(hidden_2d, effective_A.unsqueeze(0), batch_info)
-        if lora_a_output.dtype is not torch.bfloat16 or tuple(lora_a_output.shape) != (rows, 1):
-            raise RuntimeError("Pinned exact A SGEMM did not produce the required BF16 rank-one store")
+        if lora_a_output.dtype is not torch.bfloat16 or tuple(lora_a_output.shape) != (
+            rows,
+            self.max_lora_rank,
+        ):
+            raise RuntimeError("Pinned exact A SGEMM did not produce the required BF16 rank store")
         output = sgemm_lora_b_fwd(
             lora_a_output,
             effective_B.unsqueeze(0),
@@ -815,6 +826,7 @@ class Glm52ExactTP16LmHeadSelectedLogprob(nn.Module):
                 local_weight,
                 effective_A,
                 effective_B,
+                self.scaling,
             ).contiguous()
             full_reference_logits = _rank_order_vocab_all_gather(
                 local_reference_logits,
@@ -834,6 +846,7 @@ class Glm52ExactTP16LmHeadSelectedLogprob(nn.Module):
             effective_A,
             effective_B,
             local_grad_logits,
+            scaling=self.scaling,
             needs_input_grad=needs_input_grad,
         )
         if grad_hidden is not None:
@@ -899,7 +912,7 @@ class Glm52ExactTP16LmHeadSelectedLogprob(nn.Module):
     def extra_repr(self) -> str:
         return (
             f"tp_rank={self.shard.tp_rank}, vocab=[{self.shard.vocab_start},{self.shard.vocab_end}), "
-            "rank=1, alpha=1, temperature=1"
+            f"rank={self.max_lora_rank}, alpha={self.lora_alpha}, temperature=1"
         )
 
 

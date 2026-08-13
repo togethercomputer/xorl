@@ -32,7 +32,11 @@ from xorl.distributed.parallel_state import get_parallel_state
 from xorl.lora.target_manifest import load_lora_target_manifest
 from xorl.lora.utils import get_lora_state_dict, save_lora_checkpoint
 from xorl.models import save_model_weights
-from xorl.models.exact_contract import contains_glm52_exact_active_lora_component
+from xorl.models.exact_contract import (
+    contains_dsv4_exact_active_lora_component,
+    contains_glm52_exact_active_lora_component,
+    contains_glm52_fullparam_component,
+)
 from xorl.server.runner.adapters.manager import save_adapter_optimizer_shards
 from xorl.server.session_spec import write_session_spec
 from xorl.utils import helper
@@ -285,12 +289,41 @@ class CheckpointManager:
             self._require_collective_adapter_publication(model_id, strict=False)
 
     def _require_factor_only_exact_active_lora(self, operation: str) -> None:
+        if contains_dsv4_exact_active_lora_component(self.model):
+            raise RuntimeError(
+                "DSV4-Flash exact active-LoRA requires factor-only adapter publication; "
+                f"{operation} cannot materialize a merged/full-weight snapshot. Export all 948 factors "
+                "as dsv4_expert_banks and load a fresh sampler adapter version."
+            )
         if contains_glm52_exact_active_lora_component(self.model):
             raise RuntimeError(
                 "GLM-5.2 exact active-LoRA composites require factor-only adapter publication; "
                 f"{operation} cannot materialize a merged/full-weight snapshot. Export the complete 1,700-factor "
                 "adapter and start a fresh sampler adapter lifecycle."
             )
+
+    def _require_glm52_fullparam_payload_export(self, operation: str) -> None:
+        train_config = getattr(self, "train_config", {}) or {}
+        if (
+            isinstance(train_config, dict) and train_config.get("glm52_fullparam_fp8_training")
+        ) or contains_glm52_fullparam_component(self.model):
+            raise RuntimeError(
+                "GLM-5.2 full-parameter block-FP8 training must publish the checksummed step-boundary "
+                f"payload; {operation} cannot expose internal masters/caches or materialize a legacy "
+                "full-weight snapshot."
+            )
+
+    def _resolve_lora_export_format(self, *, moe_hybrid: bool = False) -> str:
+        """Resolve the configured adapter format and enforce exact DSV4 banks."""
+        export_format = self.lora_config.get(
+            "lora_export_format",
+            "sglang_shared_outer" if moe_hybrid else "peft",
+        )
+        if contains_dsv4_exact_active_lora_component(self.model) and export_format != "dsv4_expert_banks":
+            raise RuntimeError(
+                "DSV4-Flash exact active-LoRA publication requires lora_export_format='dsv4_expert_banks'"
+            )
+        return export_format
 
     @staticmethod
     def _infer_lora_rank_dim(name: str, tensor: torch.Tensor) -> Optional[int]:
@@ -357,7 +390,7 @@ class CheckpointManager:
             target_modules, lora_alpha = self._get_lora_save_config()
             adapter_session_spec = None
             adapter_rank = self.lora_config.get("lora_rank", 32)
-            lora_export_format = self.lora_config.get("lora_export_format", "peft")
+            lora_export_format = self._resolve_lora_export_format()
             if self._adapter_manager is not None and model_id in self._adapter_manager.adapters:
                 adapter_session_spec = self._adapter_manager.get_adapter_session_spec(model_id)
                 adapter_rank = adapter_session_spec["lora_config"]["lora_rank"]
@@ -407,10 +440,7 @@ class CheckpointManager:
                 # configured export format through (falls back to shared_outer when
                 # hybrid-shared MoE LoRA is enabled, else PEFT).
                 moe_hybrid = self.lora_config.get("moe_hybrid_shared_lora", False)
-                export_format = self.lora_config.get(
-                    "lora_export_format",
-                    "sglang_shared_outer" if moe_hybrid else "peft",
-                )
+                export_format = self._resolve_lora_export_format(moe_hybrid=moe_hybrid)
                 save_lora_checkpoint(
                     model=self.model,
                     save_path=save_path,
@@ -551,6 +581,7 @@ class CheckpointManager:
         Returns:
             Dictionary mapping parameter names to tensors (on CPU)
         """
+        self._require_glm52_fullparam_payload_export("extract_model_weights")
         self._require_current_adapter_weight_publication()
         # For FSDP2, use the proper distributed checkpoint API to get full state dict
         state_dict_options = StateDictOptions(
@@ -582,6 +613,7 @@ class CheckpointManager:
             Dictionary mapping parameter names to full tensors (on CPU), only on rank 0.
             Other ranks return empty dict after participating in collective ops.
         """
+        self._require_glm52_fullparam_payload_export("extract_full_weights_with_ep")
         ps = get_parallel_state()
 
         if ps.ep_enabled:
@@ -683,6 +715,7 @@ class CheckpointManager:
             Dictionary with save status, path, and number of shards
         """
         self._require_factor_only_exact_active_lora("save_full_weights")
+        self._require_glm52_fullparam_payload_export("save_full_weights")
         ps = get_parallel_state()
 
         # Use distributed writing only if we have multiple nodes and EP is enabled
@@ -731,18 +764,31 @@ class CheckpointManager:
             self.model.get_checkpoint_handler() if hasattr(self.model, "get_checkpoint_handler") else None
         )
 
-        # save_model_weights handles dtype conversion, sharding, and index.json
-        save_model_weights(
-            output_dir=output_path,
-            state_dict=state_dict,
-            global_rank=self.rank,
-            save_dtype=dtype,
-            checkpoint_handler=checkpoint_handler,
-        )
+        # extract_model_weights() returns the complete CPU state only on rank 0.
+        # Let that rank write without save_model_weights()'s per-shard distributed
+        # barriers; non-writer ranks have no shard map with which to rendezvous.
+        # Coordinate rank-local I/O failures before the completion barrier so a
+        # writer exception cannot strand every peer there.
+        local_error = None
+        try:
+            if self.rank == 0:
+                save_model_weights(
+                    output_dir=output_path,
+                    state_dict=state_dict,
+                    global_rank=None,
+                    save_dtype=dtype,
+                    checkpoint_handler=checkpoint_handler,
+                )
 
-        # Copy config files from base model (server-specific)
-        if self.rank == 0 and base_model_path and os.path.isdir(base_model_path):
-            self._copy_model_configs(output_path, base_model_path)
+                if base_model_path and os.path.isdir(base_model_path):
+                    self._copy_model_configs(output_path, base_model_path)
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Failed to save full weights to %s: %s", output_path, exc, exc_info=True)
+            local_error = str(exc)
+
+        synced_error = self._sync_collective_error(local_error)
+        if synced_error:
+            raise RuntimeError(f"Full-weight save failed: {synced_error}")
 
         save_time = time.time() - start_time
 
@@ -1253,6 +1299,7 @@ class CheckpointManager:
             Dictionary with save status
         """
         self._require_factor_only_exact_active_lora("legacy save_weights_for_sampler")
+        self._require_glm52_fullparam_payload_export("legacy save_weights_for_sampler")
         start_time = time.time()
 
         # Convert distributed checkpoint to state dict

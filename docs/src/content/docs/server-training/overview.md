@@ -15,7 +15,7 @@ Online RL requires a **training server**, an **inference server**, and an **orch
 1. **Generate rollouts** — send prompts to xorl-sglang via `xorl_client.SamplingClient`. Returns completions + per-token logprobs.
 2. **Score** — your reward model / verifier / environment scores the rollouts.
 3. **Train** — pack scored rollouts into `Datum` objects, call `forward_backward()` + `optim_step()` on the xorl training server.
-4. **Sync weights** — broadcast updated weights to xorl-sglang via NCCL. KV cache is flushed automatically.
+4. **Sync weights** — transfer updated weights to xorl-sglang using the configured NCCL or P2P backend. Cache invalidation follows the request policy and receiver metadata; it is not unconditional. Although XoRL contains a sparse-delta sender, the pinned xorl-sglang revision has no matching receiver.
 5. **Repeat** with the updated policy.
 
 | Component | Provided by | Description |
@@ -46,7 +46,6 @@ CUDA_VISIBLE_DEVICES=4 python -m sglang.launch_server \
     --port 30000 \
     --tp-size 1 \
     --rl-on-policy-target xorl \
-    --enable-fp32-router \
     --enable-fp32-lm-head
 ```
 

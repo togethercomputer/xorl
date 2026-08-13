@@ -11,6 +11,8 @@ xorl supports multiple loss functions for SFT and RL training, configured via th
 | SFT / continued pretraining | `causallm_loss` | — | Standard next-token prediction |
 | PPO | `policy_loss` | `eps_clip=0.2` | Clipped policy gradient, most stable for RL |
 | GRPO (simpler RL) | `importance_sampling` | — | No clipping, simpler but less stable |
+| DR-GRPO | `drgrpo` | `clip_low`, `clip_high`, `beta` | Clipped policy loss with optional reference KL |
+| Online policy distillation | `opd_loss` | Server OPD configuration | Full-vocabulary or sampled-token teacher/student KL |
 | PPO + stale data correction | `policy_loss` | `use_tis=True` | Multiple epochs over same rollout |
 
 ---
@@ -31,7 +33,7 @@ Full PPO-style clipped policy gradient loss ([source](https://github.com/togethe
 
 ```
 ratio = exp(new_logprobs - old_logprobs)
-pg_loss = max(ratio × A, clip(ratio, 1-ε, 1+ε_high) × A)
+pg_loss = max(-ratio × A, -clip(ratio, 1-ε, 1+ε_high) × A)
 ```
 
 **Parameters:**
@@ -104,13 +106,13 @@ tis_weight = clip(exp(train_logprobs - rollout_logprobs), tis_clip_low, tis_clip
 loss = (tis_weight × pg_loss).mean()
 ```
 
-Requires passing `rollout_logprobs` separately from `logprobs`:
+Requires passing the last-train-step `logprobs` separately from the fixed decision-time `rollout_logprobs`:
 
 ```python
 datum = xorl_client.Datum(
     model_input=xorl_client.ModelInput.from_ints(token_ids),
     loss_fn_inputs={
-        "labels": token_ids,
+        "target_tokens": target_tokens,
         "logprobs": logprobs_at_last_train_step,
         "rollout_logprobs": logprobs_at_rollout,    # fixed from inference
         "advantages": advantages,
@@ -128,13 +130,13 @@ fwd = client.forward_backward([datum], loss_fn="policy_loss", loss_fn_params={
 
 ## R3 — Routing Replay for MoE
 
-For MoE models, R3 replays expert routing decisions from inference during training to ensure gradient consistency. Pass routing data from xorl-sglang on each `Datum`:
+For MoE models, R3 replays exported expert choices during the route-conditioned trainer computation. This fixes the route used for that computation; it does not independently prove trainer/sampler logprob equality, gradient correctness, or a zero-K3 revision pair. Pass routing data from xorl-sglang on each `Datum`:
 
 ```python
 datum = xorl_client.Datum(
     model_input=xorl_client.ModelInput.from_ints(token_ids),
     loss_fn_inputs={
-        "labels": token_ids,
+        "target_tokens": target_tokens,
         "logprobs": rollout_logprobs,
         "advantages": advantages,
     },
@@ -144,6 +146,6 @@ datum = xorl_client.Datum(
 fwd = client.forward_backward([datum], loss_fn="policy_loss")
 ```
 
-The current `xorl-client` SDK only exposes `routed_experts`. The server can also consume `routed_expert_logits`, but that field is not yet wired through `Datum` / `TrainingClient`.
+The current `xorl-client` SDK only exposes `routed_experts`. The server can also consume `routed_expert_logits`, but that field is not yet wired through `Datum` / `TrainingClient`. Treat route replay support and end-to-end train/serve parity qualification as separate claims.
 
 See the [Router page](/xorl/moe/router/#routing-replay-r3) for details on how R3 works, and the [xorl-sglang page](/xorl/server-training/sglang/) for how routing data is exported from inference.

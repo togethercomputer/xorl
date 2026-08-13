@@ -10,14 +10,14 @@ Select the expert compute backend via `moe_implementation`. This controls which 
 
 | Backend | Kernel | EP compatible | torch.compile | LoRA | Notes |
 |---|---|---|---|---|---|
-| `triton` | Triton `group_gemm_same_nk` | Yes | Partial† | Yes | Recommended for Hopper. Autotuned; works with moe_act |
-| `quack` | Quack custom CUDA extension | Yes | No | Limited | Pairs well with DeepEP; custom CUDA kernels not compilable |
-| `native` | `torch._grouped_mm` | Yes | Yes (full) | Yes | No custom deps; slightly slower than triton on Hopper |
-| `eager` | Python loop + `index_add_` | No (ep_size=1 only) | Yes | Yes | Debugging only; slowest but simplest |
+| `triton` | Triton `group_gemm_same_nk` | Yes | Partial† | Yes | Triton grouped GEMM; works with recompute paths |
+| `quack` | CuTe DSL kernels | Yes | No | Yes | SM90/SM100 kernels; optional package availability is checked at runtime |
+| `native` | `torch._grouped_mm` | Yes | Yes (compute path) | Yes | PyTorch grouped GEMM, without the Quack extension |
+| `eager` | Per-expert PyTorch matmuls | Yes | Yes | Yes | Reference/debugging path; EP uses the registered eager EP compute function |
 
 ```yaml
 model:
-  moe_implementation: triton   # recommended for H100
+  moe_implementation: triton   # example; benchmark against native/quack for the target shape
 ```
 
 †Triton: The `group_gemm_same_nk` kernel is compatible with `torch.compile`. However, EP dispatch/combine (AllToAll, DeepEP) is **excluded from compile graphs** because it involves dynamic shapes (variable token counts per rank per step).
@@ -54,9 +54,9 @@ Enable autotuning only when shapes are stable (e.g. evaluation with fixed batch 
 XORL_QUACK_TUNED=1 torchrun ... -m xorl.cli.train config.yaml
 ```
 
-### Full feature matrix
+### Registered training variants
 
-Quack has dedicated kernel variants for every training mode:
+The current registries expose these Quack variants. This table does not imply support for every dtype, architecture, quantization, or topology combination:
 
 | Variant | Class / Function | Use case |
 |---|---|---|
@@ -69,7 +69,7 @@ Quack has dedicated kernel variants for every training mode:
 
 ### Pairing with DeepEP
 
-Quack and DeepEP are both optimized for H100 NVLink clusters and complement each other well: DeepEP handles the token dispatch/combine with dedicated SM kernels, while Quack handles the expert FFN compute with persistent CuTe kernels. Combining them maximizes utilization of both the NVLink interconnect and the SM compute fabric.
+Quack handles expert FFN compute while DeepEP handles dispatch/combine, so they can be evaluated together on supported H100-class deployments. Their SM allocations compete, however; compare this pairing with Quack + AllToAll and with other expert backends on the same model and token shape.
 
 ```yaml
 model:
@@ -82,7 +82,7 @@ model:
 
 - **Requires SM90+ (H100) or SM100+ (B200)** — not available on A100 or older
 - **Not compatible with `torch.compile`** — custom CUDA/CuTe extensions cannot be traced
-- **LoRA support is limited** — `moe_hybrid_shared_lora` is not supported; use `triton` or `native` for hybrid shared LoRA
+- **Capability checks still apply** — LoRA and hybrid shared-LoRA paths are registered, but dtype, quantization, architecture, and dispatch combinations can impose narrower constraints
 - **Autotuning disabled by default** — variable token counts make per-step autotuning prohibitively slow
 
 ---
@@ -172,7 +172,7 @@ The core of the `triton` backend is [`src/xorl/ops/group_gemm/kernel/group_gemm.
 - EP dispatch/combine collectives (`alltoall_pre_dispatch`, `alltoall_post_combine`, DeepEP `dispatch`/`combine`) — dynamic shapes from variable per-rank token counts break static graph tracing
 - Routing replay record/replay logic — mutable external state, decorated with `@torch.compiler.disable`
 
-**Recommended config:**
+**Example compile config:**
 
 ```yaml
 model:
@@ -191,16 +191,14 @@ The `native` backend (`torch._grouped_mm`) compiles cleanly end-to-end. The `qua
 
 ### Methods
 
-| Method | Backward recomputes | EP comm recomputed | Peak mem (32k) | Throughput |
-|---|---|---|---|---|
-| `recompute_full_layer` (default) | Entire decoder layer | **Yes** — full AllToAll re-executed | 37.5 GB (1N) / 21.2 GB (2N) | baseline |
-| `recompute_before_dispatch` | Attn + router only; keeps dispatch + expert + combine | **No** | 54.8 GB (1N) / 46.6 GB (2N) | **+24.5% (1N) / +33.4% (2N)** |
-| `no_recompute` | Nothing | **No** | highest | max throughput |
-
-*Benchmarks: Qwen3-Coder-30B-A3B, quack + alltoall, 32k seq, H100 80GB. 1N = 1-node EP8, 2N = 2-node EP16.*
+| Method | Backward recomputes | EP comm recomputed | Retained activation state |
+|---|---|---|---|
+| `recompute_full_layer` (default) | Entire decoder layer | **Yes** — dispatch/combine are replayed | lowest |
+| `recompute_before_dispatch` | Attention + router only; retains dispatch + expert + combine | **No** | higher |
+| `no_recompute` | Nothing | **No** | highest |
 
 ```yaml
-# Maximum throughput (short seq, memory permits):
+# No-recompute candidate (use only after a shape-matched fit check):
 train:
   enable_gradient_checkpointing: true
   gradient_checkpointing_method: no_recompute
@@ -210,7 +208,7 @@ train:
   enable_gradient_checkpointing: true
   gradient_checkpointing_method: recompute_before_dispatch
 
-# Maximum memory savings (long seq, required for 128k):
+# Lowest retained-activation state (start here for memory-constrained runs):
 train:
   enable_gradient_checkpointing: true
   gradient_checkpointing_method: recompute_full_layer
@@ -222,16 +220,11 @@ In the expert MLP forward: `gate_output = x @ gate_proj`, `up_output = x @ up_pr
 
 With `recompute_before_dispatch`, the attention and router outputs are recomputed in backward, but **MoE dispatch and combine are not recomputed**. This avoids re-executing AllToAll communication, which is the dominant cost at multi-node.
 
-The elementwise recompute (`postact = silu(gate_output) * up_output`) has ~0% overhead — confirmed by benchmarks showing `recompute_before_dispatch` within 0.2% of no-checkpointing speed.
+The retained tensors and avoided work differ by model and backend. Measure peak memory and end-to-end step time at the intended sequence length before changing the default.
 
-### Why the speedup grows with node count
+### Why topology matters
 
-| Scale | recompute_full_layer | recompute_before_dispatch | Speedup |
-|---|---|---|---|
-| 1-node EP8 (NVLink) | 17,542 tok/s | 21,851 tok/s | +24.5% |
-| 2-node EP16 (InfiniBand) | 20,586 tok/s | 27,470 tok/s | +33.4% |
-
-At 2-node, dispatch/combine crosses InfiniBand (~100 Gbps) instead of NVLink (~900 Gbps). `recompute_full_layer` recomputes both dispatch and combine in backward — doubling the IB communication. `recompute_before_dispatch` avoids this entirely.
+`recompute_full_layer` replays dispatch and combine during backward; `recompute_before_dispatch` retains their outputs instead. Avoiding that replay can matter more when EP communication crosses nodes, but the result depends on fabric, token balance, overlap, retained-memory pressure, and expert-kernel cost. Treat the choice as a measured memory/throughput tradeoff rather than a fixed speedup.
 
 ---
 

@@ -16,6 +16,8 @@ class FLACPContext:
     group: dist.ProcessGroup | None = None
     cu_seqlens: torch.Tensor | None = None
     cu_seqlens_cpu: torch.Tensor | None = None
+    global_cu_seqlens: torch.Tensor | None = None
+    global_cu_seqlens_cpu: torch.Tensor | None = None
     is_last_rank: bool | None = None
     pre_num_ranks: int | None = None
     is_first_rank: bool | None = None
@@ -28,6 +30,10 @@ class FLACPContext:
             group=self.group,
             cu_seqlens=self.cu_seqlens.clone() if self.cu_seqlens is not None else None,
             cu_seqlens_cpu=self.cu_seqlens_cpu.clone() if self.cu_seqlens_cpu is not None else None,
+            global_cu_seqlens=(self.global_cu_seqlens.clone() if self.global_cu_seqlens is not None else None),
+            global_cu_seqlens_cpu=(
+                self.global_cu_seqlens_cpu.clone() if self.global_cu_seqlens_cpu is not None else None
+            ),
             is_last_rank=self.is_last_rank,
             pre_num_ranks=self.pre_num_ranks,
             is_first_rank=self.is_first_rank,
@@ -104,6 +110,8 @@ def get_cp_cu_seqlens(
         group=group,
         cu_seqlens=local_cu_seqlens_gpu,
         cu_seqlens_cpu=local_cu_seqlens_cpu,
+        global_cu_seqlens=cu_seqlens,
+        global_cu_seqlens_cpu=cu_seqlens_cpu,
         is_last_rank=is_last_rank,
         pre_num_ranks=pre_num_ranks,
         is_first_rank=is_first_rank,

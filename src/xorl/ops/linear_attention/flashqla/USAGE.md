@@ -65,8 +65,8 @@ uv pip install \
 ```
 
 Notes:
-- The wheel is `cp38-abi3` → installs on the repo's Python 3.12. CUDA 13.1 build, runs against
-  the cu129 torch / cu131 H100 runtimes.
+- The wheel is `cp38-abi3` → installs on the repo's Python 3.12 and is used by the supported
+  trainer and serving H100 runtime profiles.
 - `z3-solver` is pulled transitively (tilelang needs `libz3.so.4.15`). If you hit
   `libz3.so.4.15: cannot open shared object file`, confirm `z3-solver` installed; in a
   uv-managed env it resolves automatically (no `LD_LIBRARY_PATH` hack needed).

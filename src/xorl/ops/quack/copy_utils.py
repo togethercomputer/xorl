@@ -1,22 +1,21 @@
 # Copyright (c) 2025-2026, QuACK team.
 
-from typing import Optional, Type, Tuple, Callable, Sequence
 from functools import partial
+from typing import Callable, Optional, Sequence, Tuple, Type
 
 import cutlass
 import cutlass.cute as cute
-
-from cutlass import Int32, Int16, Boolean, const_expr
+import cutlass.pipeline
+from cutlass import Boolean, Int16, Int32, const_expr
+from cutlass._mlir import ir
+from cutlass._mlir.dialects import cute_nvgpu as _cute_nvgpu_ir
+from cutlass._mlir.dialects import llvm
 from cutlass.base_dsl.arch import Arch
 from cutlass.cute.nvgpu import cpasync, tcgen05, warp, warpgroup
 from cutlass.cute.nvgpu.tcgen05.mma import CtaGroup  # noqa
 from cutlass.cutlass_dsl import dsl_user_op
-import cutlass.pipeline
-from cutlass._mlir.dialects import llvm
-from cutlass._mlir import ir
-from cutlass._mlir.dialects import cute_nvgpu as _cute_nvgpu_ir
-
 from quack import layout_utils
+
 from .utils import make_vector
 
 
@@ -58,8 +57,9 @@ def sr_cvt_copy(
 ) -> None:
     """Like cvt_copy but uses stochastic rounding for FP32 -> BF16 conversion."""
     assert isinstance(src.iterator, cute.Pointer) and src.memspace == cute.AddressSpace.rmem
-    from .rounding import convert_f32_to_bf16_sr
-    from cutlass.cute.tensor import TensorSSA
+    from cutlass.cute.tensor import TensorSSA  # noqa: PLC0415
+
+    from .rounding import convert_f32_to_bf16_sr  # noqa: PLC0415
 
     src_cvt = cute.make_rmem_tensor_like(src, dst.element_type)
     src_vec = src.load()
@@ -330,7 +330,7 @@ def as_position_independent_swizzle_tensor(tensor: cute.Tensor) -> cute.Tensor:
 
 
 def partition_D_position_independent(
-    thr_copy: cute.core.ThrCopy, tensor: cute.Tensor
+    thr_copy: cute.ThrCopy, tensor: cute.Tensor
 ) -> cute.Tensor:
     return cute.make_tensor(
         swizzle_ptr(thr_copy.partition_D(tensor).iterator),
@@ -339,7 +339,7 @@ def partition_D_position_independent(
 
 
 def partition_S_position_independent(
-    thr_copy: cute.core.ThrCopy, tensor: cute.Tensor
+    thr_copy: cute.ThrCopy, tensor: cute.Tensor
 ) -> cute.Tensor:
     return cute.make_tensor(
         swizzle_ptr(thr_copy.partition_S(tensor).iterator),

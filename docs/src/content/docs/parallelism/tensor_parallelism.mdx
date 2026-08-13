@@ -548,7 +548,7 @@ train:
   pipeline_parallel_schedule: 1F1B
   data_parallel_shard_size: 2       # 2 TP × 2 PP × 2 FSDP = 8 GPUs
   data_parallel_replicate_size: 1
-  gradient_accumulation_steps: 2    # >= pipeline_parallel_size
+  gradient_accumulation_steps: 2    # more micro-batches reduce the 1F1B bubble
   init_device: meta
 ```
 
@@ -582,7 +582,7 @@ TP is best used **within a single node** (NVLink bandwidth). Cross-node TP is ge
 Use PP when:
 - The model is too large to fit even with FSDP2 + TP on a single node.
 - You are distributing across nodes and want to minimize cross-node communication (PP only sends activations between adjacent stages, which is a small `[B, S, H]` tensor rather than full parameter shards).
-- You have a large number of gradient accumulation steps (PP requires `gradient_accumulation_steps >= pipeline_parallel_size`; more steps means better pipeline utilization).
+- You have enough gradient accumulation steps for the chosen PP schedule; additional micro-batches generally improve pipeline utilization.
 
 ### Combining TP + FSDP2 vs. pure FSDP2
 

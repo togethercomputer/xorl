@@ -118,7 +118,10 @@ def sync_lm_head_tp_parameters(
         if lm_head_tp_group is not None and dist.get_world_size(lm_head_tp_group) > 1:
             exact_src = _group_root_rank(lm_head_tp_group)
             for module in model.modules():
-                if not getattr(module, "_glm52_exact_tp16_lm_head", False):
+                if not (
+                    getattr(module, "_glm52_exact_tp16_lm_head", False)
+                    or getattr(module, "_dsv4_exact_tp8_lm_head", False)
+                ):
                     continue
                 parameter = getattr(module, "lora_A", None)
                 if parameter is None or (DTensor is not None and isinstance(parameter, DTensor)):
@@ -138,7 +141,7 @@ def sync_lm_head_tp_parameters(
 
 def clip_gradients(
     model: "torch.nn.Module | List[torch.nn.Module]",
-    max_grad_norm: float,
+    max_grad_norm: float | None,
     pp_enabled: bool = False,
     pp_group=None,
 ) -> float:
@@ -154,6 +157,11 @@ def clip_gradients(
     Returns:
         Scalar grad_norm value.
     """
+    if max_grad_norm is None:
+        raise ValueError(
+            "max_grad_norm must be configured for single-model optimizer steps; "
+            "use a finite value <= 0 to disable clipping"
+        )
     if max_grad_norm <= 0:
         return 0.0
 
@@ -177,7 +185,7 @@ def clip_gradients(
     return grad_norm
 
 
-def get_effective_grad_clip_value(max_grad_norm: float, *, use_distsignsgd: bool) -> float:
+def get_effective_grad_clip_value(max_grad_norm: float | None, *, use_distsignsgd: bool) -> float:
     """Return the clipping threshold to use for the current optimizer path.
 
     Non-positive ``max_grad_norm`` disables local-training gradient clipping.
@@ -193,6 +201,11 @@ def get_effective_grad_clip_value(max_grad_norm: float, *, use_distsignsgd: bool
     not a true gradient magnitude — its scale tracks `sqrt(num_params)` and
     voter agreement, not the underlying loss landscape.
     """
+    if max_grad_norm is None:
+        raise ValueError(
+            "max_grad_norm must be configured for single-model optimizer steps; "
+            "use a finite value <= 0 to disable clipping"
+        )
     if use_distsignsgd:
         return float("inf")
     return max_grad_norm
@@ -471,6 +484,16 @@ def make_pp_loss_fn(ce_mode: str = "compiled", lm_head=None):
             return _pp_quack_linear_ce_sum(hidden, labels, lm_head=lm_head)
 
         return _quack_loss
+    if ce_mode == "bi_fused":
+        # Exact lanes fail closed instead of silently training through a
+        # different head program: the PP loss variants above are not the
+        # bi_fused batch-invariant lm-head value program. PP supports bi_fused
+        # only on the forward/scoring surface (forward_only_pp +
+        # causallm_loss_function).
+        raise NotImplementedError(
+            "ce_mode='bi_fused' has no pipeline-parallel training-loss path yet; "
+            "refusing to substitute a different lm-head program under PP."
+        )
     raise ValueError(f"Unknown ce_mode: {ce_mode!r} (expected 'eager', 'compiled', or 'quack_linear')")
 
 

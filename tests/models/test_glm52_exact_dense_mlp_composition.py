@@ -8,12 +8,7 @@ from xorl.models.transformers.glm5.exact_gate_up_qlora import (
     Glm52ExactTP1FusedGateUpBlockFP8QLoRA,
 )
 from xorl.models.transformers.glm5.exact_qlora import Glm52ExactTP1BlockFP8QLoRALinear
-from xorl.ops.fused_silu_and_mul import (
-    fused_silu_and_mul,
-)
-from xorl.ops.fused_silu_and_mul import (
-    silu_and_mul_backward as fused_silu_and_mul_backward,
-)
+from xorl.ops.fused_silu_and_mul import exact_fp32_silu_and_mul
 
 
 def _pattern(
@@ -99,6 +94,7 @@ def test_official_tp1_dense_vertical_composition_bytes_and_manual_vjp() -> None:
     from sglang.kernels.ops.gemm.gate_up_lora_b import gate_up_lora_b_fwd
     from sglang.kernels.ops.gemm.sgemm_lora_a import sgemm_lora_a_fwd
     from sglang.kernels.ops.gemm.sgemm_lora_b import sgemm_lora_b_fwd
+    from sglang.srt.batch_invariant_ops.bi_silu_and_mul import fp32_silu_and_mul
     from sglang.srt.layers.quantization.fp8_utils import triton_w8a8_block_fp8_linear
     from sglang.srt.lora.utils import LoRABatchInfo
 
@@ -171,7 +167,7 @@ def test_official_tp1_dense_vertical_composition_bytes_and_manual_vjp() -> None:
 
     trainer_gate_up = gate_up(input)
     trainer_gate_up.retain_grad()
-    trainer_activation = fused_silu_and_mul(trainer_gate_up)
+    trainer_activation = exact_fp32_silu_and_mul(trainer_gate_up)
     trainer_activation.retain_grad()
     trainer_output = down(trainer_activation)
 
@@ -228,9 +224,10 @@ def test_official_tp1_dense_vertical_composition_bytes_and_manual_vjp() -> None:
             intermediate_size,
             base_output=raw_gate_up_base.clone(),
         )
-        # S4's exact SiluAndMul.forward_native is this literal two-operation
-        # expression, including the BF16 SiLU store before multiplication.
-        raw_activation = F.silu(raw_gate_up[:, :intermediate_size]) * raw_gate_up[:, intermediate_size:]
+        # S4's exact mode resolves SiluAndMul.forward_exact to the one-round
+        # FP32 SwiGLU (fp32_silu_and_mul, xorl-sglang f10b907d8); the raw
+        # oracle uses serving's own op so the pair cannot self-confirm.
+        raw_activation = fp32_silu_and_mul(raw_gate_up)
         raw_down_base = triton_w8a8_block_fp8_linear(
             raw_activation,
             raw_down_weight,
@@ -267,12 +264,16 @@ def test_official_tp1_dense_vertical_composition_bytes_and_manual_vjp() -> None:
         final_grad,
         needs_input_grad=(True, True, True),
     )
-    # Match the BF16 activation-storage boundary traversed by autograd before
-    # invoking the production fused activation's backward kernel.
-    manual_gate_up_grad = fused_silu_and_mul_backward(
-        manual_activation_grad.to(trainer_activation.dtype),
-        trainer_gate_up.detach(),
-    )
+    # Match the BF16 activation-storage boundary traversed by autograd, then
+    # differentiate the exact one-round activation exactly as the trainer
+    # does: through exact_fp32_silu_and_mul's own autograd definition.
+    with torch.enable_grad():
+        manual_gate_up_leaf = trainer_gate_up.detach().requires_grad_(True)
+        (manual_gate_up_grad,) = torch.autograd.grad(
+            exact_fp32_silu_and_mul(manual_gate_up_leaf),
+            manual_gate_up_leaf,
+            grad_outputs=manual_activation_grad.to(trainer_activation.dtype),
+        )
     (
         manual_input_grad,
         manual_gate_A_grad,

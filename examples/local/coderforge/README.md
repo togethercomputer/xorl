@@ -25,12 +25,14 @@ Two configs for comparing loss curves across optimizers:
 
 **AdamW:**
 ```
-torchrun --nproc_per_node=8 --master_port=29501 -m xorl.cli.train configs/qwen3_8b/qwen3_8b_adamw.yaml
+torchrun --nproc_per_node=8 --master_port=29501 -m xorl.cli.train \
+  examples/local/coderforge/configs/qwen3_8b/qwen3_8b_adamw.yaml
 ```
 
 **Muon (bf16 optimizer states):**
 ```
-torchrun --nproc_per_node=8 --master_port=29501 -m xorl.cli.train configs/qwen3_8b/qwen3_8b_muon_bf16.yaml
+torchrun --nproc_per_node=8 --master_port=29501 -m xorl.cli.train \
+  examples/local/coderforge/configs/qwen3_8b/qwen3_8b_muon_bf16.yaml
 ```
 
 | Setting | AdamW | Muon bf16 |
@@ -47,7 +49,8 @@ torchrun --nproc_per_node=8 --master_port=29501 -m xorl.cli.train configs/qwen3_
 ### Qwen3-Coder-30B-A3B MoE (8 GPUs)
 
 ```
-torchrun --nproc_per_node=8 --master_port=29501 -m xorl.cli.train configs/qwen3_coder_30b_a3b/qwen3_coder_30b_a3b.yaml
+torchrun --nproc_per_node=8 --master_port=29501 -m xorl.cli.train \
+  examples/local/coderforge/configs/qwen3_coder_30b_a3b/qwen3_coder_30b_a3b.yaml
 ```
 
 | Setting | Value |
@@ -63,7 +66,8 @@ torchrun --nproc_per_node=8 --master_port=29501 -m xorl.cli.train configs/qwen3_
 ### Qwen3-32B (8 GPUs)
 
 ```
-torchrun --nproc_per_node=8 --master_port=29501 -m xorl.cli.train configs/qwen3_32b.yaml
+torchrun --nproc_per_node=8 --master_port=29501 -m xorl.cli.train \
+  examples/local/coderforge/configs/qwen3_32b.yaml
 ```
 
 ## Notes

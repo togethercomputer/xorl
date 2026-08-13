@@ -5,6 +5,7 @@ import warnings
 
 import torch
 
+from xorl.ops.linear_attention.modules.bi_contract import _is_gdn_contract_enabled
 from xorl.ops.linear_attention.modules.l2norm import l2norm_bwd, l2norm_fwd
 from xorl.ops.linear_attention.ops.common.chunk_delta_h import (
     chunk_gated_delta_rule_bwd_dhu,
@@ -13,6 +14,10 @@ from xorl.ops.linear_attention.ops.common.chunk_delta_h import (
 from xorl.ops.linear_attention.ops.common.chunk_o import chunk_bwd_dqkwg, chunk_bwd_dv_local, chunk_fwd_o
 from xorl.ops.linear_attention.ops.common.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from xorl.ops.linear_attention.ops.cp import FLACPContext
+from xorl.ops.linear_attention.ops.cp.chain import (
+    chain_post_scan_send,
+    chain_pre_scan_initial_state,
+)
 from xorl.ops.linear_attention.ops.cp.chunk_delta_h import (
     chunk_gated_delta_rule_bwd_dhu_pre_process,
     chunk_gated_delta_rule_fwd_h_pre_process,
@@ -59,7 +64,22 @@ def chunk_gated_delta_rule_fwd(
         cu_seqlens=cu_seqlens,
     )
 
-    if cp_context is not None:
+    exact_chain = cp_context is not None and _is_gdn_contract_enabled()
+    if exact_chain:
+        # The initial state is the previous rank's fp32 boundary state,
+        # received and receipt-validated by the canonical scan chain. It is
+        # not the (h_e, M) summary fold, which executes a different floating-
+        # point program from the U1 scan.
+        assert initial_state is None, "When enable CP, the provided initial_state must be None."
+        initial_state = chain_pre_scan_initial_state(
+            num_seqs=len(cu_seqlens) - 1 if cu_seqlens is not None else k.shape[0],
+            heads=k.shape[2],
+            key_dim=k.shape[3],
+            value_dim=u.shape[-1],
+            context=cp_context,
+            device=k.device,
+        )
+    elif cp_context is not None:
         initial_state = chunk_gated_delta_rule_fwd_h_pre_process(
             k=k,
             w=w,
@@ -76,9 +96,17 @@ def chunk_gated_delta_rule_fwd(
         u=u,
         g=g,
         initial_state=initial_state,
-        output_final_state=output_final_state,
+        output_final_state=output_final_state or (exact_chain and not cp_context.is_last_rank),
         cu_seqlens=cu_seqlens,
     )
+
+    if exact_chain:
+        if not cp_context.is_last_rank:
+            # Ship the LAST local sequence's fp32 final state onward
+            # (bit-exact capture of the running scan registers).
+            chain_post_scan_send(final_state, context=cp_context)
+        if not output_final_state:
+            final_state = None
 
     if cp_context is not None:
         initial_state = compress_h0(initial_state, context=cp_context)

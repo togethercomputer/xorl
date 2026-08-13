@@ -181,8 +181,11 @@ def test_routed_bank_contract_is_strict_rank_local_ep16_moe_tp1() -> None:
     assert tuple(module.down_proj_lora_A.shape) == (_GLOBAL_EXPERTS, _INTERMEDIATE, 1)
     assert tuple(module.down_proj_lora_B.shape) == (1, 1, _HIDDEN)
 
-    with pytest.raises(ValueError, match="rank=1 and alpha=1"):
-        Glm52ExactEP16BlockFP8QLoRARoutedExperts(_HIDDEN, _INTERMEDIATE, ep_rank=0, r=2)
+    rank_three = Glm52ExactEP16BlockFP8QLoRARoutedExperts(
+        _HIDDEN, _INTERMEDIATE, ep_rank=0, r=3, lora_alpha=7, device="meta"
+    )
+    assert rank_three.gate_proj_lora_A.shape[-1] == 3
+    assert rank_three.gate_proj_lora_B.shape[1] == 3
     with pytest.raises(ValueError, match="256 global experts"):
         Glm52ExactEP16BlockFP8QLoRARoutedExperts(
             _HIDDEN,
@@ -202,8 +205,10 @@ def test_routed_bank_contract_is_strict_rank_local_ep16_moe_tp1() -> None:
     with pytest.raises(ValueError, match=r"in \[0, 15\]"):
         Glm52ExactEP16BlockFP8QLoRARoutedExperts(_HIDDEN, _INTERMEDIATE, ep_rank=16)
     module.set_runtime_lora_config(1, 1)
-    with pytest.raises(ValueError, match="only lora_rank=1"):
-        module.set_runtime_lora_config(1, 2)
+    with pytest.raises(ValueError, match="positive integer rank"):
+        Glm52ExactEP16BlockFP8QLoRARoutedExperts(_HIDDEN, _INTERMEDIATE, ep_rank=0, r=0, device="meta")
+    with pytest.raises(ValueError, match="positive integer alpha"):
+        module.set_runtime_lora_config(1, 0)
 
 
 def test_one_batched_global_grid_proves_all_16_owner_by_16_slot_remaps() -> None:

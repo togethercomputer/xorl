@@ -316,14 +316,19 @@ def _fsdp2_reduce_group(
     if math.isinf(norm_type):
         val = _local_max(params)
         for _, group in reduce_groups:
-            if group is not None:
+            # ProcessGroupNCCL initializes communicators lazily.  A singleton
+            # mesh dimension has no remote contribution, so launching an
+            # all-reduce is both mathematically redundant and may allocate a
+            # large communicator at the optimizer boundary when memory is at
+            # its peak.
+            if group is not None and dist.get_world_size(group) > 1:
                 dist.all_reduce(val, op=dist.ReduceOp.MAX, group=group)
         return val
     else:
         p = float(norm_type)
         val = _local_pth_sum(params, p)
         for _, group in reduce_groups:
-            if group is not None:
+            if group is not None and dist.get_world_size(group) > 1:
                 dist.all_reduce(val, op=dist.ReduceOp.SUM, group=group)
         return val
 
