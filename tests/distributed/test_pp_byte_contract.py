@@ -135,6 +135,19 @@ def test_exact_contract_family_classification():
     assert exact_contract_family(lora_config) == "glm52"
 
 
+def test_exact_contract_family_prefers_resolution_time_stamp():
+    # A present stamp is authoritative, even when legacy flags disagree ...
+    assert (
+        exact_contract_family(SimpleNamespace(_exact_contract_family="qwen3_5_moe", _qwen35_exact_contract=False))
+        == "qwen3_5_moe"
+    )
+    # ... including a stamped None on a generic model.
+    assert exact_contract_family(SimpleNamespace(_exact_contract_family=None, _qwen35_exact_contract=True)) is None
+    # Unstamped configs (predating resolution-time stamping) keep the
+    # legacy-flag classification through the shared resolver.
+    assert exact_contract_family(SimpleNamespace(_qwen35_exact_contract=True)) == "qwen3_5_dense"
+
+
 # ---------------------------------------------------------------------------
 # Engagement and no-op behavior
 # ---------------------------------------------------------------------------

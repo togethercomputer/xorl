@@ -30,7 +30,7 @@ from typing import List, Optional, Sequence
 import torch
 import torch.nn as nn
 
-from xorl.models.exact_contract import glm52_exact_forward_enabled
+from xorl.models.exact_contract import resolve_exact_contract_family
 
 from ..utils import logging
 
@@ -70,14 +70,6 @@ PP_EXACT_REQUIRED_METADATA = (
 #: rounding boundary, gated by tests/distributed/test_pp_byte_alignment.py.
 _CERTIFIED_BOUNDARY_FAMILIES = frozenset({"qwen3_5_dense"})
 
-_QWEN35_MOE_MODEL_TYPES = frozenset(
-    {
-        "xorl_qwen3_5_moe",
-        "qwen3_5_moe",
-        "qwen3_5_moe_text",
-    }
-)
-
 #: The ONLY fp32 parameters admitted to ride along inside an otherwise-bf16
 #: stage, as (owner module class name, parameter attribute) pairs. The exact
 #: GDN deliberately pins its gating parameters to fp32 (its ``.to(bf16)``
@@ -90,23 +82,29 @@ _APPROVED_FP32_PIN_OWNERS = frozenset(
 )
 
 
+_UNSTAMPED = object()
+
+
 def exact_contract_family(config: object | None) -> Optional[str]:
     """Classify the exact value program selected by ``config``.
 
     Returns ``None`` for generic models (no byte contract claimed), otherwise
     one of ``"qwen3_5_dense"``, ``"qwen3_5_moe"``, ``"glm52"``.
+
+    Model resolution stamps ``config._exact_contract_family`` once; when the
+    stamp is present it is authoritative (including a stamped ``None`` for
+    generic models). Configs that predate stamping (for example direct
+    construction in tests) fall back to the shared legacy-flag resolver.
+    Admitting a new family is a registry change (stamp entry plus byte
+    evidence), not surgery on this classifier.
     """
 
     if config is None:
         return None
-    if glm52_exact_forward_enabled(config):
-        return "glm52"
-    if bool(getattr(config, "_qwen35_exact_contract", False)):
-        scope = getattr(config, "text_config", None) or config
-        if getattr(config, "model_type", None) in _QWEN35_MOE_MODEL_TYPES or getattr(scope, "num_experts", None):
-            return "qwen3_5_moe"
-        return "qwen3_5_dense"
-    return None
+    stamped = getattr(config, "_exact_contract_family", _UNSTAMPED)
+    if stamped is not _UNSTAMPED:
+        return stamped
+    return resolve_exact_contract_family(config)
 
 
 def _stage_layer_indices(module_names: Sequence[str], layer_prefix: str) -> List[int]:
