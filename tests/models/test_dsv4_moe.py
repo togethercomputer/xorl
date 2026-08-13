@@ -333,6 +333,107 @@ def test_exact_hash_route_disables_unarmed_pdl(monkeypatch):
     assert calls[0]["use_pdl"] is False
 
 
+@pytest.mark.parametrize("ep_rank", range(8))
+def test_exact_native_mlp_lora_is_live_on_every_ep_partial(monkeypatch, ep_rank):
+    from types import SimpleNamespace
+
+    import xorl.distributed.parallel_state as parallel_state_module
+    import xorl.models.layers.moe.dsv4_native_combine as combine_module
+    import xorl.models.transformers.deepseek_v4.native_payload as payload_module
+    from xorl.models.transformers.deepseek_v4.modeling_deepseek_v4 import (
+        DeepseekV4MoE,
+    )
+
+    observed = {}
+    row_counts = tuple(int(rank == ep_rank) for rank in range(8))
+
+    class _RecordingExperts:
+        def __call__(
+            self,
+            hidden_states,
+            routing_weights,
+            selected_experts,
+            **kwargs,
+        ):
+            observed["routed"] = kwargs["dsv4_exact_lora_live"]
+            return torch.zeros_like(hidden_states)
+
+    def _gather_one_rank(rows, _group, _padded_rows):
+        gathered = rows.new_zeros((8, *rows.shape[1:]))
+        gathered[ep_rank : ep_rank + 1] = rows
+        return gathered
+
+    def _shared_partial(hidden_states, _module, **kwargs):
+        observed["shared"] = kwargs["lora_live"]
+        return torch.zeros_like(hidden_states)
+
+    fake_moe = SimpleNamespace(
+        is_hash_layer=False,
+        layer_id=0,
+        num_experts=256,
+        experts=_RecordingExperts(),
+        shared_experts=object(),
+        routed_scaling_factor=1.5,
+        _capture_diagnostic_component=lambda *_args: None,
+        route=lambda hidden_states, input_ids=None: (
+            torch.ones(hidden_states.shape[0], 6),
+            torch.zeros(hidden_states.shape[0], 6, dtype=torch.int32),
+            torch.zeros(hidden_states.shape[0], 256),
+        ),
+    )
+    parallel_state = SimpleNamespace(
+        ep_group=object(),
+        ep_size=8,
+        ep_rank=ep_rank,
+    )
+
+    monkeypatch.setattr(
+        parallel_state_module,
+        "get_parallel_state",
+        lambda: parallel_state,
+    )
+    monkeypatch.setattr(
+        combine_module,
+        "row_counts_for_ep_combine",
+        lambda *_args: row_counts,
+    )
+    monkeypatch.setattr(
+        combine_module,
+        "gather_tokens_for_ep_combine",
+        _gather_one_rank,
+    )
+    monkeypatch.setattr(
+        combine_module,
+        "gather_ids_for_ep_combine",
+        _gather_one_rank,
+    )
+    monkeypatch.setattr(
+        combine_module,
+        "exchange_variable_and_canonical_fold",
+        lambda partial, *_args: partial,
+    )
+    monkeypatch.setattr(
+        payload_module,
+        "dsv4_native_shared_expert_tp_partial",
+        _shared_partial,
+    )
+    monkeypatch.setattr(
+        payload_module,
+        "dsv4_join_routed_shared_partial",
+        lambda routed, shared, **_kwargs: routed + shared,
+    )
+
+    output, _ = DeepseekV4MoE._forward_exact_native(
+        fake_moe,
+        torch.ones(1, 1, 4),
+        torch.ones(1, 1, dtype=torch.long),
+        live_token_count=1,
+    )
+
+    assert output.shape == (1, 1, 4)
+    assert observed == {"routed": True, "shared": True}
+
+
 # ---------------------------------------------------------------------------
 # Routing-replay × hash-routed layer
 # ---------------------------------------------------------------------------

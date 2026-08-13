@@ -975,10 +975,9 @@ class _Dsv4NativeMxfp4RoutedFunction(torch.autograd.Function):
         lora_live,
     ):
         factors = (gate_a, gate_b, up_a, up_b, down_a, down_b)
-        # Serving applies the per-expert LoRA banks only on the rank whose
-        # scheduler owns the lora-bearing rows; every other rank's EP partial
-        # runs the Marlin base program (exact-zero LoRA delta, byte-equal to
-        # the pure base path).
+        # The gather-aware exact lane sets ``lora_live`` on every EP rank so
+        # each rank contributes its local expert-bank delta.  Keeping the gate
+        # here also supports an explicit base-only partial when requested.
         effective = factors if lora_live else tuple(torch.zeros_like(f) for f in factors)
         output, local_ids = _dsv4_native_mxfp4_forward(
             hidden_states,
@@ -1110,11 +1109,9 @@ def dsv4_native_mxfp4_routed_partial(
 ) -> torch.Tensor:
     """Literal local MXFP4-Marlin routed partial with trainable rank-one LoRA.
 
-    ``lora_live`` mirrors SGLang's ``lora_active`` gate: a serving rank whose
-    scheduler holds no lora-bearing rows runs the Marlin base program for its
-    EP partial even on gathered tokens.  The exact lane pins every request to
-    DP rank 0, so only that rank's partial carries the per-expert bank delta
-    (byte-verified against per-rank serving dumps).
+    Gather-aware serving installs rank-major LoRA metadata on every EP rank,
+    so the exact caller keeps ``lora_live`` enabled for every local expert-bank
+    partial.  Passing ``False`` remains the explicit base-only program.
     """
 
     if (experts.active_r, experts.active_lora_alpha, experts._active_scaling()) != (
@@ -1342,10 +1339,9 @@ class _Dsv4NativeSharedTpFunction(torch.autograd.Function):
         lora_live,
     ):
         factors = (gate_a, gate_b, up_a, up_b, down_a, down_b)
-        # Serving applies active-LoRA factors only on the rank whose scheduler
-        # owns the lora-bearing rows; the other ranks' TP partials run the
-        # base program with an exact-zero LoRA delta (additive identity, so
-        # the bytes equal the pure base path).
+        # The gather-aware exact lane sets ``lora_live`` on every EP rank so
+        # each rank contributes its shared-expert TP adapter slice.  Keeping
+        # the gate here also supports an explicit base-only partial.
         effective = factors if lora_live else tuple(torch.zeros_like(f) for f in factors)
         output = _dsv4_native_shared_tp_forward(
             input,
@@ -1436,11 +1432,9 @@ def dsv4_native_shared_expert_tp_partial(
 ) -> torch.Tensor:
     """Serving-value shared-expert TP slice, before the ordered rank sum.
 
-    ``lora_live`` mirrors SGLang's ``BaseLayerWithLoRA.lora_active`` gate: a
-    serving rank whose scheduler holds no lora-bearing rows computes its TP
-    partial through the pure base path even for EP-gathered tokens.  The exact
-    lane pins every request to DP rank 0, so only that rank's partial carries
-    the adapter delta (byte-verified against per-rank serving dumps).
+    Gather-aware serving installs rank-major LoRA metadata on every EP rank,
+    so the exact caller keeps ``lora_live`` enabled for every shared-expert TP
+    slice.  Passing ``False`` remains the explicit base-only program.
     """
 
     projections = (module.gate_proj, module.up_proj, module.down_proj)
