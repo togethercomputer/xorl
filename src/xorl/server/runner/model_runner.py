@@ -78,6 +78,7 @@ from xorl.ops.loss import (
     OPDLossMetrics,
     TokenPartial,
     causallm_loss_function,
+    cispo_loss_function,
     drgrpo_loss_function,
     importance_sampling_loss_function,
     opd_loss_function,
@@ -339,6 +340,14 @@ class ModelRunner:
         "causallm_loss": {"labels", "target_tokens", "weights", "_original_position_ids", "rollout_logprobs"},
         "cross_entropy": {"labels", "target_tokens", "weights", "_original_position_ids", "rollout_logprobs"},
         "importance_sampling": {
+            "labels",
+            "target_tokens",
+            "logprobs",
+            "advantages",
+            "_original_position_ids",
+            "rollout_logprobs",
+        },
+        "cispo": {
             "labels",
             "target_tokens",
             "logprobs",
@@ -6027,14 +6036,24 @@ class ModelRunner:
                 if token_diagnostics is not None:
                     per_token_outputs["token_diagnostics"] = token_diagnostics
 
-        elif loss_fn == "importance_sampling":
+        elif loss_fn in {"importance_sampling", "cispo"}:
             target_tokens = micro_batch.get("target_tokens", micro_batch.get("labels"))
             old_logprobs = micro_batch["logprobs"]
             advantages = micro_batch["advantages"]
             compute_kl_stats = params.get("compute_kl_stats", False)
             diagnostic_reference_logits = bool(params.get("diagnostic_reference_logits", False))
 
-            _result = importance_sampling_loss_function(
+            loss_function = (
+                cispo_loss_function if loss_fn == "cispo" else importance_sampling_loss_function
+            )
+            loss_kwargs = {}
+            if loss_fn == "cispo":
+                loss_kwargs = {
+                    "clip_low_threshold": float(params.get("clip_low_threshold", 0.0)),
+                    "clip_high_threshold": float(params.get("clip_high_threshold", 4.0)),
+                }
+
+            _result = loss_function(
                 hidden_states=hidden_states,
                 weight=effective_weight,
                 labels=target_tokens,
@@ -6048,6 +6067,7 @@ class ModelRunner:
                 tp_group=loss_tp_group,
                 lm_head=loss_lm_head,
                 logprob_temperature=logprob_temperature,
+                **loss_kwargs,
             )
             local_loss_sum = _result.loss
             per_token_outputs["logprobs"] = _result.per_token_logprobs
