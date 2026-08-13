@@ -7210,6 +7210,7 @@ class ModelRunner:
         result rendezvous has completed on every rank.
         """
 
+        routing_requested = routed_experts is not None or routed_expert_logits is not None
         try:
             result = self._forward_backward_impl(
                 micro_batches,
@@ -7229,6 +7230,9 @@ class ModelRunner:
             if self._adapter_manager is not None and self._adapter_manager.has_adapter(model_id):
                 self._adapter_manager.abort_gradient_capture(model_id)
             raise
+        finally:
+            if routing_requested:
+                self._routing_handler.cleanup()
 
     def commit_forward_backward_completion(self, model_id: str = "default") -> None:
         """Commit staged capture and monotonic success at the result boundary."""
@@ -7626,12 +7630,15 @@ class ModelRunner:
             raise NotImplementedError("opd_loss does not yet support pipeline parallelism")
 
         params = loss_fn_params or {}
-        if bool(params.get("diagnostic_decode_cache", False)):
-            r3_enabled = self._routing_handler.setup_decode_cache(micro_batches, routed_experts, routed_expert_logits)
-        else:
-            r3_enabled = self._routing_handler.setup(micro_batches, routed_experts, routed_expert_logits)
-
+        routing_requested = routed_experts is not None or routed_expert_logits is not None
         try:
+            if bool(params.get("diagnostic_decode_cache", False)):
+                r3_enabled = self._routing_handler.setup_decode_cache(
+                    micro_batches, routed_experts, routed_expert_logits
+                )
+            else:
+                r3_enabled = self._routing_handler.setup(micro_batches, routed_experts, routed_expert_logits)
+
             if self.pp_enabled:
                 # Forward-only must run the pipeline schedule — calling self.model(...)
                 # would execute only this rank's first stage.
@@ -7647,7 +7654,7 @@ class ModelRunner:
                     model_id=model_id,
                 )
         finally:
-            if self.pp_enabled and r3_enabled:
+            if routing_requested:
                 self._routing_handler.cleanup()
             # The lm head is called by compute_loss outside the root model. In
             # a no-grad pass FSDP2 leaves its BF16 compute view materialized,
