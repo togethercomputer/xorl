@@ -64,6 +64,12 @@ def _adapt_qwen3_5_config(config):
         adapted = config
     adapted._qwen35_exact_contract = exact_contract
     adapted._qwen35_rmsnorm_family = rmsnorm_family
+    # Carry the family-neutral resolution-time stamps across config adaptation
+    # (only when present -- direct-construction configs stay unstamped so the
+    # legacy-flag fallbacks keep working).
+    for stamp in ("_exact_contract_family", "_exact_one_round_swiglu"):
+        if hasattr(config, stamp):
+            setattr(adapted, stamp, getattr(config, stamp))
     return adapted
 
 
@@ -89,7 +95,12 @@ class Qwen3_5MLP(nn.Module):
         self._use_fused_silu = config.hidden_act == "silu" and not activation_native
         # One-round FP32 SwiGLU is scoped to the exact contract (serving-paired
         # program); every other caller keeps the historical two-round bytes.
-        self._exact_one_round = bool(getattr(config, "_qwen35_exact_contract", False))
+        # Model resolution stamps the family-neutral ``_exact_one_round_swiglu``
+        # key; configs that predate stamping keep their historical selection
+        # through the legacy Qwen-named flag.
+        self._exact_one_round = bool(
+            getattr(config, "_exact_one_round_swiglu", getattr(config, "_qwen35_exact_contract", False))
+        )
 
     def _fused_act(self, gate_up):
         if self._exact_one_round:

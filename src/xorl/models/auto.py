@@ -17,7 +17,12 @@ from transformers import (
 from ..distributed.parallel_state import get_parallel_state
 from ..ops.moe.triton import resolve_routing_weights_before_down, set_routing_weights_before_down
 from ..utils import logging
-from .exact_contract import glm52_exact_active_lora_enabled, glm52_exact_forward_enabled, set_glm52_exact_active_lora
+from .exact_contract import (
+    glm52_exact_active_lora_enabled,
+    glm52_exact_forward_enabled,
+    resolve_exact_contract_family,
+    set_glm52_exact_active_lora,
+)
 from .layers.attention import get_attention_fn
 from .layers.normalization import set_rmsnorm_mode
 from .layers.rope import set_rope_class_b, set_rope_native
@@ -645,6 +650,15 @@ def build_foundation_model(
         "qwen3_5_moe_text",
     }
     config._qwen35_exact_contract = bool(server_training and qwen35_model_type)
+    # Family-neutral exact-contract keys, stamped once at model resolution so
+    # downstream contract sites key off the resolved program rather than
+    # family-branded flags. ``_exact_contract_family`` names the exact value
+    # program (or ``None`` for generic models); ``_exact_one_round_swiglu``
+    # selects the serving-paired one-round FP32 SwiGLU. Today only the exact
+    # Qwen3.5 families carry one-round byte evidence -- GLM keeps its certified
+    # two-operation activation until it earns its own.
+    config._exact_contract_family = resolve_exact_contract_family(config)
+    config._exact_one_round_swiglu = bool(config._qwen35_exact_contract)
     _validate_exact_qwen35_model_scope(config)
     _validate_exact_qwen35_moe_program(
         config,
