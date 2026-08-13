@@ -4,11 +4,13 @@ import pytest
 import torch
 
 from xorl.models.layers.moe.ep_native_combine import (
+    NATIVE_EP_COMBINE_QUALIFIED_SIZES,
     QWEN35_NATIVE_EP_COMBINE_SIZES,
     gather_ids_for_ep_combine,
     gather_tokens_for_ep_combine,
     max_rows_for_ep_combine,
     sglang_fused_gate_sigmoid_mul_add,
+    validate_native_ep_combine_size,
     validate_qwen35_native_ep_combine_size,
 )
 
@@ -16,11 +18,21 @@ from xorl.models.layers.moe.ep_native_combine import (
 pytestmark = [pytest.mark.cpu]
 
 
-def test_qwen35_native_combine_policy(monkeypatch):
+def test_native_combine_qualified_size_registry():
+    assert NATIVE_EP_COMBINE_QUALIFIED_SIZES["qwen3_5_moe"] == frozenset({8})
     assert QWEN35_NATIVE_EP_COMBINE_SIZES == frozenset({8})
+    validate_native_ep_combine_size("qwen3_5_moe", 8)
+    for size in (1, 2, 4, 16):
+        with pytest.raises(ValueError, match=r"qualified sizes for family 'qwen3_5_moe': \[8\]"):
+            validate_native_ep_combine_size("qwen3_5_moe", size)
+    with pytest.raises(ValueError, match="no qualified EP sizes for family 'dsv4'"):
+        validate_native_ep_combine_size("dsv4", 8)
+
+
+def test_qwen35_native_combine_policy(monkeypatch):
     validate_qwen35_native_ep_combine_size(8)
     for size in (1, 2, 4, 16):
-        with pytest.raises(ValueError, match="EP8"):
+        with pytest.raises(ValueError, match=r"qualified sizes for family 'qwen3_5_moe': \[8\]"):
             validate_qwen35_native_ep_combine_size(size)
 
     blk = _qwen_block(exact=True)
@@ -190,7 +202,7 @@ def _assert_native_combine_dispatch_and_actual_operand_policy(monkeypatch):
     monkeypatch.setattr(combine, "max_rows_for_ep_combine", lambda rows, _device, _group: rows)
     monkeypatch.setattr(combine, "gather_tokens_for_ep_combine", lambda value, _group, _rows: value)
     monkeypatch.setattr(combine, "gather_ids_for_ep_combine", lambda value, _group, _rows: value)
-    monkeypatch.setattr(combine, "exchange_and_chain_sum", lambda value, _group, _size: value)
+    monkeypatch.setattr(combine, "exchange_and_canonical_fold", lambda value, _group, _size: value)
     monkeypatch.setattr(
         combine,
         "sglang_fused_gate_sigmoid_mul_add",

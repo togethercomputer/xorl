@@ -1,15 +1,25 @@
-"""Native-EP ordered combine for the exact Qwen3.5-MoE program.
+"""Native-EP canonical combine for the exact Qwen3.5-MoE program.
 
-The TRAINING half of the EP<n>/a2a-none BI-ops serving pairing: serving computes,
-on every rank, its contiguous expert slice's weighted contribution for ALL tokens
-plus a TP slice of the shared expert, adds them in bf16, and all-reduces — and
-NCCL's tree all-reduce over n intranode ranks is bitwise a SEQUENTIAL bf16 chain
-sum in rank order (n-1) -> 0 (identified against captured per-rank partials; see
-the exact-path component tests). The contributor order is part of the exact
-Qwen3.5 numerical program.
+The TRAINING half of the EP<n>/a2a-none BI-ops serving pairing: serving
+computes, on every rank, its contiguous expert slice's weighted contribution
+for ALL tokens plus a TP slice of the shared expert, adds them in bf16,
+all-gathers the raw partials, and folds them with ``canonical_moe_fold_v1``
+— the balanced adjacent-pair BF16 tree, rounding to nearest-even after every
+add (sglang ``tensor_model_parallel_canonical_moe_all_reduce``). Which
+contributors pair at each tree level is part of the exact Qwen3.5 numerical
+program; the fold is NOT bitwise a summed NCCL collective, and it is not the
+pre-unification reverse-rank chain either. The conventional discrimination
+test keeps the two programs observably distinct.
 
-The trainer mirrors this on its real EP group (trainer EP gives rank r exactly
-serving-rank-r's contiguous expert slice):
+HISTORY: serving used to reduce through a fixed reverse-rank bf16 chain
+(``tensor_model_parallel_ordered_all_reduce``, bitwise NCCL's intranode tree
+all-reduce), and this module chained to pair with it. Serving unified every
+exact MoE model onto the canonical fold (sglang ``68099a3b7``); this module
+is the Qwen trainer half of that unification. GLM52 and DSV4 already fold
+with the same trainer primitive.
+
+The trainer mirrors serving on its real EP group (trainer EP gives rank r
+exactly serving-rank-r's contiguous expert slice):
 
 1. gather the full token batch over the EP group (backward: reduce-scatter sum);
 2. every rank computes ITS routed partial for ALL tokens through the trainable
@@ -17,15 +27,16 @@ serving-rank-r's contiguous expert slice):
    shared-expert TP slice (trainable BI GEMMs and torch-native bf16 silu*mul),
    joined with the routed partial by serving's fused gate/sigmoid/mul/add;
 3. partials are exchanged RAW (all-to-all) — NEVER via an NCCL-summed
-   collective (the sum order must stay ours) — and every rank chain-sums its
-   own tokens' n partials locally in bf16, serving rank order (n-1) -> 0;
+   collective (the reduction arithmetic must stay ours) — and every rank
+   folds its own tokens' n partials locally with the canonical
+   adjacent-pair BF16 tree in serving rank order;
 4. backward reverses the exchange (grad all-to-all), then the masked backward
    per rank. Grad REDUCTIONS (reduce-scatter of d(x), DP grad sync) stay stock
    NCCL — only forward bits are contracted.
 
 The exact Qwen3.5-MoE model path selects this combine structurally when trainer
 EP is active. EP8 is the admitted topology because it is the topology whose
-serving reduction was captured; a different contributor count is a different
+serving reduction was qualified; a different contributor count is a different
 numerical program and is rejected before collectives begin.
 """
 
@@ -35,17 +46,40 @@ import torch
 import torch.distributed as dist
 
 
-QWEN35_NATIVE_EP_COMBINE_SIZES = frozenset({8})
+#: Per-family EP contributor counts whose serving reduction order has been
+#: qualified byte-exactly. The contributor count is part of the numerical
+#: program: qualifying a new (family, EP size) pair requires serving-side byte
+#: evidence and a reduction-order validation, followed by a registry entry
+#: here rather than a code change in the validator.
+NATIVE_EP_COMBINE_QUALIFIED_SIZES: dict[str, frozenset[int]] = {
+    "qwen3_5_moe": frozenset({8}),
+}
+
+#: Backward-compatible alias for the qualified Qwen3.5-MoE contributor counts.
+QWEN35_NATIVE_EP_COMBINE_SIZES = NATIVE_EP_COMBINE_QUALIFIED_SIZES["qwen3_5_moe"]
+
+
+def validate_native_ep_combine_size(family: str, ep_size: int) -> None:
+    """Reject contributor counts not qualified against serving for ``family``."""
+    qualified = NATIVE_EP_COMBINE_QUALIFIED_SIZES.get(family)
+    if qualified is None:
+        raise ValueError(
+            f"exact native-EP canonical combine has no qualified EP sizes for family {family!r}. "
+            "Qualification requires serving-side byte evidence and a byte-exact "
+            "reduction-order validation, recorded in NATIVE_EP_COMBINE_QUALIFIED_SIZES."
+        )
+    if ep_size not in qualified:
+        raise ValueError(
+            f"exact native-EP canonical combine received expert_parallel_size={ep_size}; "
+            f"qualified sizes for family {family!r}: {sorted(qualified)}. "
+            "A different EP size requires new serving-side byte evidence and a "
+            "byte-exact reduction-order validation."
+        )
 
 
 def validate_qwen35_native_ep_combine_size(ep_size: int) -> None:
-    """Reject contributor counts not validated against Qwen serving."""
-    if ep_size not in QWEN35_NATIVE_EP_COMBINE_SIZES:
-        raise ValueError(
-            f"Qwen3.5-MoE exact ordered combine requires EP8 (expert_parallel_size=8); received {ep_size}. "
-            "A different EP size requires a serving capture and a new "
-            "byte-exact reduction-order validation."
-        )
+    """Thin Qwen3.5-MoE shim over the family-keyed qualified-size registry."""
+    validate_native_ep_combine_size("qwen3_5_moe", ep_size)
 
 
 class _AllGatherSumBackward(torch.autograd.Function):
@@ -103,7 +137,7 @@ def gather_tokens_for_ep_combine(x: torch.Tensor, group, padded_rows: int | None
     Dispatcher DP slices can contain different packed sequence lengths. Native
     EP still needs every expert rank to see every slice, so shorter ranks are
     padded to the negotiated maximum before the equal-count NCCL gather. The
-    caller slices the final chain-summed result back to its original row count.
+    caller slices the final folded result back to its original row count.
     """
     if padded_rows is None:
         padded_rows = max_rows_for_ep_combine(x.shape[0], x.device, group)
@@ -178,20 +212,20 @@ def sglang_fused_gate_sigmoid_mul_add(
     return _SGLangFusedGateSigmoidMulAdd.apply(hidden_states, gate_weight, shared_output, routed_output)
 
 
-def exchange_and_chain_sum(partial: torch.Tensor, group, ep_size: int) -> torch.Tensor:
-    """RAW partial exchange + the serving-order bf16 chain sum.
+def exchange_and_canonical_fold(partial: torch.Tensor, group, ep_size: int) -> torch.Tensor:
+    """RAW partial exchange + the serving canonical BF16 contributor fold.
 
     ``partial`` is this rank's [n*T, H] contribution for ALL gathered tokens.
     The all-to-all hands rank r the n per-rank partials for ITS OWN T rows;
-    the chain then sums them SEQUENTIALLY in serving rank order (n-1) -> 0 —
-    bitwise NCCL's intranode tree all-reduce (the K3 contract; never replace
-    with a summed collective or a stacked .sum()).
+    they are then folded LOCALLY with ``canonical_moe_fold_v1`` — the
+    balanced adjacent-pair bf16 tree in serving rank order, bitwise
+    serving's post-experts combine (the K3 contract; never replace with a
+    summed collective or a stacked ``.sum()``, and never reassociate the
+    tree: the pairing structure is the program).
     """
+    from xorl.distributed.canonical_moe import canonical_moe_fold_v1  # noqa: PLC0415
     from xorl.distributed.moe.comm import _AllToAll  # noqa: PLC0415
 
     exchanged = _AllToAll.apply(group, partial.contiguous(), None, None)  # [n*T, H], segment s from rank s
     rows = exchanged.shape[0] // ep_size
-    acc = exchanged[(ep_size - 1) * rows : ep_size * rows]
-    for s in range(ep_size - 2, -1, -1):
-        acc = acc + exchanged[s * rows : (s + 1) * rows]
-    return acc
+    return canonical_moe_fold_v1(exchanged.view(ep_size, rows, *exchanged.shape[1:]))

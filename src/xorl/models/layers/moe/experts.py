@@ -1698,7 +1698,7 @@ class MoEExperts(nn.Module):
         local_ids: torch.Tensor,
     ) -> torch.Tensor:
         """This EP rank's routed partial for the gathered full token batch
-        (native-EP ordered combine for the exact Qwen3.5-MoE program).
+        (native-EP canonical combine for the exact Qwen3.5-MoE program).
 
         It runs on the module's LOCAL expert slice (trainer EP gives rank r exactly
         serving-rank-r's contiguous slice) with ids already mapped local
@@ -1707,9 +1707,9 @@ class MoEExperts(nn.Module):
         kernel call (identical bits).
         """
         if not self.gated:
-            raise NotImplementedError("Qwen3.5-MoE exact ordered combine supports gated MoE experts only")
+            raise NotImplementedError("exact native-EP canonical combine supports gated MoE experts only")
         if self.down_bias is not None or self.gate_up_bias is not None:
-            raise NotImplementedError("Qwen3.5-MoE exact ordered combine does not support expert biases")
+            raise NotImplementedError("exact native-EP canonical combine does not support expert biases")
         _validate_sglang_swiglu_limit(self.swiglu_limit)
         fused_experts_impl = self._load_sglang_fused_experts_impl()
         e_local = int(self.gate_up_proj.shape[0])
@@ -1724,7 +1724,7 @@ class MoEExperts(nn.Module):
         if needs_grad:
             if self.hidden_act not in {"silu", "gelu_tanh"}:
                 raise NotImplementedError(
-                    "Qwen3.5-MoE exact ordered-combine training supports silu/gelu_tanh only "
+                    "exact native-EP ordered-combine training supports silu/gelu_tanh only "
                     f"(got hidden_act={self.hidden_act!r})"
                 )
             return _SglangFusedExpertsTrainFunction.apply(

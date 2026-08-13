@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 
 import pytest
 import torch
@@ -9,6 +10,7 @@ from distributed_utils import run_distributed_script
 
 from xorl.distributed.canonical_moe import (
     CANONICAL_MOE_REDUCE_VERSION,
+    TRAINER_ADMISSIONS_BY_FAMILY,
     CanonicalMoEGraphMetadata,
     CanonicalMoETransport,
     LocalMoEContribution,
@@ -174,7 +176,18 @@ def _assert_exact_trainer_plan_and_fail_closed():
         with pytest.raises(ValueError, match="Unsupported GLM-5.2 trainer topology"):
             ParallelPlan.glm52_trainer(**kwargs)
 
+    _assert_trainer_admission_is_family_keyed_and_fail_closed(trainer)
     _assert_world32_cp_and_ep_group_alias_policy()
+
+
+def _assert_trainer_admission_is_family_keyed_and_fail_closed(trainer: ParallelPlan):
+    assert trainer.family == "glm52"
+    admission = TRAINER_ADMISSIONS_BY_FAMILY["glm52"]
+    assert admission.num_layers == 78
+    assert admission.admitted_topologies == {(16, 1, 1, 1, 16, 16, 1): ((0, 78),)}
+    # A family without a registry entry fails closed with the same raise class.
+    with pytest.raises(ValueError, match="No admitted trainer topologies for exact-contract family 'dsv4'"):
+        replace(trainer, family="dsv4")
 
 
 def _assert_world32_cp_and_ep_group_alias_policy():

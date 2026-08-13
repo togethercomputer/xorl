@@ -21,10 +21,39 @@ import torch
 import torch.distributed as dist
 
 
+CANONICAL_MOE_FOLD_VERSION = "canonical_moe_fold_v1"
 CANONICAL_MOE_REDUCE_VERSION = "canonical_moe_reduce_v1"
 CANONICAL_MOE_PACKED_EP16_TRANSPORT_VERSION = "packed_ep16_v2"
 CANONICAL_MOE_CP_SHARDED_TRANSPORT_VERSION = "cp_sharded_v3"
 GLM52_NUM_LAYERS = 78
+
+
+@dataclass(frozen=True)
+class TrainerFamilyAdmission:
+    """Certified trainer admission data for one exact-contract family.
+
+    ``admitted_topologies`` maps ``(world_size, pp_size, tp_size, dp_size,
+    cp_size, ep_size, effective_dense_tp)`` to the required pipeline layer
+    ranges. Admitting a new family (or a new topology for an existing one) is
+    an explicit table entry covered by byte-contract tests, never new
+    branches in ``ParallelPlan.validate``.
+    """
+
+    label: str
+    num_layers: int
+    admitted_topologies: dict[tuple[int, int, int, int, int, int, int], tuple[tuple[int, int], ...]]
+
+
+#: Family strings follow the exact-contract family vocabulary used across the
+#: repo ("glm52", "qwen3_5_moe", ...). Only families with certified canonical
+#: MoE trainer topologies appear here; everything else fails closed.
+TRAINER_ADMISSIONS_BY_FAMILY: dict[str, TrainerFamilyAdmission] = {
+    "glm52": TrainerFamilyAdmission(
+        label="GLM-5.2",
+        num_layers=GLM52_NUM_LAYERS,
+        admitted_topologies={(16, 1, 1, 1, 16, 16, 1): ((0, 78),)},
+    ),
+}
 
 
 class ParallelRole(str, Enum):
@@ -158,6 +187,10 @@ class ParallelPlan:
     pipeline_layer_ranges: tuple[tuple[int, int], ...]
     cp_ep_aliases: tuple[tuple[int, int], ...]
     contract_version: str = CANONICAL_MOE_REDUCE_VERSION
+    #: Exact-contract family whose TRAINER_ADMISSIONS_BY_FAMILY entry admits
+    #: this plan. Defaults to the historical (and so far only) canonical MoE
+    #: trainer family.
+    family: str = "glm52"
 
     def __post_init__(self) -> None:
         self.validate()
@@ -202,10 +235,15 @@ class ParallelPlan:
             if start != expected_start or end <= start:
                 raise ValueError("Pipeline layer ranges must be positive, contiguous, and start at layer 0")
             expected_start = end
-        if expected_start != GLM52_NUM_LAYERS and self.role is not ParallelRole.PRIMITIVE_TEST:
-            raise ValueError(f"Pipeline ranges must cover exactly {GLM52_NUM_LAYERS} GLM layers")
+        if self.role is not ParallelRole.PRIMITIVE_TEST:
+            admission = TRAINER_ADMISSIONS_BY_FAMILY.get(self.family)
+            if admission is None:
+                raise ValueError(f"No admitted trainer topologies for exact-contract family {self.family!r}")
+            if expected_start != admission.num_layers:
+                raise ValueError(f"Pipeline ranges must cover exactly {admission.num_layers} {admission.label} layers")
 
         if self.role is ParallelRole.TRAINER:
+            admission = TRAINER_ADMISSIONS_BY_FAMILY[self.family]
             actual = (
                 self.world_size,
                 self.pp_size,
@@ -215,15 +253,15 @@ class ParallelPlan:
                 self.ep_size,
                 self.effective_dense_tp,
             )
-            admitted = {(16, 1, 1, 1, 16, 16, 1): ((0, 78),)}
-            expected_ranges = admitted.get(actual)
+            expected_ranges = admission.admitted_topologies.get(actual)
             if expected_ranges is None:
                 raise ValueError(
-                    f"Unsupported GLM-5.2 trainer topology {actual}; admitted topologies are {tuple(admitted)}"
+                    f"Unsupported {admission.label} trainer topology {actual}; "
+                    f"admitted topologies are {tuple(admission.admitted_topologies)}"
                 )
             if self.pipeline_layer_ranges != expected_ranges:
                 raise ValueError(
-                    f"GLM-5.2 trainer topology {actual} requires pipeline ranges {expected_ranges}, "
+                    f"{admission.label} trainer topology {actual} requires pipeline ranges {expected_ranges}, "
                     f"got {self.pipeline_layer_ranges}"
                 )
             expected_groups = tuple(
@@ -231,9 +269,13 @@ class ParallelPlan:
                 for group_start in range(0, self.world_size, self.cp_size)
             )
             if self.combine_groups != expected_groups:
-                raise ValueError("GLM-5.2 trainer combine groups must be contiguous groups of cp_size physical ranks")
+                raise ValueError(
+                    f"{admission.label} trainer combine groups must be contiguous groups of cp_size physical ranks"
+                )
             if self.logical_ordinals_by_group != (expected_ordinals,) * len(expected_groups):
-                raise ValueError("GLM-5.2 trainer requires identity logical contributor ordinals in every group")
+                raise ValueError(
+                    f"{admission.label} trainer requires identity logical contributor ordinals in every group"
+                )
         elif self.role is ParallelRole.PRIMITIVE_TEST:
             if self.world_size != self.cp_size or len(self.combine_groups) != 1:
                 raise ValueError("Primitive plans use one combine group spanning the test world")
@@ -444,6 +486,18 @@ def _validate_runtime_plan(
         local_group_rank=local_group_rank,
         local_logical_ordinal=expected_logical[local_group_rank],
     )
+
+
+def canonical_moe_fold_v1(partials: torch.Tensor) -> torch.Tensor:
+    """Fold identity-ordered contributions with the version-1 BF16 tree.
+
+    The trainer half of serving's ``canonical_moe_fold_v1`` (the balanced
+    adjacent-pair BF16 tree with round-to-nearest-even after every add).
+    Per this module's doctrine the arithmetic is a deliberate independent
+    implementation — it must never import the serving fold, so the pair
+    cannot self-confirm.
+    """
+    return _adjacent_pairwise_bf16(partials)
 
 
 def _adjacent_pairwise_bf16(partials: torch.Tensor) -> torch.Tensor:
@@ -872,6 +926,7 @@ def canonical_moe_reduce_cp_sharded_v3(
 __all__ = [
     "CANONICAL_MOE_PACKED_EP16_TRANSPORT_VERSION",
     "CANONICAL_MOE_CP_SHARDED_TRANSPORT_VERSION",
+    "CANONICAL_MOE_FOLD_VERSION",
     "CANONICAL_MOE_REDUCE_VERSION",
     "CanonicalMoEGraphMetadata",
     "CanonicalMoEOutput",
@@ -882,6 +937,7 @@ __all__ = [
     "OutputDistribution",
     "ParallelPlan",
     "ParallelRole",
+    "canonical_moe_fold_v1",
     "canonical_moe_reduce_packed_ep16_v2",
     "canonical_moe_reduce_cp_sharded_v3",
     "canonical_moe_reduce_v1",

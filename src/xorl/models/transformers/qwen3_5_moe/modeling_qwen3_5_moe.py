@@ -426,21 +426,22 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
         routing_weights: torch.Tensor,
         selected_experts: torch.Tensor,
     ) -> torch.Tensor:
-        """Native-EP ordered combine for the trainer's real EP group.
+        """Native-EP canonical combine for the trainer's real EP group.
 
         Every rank gathers the full token batch (backward: reduce-scatter sum),
         computes ITS routed partial through the masked serving-kernel Function
         on the LOCAL expert slice + ITS shared-expert TP slice (trainable BI
         GEMMs, torch-native bf16 silu*mul, sigmoid gate) added in bf16 — exactly
         serving's per-rank partial — then partials are exchanged RAW
-        (all-to-all, never NCCL-summed) and each rank chain-sums its own tokens'
-        n partials in serving rank order (n-1) -> 0. Forward bits match the
-        serving engine; backward uses stock numerics throughout
-        (cuBLAS shared-expert grads, grouped-GEMM expert grads, NCCL grad
-        reductions)."""
+        (all-to-all, never NCCL-summed) and each rank folds its own tokens'
+        n partials with the canonical adjacent-pair BF16 tree
+        (``canonical_moe_fold_v1``, bitwise serving's post-experts combine).
+        Forward bits match the serving engine; backward uses stock numerics
+        throughout (cuBLAS shared-expert grads, grouped-GEMM expert grads,
+        NCCL grad reductions)."""
         from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
         from xorl.models.layers.moe.ep_native_combine import (  # noqa: PLC0415
-            exchange_and_chain_sum,
+            exchange_and_canonical_fold,
             gather_ids_for_ep_combine,
             gather_tokens_for_ep_combine,
             max_rows_for_ep_combine,
@@ -450,21 +451,21 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
 
         ps = get_parallel_state()
         if not ps.ep_enabled:
-            raise RuntimeError("Qwen3.5-MoE exact ordered combine requires trainer EP mirroring the serving EP size")
+            raise RuntimeError("Qwen3.5-MoE exact canonical combine requires trainer EP mirroring the serving EP size")
         if not hasattr(self.shared_expert, "gate_up_proj"):
-            raise NotImplementedError("Qwen3.5-MoE exact ordered combine requires the fused shared-expert gate_up_proj")
+            raise NotImplementedError("Qwen3.5-MoE exact canonical combine requires the fused shared-expert gate_up_proj")
         ep_size, ep_rank, ep_group = ps.ep_size, ps.ep_rank, ps.ep_group
         validate_qwen35_native_ep_combine_size(ep_size)
         inter = self.shared_expert.intermediate_size
         if inter % ep_size != 0:
             raise ValueError(
-                f"Qwen3.5-MoE exact ordered combine: shared_expert intermediate_size={inter} "
+                f"Qwen3.5-MoE exact canonical combine: shared_expert intermediate_size={inter} "
                 f"not divisible by ep_size={ep_size}"
             )
         e_local = int(self.experts.gate_up_proj.shape[0])
         if e_local * ep_size != self.experts.num_experts:
             raise RuntimeError(
-                f"Qwen3.5-MoE exact ordered combine: local expert slice {e_local} x ep_size {ep_size} "
+                f"Qwen3.5-MoE exact canonical combine: local expert slice {e_local} x ep_size {ep_size} "
                 f"!= num_experts {self.experts.num_experts} (trainer EP must mirror serving EP)"
             )
 
@@ -476,7 +477,7 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
         # 1. full token batch on every rank (serving's DP-attention gather)
         # Packed DP slices can have different local row counts, so negotiate one
         # equal-count collective shape and discard this rank's padding after the
-        # ordered combine. BI kernels make those extra rows forward-independent.
+        # canonical combine. BI kernels make those extra rows forward-independent.
         padded_rows = max_rows_for_ep_combine(flat.shape[0], flat.device, ep_group)
         gathered = gather_tokens_for_ep_combine(flat, ep_group, padded_rows)
         gathered_routing = gather_tokens_for_ep_combine(routing_flat, ep_group, padded_rows)
@@ -535,8 +536,8 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
         )
         self._capture_diagnostic_component("moe_native_local_partial", partial)
 
-        # 3./4. raw exchange + serving-order chain sum (autograd reverses the exchange)
-        out = exchange_and_chain_sum(partial, ep_group, ep_size)
+        # 3./4. raw exchange + the canonical serving fold (autograd reverses the exchange)
+        out = exchange_and_canonical_fold(partial, ep_group, ep_size)
         self._capture_diagnostic_component("moe_native_combined", out)
         return out[: flat.shape[0]].reshape(batch_size, sequence_length, hidden_dim)
 
