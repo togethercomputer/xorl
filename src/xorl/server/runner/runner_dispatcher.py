@@ -1305,6 +1305,9 @@ class RunnerDispatcher:
             )
             return items
 
+        if value.get("transport") == "sglang_files" and int(value.get("version", 0)) == 1:
+            return self._load_sglang_file_routing_slice(value, start, count)
+
         version = int(value.get("version", 0))
         if value.get("transport") != "filesystem" or version not in (2, 3):
             raise ValueError("Legacy pickle routing payload references are disabled; use filesystem version 2 or 3")
@@ -1398,6 +1401,108 @@ class RunnerDispatcher:
             item_dir,
         )
         return items
+
+    @staticmethod
+    def _r3_shared_roots() -> tuple[Path, ...]:
+        configured = os.getenv("XORL_R3_SHARED_ROOTS", "")
+        roots = tuple(
+            Path(entry).expanduser().resolve(strict=True)
+            for entry in configured.split(os.pathsep)
+            if entry.strip()
+        )
+        if not roots:
+            raise ValueError("XORL_R3_SHARED_ROOTS must name the trusted SGLang side-channel root")
+        return roots
+
+    @classmethod
+    def _wait_for_r3_source(cls, span: Mapping[str, Any]) -> Path:
+        raw_path = Path(str(span.get("path", "")))
+        if not raw_path.is_absolute() or raw_path.name.startswith("."):
+            raise ValueError(f"Invalid SGLang R3 source path: {raw_path}")
+        roots = cls._r3_shared_roots()
+        parent = raw_path.parent.resolve(strict=True)
+        if not any(parent == root or root in parent.parents for root in roots):
+            raise ValueError(f"SGLang R3 source path is outside XORL_R3_SHARED_ROOTS: {raw_path}")
+        error_path = Path(str(span.get("error_path", ""))) if span.get("error_path") else None
+        timeout_s = float(os.getenv("XORL_R3_SOURCE_WAIT_S", "120"))
+        deadline = time.monotonic() + timeout_s
+        while True:
+            if error_path is not None and error_path.is_file():
+                raise RuntimeError(f"SGLang R3 publisher failed: {error_path.read_text(encoding='utf-8')}")
+            if raw_path.is_file():
+                if raw_path.is_symlink():
+                    raise ValueError(f"SGLang R3 source path may not be a symlink: {raw_path}")
+                resolved = raw_path.resolve(strict=True)
+                if resolved.parent != parent:
+                    raise ValueError(f"SGLang R3 source path changed during publication: {raw_path}")
+                return resolved
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"Timed out waiting {timeout_s:.1f}s for SGLang R3 source {raw_path}")
+            time.sleep(0.01)
+
+    def _load_sglang_file_routing_slice(
+        self, value: Mapping[str, Any], start: int, count: int
+    ) -> List[torch.Tensor]:
+        if value.get("format") != "spans":
+            raise ValueError("SGLang R3 source reference must use spans format")
+        kind = str(value.get("kind", ""))
+        expected_dtype = torch.int32 if kind == "routed_experts" else torch.float32
+        expected_dtype_name = "int32" if kind == "routed_experts" else "float32"
+        items = value.get("items")
+        total = int(value.get("count", -1))
+        if kind not in {"routed_experts", "routed_expert_logits"} or not isinstance(items, list):
+            raise ValueError(f"Invalid SGLang R3 source reference for {kind!r}")
+        if total != len(items) or start < 0 or count < 0 or start + count > total:
+            raise ValueError(f"SGLang R3 source slice out of range: start={start}, count={count}, total={total}")
+
+        loaded: List[torch.Tensor] = []
+        for datum_idx, item in enumerate(items[start : start + count], start=start):
+            if not isinstance(item, Mapping) or item.get("schema") != "xorl.r3.spans.v1":
+                raise ValueError(f"Invalid R3 span datum {datum_idx}")
+            shape = item.get("shape")
+            spans = item.get("spans")
+            if (
+                item.get("dtype") != expected_dtype_name
+                or not isinstance(shape, list)
+                or len(shape) != 3
+                or not isinstance(spans, list)
+            ):
+                raise ValueError(f"Invalid R3 span metadata for datum {datum_idx}")
+            pieces: List[torch.Tensor] = []
+            for span_idx, span in enumerate(spans):
+                if not isinstance(span, Mapping):
+                    raise ValueError(f"Invalid R3 span {datum_idx}/{span_idx}")
+                rows = int(span.get("rows", -1))
+                source_row = int(span.get("source_row", -1))
+                row_nbytes = int(span.get("row_nbytes", -1))
+                offset = int(span.get("offset", -1)) + source_row * row_nbytes
+                source_shape = span.get("source_shape")
+                expected_row_nbytes = math.prod(shape[1:]) * 4
+                if (
+                    span.get("dtype") != expected_dtype_name
+                    or rows < 0
+                    or source_row < 0
+                    or row_nbytes != expected_row_nbytes
+                    or offset < 0
+                    or not isinstance(source_shape, list)
+                    or len(source_shape) != 3
+                    or source_shape[1:] != shape[1:]
+                    or source_row + rows > int(source_shape[0])
+                ):
+                    raise ValueError(f"Invalid R3 span geometry for datum {datum_idx}/{span_idx}")
+                path = self._wait_for_r3_source(span)
+                required = offset + rows * row_nbytes
+                if path.stat().st_size < required:
+                    raise ValueError(f"R3 source {path} is shorter than span {datum_idx}/{span_idx}")
+                if rows == 0:
+                    pieces.append(torch.empty((0, *shape[1:]), dtype=expected_dtype))
+                    continue
+                storage = torch.from_file(str(path), shared=False, size=path.stat().st_size // 4, dtype=expected_dtype)
+                pieces.append(storage[offset // 4 : required // 4].reshape(rows, *shape[1:]))
+            if sum(piece.shape[0] for piece in pieces) != int(shape[0]):
+                raise ValueError(f"R3 span coverage mismatch for datum {datum_idx}")
+            loaded.append(pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0))
+        return loaded
 
     def _load_packed_filesystem_routing_slice(
         self,

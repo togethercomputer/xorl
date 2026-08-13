@@ -45,6 +45,7 @@ import os
 import shutil
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Union
 
@@ -90,6 +91,12 @@ FORWARD_BACKWARD_RESULT_KEYS = {
     "forward_compute_time",
 }
 ROUTING_PAYLOAD_REF_KEY = "__xorl_routing_payload_ref__"
+R3_SPANS_SCHEMA = "xorl.r3.spans.v1"
+
+
+@dataclass(frozen=True)
+class R3SourceFilesCleanup:
+    paths: tuple[Path, ...]
 
 
 def _truthy_env(name: str) -> bool:
@@ -261,8 +268,13 @@ class RequestProcessor:
         routed_expert_logits: Optional[List[Any]],
         *,
         batches: Optional[List[Dict[str, Any]]] = None,
-    ) -> tuple[Optional[Any], Optional[Any], Optional[Union[Path, R3PayloadCleanup]]]:
-        if self.r3_payload_transport == "inline" or (routed_experts is None and routed_expert_logits is None):
+    ) -> tuple[Optional[Any], Optional[Any], Optional[Union[Path, R3PayloadCleanup, R3SourceFilesCleanup]]]:
+        if routed_experts is None and routed_expert_logits is None:
+            return routed_experts, routed_expert_logits, None
+        direct = self._externalize_sglang_routing_spans(routed_experts, routed_expert_logits)
+        if direct is not None:
+            return direct
+        if self.r3_payload_transport == "inline":
             return routed_experts, routed_expert_logits, None
         if self.r3_payload_transport == "mooncake":
             if self._routing_payload_store is None:
@@ -293,6 +305,80 @@ class RequestProcessor:
             routed_expert_logits,
             chunk_ranges=self._routing_payload_chunk_ranges(batches, len(routed_experts or routed_expert_logits or [])),
         )
+
+    @staticmethod
+    def _externalize_sglang_routing_spans(
+        routed_experts: Optional[List[Any]],
+        routed_expert_logits: Optional[List[Any]],
+    ) -> Optional[tuple[Optional[Any], Optional[Any], R3SourceFilesCleanup]]:
+        present = [items for items in (routed_experts, routed_expert_logits) if items is not None]
+        if not present:
+            return None
+        has_spans = [
+            isinstance(item, dict) and item.get("schema") == R3_SPANS_SCHEMA
+            for items in present
+            for item in items
+        ]
+        if not any(has_spans):
+            return None
+        if not all(has_spans):
+            raise ValueError("R3 span payloads cannot be mixed with inline routing payloads")
+
+        source_paths: set[Path] = set()
+        for items in present:
+            for item in items:
+                spans = item.get("spans")
+                if not isinstance(spans, list):
+                    raise ValueError("R3 span payload must contain a spans list")
+                if sum(int(span.get("rows", -1)) for span in spans if isinstance(span, dict)) != int(
+                    item.get("rows", -1)
+                ):
+                    raise ValueError("R3 span payload rows do not match its span coverage")
+                for span in spans:
+                    if not isinstance(span, dict):
+                        raise ValueError("R3 span entry must be an object")
+                    path = RequestProcessor._validate_r3_source_path(span.get("path"), final=True)
+                    source_paths.add(path)
+                    error_path = span.get("error_path")
+                    if error_path:
+                        source_paths.add(RequestProcessor._validate_r3_source_path(error_path, final=False))
+
+        def _ref(field: str, items: Optional[List[Any]]) -> Optional[Dict[str, Any]]:
+            if items is None:
+                return None
+            return {
+                ROUTING_PAYLOAD_REF_KEY: True,
+                "transport": "sglang_files",
+                "version": 1,
+                "format": "spans",
+                "kind": field,
+                "count": len(items),
+                "items": items,
+            }
+
+        return (
+            _ref(R3_ROUTED_EXPERTS, routed_experts),
+            _ref(R3_ROUTED_EXPERT_LOGITS, routed_expert_logits),
+            R3SourceFilesCleanup(paths=tuple(sorted(source_paths))),
+        )
+
+    @staticmethod
+    def _validate_r3_source_path(raw: Any, *, final: bool) -> Path:
+        path = Path(str(raw or ""))
+        if not path.is_absolute() or (final and path.name.startswith(".")):
+            raise ValueError(f"R3 source path must be an absolute payload path: {path}")
+        configured = os.getenv("XORL_R3_SHARED_ROOTS", "")
+        roots = [
+            Path(entry).expanduser().resolve(strict=True)
+            for entry in configured.split(os.pathsep)
+            if entry.strip()
+        ]
+        if not roots:
+            raise ValueError("XORL_R3_SHARED_ROOTS must name the trusted SGLang side-channel root")
+        parent = path.parent.resolve(strict=True)
+        if not any(parent == root or root in parent.parents for root in roots):
+            raise ValueError(f"R3 source path is outside XORL_R3_SHARED_ROOTS: {path}")
+        return path
 
     def _routing_payload_chunk_ranges(
         self,
@@ -418,13 +504,22 @@ class RequestProcessor:
         )
         return _ref("routed_experts", routed_experts), _ref("routed_expert_logits", routed_expert_logits), root
 
-    def _cleanup_routing_payloads(self, cleanup: Optional[Union[Path, R3PayloadCleanup]]) -> None:
+    def _cleanup_routing_payloads(
+        self, cleanup: Optional[Union[Path, R3PayloadCleanup, R3SourceFilesCleanup]]
+    ) -> None:
         if cleanup is None or self.r3_payload_keep:
             return
         if isinstance(cleanup, R3PayloadCleanup):
             cleanup_r3_mooncake_payloads(cleanup)
             log_fn = logger.info if _r3_verbose_logging_enabled() else logger.debug
             log_fn("Cleaned external R3 Mooncake routing payload keys")
+            return
+        if isinstance(cleanup, R3SourceFilesCleanup):
+            for path in cleanup.paths:
+                try:
+                    path.unlink(missing_ok=True)
+                except Exception as exc:
+                    logger.warning("Failed to clean SGLang R3 source file %s: %s", path, exc)
             return
         self._cleanup_routing_payload_dir(cleanup)
 

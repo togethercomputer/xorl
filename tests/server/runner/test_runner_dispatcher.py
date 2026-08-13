@@ -68,6 +68,76 @@ def _batch(batch_id: int, *, num_samples: int = 1) -> dict:
     }
 
 
+def _span_item(path, values: torch.Tensor) -> dict:
+    return {
+        "schema": "xorl.r3.spans.v1",
+        "rows": values.shape[0],
+        "shape": list(values.shape),
+        "dtype": "int32",
+        "spans": [
+            {
+                "path": str(path),
+                "offset": 0,
+                "source_row": 0,
+                "rows": values.shape[0],
+                "row_nbytes": values.shape[1] * values.shape[2] * 4,
+                "source_shape": list(values.shape),
+                "dtype": "int32",
+            }
+        ],
+    }
+
+
+def test_sglang_file_loader_mmaps_only_requested_datum_slice(tmp_path, monkeypatch):
+    values = torch.arange(12, dtype=torch.int32).reshape(3, 2, 2)
+    selected = tmp_path / "selected.bin"
+    selected.write_bytes(values.numpy().tobytes())
+    missing = _span_item(tmp_path / "must-not-be-read.bin", values)
+    ref = {
+        "__xorl_routing_payload_ref__": True,
+        "transport": "sglang_files",
+        "version": 1,
+        "format": "spans",
+        "kind": "routed_experts",
+        "count": 3,
+        "items": [missing, _span_item(selected, values), missing],
+    }
+    monkeypatch.setenv("XORL_R3_SHARED_ROOTS", str(tmp_path))
+
+    loaded = _dispatcher(0, 1)._load_routing_payload_slice(ref, 1, 1)
+
+    assert len(loaded) == 1
+    assert torch.equal(loaded[0], values)
+
+
+def test_sglang_file_loader_reassembles_prefix_spans_rank_locally(tmp_path, monkeypatch):
+    first = torch.arange(16, dtype=torch.int32).reshape(4, 2, 2)
+    second = torch.arange(100, 112, dtype=torch.int32).reshape(3, 2, 2)
+    first_path = tmp_path / "first.bin"
+    second_path = tmp_path / "second.bin"
+    first_path.write_bytes(first.numpy().tobytes())
+    second_path.write_bytes(second.numpy().tobytes())
+    item = _span_item(first_path, first)
+    item["rows"] = 5
+    item["shape"][0] = 5
+    item["spans"][0]["rows"] = 2
+    item["spans"].append(_span_item(second_path, second)["spans"][0] | {"rows": 3})
+    ref = {
+        "__xorl_routing_payload_ref__": True,
+        "transport": "sglang_files",
+        "version": 1,
+        "format": "spans",
+        "kind": "routed_experts",
+        "count": 1,
+        "items": [item],
+    }
+    monkeypatch.setenv("XORL_R3_SHARED_ROOTS", str(tmp_path))
+
+    loaded = _dispatcher(0, 1)._load_routing_payload_slice(ref, 0, 1)
+
+    assert torch.equal(loaded[0], torch.cat((first[:2], second), dim=0))
+
+
 def _parallel_state(**overrides):
     return SimpleNamespace(
         cp_size=overrides.get("cp_size", 1),

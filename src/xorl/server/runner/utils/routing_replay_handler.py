@@ -548,6 +548,8 @@ class RoutingReplayHandler:
         def _concat_routing(parts: List[Any]) -> Any:
             if not parts:
                 return np.empty((0, num_layers_in_data, topk), dtype=_numpy_dtype())
+            if len(parts) == 1:
+                return parts[0]
             if all(isinstance(part, np.ndarray) for part in parts):
                 return np.concatenate(parts, axis=0)
             routing = []
