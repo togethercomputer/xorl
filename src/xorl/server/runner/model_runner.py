@@ -6074,7 +6074,7 @@ class ModelRunner:
             if is_metrics is not None and "valid_tokens" not in is_metrics:
                 is_metrics["valid_tokens"] = int((target_tokens != IGNORE_INDEX).sum().item())
 
-            if compute_kl_stats and get_parallel_state().cp_enabled and is_metrics:
+            if (compute_kl_stats or loss_fn == "cispo") and get_parallel_state().cp_enabled and is_metrics:
                 is_metrics = _sp_allreduce_kl_metrics(
                     is_metrics,
                     get_parallel_state().ulysses_group,
@@ -7345,8 +7345,8 @@ class ModelRunner:
         # Get return_per_token flag from loss_fn_params (default True for tinker compatibility)
         use_distsignsgd = getattr(self, "_use_distsignsgd", False)
 
-        if self.pp_enabled and loss_fn == "opd_loss":
-            raise NotImplementedError("opd_loss does not yet support pipeline parallelism")
+        if self.pp_enabled and loss_fn in {"opd_loss", "cispo"}:
+            raise NotImplementedError(f"{loss_fn} does not yet support pipeline parallelism")
 
         # Reference forward pass: compute Xorl's own logprobs to replace SGLang logprobs
         # This guarantees KL=0 at step 0 since both old and new logprobs come from the same engine
@@ -7354,7 +7354,7 @@ class ModelRunner:
         ref_logprob_temperature = float(params.get("logprob_temperature", 1.0) or 1.0)
         if ref_logprob_temperature <= 0.0:
             raise ValueError(f"logprob_temperature must be > 0, got {ref_logprob_temperature}")
-        if compute_ref_logprobs and loss_fn in ["policy_loss", "importance_sampling"]:
+        if compute_ref_logprobs and loss_fn in ["policy_loss", "importance_sampling", "cispo"]:
             logger.info("Computing reference logprobs via no-grad forward pass")
 
             # Set up R3 routing for ref pass if needed (separate from main pass)
