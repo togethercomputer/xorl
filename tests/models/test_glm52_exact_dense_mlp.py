@@ -124,14 +124,15 @@ def test_dense_mlp_forward_composes_fused_gate_up_production_activation_and_exac
 
     def activation_value(gate_up):
         events.append(("activation", tuple(gate_up.shape)))
-        return F.silu(gate_up[..., :128]) * gate_up[..., 128:]
+        # One-round FP32 SwiGLU: SiLU and multiply in fp32, single rounding.
+        return (F.silu(gate_up[..., :128].float()) * gate_up[..., 128:].float()).to(gate_up.dtype)
 
     def down_value(input, factor_A, factor_B):
         events.append(("down", tuple(input.shape)))
         return _literal_linear_value(input, down_base, factor_A, factor_B)
 
     monkeypatch.setattr(module, "_exact_forward_value", gate_up_value)
-    monkeypatch.setattr(exact_dense_mlp_module, "fused_silu_and_mul", activation_value)
+    monkeypatch.setattr(exact_dense_mlp_module, "exact_fp32_silu_and_mul", activation_value)
     monkeypatch.setattr(module.down_proj, "_exact_forward_value", down_value)
     input = torch.arange(24, dtype=torch.float32).reshape(3, 8).sub_(7).div_(53).to(torch.bfloat16)
 
@@ -151,7 +152,9 @@ def test_dense_mlp_forward_composes_fused_gate_up_production_activation_and_exac
         effective_up_A,
         effective_up_B,
     )
-    expected_activation = F.silu(expected_gate_up[..., :128]) * expected_gate_up[..., 128:]
+    expected_activation = (F.silu(expected_gate_up[..., :128].float()) * expected_gate_up[..., 128:].float()).to(
+        expected_gate_up.dtype
+    )
     expected = _literal_linear_value(
         expected_activation,
         down_base,

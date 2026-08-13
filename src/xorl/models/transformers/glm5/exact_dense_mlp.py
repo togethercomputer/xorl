@@ -15,10 +15,10 @@ from xorl.models.transformers.glm5.exact_gate_up_qlora import (
     Glm52ExactTP1FusedGateUpBlockFP8QLoRA,
 )
 from xorl.models.transformers.glm5.exact_qlora import Glm52ExactTP1BlockFP8QLoRALinear
-from xorl.ops.fused_silu_and_mul import fused_silu_and_mul
+from xorl.ops.fused_silu_and_mul import exact_fp32_silu_and_mul
 
 
-GLM52_EXACT_TP1_DENSE_MLP_CONTRACT_VERSION = "glm52_exact_tp1_dense_mlp_rank1_qlora_v1"
+GLM52_EXACT_TP1_DENSE_MLP_CONTRACT_VERSION = "glm52_exact_tp1_dense_mlp_rank1_qlora_v2"
 
 
 class Glm52ExactTP1DenseMLP(Glm52ExactTP1FusedGateUpBlockFP8QLoRA):
@@ -132,7 +132,9 @@ class Glm52ExactTP1DenseMLP(Glm52ExactTP1FusedGateUpBlockFP8QLoRA):
     def forward(self, input: Tensor) -> Tensor:
         self._validate_dense_mlp_runtime_contract()
         gate_up = Glm52ExactTP1FusedGateUpBlockFP8QLoRA.forward(self, input)
-        activated = fused_silu_and_mul(gate_up)
+        # Serving's exact mode computes the one-round FP32 SwiGLU
+        # (SiluAndMul.forward_exact, xorl-sglang f10b907d8).
+        activated = exact_fp32_silu_and_mul(gate_up)
         return self.down_proj(activated)
 
 

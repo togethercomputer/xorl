@@ -25,9 +25,10 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from xorl.ops.block_fp8_native import NativeBlockFP8Linear, _sglang_native_block_fp8_linear_value
+from xorl.ops.fused_silu_and_mul import exact_fp32_silu_and_mul
 
 
-GLM52_EXACT_TP16_SHARED_EXPERT_QLORA_CONTRACT_VERSION = "glm52_exact_tp16_shared_expert_rank1_qlora_v1"
+GLM52_EXACT_TP16_SHARED_EXPERT_QLORA_CONTRACT_VERSION = "glm52_exact_tp16_shared_expert_rank1_qlora_v2"
 GLM52_SHARED_EXPERT_HIDDEN_SIZE = 6144
 GLM52_SHARED_EXPERT_INTERMEDIATE_SIZE = 2048
 GLM52_SHARED_EXPERT_TP_SIZE = 16
@@ -505,9 +506,10 @@ class Glm52ExactTP16SharedExpertBlockFP8QLoRA(nn.Module):
             self.shard_size,
             base_output=gate_up_base,
         )
-        # Exact SGLang target mode resolves SiluAndMul.forward_native to this
-        # two-operation expression, including its BF16 intermediate stores.
-        activated = F.silu(gate_up[:, : self.shard_size]) * gate_up[:, self.shard_size :]
+        # Exact SGLang target mode resolves SiluAndMul.forward_exact to the
+        # one-round FP32 SwiGLU (xorl-sglang f10b907d8); this site must
+        # produce those bytes.
+        activated = exact_fp32_silu_and_mul(gate_up)
 
         down_base = _sglang_native_block_fp8_linear_value(
             activated,
@@ -658,7 +660,9 @@ class Glm52ExactTP16SharedExpertBlockFP8QLoRA(nn.Module):
         if need_activation:
             with torch.enable_grad(), torch.autocast(device_type=input.device.type, enabled=False):
                 gate_up_input = exact_gate_up.detach().requires_grad_(True)
-                activation = F.silu(gate_up_input[:, : self.shard_size]) * gate_up_input[:, self.shard_size :]
+                # VJP reference differentiates the same one-round program the
+                # forward emits (backward stays trainer-owned numerics).
+                activation = exact_fp32_silu_and_mul(gate_up_input)
                 (gate_up_grad,) = torch.autograd.grad(
                     activation,
                     gate_up_input,

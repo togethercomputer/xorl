@@ -68,7 +68,7 @@ from xorl.models.transformers.glm5.rotary import glm5_apply_rotary_pos_emb
 from xorl.models.transformers.glm5.sparse_mla import sparse_mla_dispatch
 from xorl.models.transformers.glm5.support import validate_glm5_sequence_parallel
 from xorl.ops.block_fp8_native import NativeBlockFP8Linear
-from xorl.ops.fused_silu_and_mul import fused_silu_and_mul
+from xorl.ops.fused_silu_and_mul import exact_fp32_silu_and_mul, fused_silu_and_mul
 from xorl.utils import logging
 
 
@@ -126,11 +126,21 @@ class Glm5MLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, config.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
         self._use_fused_silu = config.hidden_act == "silu" and not getattr(config, "_activation_native", False)
+        # One-round FP32 SwiGLU pairs with serving's universal exact-mode
+        # activation (SiluAndMul.forward_exact, xorl-sglang f10b907d8). Model
+        # resolution stamps the family-neutral ``_exact_one_round_swiglu`` key
+        # for contracted families; unstamped configs keep the historical
+        # two-round bytes.
+        self._exact_one_round = bool(getattr(config, "_exact_one_round_swiglu", False))
+        if self._exact_one_round and config.hidden_act != "silu":
+            raise ValueError("GLM exact one-round SwiGLU requires hidden_act='silu'")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate = self.gate_proj(x)
         up = self.up_proj(x)
-        if self._use_fused_silu:
+        if self._exact_one_round:
+            hidden_states = exact_fp32_silu_and_mul(torch.cat([gate, up], dim=-1))
+        elif self._use_fused_silu:
             hidden_states = fused_silu_and_mul(torch.cat([gate, up], dim=-1))
         else:
             hidden_states = self.act_fn(gate) * up
@@ -989,7 +999,13 @@ class Glm5MoEBlock(MoEBlock):
         else:
             gate = F.linear(gathered, self.shared_experts.gate_proj.weight[shard_start:shard_end])
             up = F.linear(gathered, self.shared_experts.up_proj.weight[shard_start:shard_end])
-        activated = F.silu(gate) * up
+        if getattr(self.config, "_exact_one_round_swiglu", False):
+            # Serving computes the exact-mode shared expert with the one-round
+            # FP32 SwiGLU (SiluAndMul.forward_exact since xorl-sglang
+            # f10b907d8); the canonical partial must produce those bytes.
+            activated = exact_fp32_silu_and_mul(torch.cat([gate, up], dim=-1))
+        else:
+            activated = F.silu(gate) * up
         if isinstance(self.shared_experts.down_proj, NativeBlockFP8Linear):
             return self.shared_experts.down_proj(
                 activated,

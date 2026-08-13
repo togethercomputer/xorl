@@ -11,7 +11,7 @@ Two programs live here, deliberately:
 - ``exact_fp32_silu_and_mul`` — the ONE-ROUND FP32 program (SiLU and
   multiply in fp32, single rounding), byte-paired with serving's
   ``fp32_silu_and_mul`` (xorl-sglang f10b907d8). Selected ONLY by the
-  exact-contract dispatch (``_qwen35_exact_contract``).
+  exact-contract dispatch (``_exact_one_round_swiglu``).
 """
 
 import torch
