@@ -259,7 +259,7 @@ class TestConvContractGuards:
     def _assert_forward_routes_through_contract_when_armed(self, monkeypatch):
         calls = []
 
-        def fake_contract(q_in, k_in, v_in, *convs, cu_seqlens=None):
+        def fake_contract(q_in, k_in, v_in, *convs, cu_seqlens=None, cp_context=None):
             calls.append(cu_seqlens)
             return F.silu(q_in), F.silu(k_in), F.silu(v_in)
 
@@ -298,7 +298,10 @@ class TestConvContractGuards:
 
         cases = [
             ("decode cache", use_cache, RuntimeError, "prefill only"),
-            ("context parallelism", cp_context, RuntimeError, "does not support CP"),
+            # The blanket "does not support CP" raise is gone: the exact CP
+            # program runs under a real FLACPContext. Malformed or duck-typed
+            # contexts stay fail-closed at the convolution boundary.
+            ("context parallelism, malformed context", cp_context, TypeError, "FLACPContext"),
             ("missing short convolution", no_short_conv, RuntimeError, "requires short convolution"),
             ("convolution bias", conv_bias, NotImplementedError, "bias"),
         ]

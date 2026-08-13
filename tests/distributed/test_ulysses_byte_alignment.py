@@ -14,8 +14,17 @@ U1 reference must run in its own process):
   sequence shards in rank order and byte-compares hidden + logprobs against
   the reference npz. Includes the collator cp-multiple padding case
   (pad tokens appended as their own documents; real-token bytes must match
-  the unpadded U1 reference) and the hybrid negative: a GDN layer under
-  Ulysses must RAISE the exact-contract CP refusal, not compute.
+  the unpadded U1 reference) and hybrid cells under the composed GDN-CP
+  contract.
+
+The hybrid cells cover the composed program (canonical scan chain, conv halo,
+C1/C2 collator, conditional admission, and kernel/toolchain pin):
+`hybrid_admits_and_matches` (full contract engaged -> ADMITS and
+byte-matches the U1 hybrid reference; this fixture's pack is 64-aligned
+in-document at every tested degree, so the chain receipts admit it) and
+`hybrid_raises_without_attestation` (the fail-closed negative:
+admission REFUSES a hybrid Ulysses topology when the C1/C2 collator
+attestation is absent).
 
 """
 
@@ -173,11 +182,18 @@ def _run_reference(out_path: str) -> None:
     # would itself be an unproven assumption).
     short = _short_batch(batch, device)
     hidden_short = _forward_hidden(model, short)
+    # Hybrid U1 reference for the composed-contract positive: the same batch
+    # through the exact hybrid program at Ulysses 1.
+    hybrid_model, _ = _build_model(
+        ["linear_attention", "full_attention", "linear_attention", "full_attention"], device
+    )
+    hidden_hybrid = _forward_hidden(hybrid_model, batch)
     np.savez(
         out_path,
         hidden_bf16=hidden.view(torch.int16).cpu().numpy(),
         logprobs=logprobs.view(torch.int32).cpu().numpy(),
         hidden_short_bf16=hidden_short.view(torch.int16).cpu().numpy(),
+        hidden_hybrid_bf16=hidden_hybrid.view(torch.int16).cpu().numpy(),
     )
     print(f"[ulysses-gate] reference written: {out_path}", flush=True)
 
@@ -185,7 +201,7 @@ def _run_reference(out_path: str) -> None:
 def _run_sharded() -> None:
     import torch.distributed as dist
 
-    from xorl.distributed.parallel_state import init_parallel_state
+    from xorl.distributed.parallel_state import get_parallel_state, init_parallel_state
     from xorl.utils.device import get_nccl_backend
 
     degree = int(os.environ["ULYSSES_GATE_DEGREE"])
@@ -206,6 +222,7 @@ def _run_sharded() -> None:
         device_type="cuda",
         cp_fsdp_mode="none",
     )
+    ps = get_parallel_state()
     device = torch.device("cuda", local_rank)
     rank = dist.get_rank()
 
@@ -216,14 +233,14 @@ def _run_sharded() -> None:
     reference = np.load(ref_path)
     verdicts = {}
 
-    def _sharded_forward(batch):
+    def _sharded_forward(batch, forward_model=None):
         seq_len = batch["input_ids"].shape[-1]
         assert seq_len % degree == 0
         shard = seq_len // degree
         local_ids = batch["input_ids"][:, rank * shard : (rank + 1) * shard].contiguous()
         local_batch = dict(batch)
         local_batch["input_ids"] = local_ids
-        hidden_local = _forward_hidden(model, local_batch)
+        hidden_local = _forward_hidden(forward_model if forward_model is not None else model, local_batch)
         gathered = [torch.empty_like(hidden_local) for _ in range(degree)]
         dist.all_gather(gathered, hidden_local.contiguous())
         return torch.cat(gathered, dim=1)
@@ -253,18 +270,62 @@ def _run_sharded() -> None:
         torch.equal(hidden_padded[:, :SHORT_LEN].contiguous().view(torch.int16).cpu(), ref_short)
     )
 
-    # --- hybrid negative: GDN under Ulysses must RAISE the contract floor --
+    # --- hybrid cells under the composed contract ---------------------------
+    # Positive: full contract engaged -> ADMIT + byte-match the U1 hybrid
+    # reference (this fixture's pack is 64-aligned in-document at every
+    # tested degree: doc starts 0 and 192, shard = 512/degree, all multiples
+    # of 64, so the chain receipts admit every cut). Negative: admission
+    # REFUSES the hybrid Ulysses topology when the C1/C2 collator
+    # attestation is absent (representative missing-piece).
+    import tempfile as _tempfile
+
+    from xorl.models.auto import _validate_exact_qwen35_topology
+    from xorl.ops.kernel_config_pin import seed_exact_kernel_config_pin
+
     hybrid_model, hybrid_config = _build_model(
         ["linear_attention", "full_attention", "linear_attention", "full_attention"], device
     )
+    for tensor in list(hybrid_model.parameters()) + list(hybrid_model.buffers()):
+        dist.broadcast(tensor.data, src=0)
     hybrid_batch = _make_batch(SEQ_LEN, hybrid_config.vocab_size, device)
-    shard = SEQ_LEN // degree
-    hybrid_batch["input_ids"] = hybrid_batch["input_ids"][:, rank * shard : (rank + 1) * shard].contiguous()
+
+    saved_env = {
+        key: os.environ.get(key)
+        for key in ("XORL_GDN_CP_ALIGN_COLLATOR", "XORL_EXACT_KERNEL_CONFIG_DIR", "TRITON_CACHE_DIR")
+    }
+    pin_dir = _tempfile.mkdtemp(prefix=f"ulysses-gate-pin-r{rank}-")
+    empty_cache_src = _tempfile.mkdtemp(prefix=f"ulysses-gate-cache-r{rank}-")
     try:
-        _forward_hidden(hybrid_model, hybrid_batch)
-        verdicts["hybrid_raises"] = False
-    except RuntimeError as exc:
-        verdicts["hybrid_raises"] = "does not support CP yet" in str(exc)
+        # Negative first (attestation absent; pin present so the refusal is
+        # attributable to exactly the missing attestation). Seed from an
+        # empty cache dir: this cell asserts admission semantics, not
+        # cross-process config replay, and avoids copying the ambient default
+        # Triton cache.
+        seed_exact_kernel_config_pin(pin_dir, source_cache=empty_cache_src)
+        os.environ["XORL_EXACT_KERNEL_CONFIG_DIR"] = pin_dir
+        os.environ.pop("XORL_GDN_CP_ALIGN_COLLATOR", None)
+        try:
+            _validate_exact_qwen35_topology(hybrid_config, ps)
+            verdicts["hybrid_raises_without_attestation"] = False
+        except ValueError as exc:
+            verdicts["hybrid_raises_without_attestation"] = "aligned collator" in str(exc)
+
+        # Positive: full composed contract engaged.
+        os.environ["XORL_GDN_CP_ALIGN_COLLATOR"] = "1"
+        _validate_exact_qwen35_topology(hybrid_config, ps)  # must ADMIT (no raise)
+        hidden_hybrid = _sharded_forward(hybrid_batch, forward_model=hybrid_model)
+        verdicts["hybrid_admits_and_matches"] = bool(
+            torch.equal(
+                hidden_hybrid.view(torch.int16).cpu(),
+                torch.from_numpy(reference["hidden_hybrid_bf16"]),
+            )
+        )
+    finally:
+        for key, value in saved_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
     gathered_verdicts: list = [None] * dist.get_world_size()
     dist.all_gather_object(gathered_verdicts, verdicts)
