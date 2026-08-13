@@ -124,9 +124,7 @@ def cispo_loss_function(
             metrics["kl_k3_debug_logratio_mean"] = metric_reducer(log_ratio, valid_mask_f)
             metrics["kl_k3_debug_logratio_min"] = logratio_min
             metrics["kl_k3_debug_logratio_max"] = logratio_max
-            metrics["kl_k3_debug_frac_logratio_positive"] = metric_reducer(
-                (log_ratio > 0).float(), valid_mask_f
-            )
+            metrics["kl_k3_debug_frac_logratio_positive"] = metric_reducer((log_ratio > 0).float(), valid_mask_f)
             for suffix, threshold in K3_DEBUG_THRESHOLDS:
                 metrics[f"kl_k3_debug_frac_gt_{suffix}"] = metric_reducer(
                     (per_token_k3 > threshold).float(), valid_mask_f

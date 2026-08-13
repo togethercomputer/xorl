@@ -84,12 +84,8 @@ def _measure_once(
 
     index_devices = {str(block._routing_replay.top_indices_list[0].device) for block in blocks}
     weight_devices = {str(block._routing_replay.top_weights_list[0].device) for block in blocks}
-    index_storages = {
-        block._routing_replay.top_indices_list[0].untyped_storage().data_ptr() for block in blocks
-    }
-    weight_storages = {
-        block._routing_replay.top_weights_list[0].untyped_storage().data_ptr() for block in blocks
-    }
+    index_storages = {block._routing_replay.top_indices_list[0].untyped_storage().data_ptr() for block in blocks}
+    weight_storages = {block._routing_replay.top_weights_list[0].untyped_storage().data_ptr() for block in blocks}
     result: dict[str, float | bool] = {
         "setup_s": setup_s,
         "forward_s": forward_s,
@@ -134,8 +130,7 @@ def main() -> None:
     for _ in range(args.warmups):
         _measure_once(routed_experts, routed_weights, args.rows, args.layers)
     measurements = [
-        _measure_once(routed_experts, routed_weights, args.rows, args.layers)
-        for _ in range(args.iterations)
+        _measure_once(routed_experts, routed_weights, args.rows, args.layers) for _ in range(args.iterations)
     ]
 
     summary = {
@@ -155,12 +150,8 @@ def main() -> None:
         "median_forward_plus_recompute_s": _median(measurements, "forward_plus_recompute_s"),
         "median_total_s": _median(measurements, "total_s"),
         "all_device_resident": all(bool(row["device_resident"]) for row in measurements),
-        "all_single_index_backing_storage": all(
-            bool(row["single_index_backing_storage"]) for row in measurements
-        ),
-        "all_single_weight_backing_storage": all(
-            bool(row["single_weight_backing_storage"]) for row in measurements
-        ),
+        "all_single_index_backing_storage": all(bool(row["single_index_backing_storage"]) for row in measurements),
+        "all_single_weight_backing_storage": all(bool(row["single_weight_backing_storage"]) for row in measurements),
         "measurements": measurements,
     }
     encoded = json.dumps(summary, indent=2, sort_keys=True) + "\n"

@@ -6043,9 +6043,7 @@ class ModelRunner:
             compute_kl_stats = params.get("compute_kl_stats", False)
             diagnostic_reference_logits = bool(params.get("diagnostic_reference_logits", False))
 
-            loss_function = (
-                cispo_loss_function if loss_fn == "cispo" else importance_sampling_loss_function
-            )
+            loss_function = cispo_loss_function if loss_fn == "cispo" else importance_sampling_loss_function
             loss_kwargs = {}
             if loss_fn == "cispo":
                 loss_kwargs = {

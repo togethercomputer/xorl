@@ -55,11 +55,7 @@ def test_matches_detached_clipped_ratio_objective(inputs):
     output = call_loss(inputs, loss_reducer=unit, metric_reducer=unit)
     ratio = torch.exp(output.per_token_logprobs - inputs["old_logprobs"])
     clipped = torch.clamp(ratio, 0.0, 4.0)
-    reference = -(
-        clipped.detach()
-        * output.per_token_logprobs
-        * inputs["advantages"]
-    )[inputs["mask"]].sum()
+    reference = -(clipped.detach() * output.per_token_logprobs * inputs["advantages"])[inputs["mask"]].sum()
     assert_close(output.loss, reference)
 
 
@@ -85,12 +81,8 @@ def test_gradient_matches_reference_and_survives_clipping(inputs):
         ignore_index=IGNORE_INDEX,
     ).reshape(inputs["labels"].shape)
     logprobs = -per_token_ce
-    clipped = torch.clamp(
-        torch.exp(logprobs.detach() - inputs["old_logprobs"]), 0.9, 1.1
-    ).detach()
-    reference_loss = -(
-        clipped * logprobs * inputs["advantages"]
-    )[inputs["mask"]].sum()
+    clipped = torch.clamp(torch.exp(logprobs.detach() - inputs["old_logprobs"]), 0.9, 1.1).detach()
+    reference_loss = -(clipped * logprobs * inputs["advantages"])[inputs["mask"]].sum()
     reference_loss.backward()
 
     assert hidden_states.grad is not None
