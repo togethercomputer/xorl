@@ -13,6 +13,7 @@ Test Strategy:
 - Verify RequestProcessor correctly packs data and formats outputs
 """
 
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -358,6 +359,18 @@ async def test_model_pass_cleans_mooncake_routing_payloads_by_default():
     assert sorted(client.removed) == sorted(seen["keys"])
 
 
+def test_mooncake_chunk_ranges_follow_dispatcher_dp_slices():
+    processor = RequestProcessor(backend=DummyBackend(), dp_size=3)
+    batches = [
+        {"num_samples": 2},
+        {"num_samples": 1},
+        {"num_samples": 3},
+        {"num_samples": 4},
+    ]
+
+    assert processor._routing_payload_chunk_ranges(batches, 10) == [(0, 3), (3, 3), (6, 4)]
+
+
 @pytest.mark.asyncio
 async def test_model_pass_cleans_mooncake_routing_payloads_on_backend_exception():
     backend = DummyBackend()
@@ -469,6 +482,12 @@ async def test_model_pass_cleans_externalized_routing_payloads_by_default(tmp_pa
         expert_ref = kwargs["routed_experts"]
         manifest_path = Path(expert_ref["manifest"])
         assert manifest_path.exists()
+        assert expert_ref["version"] == 3
+        assert expert_ref["format"] == "packed_rows"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert manifest["format"] == "xorl-r3-packed"
+        assert len(manifest["routed_experts"]["chunks"]) == 1
+        assert sorted(path.name for path in (manifest_path.parent / "routed_experts").iterdir()) == ["chunk-000000.bin"]
         seen["root"] = manifest_path.parent
         dispatcher = object.__new__(RunnerDispatcher)
         dispatcher.rank = 0

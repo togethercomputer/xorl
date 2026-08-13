@@ -69,12 +69,13 @@ from xorl.server.protocol.operations import (
 )
 from xorl.server.runner.utils import batch_packed_rows
 from xorl.server.side_payloads import (
+    DEFAULT_R3_PACKED_CHUNK_BYTES,
     R3_ROUTED_EXPERT_LOGITS,
     R3_ROUTED_EXPERTS,
     MooncakeSidePayloadStore,
     R3PayloadCleanup,
-    canonicalize_r3_payload_item,
     cleanup_r3_mooncake_payloads,
+    iter_r3_packed_chunks,
     put_r3_mooncake_payload_refs,
 )
 from xorl.utils.seqlen_pos_transform_utils import pos2culen
@@ -83,7 +84,7 @@ from xorl.utils.seqlen_pos_transform_utils import pos2culen
 logger = logging.getLogger(__name__)
 
 
-FORWARD_BACKWARD_RESULT_PREFIXES = ("forward_backward_", "server_profile_")
+FORWARD_BACKWARD_RESULT_PREFIXES = ("forward_backward_", "server_profile_", "r3_replay_")
 FORWARD_BACKWARD_RESULT_KEYS = {
     "backward_compute_time",
     "forward_compute_time",
@@ -258,6 +259,8 @@ class RequestProcessor:
         request_id: str,
         routed_experts: Optional[List[Any]],
         routed_expert_logits: Optional[List[Any]],
+        *,
+        batches: Optional[List[Dict[str, Any]]] = None,
     ) -> tuple[Optional[Any], Optional[Any], Optional[Union[Path, R3PayloadCleanup]]]:
         if self.r3_payload_transport == "inline" or (routed_experts is None and routed_expert_logits is None):
             return routed_experts, routed_expert_logits, None
@@ -271,6 +274,9 @@ class RequestProcessor:
                 routed_expert_logits=routed_expert_logits,
                 store=store,
                 namespace_prefix=self.r3_payload_namespace_prefix,
+                chunk_ranges=self._routing_payload_chunk_ranges(
+                    batches, len(routed_experts or routed_expert_logits or [])
+                ),
             )
             log_fn = logger.info if _r3_verbose_logging_enabled() else logger.debug
             log_fn(
@@ -281,13 +287,46 @@ class RequestProcessor:
             )
             return refs
 
-        return self._externalize_routing_payloads_filesystem(request_id, routed_experts, routed_expert_logits)
+        return self._externalize_routing_payloads_filesystem(
+            request_id,
+            routed_experts,
+            routed_expert_logits,
+            chunk_ranges=self._routing_payload_chunk_ranges(batches, len(routed_experts or routed_expert_logits or [])),
+        )
+
+    def _routing_payload_chunk_ranges(
+        self,
+        batches: Optional[List[Dict[str, Any]]],
+        datum_count: int,
+    ) -> Optional[List[tuple[int, int]]]:
+        """Align packed side-payload chunks with the dispatcher's DP datum slices."""
+        if not batches or datum_count == 0:
+            return None
+        num_batches = len(batches)
+        base_count = num_batches // self.dp_size
+        remainder = num_batches % self.dp_size
+        ranges: List[tuple[int, int]] = []
+        datum_cursor = 0
+        for dp_rank in range(self.dp_size):
+            batch_start = dp_rank * base_count + min(dp_rank, remainder)
+            batch_count = base_count + (1 if dp_rank < remainder else 0)
+            dp_datums = sum(
+                int(batches[idx].get("num_samples", 1)) for idx in range(batch_start, batch_start + batch_count)
+            )
+            if dp_datums:
+                ranges.append((datum_cursor, dp_datums))
+                datum_cursor += dp_datums
+        if datum_cursor != datum_count:
+            raise ValueError(f"R3 packed chunk ranges cover {datum_cursor} datums from batches, expected {datum_count}")
+        return ranges
 
     def _externalize_routing_payloads_filesystem(
         self,
         request_id: str,
         routed_experts: Optional[List[Any]],
         routed_expert_logits: Optional[List[Any]],
+        *,
+        chunk_ranges: Optional[List[tuple[int, int]]] = None,
     ) -> tuple[Optional[Any], Optional[Any], Optional[Path]]:
         if self.r3_payload_dir is None:
             raise ValueError("r3_payload_dir is required for r3_payload_transport='filesystem'")
@@ -301,7 +340,7 @@ class RequestProcessor:
                 shutil.rmtree(tmp_root)
             tmp_root.mkdir(parents=True, exist_ok=True)
 
-            def _write_items(kind: str, items: Optional[List[Any]]) -> Optional[Dict[str, Any]]:
+            def _write_chunks(kind: str, items: Optional[List[Any]]) -> Optional[Dict[str, Any]]:
                 if items is None:
                     return None
                 item_dir = tmp_root / kind
@@ -316,25 +355,35 @@ class RequestProcessor:
                     raise ValueError(f"Unsupported R3 filesystem payload kind {kind!r}")
 
                 metadata = []
-                for idx, item in enumerate(items):
-                    tensor = canonicalize_r3_payload_item(item, field=kind, target_dtype=target_dtype)
+                for idx, (tensor, chunk_metadata) in enumerate(
+                    iter_r3_packed_chunks(
+                        items,
+                        field=kind,
+                        target_dtype=target_dtype,
+                        chunk_ranges=chunk_ranges,
+                        max_chunk_bytes=DEFAULT_R3_PACKED_CHUNK_BYTES,
+                    )
+                ):
                     data = tensor.numpy().tobytes(order="C")
-                    (item_dir / f"{idx:06d}.bin").write_bytes(data)
-                    metadata.append(
+                    filename = f"chunk-{idx:06d}.bin"
+                    (item_dir / filename).write_bytes(data)
+                    chunk_metadata.update(
                         {
+                            "file": filename,
                             "shape": [int(dim) for dim in tensor.shape],
                             "dtype": dtype_name,
                             "nbytes": len(data),
                         }
                     )
-                return {"count": len(items), "items": metadata}
+                    metadata.append(chunk_metadata)
+                return {"count": len(items), "chunks": metadata}
 
             manifest = {
-                "format": "xorl-r3-raw",
-                "version": 2,
+                "format": "xorl-r3-packed",
+                "version": 3,
                 "request_id": str(request_id),
-                R3_ROUTED_EXPERTS: _write_items(R3_ROUTED_EXPERTS, routed_experts),
-                R3_ROUTED_EXPERT_LOGITS: _write_items(R3_ROUTED_EXPERT_LOGITS, routed_expert_logits),
+                R3_ROUTED_EXPERTS: _write_chunks(R3_ROUTED_EXPERTS, routed_experts),
+                R3_ROUTED_EXPERT_LOGITS: _write_chunks(R3_ROUTED_EXPERT_LOGITS, routed_expert_logits),
             }
             (tmp_root / "manifest.json").write_text(
                 json.dumps(manifest, sort_keys=True, separators=(",", ":")),
@@ -352,7 +401,8 @@ class RequestProcessor:
             return {
                 ROUTING_PAYLOAD_REF_KEY: True,
                 "transport": "filesystem",
-                "version": 2,
+                "version": 3,
+                "format": "packed_rows",
                 "manifest": str(root / "manifest.json"),
                 "kind": kind,
                 "count": len(items),
@@ -586,11 +636,14 @@ class RequestProcessor:
             if row_batch_size > 1 and (routed_experts is not None or routed_expert_logits is not None):
                 raise ValueError("opd_packed_row_batch_size is not supported with routed_experts replay")
 
+            t_before_externalize = time.perf_counter()
             routed_experts, routed_expert_logits, routing_payload_root = self._externalize_routing_payloads(
                 request.request_id,
                 routed_experts,
                 routed_expert_logits,
+                batches=batches,
             )
+            t_after_externalize = time.perf_counter()
 
             if row_batch_size > 1:
                 row_batch_scope = str(loss_fn_params.get("opd_packed_row_batch_scope", "rank_local")).lower()
@@ -657,6 +710,7 @@ class RequestProcessor:
                     "execution_time", result.get("forward_backward_time", result.get("forward_time", 0.0))
                 ),
                 "executor_pack_s": t_packed - t0,
+                "executor_r3_externalize_s": t_after_externalize - t_before_externalize,
                 "executor_backend_s": t_backend - t_packed,
                 "executor_build_output_s": 0.0,  # Filled after output construction.
                 "executor_total_s": 0.0,  # Filled after output construction.

@@ -13,6 +13,7 @@ import base64
 import logging
 import time
 import uuid
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Protocol
 
@@ -36,6 +37,10 @@ R3_ROUTING_KIND = "r3_routing"
 R3_ROUTED_EXPERTS = "routed_experts"
 R3_ROUTED_EXPERT_LOGITS = "routed_expert_logits"
 R3_ROUTING_FIELDS = (R3_ROUTED_EXPERTS, R3_ROUTED_EXPERT_LOGITS)
+R3_PACKED_FORMAT = "packed_rows"
+# Keep individual Mooncake objects comfortably below the default local buffer
+# while reducing the production request from thousands of objects to tens.
+DEFAULT_R3_PACKED_CHUNK_BYTES = 256 * 1024 * 1024
 
 
 class MooncakeByteClient(Protocol):
@@ -190,8 +195,14 @@ def r3_payload_count(value: Optional[Any]) -> int:
         return len(value)
     field, items = _parse_r3_ref_items(value)
     count = int(value.get("count", len(items)))
-    if count != len(items):
+    if int(value.get("version", 0)) == 1 and count != len(items):
         raise ValueError(f"R3 side payload count mismatch for {field}: ref count={count}, metadata items={len(items)}")
+    if int(value.get("version", 0)) == 2:
+        covered = sum(int(item["datum_count"]) for item in items)
+        if covered != count:
+            raise ValueError(
+                f"R3 packed side payload count mismatch for {field}: ref count={count}, chunks cover={covered}"
+            )
     return count
 
 
@@ -202,6 +213,8 @@ def put_r3_mooncake_payload_refs(
     routed_expert_logits: Optional[list[Any]],
     store: MooncakeSidePayloadStore,
     namespace_prefix: Optional[str] = None,
+    chunk_ranges: Optional[list[tuple[int, int]]] = None,
+    max_chunk_bytes: int = DEFAULT_R3_PACKED_CHUNK_BYTES,
 ) -> tuple[Optional[dict[str, Any]], Optional[dict[str, Any]], Optional[R3PayloadCleanup]]:
     if routed_experts is None and routed_expert_logits is None:
         return routed_experts, routed_expert_logits, None
@@ -217,6 +230,8 @@ def put_r3_mooncake_payload_refs(
 
     safe_request_id = _safe_namespace_component(request_id) or "request"
     namespace = f"{(namespace_prefix or 'xorl/r3').rstrip('/')}/{safe_request_id}/{uuid.uuid4().hex[:12]}"
+    payload_count = len(routed_experts if routed_experts is not None else routed_expert_logits or [])
+    resolved_ranges = _validate_chunk_ranges(chunk_ranges, payload_count)
     written: list[Mapping[str, Any]] = []
     items: dict[str, list[dict[str, Any]]] = {}
 
@@ -228,6 +243,8 @@ def put_r3_mooncake_payload_refs(
                 R3_ROUTED_EXPERTS,
                 routed_experts,
                 target_dtype=torch.int32,
+                chunk_ranges=resolved_ranges,
+                max_chunk_bytes=max_chunk_bytes,
             )
             written.extend(items[R3_ROUTED_EXPERTS])
         if routed_expert_logits is not None:
@@ -237,6 +254,8 @@ def put_r3_mooncake_payload_refs(
                 R3_ROUTED_EXPERT_LOGITS,
                 routed_expert_logits,
                 target_dtype=torch.float32,
+                chunk_ranges=resolved_ranges,
+                max_chunk_bytes=max_chunk_bytes,
             )
             written.extend(items[R3_ROUTED_EXPERT_LOGITS])
     except Exception:
@@ -248,7 +267,8 @@ def put_r3_mooncake_payload_refs(
         SIDE_PAYLOAD_REF_KEY: True,
         "backend": "mooncake",
         "kind": R3_ROUTING_KIND,
-        "version": 1,
+        "version": 2,
+        "format": R3_PACKED_FORMAT,
         "request_id": str(request_id),
         "namespace": namespace,
         "items": items,
@@ -277,15 +297,36 @@ def load_r3_mooncake_payload_slice(
     store: Optional[MooncakeSidePayloadStore] = None,
 ) -> list[np.ndarray]:
     field, items = _parse_r3_ref_items(ref)
-    if start < 0 or count < 0 or start + count > len(items):
-        raise ValueError(
-            f"R3 side payload slice out of range for {field}: start={start}, count={count}, total={len(items)}"
-        )
+    total = int(ref.get("count", len(items)))
+    if start < 0 or count < 0 or start + count > total:
+        raise ValueError(f"R3 side payload slice out of range for {field}: start={start}, count={count}, total={total}")
     payload_store = store or MooncakeSidePayloadStore.from_metadata(_require_mapping(ref.get("mooncake"), "mooncake"))
     arrays: list[np.ndarray] = []
-    for entry in items[start : start + count]:
+    if int(ref.get("version", 0)) == 1:
+        for entry in items[start : start + count]:
+            tensor = payload_store.get_tensor_from_metadata(entry)
+            arrays.append(tensor.detach().cpu().numpy())
+        return arrays
+
+    stop = start + count
+    for entry in items:
+        chunk_start = int(entry["datum_start"])
+        chunk_stop = chunk_start + int(entry["datum_count"])
+        overlap_start = max(start, chunk_start)
+        overlap_stop = min(stop, chunk_stop)
+        if overlap_start >= overlap_stop:
+            continue
         tensor = payload_store.get_tensor_from_metadata(entry)
-        arrays.append(tensor.detach().cpu().numpy())
+        offsets = entry["row_offsets"]
+        for datum_idx in range(overlap_start, overlap_stop):
+            local_idx = datum_idx - chunk_start
+            row_start = int(offsets[local_idx])
+            row_stop = int(offsets[local_idx + 1])
+            arrays.append(tensor[row_start:row_stop].detach().cpu().numpy())
+    if len(arrays) != count:
+        raise ValueError(
+            f"R3 packed side payload slice coverage mismatch for {field}: requested={count}, loaded={len(arrays)}"
+        )
     return arrays
 
 
@@ -336,12 +377,84 @@ def _put_r3_field(
     payloads: list[Any],
     *,
     target_dtype: torch.dtype,
+    chunk_ranges: list[tuple[int, int]],
+    max_chunk_bytes: int,
 ) -> list[dict[str, Any]]:
     entries: list[dict[str, Any]] = []
-    for idx, item in enumerate(payloads):
-        tensor = canonicalize_r3_payload_item(item, field=field, target_dtype=target_dtype)
-        entries.append(store.put_tensor(f"{namespace}/{field}/{idx:06d}", tensor))
+    for chunk_index, (packed, chunk_metadata) in enumerate(
+        iter_r3_packed_chunks(
+            payloads,
+            field=field,
+            target_dtype=target_dtype,
+            chunk_ranges=chunk_ranges,
+            max_chunk_bytes=max_chunk_bytes,
+        )
+    ):
+        metadata = store.put_tensor(f"{namespace}/{field}/chunk-{chunk_index:06d}", packed)
+        metadata.update(chunk_metadata)
+        entries.append(metadata)
     return entries
+
+
+def iter_r3_packed_chunks(
+    payloads: list[Any],
+    *,
+    field: str,
+    target_dtype: torch.dtype,
+    chunk_ranges: Optional[list[tuple[int, int]]] = None,
+    max_chunk_bytes: int = DEFAULT_R3_PACKED_CHUNK_BYTES,
+) -> Iterator[tuple[torch.Tensor, dict[str, Any]]]:
+    """Yield bounded contiguous row tensors plus per-datum row offsets."""
+    if max_chunk_bytes <= 0:
+        raise ValueError(f"R3 packed max_chunk_bytes must be positive, got {max_chunk_bytes}")
+    resolved_ranges = _validate_chunk_ranges(chunk_ranges, len(payloads))
+    for range_start, range_count in resolved_ranges:
+        pending: list[torch.Tensor] = []
+        pending_start = range_start
+        pending_bytes = 0
+        for idx in range(range_start, range_start + range_count):
+            tensor = canonicalize_r3_payload_item(payloads[idx], field=field, target_dtype=target_dtype)
+            tensor_bytes = tensor.numel() * tensor.element_size()
+            if pending and pending_bytes + tensor_bytes > max_chunk_bytes:
+                yield _finalize_r3_packed_chunk(pending, pending_start, field)
+                pending = []
+                pending_start = idx
+                pending_bytes = 0
+            pending.append(tensor)
+            pending_bytes += tensor_bytes
+        if pending:
+            yield _finalize_r3_packed_chunk(pending, pending_start, field)
+
+
+def _finalize_r3_packed_chunk(
+    tensors: list[torch.Tensor], datum_start: int, field: str
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    trailing_shape = tuple(tensors[0].shape[1:])
+    if any(tuple(tensor.shape[1:]) != trailing_shape for tensor in tensors):
+        raise ValueError(f"R3 {field} payload has inconsistent layer/top-k shapes within a packed chunk")
+    row_offsets = [0]
+    for tensor in tensors:
+        row_offsets.append(row_offsets[-1] + int(tensor.shape[0]))
+    packed = torch.cat(tensors, dim=0) if len(tensors) > 1 else tensors[0]
+    return packed, {
+        "datum_start": datum_start,
+        "datum_count": len(tensors),
+        "row_offsets": row_offsets,
+    }
+
+
+def _validate_chunk_ranges(ranges: Optional[list[tuple[int, int]]], count: int) -> list[tuple[int, int]]:
+    if ranges is None:
+        return [(0, count)] if count else []
+    resolved = [(int(start), int(length)) for start, length in ranges if int(length) > 0]
+    cursor = 0
+    for start, length in resolved:
+        if start != cursor or length < 0 or start + length > count:
+            raise ValueError(f"R3 packed chunk ranges must cover [0, {count}) contiguously, got {resolved!r}")
+        cursor += length
+    if cursor != count:
+        raise ValueError(f"R3 packed chunk ranges cover [0, {cursor}), expected [0, {count})")
+    return resolved
 
 
 def _to_routing_tensor(item: Any, *, field: str, target_dtype: torch.dtype) -> torch.Tensor:
@@ -378,6 +491,10 @@ def _decode_sglang_routing_dict(item: Mapping[str, Any], *, field: str, target_d
         arr = np.frombuffer(raw, dtype=np_dtype).reshape(shape)
     except Exception as exc:
         raise ValueError(f"R3 {field} dict payload cannot be reshaped to {shape}: {exc}") from exc
+    rows = item.get("rows", shape[0])
+    if not isinstance(rows, int) or isinstance(rows, bool) or rows < 0 or rows > shape[0]:
+        raise ValueError(f"R3 {field} dict payload has invalid rows view {rows!r} for shape {shape}")
+    arr = arr[:rows]
     return torch.from_numpy(arr.copy())
 
 
@@ -390,8 +507,27 @@ def _parse_r3_ref_items(ref: Mapping[str, Any]) -> tuple[str, list[Mapping[str, 
     entries = items_by_field.get(field)
     if not isinstance(entries, list):
         raise ValueError(f"R3 side payload ref missing items[{field!r}] list")
+    version = int(ref.get("version", 0))
+    expected_start = 0
     for idx, entry in enumerate(entries):
-        parse_tensor_metadata(_require_mapping(entry, f"items[{field!r}][{idx}]"))
+        entry = _require_mapping(entry, f"items[{field!r}][{idx}]")
+        _, shape, _ = parse_tensor_metadata(entry)
+        if version == 2:
+            datum_start = int(entry.get("datum_start", -1))
+            datum_count = int(entry.get("datum_count", -1))
+            offsets = entry.get("row_offsets")
+            if datum_start != expected_start or datum_count < 1:
+                raise ValueError(f"R3 packed side payload chunk {idx} is not contiguous")
+            if (
+                not isinstance(offsets, list)
+                or len(offsets) != datum_count + 1
+                or offsets[0] != 0
+                or any(not isinstance(value, int) or value < 0 for value in offsets)
+                or any(left > right for left, right in zip(offsets, offsets[1:]))
+                or offsets[-1] != shape[0]
+            ):
+                raise ValueError(f"R3 packed side payload chunk {idx} has invalid row_offsets")
+            expected_start += datum_count
     return str(field), entries
 
 
@@ -402,8 +538,11 @@ def _validate_r3_ref_header(ref: Mapping[str, Any]) -> None:
         raise ValueError(f"R3 side payload ref backend must be 'mooncake', got {ref.get('backend')!r}")
     if ref.get("kind") != R3_ROUTING_KIND:
         raise ValueError(f"R3 side payload ref kind must be {R3_ROUTING_KIND!r}, got {ref.get('kind')!r}")
-    if int(ref.get("version", 0)) != 1:
-        raise ValueError(f"R3 side payload ref version must be 1, got {ref.get('version')!r}")
+    version = int(ref.get("version", 0))
+    if version not in (1, 2):
+        raise ValueError(f"R3 side payload ref version must be 1 or 2, got {ref.get('version')!r}")
+    if version == 2 and ref.get("format") != R3_PACKED_FORMAT:
+        raise ValueError(f"R3 side payload ref version 2 must use format {R3_PACKED_FORMAT!r}")
 
 
 def _require_mapping(value: Any, name: str) -> Mapping[str, Any]:

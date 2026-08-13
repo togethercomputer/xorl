@@ -7495,6 +7495,9 @@ class ModelRunner:
                     self._adapter_manager.abort_gradient_capture(model_id)
                 raise
 
+        if r3_enabled:
+            result.update(self._routing_handler.last_setup_metrics)
+
         if self._adapter_manager is not None:
             self._adapter_manager.trace_model_gradient_stage(
                 model_id,

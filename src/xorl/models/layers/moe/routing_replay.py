@@ -87,6 +87,12 @@ class RoutingReplay:
             return torch.device("cuda", torch.cuda.current_device())
         return torch.device("cpu")
 
+    def _to_target_device(self, tensor: torch.Tensor) -> torch.Tensor:
+        target = self._target_device()
+        if tensor.device == target:
+            return tensor
+        return tensor.to(target, non_blocking=torch.cuda.is_available())
+
     @torch.compiler.disable
     def pop_forward(self) -> torch.Tensor:
         """Read routing for forward replay, advance forward_index."""
@@ -94,7 +100,7 @@ class RoutingReplay:
         idx = self.top_indices_list[index]
         self._wait_for_copy(self.top_indices_events, index)
         self.forward_index += 1
-        return idx.to(self._target_device(), non_blocking=torch.cuda.is_available())
+        return self._to_target_device(idx)
 
     @torch.compiler.disable
     def pop_forward_weights(self) -> Optional[torch.Tensor]:
@@ -104,7 +110,7 @@ class RoutingReplay:
         # forward_index was already incremented by pop_forward, so use -1
         index = self.forward_index - 1
         self._wait_for_copy(self.top_weights_events, index)
-        return self.top_weights_list[index].to(self._target_device(), non_blocking=torch.cuda.is_available())
+        return self._to_target_device(self.top_weights_list[index])
 
     @torch.compiler.disable
     def pop_backward(self) -> torch.Tensor:
@@ -113,7 +119,7 @@ class RoutingReplay:
         idx = self.top_indices_list[index]
         self._wait_for_copy(self.top_indices_events, index)
         self.backward_index += 1
-        return idx.to(self._target_device(), non_blocking=torch.cuda.is_available())
+        return self._to_target_device(idx)
 
     @torch.compiler.disable
     def pop_backward_weights(self) -> Optional[torch.Tensor]:
@@ -122,7 +128,7 @@ class RoutingReplay:
             return None
         index = self.backward_index - 1
         self._wait_for_copy(self.top_weights_events, index)
-        return self.top_weights_list[index].to(self._target_device(), non_blocking=torch.cuda.is_available())
+        return self._to_target_device(self.top_weights_list[index])
 
     @property
     def has_weights(self) -> bool:

@@ -79,6 +79,7 @@ class RoutingReplayHandler:
         self.model = model
         self._moe_blocks: Optional[List[nn.Module]] = None
         self._model_topk: Optional[int] = self._extract_topk(model)
+        self.last_setup_metrics: Dict[str, float] = {}
 
     @staticmethod
     def _extract_topk(model: nn.Module) -> Optional[int]:
@@ -191,6 +192,11 @@ class RoutingReplayHandler:
                 except Exception as e:
                     logger.warning(f"{log_prefix}: Failed to reshape with shape {shape}: {e}")
                     return None
+                rows = item.get("rows", shape[0])
+                if not isinstance(rows, int) or isinstance(rows, bool) or rows < 0 or rows > shape[0]:
+                    logger.warning(f"{log_prefix}: Invalid rows view {rows!r} for shape {shape}")
+                    return None
+                arr = arr[:rows]
             else:
                 arr = self._infer_shape(arr, num_moe_layers)
                 if arr is None:
@@ -230,9 +236,29 @@ class RoutingReplayHandler:
         return self._decode_routing_array(item, num_moe_layers, np.float32, "R3 weights")
 
     @staticmethod
-    def _append_cpu_replay_tensor(replay: RoutingReplay, list_name: str, tensor: torch.Tensor) -> None:
-        """Append a CPU replay buffer without the extra pinned-memory staging copy."""
-        getattr(replay, list_name).append(tensor.detach().cpu().contiguous())
+    def _append_replay_tensor(replay: RoutingReplay, list_name: str, tensor: torch.Tensor) -> None:
+        """Append a view into an already staged replay buffer."""
+        getattr(replay, list_name).append(tensor.detach())
+
+    @staticmethod
+    def _stage_layer_major_replay_tensor(tensor: torch.Tensor) -> torch.Tensor:
+        """Transpose once and stage a whole microbatch in one H2D transfer.
+
+        Layer-major layout makes every per-layer replay entry contiguous while
+        retaining a single backing allocation for the microbatch.
+        """
+        if not torch.cuda.is_available():
+            return tensor.detach().permute(1, 0, 2).contiguous()
+
+        # Keep the host buffer in its existing token-major layout.  Pinning and
+        # transposing the full buffer on the host adds two more full-size CPU
+        # copies before H2D.  Transfer once, then use the GPU's memory bandwidth
+        # to materialize the contiguous layer-major backing allocation.
+        staged = tensor.detach().to(
+            device=torch.device("cuda", torch.cuda.current_device()),
+            non_blocking=True,
+        )
+        return staged.permute(1, 0, 2).contiguous()
 
     @staticmethod
     def _flatten_labels_for_decode_cache(labels: Any) -> List[int]:
@@ -268,18 +294,19 @@ class RoutingReplayHandler:
         segment_count = 0
         num_moe_layers = len(moe_blocks)
         for mb_idx, mb_routing_tensor in enumerate(per_mb_routing):
+            staged = self._stage_layer_major_replay_tensor(mb_routing_tensor)
             micro_batch = micro_batches[mb_idx] if mb_idx < len(micro_batches) else {}
             labels = self._flatten_labels_for_decode_cache(micro_batch.get("target_tokens", micro_batch.get("labels")))
             segments = self._decode_cache_segments(labels)
             if not segments:
                 continue
-            num_layers_to_use = min(num_moe_layers, mb_routing_tensor.shape[1])
+            num_layers_to_use = min(num_moe_layers, staged.shape[0])
             for start, end in segments:
                 for moe_idx in range(num_layers_to_use):
-                    self._append_cpu_replay_tensor(
+                    self._append_replay_tensor(
                         moe_blocks[moe_idx]._routing_replay,
                         list_name,
-                        mb_routing_tensor[start:end, moe_idx, :],
+                        staged[moe_idx, start:end, :],
                     )
                 segment_count += 1
         return segment_count
@@ -343,6 +370,7 @@ class RoutingReplayHandler:
             return False
 
         decode_start = time.perf_counter()
+        self.last_setup_metrics = {}
 
         # Decode each item (may be base64-encoded or nested list)
         decoded_routing = []
@@ -388,13 +416,19 @@ class RoutingReplayHandler:
         # Pre-populate RoutingReplay instances: for each micro-batch, for each
         # MoE block, call record() with the routing tensor for that (mb, layer).
         populate_start = time.perf_counter()
+        routing_stage_s = 0.0
+        staged_bytes = 0
         for mb_idx, mb_routing_tensor in enumerate(per_mb_routing):
-            # mb_routing_tensor: [num_tokens_mb, num_layers, topk]
-            num_layers_to_use = min(num_moe_layers, mb_routing_tensor.shape[1])
+            # One layer-major backing buffer and one H2D transfer per
+            # microbatch, rather than one transfer per layer during each pass.
+            stage_start = time.perf_counter()
+            staged_routing = self._stage_layer_major_replay_tensor(mb_routing_tensor)
+            routing_stage_s += time.perf_counter() - stage_start
+            staged_bytes += staged_routing.numel() * staged_routing.element_size()
+            num_layers_to_use = min(num_moe_layers, staged_routing.shape[0])
             for moe_idx in range(num_layers_to_use):
-                # [num_tokens_mb, topk]
-                layer_routing = mb_routing_tensor[:, moe_idx, :]
-                self._append_cpu_replay_tensor(
+                layer_routing = staged_routing[moe_idx]
+                self._append_replay_tensor(
                     moe_blocks[moe_idx]._routing_replay,
                     "top_indices_list",
                     layer_routing,
@@ -418,11 +452,16 @@ class RoutingReplayHandler:
                     topk,
                     tensor_dtype=torch.float32,
                 )
+                weights_stage_s = 0.0
                 for mb_idx, mb_weights_tensor in enumerate(per_mb_weights):
-                    num_layers_to_use_w = min(num_moe_layers, mb_weights_tensor.shape[1])
+                    stage_start = time.perf_counter()
+                    staged_weights = self._stage_layer_major_replay_tensor(mb_weights_tensor)
+                    weights_stage_s += time.perf_counter() - stage_start
+                    staged_bytes += staged_weights.numel() * staged_weights.element_size()
+                    num_layers_to_use_w = min(num_moe_layers, staged_weights.shape[0])
                     for moe_idx in range(num_layers_to_use_w):
-                        layer_weights = mb_weights_tensor[:, moe_idx, :].float()
-                        self._append_cpu_replay_tensor(
+                        layer_weights = staged_weights[moe_idx]
+                        self._append_replay_tensor(
                             moe_blocks[moe_idx]._routing_replay,
                             "top_weights_list",
                             layer_weights,
@@ -433,7 +472,18 @@ class RoutingReplayHandler:
                     weights_build_start - weights_decode_start,
                     time.perf_counter() - weights_build_start,
                 )
+                self.last_setup_metrics["r3_replay_weights_stage_s"] = weights_stage_s
 
+        setup_total_s = time.perf_counter() - decode_start
+        self.last_setup_metrics.update(
+            {
+                "r3_replay_setup_s": setup_total_s,
+                "r3_replay_routing_decode_s": build_start - decode_start,
+                "r3_replay_routing_build_s": populate_start - build_start,
+                "r3_replay_routing_stage_s": routing_stage_s,
+                "r3_replay_staged_bytes": float(staged_bytes),
+            }
+        )
         _r3_log_info(
             "R3: Pre-populated %s micro-batches x %s MoE layers into RoutingReplay instances "
             "(decode=%.3fs build=%.3fs populate=%.3fs total=%.3fs)",
@@ -442,7 +492,7 @@ class RoutingReplayHandler:
             build_start - decode_start,
             populate_start - build_start,
             time.perf_counter() - populate_start,
-            time.perf_counter() - decode_start,
+            setup_total_s,
         )
         return True
 

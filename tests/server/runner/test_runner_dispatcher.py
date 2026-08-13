@@ -345,6 +345,7 @@ def test_select_batches_loads_only_mooncake_routing_ref_slice(monkeypatch):
         routed_experts=[[[[idx, idx + 1]]] for idx in range(4)],
         routed_expert_logits=[[[[float(idx), float(idx + 1)]]] for idx in range(4)],
         store=store,
+        chunk_ranges=[(0, 1), (1, 1), (2, 1), (3, 1)],
     )
     assert expert_ref is not None and logits_ref is not None
 
@@ -391,9 +392,7 @@ def test_select_batches_world_size_one_loads_mooncake_routing_refs(monkeypatch):
     assert [item.tolist() for item in routed_logits] == [[[[0.0, 1.0]]], [[[2.0, 3.0]]]]
     assert client.get_calls == [
         expert_ref["items"]["routed_experts"][0]["key"],
-        expert_ref["items"]["routed_experts"][1]["key"],
         logits_ref["items"]["routed_expert_logits"][0]["key"],
-        logits_ref["items"]["routed_expert_logits"][1]["key"],
     ]
 
 

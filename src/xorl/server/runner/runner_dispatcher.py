@@ -1305,8 +1305,9 @@ class RunnerDispatcher:
             )
             return items
 
-        if value.get("transport") != "filesystem" or int(value.get("version", 0)) != 2:
-            raise ValueError("Legacy pickle routing payload references are disabled; use filesystem version 2")
+        version = int(value.get("version", 0))
+        if value.get("transport") != "filesystem" or version not in (2, 3):
+            raise ValueError("Legacy pickle routing payload references are disabled; use filesystem version 2 or 3")
 
         manifest_path = Path(str(value.get("manifest", "")))
         if not manifest_path.is_absolute():
@@ -1326,6 +1327,14 @@ class RunnerDispatcher:
             raise ValueError(f"Invalid R3 filesystem manifest {manifest_path}: {exc}") from exc
         if not isinstance(manifest, Mapping):
             raise ValueError("R3 filesystem manifest must be a JSON object")
+        if version == 3:
+            return self._load_packed_filesystem_routing_slice(
+                value=value,
+                manifest=manifest,
+                manifest_path=manifest_path,
+                start=start,
+                count=count,
+            )
         if manifest.get("format") != "xorl-r3-raw" or int(manifest.get("version", 0)) != 2:
             raise ValueError("R3 filesystem manifest must use xorl-r3-raw version 2")
 
@@ -1386,6 +1395,104 @@ class RunnerDispatcher:
             kind,
             start,
             start + count,
+            item_dir,
+        )
+        return items
+
+    def _load_packed_filesystem_routing_slice(
+        self,
+        *,
+        value: Mapping[str, Any],
+        manifest: Mapping[str, Any],
+        manifest_path: Path,
+        start: int,
+        count: int,
+    ) -> List[torch.Tensor]:
+        if value.get("format") != "packed_rows":
+            raise ValueError("R3 filesystem version 3 reference must use packed_rows format")
+        if manifest.get("format") != "xorl-r3-packed" or int(manifest.get("version", 0)) != 3:
+            raise ValueError("R3 filesystem manifest must use xorl-r3-packed version 3")
+        kind = str(value.get("kind", ""))
+        if kind not in {"routed_experts", "routed_expert_logits"}:
+            raise ValueError(f"Unsupported R3 filesystem payload kind {kind!r}")
+        kind_meta = manifest.get(kind)
+        if not isinstance(kind_meta, Mapping):
+            raise ValueError(f"R3 filesystem manifest field {kind!r} must be an object")
+        chunks = kind_meta.get("chunks")
+        total = int(kind_meta.get("count", -1))
+        if not isinstance(chunks, list) or int(value.get("count", -1)) != total:
+            raise ValueError(f"R3 packed filesystem manifest has invalid {kind!r} metadata")
+        if start < 0 or count < 0 or start + count > total:
+            raise ValueError(
+                f"R3 filesystem payload slice out of range for {kind}: start={start}, count={count}, total={total}"
+            )
+
+        item_dir = manifest_path.parent / kind
+        if item_dir.is_symlink() or item_dir.resolve(strict=True).parent != manifest_path.parent:
+            raise ValueError(f"Invalid R3 filesystem item directory: {item_dir}")
+        expected_dtype = torch.int32 if kind == "routed_experts" else torch.float32
+        expected_dtype_name = "int32" if kind == "routed_experts" else "float32"
+        stop = start + count
+        expected_chunk_start = 0
+        items: List[torch.Tensor] = []
+        for chunk_idx, metadata in enumerate(chunks):
+            if not isinstance(metadata, Mapping):
+                raise ValueError(f"R3 packed filesystem chunk {kind}[{chunk_idx}] must be an object")
+            shape = metadata.get("shape")
+            datum_start = int(metadata.get("datum_start", -1))
+            datum_count = int(metadata.get("datum_count", -1))
+            offsets = metadata.get("row_offsets")
+            filename = metadata.get("file")
+            if (
+                not isinstance(shape, list)
+                or len(shape) != 3
+                or not all(isinstance(dim, int) and dim >= 0 for dim in shape)
+                or metadata.get("dtype") != expected_dtype_name
+                or datum_start != expected_chunk_start
+                or datum_count < 1
+                or not isinstance(offsets, list)
+                or len(offsets) != datum_count + 1
+                or offsets[0] != 0
+                or any(not isinstance(offset, int) or offset < 0 for offset in offsets)
+                or any(left > right for left, right in zip(offsets, offsets[1:]))
+                or offsets[-1] != shape[0]
+            ):
+                raise ValueError(f"R3 packed filesystem chunk {kind}[{chunk_idx}] has invalid metadata")
+            expected_chunk_start += datum_count
+            expected_nbytes = math.prod(shape) * 4
+            if int(metadata.get("nbytes", -1)) != expected_nbytes:
+                raise ValueError(f"R3 packed filesystem chunk {kind}[{chunk_idx}] has inconsistent byte size")
+            expected_filename = f"chunk-{chunk_idx:06d}.bin"
+            if filename != expected_filename:
+                raise ValueError(f"R3 packed filesystem chunk {kind}[{chunk_idx}] has invalid filename")
+
+            chunk_stop = datum_start + datum_count
+            overlap_start = max(start, datum_start)
+            overlap_stop = min(stop, chunk_stop)
+            if overlap_start >= overlap_stop:
+                continue
+            item_path = item_dir / expected_filename
+            if item_path.is_symlink() or item_path.resolve(strict=True).parent != item_dir:
+                raise ValueError(f"Invalid R3 filesystem item path: {item_path}")
+            if item_path.stat().st_size != expected_nbytes:
+                raise ValueError(f"R3 packed filesystem chunk {kind}[{chunk_idx}] byte size does not match metadata")
+            data = item_path.read_bytes()
+            tensor = torch.frombuffer(bytearray(data), dtype=expected_dtype).reshape(shape)
+            for datum_idx in range(overlap_start, overlap_stop):
+                local_idx = datum_idx - datum_start
+                items.append(tensor[offsets[local_idx] : offsets[local_idx + 1]])
+        if expected_chunk_start != total or len(items) != count:
+            raise ValueError(
+                f"R3 packed filesystem coverage mismatch for {kind}: chunks={expected_chunk_start}/{total}, "
+                f"loaded={len(items)}/{count}"
+            )
+        log_fn = logger.info if _r3_verbose_logging_enabled() else logger.debug
+        log_fn(
+            "Rank %s: Loaded packed R3 %s slice [%s:%s] from %s",
+            self.rank,
+            kind,
+            start,
+            stop,
             item_dir,
         )
         return items

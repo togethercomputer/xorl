@@ -181,6 +181,16 @@ def test_decode_routed_experts_sglang_dict_base64_int32_format():
     np.testing.assert_array_equal(decoded, arr)
 
 
+def test_decode_routed_experts_sglang_dict_honors_rows_view():
+    handler = _handler()
+    arr = np.arange(4 * 2 * 2, dtype=np.int32).reshape(4, 2, 2)
+    item = {"data": base64.b64encode(arr.tobytes()).decode("ascii"), "shape": [4, 2, 2], "rows": 3}
+
+    decoded = handler.decode_routed_experts_item(item, num_moe_layers=2)
+
+    np.testing.assert_array_equal(decoded, arr[:3])
+
+
 def test_decode_routed_experts_base64_string_infers_shape_from_model_topk():
     model = SimpleNamespace(config=SimpleNamespace(num_experts_per_tok=8))
     handler = rrh.RoutingReplayHandler(model)
@@ -251,3 +261,45 @@ def test_routing_weight_builder_accepts_decoded_numpy_arrays(monkeypatch):
     assert per_mb[0].dtype == torch.float32
     assert per_mb[0].shape == (3, 1, 2)
     torch.testing.assert_close(per_mb[0][:, 0, :], torch.tensor([[6.0, 7.0], [8.0, 9.0], [10.0, 11.0]]))
+
+
+def test_replay_staging_is_one_layer_major_backing_buffer(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    source = torch.arange(4 * 3 * 2, dtype=torch.int64).reshape(4, 3, 2)
+
+    staged = _handler()._stage_layer_major_replay_tensor(source)
+
+    assert staged.shape == (3, 4, 2)
+    assert staged.is_contiguous()
+    assert torch.equal(staged[1], source[:, 1, :])
+    assert staged[0].untyped_storage().data_ptr() == staged[2].untyped_storage().data_ptr()
+
+
+def test_fill_routing_replay_populates_device_ready_layer_views(monkeypatch):
+    monkeypatch.setattr(rrh, "get_parallel_state", lambda: SimpleNamespace(cp_enabled=False))
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    handler = _handler()
+    blocks = [SimpleNamespace(_routing_replay=rrh.RoutingReplay()) for _ in range(2)]
+    monkeypatch.setattr(handler, "get_moe_blocks", lambda: blocks)
+    ids = np.arange(3 * 2 * 2, dtype=np.int32).reshape(3, 2, 2)
+    weights = np.arange(3 * 2 * 2, dtype=np.float32).reshape(3, 2, 2) / 10
+
+    try:
+        assert handler.fill_routing_replay(
+            [{"input_ids": torch.zeros(1, 3, dtype=torch.long), "num_samples": 1}],
+            [ids],
+            [weights],
+        )
+        for layer, block in enumerate(blocks):
+            replay = block._routing_replay
+            assert len(replay.top_indices_list) == len(replay.top_weights_list) == 1
+            torch.testing.assert_close(replay.top_indices_list[0], torch.from_numpy(ids[:, layer]).long())
+            torch.testing.assert_close(replay.top_weights_list[0], torch.from_numpy(weights[:, layer]))
+        assert (
+            blocks[0]._routing_replay.top_indices_list[0].untyped_storage().data_ptr()
+            == blocks[1]._routing_replay.top_indices_list[0].untyped_storage().data_ptr()
+        )
+        assert handler.last_setup_metrics["r3_replay_setup_s"] >= 0.0
+        assert handler.last_setup_metrics["r3_replay_staged_bytes"] == float(ids.size * 8 + weights.nbytes)
+    finally:
+        rrh.RoutingReplay.clear_all()
