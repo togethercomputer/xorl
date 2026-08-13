@@ -1406,9 +1406,7 @@ class RunnerDispatcher:
     def _r3_shared_roots() -> tuple[Path, ...]:
         configured = os.getenv("XORL_R3_SHARED_ROOTS", "")
         roots = tuple(
-            Path(entry).expanduser().resolve(strict=True)
-            for entry in configured.split(os.pathsep)
-            if entry.strip()
+            Path(entry).expanduser().resolve(strict=True) for entry in configured.split(os.pathsep) if entry.strip()
         )
         if not roots:
             raise ValueError("XORL_R3_SHARED_ROOTS must name the trusted SGLang side-channel root")
@@ -1440,9 +1438,7 @@ class RunnerDispatcher:
                 raise TimeoutError(f"Timed out waiting {timeout_s:.1f}s for SGLang R3 source {raw_path}")
             time.sleep(0.01)
 
-    def _load_sglang_file_routing_slice(
-        self, value: Mapping[str, Any], start: int, count: int
-    ) -> List[torch.Tensor]:
+    def _load_sglang_file_routing_slice(self, value: Mapping[str, Any], start: int, count: int) -> List[torch.Tensor]:
         if value.get("format") != "spans":
             raise ValueError("SGLang R3 source reference must use spans format")
         kind = str(value.get("kind", ""))

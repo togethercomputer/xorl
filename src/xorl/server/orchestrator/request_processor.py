@@ -92,6 +92,7 @@ FORWARD_BACKWARD_RESULT_KEYS = {
 }
 ROUTING_PAYLOAD_REF_KEY = "__xorl_routing_payload_ref__"
 R3_SPANS_SCHEMA = "xorl.r3.spans.v1"
+SGLANG_R3_FILE_SCHEMA = "sglang.routed_experts.file.v1"
 
 
 @dataclass(frozen=True)
@@ -311,13 +312,18 @@ class RequestProcessor:
         routed_experts: Optional[List[Any]],
         routed_expert_logits: Optional[List[Any]],
     ) -> Optional[tuple[Optional[Any], Optional[Any], R3SourceFilesCleanup]]:
+        def _normalize(items: Optional[List[Any]], kind: str) -> Optional[List[Any]]:
+            if items is None:
+                return None
+            return [RequestProcessor._normalize_sglang_routing_file(item, kind) for item in items]
+
+        routed_experts = _normalize(routed_experts, R3_ROUTED_EXPERTS)
+        routed_expert_logits = _normalize(routed_expert_logits, R3_ROUTED_EXPERT_LOGITS)
         present = [items for items in (routed_experts, routed_expert_logits) if items is not None]
         if not present:
             return None
         has_spans = [
-            isinstance(item, dict) and item.get("schema") == R3_SPANS_SCHEMA
-            for items in present
-            for item in items
+            isinstance(item, dict) and item.get("schema") == R3_SPANS_SCHEMA for items in present for item in items
         ]
         if not any(has_spans):
             return None
@@ -363,15 +369,49 @@ class RequestProcessor:
         )
 
     @staticmethod
+    def _normalize_sglang_routing_file(item: Any, kind: str) -> Any:
+        if not isinstance(item, dict) or item.get("schema") != SGLANG_R3_FILE_SCHEMA:
+            return item
+        if item.get("field") != kind:
+            raise ValueError(f"SGLang R3 descriptor field does not match {kind}")
+        fields = item.get("fields")
+        field = fields.get(kind) if isinstance(fields, dict) else None
+        if not isinstance(field, dict):
+            raise ValueError(f"SGLang R3 descriptor is missing {kind} metadata")
+        shape = field.get("shape")
+        if not isinstance(shape, list) or len(shape) != 3:
+            raise ValueError(f"SGLang R3 descriptor has invalid {kind} shape")
+        rows = int(item.get("rows", -1))
+        row_nbytes = math.prod(int(dim) for dim in shape[1:]) * 4
+        if rows != int(shape[0]) or int(field.get("nbytes", -1)) != rows * row_nbytes:
+            raise ValueError(f"SGLang R3 descriptor has inconsistent {kind} geometry")
+        return {
+            "schema": R3_SPANS_SCHEMA,
+            "rows": rows,
+            "shape": [int(dim) for dim in shape],
+            "dtype": field.get("dtype"),
+            "spans": [
+                {
+                    "path": item.get("path"),
+                    "error_path": item.get("error_path"),
+                    "offset": int(field.get("offset", -1)),
+                    "source_row": 0,
+                    "rows": rows,
+                    "row_nbytes": row_nbytes,
+                    "source_shape": [int(dim) for dim in shape],
+                    "dtype": field.get("dtype"),
+                }
+            ],
+        }
+
+    @staticmethod
     def _validate_r3_source_path(raw: Any, *, final: bool) -> Path:
         path = Path(str(raw or ""))
         if not path.is_absolute() or (final and path.name.startswith(".")):
             raise ValueError(f"R3 source path must be an absolute payload path: {path}")
         configured = os.getenv("XORL_R3_SHARED_ROOTS", "")
         roots = [
-            Path(entry).expanduser().resolve(strict=True)
-            for entry in configured.split(os.pathsep)
-            if entry.strip()
+            Path(entry).expanduser().resolve(strict=True) for entry in configured.split(os.pathsep) if entry.strip()
         ]
         if not roots:
             raise ValueError("XORL_R3_SHARED_ROOTS must name the trusted SGLang side-channel root")
@@ -504,9 +544,7 @@ class RequestProcessor:
         )
         return _ref("routed_experts", routed_experts), _ref("routed_expert_logits", routed_expert_logits), root
 
-    def _cleanup_routing_payloads(
-        self, cleanup: Optional[Union[Path, R3PayloadCleanup, R3SourceFilesCleanup]]
-    ) -> None:
+    def _cleanup_routing_payloads(self, cleanup: Optional[Union[Path, R3PayloadCleanup, R3SourceFilesCleanup]]) -> None:
         if cleanup is None or self.r3_payload_keep:
             return
         if isinstance(cleanup, R3PayloadCleanup):

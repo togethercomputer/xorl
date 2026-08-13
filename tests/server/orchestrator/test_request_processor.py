@@ -1072,13 +1072,53 @@ def test_sglang_span_payloads_bypass_repacking_and_cleanup_sources(tmp_path, mon
     monkeypatch.setenv("XORL_R3_SHARED_ROOTS", str(tmp_path))
     processor = RequestProcessor(backend=DummyBackend())
 
-    routed, logits, cleanup = processor._externalize_routing_payloads(
-        "request", [item], None
-    )
+    routed, logits, cleanup = processor._externalize_routing_payloads("request", [item], None)
 
     assert logits is None
     assert routed["transport"] == "sglang_files"
     assert routed["items"][0] is item
     assert source.exists()
+    processor._cleanup_routing_payloads(cleanup)
+    assert not source.exists()
+
+
+def test_sglang_file_descriptor_is_normalized_to_span_payload(tmp_path, monkeypatch):
+    source = tmp_path / "routing.bin"
+    source.write_bytes(b"\0" * 32)
+    item = {
+        "schema": "sglang.routed_experts.file.v1",
+        "path": str(source),
+        "error_path": str(tmp_path / ".routing.error.json"),
+        "rows": 2,
+        "field": "routed_experts",
+        "fields": {
+            "routed_experts": {
+                "offset": 0,
+                "nbytes": 32,
+                "shape": [2, 2, 2],
+                "dtype": "int32",
+            }
+        },
+    }
+    monkeypatch.setenv("XORL_R3_SHARED_ROOTS", str(tmp_path))
+    processor = RequestProcessor(backend=DummyBackend())
+
+    routed, logits, cleanup = processor._externalize_routing_payloads("request", [item], None)
+
+    assert logits is None
+    normalized = routed["items"][0]
+    assert normalized["schema"] == "xorl.r3.spans.v1"
+    assert normalized["spans"] == [
+        {
+            "path": str(source),
+            "error_path": str(tmp_path / ".routing.error.json"),
+            "offset": 0,
+            "source_row": 0,
+            "rows": 2,
+            "row_nbytes": 16,
+            "source_shape": [2, 2, 2],
+            "dtype": "int32",
+        }
+    ]
     processor._cleanup_routing_payloads(cleanup)
     assert not source.exists()
