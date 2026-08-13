@@ -309,7 +309,12 @@ class Qwen3_5Attention(nn.Module):
         **kwargs: Unpack[AttentionKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         del position_ids, past_key_values
-        attn_strategy = get_cp_strategy()
+        # Qwen3.5 PINS the sync Ulysses variant: this call site and the
+        # prepare_position_embeddings site must agree (RoPE is applied before
+        # the head-scattering all-to-all on sequence-sliced tables). The
+        # historical "auto" heuristic flips the variant — and with it the
+        # RoPE placement — based on whether num_kv_heads is passed.
+        attn_strategy = get_cp_strategy(variant="sync")
         query_states, key_states, value_states = attn_strategy.project_qkv(self, hidden_states, position_embeddings)
         attn_output = attn_strategy.compute_attention(
             self, query_states, key_states, value_states, attention_mask, **kwargs
@@ -552,7 +557,9 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
             linear_attn_mask = None
 
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
-        position_embeddings = get_cp_strategy().prepare_position_embeddings(
+        # Same explicit variant as the attention call site: sequence-slice the
+        # cos/sin tables because RoPE runs before the sync all-to-all.
+        position_embeddings = get_cp_strategy(variant="sync").prepare_position_embeddings(
             position_embeddings,
             dim=1,
             sp_group=ps.sp_group,
