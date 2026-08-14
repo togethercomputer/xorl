@@ -244,6 +244,8 @@ def test_save_writes_sharded_optimizer_with_manifest(tmp_path: Path):
         manifest = json.load(f)
     assert manifest["format_version"] == 3
     assert manifest["world_size"] == 1
+    assert manifest["per_rank_layout_world_size"] == [1]
+    assert manifest["per_rank_layout_group_ranks"] == [[0]]
     assert manifest["session_rank"] == 4
     assert manifest["per_rank_optimizer_parameter_order"] == [manifest["optimizer_parameter_order"]]
     assert manifest["per_rank_layout_fingerprint"] == [manager.get_adapter_state("resume-a").layout_fingerprint]
@@ -254,6 +256,11 @@ def test_save_writes_sharded_optimizer_with_manifest(tmp_path: Path):
     )
     state = manager.get_adapter_state("resume-a")
     assert manifest["per_rank_param_structure_sha256"] == [_adapter_param_structure_fingerprint(state.lora_params)]
+    stage_records = manifest["optimizer_restore_contracts_by_stage"]
+    assert len(stage_records) == 1
+    assert stage_records[0]["pipeline_stage_ordinal"] == 0
+    assert stage_records[0]["layout_world_size"] == 1
+    assert stage_records[0]["parameter_fqns"] == manifest["optimizer_parameter_order"]
 
 
 @pytest.mark.parametrize(

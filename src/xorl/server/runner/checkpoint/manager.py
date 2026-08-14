@@ -37,7 +37,10 @@ from xorl.models.exact_contract import (
     contains_glm52_exact_active_lora_component,
     contains_glm52_fullparam_component,
 )
-from xorl.server.runner.adapters.manager import save_adapter_optimizer_shards
+from xorl.server.runner.adapters.manager import (
+    adapter_gradient_ownership_checkpoint_metadata,
+    save_adapter_optimizer_shards,
+)
 from xorl.server.session_spec import write_session_spec
 from xorl.utils import helper
 from xorl.utils.device import get_device_type
@@ -214,6 +217,7 @@ class CheckpointManager:
         model_id: str,
         adapter_state: Any,
         save_optimizer: bool,
+        optimizer_manifest: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Write adapter training metadata on rank 0.
 
@@ -231,18 +235,14 @@ class CheckpointManager:
             "optimizer_format": "sharded_v3" if save_optimizer else None,
             "optimizer": adapter_state.session_spec["optimizer_config"],
             "layout_fingerprint": adapter_state.layout_fingerprint,
-            "gradient_ownership": {
-                "plan_fingerprint": (
-                    adapter_state.gradient_ownership_plan.fingerprint
-                    if getattr(adapter_state, "gradient_ownership_plan", None) is not None
+            "gradient_ownership": adapter_gradient_ownership_checkpoint_metadata(
+                adapter_state,
+                stage_records=(
+                    optimizer_manifest.get("optimizer_restore_contracts_by_stage")
+                    if optimizer_manifest is not None
                     else None
                 ),
-                "optimizer_restore_contract": (
-                    adapter_state.gradient_ownership_plan.optimizer_restore_contract()
-                    if getattr(adapter_state, "gradient_ownership_plan", None) is not None
-                    else None
-                ),
-            },
+            ),
             "layout_descriptors": [
                 adapter_state.tensor_layouts[name].to_json_dict() for name in sorted(adapter_state.tensor_layouts)
             ],
@@ -509,11 +509,18 @@ class CheckpointManager:
 
             # Save per-rank optimizer shards (collective operation): each rank's
             # adapter optimizer only holds its own EP-local expert moments.
+            optimizer_manifest = None
             if save_optimizer:
-                save_adapter_optimizer_shards(adapter_state, path)
+                optimizer_manifest = save_adapter_optimizer_shards(adapter_state, path)
 
             if self.rank == 0:
-                self._write_adapter_training_artifacts(path, model_id, adapter_state, save_optimizer)
+                self._write_adapter_training_artifacts(
+                    path,
+                    model_id,
+                    adapter_state,
+                    save_optimizer,
+                    optimizer_manifest,
+                )
                 logger.info(
                     f"Saved adapter state for model_id={model_id} to {path} "
                     f"(step={adapter_state.global_step}, save_optimizer={save_optimizer})"
