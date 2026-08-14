@@ -34,6 +34,10 @@ CANONICAL_MOE_LEAF_VERSION = "canonical_moe_leaf_fp32_v1"
 CANONICAL_MOE_PACKED_EP16_TRANSPORT_VERSION = "packed_ep16_v2"
 CANONICAL_MOE_CP_SHARDED_TRANSPORT_VERSION = "cp_sharded_v3"
 GLM52_NUM_LAYERS = 78
+# Bound only the first FP32 tree level.  Later adjacent-pair levels are at
+# most half as large, so this keeps the local arithmetic workspace independent
+# of sequence length and payload width without changing any reduction bytes.
+_CANONICAL_MOE_FP32_FOLD_MAX_LEVEL_BYTES = 32 * 1024 * 1024
 # Dense transport expands each row across the complete contributor axis.  Keep
 # its transient send/receive tensors bounded even when DP-owned rows make the
 # logical capacity much larger than the per-rank sequence.  Chunk boundaries
@@ -653,6 +657,16 @@ def _canonical_moe_fold_fp32_tree(partials_by_logical_ordinal: torch.Tensor) -> 
     return level[0]
 
 
+def _canonical_moe_fp32_fold_chunk_elements(contributor_count: int) -> int:
+    """Maximum payload elements whose initial FP32 level fits the bound."""
+    if contributor_count <= 0:
+        raise ValueError("Canonical MoE fold requires a positive contributor count")
+    return max(
+        1,
+        _CANONICAL_MOE_FP32_FOLD_MAX_LEVEL_BYTES // (contributor_count * 4),
+    )
+
+
 def canonical_moe_fold_fp32_v2(partials_by_logical_ordinal: torch.Tensor) -> torch.Tensor:
     """Fold source-ordered low-precision contributions under the FP32-v2 contract.
 
@@ -663,8 +677,39 @@ def canonical_moe_fold_fp32_v2(partials_by_logical_ordinal: torch.Tensor) -> tor
     the consumer boundary. The arithmetic is an independent implementation of
     serving's identically versioned program; neither side imports the other.
     """
-    output_dtype = partials_by_logical_ordinal.dtype
-    return _canonical_moe_fold_fp32_tree(partials_by_logical_ordinal).to(output_dtype)
+    partials = partials_by_logical_ordinal
+    if partials.ndim < 2:
+        raise ValueError("Canonical MoE fold requires contributor and payload dimensions")
+    if partials.dtype not in (torch.bfloat16, torch.float16):
+        raise TypeError("Canonical MoE fold requires BF16 or FP16 inputs")
+    contributor_count = partials.shape[0]
+    if contributor_count <= 0:
+        raise ValueError("Canonical MoE fold requires a positive contributor count")
+
+    # Production arrivals are contiguous, so this is a view and does not copy
+    # the complete BF16/FP16 transport tensor.  ``reshape`` preserves support
+    # for an unusual strided caller and may copy only in that fallback case.
+    payload_elements = partials.numel() // contributor_count
+    flat_partials = (
+        partials.view(contributor_count, payload_elements)
+        if partials.is_contiguous()
+        else partials.reshape(contributor_count, payload_elements)
+    )
+    chunk_elements = _canonical_moe_fp32_fold_chunk_elements(contributor_count)
+    if payload_elements <= chunk_elements:
+        return _canonical_moe_fold_fp32_tree(partials).to(partials.dtype)
+
+    # Each payload element is independent: the only reduction axis is the
+    # immutable logical-contributor axis.  Chunking that orthogonal payload
+    # axis therefore preserves the exact adjacent-pair FP32 tree.  Store every
+    # completed element once at the declared low-precision boundary instead of
+    # ever materializing the complete contributor tensor in FP32.
+    output = torch.empty((payload_elements,), dtype=partials.dtype, device=partials.device)
+    for start in range(0, payload_elements, chunk_elements):
+        end = min(start + chunk_elements, payload_elements)
+        folded_fp32 = _canonical_moe_fold_fp32_tree(flat_partials[:, start:end])
+        output[start:end] = folded_fp32.to(partials.dtype)
+    return output.view(partials.shape[1:])
 
 
 def canonical_moe_reduce_reference(

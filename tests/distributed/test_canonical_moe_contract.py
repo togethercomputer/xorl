@@ -9,6 +9,7 @@ import torch.distributed as dist
 from distributed_utils import run_distributed_script
 
 from xorl.distributed.canonical_moe import (
+    _CANONICAL_MOE_FP32_FOLD_MAX_LEVEL_BYTES,
     CANONICAL_MOE_DENSE_MAX_CHUNK_ROWS,
     CANONICAL_MOE_FOLD_VERSION,
     CANONICAL_MOE_LEAF_VERSION,
@@ -21,6 +22,7 @@ from xorl.distributed.canonical_moe import (
     ParallelPlan,
     ParallelRole,
     _canonical_moe_fold_fp32_tree,
+    _canonical_moe_fp32_fold_chunk_elements,
     _resolve_transport_chunk_rows,
     canonical_moe_fold_fp32_v2,
     canonical_moe_leaf_fp32_v1,
@@ -107,6 +109,69 @@ def test_fp32_tree_preserves_adversarial_cancellation_before_final_cast(dtype: t
     assert pre_cast.item() == 2.0
     assert transported.dtype is dtype
     assert transported.item() == 2.0
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("contributors", [3, 16, 17])
+def test_chunked_fp32_tree_is_bitwise_exact_across_payload_boundaries(
+    monkeypatch: pytest.MonkeyPatch,
+    dtype: torch.dtype,
+    contributors: int,
+):
+    import xorl.distributed.canonical_moe as canonical_moe
+
+    # Force many chunks in a compact test while exercising both odd tails and
+    # the production EP16 adjacent-pair tree.
+    monkeypatch.setattr(canonical_moe, "_CANONICAL_MOE_FP32_FOLD_MAX_LEVEL_BYTES", 128)
+    rows, payload = 5, 13
+    values = torch.arange(contributors * rows * payload, dtype=torch.float32).reshape(contributors, rows, payload)
+    signs = torch.where(torch.arange(contributors).remainder(2) == 0, 1.0, -1.0).view(-1, 1, 1)
+    partials = (values.remainder(31).sub(15).mul(signs)).to(dtype)
+    witness_count = min(4, contributors)
+    partials[:witness_count, 0, :4] = torch.tensor([[4096.0], [1.0], [-4096.0], [1.0]], dtype=dtype)[:witness_count]
+
+    chunk_elements = _canonical_moe_fp32_fold_chunk_elements(contributors)
+    assert chunk_elements < rows * payload
+    actual = canonical_moe_fold_fp32_v2(partials)
+    expected = _explicit_tree(partials)
+
+    assert torch.equal(actual.view(torch.uint16), expected.view(torch.uint16))
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("contributors", [3, 16, 17])
+def test_chunked_fp32_tree_backward_matches_the_unchunked_tree(
+    monkeypatch: pytest.MonkeyPatch,
+    contributors: int,
+):
+    import xorl.distributed.canonical_moe as canonical_moe
+
+    monkeypatch.setattr(canonical_moe, "_CANONICAL_MOE_FP32_FOLD_MAX_LEVEL_BYTES", 128)
+    actual_leaf = torch.randn((contributors, 7, 11), dtype=torch.bfloat16, requires_grad=True)
+    expected_leaf = actual_leaf.detach().clone().requires_grad_(True)
+    grad_output = torch.randn((7, 11), dtype=torch.bfloat16)
+
+    actual = canonical_moe_fold_fp32_v2(actual_leaf)
+    expected = _explicit_tree(expected_leaf)
+    actual_grad = torch.autograd.grad(actual, actual_leaf, grad_outputs=grad_output)[0]
+    expected_grad = torch.autograd.grad(expected, expected_leaf, grad_outputs=grad_output)[0]
+
+    assert torch.equal(actual.view(torch.uint16), expected.view(torch.uint16))
+    assert torch.equal(actual_grad.view(torch.uint16), expected_grad.view(torch.uint16))
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("contributors", [1, 3, 16, 17, 64])
+def test_fp32_fold_chunk_planner_bounds_the_initial_level(contributors: int):
+    chunk_elements = _canonical_moe_fp32_fold_chunk_elements(contributors)
+    level_bytes = contributors * chunk_elements * torch.float32.itemsize
+
+    assert 0 < level_bytes <= _CANONICAL_MOE_FP32_FOLD_MAX_LEVEL_BYTES
+    assert (
+        chunk_elements == 1
+        or contributors * (chunk_elements + 1) * torch.float32.itemsize > _CANONICAL_MOE_FP32_FOLD_MAX_LEVEL_BYTES
+    )
 
 
 @pytest.mark.cpu
@@ -404,6 +469,33 @@ def test_shared_fold_replays_in_cuda_graph(contributors: int):
 
     assert not torch.equal(first, folded)
     assert torch.equal(folded, _explicit_tree(partials))
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_production_shaped_ep16_fold_has_bounded_peak_workspace():
+    contributors, rows, payload = 16, 4096, 6144
+    partials = torch.empty(
+        (contributors, rows, payload),
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    for contributor in range(contributors):
+        partials[contributor].fill_(float(contributor - 8) / 16.0)
+    torch.cuda.synchronize()
+
+    baseline = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    folded = canonical_moe_fold_fp32_v2(partials)
+    torch.cuda.synchronize()
+    incremental_peak = torch.cuda.max_memory_allocated() - baseline
+
+    expected_sample = _explicit_tree(partials[:, :1, :16])
+    assert torch.equal(folded[:1, :16].view(torch.uint16), expected_sample.view(torch.uint16))
+    assert torch.all(folded == expected_sample[0, 0])
+    # The required 48 MiB BF16 output plus at most 48 MiB for the first two
+    # FP32 tree levels stays well below the former 1.50 GiB input promotion.
+    assert incremental_peak < 128 * 1024 * 1024
 
 
 @pytest.mark.cpu
