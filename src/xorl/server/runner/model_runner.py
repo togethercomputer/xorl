@@ -2989,9 +2989,7 @@ class ModelRunner:
                 )
             per_row_temperature = logprob_temperature.reshape(-1)
             if per_row_temperature.dtype is not torch.float32:
-                raise TypeError(
-                    f"per-row logprob_temperature must be FP32, got {per_row_temperature.dtype}"
-                )
+                raise TypeError(f"per-row logprob_temperature must be FP32, got {per_row_temperature.dtype}")
             if per_row_temperature.device != hidden_states.device:
                 raise ValueError(
                     "per-row logprob_temperature must share the hidden-state device, got "
@@ -7458,16 +7456,25 @@ class ModelRunner:
         return input_args, output_args
 
     def _get_pp_schedule(self, n_microbatches, seq_len, loss_fn=None, example_input_ids=None):
-        """Return a cached PP schedule keyed by (n_microbatches, seq_len, has_loss).
+        """Return a cached PP schedule keyed by physical input geometry.
 
         A new PipelineStage per local model chunk (cheap, no deepcopy) is created
-        for each unique bucketed seq_len so P2P buffers match the actual tensor
-        shape. ``loss_fn=None`` builds a forward-only schedule (eval / ref
-        logprobs) whose last stage returns HIDDEN states; the caller applies
-        lm_head + loss outside the schedule.
+        for each unique ``(n_microbatches, physical_batch_size, seq_len,
+        schedule)`` so P2P buffers match the actual tensor shape.
+        ``loss_fn=None`` builds a forward-only schedule (eval / ref logprobs)
+        whose last stage returns HIDDEN states; the caller applies lm_head +
+        loss outside the schedule.
         """
         has_loss = loss_fn is not None
-        key = (n_microbatches, seq_len, has_loss)
+        schedule_name = self.train_config.get("pipeline_parallel_schedule", "1F1B")
+        if n_microbatches == 1 and self.pp_num_stages > 1 and schedule_stage_style(schedule_name) == "single":
+            # Torch's single-stage-per-rank GPipe/1F1B classes reject m < p,
+            # even though one ordered chunk is a valid fill/drain pipeline.
+            # Its interleaved runtime accepts the same one-stage-per-rank
+            # placement and provides that mechanical one-chunk schedule.
+            schedule_name = "Interleaved1F1B"
+        physical_batch_size = None if example_input_ids is None else int(example_input_ids.shape[0])
+        key = (n_microbatches, physical_batch_size, seq_len, has_loss, schedule_name.lower())
         # ModelRunner objectives always consume terminal hidden states.  The
         # stable dispatcher selects the requested CE/RL/OPD program and the
         # terminal local head; no schedule ever caches first-call logits or an
@@ -7495,7 +7502,7 @@ class ModelRunner:
                 stages=stages,
                 n_microbatches=n_microbatches,
                 loss_fn=loss_fn,
-                schedule_name=self.train_config.get("pipeline_parallel_schedule", "1F1B"),
+                schedule_name=schedule_name,
             )
         self._set_pp_lm_head_in_loss(lm_head_in_loss)
         return self._pp_schedule_cache[key]
@@ -7531,24 +7538,8 @@ class ModelRunner:
             seq_len = micro_batches[0]["input_ids"].shape[-1]
 
         dispatcher = self._make_pp_train_loss_fn()
-        pp_schedule = self._get_pp_schedule(
-            len(micro_batches),
-            seq_len,
-            loss_fn=dispatcher,
-            example_input_ids=micro_batches[0]["input_ids"],
-        )
-        schedule_targets = torch.cat(
-            [
-                torch.full(
-                    (micro_batch["input_ids"].shape[0],),
-                    microbatch_id,
-                    dtype=torch.long,
-                    device=get_device_type(),
-                )
-                for microbatch_id, micro_batch in enumerate(micro_batches)
-            ],
-            dim=0,
-        )
+        physical_batch_sizes = [int(micro_batch["input_ids"].shape[0]) for micro_batch in micro_batches]
+        ragged_physical_batches = len(set(physical_batch_sizes)) > 1
         dispatcher.begin_step(
             micro_batches,
             loss_fn=loss_fn,
@@ -7557,16 +7548,68 @@ class ModelRunner:
             assert_consumed=self.has_last_stage,
         )
         try:
-            raw_loss = forward_backward_pp(
-                model_parts=self.model_parts,
-                pp_schedule=pp_schedule,
-                micro_batches=micro_batches,
-                has_first_stage=self.has_first_stage,
-                has_last_stage=self.has_last_stage,
-                pp_group=ps.pp_group,
-                logprob_temperature=float(loss_fn_params.get("logprob_temperature", 1.0) or 1.0),
-                schedule_targets=schedule_targets,
-            )
+            logprob_temperature = float(loss_fn_params.get("logprob_temperature", 1.0) or 1.0)
+            if ragged_physical_batches:
+                # torch.distributed.pipelining schedules split concatenated
+                # inputs evenly and retain one fixed P2P tensor shape. Preserve
+                # the caller's real row boundaries by executing ordered,
+                # geometry-keyed one-microbatch schedules. The dispatcher
+                # remains bound once for the whole logical step, so IDs,
+                # objective metadata, records, and signed loss accumulation
+                # retain the same semantics as the pipelined fast path.
+                raw_loss = 0.0
+                for microbatch_id, micro_batch in enumerate(micro_batches):
+                    pp_schedule = self._get_pp_schedule(
+                        1,
+                        seq_len,
+                        loss_fn=dispatcher,
+                        example_input_ids=micro_batch["input_ids"],
+                    )
+                    schedule_targets = torch.full(
+                        (physical_batch_sizes[microbatch_id],),
+                        microbatch_id,
+                        dtype=torch.long,
+                        device=get_device_type(),
+                    )
+                    raw_loss += forward_backward_pp(
+                        model_parts=self.model_parts,
+                        pp_schedule=pp_schedule,
+                        micro_batches=[micro_batch],
+                        has_first_stage=self.has_first_stage,
+                        has_last_stage=self.has_last_stage,
+                        pp_group=ps.pp_group,
+                        logprob_temperature=logprob_temperature,
+                        schedule_targets=schedule_targets,
+                    )
+            else:
+                pp_schedule = self._get_pp_schedule(
+                    len(micro_batches),
+                    seq_len,
+                    loss_fn=dispatcher,
+                    example_input_ids=micro_batches[0]["input_ids"],
+                )
+                schedule_targets = torch.cat(
+                    [
+                        torch.full(
+                            (physical_batch_sizes[microbatch_id],),
+                            microbatch_id,
+                            dtype=torch.long,
+                            device=get_device_type(),
+                        )
+                        for microbatch_id in range(len(micro_batches))
+                    ],
+                    dim=0,
+                )
+                raw_loss = forward_backward_pp(
+                    model_parts=self.model_parts,
+                    pp_schedule=pp_schedule,
+                    micro_batches=micro_batches,
+                    has_first_stage=self.has_first_stage,
+                    has_last_stage=self.has_last_stage,
+                    pp_group=ps.pp_group,
+                    logprob_temperature=logprob_temperature,
+                    schedule_targets=schedule_targets,
+                )
             if self.has_last_stage:
                 try:
                     wire = ["ok", dispatcher.end_step()]
@@ -7665,11 +7708,12 @@ class ModelRunner:
     def _pp_forward_only_loop(self, micro_batches, loss_fn, loss_fn_params, r3_enabled=False):
         """Pipeline-aware forward-only pass (eval / reference logprobs).
 
-        Runs the full pipeline schedule in forward-only mode (all microbatches in
-        one pipelined step), computes loss + per-token logprobs from the last
-        stage's hidden states, and broadcasts per-microbatch results across
-        pp_group so every rank returns the same result dict as the non-PP
-        ``_forward_loop``.
+        Runs equal-size microbatches in one pipelined step. Ragged physical
+        batches use ordered one-microbatch schedules so the fixed-shape torch
+        pipeline transport cannot change caller row boundaries. Computes loss +
+        per-token logprobs from the last stage's hidden states, and broadcasts
+        per-microbatch results across pp_group so every rank returns the same
+        result dict as the non-PP ``_forward_loop``.
         """
         if loss_fn not in self._PP_FORWARD_ONLY_LOSS_FNS:
             raise NotImplementedError(
@@ -7707,19 +7751,43 @@ class ModelRunner:
         if r3_enabled:
             set_replay_stage("replay_forward")
         try:
-            pp_schedule = self._get_pp_schedule(
-                len(micro_batches),
-                micro_batches[0]["input_ids"].shape[-1],
-                loss_fn=None,
-                example_input_ids=micro_batches[0]["input_ids"],
-            )
-            hidden_per_mb = forward_only_pp(
-                model_parts=self.model_parts,
-                pp_schedule=pp_schedule,
-                micro_batches=micro_batches,
-                has_first_stage=self.has_first_stage,
-                has_last_stage=self.has_last_stage,
-            )
+            physical_batch_sizes = [int(micro_batch["input_ids"].shape[0]) for micro_batch in micro_batches]
+            if len(set(physical_batch_sizes)) > 1:
+                hidden_per_mb = [] if self.has_last_stage else None
+                for micro_batch in micro_batches:
+                    pp_schedule = self._get_pp_schedule(
+                        1,
+                        micro_batch["input_ids"].shape[-1],
+                        loss_fn=None,
+                        example_input_ids=micro_batch["input_ids"],
+                    )
+                    microbatch_hidden = forward_only_pp(
+                        model_parts=self.model_parts,
+                        pp_schedule=pp_schedule,
+                        micro_batches=[micro_batch],
+                        has_first_stage=self.has_first_stage,
+                        has_last_stage=self.has_last_stage,
+                    )
+                    if hidden_per_mb is not None:
+                        if microbatch_hidden is None or len(microbatch_hidden) != 1:
+                            raise RuntimeError(
+                                "Ragged physical PP forward-only schedule did not return exactly one terminal output"
+                            )
+                        hidden_per_mb.extend(microbatch_hidden)
+            else:
+                pp_schedule = self._get_pp_schedule(
+                    len(micro_batches),
+                    micro_batches[0]["input_ids"].shape[-1],
+                    loss_fn=None,
+                    example_input_ids=micro_batches[0]["input_ids"],
+                )
+                hidden_per_mb = forward_only_pp(
+                    model_parts=self.model_parts,
+                    pp_schedule=pp_schedule,
+                    micro_batches=micro_batches,
+                    has_first_stage=self.has_first_stage,
+                    has_last_stage=self.has_last_stage,
+                )
         finally:
             if r3_enabled:
                 set_replay_stage(None)

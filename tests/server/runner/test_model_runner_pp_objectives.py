@@ -138,6 +138,7 @@ def test_physical_pp_rejects_only_intermediate_capture_objectives():
 
 def test_physical_pp_sampling_transform_fallback_uses_frozen_identity():
     runner = _runner()
+    runner._resolve_logprob_sampling_transforms = None
     assert runner._pp_sampling_transform_kwargs({}, {"logprob_top_k": 1 << 30}) == {}
     with pytest.raises(RuntimeError, match="before the exact sampling-transform"):
         runner._pp_sampling_transform_kwargs({}, {"logprob_top_k": 2**31 - 1})
@@ -179,6 +180,38 @@ def test_cached_physical_pp_schedule_captures_only_stable_dispatcher(monkeypatch
 
     assert first is schedule and second is schedule
     assert built_loss_fns == [dispatcher]
+
+
+def test_physical_pp_schedule_cache_keys_physical_batch_size_without_changing_equal_batch_schedule(monkeypatch):
+    runner = _runner()
+    runner.pp_num_stages = 2
+    runner.train_config = {"pipeline_parallel_schedule": "1F1B"}
+    runner._pp_schedule_cache = {}
+    built = []
+    monkeypatch.setattr(
+        model_runner_module,
+        "get_parallel_state",
+        lambda: SimpleNamespace(pp_group="pp"),
+    )
+    monkeypatch.setattr(model_runner_module, "get_device_type", lambda: "cpu")
+    monkeypatch.setattr(runner, "_build_pp_stage_io", lambda *_args, **_kwargs: (None, None))
+    monkeypatch.setattr(model_runner_module, "build_pp_stage", lambda *_args, **_kwargs: object())
+
+    def fake_build_pipeline_schedule(*, stages, n_microbatches, loss_fn, schedule_name):
+        built.append((n_microbatches, loss_fn, schedule_name))
+        return object()
+
+    monkeypatch.setattr(model_runner_module, "build_pipeline_schedule", fake_build_pipeline_schedule)
+    dispatcher = runner._make_pp_train_loss_fn()
+    batch_two = torch.zeros(2, 4, dtype=torch.long)
+    batch_three = torch.zeros(3, 4, dtype=torch.long)
+
+    first = runner._get_pp_schedule(3, 4, loss_fn=dispatcher, example_input_ids=batch_two)
+    assert runner._get_pp_schedule(3, 4, loss_fn=dispatcher, example_input_ids=batch_two) is first
+    second_geometry = runner._get_pp_schedule(3, 4, loss_fn=dispatcher, example_input_ids=batch_three)
+
+    assert second_geometry is not first
+    assert built == [(3, dispatcher, "1F1B"), (3, dispatcher, "1F1B")]
 
 
 def test_physical_pp_objective_composes_future_per_row_sampling_resolver(monkeypatch):
