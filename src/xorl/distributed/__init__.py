@@ -9,6 +9,7 @@ from .canonical_moe import (
     ContributionLayout,
     GraphContractStatus,
     LocalMoEContribution,
+    LogicalRowOwnership,
     OutputDistribution,
     ParallelRole,
     canonical_moe_fold_v1,

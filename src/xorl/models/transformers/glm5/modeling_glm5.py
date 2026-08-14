@@ -12,6 +12,7 @@ from xorl.distributed.canonical_moe import (
     CanonicalMoEGraphMetadata,
     CanonicalMoETransport,
     LocalMoEContribution,
+    LogicalRowOwnership,
     OutputDistribution,
     ParallelPlan,
     canonical_moe_reduce_cp_sharded_v3,
@@ -74,10 +75,6 @@ from xorl.utils import logging
 
 logger = logging.get_logger(__name__)
 GLM52_LOCAL_PARTIAL_POLICY = "glm52_routed_final_scaled_then_shared_ep_slice_bf16_v2"
-_GLM52_CANONICAL_TRAINER_TOPOLOGIES = (
-    (16, 1, 1, 1),
-    (16, 1, 1, 16),
-)
 
 
 def _glm52_serving_grouped_topk(
@@ -1112,21 +1109,19 @@ class Glm5MoEBlock(MoEBlock):
         )
 
         ps = get_parallel_state()
-        if not ps.ep_enabled or ps.ep_size != 16 or ps.cp_size not in (1, 16):
-            raise RuntimeError("GLM-5.2 exact trainer path requires EP16 with CP16 or DP-owned CP1 rows")
-        admitted = _GLM52_CANONICAL_TRAINER_TOPOLOGIES
-        topology = (dist.get_world_size(), ps.pp_size, ps.tp_size, ps.dp_size)
-        if topology not in admitted:
-            raise RuntimeError(
-                f"GLM-5.2 canonical MoE trainer path does not admit WORLD/PP/TP/DP={topology}; "
-                f"admitted topologies are {admitted}"
-            )
-        expected_ulysses = 16 if ps.cp_size == 16 else 1
-        if ps.ringattn_size != 1 or ps.ulysses_size != expected_ulysses:
-            raise RuntimeError(
-                "GLM-5.2 canonical MoE trainer path requires Ring1 and Ulysses16 for CP-owned rows or "
-                "Ulysses1 for DP-owned rows"
-            )
+        if not ps.ep_enabled:
+            raise RuntimeError("GLM-5.2 canonical MoE requires expert-parallel contributors")
+        ownership = LogicalRowOwnership(
+            dp_size=ps.dp_size,
+            cp_size=ps.cp_size,
+            dp_rank=ps.dp_rank,
+            cp_rank=ps.cp_rank if ps.cp_enabled else 0,
+            contributor_count=ps.ep_size,
+        )
+        if ps.tp_size != 1:
+            raise RuntimeError("GLM-5.2 canonical MoE requires stage-local dense TP1")
+        if ps.ringattn_size != 1 or ps.ulysses_size != ps.cp_size:
+            raise RuntimeError("GLM-5.2 canonical MoE requires Ring1 and Ulysses to realize the configured CP degree")
         if ps.dp_replicate_size != 1 or ps.dp_shard_size != ps.dp_size or ps.cp_fsdp_mode != "all":
             raise RuntimeError(
                 "GLM-5.2 canonical trainer path requires DP-replicate1, fully sharded DP, and cp_fsdp_mode=all"
@@ -1134,15 +1129,20 @@ class Glm5MoEBlock(MoEBlock):
         if ps.ep_group is None:
             raise RuntimeError("GLM-5.2 canonical MoE requires a stage-local EP16 contributor group")
         get_group_ranks = getattr(dist, "get_process_group_ranks", None)
-        if ps.cp_size == 16:
+        if ps.cp_size > 1:
             if ps.ulysses_group is None:
-                raise RuntimeError("GLM-5.2 CP-owned rows require a stage-local Ulysses16 group")
-            if get_group_ranks is not None and tuple(get_group_ranks(ps.ep_group)) != tuple(
-                get_group_ranks(ps.ulysses_group)
-            ):
-                raise RuntimeError("GLM-5.2 CP-owned rows require identical stage-local CP and EP rank membership")
+                raise RuntimeError("GLM-5.2 CP-owned rows require a stage-local Ulysses group")
+            if get_group_ranks is not None:
+                ep_ranks = tuple(get_group_ranks(ps.ep_group))
+                cp_ranks = tuple(get_group_ranks(ps.ulysses_group))
+                expected_cp_ranks = tuple(ep_ranks[index] for index in ownership.context_source_ordinals)
+                if cp_ranks != expected_cp_ranks:
+                    raise RuntimeError(
+                        "GLM-5.2 CP membership does not match the DP-major logical row layout: "
+                        f"expected={expected_cp_ranks}, actual={cp_ranks}"
+                    )
         elif ps.ulysses_group is not None:
-            raise RuntimeError("GLM-5.2 DP-owned rows require CP1 without a Ulysses process group")
+            raise RuntimeError("GLM-5.2 CP1 rows must not have a Ulysses process group")
         if self.experts.ep_dispatch == "deepep":
             raise RuntimeError("GLM-5.2 canonical MoE canonical path does not support DeepEP")
         if hidden_states.dtype is not torch.bfloat16:
@@ -1165,10 +1165,15 @@ class Glm5MoEBlock(MoEBlock):
         gathered_routing = gather_tokens_for_ep_combine(routing_weights.reshape(local_rows, -1), group, padded_rows)
         gathered_ids = gather_ids_for_ep_combine(selected_experts.reshape(local_rows, -1), group, padded_rows)
         gathered_positions = gather_ids_for_ep_combine(local_positions[:, None], group, padded_rows).squeeze(-1)
-        local_valid = torch.ones((local_rows, 1), dtype=torch.int32, device=flat.device)
-        gathered_valid = gather_ids_for_ep_combine(local_valid, group, padded_rows).squeeze(-1) >= 0
+        local_valid = LogicalRowOwnership.valid_positions(local_positions).to(torch.int32)[:, None]
+        gathered_valid = gather_ids_for_ep_combine(local_valid, group, padded_rows).squeeze(-1) > 0
 
         ep_rank = dist.get_rank(group)
+        if ep_rank != ownership.source_ordinal:
+            raise RuntimeError(
+                "GLM-5.2 EP rank order does not match the DP-major/CP-minor row layout: "
+                f"ep_rank={ep_rank}, source_ordinal={ownership.source_ordinal}"
+            )
         local_experts, expert_start = self._canonical_expert_slice(ep_rank, ps.ep_size)
         local_ids = torch.where(
             (gathered_ids >= expert_start) & (gathered_ids < expert_start + local_experts),
@@ -1218,6 +1223,15 @@ class Glm5MoEBlock(MoEBlock):
             dp_size=ps.dp_size,
             contributor_count=ps.ep_size,
             cp_size=ps.cp_size,
+            pipeline_layer_ranges=tuple(
+                tuple(int(value) for value in stage)
+                for stage in getattr(
+                    self.config,
+                    "_glm52_pipeline_layer_ranges",
+                    ((0, self.config.num_hidden_layers),),
+                )
+            ),
+            model_num_layers=self.config.num_hidden_layers,
         )
         resolved_transport = resolve_canonical_moe_transport(
             self.canonical_moe_transport,
@@ -1266,9 +1280,7 @@ class Glm5MoEBlock(MoEBlock):
         if resolved_transport is CanonicalMoETransport.CP_SHARDED_V3:
             local_canonical = canonical.tensor[:local_rows]
         else:
-            source_start = ep_rank * padded_rows
-            source_end = source_start + local_rows
-            local_canonical = canonical.tensor[source_start:source_end]
+            local_canonical = canonical.tensor[ownership.source_slice(padded_rows=padded_rows, local_rows=local_rows)]
         return local_canonical.reshape(batch_size, sequence_length, hidden_dim)
 
     def forward(

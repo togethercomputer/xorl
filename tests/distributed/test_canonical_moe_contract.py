@@ -12,10 +12,10 @@ from xorl.distributed.canonical_moe import (
     CANONICAL_MOE_DENSE_MAX_CHUNK_ROWS,
     CANONICAL_MOE_FOLD_VERSION,
     CANONICAL_MOE_REDUCE_VERSION,
-    TRAINER_ADMISSIONS_BY_FAMILY,
     CanonicalMoEGraphMetadata,
     CanonicalMoETransport,
     LocalMoEContribution,
+    LogicalRowOwnership,
     OutputDistribution,
     ParallelPlan,
     ParallelRole,
@@ -297,13 +297,16 @@ def test_exact_parallel_plans_hash_launcher_spelling_and_fail_closed():
     assert dp_trainer.cp_ep_aliases == ()
     assert dp_trainer.digest != trainer.digest
 
-    for kwargs in (
-        {"world_size": 16, "dp_size": 2, "contributor_count": 8},
-        {"world_size": 32, "dp_size": 2, "contributor_count": 16},
-        {"world_size": 32, "pp_size": 2, "dp_size": 2},
-    ):
-        with pytest.raises(ValueError, match="Unsupported GLM-5.2 trainer topology"):
-            ParallelPlan.glm52_trainer(**kwargs)
+    for dp_size, cp_size in ((1, 16), (2, 8), (4, 4), (8, 2), (16, 1)):
+        plan = ParallelPlan.glm52_trainer(dp_size=dp_size, cp_size=cp_size)
+        assert plan.dp_size * plan.cp_size == plan.ep_size == 16
+
+    with pytest.raises(ValueError, match="exactly cover"):
+        ParallelPlan.glm52_trainer(dp_size=2, cp_size=4)
+    with pytest.raises(ValueError, match="world size"):
+        ParallelPlan.glm52_trainer(world_size=32, dp_size=2, cp_size=8)
+    with pytest.raises(ValueError, match="explicit model-derived pipeline ranges"):
+        ParallelPlan.glm52_trainer(pp_size=2, dp_size=2, cp_size=8)
 
     payload = sampler.as_dict()
     payload["world_size"] = 16
@@ -314,7 +317,7 @@ def test_exact_parallel_plans_hash_launcher_spelling_and_fail_closed():
     payload = sampler.as_dict()
     payload["role"] = ParallelRole.SAMPLER
     payload["launcher_tp_size"] = 99
-    with pytest.raises(ValueError, match="launcher-level tp_size must be exactly 8"):
+    with pytest.raises(ValueError, match="launcher TP"):
         ParallelPlan(**payload)
 
     payload = sampler.as_dict()
@@ -325,17 +328,15 @@ def test_exact_parallel_plans_hash_launcher_spelling_and_fail_closed():
 
 
 @pytest.mark.cpu
-def test_trainer_admission_is_family_keyed_and_fail_closed():
+def test_trainer_identity_is_descriptive_and_runtime_invariants_are_structural():
     trainer = ParallelPlan.glm52_trainer()
     assert trainer.family == "glm52"
-    admission = TRAINER_ADMISSIONS_BY_FAMILY["glm52"]
-    assert admission.num_layers == 78
-    assert admission.admitted_topologies == {
-        (16, 1, 1, 1, 16, 16, 1): ((0, 78),),
-        (16, 1, 1, 16, 1, 16, 1): ((0, 78),),
-    }
-    with pytest.raises(ValueError, match="No admitted trainer topologies for exact-contract family 'dsv4'"):
-        replace(trainer, family="dsv4")
+    renamed = replace(trainer, family="model-defined-exact-moe")
+    assert renamed.family == "model-defined-exact-moe"
+    assert renamed.digest != trainer.digest
+
+    with pytest.raises(ValueError, match="model metadata exactly"):
+        replace(trainer, model_num_layers=80)
 
     primitive = ParallelPlan.primitive(8)
     qwen_primitive = replace(primitive, family="qwen3_5_moe")
@@ -346,6 +347,30 @@ def test_trainer_admission_is_family_keyed_and_fail_closed():
     assert round_tripped.digest == qwen_primitive.digest
     assert ParallelPlan(**trainer.as_dict()).digest == trainer.digest
     assert ParallelPlan(**ParallelPlan.glm52_sampler(launcher_tp_size=8).as_dict()).role is ParallelRole.SAMPLER
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("dp_size,cp_size", [(1, 16), (2, 8), (4, 4), (8, 2), (16, 1)])
+def test_logical_row_ownership_covers_every_mixed_factorization(dp_size: int, cp_size: int):
+    seen = []
+    for dp_rank in range(dp_size):
+        expected_context = tuple(range(dp_rank * cp_size, (dp_rank + 1) * cp_size))
+        for cp_rank in range(cp_size):
+            ownership = LogicalRowOwnership(dp_size, cp_size, dp_rank, cp_rank, 16)
+            seen.append(ownership.source_ordinal)
+            assert ownership.context_source_ordinals == expected_context
+            source = ownership.source_slice(padded_rows=7, local_rows=3)
+            assert source == slice(ownership.source_ordinal * 7, ownership.source_ordinal * 7 + 3)
+    assert seen == list(range(16))
+
+
+@pytest.mark.cpu
+def test_logical_row_ownership_rejects_only_concrete_shape_mismatch():
+    with pytest.raises(ValueError, match="exactly cover"):
+        LogicalRowOwnership(2, 4, 0, 0, 16)
+    with pytest.raises(ValueError, match="DP rank"):
+        LogicalRowOwnership(2, 8, 2, 0, 16)
+    assert LogicalRowOwnership.valid_positions(torch.tensor([0, -1, 9])).tolist() == [True, False, True]
 
 
 @pytest.mark.cpu

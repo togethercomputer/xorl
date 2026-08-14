@@ -38,36 +38,52 @@ CANONICAL_MOE_DENSE_MAX_CHUNK_ROWS = 4096
 
 
 @dataclass(frozen=True)
-class TrainerFamilyAdmission:
-    """Certified trainer admission data for one exact-contract family.
+class LogicalRowOwnership:
+    """Two-dimensional logical row placement inside one contributor group.
 
-    ``admitted_topologies`` maps ``(world_size, pp_size, tp_size, dp_size,
-    cp_size, ep_size, effective_dense_tp)`` to the required pipeline layer
-    ranges. Admitting a new family (or a new topology for an existing one) is
-    an explicit table entry covered by byte-contract tests, never new
-    branches in ``ParallelPlan.validate``.
+    Rank order is data-parallel major and context-parallel minor.  The
+    canonical MoE transport is allowed whenever those two ownership degrees
+    exactly cover the contributor group; no endpoint-specific topology table
+    is involved.
     """
 
-    label: str
-    num_layers: int
-    admitted_topologies: dict[tuple[int, int, int, int, int, int, int], tuple[tuple[int, int], ...]]
+    dp_size: int
+    cp_size: int
+    dp_rank: int
+    cp_rank: int
+    contributor_count: int
 
+    def __post_init__(self) -> None:
+        if self.dp_size <= 0 or self.cp_size <= 0:
+            raise ValueError("Logical row ownership degrees must be positive")
+        if self.dp_size * self.cp_size != self.contributor_count:
+            raise ValueError(
+                "Logical DP and CP ownership must exactly cover the canonical "
+                f"contributors: {self.dp_size} * {self.cp_size} != {self.contributor_count}"
+            )
+        if not 0 <= self.dp_rank < self.dp_size:
+            raise ValueError(f"DP rank {self.dp_rank} is outside DP size {self.dp_size}")
+        if not 0 <= self.cp_rank < self.cp_size:
+            raise ValueError(f"CP rank {self.cp_rank} is outside CP size {self.cp_size}")
 
-#: Family strings follow the exact-contract family vocabulary used across the
-#: repo ("glm52", "qwen3_5_moe", ...). Only families with certified canonical
-#: MoE trainer topologies appear here; everything else fails closed.
-TRAINER_ADMISSIONS_BY_FAMILY: dict[str, TrainerFamilyAdmission] = {
-    "glm52": TrainerFamilyAdmission(
-        label="GLM-5.2",
-        num_layers=GLM52_NUM_LAYERS,
-        admitted_topologies={
-            # CP-owned rows: CP16 aliases EP16.
-            (16, 1, 1, 1, 16, 16, 1): ((0, 78),),
-            # DP-owned rows: CP1 is independent of the EP16 contributor group.
-            (16, 1, 1, 16, 1, 16, 1): ((0, 78),),
-        },
-    ),
-}
+    @property
+    def source_ordinal(self) -> int:
+        return self.dp_rank * self.cp_size + self.cp_rank
+
+    @property
+    def context_source_ordinals(self) -> tuple[int, ...]:
+        start = self.dp_rank * self.cp_size
+        return tuple(range(start, start + self.cp_size))
+
+    def source_slice(self, *, padded_rows: int, local_rows: int) -> slice:
+        if padded_rows < 0 or local_rows < 0 or local_rows > padded_rows:
+            raise ValueError("Logical row source slice requires 0 <= local_rows <= padded_rows")
+        start = self.source_ordinal * padded_rows
+        return slice(start, start + local_rows)
+
+    @staticmethod
+    def valid_positions(absolute_positions: torch.Tensor) -> torch.Tensor:
+        return absolute_positions.reshape(-1) >= 0
 
 
 class ParallelRole(str, Enum):
@@ -206,9 +222,9 @@ class ParallelPlan:
     cp_ep_aliases: tuple[tuple[int, int], ...]
     launcher_tp_size: int | None = None
     contract_version: str = CANONICAL_MOE_REDUCE_VERSION
-    #: Exact-contract family whose TRAINER_ADMISSIONS_BY_FAMILY entry admits
-    #: this plan. Defaults to the historical (and so far only) canonical MoE
-    #: trainer family.
+    model_num_layers: int = GLM52_NUM_LAYERS
+    #: Descriptive identity only.  Family names do not admit or reject a
+    #: topology; runtime shape and arithmetic invariants do.
     family: str = "glm52"
 
     def __post_init__(self) -> None:
@@ -259,75 +275,54 @@ class ParallelPlan:
                 "expert axes alias"
             )
 
+        if self.model_num_layers <= 0:
+            raise ValueError("model_num_layers must be positive")
         expected_start = 0
         for start, end in self.pipeline_layer_ranges:
             if start != expected_start or end <= start:
                 raise ValueError("Pipeline layer ranges must be positive, contiguous, and start at layer 0")
             expected_start = end
-        if self.role is not ParallelRole.PRIMITIVE_TEST:
-            admission = TRAINER_ADMISSIONS_BY_FAMILY.get(self.family)
-            if admission is None:
-                raise ValueError(f"No admitted trainer topologies for exact-contract family {self.family!r}")
-            if expected_start != admission.num_layers:
-                raise ValueError(f"Pipeline ranges must cover exactly {admission.num_layers} {admission.label} layers")
+        if expected_start != self.model_num_layers:
+            raise ValueError(
+                "Pipeline ranges must cover the model metadata exactly: "
+                f"covered={expected_start}, model_num_layers={self.model_num_layers}"
+            )
 
         if self.role is ParallelRole.TRAINER:
-            admission = TRAINER_ADMISSIONS_BY_FAMILY[self.family]
-            actual = (
-                self.world_size,
-                self.pp_size,
-                self.tp_size,
-                self.dp_size,
-                self.cp_size,
-                self.ep_size,
-                self.effective_dense_tp,
-            )
-            expected_ranges = admission.admitted_topologies.get(actual)
-            if expected_ranges is None:
+            if len(self.pipeline_layer_ranges) != self.pp_size:
+                raise ValueError("Trainer pipeline ranges must name exactly one non-empty range per stage")
+            if self.tp_size != 1 or self.effective_dense_tp != 1:
+                raise ValueError("Canonical trainer rows require stage-local dense TP1 before the EP fold")
+            if self.dp_size <= 0 or self.cp_size <= 0 or self.dp_size * self.cp_size != self.ep_size:
                 raise ValueError(
-                    f"Unsupported {admission.label} trainer topology {actual}; "
-                    f"admitted topologies are {tuple(admission.admitted_topologies)}"
+                    "Trainer DP and CP ownership must exactly cover the stage-local "
+                    f"EP contributors: {self.dp_size} * {self.cp_size} != {self.ep_size}"
                 )
-            if self.pipeline_layer_ranges != expected_ranges:
-                raise ValueError(
-                    f"{admission.label} trainer topology {actual} requires pipeline ranges {expected_ranges}, "
-                    f"got {self.pipeline_layer_ranges}"
-                )
+            if self.world_size != self.pp_size * self.ep_size:
+                raise ValueError("Trainer world size must equal pipeline stages times stage-local contributors")
             expected_groups = tuple(
                 tuple(range(group_start, group_start + self.contributor_count))
                 for group_start in range(0, self.world_size, self.contributor_count)
             )
             if self.combine_groups != expected_groups:
-                raise ValueError(
-                    f"{admission.label} trainer combine groups must be contiguous groups of contributor physical ranks"
-                )
+                raise ValueError("Trainer combine groups must be contiguous stage-local contributor groups")
             if self.logical_ordinals_by_group != (expected_ordinals,) * len(expected_groups):
-                raise ValueError(
-                    f"{admission.label} trainer requires identity logical contributor ordinals in every group"
-                )
+                raise ValueError("Trainer requires identity logical contributor ordinals in every stage")
             if self.launcher_tp_size is not None:
                 raise ValueError("Trainer ParallelPlan does not accept a launcher_tp_size alias")
         elif self.role is ParallelRole.SAMPLER:
-            expected = (8, 1, 1, 1, 8, 8, 1)
-            actual = (
-                self.world_size,
-                self.pp_size,
-                self.tp_size,
-                self.dp_size,
-                self.cp_size,
-                self.ep_size,
-                self.effective_dense_tp,
-            )
-            if actual != expected:
-                raise ValueError(f"GLM-5.2 sampler topology must be {expected}, got {actual}")
-            if self.pipeline_layer_ranges != ((0, 78),):
-                raise ValueError("GLM-5.2 sampler must own all 78 layers in one pipeline stage")
-            if self.combine_groups != (tuple(range(8)),):
-                raise ValueError("GLM-5.2 sampler combine group must contain physical ranks 0..7")
+            if self.pp_size != 1 or len(self.pipeline_layer_ranges) != 1:
+                raise ValueError("Sampler plans currently require one complete pipeline stage")
+            if self.tp_size != 1 or self.effective_dense_tp != 1:
+                raise ValueError("Canonical sampler rows require effective dense TP1")
+            if self.dp_size <= 0 or self.cp_size <= 0 or self.dp_size * self.cp_size != self.ep_size:
+                raise ValueError("Sampler DP and CP ownership must exactly cover the contributor group")
+            if self.world_size != self.ep_size or self.launcher_tp_size != self.ep_size:
+                raise ValueError("Sampler launcher TP, world size, and contributor count must match")
+            if self.combine_groups != (tuple(range(self.ep_size)),):
+                raise ValueError("Sampler combine group must contain the complete launcher rank order")
             if self.logical_ordinals_by_group != (expected_ordinals,):
-                raise ValueError("GLM-5.2 sampler requires identity logical contributor ordinals")
-            if self.launcher_tp_size != 8:
-                raise ValueError("GLM-5.2 sampler launcher-level tp_size must be exactly 8")
+                raise ValueError("Sampler requires identity logical contributor ordinals")
         elif self.role is ParallelRole.PRIMITIVE_TEST:
             if self.world_size != self.cp_size or len(self.combine_groups) != 1:
                 raise ValueError("Primitive plans use one combine group spanning the test world")
@@ -340,19 +335,28 @@ class ParallelPlan:
     def glm52_trainer(
         cls,
         *,
-        world_size: int = 16,
+        world_size: int | None = None,
         pp_size: int = 1,
         dp_size: int = 1,
         contributor_count: int = 16,
         cp_size: int | None = None,
+        pipeline_layer_ranges: tuple[tuple[int, int], ...] | None = None,
+        model_num_layers: int = GLM52_NUM_LAYERS,
     ) -> ParallelPlan:
         if cp_size is None:
-            cp_size = contributor_count
+            if dp_size <= 0 or contributor_count % dp_size:
+                raise ValueError("contributor_count must divide evenly across data-parallel owners")
+            cp_size = contributor_count // dp_size
+        if world_size is None:
+            world_size = pp_size * contributor_count
+        if pipeline_layer_ranges is None:
+            if pp_size != 1:
+                raise ValueError("Multi-stage trainer plans require explicit model-derived pipeline ranges")
+            pipeline_layer_ranges = ((0, model_num_layers),)
         identity = tuple(range(contributor_count))
         combine_groups = tuple(
             tuple(range(start, start + contributor_count)) for start in range(0, world_size, contributor_count)
         )
-        pipeline_layer_ranges = ((0, 78),)
         return cls(
             role=ParallelRole.TRAINER,
             world_size=world_size,
@@ -366,25 +370,27 @@ class ParallelPlan:
             logical_ordinals_by_group=(identity,) * len(combine_groups),
             pipeline_layer_ranges=pipeline_layer_ranges,
             cp_ep_aliases=tuple((rank, rank) for rank in range(cp_size)) if cp_size == contributor_count else (),
+            model_num_layers=model_num_layers,
         )
 
     @classmethod
-    def glm52_sampler(cls, *, launcher_tp_size: int) -> ParallelPlan:
-        identity = tuple(range(8))
+    def glm52_sampler(cls, *, launcher_tp_size: int, model_num_layers: int = GLM52_NUM_LAYERS) -> ParallelPlan:
+        identity = tuple(range(launcher_tp_size))
         return cls(
             role=ParallelRole.SAMPLER,
-            world_size=8,
+            world_size=launcher_tp_size,
             pp_size=1,
             tp_size=1,
             dp_size=1,
-            cp_size=8,
-            ep_size=8,
+            cp_size=launcher_tp_size,
+            ep_size=launcher_tp_size,
             effective_dense_tp=1,
             combine_groups=(identity,),
             logical_ordinals_by_group=(identity,),
-            pipeline_layer_ranges=((0, 78),),
+            pipeline_layer_ranges=((0, model_num_layers),),
             cp_ep_aliases=tuple((rank, rank) for rank in identity),
             launcher_tp_size=launcher_tp_size,
+            model_num_layers=model_num_layers,
         )
 
     @classmethod
@@ -409,6 +415,7 @@ class ParallelPlan:
             logical_ordinals_by_group=(ordinals,),
             pipeline_layer_ranges=((0, 1),),
             cp_ep_aliases=tuple((rank, rank) for rank in physical_ranks),
+            model_num_layers=1,
         )
 
     def group_index_for_physical_rank(self, physical_global_rank: int) -> int:
@@ -438,6 +445,7 @@ class ParallelPlan:
             "ep_size": self.ep_size,
             "effective_dense_tp": self.effective_dense_tp,
             "launcher_tp_size": self.launcher_tp_size,
+            "model_num_layers": self.model_num_layers,
             "combine_groups": self.combine_groups,
             "logical_ordinals_by_group": self.logical_ordinals_by_group,
             "pipeline_layer_ranges": self.pipeline_layer_ranges,
@@ -1078,6 +1086,7 @@ __all__ = [
     "ContributionLayout",
     "GraphContractStatus",
     "LocalMoEContribution",
+    "LogicalRowOwnership",
     "OutputDistribution",
     "ParallelPlan",
     "ParallelRole",

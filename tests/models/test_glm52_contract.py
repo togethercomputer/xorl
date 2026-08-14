@@ -30,7 +30,6 @@ from xorl.models.transformers.glm5.indexer import (
 )
 from xorl.models.transformers.glm5.layer_plan import Glm52LayerPlan
 from xorl.models.transformers.glm5.modeling_glm5 import (
-    _GLM52_CANONICAL_TRAINER_TOPOLOGIES,
     Glm5Attention,
     Glm5ForCausalLM,
     Glm5MoEBlock,
@@ -65,47 +64,20 @@ def _map_tensors(fn, value):
 
 
 @pytest.mark.cpu
-def test_canonical_trainer_admits_certified_cp16_and_dp16_row_placements():
-    assert _GLM52_CANONICAL_TRAINER_TOPOLOGIES == ((16, 1, 1, 1), (16, 1, 1, 16))
-    cp_plan = ParallelPlan.glm52_trainer()
+@pytest.mark.parametrize("dp_size,cp_size", [(1, 16), (2, 8), (4, 4), (8, 2), (16, 1)])
+def test_canonical_trainer_derives_every_dp_cp_row_placement(dp_size, cp_size):
+    plan = ParallelPlan.glm52_trainer(dp_size=dp_size, cp_size=cp_size)
     assert (
-        cp_plan.world_size,
-        cp_plan.pp_size,
-        cp_plan.tp_size,
-        cp_plan.dp_size,
-        cp_plan.ep_size,
-        cp_plan.cp_size,
-    ) == (
-        16,
-        1,
-        1,
-        1,
-        16,
-        16,
-    )
-    dp_plan = ParallelPlan.glm52_trainer(dp_size=16, contributor_count=16, cp_size=1)
-    assert (
-        dp_plan.world_size,
-        dp_plan.pp_size,
-        dp_plan.tp_size,
-        dp_plan.dp_size,
-        dp_plan.ep_size,
-        dp_plan.cp_size,
-    ) == (
-        16,
-        1,
-        1,
-        16,
-        16,
-        1,
-    )
-    assert cp_plan.combine_groups == dp_plan.combine_groups == (tuple(range(16)),)
-    assert cp_plan.logical_ordinals_by_group == dp_plan.logical_ordinals_by_group == (tuple(range(16)),)
-    assert cp_plan.cp_ep_aliases == tuple((rank, rank) for rank in range(16))
-    assert dp_plan.cp_ep_aliases == ()
-    assert cp_plan.digest != dp_plan.digest
-    with pytest.raises(ValueError, match="Unsupported GLM-5.2 trainer topology"):
-        ParallelPlan.glm52_trainer(world_size=32, dp_size=2, contributor_count=16)
+        plan.world_size,
+        plan.pp_size,
+        plan.tp_size,
+        plan.dp_size,
+        plan.ep_size,
+        plan.cp_size,
+    ) == (16, 1, 1, dp_size, 16, cp_size)
+    assert plan.combine_groups == (tuple(range(16)),)
+    assert plan.logical_ordinals_by_group == (tuple(range(16)),)
+    assert plan.cp_ep_aliases == (tuple((rank, rank) for rank in range(16)) if dp_size == 1 else ())
 
 
 def _fake_fp8_mqa_logits(q, kv, weights, starts, ends, *, clean_logits):
