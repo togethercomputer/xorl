@@ -160,6 +160,7 @@ def _official_glm52_config(*, hidden_act: str = "silu") -> Glm5Config:
     return Glm5Config(
         indexer_types=indexer_types,
         index_topk_freq=4,
+        index_skip_topk_offset=3,
         mlp_layer_types=mlp_layer_types,
         hidden_act=hidden_act,
     )
