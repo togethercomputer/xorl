@@ -385,6 +385,12 @@ def test_exact_native_mlp_lora_is_live_on_every_ep_partial(monkeypatch, ep_rank)
         ep_group=object(),
         ep_size=8,
         ep_rank=ep_rank,
+        dp_size=8,
+        dp_rank=ep_rank,
+        cp_size=1,
+        cp_rank=0,
+        cp_enabled=False,
+        tp_size=1,
     )
 
     monkeypatch.setattr(

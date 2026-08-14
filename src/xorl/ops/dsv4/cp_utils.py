@@ -50,9 +50,61 @@ def _get_compress_topk_idxs_ref(ratio: int, bsz: int, seqlen: int, start_pos: in
     return _inner().unsqueeze(0).expand(bsz, -1, -1)
 
 
+class _AllGatherCP(torch.autograd.Function):
+    """Differentiable CP gather for arbitrary process-group rank ranges.
+
+    ``torch.distributed.nn.functional.all_gather`` implements its Gloo VJP via
+    subgroup-unsafe global ``scatter`` sources.  A DP2/CP4 owner plane therefore
+    fails on its second CP group (global ranks 4..7).  The mathematical VJP is a
+    reduce-scatter of the gathered-axis gradient; encode that directly so the
+    same path works for every DP and PP-local CP group on Gloo and NCCL.
+    """
+
+    @staticmethod
+    def forward(ctx, tensor: Tensor, dim: int, cp_group: torch.distributed.ProcessGroup) -> Tensor:
+        dim = dim if dim >= 0 else tensor.ndim + dim
+        if dim < 0 or dim >= tensor.ndim:
+            raise IndexError(f"CP all-gather dimension {dim} is invalid for rank-{tensor.ndim} tensor")
+        world_size = cp_group.size()
+        gathered = [torch.empty_like(tensor) for _ in range(world_size)]
+        torch.distributed.all_gather(gathered, tensor.contiguous(), group=cp_group)
+        ctx.dim = dim
+        ctx.cp_group = cp_group
+        ctx.world_size = world_size
+        return torch.cat(gathered, dim=dim)
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        # reduce_scatter_tensor splits its input on dimension 0.  Move the
+        # gathered sequence axis there without changing its rank-order chunks.
+        grad_front = grad_output.movedim(ctx.dim, 0).contiguous()
+        if grad_front.shape[0] % ctx.world_size:
+            raise RuntimeError(
+                "CP all-gather backward cannot evenly reduce-scatter the gathered axis: "
+                f"length={grad_front.shape[0]}, world_size={ctx.world_size}"
+            )
+        local_front = torch.empty(
+            (grad_front.shape[0] // ctx.world_size, *grad_front.shape[1:]),
+            dtype=grad_front.dtype,
+            device=grad_front.device,
+        )
+        torch.distributed.reduce_scatter_tensor(
+            local_front,
+            grad_front,
+            op=torch.distributed.ReduceOp.SUM,
+            group=ctx.cp_group,
+        )
+        return local_front.movedim(0, ctx.dim), None, None
+
+
 def all_gather_cp(tensor: Tensor, dim: int, cp_group: torch.distributed.ProcessGroup) -> Tensor:
-    """All-gather tensor across CP ranks on `dim`. Contiguous CP = result already in natural order."""
-    return torch.cat(torch.distributed.nn.functional.all_gather(tensor, group=cp_group), dim=dim)
+    """All-gather CP shards in group-rank order with a reduce-scatter VJP.
+
+    The trainer's CP collator owns contiguous sequence shards, so group-rank
+    order is the request's natural logical token order.
+    """
+
+    return _AllGatherCP.apply(tensor, dim, cp_group)
 
 
 def get_q_positions_for_cp(

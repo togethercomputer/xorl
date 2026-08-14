@@ -261,6 +261,45 @@ def exact_q_norm_rope(q_input: Tensor, freqs_cis: Tensor, eps: float, position_o
     return _ExactQNormRope.apply(q_input, freqs_cis, positions, eps)
 
 
+class _ExactKVNormRope(torch.autograd.Function):
+    """Serving's CP-prefill BF16 KV boundary with a trainer-owned VJP."""
+
+    @staticmethod
+    def forward(ctx, kv_input: Tensor, kv_norm_weight: Tensor, freqs_cis: Tensor, eps: float) -> Tensor:
+        if not kv_input.is_cuda or kv_input.dtype != torch.bfloat16 or kv_input.shape[-1] != 512:
+            raise RuntimeError("DSV4 exact CP KV norm/RoPE requires CUDA BF16 official KV geometry")
+        from sglang.kernels.ops.attention.dsv4 import fused_norm_rope_inplace  # noqa: PLC0415
+
+        batch_size, sequence_length = kv_input.shape[:2]
+        positions = _positions(batch_size, sequence_length, kv_input.device)
+        output = kv_input.contiguous().clone()
+        fused_norm_rope_inplace(
+            output.view(-1, 512),
+            kv_norm_weight,
+            eps,
+            freqs_cis,
+            positions,
+        )
+        ctx.save_for_backward(kv_input, kv_norm_weight, freqs_cis, positions)
+        ctx.eps = eps
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        kv_input, kv_norm_weight, freqs_cis, positions = ctx.saved_tensors
+        with torch.enable_grad():
+            kv = kv_input.detach().requires_grad_(True)
+            surrogate = _kv_norm_rope_torch(kv, kv_norm_weight, freqs_cis, positions, ctx.eps)
+            grad_kv = torch.autograd.grad(surrogate, kv, grad_output, create_graph=False)[0]
+        return grad_kv, None, None, None
+
+
+def exact_kv_norm_rope(kv_input: Tensor, kv_norm_weight: Tensor, freqs_cis: Tensor, eps: float) -> Tensor:
+    """Materialize the BF16 KV rows SGLang gathers during exact CP prefill."""
+
+    return _ExactKVNormRope.apply(kv_input, kv_norm_weight, freqs_cis, eps)
+
+
 def _causal_window_indices(batch_size: int, sequence_length: int, device: torch.device) -> Tensor:
     positions = torch.arange(sequence_length, device=device)
     starts = torch.clamp(positions - 127, min=0)
@@ -306,6 +345,38 @@ def _native_swa_kv(kv_input: Tensor, kv_norm_weight: Tensor, freqs_cis: Tensor, 
     _validate_dsv4_lora_metadata(kv_input, where="compressed attention SWA cache store")
     output = dequantize_k_cache_paged(kvcache, out_loc, page_size).view(batch_size, sequence_length, 512)
     _validate_dsv4_lora_metadata(kv_input, where="compressed attention SWA cache dequantize")
+    return output
+
+
+def _native_swa_kv_from_bf16(kv: Tensor) -> Tensor:
+    """Quantize/dequantize SGLang's already-normalized CP-prefill KV rows."""
+
+    from sglang.kernels.ops.attention.dsv4 import fused_store_cache  # noqa: PLC0415
+    from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (  # noqa: PLC0415
+        dequantize_k_cache_paged,
+    )
+
+    batch_size, sequence_length = kv.shape[:2]
+    kv_flat = kv.contiguous().view(-1, 512)
+    num_tokens = kv_flat.shape[0]
+    page_size = _SERVING_SWA_PAGE_SIZE
+    num_pages = max((num_tokens + page_size - 1) // page_size, 1)
+    kvcache = torch.zeros(
+        (num_pages, _flashmla_page_bytes(page_size)),
+        dtype=torch.uint8,
+        device=kv.device,
+    )
+    out_loc = torch.arange(num_tokens, dtype=torch.int32, device=kv.device)
+    fused_store_cache(
+        input=kv_flat,
+        cache=kvcache,
+        indices=out_loc,
+        page_size=page_size,
+        type="flashmla",
+    )
+    _validate_dsv4_lora_metadata(kv, where="CP-prefill BF16 SWA cache store")
+    output = dequantize_k_cache_paged(kvcache, out_loc, page_size).view(batch_size, sequence_length, 512)
+    _validate_dsv4_lora_metadata(kv, where="CP-prefill BF16 SWA cache dequantize")
     return output
 
 
@@ -658,6 +729,8 @@ class _ExactC0Attention(torch.autograd.Function):
         softmax_scale: float,
         carry_state: Dsv4DecodeCarryState | None = None,
         position_offset: int = 0,
+        query_positions: Tensor | None = None,
+        kv_preprocessed: bool = False,
     ) -> Tensor:
         if not q.is_cuda or q.dtype != torch.bfloat16 or kv_input.dtype != torch.bfloat16:
             raise RuntimeError("DSV4 exact C0 attention requires CUDA BF16 Q/KV inputs")
@@ -673,6 +746,8 @@ class _ExactC0Attention(torch.autograd.Function):
         )
 
         if carry_state is not None:
+            if kv_preprocessed:
+                raise RuntimeError("DSV4 exact decode-cache carry cannot consume CP-prefill BF16 KV rows")
             # Incremental serving replay over carried per-layer state: append
             # this segment's K entries to the carried FP8 cache and attend from
             # the segment's absolute positions over every carried row.
@@ -681,6 +756,8 @@ class _ExactC0Attention(torch.autograd.Function):
             kv = _store_raw_kv_carry(kv_input, kv_norm_weight, freqs_cis, eps, carry_state, position_offset)
             sequence_length = q.shape[1]
             positions = _positions(1, sequence_length, q.device, offset=position_offset)
+            if query_positions is not None and not torch.equal(query_positions, positions):
+                raise RuntimeError("DSV4 exact decode-cache carry cannot remap query positions")
             if position_offset > 0:
                 # M=1 decode step: the literal serving decode kernel over the
                 # carried paged FP8 cache.
@@ -718,33 +795,55 @@ class _ExactC0Attention(torch.autograd.Function):
             raise RuntimeError("DSV4 exact C0 attention requires a carry state for offset segments")
         ctx.carry_offset = None
         batch_size, sequence_length = kv_input.shape[:2]
-        positions = _positions(batch_size, sequence_length, kv_input.device)
-        kv_flat = kv_input.contiguous().view(-1, 512)
-        num_tokens = kv_flat.shape[0]
-        page_size = 256
-        page_bytes = ((584 * page_size + 575) // 576) * 576
-        num_pages = (num_tokens + page_size - 1) // page_size
-        kvcache = torch.empty((num_pages, page_bytes), dtype=torch.uint8, device=kv_input.device)
-        out_loc = torch.arange(num_tokens, dtype=torch.int32, device=kv_input.device)
-        fused_k_norm_rope_flashmla(
-            kv=kv_flat,
-            kv_weight=kv_norm_weight,
-            eps=eps,
-            freqs_cis=freqs_cis,
-            positions=positions,
-            out_loc=out_loc,
-            kvcache=kvcache,
-            page_size=page_size,
-        )
-        kv = dequantize_k_cache_paged(kvcache, out_loc, page_size)
-        indices = _causal_window_indices(1, sequence_length, q.device)[0]
-        topk_length = torch.minimum(
-            torch.arange(1, sequence_length + 1, dtype=torch.int32, device=q.device),
-            torch.tensor(128, dtype=torch.int32, device=q.device),
-        )
+        if q.shape[0] != batch_size:
+            raise RuntimeError(
+                "DSV4 exact C0 attention requires Q and KV to have the same request batch, "
+                f"got Q batch={q.shape[0]} and KV batch={batch_size}"
+            )
+        if query_positions is None:
+            query_positions = torch.arange(q.shape[1], dtype=torch.int64, device=q.device)
+        else:
+            query_positions = query_positions.to(device=q.device, dtype=torch.int64)
+        if query_positions.ndim != 1 or query_positions.numel() != q.shape[1]:
+            raise RuntimeError(
+                "DSV4 exact C0 attention requires one absolute position per local query row, "
+                f"got positions={tuple(query_positions.shape)} and Q rows={q.shape[1]}"
+            )
+        if query_positions.numel() and (
+            int(query_positions.min().item()) < 0 or int(query_positions.max().item()) >= sequence_length
+        ):
+            raise RuntimeError(
+                "DSV4 exact C0 query positions must index the gathered logical KV sequence, "
+                f"got range [{int(query_positions.min().item())}, {int(query_positions.max().item())}] "
+                f"for KV length {sequence_length}"
+            )
+        kv_positions = _positions(batch_size, sequence_length, kv_input.device)
+        if kv_preprocessed:
+            kv = _native_swa_kv_from_bf16(kv_input).view(-1, 512)
+        else:
+            kv_flat = kv_input.contiguous().view(-1, 512)
+            num_tokens = kv_flat.shape[0]
+            page_size = 256
+            page_bytes = ((584 * page_size + 575) // 576) * 576
+            num_pages = (num_tokens + page_size - 1) // page_size
+            kvcache = torch.empty((num_pages, page_bytes), dtype=torch.uint8, device=kv_input.device)
+            out_loc = torch.arange(num_tokens, dtype=torch.int32, device=kv_input.device)
+            fused_k_norm_rope_flashmla(
+                kv=kv_flat,
+                kv_weight=kv_norm_weight,
+                eps=eps,
+                freqs_cis=freqs_cis,
+                positions=kv_positions,
+                out_loc=out_loc,
+                kvcache=kvcache,
+                page_size=page_size,
+            )
+            kv = dequantize_k_cache_paged(kvcache, out_loc, page_size)
+        indices = _window_indices_for_positions(query_positions)
+        topk_length = torch.clamp(query_positions + 1, max=128).to(torch.int32)
 
         outputs = []
-        q_flat = q.contiguous().view(batch_size, sequence_length, 64, 512)
+        q_flat = q.contiguous().view(batch_size, q.shape[1], 64, 512)
         kv_flat = kv.view(batch_size, sequence_length, 1, 512)
         for batch_idx in range(batch_size):
             output, _, _ = flash_mla_sparse_fwd(
@@ -758,9 +857,10 @@ class _ExactC0Attention(torch.autograd.Function):
             )
             outputs.append(output)
 
-        ctx.save_for_backward(q, kv_input, kv_norm_weight, attn_sink, freqs_cis, positions)
+        ctx.save_for_backward(q, kv_input, kv_norm_weight, attn_sink, freqs_cis, kv_positions, query_positions)
         ctx.eps = eps
         ctx.softmax_scale = softmax_scale
+        ctx.kv_preprocessed = kv_preprocessed
         return torch.stack(outputs, dim=0)
 
     @staticmethod
@@ -790,15 +890,19 @@ class _ExactC0Attention(torch.autograd.Function):
                     grad_output,
                     create_graph=False,
                 )
-            return grad_q, grad_kv, None, None, None, None, None, None, None
+            return grad_q, grad_kv, None, None, None, None, None, None, None, None, None
 
-        q_saved, kv_saved, weight, attn_sink, freqs_cis, positions = ctx.saved_tensors
-        batch_size, sequence_length = kv_saved.shape[:2]
-        indices = _causal_window_indices(batch_size, sequence_length, q_saved.device)
+        q_saved, kv_saved, weight, attn_sink, freqs_cis, kv_positions, query_positions = ctx.saved_tensors
+        batch_size = kv_saved.shape[0]
+        indices = _window_indices_for_positions(query_positions).unsqueeze(0).expand(batch_size, -1, -1)
         with torch.enable_grad():
             q = q_saved.detach().requires_grad_(True)
             kv_input = kv_saved.detach().requires_grad_(True)
-            kv = _kv_norm_rope_torch(kv_input, weight, freqs_cis, positions, ctx.eps)
+            kv = (
+                kv_input
+                if ctx.kv_preprocessed
+                else _kv_norm_rope_torch(kv_input, weight, freqs_cis, kv_positions, ctx.eps)
+            )
             surrogate = sparse_attn_torch(q, kv, attn_sink, indices, ctx.softmax_scale)
             grad_q, grad_kv = torch.autograd.grad(
                 surrogate,
@@ -806,7 +910,7 @@ class _ExactC0Attention(torch.autograd.Function):
                 grad_output,
                 create_graph=False,
             )
-        return grad_q, grad_kv, None, None, None, None, None, None, None
+        return grad_q, grad_kv, None, None, None, None, None, None, None, None, None
 
 
 def exact_c0_attention(
@@ -819,6 +923,8 @@ def exact_c0_attention(
     softmax_scale: float,
     carry_state: Dsv4DecodeCarryState | None = None,
     position_offset: int = 0,
+    query_positions: Tensor | None = None,
+    kv_preprocessed: bool = False,
 ) -> Tensor:
     """Run native SWA-cache quantization and FlashMLA sparse attention for C0.
 
@@ -838,6 +944,8 @@ def exact_c0_attention(
         softmax_scale,
         carry_state,
         position_offset,
+        query_positions,
+        kv_preprocessed,
     )
 
 
@@ -860,8 +968,17 @@ class _ExactHybridAttention(torch.autograd.Function):
         ratio: int,
         carry_state: Dsv4DecodeCarryState | None = None,
         position_offset: int = 0,
+        query_positions: Tensor | None = None,
+        kv_preprocessed: bool = False,
     ) -> Tensor:
-        if q.shape[0] != 1 or q.shape[1] > 128:
+        if q.shape[0] != 1 or kv_input.shape[0] != 1 or x.shape[0] != 1:
+            raise RuntimeError("DSV4 exact compressed attention currently admits one request")
+        if kv_input.shape[1] != x.shape[1]:
+            raise RuntimeError(
+                "DSV4 exact compressed attention requires gathered KV and compressor inputs to cover "
+                f"the same logical sequence, got KV={kv_input.shape[1]} and hidden={x.shape[1]} rows"
+            )
+        if kv_input.shape[1] > 128:
             raise RuntimeError("DSV4 exact compressed attention currently admits one request with at most 128 tokens")
         if q.dtype != torch.bfloat16 or kv_input.dtype != torch.bfloat16 or x.dtype != torch.bfloat16:
             raise RuntimeError("DSV4 exact compressed attention requires BF16 activations")
@@ -870,9 +987,14 @@ class _ExactHybridAttention(torch.autograd.Function):
 
         from sgl_kernel.flash_mla import flash_mla_sparse_fwd  # noqa: PLC0415
 
-        sequence_length = q.shape[1]
+        query_length = q.shape[1]
+        sequence_length = kv_input.shape[1]
         _validate_dsv4_lora_metadata(q, where=f"C{ratio} hybrid attention entry")
         if carry_state is not None:
+            if kv_preprocessed:
+                raise RuntimeError("DSV4 exact decode-cache carry cannot consume CP-prefill BF16 KV rows")
+            if query_length != sequence_length:
+                raise RuntimeError("DSV4 exact decode-cache carry cannot shard query rows")
             if position_offset > 0 and sequence_length != 1:
                 raise RuntimeError("DSV4 exact compressed decode-cache carry admits M=1 decode segments")
             vanilla = _store_raw_kv_carry(kv_input, kv_norm_weight, freqs_cis, eps, carry_state, position_offset)
@@ -908,11 +1030,35 @@ class _ExactHybridAttention(torch.autograd.Function):
             _validate_dsv4_lora_metadata(q, where=f"C{ratio} hybrid KV assembly")
             compressed_capacity = max(total_tokens // ratio, 1)
             positions = _positions(1, sequence_length, q.device, offset=position_offset)
+            if query_positions is not None and not torch.equal(query_positions, positions):
+                raise RuntimeError("DSV4 exact decode-cache carry cannot remap query positions")
             indices, lengths = _hybrid_indices_for_positions(positions, ratio, compressed_capacity)
         else:
             if position_offset != 0:
                 raise RuntimeError("DSV4 exact compressed attention requires a carry state for offset segments")
-            vanilla = _native_swa_kv(kv_input, kv_norm_weight, freqs_cis, eps)[0]
+            if query_positions is None:
+                query_positions = torch.arange(query_length, dtype=torch.int64, device=q.device)
+            else:
+                query_positions = query_positions.to(device=q.device, dtype=torch.int64)
+            if query_positions.ndim != 1 or query_positions.numel() != query_length:
+                raise RuntimeError(
+                    "DSV4 exact compressed attention requires one absolute position per local query row, "
+                    f"got positions={tuple(query_positions.shape)} and Q rows={query_length}"
+                )
+            if query_positions.numel() and (
+                int(query_positions.min().item()) < 0
+                or int(query_positions.max().item()) >= sequence_length
+            ):
+                raise RuntimeError(
+                    "DSV4 exact compressed query positions must index the gathered logical KV sequence, "
+                    f"got range [{int(query_positions.min().item())}, {int(query_positions.max().item())}] "
+                    f"for KV length {sequence_length}"
+                )
+            vanilla = (
+                _native_swa_kv_from_bf16(kv_input)[0]
+                if kv_preprocessed
+                else _native_swa_kv(kv_input, kv_norm_weight, freqs_cis, eps)[0]
+            )
             compressed = _serving_compressed_kv(
                 x,
                 compressor_wkv_weight,
@@ -924,7 +1070,8 @@ class _ExactHybridAttention(torch.autograd.Function):
                 ratio,
             )
             _validate_dsv4_lora_metadata(q, where=f"C{ratio} hybrid KV assembly")
-            indices, lengths, compressed_capacity = _hybrid_prefill_indices(sequence_length, ratio, q.device)
+            compressed_capacity = max(sequence_length // ratio, 1)
+            indices, lengths = _hybrid_indices_for_positions(query_positions, ratio, compressed_capacity)
         if compressed.shape[0] < compressed_capacity:
             compressed = torch.cat(
                 (
@@ -991,10 +1138,12 @@ class _ExactHybridAttention(torch.autograd.Function):
             compressor_wgate_weight,
             compressor_ape,
             compressor_norm_weight,
+            query_positions,
         )
         ctx.eps = eps
         ctx.softmax_scale = softmax_scale
         ctx.ratio = ratio
+        ctx.kv_preprocessed = kv_preprocessed
         return output.unsqueeze(0)
 
     @staticmethod
@@ -1049,6 +1198,8 @@ class _ExactHybridAttention(torch.autograd.Function):
                 None,
                 None,
                 None,
+                None,
+                None,
             )
 
         (
@@ -1062,15 +1213,21 @@ class _ExactHybridAttention(torch.autograd.Function):
             compressor_wgate_weight,
             compressor_ape,
             compressor_norm_weight,
+            query_positions,
         ) = ctx.saved_tensors
-        sequence_length = q_saved.shape[1]
-        positions = _positions(1, sequence_length, q_saved.device)
-        indices, _, compressed_capacity = _hybrid_prefill_indices(sequence_length, ctx.ratio, q_saved.device)
+        sequence_length = kv_saved.shape[1]
+        kv_positions = _positions(1, sequence_length, q_saved.device)
+        compressed_capacity = max(sequence_length // ctx.ratio, 1)
+        indices, _ = _hybrid_indices_for_positions(query_positions, ctx.ratio, compressed_capacity)
         with torch.enable_grad():
             q = q_saved.detach().requires_grad_(True)
             kv_input = kv_saved.detach().requires_grad_(True)
             x = x_saved.detach().requires_grad_(True)
-            vanilla = _kv_norm_rope_torch(kv_input, kv_norm_weight, freqs_cis, positions, ctx.eps)
+            vanilla = (
+                kv_input
+                if ctx.kv_preprocessed
+                else _kv_norm_rope_torch(kv_input, kv_norm_weight, freqs_cis, kv_positions, ctx.eps)
+            )
             compressed = _compress_surrogate(
                 x,
                 compressor_wkv_weight,
@@ -1129,6 +1286,8 @@ class _ExactHybridAttention(torch.autograd.Function):
             None,
             None,
             None,
+            None,
+            None,
         )
 
 
@@ -1148,6 +1307,8 @@ def exact_compressed_attention(
     ratio: int,
     carry_state: Dsv4DecodeCarryState | None = None,
     position_offset: int = 0,
+    query_positions: Tensor | None = None,
+    kv_preprocessed: bool = False,
 ) -> Tensor:
     """Run the pinned C4/C128 compact-cache attention with a trainer VJP.
 
@@ -1173,6 +1334,8 @@ def exact_compressed_attention(
         ratio,
         carry_state,
         position_offset,
+        query_positions,
+        kv_preprocessed,
     )
 
 

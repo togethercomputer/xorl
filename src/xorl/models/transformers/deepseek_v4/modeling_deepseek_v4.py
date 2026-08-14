@@ -395,6 +395,25 @@ class DeepSeekV4Attention(nn.Module):
             freqs_cis = self.freqs_cis
         else:
             freqs_cis = get_freqs_cis_for_cp(self.freqs_cis, seqlen_local, self.cp_size, self.cp_group)
+        seqlen_global = seqlen_local * self.cp_size
+        q_positions = get_q_positions_for_cp(
+            seqlen_local, cp_size=self.cp_size, cp_group=self.cp_group, device=x.device
+        )
+        # SGLang's DSV4 CP path shards queries for execution, but explicitly
+        # all-gathers and reranges BF16 KV plus compressor scores back into
+        # logical token order before the cache/compressor kernels.  The trainer
+        # owns contiguous CP shards, so rank-order concatenation is already that
+        # logical order.  Keep Q local (and carry its absolute positions) while
+        # replaying the literal serving attention against the gathered source.
+        exact_query_positions = q_positions if self._exact_attention and self.cp_size > 1 else None
+        exact_kv_freqs_cis = freqs_cis
+        if exact_query_positions is not None:
+            exact_kv_freqs_cis = get_freqs_cis_for_cp(
+                self.freqs_cis,
+                seqlen_global,
+                1,
+                None,
+            )
         win = self.window_size
         ratio = self.compress_ratio
         rd = self.rope_head_dim
@@ -439,30 +458,52 @@ class DeepSeekV4Attention(nn.Module):
         validate_lora_metadata("KV projection")
         self._capture_diagnostic_component("k_pre_qk_norm", kv_pre_norm)
         if self._exact_attention:
+            exact_kv_pre_norm = kv_pre_norm
+            exact_x = x
+            exact_kv_preprocessed = False
+            if self.cp_size > 1:
+                from xorl.ops.dsv4.exact_attention import exact_kv_norm_rope  # noqa: PLC0415
+
+                # Serving's CP-prefill boundary materializes BF16 norm+RoPE KV
+                # locally, reranges those rows globally, and only then performs
+                # the separate FP8 cache store.  Preserve that two-kernel
+                # boundary; the CP1 path intentionally retains its fused store.
+                exact_kv_pre_norm = exact_kv_norm_rope(
+                    exact_kv_pre_norm,
+                    self.kv_norm.weight,
+                    freqs_cis,
+                    self.eps,
+                )
+                exact_kv_pre_norm = all_gather_cp(exact_kv_pre_norm, dim=1, cp_group=self.cp_group)
+                exact_kv_preprocessed = True
+                if ratio:
+                    exact_x = all_gather_cp(exact_x, dim=1, cp_group=self.cp_group)
             if ratio == 0:
                 from xorl.ops.dsv4.exact_attention import exact_c0_attention  # noqa: PLC0415
 
                 o = exact_c0_attention(
                     q,
-                    kv_pre_norm,
+                    exact_kv_pre_norm,
                     self.kv_norm.weight,
                     self.attn_sink,
-                    freqs_cis,
+                    exact_kv_freqs_cis,
                     self.eps,
                     self.softmax_scale,
                     carry_state=carry_state,
                     position_offset=carry_offset or 0,
+                    query_positions=exact_query_positions,
+                    kv_preprocessed=exact_kv_preprocessed,
                 )
             else:
                 from xorl.ops.dsv4.exact_attention import exact_compressed_attention  # noqa: PLC0415
 
                 o = exact_compressed_attention(
                     q,
-                    kv_pre_norm,
-                    x,
+                    exact_kv_pre_norm,
+                    exact_x,
                     self.kv_norm.weight,
                     self.attn_sink,
-                    freqs_cis,
+                    exact_kv_freqs_cis,
                     self.compressor.wkv.weight,
                     self.compressor.wgate.weight,
                     self.compressor.ape,
@@ -472,6 +513,8 @@ class DeepSeekV4Attention(nn.Module):
                     ratio,
                     carry_state=carry_state,
                     position_offset=carry_offset or 0,
+                    query_positions=exact_query_positions,
+                    kv_preprocessed=exact_kv_preprocessed,
                 )
             kv_vanilla = None
         else:
@@ -481,11 +524,6 @@ class DeepSeekV4Attention(nn.Module):
             if self._kv_qat_enabled:
                 kv_vanilla[..., : self.nope_head_dim] = fp8_simulate_qat(kv_vanilla[..., : self.nope_head_dim], 64)
             self._capture_diagnostic_component("k_post_qk_norm", kv_vanilla)
-
-        seqlen_global = seqlen_local * self.cp_size
-        q_positions = get_q_positions_for_cp(
-            seqlen_local, cp_size=self.cp_size, cp_group=self.cp_group, device=x.device
-        )
 
         # ---------------- topk indices: window + (optional) compress ----------------
         topk_idxs = get_window_topk_idxs_cp(q_positions, window_size=win, cp_size=self.cp_size, bsz=bsz)

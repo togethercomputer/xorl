@@ -28,7 +28,12 @@ from xorl.models.transformers.deepseek_v4.exact_lm_head import (
     bind_dsv4_exact_lm_head,
     dsv4_lm_head_shard,
 )
-from xorl.ops.dsv4.exact_attention import _hybrid_prefill_indices
+from xorl.ops.dsv4.exact_attention import (
+    _causal_window_indices,
+    _hybrid_indices_for_positions,
+    _hybrid_prefill_indices,
+    _window_indices_for_positions,
+)
 
 
 pytestmark = pytest.mark.cpu
@@ -344,3 +349,39 @@ def test_exact_c128_short_prefill_reserves_ignored_cache_slot() -> None:
     assert lengths.tolist() == list(range(1, 11))
     assert indices[9, :10].tolist() == list(range(1, 11))
     assert torch.all(indices[:, 10:] == -1)
+
+
+@pytest.mark.parametrize("dp_size,cp_size", [(1, 8), (2, 4)])
+@pytest.mark.parametrize("ratio", [4, 128])
+def test_exact_cp_local_queries_select_the_same_global_attention_rows(
+    dp_size: int,
+    cp_size: int,
+    ratio: int,
+) -> None:
+    """DP factorization and PP placement do not change the CP attention row contract."""
+
+    sequence_length = 128
+    local_length = sequence_length // cp_size
+    full_window = _causal_window_indices(1, sequence_length, torch.device("cpu"))[0]
+    full_hybrid, full_lengths, compressed_capacity = _hybrid_prefill_indices(
+        sequence_length,
+        ratio,
+        torch.device("cpu"),
+    )
+
+    for _dp_rank in range(dp_size):
+        for cp_rank in range(cp_size):
+            start = cp_rank * local_length
+            stop = start + local_length
+            query_positions = torch.arange(start, stop, dtype=torch.int64)
+
+            local_window = _window_indices_for_positions(query_positions)
+            local_hybrid, local_lengths = _hybrid_indices_for_positions(
+                query_positions,
+                ratio,
+                compressed_capacity,
+            )
+
+            assert torch.equal(local_window, full_window[start:stop])
+            assert torch.equal(local_hybrid, full_hybrid[start:stop])
+            assert torch.equal(local_lengths, full_lengths[start:stop])

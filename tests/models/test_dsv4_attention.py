@@ -204,3 +204,101 @@ def test_tp_size_gt_1_rejected():
 
     with pytest.raises(AssertionError, match="TP > 1 is not implemented"):
         DeepSeekV4Attention(cfg, layer_id=0, tp_group=_FakeGroup())
+
+
+@pytest.mark.parametrize("compress_ratio", [0, 128])
+@pytest.mark.parametrize("cp_size", [1, 2])
+def test_exact_cp_selects_the_serving_kv_boundary(monkeypatch, compress_ratio, cp_size):
+    """CP1 keeps fused raw-KV store; CP>1 gathers the serving BF16 KV seam."""
+
+    from xorl.models.transformers.deepseek_v4 import modeling_deepseek_v4  # noqa: PLC0415
+    from xorl.models.transformers.deepseek_v4.modeling_deepseek_v4 import (  # noqa: PLC0415
+        DeepSeekV4Attention,
+    )
+    from xorl.ops.dsv4 import exact_attention  # noqa: PLC0415
+
+    class _FakeCPGroup:
+        def size(self):
+            return cp_size
+
+        def rank(self):
+            return cp_size - 1
+
+    cfg = _tiny_config(compress_ratios=[compress_ratio])
+    cfg._dsv4_flash_exact_mode = True
+    group = _FakeCPGroup() if cp_size > 1 else None
+    layer = DeepSeekV4Attention(cfg, layer_id=0, cp_group=group)
+    sequence_length = 4
+    hidden = torch.arange(
+        sequence_length * cfg.hidden_size,
+        dtype=torch.float32,
+    ).view(1, sequence_length, cfg.hidden_size)
+    raw_kv = layer.wkv(hidden).detach()
+
+    observed = {"kv_norm": [], "gathers": [], "attention": []}
+
+    monkeypatch.setattr(
+        modeling_deepseek_v4._ExactBatchInvariantRmsNorm,
+        "apply",
+        lambda value, _weight, _eps: value,
+    )
+    monkeypatch.setattr(exact_attention, "exact_q_norm_rope", lambda value, *_args, **_kwargs: value)
+    monkeypatch.setattr(exact_attention, "exact_inverse_rope", lambda value, *_args, **_kwargs: value)
+
+    def fake_kv_norm_rope(value, *_args, **_kwargs):
+        result = value + 7.0
+        observed["kv_norm"].append((value.detach().clone(), result.detach().clone()))
+        return result
+
+    def fake_gather(value, dim, cp_group):
+        assert cp_group is group
+        result = torch.cat([value + 1000.0 * rank for rank in range(cp_size)], dim=dim)
+        observed["gathers"].append((value.detach().clone(), result.detach().clone()))
+        return result
+
+    def fake_c0(q, kv, *_args, **kwargs):
+        observed["attention"].append((kv.detach().clone(), None, kwargs))
+        return q
+
+    def fake_compressed(q, kv, source, *_args, **kwargs):
+        observed["attention"].append((kv.detach().clone(), source.detach().clone(), kwargs))
+        return q
+
+    monkeypatch.setattr(exact_attention, "exact_kv_norm_rope", fake_kv_norm_rope)
+    monkeypatch.setattr(modeling_deepseek_v4, "all_gather_cp", fake_gather)
+    monkeypatch.setattr(exact_attention, "exact_c0_attention", fake_c0)
+    monkeypatch.setattr(exact_attention, "exact_compressed_attention", fake_compressed)
+
+    output = layer(hidden)
+    assert output.shape == hidden.shape
+    assert len(observed["attention"]) == 1
+    attention_kv, attention_source, kwargs = observed["attention"][0]
+
+    if cp_size == 1:
+        assert observed["kv_norm"] == []
+        assert observed["gathers"] == []
+        assert torch.equal(attention_kv, raw_kv)
+        assert kwargs["kv_preprocessed"] is False
+        assert kwargs["query_positions"] is None
+        if compress_ratio:
+            assert torch.equal(attention_source, hidden)
+    else:
+        assert len(observed["kv_norm"]) == 1
+        normalized_local = observed["kv_norm"][0][1]
+        expected_kv = torch.cat(
+            [normalized_local + 1000.0 * rank for rank in range(cp_size)],
+            dim=1,
+        )
+        assert torch.equal(attention_kv, expected_kv)
+        assert kwargs["kv_preprocessed"] is True
+        assert torch.equal(
+            kwargs["query_positions"],
+            torch.arange(sequence_length, 2 * sequence_length),
+        )
+        assert len(observed["gathers"]) == (2 if compress_ratio else 1)
+        if compress_ratio:
+            expected_source = torch.cat(
+                [hidden + 1000.0 * rank for rank in range(cp_size)],
+                dim=1,
+            )
+            assert torch.equal(attention_source, expected_source)
