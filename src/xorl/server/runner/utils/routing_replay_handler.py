@@ -72,13 +72,22 @@ class RoutingReplayHandler:
     training loss depends on matching the inference-time expert assignments.
 
     Args:
-        model: The nn.Module model containing MoE layers.
+        model: One model or the ordered local virtual-pipeline model parts
+            containing MoE layers.
     """
 
-    def __init__(self, model: nn.Module) -> None:
-        self.model = model
+    def __init__(self, model: Union[nn.Module, List[nn.Module]]) -> None:
+        self.models = tuple(model) if isinstance(model, (list, tuple)) else (model,)
+        if not self.models:
+            raise TypeError("RoutingReplayHandler requires one model or a nonempty list of model parts")
+        # Preserve the historical single-model attribute for callers that use
+        # it for metadata; discovery always walks every ordered local part.
+        self.model = self.models[0]
         self._moe_blocks: Optional[List[nn.Module]] = None
-        self._model_topk: Optional[int] = self._extract_topk(model)
+        self._model_topk: Optional[int] = next(
+            (topk for part in self.models if (topk := self._extract_topk(part)) is not None),
+            None,
+        )
         self.last_setup_metrics: Dict[str, float] = {}
 
     @staticmethod
@@ -112,7 +121,8 @@ class RoutingReplayHandler:
 
     def get_moe_blocks(self) -> List[nn.Module]:
         """
-        Find all MoE blocks in the model that have routing replay enabled.
+        Find all MoE blocks in the model that have routing replay enabled and
+        whose instantiated route program supports replay.
 
         Uses the same discovery pattern as base.py:enable_routing_replay() —
         looks for decoder layers whose ``mlp`` attribute is a MoEBlock with
@@ -129,10 +139,21 @@ class RoutingReplayHandler:
             return []
 
         moe_blocks = []
-        for _name, module in self.model.named_modules():
-            mlp = getattr(module, "mlp", None)
-            if isinstance(mlp, MoEBlock) and getattr(mlp, "_routing_replay", None) is not None:
-                moe_blocks.append(mlp)
+        seen = set()
+        for model_part in self.models:
+            named_modules = getattr(model_part, "named_modules", None)
+            if not callable(named_modules):
+                continue
+            for _name, module in named_modules():
+                mlp = getattr(module, "mlp", None)
+                if (
+                    isinstance(mlp, MoEBlock)
+                    and id(mlp) not in seen
+                    and mlp.supports_routing_replay()
+                    and getattr(mlp, "_routing_replay", None) is not None
+                ):
+                    seen.add(id(mlp))
+                    moe_blocks.append(mlp)
 
         self._moe_blocks = moe_blocks
         return moe_blocks

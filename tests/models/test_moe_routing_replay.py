@@ -13,16 +13,15 @@ import torch.nn as nn
 from torch.utils.checkpoint import checkpoint
 
 from xorl.models.base import XorlPreTrainedModel
-
-
-pytestmark = [pytest.mark.gpu]
-
 from xorl.models.layers.moe.moe_block import MoEBlock
 from xorl.models.layers.moe.routing_replay import (
     RoutingReplay,
     get_replay_stage,
     set_replay_stage,
 )
+
+
+pytestmark = [pytest.mark.gpu]
 
 
 # ---------------------------------------------------------------------------
@@ -212,6 +211,38 @@ class TestRoutingReplayUnit:
         assert get_replay_stage() == "replay_backward"
         set_replay_stage(None)
         assert get_replay_stage() is None
+
+    def test_enabling_multiple_model_parts_preserves_every_live_replay_for_cleanup(self):
+        """Virtual PP enables checkpointing once per local model part."""
+
+        class _FakeConfig:
+            pass
+
+        replays = []
+        model_parts = []
+        for _ in range(2):
+            model_part = XorlPreTrainedModel.__new__(XorlPreTrainedModel)
+            nn.Module.__init__(model_part)
+            model_part.config = _FakeConfig()
+            model_part.gradient_checkpointing = False
+            model_part.layer = _SimpleDecoderLayer()
+            attached = model_part.enable_routing_replay()
+            assert len(attached) == 1
+            replays.append(model_part.layer.mlp._routing_replay)
+            model_parts.append(model_part)
+
+        assert len(RoutingReplay._instances) == 2
+        for index, replay in enumerate(replays):
+            replay.record(torch.tensor([[index, index + 1]]))
+            replay.forward_index = 1
+            replay.backward_index = 1
+
+        RoutingReplay.clear_all()
+
+        for replay in replays:
+            assert replay.top_indices_list == []
+            assert replay.forward_index == replay.backward_index == 0
+        assert len(model_parts) == 2  # Keep both weakly registered parts live through the assertions.
 
 
 # ===========================================================================

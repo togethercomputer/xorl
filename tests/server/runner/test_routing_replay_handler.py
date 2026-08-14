@@ -4,6 +4,8 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
+from xorl.models.layers.moe.moe_block import MoEBlock
+from xorl.models.layers.moe.routing_replay import RoutingReplay
 from xorl.server.runner.utils import routing_replay_handler as rrh
 
 
@@ -13,6 +15,27 @@ def _routing(start: int, length: int) -> list[list[list[int]]]:
 
 def _handler() -> rrh.RoutingReplayHandler:
     return rrh.RoutingReplayHandler(torch.nn.Module())
+
+
+def test_handler_discovers_replayable_moe_in_later_virtual_pipeline_part():
+    first_part = torch.nn.Module()
+    first_part.config = SimpleNamespace(num_experts_per_tok=2)
+    later_part = torch.nn.Module()
+    later_part.layer = torch.nn.Module()
+    later_part.layer.mlp = MoEBlock(
+        hidden_size=8,
+        num_experts=4,
+        top_k=2,
+        intermediate_size=16,
+        moe_implementation="eager",
+    )
+    later_part.layer.mlp._routing_replay = RoutingReplay()
+
+    handler = rrh.RoutingReplayHandler([first_part, later_part])
+
+    assert handler.model is first_part
+    assert handler.models == (first_part, later_part)
+    assert handler.get_moe_blocks() == [later_part.layer.mlp]
 
 
 def test_sp_routing_uses_actual_position_ids_length_without_128_padding(monkeypatch):

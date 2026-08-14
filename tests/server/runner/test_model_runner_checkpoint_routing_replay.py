@@ -246,6 +246,23 @@ def test_r3_checkpoint_replay_keeps_forward_then_backward_stages(monkeypatch):
     assert replay.top_indices_list == []
 
 
+def test_r3_checkpoint_replay_cleans_up_when_recompute_fails(monkeypatch):
+    runner, replay, micro_batches, observed_stages, _observed_routes, _selected_experts = _checkpoint_runner(
+        monkeypatch,
+        r3_enabled=True,
+        fail_recompute=True,
+    )
+
+    with pytest.raises(RuntimeError, match="injected checkpoint recompute failure"):
+        runner._forward_loop(micro_batches, "drgrpo", {"beta": 0.0}, r3_enabled=True)
+
+    assert observed_stages == ["replay_forward", "replay_backward"]
+    assert runner._routing_handler.cleanup_calls == 1
+    assert get_replay_stage() is None
+    assert replay.top_indices_list == []
+    assert replay.forward_index == replay.backward_index == 0
+
+
 def test_pp_checkpoint_replay_initializes_outer_stage_and_cleans_up_on_failure():
     runner = object.__new__(ModelRunner)
     runner.model = SimpleNamespace(config=SimpleNamespace(vocab_size=8))

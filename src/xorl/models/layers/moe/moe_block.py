@@ -182,6 +182,11 @@ class MoEBlock(nn.Module):
         # Set by XorlPreTrainedModel.enable_routing_replay().
         self._routing_replay: Optional[RoutingReplay] = None
 
+    def supports_routing_replay(self) -> bool:
+        """Whether this block's route program can replay cached decisions."""
+
+        return True
+
     def _capture_diagnostic_component(self, name: str, tensor: torch.Tensor) -> None:
         capture = getattr(self, "_diagnostic_capture_component", None)
         if callable(capture):

@@ -287,6 +287,39 @@ def test_moe_hash_layer_requires_input_ids():
         block(x, input_ids=None)
 
 
+def test_exact_dsv4_checkpointing_does_not_attach_or_activate_routing_replay():
+    from xorl.models.base import XorlPreTrainedModel
+    from xorl.models.layers.moe.routing_replay import RoutingReplay, get_replay_stage, set_replay_stage
+    from xorl.models.transformers.deepseek_v4.modeling_deepseek_v4 import DeepseekV4MoE
+    from xorl.server.runner.model_runner import ModelRunner
+    from xorl.server.runner.utils import RoutingReplayHandler
+
+    cfg = _tiny_config(num_hash_layers=1)
+    cfg._dsv4_flash_exact_mode = True
+    block = DeepseekV4MoE(cfg, layer_id=0)
+    block._routing_replay = RoutingReplay()  # Simulate stale state from a prior enable call.
+    container = nn.Module()
+    container.layer = nn.Module()
+    container.layer.mlp = block
+
+    try:
+        attached = XorlPreTrainedModel.enable_routing_replay(container)
+        handler = RoutingReplayHandler(container)
+
+        assert attached == []
+        assert block.supports_routing_replay() is False
+        assert block._routing_replay is None
+        assert handler.get_moe_blocks() == []
+        assert not ModelRunner._checkpoint_routing_replay_enabled(
+            {"enable_gradient_checkpointing": True, "gradient_checkpointing_method": "recompute_full_layer"},
+            handler,
+        )
+        assert get_replay_stage() is None
+    finally:
+        set_replay_stage(None)
+        RoutingReplay.clear_all()
+
+
 def test_exact_hash_route_disables_unarmed_pdl(monkeypatch):
     import sys
     from types import ModuleType
@@ -324,10 +357,19 @@ def test_exact_hash_route_disables_unarmed_pdl(monkeypatch):
     sys.modules["sglang.kernels.ops.attention.dsv4"].hash_topk = fake_hash_topk
     # The exact router mirrors the sampler's patched mm: a BF16-output GEMM.
     sys.modules["sglang.srt.batch_invariant_ops.batch_invariant_ops"].matmul_persistent = lambda a, b: torch.mm(a, b)
-    block.route(
-        torch.ones(3, cfg.hidden_size, dtype=torch.bfloat16),
-        input_ids=torch.tensor([1, 2, 3]),
-    )
+    from xorl.models.layers.moe.routing_replay import set_replay_stage
+
+    try:
+        # A replay-capable block elsewhere in the same process may own the
+        # global stage. Exact DSV4 has no local replay state and must continue
+        # through its deterministic serving route normally.
+        set_replay_stage("record")
+        block.route(
+            torch.ones(3, cfg.hidden_size, dtype=torch.bfloat16),
+            input_ids=torch.tensor([1, 2, 3]),
+        )
+    finally:
+        set_replay_stage(None)
 
     assert len(calls) == 1
     assert calls[0]["use_pdl"] is False

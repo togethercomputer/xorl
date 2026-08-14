@@ -28,6 +28,7 @@ Stage switching lifecycle::
 """
 
 from typing import ClassVar, List, Optional
+from weakref import WeakSet
 
 import torch
 
@@ -35,7 +36,11 @@ import torch
 class RoutingReplay:
     """Per-MoE-layer routing replay with dual-index for PP + checkpoint."""
 
-    _instances: ClassVar[List["RoutingReplay"]] = []
+    # Model construction can enable checkpointing independently on several
+    # local virtual-pipeline parts.  Weak membership keeps every live part in
+    # global reset/cleanup operations without one part clearing registrations
+    # created by an earlier part, and without retaining destroyed models.
+    _instances: ClassVar[WeakSet["RoutingReplay"]] = WeakSet()
 
     def __init__(self):
         self.forward_index: int = 0
@@ -44,7 +49,7 @@ class RoutingReplay:
         self.top_weights_list: List[torch.Tensor] = []  # CPU routing weight buffers (R3 logits)
         self.top_indices_events: List[Optional[torch.cuda.Event]] = []
         self.top_weights_events: List[Optional[torch.cuda.Event]] = []
-        RoutingReplay._instances.append(self)
+        RoutingReplay._instances.add(self)
 
     @staticmethod
     def _record_copy_event(source: torch.Tensor) -> Optional[torch.cuda.Event]:

@@ -15,6 +15,7 @@ from xorl.distributed.canonical_moe import (
     ParallelPlan,
     canonical_moe_reduce_reference,
 )
+from xorl.models.base import XorlPreTrainedModel
 from xorl.models.layers.moe.routing_replay import RoutingReplay, set_replay_stage
 from xorl.models.transformers.glm5 import indexer as indexer_module
 from xorl.models.transformers.glm5 import sparse_selector as sparse_selector_module
@@ -55,6 +56,8 @@ from xorl.models.transformers.glm5.sparse_selector import (
     rotate_sparse_selector_activation,
     select_glm52_logical_indices,
 )
+from xorl.server.runner.model_runner import ModelRunner
+from xorl.server.runner.utils import RoutingReplayHandler
 from xorl.trainers.training_utils import forward_backward_pp
 
 
@@ -1143,9 +1146,20 @@ def test_canonical_moe_checkpoint_replay_preserves_serving_routing_bytes_and_rou
     config._glm52_exact_contract = True
     config.routed_scaling_factor = 3.25
     block = Glm5MoEBlock(config, layer_idx=1)
-    block._routing_replay = RoutingReplay()
+    container = nn.Module()
+    container.layer = nn.Module()
+    container.layer.mlp = block
+    attached = XorlPreTrainedModel.enable_routing_replay(container)
+    assert len(attached) == 1
+    handler = RoutingReplayHandler(container)
+    assert ModelRunner._checkpoint_routing_replay_enabled(
+        {"enable_gradient_checkpointing": True, "gradient_checkpointing_method": "recompute_full_layer"},
+        handler,
+    )
     monkeypatch.setattr(block._routing_replay, "_target_device", lambda: torch.device("cpu"))
     block.gate._glm52_exact_fullparam_component = True
+    with torch.no_grad():
+        block.gate.weight.copy_(torch.linspace(-0.1, 0.1, block.gate.weight.numel()).reshape_as(block.gate.weight))
 
     serving_weights = torch.tensor(
         [[0.12500001, 0.87499994], [0.33333334, 0.66666663]],

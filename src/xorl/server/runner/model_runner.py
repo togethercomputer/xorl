@@ -745,14 +745,11 @@ class ModelRunner:
             self.tokenizer = None
 
         # Initialize extracted modules
-        self._routing_handler = RoutingReplayHandler(self.model)
-        checkpoint_method = self.train_config.get("gradient_checkpointing_method")
-        # Full-layer checkpointing recomputes the MoE dispatch.  RoutingReplay
-        # is model-generic and consumed only by MoE blocks that were equipped
-        # with replay state during gradient-checkpoint setup, so this lifecycle
-        # deliberately has no model-family or parallel-geometry allowlist.
-        self._use_routing_replay = bool(self.train_config.get("enable_gradient_checkpointing", False)) and (
-            checkpoint_method is None or checkpoint_method == "recompute_full_layer"
+        routing_models = self.model_parts if self.pp_enabled else self.model
+        self._routing_handler = RoutingReplayHandler(routing_models)
+        self._use_routing_replay = self._checkpoint_routing_replay_enabled(
+            self.train_config,
+            self._routing_handler,
         )
         # Sync initial attributes
         self._checkpoint_mgr.lora_target_modules = getattr(self, "lora_target_modules", None)
@@ -773,6 +770,16 @@ class ModelRunner:
     def lora_enabled(self) -> bool:
         """Check if LoRA training mode is enabled."""
         return self.lora_config.get("enable_lora", False)
+
+    @staticmethod
+    def _checkpoint_routing_replay_enabled(train_config, routing_handler) -> bool:
+        """Derive replay lifecycle from checkpointing and live block capability."""
+
+        checkpoint_method = train_config.get("gradient_checkpointing_method")
+        recomputes_full_moe = bool(train_config.get("enable_gradient_checkpointing", False)) and (
+            checkpoint_method is None or checkpoint_method == "recompute_full_layer"
+        )
+        return recomputes_full_moe and bool(routing_handler.get_moe_blocks())
 
     @property
     def adapter_manager(self):
@@ -6768,6 +6775,7 @@ class ModelRunner:
         abort_callback=None,
     ):
         checkpoint_replay = compute_backward and getattr(self, "_use_routing_replay", False) and not r3_enabled
+        routing_replay_active = checkpoint_replay or r3_enabled
         try:
             return self._forward_loop_impl(
                 micro_batches,
@@ -6779,7 +6787,7 @@ class ModelRunner:
                 abort_callback=abort_callback,
             )
         finally:
-            if checkpoint_replay:
+            if routing_replay_active:
                 self._routing_handler.cleanup()
             # A successful backward releases each micro-batch below. This
             # boundary owns setup/loss failures after a successful forward.
@@ -6803,11 +6811,7 @@ class ModelRunner:
         if loss_fn == "teacher_hidden_cache":
             if compute_backward:
                 raise ValueError("teacher_hidden_cache is a forward-only operation")
-            try:
-                return self._forward_teacher_hidden_cache(micro_batches, params, abort_callback=abort_callback)
-            finally:
-                if r3_enabled:
-                    self._routing_handler.cleanup()
+            return self._forward_teacher_hidden_cache(micro_batches, params, abort_callback=abort_callback)
         if compute_backward and bool(params.get("diagnostic_decode_cache", False)):
             raise ValueError("diagnostic_decode_cache is a forward-only diagnostic")
 
@@ -7038,10 +7042,6 @@ class ModelRunner:
             if not getattr(self, "_fb_defrag_announced", False):
                 self._fb_defrag_announced = True
                 logger.info("XORL_FB_PER_CALL_DEFRAG active: gc+empty_cache per forward_backward call")
-
-        # R3 cleanup
-        if r3_enabled:
-            self._routing_handler.cleanup()
 
         # CP/SP gradient sync (backward only)
         if compute_backward:

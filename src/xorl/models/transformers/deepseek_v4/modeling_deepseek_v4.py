@@ -838,6 +838,11 @@ class DeepseekV4MoE(MoEBlock):
             DeepseekV4MLP(config, intermediate_size=config.moe_intermediate_size * n_shared) if n_shared > 0 else None
         )
 
+    def supports_routing_replay(self) -> bool:
+        """Exact serving-kernel routing is deterministic but not replayable."""
+
+        return not self._dsv4_exact_native
+
     def _capture_diagnostic_component(self, name: str, value: torch.Tensor) -> None:
         capture = self.__dict__.get("_diagnostic_capture_component")
         if callable(capture):
@@ -882,7 +887,7 @@ class DeepseekV4MoE(MoEBlock):
 
         if self._dsv4_exact_native:
             stage = get_replay_stage()
-            if stage is not None:
+            if stage is not None and self._routing_replay is not None:
                 raise RuntimeError(
                     "Exact DSV4 serving-kernel routing does not admit gradient-checkpoint routing replay"
                 )
