@@ -218,6 +218,26 @@ class TestCollatorCall:
             torch.tensor([[[3.25, 3.5], [4.25, 4.5], [0.0, 0.0]]]),
         )
 
+    @patch("xorl.data.collators.sequence_shard_collator.get_parallel_state")
+    def test_logprob_temperatures_follow_cp_slice_with_identity_padding(self, mock_parallel_state):
+        mock_parallel_state.return_value = _make_mock_ps(cp_size=2, cp_rank=1)
+        collator = TextSequenceShardCollator(pad_token_id=0)
+        result = collator(
+            {
+                "input_ids": torch.tensor([[1, 2, 3, 4, 5]]),
+                "attention_mask": torch.ones(1, 5, dtype=torch.long),
+                "labels": torch.tensor([[2, 3, 4, 5, IGNORE_INDEX]]),
+                "position_ids": torch.arange(5).unsqueeze(0),
+                "logprob_temperatures": torch.tensor([[0.7, 0.8, 0.9, 1.2, 1.3]]),
+            }
+        )
+
+        assert result["logprob_temperatures"].dtype is torch.float32
+        torch.testing.assert_close(
+            result["logprob_temperatures"],
+            torch.tensor([[1.2, 1.3, 1.0]]),
+        )
+
     @pytest.mark.parametrize("cp_rank", [0, 15])
     @patch("xorl.data.collators.sequence_shard_collator.get_parallel_state")
     def test_drgrpo_side_channels_follow_cp16_target_shard(self, mock_parallel_state, cp_rank):

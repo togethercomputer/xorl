@@ -4,37 +4,42 @@ import pytest
 import torch
 
 from xorl.models.layers.moe.ep_native_combine import (
-    NATIVE_EP_COMBINE_QUALIFIED_SIZES,
-    QWEN35_NATIVE_EP_COMBINE_SIZES,
     exchange_and_canonical_fold,
     gather_ids_for_ep_combine,
     gather_tokens_for_ep_combine,
     max_rows_for_ep_combine,
     sglang_fused_gate_sigmoid_mul_add,
     validate_native_ep_combine_size,
-    validate_qwen35_native_ep_combine_size,
 )
 
 
 pytestmark = [pytest.mark.cpu]
 
 
-def test_native_combine_qualified_size_registry():
-    assert NATIVE_EP_COMBINE_QUALIFIED_SIZES["qwen3_5_moe"] == frozenset({8})
-    assert QWEN35_NATIVE_EP_COMBINE_SIZES == frozenset({8})
-    validate_native_ep_combine_size("qwen3_5_moe", 8)
-    for size in (1, 2, 4, 16):
-        with pytest.raises(ValueError, match=r"qualified sizes for family 'qwen3_5_moe': \[8\]"):
-            validate_native_ep_combine_size("qwen3_5_moe", size)
-    with pytest.raises(ValueError, match="no qualified EP sizes for family 'dsv4'"):
-        validate_native_ep_combine_size("dsv4", 8)
+def test_native_combine_accepts_the_balanced_fold_geometries():
+    for size in (2, 4, 8, 16, 32, 64):
+        validate_native_ep_combine_size(size)
+    for size in (0, 1, 3, 6, 31):
+        with pytest.raises(ValueError, match="power-of-two contributor count greater than one"):
+            validate_native_ep_combine_size(size)
 
 
-def test_qwen35_native_combine_policy(monkeypatch):
-    validate_qwen35_native_ep_combine_size(8)
-    for size in (1, 2, 4, 16):
-        with pytest.raises(ValueError, match=r"qualified sizes for family 'qwen3_5_moe': \[8\]"):
-            validate_qwen35_native_ep_combine_size(size)
+def test_native_combine_32_way_fallback_matches_explicit_adjacent_tree(monkeypatch):
+    from xorl.distributed.moe.comm import _AllToAll  # noqa: PLC0415
+
+    monkeypatch.setattr(
+        _AllToAll,
+        "apply",
+        staticmethod(lambda _group, partial, _out_splits, _in_splits: partial),
+    )
+    contributors = torch.randn(32, 3, 5, generator=torch.Generator().manual_seed(41)).to(torch.bfloat16)
+
+    result = exchange_and_canonical_fold(contributors.reshape(96, 5), group=None, ep_size=32)
+
+    level = contributors
+    while level.shape[0] > 1:
+        level = (level[0::2] + level[1::2]).bfloat16()
+    assert torch.equal(result, level[0])
 
 
 def test_qwen35_exchange_uses_canonical_tree_and_preserves_backward(monkeypatch):
@@ -76,7 +81,7 @@ def test_qwen35_exchange_uses_canonical_tree_and_preserves_backward(monkeypatch)
     [
         (torch.zeros((16, 2), dtype=torch.float32), 8, "BF16"),
         (torch.zeros((15, 2), dtype=torch.bfloat16), 8, "divisible"),
-        (torch.zeros((16, 2), dtype=torch.bfloat16), 4, "qualified sizes"),
+        (torch.zeros((18, 2), dtype=torch.bfloat16), 3, "power-of-two contributor count greater than one"),
     ],
 )
 def test_qwen35_exchange_fails_closed_before_transport(monkeypatch, partial, ep_size, message):

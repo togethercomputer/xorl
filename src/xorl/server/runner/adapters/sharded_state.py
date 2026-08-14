@@ -402,7 +402,6 @@ def discover_adapter_layouts(
     *,
     active_rank: int,
     process_group: Optional[dist.ProcessGroup] = None,
-    pipeline_parallel_size: int = 1,
     local_group_memberships: Mapping[str, tuple[int, ...]] | None = None,
 ) -> tuple[
     dict[str, AdapterTensorLayout],
@@ -411,11 +410,6 @@ def discover_adapter_layouts(
 ]:
     """Discover and validate the local layouts for one active adapter rank."""
 
-    if pipeline_parallel_size > 1:
-        raise RuntimeError(
-            "Multi-adapter topology discovery does not support pipeline parallelism; "
-            "use the exact optimizer ownership group or disable PP."
-        )
     named_params = dict(model.named_parameters())
     layouts: dict[str, AdapterTensorLayout] = {}
     for name in sorted(parameter_metadata):
@@ -433,7 +427,16 @@ def discover_adapter_layouts(
     group = process_group
     distributed = dist.is_available() and dist.is_initialized()
     world = dist.get_world_size(group=group) if distributed else 1
-    local_rank = dist.get_rank(group=group) if distributed else 0
+    if distributed:
+        group_global_ranks = (
+            tuple(int(rank) for rank in dist.get_process_group_ranks(group))
+            if group is not None
+            else tuple(range(dist.get_world_size()))
+        )
+        local_global_rank = int(dist.get_rank())
+    else:
+        group_global_ranks = (0,)
+        local_global_rank = 0
     local_descriptors = [_descriptor_from_layout(layouts[name]) for name in sorted(layouts)]
     local_payload = {
         "layouts": local_descriptors,
@@ -471,13 +474,14 @@ def discover_adapter_layouts(
                 raise RuntimeError(f"Incompatible logical LoRA layout for {key!r} on rank {rank}")
 
     replica_members: dict[tuple[Any, ...], list[int]] = defaultdict(list)
-    for peer_rank, payload in enumerate(gathered):
+    for peer_index, payload in enumerate(gathered):
+        peer_rank = group_global_ranks[peer_index]
         descriptors = payload["layouts"]
         for descriptor in descriptors:
             key = _replica_key_from_descriptor(descriptor, rank=peer_rank)
             replica_members[key].append(peer_rank)
     for name, layout in list(layouts.items()):
-        replica_key = _replica_key_from_descriptor(_descriptor_from_layout(layout), rank=local_rank)
+        replica_key = _replica_key_from_descriptor(_descriptor_from_layout(layout), rank=local_global_rank)
         members = tuple(replica_members[replica_key])
         layouts[name] = replace(
             layout,

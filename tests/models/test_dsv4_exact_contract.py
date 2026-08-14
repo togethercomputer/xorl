@@ -11,7 +11,6 @@ from xorl.models.transformers.deepseek_v4.exact_contract import (
     DSV4_FLASH_COMPRESS_RATIOS,
     DSV4_FLASH_LOGICAL_FACTOR_COUNT,
     DSV4_FLASH_NON_ROUTED_LOGICAL_PROJECTION_COUNT,
-    DSV4_FLASH_RCA_TRAINING_TOPOLOGY,
     DSV4_FLASH_REQUIRED_TARGET_MODULES,
     DSV4_FLASH_ROUTED_BANK_COUNT,
     DSV4_FLASH_TARGET_ENTITY_COUNT,
@@ -19,13 +18,13 @@ from xorl.models.transformers.deepseek_v4.exact_contract import (
     build_dsv4_flash_adapter_inventory,
     validate_dsv4_flash_adapter_program,
     validate_dsv4_flash_official_geometry,
-    validate_dsv4_flash_training_topology,
 )
 from xorl.models.transformers.deepseek_v4.exact_lm_head import (
     DSV4_LM_HEAD_LOCAL_VOCAB_SIZE,
     DSV4_LM_HEAD_TP_SIZE,
     DSV4_LM_HEAD_VOCAB_SIZE,
     Dsv4ExactTP8LmHeadLoraLinear,
+    bind_dsv4_exact_lm_head,
     dsv4_lm_head_shard,
 )
 from xorl.ops.dsv4.exact_attention import _hybrid_prefill_indices
@@ -91,20 +90,13 @@ def _official_config() -> DeepseekV4Config:
     return config
 
 
-def test_official_geometry_and_rca_topology_are_fail_closed() -> None:
+def test_official_geometry_is_fail_closed() -> None:
     config = _official_config()
     validate_dsv4_flash_official_geometry(config)
 
     config.quantization_config = SimpleNamespace(**config.quantization_config)
     config.rope_scaling = SimpleNamespace(**config.rope_scaling)
     validate_dsv4_flash_official_geometry(config)
-
-    topology = SimpleNamespace(**vars(DSV4_FLASH_RCA_TRAINING_TOPOLOGY))
-    assert validate_dsv4_flash_training_topology(topology) == DSV4_FLASH_RCA_TRAINING_TOPOLOGY
-
-    topology.tp_size = 8
-    with pytest.raises(ValueError, match="byte-proxy candidate"):
-        validate_dsv4_flash_training_topology(topology)
 
     config.compress_ratios[2] = 128
     with pytest.raises(ValueError, match="C0/C4/C128 schedule"):
@@ -243,6 +235,78 @@ def test_exact_lm_head_rejects_ordinary_full_weight_value_paths() -> None:
         head(torch.empty(1, 4096, device="meta", dtype=torch.bfloat16))
     with pytest.raises(RuntimeError, match="selected-logprob"):
         head.get_delta_weight()
+
+
+def test_exact_lm_head_binds_to_a_pp2_stage_local_tp8_group(monkeypatch) -> None:
+    from xorl.distributed import parallel_state as parallel_state_impl  # noqa: PLC0415
+    from xorl.lora.modules.linear import LoraLinear  # noqa: PLC0415
+
+    group = object()
+    device_mesh = SimpleNamespace(
+        mesh=torch.arange(16).reshape(2, 8),
+        mesh_dim_names=("pp", "dp_shard"),
+        get_coordinate=lambda: [1, 0],
+    )
+    state = SimpleNamespace(
+        tp_size=1,
+        lm_head_tp_size=8,
+        lm_head_tp_group=group,
+        device_mesh=device_mesh,
+    )
+    monkeypatch.setattr(parallel_state_impl, "get_parallel_state", lambda: state)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda actual: 8)
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda actual: tuple(range(8, 16)))
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda actual=None: 0 if actual is group else 8)
+    model = SimpleNamespace(
+        lm_head=LoraLinear(
+            4096,
+            DSV4_LM_HEAD_VOCAB_SIZE,
+            r=1,
+            lora_alpha=1,
+            device=torch.device("meta"),
+            dtype=torch.bfloat16,
+        )
+    )
+
+    bind_dsv4_exact_lm_head(model)
+
+    assert isinstance(model.lm_head, Dsv4ExactTP8LmHeadLoraLinear)
+    assert model.lm_head._dsv4_exact_selected_logprob.expected_group_ranks == tuple(range(8, 16))
+
+
+def test_exact_lm_head_rejects_a_cross_stage_tp8_group(monkeypatch) -> None:
+    from xorl.distributed import parallel_state as parallel_state_impl  # noqa: PLC0415
+    from xorl.lora.modules.linear import LoraLinear  # noqa: PLC0415
+
+    group = object()
+    state = SimpleNamespace(
+        tp_size=1,
+        lm_head_tp_size=8,
+        lm_head_tp_group=group,
+        device_mesh=SimpleNamespace(
+            mesh=torch.arange(16).reshape(2, 8),
+            mesh_dim_names=("pp", "dp_shard"),
+            get_coordinate=lambda: [1, 0],
+        ),
+    )
+    monkeypatch.setattr(parallel_state_impl, "get_parallel_state", lambda: state)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda actual: 8)
+    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda actual: tuple(range(4, 12)))
+    model = SimpleNamespace(
+        lm_head=LoraLinear(
+            4096,
+            DSV4_LM_HEAD_VOCAB_SIZE,
+            r=1,
+            lora_alpha=1,
+            device=torch.device("meta"),
+            dtype=torch.bfloat16,
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="crosses the current pipeline stage"):
+        bind_dsv4_exact_lm_head(model)
 
 
 def test_exact_c4_short_prefill_uses_compact_prefix_then_swa_order() -> None:

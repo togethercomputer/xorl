@@ -23,6 +23,16 @@ def test_convert_batch_to_tensors_preserves_drgrpo_logprob_floats():
     torch.testing.assert_close(converted["ref_logprobs"], torch.tensor([[-1.75, -3.125]]))
 
 
+def test_convert_batch_to_tensors_uses_float_identity_padding_for_temperatures():
+    converted = convert_batch_to_tensors({"logprob_temperatures": [[0.7, 0.7], [1.3]]})
+
+    assert converted["logprob_temperatures"].dtype == torch.float32
+    torch.testing.assert_close(
+        converted["logprob_temperatures"],
+        torch.tensor([[0.7, 0.7], [1.3, 1.0]]),
+    )
+
+
 def test_convert_batch_to_tensors_preserves_teacher_hidden_state_floats():
     batch = {
         "teacher_hidden_states": [
@@ -79,4 +89,44 @@ def test_simple_sequence_shard_slices_teacher_hidden_states_on_sequence_dim(mock
     torch.testing.assert_close(
         sharded["teacher_hidden_states"],
         torch.tensor([[[2.25, 2.5], [0.0, 0.0]]]),
+    )
+
+
+@patch("xorl.server.runner.utils.batch_utils.get_parallel_state")
+def test_simple_sequence_shard_identity_pads_temperatures(mock_parallel_state):
+    mock_parallel_state.return_value = Mock(cp_size=2, cp_rank=1)
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3]]),
+        "labels": torch.tensor([[2, 3, -100]]),
+        "position_ids": torch.tensor([[0, 1, 2]]),
+        "logprob_temperatures": torch.tensor([[0.7, 0.9, 1.3]]),
+    }
+
+    sharded = simple_sequence_shard(batch)
+
+    torch.testing.assert_close(
+        sharded["logprob_temperatures"],
+        torch.tensor([[1.3, 1.0]]),
+    )
+
+
+@patch("xorl.server.runner.utils.batch_utils.get_parallel_state")
+def test_simple_sequence_shard_keeps_batched_temperatures_contiguous(mock_parallel_state):
+    mock_parallel_state.return_value = Mock(cp_size=2, cp_rank=1)
+    batch = {
+        "input_ids": torch.tensor([[1, 2, 3, 4], [5, 6, 7, 8]]),
+        "labels": torch.tensor([[2, 3, 4, -100], [6, 7, 8, -100]]),
+        "position_ids": torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]]),
+        "logprob_temperatures": torch.tensor(
+            [[0.7, 0.8, 0.9, 1.0], [1.1, 1.2, 1.3, 1.4]],
+            dtype=torch.float32,
+        ),
+    }
+
+    sharded = simple_sequence_shard(batch)
+
+    assert sharded["logprob_temperatures"].is_contiguous()
+    torch.testing.assert_close(
+        sharded["logprob_temperatures"],
+        torch.tensor([[0.9, 1.0], [1.3, 1.4]], dtype=torch.float32),
     )

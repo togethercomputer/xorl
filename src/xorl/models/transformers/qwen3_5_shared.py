@@ -55,13 +55,13 @@ def _apply_qwen35_gdn_exact(model: torch.nn.Module) -> dict[str, int]:
     if is_moe:
         from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
         from xorl.models.layers.moe.ep_native_combine import (  # noqa: PLC0415
-            validate_qwen35_native_ep_combine_size,
+            validate_native_ep_combine_size,
         )
 
         ps = get_parallel_state()
         if not ps.ep_enabled:
             raise ValueError("Exact Qwen3.5-MoE server training requires expert parallelism")
-        validate_qwen35_native_ep_combine_size(ps.ep_size)
+        validate_native_ep_combine_size(ps.ep_size)
 
     from xorl.lora.modules.base import LoraModule  # noqa: PLC0415
     from xorl.ops.batch_invariant_ops import wrap_trunk_linears_batch_invariant  # noqa: PLC0415

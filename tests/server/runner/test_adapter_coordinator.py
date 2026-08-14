@@ -584,7 +584,7 @@ def test_handle_load_adapter_state_rolls_back_new_adapter_on_cross_rank_restore_
     coordinator.broadcast_adapter_optimizer_state.assert_not_called()
 
 
-def test_handle_load_adapter_state_rejects_pipeline_parallel_multi_adapter_lora(tmp_path):
+def test_handle_load_adapter_state_admits_pipeline_parallel_multi_adapter_lora(tmp_path):
     checkpoint_dir = tmp_path / "adapters"
     checkpoint_dir.mkdir()
     adapter_path = tmp_path / "checkpoint"
@@ -594,6 +594,9 @@ def test_handle_load_adapter_state_rejects_pipeline_parallel_multi_adapter_lora(
     trainer.train_config["pipeline_parallel_size"] = 2
     trainer.register_session("policy-pp", trainer._session_spec(2e-5), materialize=False)
     coordinator = AdapterCoordinator(trainer=trainer, rank=1, world_size=2, cpu_group=None)
+    coordinator._restore_rank0_broadcast_adapter_state = Mock(
+        return_value={"success": True, "model_id": "policy-pp", "step": 0}
+    )
 
     payload = AdapterStateData(
         model_id="policy-pp",
@@ -604,15 +607,10 @@ def test_handle_load_adapter_state_rejects_pipeline_parallel_multi_adapter_lora(
 
     result = asyncio.run(coordinator.handle_load_adapter_state({"payload": payload}))
 
-    assert result == {
-        "success": False,
-        "error": (
-            "Adapter state load failed: pipeline_parallel_size > 1 is not supported with multi-adapter LoRA "
-            "server training. Adapter coordination currently assumes identical local LoRA layouts on every rank."
-        ),
-    }
+    assert result == {"success": True, "model_id": "policy-pp"}
     assert "policy-pp" in trainer.lora_session_specs
     assert trainer.load_calls == []
+    coordinator._restore_rank0_broadcast_adapter_state.assert_called_once()
 
 
 def test_handle_load_adapter_state_rolls_back_auto_registered_session_on_failure(tmp_path):

@@ -71,6 +71,8 @@ OPD_TOKEN_ALIGNED_FIELDS = (
     "opd_sample_ok",
 )
 
+CAUSAL_TARGET_ALIGNED_FIELDS = ("logprob_temperatures",)
+
 # Packing strategies (see SequentialPacker for semantics).
 PACKING_STRATEGIES = ("sequential", "best_fit", "balanced_dp")
 # How to treat samples whose raw length exceeds max_seq_len.
@@ -134,6 +136,32 @@ def shift_opd_token_aligned_fields(
                 f"({shifted_seq_len}) or original length ({original_seq_len})"
             )
         flattened_datum[key] = value[:-1]
+
+
+def shift_causal_target_aligned_fields(
+    flattened_datum: Dict[str, Any],
+    original_seq_len: int,
+    shifted_seq_len: int,
+    sample_idx: int,
+) -> None:
+    """Align decision metadata with labels[1:] for HF-style causal shifting."""
+    for key in CAUSAL_TARGET_ALIGNED_FIELDS:
+        if key not in flattened_datum:
+            continue
+        value = flattened_datum[key]
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+        if not isinstance(value, list):
+            raise ValueError(f"Sample {sample_idx}: {key} must be token-aligned")
+        if len(value) == shifted_seq_len:
+            flattened_datum[key] = value
+            continue
+        if len(value) != original_seq_len:
+            raise ValueError(
+                f"Sample {sample_idx}: {key} length ({len(value)}) must match either shifted length "
+                f"({shifted_seq_len}) or original length ({original_seq_len})"
+            )
+        flattened_datum[key] = value[1:]
 
 
 def _resolve_teacher_cache_base(t_base: Any, t_cache: List[int]) -> int:
@@ -956,6 +984,12 @@ class SequentialPacker(Packer):
                 shifted_seq_len=len(input_ids) - 1,
                 sample_idx=sample_idx,
             )
+            shift_causal_target_aligned_fields(
+                flattened_datum,
+                original_seq_len=len(input_ids),
+                shifted_seq_len=len(input_ids) - 1,
+                sample_idx=sample_idx,
+            )
             input_ids = input_ids[:-1]
             labels = labels[1:]
             if weights is not None:
@@ -1180,7 +1214,13 @@ class SequentialPacker(Packer):
                                 hidden_dim = len(value[0][0])
                                 value[0].extend([[0.0] * hidden_dim for _ in range(pad_length)])
                             else:
-                                pad_value = IGNORE_INDEX if key == "target_tokens" else 0
+                                pad_value = (
+                                    IGNORE_INDEX
+                                    if key == "target_tokens"
+                                    else 1.0
+                                    if key == "logprob_temperatures"
+                                    else 0
+                                )
                                 value[0].extend([pad_value] * pad_length)
 
         # For non-SP cases, pre-compute Flash Attention kwargs from position_ids.
@@ -1284,6 +1324,12 @@ class SequentialPacker(Packer):
                 weights = weights[1:]
             if advantages is not None:
                 advantages = advantages[1:]
+            shift_causal_target_aligned_fields(
+                flattened_datum,
+                original_seq_len=len(input_ids) + 1,
+                shifted_seq_len=len(input_ids),
+                sample_idx=sample_idx,
+            )
 
         if advantages is not None:
             flattened_datum["advantages"] = advantages

@@ -99,6 +99,7 @@ def test_repack_loss_fields_and_token_roundtrip():
         ([30, 31], [40, 41, 42]),
     ]
     b = _build_packed(seqs)
+    b["logprob_temperatures"] = torch.linspace(0.7, 1.3, b["input_ids"].numel()).unsqueeze(0)
     out = shared_prefix_repack_batch(b)
     ctx = out["shared_prefix_context"]
     orig_ids = b["input_ids"].squeeze(0)
@@ -111,6 +112,11 @@ def test_repack_loss_fields_and_token_roundtrip():
     assert torch.equal(out["target_tokens"].squeeze(0)[ctx.dec_idx], b["target_tokens"].squeeze(0)[ctx.dec_orig_idx])
     assert (out["target_tokens"].squeeze(0)[ctx.shared_idx] == IGNORE).all()
     assert torch.equal(out["advantages"].squeeze(0)[ctx.dec_idx], b["advantages"].squeeze(0)[ctx.dec_orig_idx])
+    assert torch.equal(
+        out["logprob_temperatures"].squeeze(0)[ctx.dec_idx],
+        b["logprob_temperatures"].squeeze(0)[ctx.dec_orig_idx],
+    )
+    assert (out["logprob_temperatures"].squeeze(0)[ctx.shared_idx] == 1.0).all()
 
     # cu_seq_lens dropped (shared-prefix backend drives attention from the context)
     assert "cu_seq_lens_q" not in out

@@ -48,12 +48,14 @@ from .pp_byte_contract import (
     assert_pp_wire_dtype,
     engage_pp_byte_contract,
     validate_pp_exact_microbatch_metadata,
+    validate_pp_wire_boundary_state,
 )
 
 
 logger = logging.get_logger(__name__)
 
 __all__ = [
+    "generate_llm_fqn_from_layer_ranges",
     "generate_llm_fqn_per_model_part",
     "pipeline_module_split",
     "build_pp_stage",
@@ -64,6 +66,39 @@ __all__ = [
     "schedule_splits_backward",
     "validate_pp_schedule_config",
 ]
+
+
+def generate_llm_fqn_from_layer_ranges(
+    layer_ranges,
+    *,
+    num_layers: int,
+    input_fqns: Optional[List[str]] = None,
+    layer_prefix: str = "layers",
+    output_fqns: Optional[List[str]] = None,
+) -> List[List[str]]:
+    """Build stage module assignments from model-derived legal ranges."""
+
+    input_fqns = ["tok_embeddings"] if input_fqns is None else list(input_fqns)
+    output_fqns = ["norm", "output"] if output_fqns is None else list(output_fqns)
+    ranges = tuple((int(start), int(end)) for start, end in layer_ranges)
+    expected_start = 0
+    for start, end in ranges:
+        if start != expected_start or end <= start:
+            raise ValueError("Pipeline layer ranges must be nonempty, contiguous, and start at layer 0")
+        expected_start = end
+    if not ranges or expected_start != num_layers:
+        raise ValueError(f"Pipeline layer ranges must cover exactly {num_layers} decoder layers")
+
+    assignments: List[List[str]] = []
+    for stage_index, (start, end) in enumerate(ranges):
+        modules: List[str] = []
+        if stage_index == 0:
+            modules.extend(input_fqns)
+        modules.extend(f"{layer_prefix}.{layer_index}" for layer_index in range(start, end))
+        if stage_index == len(ranges) - 1:
+            modules.extend(output_fqns)
+        assignments.append(modules)
+    return assignments
 
 
 # Schedules taking exactly one stage per rank use style "single"; multi-stage
@@ -350,11 +385,13 @@ def _pp_forward(self, x):
     # Skip during shape inference to avoid consuming queue entries that are
     # needed for the actual scheduled forward passes.
     position_ids = None
+    pipeline_input_ids = None
     extra_kwargs = {}
     if in_scheduled_forward:
         metadata_queue = getattr(self, "_pp_batch_metadata", None)
         if metadata_queue:
             metadata = metadata_queue.popleft()
+            pipeline_input_ids = metadata.pop("_pp_input_ids", None)
             position_ids = metadata.pop("position_ids", None)
             if position_ids is not None:
                 position_ids = position_ids.to(x.device)
@@ -383,6 +420,12 @@ def _pp_forward(self, x):
                 # The received wire bytes must be bf16 regardless of what any
                 # config declared (resolved reality, not metadata).
                 assert_pp_wire_dtype(x, where="received inter-stage hidden state")
+        if not self._pp_is_first:
+            validate_pp_wire_boundary_state(
+                x,
+                getattr(self, "_pp_pipeline_boundary_state", None),
+                where="received inter-stage hidden state",
+            )
 
     # Fallback: generate sequential position_ids covering the full SP range
     # so that RoPE embeddings have a large enough cache.
@@ -402,6 +445,14 @@ def _pp_forward(self, x):
         )
     else:
         # x is hidden_states from previous stage
+        if getattr(self, "_pp_requires_input_ids_on_all_stages", False):
+            if pipeline_input_ids is None:
+                if in_scheduled_forward:
+                    raise PPByteContractError(
+                        "PP stage requires original input_ids for layer-local routing, but the microbatch metadata omitted them"
+                    )
+                pipeline_input_ids = torch.zeros(x.shape[:2], dtype=torch.long, device=x.device)
+            extra_kwargs["input_ids"] = pipeline_input_ids.to(x.device)
         outputs = self._pp_original_forward(
             inputs_embeds=x,
             position_ids=position_ids,
@@ -420,6 +471,18 @@ def _pp_forward(self, x):
         # declared: a bf16-declared model computing in fp32 is caught here at
         # its first scheduled forward (resolved reality, not metadata).
         assert_pp_wire_dtype(hidden_states, where="emitted stage hidden state")
+        if not self._pp_is_last:
+            validate_pp_wire_boundary_state(
+                hidden_states,
+                getattr(self, "_pp_pipeline_boundary_state", None),
+                where="emitted inter-stage hidden state",
+            )
+    elif in_scheduled_forward and not self._pp_is_last:
+        validate_pp_wire_boundary_state(
+            hidden_states,
+            getattr(self, "_pp_pipeline_boundary_state", None),
+            where="emitted inter-stage hidden state",
+        )
 
     if self._pp_is_last:
         # When the loss fn applies lm_head (fused quack_linear CE), return HIDDEN
@@ -491,7 +554,6 @@ def pipeline_module_split(
     module_names_per_stage: List[List[str]],
     always_keep_fqns: Optional[List[str]] = None,
     stage_style: str = "single",
-    expects_bf16_mixed_precision: bool = False,
 ) -> tuple:
     """
     Split a model into pipeline stages based on specified module FQN names.
@@ -562,6 +624,12 @@ def pipeline_module_split(
         model._pp_is_last = stage_idx == num_stages - 1
         model._pp_stage_idx = stage_idx
         model._pp_original_forward = model.forward
+        decoder = getattr(model, "model", model)
+        decoder_layers = getattr(decoder, "layers", None)
+        owns_decoder_layers = decoder_layers is None or any(layer is not None for layer in decoder_layers)
+        model._pp_requires_index_share_mode = bool(
+            owns_decoder_layers and callable(getattr(model, "release_index_share_context", None))
+        )
         model.forward = types.MethodType(_pp_forward, model)
 
         stage = PipelineStage(
@@ -575,19 +643,15 @@ def pipeline_module_split(
         stages.append(stage)
         model_parts.append(model)
 
-    # Exact value programs additionally require the fail-closed byte-boundary
-    # contract (no-op for generic models): certified family, cuts only at
-    # decoder-layer rounding boundaries, preserved global layer identity, and
-    # metadata fail-closed marking.
+    # Validate the actual split structure. Exact programs additionally receive
+    # fail-closed metadata and runtime wire checks; family names never admit a
+    # topology.
     engage_pp_byte_contract(
         whole_model,
         module_names_per_stage=module_names_per_stage,
         stage_ids=stage_ids,
         model_parts=model_parts,
-        # Uniform-fp32 masters are admitted only when the caller genuinely
-        # intends bf16 mixed-precision compute (production full-weight path);
-        # the declaration is validated against the actual parameter reality.
-        expects_bf16_mixed_precision=expects_bf16_mixed_precision,
+        parallel_state=get_parallel_state(),
     )
 
     return stages, model_parts

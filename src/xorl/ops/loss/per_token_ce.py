@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Optional
 
 import torch
@@ -17,6 +18,8 @@ from xorl.ops.loss.vocab_parallel_cross_entropy import (
 
 
 _MODULE_LM_HEAD_MIN_CHUNK_ROWS = 128
+
+LogprobTemperature = float | torch.Tensor
 
 
 def _module_lm_head_ce(
@@ -46,11 +49,44 @@ def _module_lm_head_ce(
     return torch.cat(ce_chunks, dim=0)
 
 
-def _normalize_logprob_temperature(logprob_temperature: float) -> float:
-    logprob_temperature = float(logprob_temperature)
-    if logprob_temperature <= 0.0:
-        raise ValueError(f"logprob_temperature must be > 0, got {logprob_temperature}")
-    return logprob_temperature
+def normalize_logprob_temperature(
+    logprob_temperature: LogprobTemperature,
+    *,
+    rows: int,
+    device: torch.device,
+) -> LogprobTemperature:
+    """Validate the scalar or exact per-row FP32 sampling temperature.
+
+    Exact heads consume a contiguous ``[rows]`` FP32 tensor in the same
+    logical row order as hidden states and labels.  Ordinary loss modes keep
+    their existing scalar-only contract.
+    """
+
+    if isinstance(logprob_temperature, torch.Tensor):
+        if logprob_temperature.dtype is not torch.float32:
+            raise TypeError(f"per-row logprob_temperature must be FP32, got {logprob_temperature.dtype}")
+        if logprob_temperature.device != device:
+            raise ValueError(
+                f"per-row logprob_temperature must share the loss device, got {logprob_temperature.device} and {device}"
+            )
+        if tuple(logprob_temperature.shape) != (rows,):
+            raise ValueError(
+                f"per-row logprob_temperature must have shape ({rows},), got {tuple(logprob_temperature.shape)}"
+            )
+        if not logprob_temperature.is_contiguous():
+            raise ValueError("per-row logprob_temperature must be contiguous")
+        if logprob_temperature.requires_grad:
+            raise ValueError("per-row logprob_temperature is sampling metadata and cannot require gradients")
+        torch._assert_async(
+            (torch.isfinite(logprob_temperature) & (logprob_temperature > 0)).all(),
+            "per-row logprob_temperature must contain finite values > 0",
+        )
+        return logprob_temperature
+
+    value = float(logprob_temperature)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"logprob_temperature must be finite and > 0, got {value}")
+    return value
 
 
 def _scale_hidden_for_temperature(hidden_states_flat: torch.Tensor, logprob_temperature: float) -> torch.Tensor:
@@ -70,7 +106,7 @@ def compute_per_token_ce(
     use_compile: bool = False,
     lm_head_fp32: bool = False,
     lm_head: Optional[torch.nn.Module] = None,
-    logprob_temperature: float = 1.0,
+    logprob_temperature: LogprobTemperature = 1.0,
 ) -> torch.Tensor:
     """
     Compute per-token cross-entropy loss based on the specified mode.
@@ -98,12 +134,17 @@ def compute_per_token_ce(
         logprob_temperature: Temperature applied before the selected-token
             logprob/CE calculation. ``1.0`` preserves raw model logprobs; values
             such as a rollout temperature of ``0.7`` compute behavior-policy
-            logprobs matching ``log_softmax(logits / temperature)``.
+            logprobs matching ``log_softmax(logits / temperature)``. Exact heads
+            also accept a contiguous per-row FP32 tensor.
 
     Returns:
         per_token_ce: Per-token cross-entropy loss, shape (BT,)
     """
-    logprob_temperature = _normalize_logprob_temperature(logprob_temperature)
+    logprob_temperature = normalize_logprob_temperature(
+        logprob_temperature,
+        rows=hidden_states_flat.shape[0],
+        device=hidden_states_flat.device,
+    )
 
     # The complete GLM-5.2 active-LoRA lane owns the selected-logprob value and
     # its hybrid VJP. Route before the generic lm_head_fp32/module precedence:
@@ -152,6 +193,8 @@ def compute_per_token_ce(
     # via chunked cuBLAS matmul + a fused CuTeDSL cross-entropy reduction
     # (chunk-sized logits, scalar TP reductions); it serves TP and non-TP cases.
     if ce_mode == "fused_quack":
+        if isinstance(logprob_temperature, torch.Tensor):
+            raise NotImplementedError("per-row logprob_temperature is supported only by exact LM-head modes")
         local_weight = weight.to_local() if hasattr(weight, "to_local") else weight
         hidden_for_ce = hidden_states_flat
         if lm_head_fp32:
@@ -167,8 +210,8 @@ def compute_per_token_ce(
         )
 
     # ``bi_fused`` is the K3 lm-head contract (vendored identically in SGLang).
-    # Hidden states stay bf16 and temperature scales the logits IN-KERNEL —
-    # matching serving's temp-scaled input logprobs bitwise, unlike the
+    # Hidden states stay bf16. Per-row temperature materializes the same FP32
+    # transformed logits that serving samples and scores, unlike the
     # scale-hidden-pre-GEMM convention used by the other modes.
     if ce_mode == "bi_fused":
         from xorl.ops.loss.bi_fused_lm_head import bi_fused_per_token_ce  # noqa: PLC0415
@@ -191,6 +234,8 @@ def compute_per_token_ce(
         )
 
     if tp_group is not None:
+        if isinstance(logprob_temperature, torch.Tensor):
+            raise NotImplementedError("per-row logprob_temperature is supported only by exact LM-head modes")
         if use_lm_head_module:
             if logprob_temperature != 1.0:
                 raise NotImplementedError("logprob_temperature with tensor-parallel lm_head modules is not supported")
@@ -220,6 +265,8 @@ def compute_per_token_ce(
         )
 
     if use_lm_head_module:
+        if isinstance(logprob_temperature, torch.Tensor):
+            raise NotImplementedError("per-row logprob_temperature is supported only by exact LM-head modes")
         return _module_lm_head_ce(
             hidden_states_flat,
             labels_flat,
@@ -229,6 +276,8 @@ def compute_per_token_ce(
             logprob_temperature=logprob_temperature,
         )
 
+    if isinstance(logprob_temperature, torch.Tensor):
+        raise NotImplementedError("per-row logprob_temperature is supported only by exact LM-head modes")
     hidden_for_ce = hidden_states_flat.float() if lm_head_fp32 else hidden_states_flat
     hidden_for_ce = _scale_hidden_for_temperature(hidden_for_ce, logprob_temperature)
     if ce_mode == "compiled":

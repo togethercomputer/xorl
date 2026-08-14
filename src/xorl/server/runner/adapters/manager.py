@@ -19,6 +19,7 @@ import logging
 import math
 import os
 import time
+from collections.abc import Iterator, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -115,6 +116,96 @@ OPTIMIZER_SHARD_MANIFEST_FILENAME = "optimizer_shards.json"
 _LEGACY_OPTIMIZER_FILENAME = "optimizer.pt"
 _OPTIMIZER_STATE_METADATA_KEY = "xorl_optimizer_state_v1"
 _OPTIMIZER_STATE_MAX_DEPTH = 64
+
+
+class LocalModelPartsView:
+    """Present disjoint local PP chunks through their original global FQNs.
+
+    Registering the chunks in an ``nn.ModuleList`` would prefix every key with
+    a local ordinal, making checkpoints depend on virtual-stage placement.
+    This view instead merges the pruned chunks' existing FQNs.  Decoder and
+    output parameters are disjoint by construction; replicated helper modules
+    may repeat and are yielded once.
+    """
+
+    def __init__(self, model_parts: Sequence[nn.Module]) -> None:
+        parts = tuple(model_parts)
+        if not parts:
+            raise ValueError("LocalModelPartsView requires at least one model part")
+        if any(not isinstance(part, nn.Module) for part in parts):
+            raise TypeError("Every local model part must be an nn.Module")
+        self.model_parts = parts
+        self.config = getattr(parts[0], "config", None)
+
+        spec_info: dict[str, Any] = {}
+        for part in parts:
+            for name, value in (getattr(part, "_fqn2spec_info", None) or {}).items():
+                spec_info.setdefault(name, value)
+        self._fqn2spec_info = spec_info or None
+
+    @staticmethod
+    def _prefixed(prefix: str, name: str) -> str:
+        return f"{prefix}.{name}" if prefix and name else prefix or name
+
+    def named_parameters(
+        self,
+        prefix: str = "",
+        recurse: bool = True,
+        remove_duplicate: bool = True,
+    ) -> Iterator[tuple[str, nn.Parameter]]:
+        seen_names: dict[str, nn.Parameter] = {}
+        seen_parameters: set[int] = set()
+        for part in self.model_parts:
+            for name, parameter in part.named_parameters(recurse=recurse, remove_duplicate=remove_duplicate):
+                previous = seen_names.get(name)
+                if previous is not None:
+                    if previous is not parameter and ("lora_A" in name or "lora_B" in name):
+                        raise RuntimeError(f"Local PP model parts overlap on trainable adapter parameter {name!r}")
+                    continue
+                if remove_duplicate and id(parameter) in seen_parameters:
+                    continue
+                seen_names[name] = parameter
+                seen_parameters.add(id(parameter))
+                yield self._prefixed(prefix, name), parameter
+
+    def parameters(self, recurse: bool = True) -> Iterator[nn.Parameter]:
+        for _name, parameter in self.named_parameters(recurse=recurse):
+            yield parameter
+
+    def named_modules(
+        self,
+        memo: set[Any] | None = None,
+        prefix: str = "",
+        remove_duplicate: bool = True,
+    ) -> Iterator[tuple[str, Any]]:
+        memo = set() if memo is None else memo
+        if not remove_duplicate or self not in memo:
+            memo.add(self)
+            yield prefix, self
+        seen_names: set[str] = set()
+        for part in self.model_parts:
+            for name, module in part.named_modules(remove_duplicate=remove_duplicate):
+                if not name or name in seen_names:
+                    continue
+                if remove_duplicate and module in memo:
+                    continue
+                seen_names.add(name)
+                memo.add(module)
+                yield self._prefixed(prefix, name), module
+
+    def modules(self) -> Iterator[Any]:
+        for _name, module in self.named_modules():
+            yield module
+
+    def children(self) -> Iterator[nn.Module]:
+        yield from self.model_parts
+
+    def get_parallel_plan(self):
+        for part in self.model_parts:
+            getter = getattr(part, "get_parallel_plan", None)
+            if callable(getter):
+                return getter()
+        raise AttributeError("Local model parts do not expose get_parallel_plan")
 
 
 def _parameter_layout_tensor(param: Any) -> Any:
@@ -641,7 +732,7 @@ class LoRAAdapterManager:
 
     def __init__(
         self,
-        model: nn.Module,
+        model: nn.Module | Sequence[nn.Module],
         device: torch.device,
         max_adapters: int = 10,
         checkpoint_dir: Optional[str] = None,
@@ -661,7 +752,7 @@ class LoRAAdapterManager:
         Initialize the adapter manager.
 
         Args:
-            model: The model with LoRA layers injected
+            model: One model or all disjoint local PP model parts with LoRA layers injected
             device: Device to create adapter parameters on
             max_adapters: Maximum number of adapters to keep in memory (LRU eviction)
             checkpoint_dir: Directory for saving adapter checkpoints (default: outputs/adapters)
@@ -677,7 +768,17 @@ class LoRAAdapterManager:
             optimizer_fused: Whether to request fused optimizer kernels
             gradient_ownership_bucket_bytes: Maximum residual-transport bucket bytes
         """
-        self.model = model
+        if isinstance(model, nn.Module):
+            self.model_parts = (model,)
+        else:
+            self.model_parts = tuple(model)
+            if not self.model_parts:
+                raise ValueError("LoRAAdapterManager requires at least one local model part")
+            if any(not isinstance(part, nn.Module) for part in self.model_parts):
+                raise TypeError("Every LoRAAdapterManager model part must be an nn.Module")
+        # Preserve the exact PP1/one-part object identity. Virtual PP receives
+        # an FQN-preserving view over every local chunk.
+        self.model = self.model_parts[0] if len(self.model_parts) == 1 else LocalModelPartsView(self.model_parts)
         self.device = device
         self.max_adapters = max_adapters
         self.checkpoint_dir = checkpoint_dir or "outputs/adapters"
@@ -744,17 +845,22 @@ class LoRAAdapterManager:
         self._pipeline_parallel_size = int(
             self.lora_config.get("pipeline_parallel_size", self.lora_config.get("pp_size", 1))
         )
+        self._adapter_process_group = None
         try:
             from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
 
-            self._pipeline_parallel_size = max(self._pipeline_parallel_size, int(get_parallel_state().pp_size))
+            parallel_state = get_parallel_state()
         except Exception:
-            pass
-        if self._pipeline_parallel_size > 1 and self._lora_param_names:
-            raise RuntimeError(
-                "Multi-adapter LoRA state requires a single pipeline stage; "
-                "pipeline parallelism has no known optimizer ownership group."
-            )
+            parallel_state = None
+        if parallel_state is not None:
+            self._pipeline_parallel_size = max(self._pipeline_parallel_size, int(parallel_state.pp_size))
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            if self._pipeline_parallel_size > 1:
+                if parallel_state is None or parallel_state.loss_group is None:
+                    raise RuntimeError("Pipeline adapter ownership requires the live stage-local loss group")
+                self._adapter_process_group = parallel_state.loss_group
+            else:
+                self._adapter_process_group = torch.distributed.group.WORLD
 
         logger.info(
             f"LoRAAdapterManager initialized with {len(self._lora_param_names)} LoRA parameters, "
@@ -933,7 +1039,7 @@ class LoRAAdapterManager:
             self.model,
             self._lora_param_metadata,
             active_rank=session_rank,
-            pipeline_parallel_size=self._pipeline_parallel_size,
+            process_group=self._adapter_process_group,
             local_group_memberships=local_group_memberships,
         )
         self._layout_cache[session_rank] = layouts, fingerprint, group_memberships
@@ -958,7 +1064,9 @@ class LoRAAdapterManager:
 
         if not torch.distributed.is_available() or not torch.distributed.is_initialized():
             return
-        group = torch.distributed.group.WORLD
+        group = self._adapter_process_group
+        if group is None:
+            return
         if torch.distributed.get_world_size(group=group) <= 1:
             return
         fingerprint = torch.tensor(
@@ -1040,9 +1148,7 @@ class LoRAAdapterManager:
         expected_world = 8 if exact_dsv4 else 16
         model_label = "DSV4-Flash" if exact_dsv4 else "GLM-5.2"
         if group is None or torch.distributed.get_world_size(group) != expected_world:
-            raise RuntimeError(
-                f"Exact {model_label} adapter coherence requires the WORLD{expected_world} lm-head TP group"
-            )
+            raise RuntimeError(f"Exact {model_label} adapter coherence requires an lm-head TP{expected_world} group")
 
         def _assert_equal(label: str, value: torch.Tensor) -> None:
             # AdamW stores ``step`` as a scalar tensor.  Flatten before the
@@ -2688,14 +2794,42 @@ class LoRAAdapterManager:
             raise KeyError(f"No adapter layout for {fqn!r}") from None
 
     def materialize_logical_state_dict(self, model_id: str, *, destination_rank: int = 0) -> Dict[str, torch.Tensor]:
-        """Collectively reconstruct full active logical weights for cold paths."""
+        """Collectively reconstruct every PP stage's active logical weights."""
 
         self.prepare_forward(model_id)
         from xorl.lora.utils import get_lora_state_dict  # noqa: PLC0415
 
-        state_dict = get_lora_state_dict(self.model)
-        rank, _world = _optimizer_shard_rank_world()
-        return state_dict if rank == destination_rank else {}
+        local_stage_state = get_lora_state_dict(self.model)
+        rank, world = _optimizer_shard_rank_world()
+        if world == 1 or self._pipeline_parallel_size <= 1:
+            return local_stage_state if rank == destination_rank else {}
+
+        stage_group = self._adapter_process_group
+        if stage_group is None:
+            raise RuntimeError("Pipeline adapter publication requires the live stage-local owner group")
+        stage_ranks = tuple(int(member) for member in torch.distributed.get_process_group_ranks(stage_group))
+        if not stage_ranks or rank not in stage_ranks:
+            raise RuntimeError("Current rank is absent from its pipeline-stage adapter owner group")
+        stage_payload = local_stage_state if rank == stage_ranks[0] else None
+        gathered = [None] * world if rank == destination_rank else None
+        torch.distributed.gather_object(
+            stage_payload,
+            object_gather_list=gathered,
+            dst=destination_rank,
+        )
+        if rank != destination_rank:
+            return {}
+
+        merged: Dict[str, torch.Tensor] = {}
+        assert gathered is not None
+        for payload in gathered:
+            if payload is None:
+                continue
+            for name, tensor in payload.items():
+                if name in merged:
+                    raise RuntimeError(f"Pipeline adapter publication produced duplicate parameter {name!r}")
+                merged[name] = tensor
+        return merged
 
     def load_logical_state_dict(self, model_id: str, state_dict: Dict[str, torch.Tensor]) -> None:
         """Pack full active logical tensors into this rank's local adapter slots."""
@@ -2718,7 +2852,7 @@ class LoRAAdapterManager:
         converted = convert_peft_lora_state_dict(state_dict, expected_shapes=expected_shapes)
         converted_by_name = {canonical_parameter_name(name): tensor for name, tensor in converted.items()}
         missing = sorted(set(expected_names) - set(converted_by_name))
-        unexpected = sorted(set(converted_by_name) - set(expected_names))
+        unexpected = [] if self._pipeline_parallel_size > 1 else sorted(set(converted_by_name) - set(expected_names))
         if missing or unexpected:
             raise ValueError(
                 "Logical adapter parameter set does not match the live adapter structure. "

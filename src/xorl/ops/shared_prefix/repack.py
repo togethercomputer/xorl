@@ -38,9 +38,20 @@ from xorl.utils.seqlen_pos_transform_utils import prepare_fa_kwargs_from_positio
 IGNORE_INDEX = -100
 
 # Sequence-aligned fields repacked alongside input_ids (1-D, length T).
-_LOSS_FIELDS = ("target_tokens", "labels", "advantages", "logprobs", "rollout_logprobs")
+_LOSS_FIELDS = (
+    "target_tokens",
+    "labels",
+    "advantages",
+    "logprobs",
+    "rollout_logprobs",
+    "logprob_temperatures",
+)
 # Repacked fill values for the shared-prefix positions (never trained).
-_FILL = {"target_tokens": IGNORE_INDEX, "labels": IGNORE_INDEX}
+_FILL = {
+    "target_tokens": IGNORE_INDEX,
+    "labels": IGNORE_INDEX,
+    "logprob_temperatures": 1.0,
+}
 
 
 @dataclass

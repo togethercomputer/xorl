@@ -22,6 +22,7 @@ _2D_PAD_VALUES = {
     "logprobs": 0.0,
     "advantages": 0.0,
     "rollout_logprobs": 0.0,
+    "logprob_temperatures": 1.0,
 }
 
 # Pad values for known 3D sequence tensor keys: (1, seq_len, hidden_dim)

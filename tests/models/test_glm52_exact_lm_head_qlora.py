@@ -18,8 +18,10 @@ from xorl.models.transformers.glm5.exact_lm_head_qlora import (
     _Glm52ExactTP16LmHeadFunction,
     _local_qlora_surrogate_vjp,
     _rank_order_vocab_from_stacked,
+    _selected_logprob_reference_grad,
     glm52_lm_head_shard,
 )
+from xorl.ops.bi_families_v2 import exact_temperature_scale_fp32_logits
 
 
 def _component(tp_rank: int = 0) -> Glm52ExactTP16LmHeadSelectedLogprob:
@@ -243,14 +245,26 @@ def test_custom_boundary_is_grad_enabled_and_saves_effective_factor_bytes() -> N
 
     class FakeComponent:
         @staticmethod
-        def _exact_forward_value(hidden, weight, effective_A, effective_B, token_ids):
+        def _exact_forward_value(hidden, weight, effective_A, effective_B, token_ids, temperature):
             captures["A"] = effective_A.clone()
             captures["B"] = effective_B.clone()
+            captures["temperature"] = temperature.clone()
             return hidden.float().sum(dim=-1) + weight.float().sum() * 0.0 + token_ids.float() * 0.0
 
         @staticmethod
-        def _surrogate_vjp(hidden, weight, effective_A, effective_B, token_ids, grad_logprob, *, needs_input_grad):
+        def _surrogate_vjp(
+            hidden,
+            weight,
+            effective_A,
+            effective_B,
+            token_ids,
+            grad_logprob,
+            temperature,
+            *,
+            needs_input_grad,
+        ):
             del weight, effective_A, effective_B, token_ids, needs_input_grad
+            captures["backward_temperature"] = temperature.clone()
             return grad_logprob.unsqueeze(-1).expand_as(hidden).float(), torch.ones(1, 3), torch.ones(5, 1)
 
     hidden = torch.arange(6, dtype=torch.float32).reshape(2, 3).to(torch.bfloat16).requires_grad_(True)
@@ -258,16 +272,48 @@ def test_custom_boundary_is_grad_enabled_and_saves_effective_factor_bytes() -> N
     lora_A = torch.tensor([[0.1001, -0.2002, 0.3003]], requires_grad=True)
     lora_B = torch.tensor([[0.1101], [-0.2202], [0.3303], [-0.4404], [0.5505]], requires_grad=True)
     token_ids = torch.tensor([0, 4], dtype=torch.int64)
+    temperature = torch.tensor([0.7, 1.3], dtype=torch.float32)
 
-    logprob = _Glm52ExactTP16LmHeadFunction.apply(hidden, weight, lora_A, lora_B, token_ids, FakeComponent())
+    logprob = _Glm52ExactTP16LmHeadFunction.apply(
+        hidden,
+        weight,
+        lora_A,
+        lora_B,
+        token_ids,
+        temperature,
+        FakeComponent(),
+    )
     assert logprob.requires_grad
     assert torch.equal(captures["A"], lora_A.detach().to(torch.bfloat16))
     assert torch.equal(captures["B"], lora_B.detach().to(torch.bfloat16))
+    assert torch.equal(captures["temperature"], temperature)
 
     logprob.sum().backward()
     assert torch.equal(hidden.grad, torch.ones_like(hidden))
     assert torch.equal(lora_A.grad, torch.ones_like(lora_A))
     assert torch.equal(lora_B.grad, torch.ones_like(lora_B))
+    assert torch.equal(captures["backward_temperature"], temperature)
+
+
+def test_temperature_reference_gradient_scales_each_row_before_softmax() -> None:
+    logits = torch.tensor([[1.25, -0.5, 0.75], [-1.0, 2.0, 0.25]], dtype=torch.float32)
+    token_ids = torch.tensor([2, 1], dtype=torch.int64)
+    grad_logprob = torch.tensor([0.5, -0.75], dtype=torch.float32)
+    temperature = torch.tensor([0.7, 1.3], dtype=torch.float32)
+
+    actual = _selected_logprob_reference_grad(logits, token_ids, grad_logprob, temperature)
+
+    reference_logits = logits.detach().requires_grad_(True)
+    selected = (
+        F.log_softmax(
+            reference_logits * (1.0 / temperature).unsqueeze(1),
+            dim=-1,
+        )
+        .gather(1, token_ids.unsqueeze(1))
+        .squeeze(1)
+    )
+    (expected,) = torch.autograd.grad(selected, reference_logits, grad_outputs=grad_logprob)
+    assert torch.equal(actual, expected)
 
 
 def test_tp_group_validation_rejects_size_order_rank_and_backend(monkeypatch) -> None:
@@ -417,9 +463,23 @@ def test_official_local_shard_literal_v2_bytes_tail_and_surrogate_gradients() ->
     assert torch.equal(gathered.view(torch.uint8), expected_gathered.view(torch.uint8))
 
     token_ids = torch.tensor([0, GLM52_LM_HEAD_VOCAB_SIZE - 1], dtype=torch.int64, device=device)
-    actual_logprob = component._selected_logprob_from_gathered(gathered, token_ids)
-    expected_logprob, _, _ = head_v2_selected_logprob_from_logits(gathered, token_ids, temperature=None)
-    assert torch.equal(actual_logprob.view(torch.uint8), expected_logprob.view(torch.uint8))
+    for temperature in (
+        None,
+        torch.ones(2, dtype=torch.float32, device=device),
+        torch.tensor([0.7, 1.3], dtype=torch.float32, device=device),
+    ):
+        actual_logprob = component._selected_logprob_from_gathered(
+            gathered,
+            token_ids,
+            temperature,
+        )
+        score_logits = gathered if temperature is None else exact_temperature_scale_fp32_logits(gathered, temperature)
+        expected_logprob, _, _ = head_v2_selected_logprob_from_logits(
+            score_logits,
+            token_ids,
+            temperature=None,
+        )
+        assert torch.equal(actual_logprob.view(torch.uint8), expected_logprob.view(torch.uint8))
 
     grad_local_logits = (
         torch.arange(rows * GLM52_LM_HEAD_LOCAL_VOCAB_SIZE, dtype=torch.float32, device=device)

@@ -19,7 +19,7 @@ from xorl.models.layers.attention import AttentionKwargs, update_causal_mask
 from xorl.models.layers.attention.backend import ATTENTION_FUNCTIONS
 from xorl.models.layers.attention.backend.eager import eager_attention_forward
 from xorl.models.layers.moe import MoEBlock
-from xorl.models.layers.moe.ep_native_combine import validate_qwen35_native_ep_combine_size
+from xorl.models.layers.moe.ep_native_combine import validate_native_ep_combine_size
 from xorl.models.layers.normalization import (
     compiled_zero_centered_rms_norm,
     eager_zero_centered_rms_norm,
@@ -457,7 +457,7 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
                 "Qwen3.5-MoE exact canonical combine requires the fused shared-expert gate_up_proj"
             )
         ep_size, ep_rank, ep_group = ps.ep_size, ps.ep_rank, ps.ep_group
-        validate_qwen35_native_ep_combine_size(ep_size)
+        validate_native_ep_combine_size(ep_size)
         inter = self.shared_expert.intermediate_size
         if inter % ep_size != 0:
             raise ValueError(

@@ -16,6 +16,7 @@ from xorl.distributed.fsdp2 import BF16StochasticAllToAllReduceScatter, clip_gra
 from xorl.distributed.gradient_reduction import GradientReductionDomain, validate_gradient_reduction_domain
 from xorl.distributed.parallel_state import get_parallel_state
 from xorl.distributed.pipeline_parallel import (
+    generate_llm_fqn_from_layer_ranges,
     generate_llm_fqn_per_model_part,
     pipeline_module_split,
     schedule_splits_backward,
@@ -565,9 +566,7 @@ def parallelize_model_fsdp2(
         raise RuntimeError("The exact GLM-5.2 lm head requires lm_head_tensor_parallel_size=16")
     if exact_dsv4_lm_head and getattr(parallel_state, "lm_head_tp_size", 1) != 8:
         raise RuntimeError("The exact DSV4-Flash lm head requires lm_head_tensor_parallel_size=8")
-    if fsdp_sharded_lm_head_loss or exact_dsv4_lm_head:
-        if pp_enabled:
-            raise NotImplementedError("fsdp_sharded_lm_head_loss is not supported with pipeline parallelism.")
+    if lm_head_mod is not None and (fsdp_sharded_lm_head_loss or exact_dsv4_lm_head):
         if parallel_state.tp_enabled:
             raise NotImplementedError("fsdp_sharded_lm_head_loss is not supported with tensor parallelism.")
         if not parallel_state.cp_enabled and not lm_head_tp:
@@ -598,8 +597,6 @@ def parallelize_model_fsdp2(
                 "lm_head_tensor_parallel_size>1 currently requires cp_fsdp_mode='all' so the external SP "
                 "gradient sync does not conflict with the lm_head replica reduction."
             )
-        if lm_head_mod is None:
-            raise ValueError("fsdp_sharded_lm_head_loss requires model.lm_head.")
         if norm_mod is not None:
             fully_shard(norm_mod, **fsdp_kwargs)
         setattr(lm_head_mod, "_xorl_fsdp_sharded_lm_head_loss", True)
@@ -947,17 +944,50 @@ def build_parallelize_model(
             )
 
         # 2. Generate FQN assignment per stage
-        module_names_per_stage = generate_llm_fqn_per_model_part(
-            num_stages=num_stages,
-            num_layers=pp_config["num_layers"],
-            input_weight=pp_input_weight,
-            output_weight=pp_output_weight,
-            input_fqns=pp_config.get("input_fqns"),
-            layer_prefix=pp_config.get("layer_prefix", "layers"),
-            output_fqns=pp_config.get("output_fqns"),
-            num_layers_in_first_stage=pp_num_layers_in_first_stage,
-            num_layers_in_last_stage=pp_num_layers_in_last_stage,
-        )
+        installed_module_plan = pp_config.get("module_names_per_stage")
+        pipeline_ranges = pp_config.get("pipeline_layer_ranges")
+        if installed_module_plan is not None:
+            if len(installed_module_plan) != num_stages:
+                raise ValueError(
+                    f"The model-installed pipeline module plan contains {len(installed_module_plan)} stages, "
+                    f"but the schedule requested {num_stages}"
+                )
+            module_names_per_stage = [list(names) for names in installed_module_plan]
+        elif pipeline_ranges is not None:
+            if len(pipeline_ranges) != num_stages:
+                raise ValueError(
+                    f"The model-derived pipeline plan contains {len(pipeline_ranges)} stages, "
+                    f"but the schedule requested {num_stages}"
+                )
+            expected_first = int(pipeline_ranges[0][1]) - int(pipeline_ranges[0][0])
+            expected_last = int(pipeline_ranges[-1][1]) - int(pipeline_ranges[-1][0])
+            if pp_num_layers_in_first_stage not in (None, expected_first):
+                raise ValueError(
+                    f"pipeline_parallel_num_layers_in_first_stage must be {expected_first} for the model plan"
+                )
+            if pp_num_layers_in_last_stage not in (None, expected_last):
+                raise ValueError(
+                    f"pipeline_parallel_num_layers_in_last_stage must be {expected_last} for the model plan"
+                )
+            module_names_per_stage = generate_llm_fqn_from_layer_ranges(
+                pipeline_ranges,
+                num_layers=pp_config["num_layers"],
+                input_fqns=pp_config.get("input_fqns"),
+                layer_prefix=pp_config.get("layer_prefix", "layers"),
+                output_fqns=pp_config.get("output_fqns"),
+            )
+        else:
+            module_names_per_stage = generate_llm_fqn_per_model_part(
+                num_stages=num_stages,
+                num_layers=pp_config["num_layers"],
+                input_weight=pp_input_weight,
+                output_weight=pp_output_weight,
+                input_fqns=pp_config.get("input_fqns"),
+                layer_prefix=pp_config.get("layer_prefix", "layers"),
+                output_fqns=pp_config.get("output_fqns"),
+                num_layers_in_first_stage=pp_num_layers_in_first_stage,
+                num_layers_in_last_stage=pp_num_layers_in_last_stage,
+            )
 
         # 3. Split model into pipeline stages
         stages, model_parts = pipeline_module_split(
@@ -967,11 +997,6 @@ def build_parallelize_model(
             module_names_per_stage=module_names_per_stage,
             always_keep_fqns=pp_config.get("always_keep_fqns"),
             stage_style=stage_style,
-            # The byte contract validates the ACTUAL parameter reality per
-            # stage; uniform-fp32 masters are admitted only under a genuine
-            # bf16 mixed-precision compute intent (declared here, verified at
-            # the wire by the runtime dtype assertions in _pp_forward).
-            expects_bf16_mixed_precision=bool(enable_mixed_precision),
         )
         logger.info_rank0(f"Model split into {num_stages} PP stages ({pp_virtual_stages} per rank, {stage_style})")
 

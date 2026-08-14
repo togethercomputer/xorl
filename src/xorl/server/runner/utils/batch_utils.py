@@ -367,6 +367,7 @@ def convert_batch_to_tensors(batch: Dict[str, Any], rank: int = 0) -> Dict[str, 
         "advantages",
         "old_logprobs",
         "ref_logprobs",
+        "logprob_temperatures",
         "values",
         "returns",
         "teacher_weights",
@@ -417,8 +418,12 @@ def convert_batch_to_tensors(batch: Dict[str, Any], rank: int = 0) -> Dict[str, 
                         else:
                             max_len = max(len(seq) for seq in value)
                             pad_value = (
-                                -100 if key in ("labels", "target_tokens") else 0
-                            )  # Use -100 for labels/target_tokens (IGNORE_INDEX)
+                                -100
+                                if key in ("labels", "target_tokens")
+                                else 1.0
+                                if key == "logprob_temperatures"
+                                else 0
+                            )
                             padded = []
                             for seq in value:
                                 padded_seq = seq + [pad_value] * (max_len - len(seq))
@@ -585,9 +590,14 @@ def simple_sequence_shard(batch: Dict[str, Any], rank: int = 0) -> Dict[str, Any
             # Use appropriate pad value based on field type
             if key == "target_tokens":
                 pad_val = -100  # IGNORE_INDEX
+            elif key == "logprob_temperatures":
+                pad_val = 1.0
             else:
                 pad_val = 0
-            sharded_batch[key] = pad_and_slice(value, pad_value=pad_val)
+            sharded_value = pad_and_slice(value, pad_value=pad_val)
+            if key == "logprob_temperatures":
+                sharded_value = sharded_value.contiguous()
+            sharded_batch[key] = sharded_value
         else:
             # Non-sequence tensors (e.g., scalar values, metadata)
             sharded_batch[key] = value

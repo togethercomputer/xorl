@@ -4,10 +4,9 @@ Forward scores per-token cross-entropy through
 :func:`xorl.ops.batch_invariant_ops.bi_lm_head_selected_logprob` — the K3
 lm-head contract vendored identically in SGLang, so trainer and serving
 logprobs are bitwise identical from bit-exact hidden states. The bf16 weight
-stays resident (no fp32 lm-head copy) and only chunk-sized logits tiles ever
-materialize. An optional scalar temperature scores ``log softmax(z/T)`` with
-the ``1/T`` divide inside the contract kernel, matching serving's
-temp-scaled input logprobs bitwise.
+stays resident (no fp32 lm-head copy). Per-row temperature materializes the
+same FP32 ``z * (1/T)`` tensor that serving samples and scores; the scalar-one
+call keeps the original non-materialized path.
 
 Backward is the closed-form CE gradient computed against the saved forward
 ``lse`` with chunked cuBLAS recompute (stock-numerics class, like the other
@@ -17,23 +16,73 @@ recompute GEMMs run on the resident bf16 tensors with fp32 accumulation
 materializes.
 """
 
+import math
+
 import torch
 
-from xorl.ops.batch_invariant_ops import BI_LM_HEAD_VOCAB_CHUNK, bi_lm_head_selected_logprob
-from xorl.ops.bi_families_v2 import families_v2_enabled, head_v2_selected_logprob
+from xorl.ops.batch_invariant_ops import (
+    BI_LM_HEAD_VOCAB_CHUNK,
+    bi_lm_head_full_logits,
+    bi_lm_head_selected_logprob,
+    bi_lm_head_selected_logprob_from_logits,
+)
+from xorl.ops.bi_families_v2 import (
+    exact_temperature_scale_fp32_logits,
+    families_v2_enabled,
+    head_v2_full_logits_with_lse,
+    head_v2_selected_logprob,
+    head_v2_selected_logprob_from_logits,
+)
+
+
+_TEMPERATURE_MATERIALIZE_ROW_CHUNK = 32
 
 
 class _BiFusedLmHeadPerTokenCE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, hidden, weight, labels_safe, valid_mask, temp_row, vocab_chunk):
-        if families_v2_enabled():
+        use_v2 = families_v2_enabled()
+        if temp_row is None and use_v2:
             # head v2 (families-v2 migration): same GEMM K-chain, epilogue-stats
             # online LSE; logits never materialize; backward only consumes lse.
             logprob, lse, _ = head_v2_selected_logprob(hidden, weight, labels_safe, temperature=temp_row)
-        else:
+        elif temp_row is None:
             logprob, lse, _ = bi_lm_head_selected_logprob(
                 hidden, weight, labels_safe, temperature=temp_row, vocab_chunk=vocab_chunk
             )
+        else:
+            logprob_chunks = []
+            lse_chunks = []
+            for start in range(0, hidden.shape[0], _TEMPERATURE_MATERIALIZE_ROW_CHUNK):
+                end = min(start + _TEMPERATURE_MATERIALIZE_ROW_CHUNK, hidden.shape[0])
+                hidden_chunk = hidden[start:end]
+                labels_chunk = labels_safe[start:end]
+                temperature_chunk = temp_row[start:end]
+                if use_v2:
+                    logits, _ = head_v2_full_logits_with_lse(hidden_chunk, weight, temperature=None)
+                    transformed_logits = exact_temperature_scale_fp32_logits(logits, temperature_chunk)
+                    logprob_chunk, lse_chunk, _ = head_v2_selected_logprob_from_logits(
+                        transformed_logits,
+                        labels_chunk,
+                        temperature=None,
+                    )
+                else:
+                    logits = bi_lm_head_full_logits(hidden_chunk, weight, vocab_chunk=vocab_chunk)
+                    transformed_logits = exact_temperature_scale_fp32_logits(logits, temperature_chunk)
+                    logprob_chunk, lse_chunk, _ = bi_lm_head_selected_logprob_from_logits(
+                        transformed_logits,
+                        labels_chunk,
+                        temperature=None,
+                        vocab_chunk=vocab_chunk,
+                    )
+                logprob_chunks.append(logprob_chunk)
+                lse_chunks.append(lse_chunk)
+            if logprob_chunks:
+                logprob = torch.cat(logprob_chunks, dim=0)
+                lse = torch.cat(lse_chunks, dim=0)
+            else:
+                logprob = torch.empty((0,), dtype=torch.float32, device=hidden.device)
+                lse = logprob.clone()
         ctx.save_for_backward(hidden, weight, labels_safe, valid_mask, lse, temp_row)
         ctx.vocab_chunk = vocab_chunk
         return torch.where(valid_mask, -logprob, torch.zeros_like(logprob))
@@ -88,26 +137,37 @@ def bi_fused_per_token_ce(
     weight: torch.Tensor,
     labels: torch.Tensor,
     ignore_index: int = -100,
-    temperature: float = 1.0,
+    temperature: float | torch.Tensor = 1.0,
     vocab_chunk: int = BI_LM_HEAD_VOCAB_CHUNK,
 ) -> torch.Tensor:
     """Per-token CE (``-log p(labels)``; 0 at ignored positions) through the
     batch-invariant lm-head contract. Requires CUDA bf16 hidden/weight; the
     fp32-class numerics come from the contract itself, so ``lm_head_fp32`` is
-    implied rather than materialized. ``temperature != 1.0`` scores
-    ``log softmax(z/T)`` via the in-kernel per-row scale (serving passes the
-    same per-row fp32 temperatures, keeping the contract bitwise)."""
+    implied rather than materialized. Per-row temperature scores the same
+    materialized FP32 ``z * (1/T)`` tensor as serving."""
     if not hidden_states.is_cuda:
         raise ValueError("ce_mode='bi_fused' requires CUDA tensors")
     if hidden_states.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
         raise ValueError("ce_mode='bi_fused' requires bf16 hidden states and lm-head weight")
-    if temperature <= 0:
-        raise ValueError("ce_mode='bi_fused' requires temperature > 0")
     valid_mask = labels != ignore_index
     labels_safe = torch.where(valid_mask, labels, torch.zeros_like(labels))
-    temp_row = None
-    if temperature != 1.0:
-        temp_row = torch.full(
-            (hidden_states.shape[0],), float(temperature), dtype=torch.float32, device=hidden_states.device
+    if isinstance(temperature, torch.Tensor):
+        if temperature.dtype is not torch.float32:
+            raise TypeError("ce_mode='bi_fused' requires per-row FP32 temperature")
+        if temperature.device != hidden_states.device or tuple(temperature.shape) != (hidden_states.shape[0],):
+            raise ValueError("ce_mode='bi_fused' requires temperature aligned one-to-one with hidden-state rows")
+        if not temperature.is_contiguous() or temperature.requires_grad:
+            raise ValueError("ce_mode='bi_fused' requires contiguous, non-differentiable temperature metadata")
+        torch._assert_async(
+            (torch.isfinite(temperature) & (temperature > 0)).all(),
+            "ce_mode='bi_fused' requires finite temperature > 0",
         )
+        temp_row = temperature
+    elif temperature == 1.0:
+        temp_row = None
+    else:
+        temperature = float(temperature)
+        if not math.isfinite(temperature) or temperature <= 0:
+            raise ValueError("ce_mode='bi_fused' requires finite temperature > 0")
+        temp_row = torch.full((hidden_states.shape[0],), temperature, dtype=torch.float32, device=hidden_states.device)
     return _BiFusedLmHeadPerTokenCE.apply(hidden_states, weight, labels_safe, valid_mask, temp_row, vocab_chunk)

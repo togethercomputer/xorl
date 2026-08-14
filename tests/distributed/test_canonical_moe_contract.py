@@ -50,13 +50,13 @@ def _explicit_tree(partials: torch.Tensor) -> torch.Tensor:
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize("contributors", [2, 4, 8, 16])
+@pytest.mark.parametrize("contributors", [2, 4, 8, 16, 32])
 def test_reference_is_the_adjacent_bf16_tree(contributors: int):
     assert CANONICAL_MOE_FOLD_VERSION == "canonical_moe_fold_v1"
     rows = contributors + 2
     values = torch.zeros((contributors, rows, 3), dtype=torch.bfloat16)
     adversarial = torch.tensor(
-        [4096.0, -4096.0, 1.0, 1.0, 0.5, -0.5, 2.0, -2.0] * 2,
+        [4096.0, -4096.0, 1.0, 1.0, 0.5, -0.5, 2.0, -2.0] * 4,
         dtype=torch.bfloat16,
     )
     for ordinal in range(contributors):

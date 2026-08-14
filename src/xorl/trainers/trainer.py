@@ -718,6 +718,11 @@ class Trainer:
             lora_rank=args.lora.lora_rank,
             lora_alpha=args.lora.lora_alpha,
             init_device=args.train.init_device,
+            pipeline_parallel_virtual_stages=args.train.pipeline_parallel_virtual_stages,
+            pipeline_parallel_input_weight=args.train.pipeline_parallel_input_weight,
+            pipeline_parallel_output_weight=args.train.pipeline_parallel_output_weight,
+            pipeline_parallel_num_layers_in_first_stage=args.train.pipeline_parallel_num_layers_in_first_stage,
+            pipeline_parallel_num_layers_in_last_stage=args.train.pipeline_parallel_num_layers_in_last_stage,
         )
         self.model_config = self.model.config
         numerical_program = self.model_config._resolved_numerical_program
@@ -1251,15 +1256,28 @@ class Trainer:
         h = cfg.hidden_size
         v = cfg.vocab_size
         dt = torch.bfloat16
+        boundary_state = None
+        for model_part, init_stage in zip(self.model_parts, self.pp_stages):
+            if init_stage.stage_index == stage_index:
+                boundary_state = getattr(model_part, "_pp_pipeline_boundary_state", None)
+                break
+        if boundary_state is None:
+            boundary_shape = (mbs, s, h)
+        else:
+            boundary_shape = (mbs, s, *tuple(boundary_state["shape_suffix"]))
+            dt = boundary_state["dtype"]
         if stage_index == 0:
             input_args = (torch.empty(mbs, s, dtype=example_input_ids.dtype, device="meta"),)
         else:
-            input_args = (torch.empty(mbs, s, h, dtype=dt, device="meta"),)
+            input_args = (torch.empty(*boundary_shape, dtype=dt, device="meta"),)
         # quack_linear PP loss consumes HIDDEN (lm_head fused into the loss fn),
         # so the last stage outputs hidden [mbs,s,h] instead of logits [mbs,s,v]
         # — this is what avoids the 8GB+ last-stage logits OOM at 248k vocab.
-        if stage_index == self.pp_num_stages - 1 and not lm_head_in_loss:
-            output_args = (torch.empty(mbs, s, v, dtype=dt, device="meta"),)
+        if stage_index == self.pp_num_stages - 1:
+            terminal_shape = (mbs, s, h) if lm_head_in_loss else (mbs, s, v)
+            output_args = (torch.empty(*terminal_shape, dtype=torch.bfloat16, device="meta"),)
+        elif boundary_state is not None:
+            output_args = (torch.empty(*boundary_shape, dtype=dt, device="meta"),)
         else:
             output_args = (torch.empty(mbs, s, h, dtype=dt, device="meta"),)
         return input_args, output_args
@@ -1288,11 +1306,23 @@ class Trainer:
         watchdog hang at the first schedule step).
         """
         if seq_len not in self._pp_schedule_cache:
-            # quack_linear: last stage returns hidden; the loss fn applies lm_head.
             ce_mode = self.args.train.ce_mode
-            lm_head_in_loss = ce_mode == "quack_linear"
-            stages = []
             pp_lm_head = None
+            pp_loss_owner = None
+            for model_part, init_stage in zip(self.model_parts, self.pp_stages):
+                if init_stage.stage_index == self.pp_num_stages - 1:
+                    pp_lm_head = getattr(model_part, "lm_head", None)
+                    pp_loss_owner = model_part
+                    break
+            exact_head = bool(
+                pp_lm_head is not None
+                and (
+                    getattr(pp_lm_head, "_glm52_exact_tp16_lm_head", False)
+                    or getattr(pp_lm_head, "_dsv4_exact_tp8_lm_head", False)
+                )
+            )
+            lm_head_in_loss = ce_mode in {"quack_linear", "bi_fused"} or exact_head
+            stages = []
             for model_part, init_stage in zip(self.model_parts, self.pp_stages):
                 stage_index = init_stage.stage_index
                 model_part._pp_lm_head_in_loss = lm_head_in_loss
@@ -1308,13 +1338,17 @@ class Trainer:
                         output_args=output_args,
                     )
                 )
-                if stage_index == self.pp_num_stages - 1:
-                    # Only the last stage computes the loss; pass its lm_head to the loss fn.
-                    pp_lm_head = getattr(model_part, "lm_head", None)
             schedule = build_pipeline_schedule(
                 stages=stages,
                 n_microbatches=self.args.train.gradient_accumulation_steps,
-                loss_fn=make_pp_loss_fn(ce_mode, lm_head=pp_lm_head),
+                loss_fn=make_pp_loss_fn(
+                    ce_mode,
+                    lm_head=pp_lm_head,
+                    tp_group=getattr(self.ps, "lm_head_tp_group", None),
+                    lm_head_fp32=bool(self.args.model.lm_head_fp32),
+                    num_chunks=self.args.train.fsdp_sharded_lm_head_loss_num_chunks,
+                    loss_owner=pp_loss_owner,
+                ),
                 schedule_name=self.args.train.pipeline_parallel_schedule,
             )
             if os.environ.get("XORL_PP_BUBBLE_PROFILE", "0") == "1":
@@ -2152,6 +2186,7 @@ class Trainer:
                 has_first_stage=self.has_first_stage,
                 has_last_stage=self.has_last_stage,
                 pp_group=self.ps.pp_group,
+                logprob_temperature=float(self._causallm_loss_params.get("logprob_temperature", 1.0)),
             )
 
         if profiler is not None:

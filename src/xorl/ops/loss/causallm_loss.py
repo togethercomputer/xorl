@@ -11,7 +11,11 @@ from xorl.ops.loss.compiled_cross_entropy import (
     compiled_cross_entropy_function,
 )
 from xorl.ops.loss.loss_output import LossOutput
-from xorl.ops.loss.per_token_ce import compute_per_token_ce
+from xorl.ops.loss.per_token_ce import (
+    LogprobTemperature,
+    compute_per_token_ce,
+    normalize_logprob_temperature,
+)
 from xorl.ops.loss.reducers import Reducer, TokenPartial
 from xorl.ops.loss.vocab_parallel_cross_entropy import (
     _backward_kernel as _vocab_parallel_ce_backward_kernel,
@@ -448,7 +452,7 @@ def causallm_loss_function(
     loss_reducer: Reducer | None = None,
     z_loss_coef: float = 0.0,
     lm_head: torch.nn.Module | None = None,
-    logprob_temperature: float = 1.0,
+    logprob_temperature: LogprobTemperature = 1.0,
 ) -> "LossOutput":
     """
     Compute causal language modeling loss.
@@ -485,7 +489,8 @@ def causallm_loss_function(
         logprob_temperature: Temperature for selected-token logprobs. ``1.0``
                      returns raw model logprobs; a rollout temperature such as
                      ``0.7`` returns behavior-policy logprobs using
-                     ``log_softmax(logits / temperature)``.
+                     ``log_softmax(logits / temperature)``. Exact LM heads also
+                     accept contiguous FP32 temperatures aligned with labels.
 
     Returns:
         LossOutput with loss, and optionally per_token_logprobs/per_token_loss.
@@ -504,9 +509,21 @@ def causallm_loss_function(
         loss_reducer = TokenPartial(scale=valid_mask.sum().float())
 
     mask_flat = valid_mask.float()
-    logprob_temperature = float(logprob_temperature)
-    if logprob_temperature <= 0.0:
-        raise ValueError(f"logprob_temperature must be > 0, got {logprob_temperature}")
+    if isinstance(logprob_temperature, torch.Tensor):
+        if not logprob_temperature.is_contiguous():
+            raise ValueError("per-row logprob_temperature must be contiguous")
+        if tuple(logprob_temperature.shape) not in (tuple(labels.shape), (labels_flat.shape[0],)):
+            raise ValueError(
+                "per-row logprob_temperature must match labels or flattened labels, got "
+                f"{tuple(logprob_temperature.shape)} for labels {tuple(labels.shape)}"
+            )
+        logprob_temperature = logprob_temperature.reshape(-1)
+    logprob_temperature = normalize_logprob_temperature(
+        logprob_temperature,
+        rows=labels_flat.shape[0],
+        device=hidden_states.device,
+    )
+    has_temperature_transform = isinstance(logprob_temperature, torch.Tensor) or logprob_temperature != 1.0
     exact_lm_head = bool(
         lm_head is not None
         and (getattr(lm_head, "_glm52_exact_tp16_lm_head", False) or getattr(lm_head, "_dsv4_exact_tp8_lm_head", False))
@@ -540,7 +557,7 @@ def causallm_loss_function(
                 per_token_loss=per_token_ce.view(original_shape),
             )
         return LossOutput(loss=loss)
-    if logprob_temperature != 1.0:
+    if has_temperature_transform:
         if z_loss_coef > 0.0:
             raise NotImplementedError("logprob_temperature is not supported with softmax_auxiliary_loss")
         per_token_ce = compute_per_token_ce(

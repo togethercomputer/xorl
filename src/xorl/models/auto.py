@@ -34,11 +34,11 @@ from .transformers.deepseek_v4.exact_contract import (
     is_dsv4_flash_config,
     validate_dsv4_flash_adapter_program,
     validate_dsv4_flash_official_geometry,
-    validate_dsv4_flash_training_topology,
 )
 from .transformers.glm4_moe.configuration_glm4_moe import Glm4MoeConfig
 from .transformers.glm5.configuration_glm5 import Glm5Config
 from .transformers.glm5.exact_lora_contract import glm52_exact_lora_scaling
+from .transformers.glm5.layer_plan import install_glm52_pipeline_module_plan
 from .transformers.glm5.support import validate_glm5_router_settings, validate_glm5_sequence_parallel
 from .transformers.gpt_oss.configuration_gpt_oss import GptOssConfig
 from .transformers.minimax_m3.configuration_minimax_m3 import MiniMaxM3Config
@@ -516,124 +516,6 @@ def _validate_exact_qwen35_moe_program(
         )
 
 
-def _validate_exact_qwen35_topology(config: PretrainedConfig, parallel_state: Any) -> None:
-    if not _is_exact_qwen35(config):
-        return
-    topology = (
-        parallel_state.world_size,
-        parallel_state.dp_size,
-        parallel_state.dp_replicate_size,
-        parallel_state.dp_shard_size,
-        parallel_state.tp_size,
-        parallel_state.pp_size,
-        parallel_state.ep_size,
-        parallel_state.cp_size,
-        parallel_state.ringattn_size,
-        parallel_state.ulysses_size,
-    )
-    admitted = (
-        (
-            (8, 8, 1, 8, 1, 1, 8, 1, 1, 1),
-            (8, 1, 1, 1, 1, 1, 8, 8, 1, 8),
-            (16, 16, 2, 8, 1, 1, 8, 1, 1, 1),
-        )
-        if _is_qwen35_moe(config)
-        else ((1, 1, 1, 1, 1, 1, 1, 1, 1, 1),)
-    )
-    if topology in admitted:
-        return
-    if not _is_qwen35_moe(config) and _admit_qwen35_hybrid_ulysses(config, parallel_state):
-        return
-    raise ValueError(
-        "The Qwen3.5-family exact server-training path is admitted only for "
-        "WORLD/DP/DP-replicate/DP-shard/TP/PP/EP/CP/Ring/Ulysses="
-        f"{admitted}; got {topology}"
-    )
-
-
-# Hybrid (GDN + full-attention) dense Qwen3.5 under Ulysses: degrees covered
-# by the composed-program and FA4 head-bucket byte-contract tests.
-_QWEN35_HYBRID_ULYSSES_DEGREES = (2, 4, 8)
-_GDN_CP_COLLATOR_ATTESTATION_ENV = "XORL_GDN_CP_ALIGN_COLLATOR"
-
-
-def _admit_qwen35_hybrid_ulysses(config: PretrainedConfig, parallel_state: Any) -> bool:
-    """Conditional Ulysses admission for the exact hybrid dense program.
-
-    Returns False when the topology is not the pure-Ulysses hybrid shape (the
-    caller then raises its generic refusal). When the shape matches, every
-    requirement below must hold or this RAISES with an actionable message:
-
-    1. hybrid layer_types (a GDN-free dense config has no qualified U>1
-       program — its contract remains single-rank);
-    2. the Ulysses degree checks (heads divisible by the degree; GQA
-       replication degree divisible by kv-heads) — admission-time versions
-       of the pre-collective raises in UlyssesSyncStrategy;
-    3. the C1/C2 aligned-collator attestation
-       (``XORL_GDN_CP_ALIGN_COLLATOR=1``): admission cannot see the data
-       pipeline, so it demands an explicit attestation that
-       ``gdn_exact_cp_align`` is engaged; the GDN chain receipts and the
-       collator postcondition remain the runtime enforcement (fail-closed on
-       any misaligned shard cut);
-    4. the kernel/toolchain pin (first-class): a seeded pin directory whose
-       toolchain fingerprint matches this runtime, installed as this rank's
-       per-rank Triton cache before any kernel compiles.
-    """
-    import os  # noqa: PLC0415
-
-    u = parallel_state.ulysses_size
-    shape_matches = (
-        u in _QWEN35_HYBRID_ULYSSES_DEGREES
-        and parallel_state.world_size == u
-        and parallel_state.cp_size == u
-        and parallel_state.ringattn_size == 1
-        and parallel_state.dp_size == 1
-        and parallel_state.dp_replicate_size == 1
-        and parallel_state.dp_shard_size == 1
-        and parallel_state.tp_size == 1
-        and parallel_state.pp_size == 1
-        and parallel_state.ep_size == 1
-    )
-    if not shape_matches:
-        return False
-
-    layer_types = getattr(config, "layer_types", None) or []
-    if "linear_attention" not in layer_types:
-        return False  # GDN-free dense: keep the single-rank refusal.
-
-    num_heads = getattr(config, "num_attention_heads", None)
-    num_kv = getattr(config, "num_key_value_heads", None)
-    if not num_heads or num_heads % u != 0:
-        raise ValueError(
-            f"Exact hybrid Qwen3.5 at Ulysses {u}: num_attention_heads ({num_heads}) must be "
-            f"divisible by the Ulysses degree; an uneven head split cannot be scattered "
-            "byte-safely",
-        )
-    if not num_kv or (u > num_kv and u % num_kv != 0):
-        raise ValueError(
-            f"Exact hybrid Qwen3.5 at Ulysses {u}: num_key_value_heads ({num_kv}) must divide "
-            "the Ulysses degree for GQA replication",
-        )
-    if os.environ.get(_GDN_CP_COLLATOR_ATTESTATION_ENV) != "1":
-        raise ValueError(
-            f"Exact hybrid Qwen3.5 at Ulysses {u} requires the C1/C2 aligned collator "
-            f"(TextSequenceShardCollator(gdn_exact_cp_align=True)); set "
-            f"{_GDN_CP_COLLATOR_ATTESTATION_ENV}=1 to attest it. Without 64-aligned shard "
-            "cuts the GDN chain receipts fail closed at the first crossing document.",
-        )
-    from xorl.ops.kernel_config_pin import pin_exact_kernel_configs  # noqa: PLC0415
-
-    pin_clone = pin_exact_kernel_configs()
-    logger.info(
-        "exact hybrid Qwen3.5 Ulysses-%d admission engaged: heads %d/%d kv, collator attested, kernel pin -> %s",
-        u,
-        num_heads,
-        num_kv,
-        pin_clone,
-    )
-    return True
-
-
 @dataclass(frozen=True)
 class ResolvedModelNumericalProgram:
     """Bit-relevant model choices resolved before module construction."""
@@ -946,6 +828,11 @@ def build_foundation_model(
     lora_target_modules: Optional[list[str]] = None,
     init_device: Literal["cpu", "cuda", "npu", "meta"] = "cuda",
     config_kwargs: Optional[Dict[str, Any]] = None,
+    pipeline_parallel_virtual_stages: int = 1,
+    pipeline_parallel_input_weight: int = 1,
+    pipeline_parallel_output_weight: int = 1,
+    pipeline_parallel_num_layers_in_first_stage: Optional[int] = None,
+    pipeline_parallel_num_layers_in_last_stage: Optional[int] = None,
 ) -> nn.Module:
     """
     Builds the foundation model.
@@ -1169,16 +1056,15 @@ def build_foundation_model(
         )
 
     ps = get_parallel_state()
-    _validate_exact_qwen35_topology(config, ps)
-    if dsv4_flash_exact:
-        validate_dsv4_flash_training_topology(ps)
     if isinstance(config, Glm5Config) and config.num_hidden_layers == 78:
-        if ps.pp_size == 1:
-            config._glm52_pipeline_layer_ranges = ((0, 78),)
-        elif ps.pp_size == 2:
-            config._glm52_pipeline_layer_ranges = ((0, 38), (38, 78))
-        else:
-            raise ValueError("GLM-5.2 supports only PP1 or the supported 38/40 PP2 split")
+        install_glm52_pipeline_module_plan(
+            config,
+            num_stages=ps.pp_size * int(pipeline_parallel_virtual_stages),
+            input_weight=pipeline_parallel_input_weight,
+            output_weight=pipeline_parallel_output_weight,
+            num_layers_in_first_stage=pipeline_parallel_num_layers_in_first_stage,
+            num_layers_in_last_stage=pipeline_parallel_num_layers_in_last_stage,
+        )
     if ps.ringattn_size > 1 and has_linear_attention_layers(config):
         logger.warning_once(LINEAR_ATTENTION_RING_UNSUPPORTED_MESSAGE)
         raise ValueError(LINEAR_ATTENTION_RING_UNSUPPORTED_MESSAGE)

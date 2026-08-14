@@ -696,6 +696,88 @@ def head_v2_full_logits_with_lse(
 
 
 @triton.jit
+def _exact_temperature_scale_fp32_kernel(
+    logits_ptr,
+    temperature_ptr,
+    output_ptr,
+    n_cols,
+    logits_row_stride,
+    output_row_stride,
+    BLOCK_N: tl.constexpr,
+):
+    row = tl.program_id(0)
+    cols = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    mask = cols < n_cols
+    values = tl.load(
+        logits_ptr + row * logits_row_stride + cols,
+        mask=mask,
+        other=0.0,
+    )
+    inv_t = 1.0 / tl.load(temperature_ptr + row)
+    values = values * inv_t
+    tl.store(output_ptr + row * output_row_stride + cols, values, mask=mask)
+
+
+def exact_temperature_scale_fp32_logits(
+    logits: torch.Tensor,
+    temperature: torch.Tensor,
+) -> torch.Tensor:
+    """Materialize the exact per-row FP32 sampling transform."""
+
+    assert logits.ndim == 2 and logits.dtype == torch.float32
+    assert logits.stride(1) == 1, "logits rows must be unit-stride"
+    assert temperature.dtype == torch.float32
+    assert temperature.device == logits.device
+    assert temperature.is_contiguous()
+    temperature = temperature.reshape(-1)
+    assert temperature.shape == (logits.shape[0],)
+    torch._assert_async(
+        (torch.isfinite(temperature) & (temperature > 0)).all(),
+        "temperature must contain finite values > 0",
+    )
+
+    output = torch.empty_like(logits)
+    if logits.numel() == 0:
+        return output
+    if logits.is_cuda:
+        block_n = 1024
+        _exact_temperature_scale_fp32_kernel[(logits.shape[0], triton.cdiv(logits.shape[1], block_n))](
+            logits,
+            temperature,
+            output,
+            logits.shape[1],
+            logits.stride(0),
+            output.stride(0),
+            BLOCK_N=block_n,
+        )
+    else:
+        output.copy_(logits * (1.0 / temperature).unsqueeze(1))
+    return output
+
+
+def exact_temperature_scale_bf16_logits(
+    logits: torch.Tensor,
+    temperature: torch.Tensor | None,
+) -> torch.Tensor:
+    """Apply DSV4's BF16 divide/store temperature boundary."""
+
+    assert logits.ndim == 2 and logits.dtype == torch.bfloat16
+    assert logits.stride(1) == 1, "logits rows must be unit-stride"
+    if temperature is None:
+        return logits
+    assert temperature.dtype == torch.float32
+    assert temperature.device == logits.device
+    assert temperature.is_contiguous()
+    temperature = temperature.reshape(-1)
+    assert temperature.shape == (logits.shape[0],)
+    torch._assert_async(
+        (torch.isfinite(temperature) & (temperature > 0)).all(),
+        "temperature must contain finite values > 0",
+    )
+    return logits.bfloat16().div(temperature.unsqueeze(1)).bfloat16()
+
+
+@triton.jit
 def _head_v2_stats_from_logits_kernel(
     logits_ptr,
     m_out_ptr,

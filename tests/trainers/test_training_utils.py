@@ -10,6 +10,7 @@ from xorl.trainers.training_utils import (
     clip_gradients,
     count_active_microbatches,
     count_valid_tokens,
+    forward_backward_pp,
     get_distsign_grad_scale_factor,
     get_effective_grad_clip_value,
     sync_lm_head_tp_gradient,
@@ -216,6 +217,48 @@ def test_pp_chunked_ce_matches_eager_loss_and_grad(monkeypatch):
 
     torch.testing.assert_close(chunked_loss, ref_loss)
     torch.testing.assert_close(pred.grad, ref_pred.grad)
+
+
+def test_forward_backward_pp_relays_tensor_ids_and_preserves_signed_loss(monkeypatch):
+    observed = {}
+
+    class _Schedule:
+        def step(self, input_ids, *, target, losses, return_outputs):
+            observed["input_ids"] = input_ids.clone()
+            observed["target"] = target.clone()
+            assert return_outputs is False
+            losses.extend((torch.tensor(-1.25), torch.tensor(-2.5)))
+
+    reduced = []
+
+    def fake_all_reduce(tensor, op, group):
+        reduced.append((tensor.clone(), op, group))
+
+    monkeypatch.setattr(training_utils_module, "get_device_type", lambda: "cpu")
+    monkeypatch.setattr(training_utils_module.dist, "all_reduce", fake_all_reduce)
+    model_part = nn.Module()
+    micro_batches = [
+        {"input_ids": torch.tensor([[1, 2]]), "labels": torch.tensor([[2, 3]])},
+        {"input_ids": torch.tensor([[4, 5]]), "labels": torch.tensor([[5, 6]])},
+    ]
+    target_ids = torch.tensor([7, 9], dtype=torch.long)
+
+    raw_loss = forward_backward_pp(
+        model_parts=[model_part],
+        pp_schedule=_Schedule(),
+        micro_batches=micro_batches,
+        has_first_stage=True,
+        has_last_stage=True,
+        pp_group="pp",
+        schedule_targets=target_ids,
+    )
+
+    assert torch.equal(observed["input_ids"], torch.tensor([[1, 2], [4, 5]]))
+    assert torch.equal(observed["target"], target_ids)
+    assert raw_loss == pytest.approx(-3.75)
+    assert len(reduced) == 1
+    assert reduced[0][1] == torch.distributed.ReduceOp.SUM
+    assert reduced[0][2] == "pp"
 
 
 def test_sync_sp_gradients_reduces_every_grad_by_default(monkeypatch):

@@ -342,9 +342,7 @@ def build_training_model(
                 f"glm52_fullparam_trainable_expert_layers must be unique non-negative layer indices, got {scope!r}"
             )
         if not enable_mixed_precision:
-            raise ValueError(
-                "glm52_fullparam_fp8_training requires enable_mixed_precision=True for the qualified BF16 build"
-            )
+            raise ValueError("glm52_fullparam_fp8_training requires enable_mixed_precision=True for BF16 model compute")
         if torch_dtype != "bfloat16":
             raise ValueError(f"glm52_fullparam_fp8_training requires torch_dtype='bfloat16', got {torch_dtype!r}")
         mode_requirements = {
@@ -363,26 +361,6 @@ def build_training_model(
                 "GLM-5.2 full-param block-FP8 training rejects unsupported configuration: " + ", ".join(mode_mismatches)
             )
         skip_param_upcast = True
-        from xorl.models.transformers.glm5.support import (  # noqa: PLC0415
-            validate_glm52_fullparam_runtime_topology,
-        )
-
-        validate_glm52_fullparam_runtime_topology(
-            init_device=init_device,
-            data_parallel_mode=data_parallel_mode,
-            tensor_parallel_size=tensor_parallel_size,
-            pipeline_parallel_size=pipeline_parallel_size,
-            expert_parallel_size=expert_parallel_size,
-            ringattn_parallel_size=ringattn_parallel_size,
-            ulysses_parallel_size=ulysses_parallel_size,
-            data_parallel_replicate_size=data_parallel_replicate_size,
-            data_parallel_shard_size=data_parallel_shard_size,
-            cp_fsdp_mode=cp_fsdp_mode,
-            lm_head_tensor_parallel_size=lm_head_tensor_parallel_size,
-            fsdp_sharded_lm_head_loss=fsdp_sharded_lm_head_loss,
-            enable_full_shard=enable_full_shard,
-            reshard_after_forward=reshard_after_forward,
-        )
     elif glm52_fullparam_trainable_expert_layers is not None:
         raise ValueError(
             "glm52_fullparam_trainable_expert_layers is only meaningful with glm52_fullparam_fp8_training=True"
@@ -426,6 +404,11 @@ def build_training_model(
         lora_alpha=lora_alpha,
         lora_target_modules=lora_target_modules,
         init_device=init_device,
+        pipeline_parallel_virtual_stages=pp_virtual_stages,
+        pipeline_parallel_input_weight=pp_input_weight,
+        pipeline_parallel_output_weight=pp_output_weight,
+        pipeline_parallel_num_layers_in_first_stage=pp_num_layers_in_first_stage,
+        pipeline_parallel_num_layers_in_last_stage=pp_num_layers_in_last_stage,
     )
 
     # Set module-level flags for rope and activation
@@ -659,11 +642,6 @@ def build_training_model(
     # it swaps composites in and decides the complete trainable set).
     glm52_fullparam_admission_report = None
     if glm52_fullparam_fp8_training:
-        if get_parallel_state().pp_enabled:
-            raise ValueError(
-                "glm52_fullparam_fp8_training does not support pipeline parallelism: splitting the "
-                "model would break the admission's whole-model allowlist/refresh/publication walks"
-            )
         from xorl.models.transformers.glm5.exact_fullparam_admission import (  # noqa: PLC0415
             prepare_glm52_fullparam_training,
         )

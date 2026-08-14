@@ -90,6 +90,9 @@ def _run_lm_head_tp_parallel_state_case() -> None:
         if cfg == "pp":
             expected_stage = [[0, 1]] if rank < 2 else [[2, 3]]
             assert ps.lm_head_mesh.mesh.tolist() == expected_stage
+            expected_loss_ranks = [0, 1] if rank < 2 else [2, 3]
+            assert dist.get_process_group_ranks(ps.loss_group) == expected_loss_ranks
+            assert ps.loss_size == 2
     finally:
         dist.destroy_process_group()
 

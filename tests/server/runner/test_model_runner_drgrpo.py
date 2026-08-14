@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import xorl.server.runner.model_runner as model_runner_module
 from xorl.server.runner.model_runner import ModelRunner
 
 
@@ -118,6 +119,47 @@ def test_compute_micro_batch_loss_drgrpo_forwards_logprob_temperature():
     )
 
     assert not torch.allclose(raw_outputs["logprobs"], temp_outputs["logprobs"])
+
+
+def test_compute_micro_batch_loss_forwards_per_row_temperatures(monkeypatch):
+    runner = object.__new__(ModelRunner)
+    runner.model = _TinyModel()
+    runner.ce_mode = "eager"
+    runner.lm_head_fp32 = False
+    temperatures = torch.tensor([[0.7, 1.3]], dtype=torch.float32)
+    captured = {}
+
+    def fake_drgrpo_loss_function(*, hidden_states, labels, logprob_temperature, **_kwargs):
+        captured["temperature"] = logprob_temperature
+        zero = hidden_states.float().sum() * 0.0
+        return SimpleNamespace(
+            loss=zero,
+            per_token_logprobs=torch.zeros_like(labels, dtype=torch.float32),
+            per_token_loss=torch.zeros_like(labels, dtype=torch.float32),
+            metrics={"valid_tokens": labels.numel()},
+            metric_ops=None,
+        )
+
+    monkeypatch.setattr(model_runner_module, "drgrpo_loss_function", fake_drgrpo_loss_function)
+    micro_batch = {
+        "input_ids": torch.tensor([[1, 2]]),
+        "target_tokens": torch.tensor([[2, 3]]),
+        "logprobs": torch.tensor([[-2.0, -2.1]]),
+        "advantages": torch.ones((1, 2)),
+        "logprob_temperatures": temperatures,
+    }
+
+    runner._compute_micro_batch_loss(micro_batch, "drgrpo", {"beta": 0.0})
+
+    assert captured["temperature"] is temperatures
+
+
+def test_per_row_temperatures_reject_nonunit_scalar_override():
+    with pytest.raises(ValueError, match="cannot be combined"):
+        ModelRunner._resolve_logprob_temperature(
+            {"logprob_temperatures": torch.ones(2, dtype=torch.float32)},
+            {"logprob_temperature": 0.7},
+        )
 
 
 def test_compute_micro_batch_loss_drgrpo_skips_returned_logprobs_when_disabled():

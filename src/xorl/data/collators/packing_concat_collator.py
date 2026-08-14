@@ -93,6 +93,7 @@ class PackingConcatCollator(DataCollator):
                 "logprobs",
                 "advantages",
                 "rollout_logprobs",
+                "logprob_temperatures",
                 "teacher_ids",
                 "teacher_cache_indices",
                 "teacher_cache_local_indices",
@@ -183,6 +184,7 @@ class PackingConcatCollator(DataCollator):
                     "logprobs",
                     "advantages",
                     "rollout_logprobs",
+                    "logprob_temperatures",
                     "teacher_ids",
                     "teacher_cache_indices",
                     "teacher_cache_local_indices",
@@ -190,7 +192,7 @@ class PackingConcatCollator(DataCollator):
                     "hidden_match_weights",
                 ):
                     if key in batch and batch[key].shape[-1] == seq_len:
-                        pad_value = -100 if key == "target_tokens" else 0
+                        pad_value = -100 if key == "target_tokens" else 1.0 if key == "logprob_temperatures" else 0
                         batch[key] = torch.nn.functional.pad(batch[key], (0, pad_length), value=pad_value)
 
                 # Pad 2D sequence-aligned tensors.

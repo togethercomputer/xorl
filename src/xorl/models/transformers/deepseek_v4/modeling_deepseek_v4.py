@@ -1539,6 +1539,9 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
         Returns:
             ``[batch, seqlen, hidden_size]``.
         """
+        pipeline_stage = bool(kwargs.pop("_dsv4_pipeline_stage", False))
+        pipeline_is_first = bool(kwargs.pop("_dsv4_pipeline_is_first", True))
+        pipeline_is_last = bool(kwargs.pop("_dsv4_pipeline_is_last", True))
         decode_cache_carry = False
         carry_position_offset = 0
         if getattr(self.config, "_dsv4_flash_exact_mode", False):
@@ -1559,6 +1562,12 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
             h3d = inputs_embeds
             if input_ids is None and int(getattr(self.config, "num_hash_layers", 0)) > 0:
                 raise ValueError("input_ids are required when DeepSeek-V4 hash-routed layers are enabled")
+        if pipeline_stage and not pipeline_is_first:
+            if h3d.ndim != 4 or tuple(h3d.shape[-2:]) != (self.hc_mult, self.hidden_size):
+                raise ValueError(
+                    "DeepSeek-V4 PP stages receive the completed hyperconnection state "
+                    f"[batch, sequence, {self.hc_mult}, {self.hidden_size}], got {tuple(h3d.shape)}"
+                )
 
         live_token_count = None
         packed_sequence_length = int(h3d.shape[1])
@@ -1596,7 +1605,13 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
                 )
             compute_rows = torch.tensor([live_token_count], dtype=torch.int64, device=h3d.device)
             if dist.is_available() and dist.is_initialized():
-                dist.all_reduce(compute_rows, op=dist.ReduceOp.MAX)
+                from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
+
+                dist.all_reduce(
+                    compute_rows,
+                    op=dist.ReduceOp.MAX,
+                    group=get_parallel_state().loss_group,
+                )
             exact_compute_token_count = int(compute_rows.item())
             if not 0 <= exact_compute_token_count <= packed_sequence_length:
                 raise RuntimeError(
@@ -1611,6 +1626,8 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
             # its carried serving state. Clearing on non-carry forwards keeps a
             # stale offset from leaking out of an aborted diagnostic run.
             for layer in self.layers:
+                if layer is None:
+                    continue
                 attention = layer.self_attn
                 if decode_cache_carry:
                     attention._dsv4_decode_carry_offset = carry_position_offset
@@ -1622,7 +1639,7 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
             self.config.output_router_logits if output_router_logits is None else output_router_logits
         )
         all_router_logits = [] if output_router_logits else None
-        h4d = self.hc_util.block_expand(h3d)  # [B, S, hc_mult, H]
+        h4d = h3d if pipeline_stage and not pipeline_is_first else self.hc_util.block_expand(h3d)
 
         use_outer_checkpoint = (
             self.gradient_checkpointing
@@ -1630,6 +1647,8 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
             and self._gradient_checkpointing_method == DEFAULT_GRADIENT_CHECKPOINTING_METHOD
         )
         for layer in self.layers:
+            if layer is None:
+                continue
             if use_outer_checkpoint:
                 layer_outputs = self._gradient_checkpointing_func(
                     layer.__call__,
@@ -1660,6 +1679,17 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
             else:
                 h4d = layer_outputs
 
+        if pipeline_stage and not pipeline_is_last:
+            if exact_compute_token_count < packed_sequence_length:
+                h4d = F.pad(
+                    h4d,
+                    (0, 0, 0, 0, 0, packed_sequence_length - exact_compute_token_count),
+                )
+            return MoeModelOutput(
+                last_hidden_state=h4d,
+                router_logits=tuple(all_router_logits) if all_router_logits is not None else None,
+            )
+
         h3d = self.hc_util.block_head(h4d, self.hc_head_fn, self.hc_head_scale, self.hc_head_base)
         self._capture_diagnostic_component("hc_head_output", h3d)
         h3d = self.norm(h3d)
@@ -1676,6 +1706,7 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel):
     """Causal-LM head wrapping :class:`DeepseekV4Model`."""
 
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+    _pp_requires_input_ids_on_all_stages = True
 
     def __init__(
         self,
@@ -1719,10 +1750,18 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel):
         return self.model
 
     def get_pp_module_config(self):
-        raise ValueError(
-            "Pipeline parallelism is not supported for DeepseekV4ForCausalLM. "
-            "DSv4 uses 4-D hyperconnection state that is incompatible with the generic PP splitter."
-        )
+        return {
+            "input_fqns": ["model.embed_tokens"],
+            "layer_prefix": "model.layers",
+            "output_fqns": ["model.norm", "lm_head"],
+            "num_layers": self.config.num_hidden_layers,
+            "pipeline_boundary_state": {
+                "rank": 4,
+                "dtype": "bfloat16",
+                "shape_suffix": (int(self.config.hc_mult), int(self.config.hidden_size)),
+                "state": "completed_hyperconnection_residual",
+            },
+        }
 
     def forward(
         self,
@@ -1734,6 +1773,10 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel):
     ) -> MoeCausalLMOutput:
         """Return hidden states for xorl's external CE/loss path."""
         output_router_logits = kwargs.pop("output_router_logits", self.config.output_router_logits)
+        if hasattr(self, "_pp_is_first"):
+            kwargs["_dsv4_pipeline_stage"] = True
+            kwargs["_dsv4_pipeline_is_first"] = bool(self._pp_is_first)
+            kwargs["_dsv4_pipeline_is_last"] = bool(self._pp_is_last)
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,

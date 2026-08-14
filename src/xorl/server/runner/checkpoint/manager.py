@@ -261,7 +261,7 @@ class CheckpointManager:
         """Collectively reconstruct full active logical tensors on rank 0."""
         if self._adapter_manager is None:
             return get_lora_state_dict(self.model)
-        return self._adapter_manager.materialize_logical_state_dict(model_id, destination_rank=self.rank)
+        return self._adapter_manager.materialize_logical_state_dict(model_id, destination_rank=0)
 
     def _adapter_publication_error(self, model_id: str, *, strict: bool) -> Optional[str]:
         if self._adapter_manager is None:

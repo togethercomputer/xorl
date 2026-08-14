@@ -407,6 +407,7 @@ class TextSequenceShardCollator(DataCollator):
             "advantages": torch.float,
             "ref_logprobs": torch.float,
             "rollout_logprobs": torch.float,
+            "logprob_temperatures": torch.float32,
             "teacher_ids": torch.long,
             "teacher_cache_indices": torch.long,
             "teacher_cache_local_indices": torch.long,
@@ -442,8 +443,11 @@ class TextSequenceShardCollator(DataCollator):
                 else:
                     seq_dim = -1
 
-                # Determine pad value: IGNORE_INDEX for target_tokens, 0 for others
-                pad_value = IGNORE_INDEX if field == "target_tokens" else 0.0
+                # Temperature is a multiplicative identity side channel, so
+                # ignored/padded rows must carry T=1 rather than zero.
+                pad_value = (
+                    IGNORE_INDEX if field == "target_tokens" else 1.0 if field == "logprob_temperatures" else 0.0
+                )
                 if alignment_segments is not None:
                     field_tensor = apply_alignment_segments(field_tensor, alignment_segments, seq_dim, pad_value)
                 field_tensor = self.sp_padding(field_tensor, dim=seq_dim, pad_value=pad_value, pad_length=pad_length)

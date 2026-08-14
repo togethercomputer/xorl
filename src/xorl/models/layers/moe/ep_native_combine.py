@@ -35,9 +35,8 @@ exactly serving-rank-r's contiguous expert slice):
    NCCL — only forward bits are contracted.
 
 The exact Qwen3.5-MoE model path selects this combine structurally when trainer
-EP is active. EP8 is the admitted topology because it is the topology whose
-serving reduction was qualified; a different contributor count is a different
-numerical program and is rejected before collectives begin.
+EP is active. The contributor count is validated against the balanced binary
+fold implemented by both sides, not against a model-family registry.
 """
 
 from __future__ import annotations
@@ -46,40 +45,11 @@ import torch
 import torch.distributed as dist
 
 
-#: Per-family EP contributor counts whose serving reduction order has been
-#: qualified byte-exactly. The contributor count is part of the numerical
-#: program: qualifying a new (family, EP size) pair requires serving-side byte
-#: evidence and a reduction-order validation, followed by a registry entry
-#: here rather than a code change in the validator.
-NATIVE_EP_COMBINE_QUALIFIED_SIZES: dict[str, frozenset[int]] = {
-    "qwen3_5_moe": frozenset({8}),
-}
+def validate_native_ep_combine_size(ep_size: int) -> None:
+    """Validate the contributor count supported by the balanced BF16 fold."""
 
-#: Backward-compatible alias for the qualified Qwen3.5-MoE contributor counts.
-QWEN35_NATIVE_EP_COMBINE_SIZES = NATIVE_EP_COMBINE_QUALIFIED_SIZES["qwen3_5_moe"]
-
-
-def validate_native_ep_combine_size(family: str, ep_size: int) -> None:
-    """Reject contributor counts not qualified against serving for ``family``."""
-    qualified = NATIVE_EP_COMBINE_QUALIFIED_SIZES.get(family)
-    if qualified is None:
-        raise ValueError(
-            f"exact native-EP canonical combine has no qualified EP sizes for family {family!r}. "
-            "Qualification requires serving-side byte evidence and a byte-exact "
-            "reduction-order validation, recorded in NATIVE_EP_COMBINE_QUALIFIED_SIZES."
-        )
-    if ep_size not in qualified:
-        raise ValueError(
-            f"exact native-EP canonical combine received expert_parallel_size={ep_size}; "
-            f"qualified sizes for family {family!r}: {sorted(qualified)}. "
-            "A different EP size requires new serving-side byte evidence and a "
-            "byte-exact reduction-order validation."
-        )
-
-
-def validate_qwen35_native_ep_combine_size(ep_size: int) -> None:
-    """Thin Qwen3.5-MoE shim over the family-keyed qualified-size registry."""
-    validate_native_ep_combine_size("qwen3_5_moe", ep_size)
+    if ep_size <= 1 or ep_size & (ep_size - 1):
+        raise ValueError("Native EP canonical combine requires a power-of-two contributor count greater than one")
 
 
 class _AllGatherSumBackward(torch.autograd.Function):
@@ -226,13 +196,17 @@ def exchange_and_canonical_fold(partial: torch.Tensor, group, ep_size: int) -> t
     from xorl.distributed.canonical_moe import canonical_moe_fold_v1  # noqa: PLC0415
     from xorl.distributed.moe.comm import _AllToAll  # noqa: PLC0415
 
-    validate_qwen35_native_ep_combine_size(ep_size)
+    validate_native_ep_combine_size(ep_size)
+    if dist.is_initialized() and dist.get_world_size(group) != ep_size:
+        raise ValueError(
+            f"Native EP canonical combine group has {dist.get_world_size(group)} ranks, expected {ep_size}"
+        )
     if partial.ndim < 2:
-        raise ValueError("Qwen3.5-MoE canonical combine requires row and payload dimensions")
+        raise ValueError("Native EP canonical combine requires row and payload dimensions")
     if partial.dtype is not torch.bfloat16:
-        raise TypeError("Qwen3.5-MoE canonical combine requires BF16 partials")
+        raise TypeError("Native EP canonical combine requires BF16 partials")
     if partial.shape[0] % ep_size:
-        raise ValueError("Qwen3.5-MoE canonical combine rows must be divisible by EP size")
+        raise ValueError("Native EP canonical combine rows must be divisible by EP size")
     exchanged = _AllToAll.apply(group, partial.contiguous(), None, None)  # [n*T, H], segment s from rank s
     rows = exchanged.shape[0] // ep_size
     logical_sources = exchanged.reshape(ep_size, rows, *exchanged.shape[1:])

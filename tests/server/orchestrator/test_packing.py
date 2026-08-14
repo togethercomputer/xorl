@@ -345,6 +345,51 @@ def test_packing_pads_target_tokens_as_ignore_index():
     assert batch["advantages"] == [[1.0, 1.0, 1.0, -1.0, -1.0, 0, 0, 0]]
 
 
+def test_ragged_request_temperatures_pack_and_pad_with_identity():
+    packer = SequentialPacker(enable_packing=True, log_stats=False, pad_to_multiple_of=8)
+    data = [
+        {
+            "model_input": {"input_ids": [11, 22, 33]},
+            "loss_fn_inputs": {
+                "target_tokens": [22, 33, 44],
+                "logprobs": [-0.1, -0.2, -0.3],
+                "advantages": [1.0, 1.0, 1.0],
+                "logprob_temperatures": [0.7, 0.7, 0.7],
+            },
+        },
+        {
+            "model_input": {"input_ids": [55, 66]},
+            "loss_fn_inputs": {
+                "target_tokens": [66, 77],
+                "logprobs": [-0.4, -0.5],
+                "advantages": [-1.0, -1.0],
+                "logprob_temperatures": [1.3, 1.3],
+            },
+        },
+    ]
+
+    batch = packer.pack(data, max_seq_len=1000, request_id="mixed-temperature")[0]
+
+    assert batch["logprob_temperatures"] == [[0.7, 0.7, 0.7, 1.3, 1.3, 1.0, 1.0, 1.0]]
+
+
+def test_hf_shift_keeps_temperatures_aligned_with_shifted_labels():
+    packer = SequentialPacker(enable_packing=True, log_stats=False, pad_to_multiple_of=1)
+    batch = packer.pack(
+        [
+            {
+                "input_ids": [1, 2, 3, 4],
+                "labels": [1, 2, 3, 4],
+                "logprob_temperatures": [1.0, 0.7, 0.8, 0.9],
+            }
+        ],
+        max_seq_len=100,
+    )[0]
+
+    assert batch["labels"] == [[2, 3, 4]]
+    assert batch["logprob_temperatures"] == [[0.7, 0.8, 0.9]]
+
+
 def test_position_ids_and_labels():
     """Auto-generated position_ids and label creation (IGNORE_INDEX when missing)."""
     packer = SequentialPacker(enable_packing=True, log_stats=False, pad_to_multiple_of=1)

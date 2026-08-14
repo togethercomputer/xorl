@@ -210,6 +210,20 @@ class TestDatumToPlainDictTensorData:
         assert plain["model_input"]["input_ids"] == [1, 2, 3]
         assert plain["loss_fn_inputs"]["labels"] == [2, 3, 4]
 
+    def test_per_token_temperature_side_channel_survives_schema(self):
+        datum = Datum(
+            model_input={"input_ids": [1, 2, 3]},
+            loss_fn_inputs={
+                "logprob_temperatures": TensorData(
+                    data=[1.0, 0.7, 0.7],
+                    dtype="float32",
+                    shape=[3],
+                )
+            },
+        )
+
+        assert datum.to_plain_dict()["loss_fn_inputs"]["logprob_temperatures"] == [1.0, 0.7, 0.7]
+
     def test_rank2_renested_per_shape(self):
         """Rank-2 TensorData is re-nested into per-row lists per its shape."""
         # [seq_len=3, hidden=2], flattened row-major like TensorData.from_torch

@@ -61,15 +61,6 @@ class AdapterCoordinator:
         self.world_size = world_size
         self.cpu_group = cpu_group
 
-    def _validate_pipeline_parallel_broadcast_safe(self) -> None:
-        """Reject pipeline-parallel topologies for broadcast-based adapter coordination."""
-        pipeline_parallel_size = int(getattr(self.trainer, "train_config", {}).get("pipeline_parallel_size", 1))
-        if pipeline_parallel_size > 1 and self.world_size > 1:
-            raise RuntimeError(
-                "pipeline_parallel_size > 1 is not supported with multi-adapter LoRA server training. "
-                "Adapter coordination currently assumes identical local LoRA layouts on every rank."
-            )
-
     def _validate_adapter_state_path(self, path: str) -> str:
         """Resolve an adapter path and confine it to the server output tree."""
         if not isinstance(path, str):
@@ -101,7 +92,6 @@ class AdapterCoordinator:
         """
         if self.world_size <= 1:
             return
-        self._validate_pipeline_parallel_broadcast_safe()
 
         adapter_state = self.trainer.adapter_manager.get_adapter_state(model_id)
 
@@ -134,7 +124,6 @@ class AdapterCoordinator:
         """Deprecated no-op: optimizer state is topology-specific and not broadcastable."""
         if self.world_size <= 1:
             return
-        self._validate_pipeline_parallel_broadcast_safe()
         logger.debug(
             "Rank %s: refusing rank-0 optimizer broadcast for local-shard adapter %s; use all_ranks checkpoint restore",
             self.rank,
@@ -283,7 +272,6 @@ class AdapterCoordinator:
         lr: Optional[float],
     ) -> Dict[str, Any]:
         """Restore logical adapter weights without broadcasting rank 0's local slice."""
-        self._validate_pipeline_parallel_broadcast_safe()
         start_time = time.time()
         payload = self._rank0_load_adapter_checkpoint_payload(model_id, path, load_optimizer)
         if payload.get("optimizer_present") and load_optimizer:
@@ -430,8 +418,6 @@ class AdapterCoordinator:
     ) -> Dict[str, Any]:
         """Restore adapter state using the configured rank loading strategy."""
         mode = self._get_adapter_state_load_mode()
-        if mode == "rank0_broadcast" and self.world_size > 1:
-            self._validate_pipeline_parallel_broadcast_safe()
         result = None
         local_error = None
 

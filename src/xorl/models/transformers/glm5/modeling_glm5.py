@@ -1120,29 +1120,23 @@ class Glm5MoEBlock(MoEBlock):
         )
         if ps.tp_size != 1:
             raise RuntimeError("GLM-5.2 canonical MoE requires stage-local dense TP1")
-        if ps.ringattn_size != 1 or ps.ulysses_size != ps.cp_size:
-            raise RuntimeError("GLM-5.2 canonical MoE requires Ring1 and Ulysses to realize the configured CP degree")
-        if ps.dp_replicate_size != 1 or ps.dp_shard_size != ps.dp_size or ps.cp_fsdp_mode != "all":
-            raise RuntimeError(
-                "GLM-5.2 canonical trainer path requires DP-replicate1, fully sharded DP, and cp_fsdp_mode=all"
-            )
         if ps.ep_group is None:
-            raise RuntimeError("GLM-5.2 canonical MoE requires a stage-local EP16 contributor group")
+            raise RuntimeError("GLM-5.2 canonical MoE requires a stage-local EP contributor group")
         get_group_ranks = getattr(dist, "get_process_group_ranks", None)
         if ps.cp_size > 1:
-            if ps.ulysses_group is None:
-                raise RuntimeError("GLM-5.2 CP-owned rows require a stage-local Ulysses group")
+            if ps.sp_group is None:
+                raise RuntimeError("GLM-5.2 CP-owned rows require a stage-local sequence-parallel group")
             if get_group_ranks is not None:
                 ep_ranks = tuple(get_group_ranks(ps.ep_group))
-                cp_ranks = tuple(get_group_ranks(ps.ulysses_group))
+                cp_ranks = tuple(get_group_ranks(ps.sp_group))
                 expected_cp_ranks = tuple(ep_ranks[index] for index in ownership.context_source_ordinals)
                 if cp_ranks != expected_cp_ranks:
                     raise RuntimeError(
                         "GLM-5.2 CP membership does not match the DP-major logical row layout: "
                         f"expected={expected_cp_ranks}, actual={cp_ranks}"
                     )
-        elif ps.ulysses_group is not None:
-            raise RuntimeError("GLM-5.2 CP1 rows must not have a Ulysses process group")
+        elif ps.sp_group is not None:
+            raise RuntimeError("GLM-5.2 CP1 rows must not have a sequence-parallel process group")
         if self.experts.ep_dispatch == "deepep":
             raise RuntimeError("GLM-5.2 canonical MoE canonical path does not support DeepEP")
         if hidden_states.dtype is not torch.bfloat16:
@@ -1217,12 +1211,19 @@ class Glm5MoEBlock(MoEBlock):
             valid_rows=int(gathered_valid.sum().item()),
         )
         contribution = LocalMoEContribution(local_partial, metadata, GLM52_LOCAL_PARTIAL_POLICY)
+        ep_mesh = ps.ep_fsdp_device_mesh
+        ep_dim = tuple(ep_mesh.mesh_dim_names).index("ep")
+        combine_groups = tuple(
+            tuple(int(rank) for rank in row.tolist())
+            for row in ep_mesh.mesh.movedim(ep_dim, -1).reshape(-1, ps.ep_size)
+        )
         plan = ParallelPlan.glm52_trainer(
             world_size=dist.get_world_size(),
             pp_size=ps.pp_size,
             dp_size=ps.dp_size,
             contributor_count=ps.ep_size,
             cp_size=ps.cp_size,
+            combine_groups=combine_groups,
             pipeline_layer_ranges=tuple(
                 tuple(int(value) for value in stage)
                 for stage in getattr(
@@ -1616,7 +1617,9 @@ class Glm5Model(Glm5PreTrainedModel):
             return None
         local_layers = tuple(index for index, layer in enumerate(self.layers) if layer is not None)
         if not local_layers:
-            raise RuntimeError("GLM-5.2 model part owns no decoder layers")
+            # Weighted PP layouts may assign embedding/head-only edge stages.
+            # They carry no IndexShare producer/consumer and need no context.
+            return None
         candidates = [
             stage
             for stage in self.layer_plan.pipeline_layer_ranges
@@ -1637,10 +1640,10 @@ class Glm5Model(Glm5PreTrainedModel):
         return manager
 
     def release_index_share_context(self) -> None:
-        """Idempotently release a retained backward-bearing invocation."""
+        """Release every invocation retained by the completed PP schedule."""
 
         for manager in self._index_share_context_managers.values():
-            manager.end_active()
+            manager.end_all()
 
     def forward(
         self,
@@ -1810,13 +1813,22 @@ class Glm5ForCausalLM(Glm5PreTrainedModel):
         self.model.release_index_share_context()
 
     def get_pp_module_config(self):
-        return {
+        pp_config = {
             "input_fqns": ["model.embed_tokens"],
             "layer_prefix": "model.layers",
             "output_fqns": ["model.norm", "lm_head"],
             "always_keep_fqns": ["model.rotary_emb"],
             "num_layers": self.config.num_hidden_layers,
         }
+        ranges = getattr(self.config, "_glm52_pipeline_layer_ranges", None)
+        if ranges is not None:
+            pp_config["pipeline_layer_ranges"] = tuple(
+                tuple(int(value) for value in stage_range) for stage_range in ranges
+            )
+        module_plan = getattr(self.config, "_glm52_pipeline_module_names_per_stage", None)
+        if module_plan is not None:
+            pp_config["module_names_per_stage"] = tuple(tuple(names) for names in module_plan)
+        return pp_config
 
     def forward(
         self,

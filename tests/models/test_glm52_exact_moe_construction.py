@@ -35,6 +35,16 @@ class _EPState:
     lm_head_tp_size: int = 1
     lm_head_tp_group: object | None = None
     lm_head_mesh: object | None = None
+    device_mesh: object | None = None
+
+
+class _FakeDeviceMesh:
+    mesh = torch.arange(16)
+    mesh_dim_names = ("ep",)
+
+    @staticmethod
+    def get_coordinate() -> tuple[int]:
+        return (7,)
 
 
 class _FakeEPMesh:
@@ -85,6 +95,7 @@ def _patch_exact_world16_rank7(monkeypatch: pytest.MonkeyPatch) -> object:
         lm_head_tp_size=16,
         lm_head_tp_group=group,
         lm_head_mesh=object(),
+        device_mesh=_FakeDeviceMesh(),
     )
     monkeypatch.setattr("xorl.models.transformers.glm5.qlora.get_parallel_state", lambda: state)
     monkeypatch.setattr("xorl.models.transformers.glm5.qlora.dist.is_initialized", lambda: True)

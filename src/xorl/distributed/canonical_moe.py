@@ -243,8 +243,8 @@ class ParallelPlan:
             raise ValueError(f"Unsupported canonical MoE contract version: {self.contract_version}")
         if self.world_size <= 0:
             raise ValueError("world_size must be positive")
-        if self.ep_size not in (2, 4, 8, 16):
-            raise ValueError("canonical_moe_reduce_v1 admits contributor counts 2, 4, 8, or 16")
+        if self.ep_size <= 1 or self.ep_size & (self.ep_size - 1):
+            raise ValueError("canonical_moe_reduce_v1 requires a power-of-two contributor count greater than one")
         if len(self.combine_groups) != len(self.logical_ordinals_by_group):
             raise ValueError("combine_groups and logical_ordinals_by_group must have equal lengths")
 
@@ -300,13 +300,9 @@ class ParallelPlan:
                 )
             if self.world_size != self.pp_size * self.ep_size:
                 raise ValueError("Trainer world size must equal pipeline stages times stage-local contributors")
-            expected_groups = tuple(
-                tuple(range(group_start, group_start + self.contributor_count))
-                for group_start in range(0, self.world_size, self.contributor_count)
-            )
-            if self.combine_groups != expected_groups:
-                raise ValueError("Trainer combine groups must be contiguous stage-local contributor groups")
-            if self.logical_ordinals_by_group != (expected_ordinals,) * len(expected_groups):
+            if len(self.combine_groups) != self.pp_size:
+                raise ValueError("Trainer requires one live contributor group per pipeline stage")
+            if self.logical_ordinals_by_group != (expected_ordinals,) * len(self.combine_groups):
                 raise ValueError("Trainer requires identity logical contributor ordinals in every stage")
             if self.launcher_tp_size is not None:
                 raise ValueError("Trainer ParallelPlan does not accept a launcher_tp_size alias")
@@ -340,6 +336,7 @@ class ParallelPlan:
         dp_size: int = 1,
         contributor_count: int = 16,
         cp_size: int | None = None,
+        combine_groups: tuple[tuple[int, ...], ...] | None = None,
         pipeline_layer_ranges: tuple[tuple[int, int], ...] | None = None,
         model_num_layers: int = GLM52_NUM_LAYERS,
     ) -> ParallelPlan:
@@ -354,9 +351,12 @@ class ParallelPlan:
                 raise ValueError("Multi-stage trainer plans require explicit model-derived pipeline ranges")
             pipeline_layer_ranges = ((0, model_num_layers),)
         identity = tuple(range(contributor_count))
-        combine_groups = tuple(
-            tuple(range(start, start + contributor_count)) for start in range(0, world_size, contributor_count)
-        )
+        if combine_groups is None:
+            combine_groups = tuple(
+                tuple(range(start, start + contributor_count)) for start in range(0, world_size, contributor_count)
+            )
+        else:
+            combine_groups = tuple(tuple(int(rank) for rank in group) for group in combine_groups)
         return cls(
             role=ParallelRole.TRAINER,
             world_size=world_size,
@@ -622,8 +622,9 @@ def canonical_moe_fold_v1(partials_by_logical_ordinal: torch.Tensor) -> torch.Te
     partials = partials_by_logical_ordinal
     if partials.dtype is not torch.bfloat16:
         raise TypeError("Canonical MoE fold requires BF16 inputs")
-    if partials.shape[0] not in (2, 4, 8, 16):
-        raise ValueError("Canonical MoE fold admits 2, 4, 8, or 16 contributors")
+    contributor_count = partials.shape[0]
+    if contributor_count <= 1 or contributor_count & (contributor_count - 1):
+        raise ValueError("Canonical MoE fold requires a power-of-two contributor count greater than one")
 
     level = partials
     while level.shape[0] > 1:

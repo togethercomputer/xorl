@@ -45,6 +45,36 @@ def test_compute_token_diagnostics_target_consistent_with_topk(small_inputs):
             assert top_lp[0] > target_lp
 
 
+def test_compute_token_diagnostics_applies_per_row_temperatures(small_inputs):
+    hidden_states, weight, labels = small_inputs
+    temperatures = torch.tensor([[1.0, 0.7, 1.0, 1.3]], dtype=torch.float32)
+    valid_indices = torch.tensor([1, 3])
+    valid_hidden = hidden_states.reshape(-1, hidden_states.shape[-1])[valid_indices]
+    valid_temperatures = temperatures.reshape(-1)[valid_indices]
+    expected_logprobs = torch.log_softmax(
+        (valid_hidden.float() @ weight.float().t()) * (1.0 / valid_temperatures).unsqueeze(1),
+        dim=-1,
+    )
+    target_ids = labels.reshape(-1)[valid_indices]
+    expected_targets = expected_logprobs[torch.arange(target_ids.shape[0]), target_ids]
+    per_token_logprobs = torch.zeros_like(labels, dtype=torch.float32)
+    per_token_logprobs.reshape(-1)[valid_indices] = expected_targets
+
+    out = ModelRunner._compute_token_diagnostics(
+        hidden_states,
+        weight,
+        labels,
+        topk=4,
+        logprob_temperature=temperatures,
+        per_token_logprobs=per_token_logprobs,
+        include_weight_reference=True,
+    )
+
+    assert out["target_logprobs"] == pytest.approx(expected_targets.tolist())
+    assert out["loss_logprob_max_abs_delta"] == 0.0
+    assert out["reference_logprob_max_abs_delta"] == 0.0
+
+
 def test_compute_token_diagnostics_topk_zero_returns_none(small_inputs):
     hidden_states, weight, labels = small_inputs
     assert ModelRunner._compute_token_diagnostics(hidden_states, weight, labels, topk=0) is None

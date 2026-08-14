@@ -138,23 +138,40 @@ class IndexShareContext:
 
 
 class IndexShareContextManager:
-    """One-live-context manager for the GLM-5.2 forward invocation."""
+    """Own the in-flight IndexShare contexts for one GLM-5.2 stage.
+
+    Pipeline schedules may issue several forwards before the matching
+    backwards.  Each invocation therefore owns a distinct context, retained
+    until the schedule has completed every backward (or aborts).  Checkpoint
+    recomputation closes over that invocation's context object directly, so
+    overlapping microbatches cannot observe one another's producer payloads.
+    """
 
     def __init__(self, layer_plan: Glm52LayerPlan, owning_pipeline_stage: tuple[int, int]):
         if owning_pipeline_stage not in layer_plan.pipeline_layer_ranges:
             raise ValueError(f"Unknown pipeline stage {owning_pipeline_stage} for layer plan")
         self.layer_plan = layer_plan
         self.owning_pipeline_stage = owning_pipeline_stage
-        self._active: IndexShareContext | None = None
+        self._active: dict[str, IndexShareContext] = {}
         self._invocation_counter = 0
 
     @property
     def active(self) -> IndexShareContext | None:
-        return self._active
+        """Return the sole active context, or the newest one when several overlap.
+
+        This compatibility view is useful for diagnostics.  Lifecycle code
+        must use ``active_contexts``/``end_all`` because a PP stage can have
+        more than one training microbatch in flight.
+        """
+
+        invocation_id = next(reversed(self._active), None)
+        return None if invocation_id is None else self._active[invocation_id]
+
+    @property
+    def active_contexts(self) -> tuple[IndexShareContext, ...]:
+        return tuple(self._active.values())
 
     def begin(self, *, mode: IndexShareMode | str) -> IndexShareContext:
-        if self._active is not None:
-            raise RuntimeError("GLM-5.2 canonical path supports only one live IndexShareContext per pipeline stage")
         try:
             mode = IndexShareMode(mode)
         except ValueError as exc:
@@ -162,29 +179,37 @@ class IndexShareContextManager:
             raise ValueError(f"Unknown IndexShare mode {mode!r}; expected one of: {choices}") from exc
         invocation_id = f"{self.layer_plan.identity[:12]}:{self._invocation_counter}"
         self._invocation_counter += 1
-        self._active = IndexShareContext(
+        context = IndexShareContext(
             invocation_id=invocation_id,
             plan_identity=self.layer_plan.identity,
             owning_pipeline_stage=self.owning_pipeline_stage,
             mode=mode,
         )
-        return self._active
+        self._active[invocation_id] = context
+        return context
 
     def end(self, context: IndexShareContext) -> None:
-        if context is self._active:
+        active = self._active.get(context.invocation_id)
+        if context is active:
             context.close()
-            self._active = None
+            del self._active[context.invocation_id]
             return
-        if self._active is None and context.lifecycle is IndexShareLifecycle.CLOSED:
+        if active is None and context.lifecycle is IndexShareLifecycle.CLOSED:
             return
-        if context is not self._active:
-            raise RuntimeError("Attempted to close a stale or foreign IndexShareContext")
+        raise RuntimeError("Attempted to close a stale or foreign IndexShareContext")
 
     def end_active(self) -> None:
-        """Idempotently release the currently active invocation, if any."""
+        """Idempotently release the newest active invocation, if any."""
 
-        if self._active is not None:
-            self.end(self._active)
+        context = self.active
+        if context is not None:
+            self.end(context)
+
+    def end_all(self) -> None:
+        """Release every invocation retained for backward by this stage."""
+
+        for context in tuple(self._active.values()):
+            self.end(context)
 
     def finish_forward(self, context: IndexShareContext, *, succeeded: bool) -> None:
         """Apply the model-owned half of the explicit lifecycle contract."""

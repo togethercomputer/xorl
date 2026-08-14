@@ -4,7 +4,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 
+import xorl.distributed.pipeline_parallel as pipeline_parallel_module
+import xorl.models.transformers.glm5.modeling_glm5 as glm5_modeling_module
+import xorl.trainers.training_utils as training_utils_module
 from xorl.distributed.canonical_moe import (
     CanonicalMoEGraphMetadata,
     CanonicalMoETransport,
@@ -28,7 +32,11 @@ from xorl.models.transformers.glm5.indexer import (
     _mix_sampler_index_k_preparation,
     _scale_fused_bf16_indexer_head_gates,
 )
-from xorl.models.transformers.glm5.layer_plan import Glm52LayerPlan
+from xorl.models.transformers.glm5.layer_plan import (
+    Glm52LayerPlan,
+    derive_glm52_pipeline_layer_ranges,
+    install_glm52_pipeline_module_plan,
+)
 from xorl.models.transformers.glm5.modeling_glm5 import (
     Glm5Attention,
     Glm5ForCausalLM,
@@ -46,6 +54,7 @@ from xorl.models.transformers.glm5.sparse_selector import (
     rotate_sparse_selector_activation,
     select_glm52_logical_indices,
 )
+from xorl.trainers.training_utils import forward_backward_pp
 
 
 GLM52_FULL_INDEX_LAYERS = (0, 1, 2, 6, 10, 14, 18, 22, 26, 30, 34, 38, 42, 46, 50, 54, 58, 62, 66, 70, 74)
@@ -131,6 +140,15 @@ def test_official_layer_plan_counts_producers_and_38_40_split():
 
 
 @pytest.mark.cpu
+def test_pipeline_ranges_derive_from_full_index_boundaries_for_arbitrary_pp_degree():
+    config = _official_schedule_config()
+    assert derive_glm52_pipeline_layer_ranges(config, 3) == ((0, 26), (26, 50), (50, 78))
+    assert derive_glm52_pipeline_layer_ranges(config, 4) == ((0, 18), (18, 38), (38, 58), (58, 78))
+    with pytest.raises(ValueError, match="only 21"):
+        derive_glm52_pipeline_layer_ranges(config, 22)
+
+
+@pytest.mark.cpu
 def test_layer_plan_rejects_malformed_schedules_and_shared_stage_start():
     config = _official_schedule_config()
     config.indexer_types = config.indexer_types[:-1]
@@ -162,7 +180,7 @@ def _small_plan() -> Glm52LayerPlan:
 
 
 @pytest.mark.cpu
-def test_index_share_context_lifecycle_reuse_exception_cleanup_and_concurrency_guard():
+def test_index_share_context_lifecycle_reuse_exception_cleanup_and_overlapping_invocations():
     plan = _small_plan()
     manager = IndexShareContextManager(plan, (0, 4))
     payload = CanonicalLogicalIndices(torch.tensor([[[0, 1, -1]]], dtype=torch.int32))
@@ -171,18 +189,32 @@ def test_index_share_context_lifecycle_reuse_exception_cleanup_and_concurrency_g
     published = first.get_or_publish(producer_layer_index=0, layer_plan=plan, produce_payload=lambda: payload)
     assert torch.equal(published.values, payload.values)
     assert first.require(producer_layer_index=0, layer_plan=plan) is published
-    with pytest.raises(RuntimeError, match="one live"):
-        manager.begin(mode=IndexShareMode.FORWARD_ONLY)
+    overlapping = manager.begin(mode=IndexShareMode.TRAINING_WITH_BACKWARD)
+    other_payload = CanonicalLogicalIndices(torch.tensor([[[2, 0, -1]]], dtype=torch.int32))
+    other_published = overlapping.get_or_publish(
+        producer_layer_index=0,
+        layer_plan=plan,
+        produce_payload=lambda: other_payload,
+    )
+    assert other_published is not published
+    assert torch.equal(first.require(producer_layer_index=0, layer_plan=plan).values, payload.values)
+    assert torch.equal(
+        overlapping.require(producer_layer_index=0, layer_plan=plan).values,
+        other_payload.values,
+    )
+    assert manager.active_contexts == (first, overlapping)
     manager.end(first)
     manager.end(first)
     assert first.lifecycle is IndexShareLifecycle.CLOSED
-    assert manager.active is None
+    assert manager.active is overlapping
+    manager.end(overlapping)
+    assert manager.active_contexts == ()
 
     with pytest.raises(RuntimeError, match="body failed"):
         with manager.invocation(mode=IndexShareMode.FORWARD_ONLY) as second:
             second.get_or_publish(producer_layer_index=0, layer_plan=plan, produce_payload=lambda: payload)
             raise RuntimeError("body failed")
-    assert manager.active is None
+    assert manager.active_contexts == ()
 
     with manager.invocation(mode=IndexShareMode.FORWARD_ONLY) as third:
         with pytest.raises(RuntimeError, match="has not published"):
@@ -297,6 +329,223 @@ def _small_glm_config() -> Glm5Config:
         index_topk_pattern=[1, 0, 0, 1],
         mlp_layer_types=["dense", "sparse", "sparse", "sparse"],
     )
+
+
+@pytest.mark.cpu
+def test_staged_glm_pp_relays_index_mode_and_isolates_overlapping_checkpointed_microbatches(monkeypatch):
+    """Exercise the actual staged Glm5Model entry through the PP tensor wrapper."""
+
+    config = _small_glm_config()
+    config.indexer_types = ["full", "shared", "full", "shared"]
+    config.index_topk_freq = 2
+    config.index_topk_pattern = [1, 0, 1, 0]
+    module_plan = install_glm52_pipeline_module_plan(
+        config,
+        num_stages=4,
+        input_weight=2,
+        output_weight=2,
+    )
+    assert module_plan == (
+        ("model.embed_tokens",),
+        ("model.layers.0", "model.layers.1"),
+        ("model.layers.2", "model.layers.3"),
+        ("model.norm", "lm_head"),
+    )
+    assert config._glm52_pipeline_layer_ranges == ((0, 2), (2, 4))
+    whole_model = Glm5ForCausalLM(config)
+    assert whole_model.get_pp_module_config()["module_names_per_stage"] == module_plan
+
+    class _Mesh:
+        @staticmethod
+        def get_local_rank():
+            return 2
+
+        @staticmethod
+        def size():
+            return 4
+
+        @staticmethod
+        def get_group(_name):
+            return object()
+
+    monkeypatch.setattr(pipeline_parallel_module, "PipelineStage", lambda *args, **kwargs: object())
+    monkeypatch.setattr(pipeline_parallel_module, "engage_pp_byte_contract", lambda *args, **kwargs: None)
+    _stages, model_parts = pipeline_parallel_module.pipeline_module_split(
+        whole_model,
+        pp_mesh=_Mesh(),
+        device=torch.device("cpu"),
+        module_names_per_stage=[list(names) for names in module_plan],
+        always_keep_fqns=["model.rotary_emb"],
+    )
+    model = model_parts[0]
+    decoder = model.model
+    plan = decoder.layer_plan
+    assert plan is not None
+    assert model._pp_requires_index_share_mode
+
+    payload_calls = {11: 0, 29: 0}
+    shared_payloads = []
+
+    class _Producer(nn.Module):
+        def forward(
+            self,
+            hidden_states,
+            _attention_mask,
+            position_ids,
+            _output_attentions,
+            _output_router_logits,
+            _position_embeddings,
+            *,
+            index_share_context,
+            **_kwargs,
+        ):
+            marker = int(position_ids[0, 0])
+
+            def produce():
+                payload_calls[marker] += 1
+                return torch.full((*position_ids.shape, 1), marker, dtype=torch.int64)
+
+            payload = index_share_context.get_or_publish(
+                producer_layer_index=2,
+                layer_plan=plan,
+                produce_payload=produce,
+            )
+            return (hidden_states.sin() * 1.25 + payload.values.sum().to(hidden_states) * 0.0,)
+
+    class _Shared(nn.Module):
+        def forward(
+            self,
+            hidden_states,
+            _attention_mask,
+            position_ids,
+            _output_attentions,
+            _output_router_logits,
+            _position_embeddings,
+            *,
+            index_share_context,
+            **_kwargs,
+        ):
+            payload = index_share_context.require(producer_layer_index=2, layer_plan=plan)
+            marker = int(position_ids[0, 0])
+            assert bool(torch.all(payload.values == marker))
+            shared_payloads.append((index_share_context.invocation_id, marker))
+            return (hidden_states.cos() * 0.75,)
+
+    class _Rotary(nn.Module):
+        def forward(self, hidden_states, _position_ids):
+            return hidden_states, hidden_states
+
+    # The actual builder retained the model-derived legal decoder range [2, 4).
+    assert tuple(index for index, layer in enumerate(decoder.layers) if layer is not None) == (2, 3)
+    decoder.layers[2] = _Producer()
+    decoder.layers[3] = _Shared()
+    decoder.norm = nn.Identity()
+    decoder.rotary_emb = _Rotary()
+    decoder._skip_causal_mask = True
+    decoder.gradient_checkpointing = True
+    decoder._gradient_checkpointing_method = "recompute_full_layer"
+    decoder._gradient_checkpointing_func = lambda function, *args, **kwargs: checkpoint(
+        function,
+        *args,
+        use_reentrant=False,
+        **kwargs,
+    )
+    model.train()
+
+    parallel_state = SimpleNamespace(cp_size=1, sp_group=None)
+    cp_strategy = SimpleNamespace(prepare_position_embeddings=lambda value, **_kwargs: value)
+    monkeypatch.setattr(pipeline_parallel_module, "get_parallel_state", lambda: parallel_state)
+    monkeypatch.setattr(glm5_modeling_module, "get_parallel_state", lambda: parallel_state)
+    monkeypatch.setattr(glm5_modeling_module, "get_cp_strategy", lambda: cp_strategy)
+
+    model._pp_lm_head_in_loss = True
+
+    micro_batches = [
+        {
+            "input_ids": torch.tensor([[1, 2]], dtype=torch.long),
+            "position_ids": torch.full((1, 2), marker, dtype=torch.long),
+        }
+        for marker in (11, 29)
+    ]
+    inputs = [torch.randn(1, 2, config.hidden_size, requires_grad=True) for _ in micro_batches]
+    observed_active_counts = []
+
+    class _TwoMicrobatchSchedule:
+        def step(self, _input_ids, *, target, losses, return_outputs):
+            assert target.shape == (2, 2)
+            assert return_outputs is False
+            outputs = [model(hidden_states) for hidden_states in inputs]
+            manager = decoder._index_share_context_managers[(2, 4)]
+            observed_active_counts.append(len(manager.active_contexts))
+            local_losses = [output.sum() for output in outputs]
+            losses.extend(local_losses)
+            # 1F1B-style reverse completion: each checkpoint recompute must
+            # retain the context captured by its own forward.
+            for loss in reversed(local_losses):
+                loss.backward()
+            observed_active_counts.append(len(manager.active_contexts))
+
+    monkeypatch.setattr(training_utils_module, "get_device_type", lambda: "cpu")
+    monkeypatch.setattr(training_utils_module.dist, "all_reduce", lambda *_args, **_kwargs: None)
+    forward_backward_pp(
+        model_parts=[model],
+        pp_schedule=_TwoMicrobatchSchedule(),
+        micro_batches=[{**micro_batch, "labels": micro_batch["input_ids"]} for micro_batch in micro_batches],
+        has_first_stage=True,
+        has_last_stage=True,
+        pp_group=object(),
+    )
+
+    manager = decoder._index_share_context_managers[(2, 4)]
+    assert observed_active_counts == [2, 2]
+    assert payload_calls == {11: 1, 29: 1}
+    assert [marker for _, marker in shared_payloads] == [11, 29, 29, 11]
+    assert len({invocation_id for invocation_id, _ in shared_payloads}) == 2
+    assert manager.active_contexts == ()
+
+
+@pytest.mark.cpu
+def test_glm_pipeline_builder_makes_module_only_edges_without_index_share(monkeypatch):
+    config = _small_glm_config()
+    config.indexer_types = ["full", "shared", "full", "shared"]
+    config.index_topk_freq = 2
+    config.index_topk_pattern = [1, 0, 1, 0]
+    module_plan = install_glm52_pipeline_module_plan(
+        config,
+        num_stages=4,
+        input_weight=2,
+        output_weight=2,
+    )
+    whole_model = Glm5ForCausalLM(config)
+    monkeypatch.setattr(pipeline_parallel_module, "PipelineStage", lambda *args, **kwargs: object())
+    monkeypatch.setattr(pipeline_parallel_module, "engage_pp_byte_contract", lambda *args, **kwargs: None)
+
+    class _Mesh:
+        def __init__(self, rank):
+            self.rank = rank
+
+        def get_local_rank(self):
+            return self.rank
+
+        @staticmethod
+        def size():
+            return 4
+
+        @staticmethod
+        def get_group(_name):
+            return object()
+
+    for rank in (0, 3):
+        _stages, model_parts = pipeline_parallel_module.pipeline_module_split(
+            whole_model,
+            pp_mesh=_Mesh(rank),
+            device=torch.device("cpu"),
+            module_names_per_stage=[list(names) for names in module_plan],
+            always_keep_fqns=["model.rotary_emb"],
+        )
+        part = model_parts[0]
+        assert not part._pp_requires_index_share_mode
+        assert part.model._index_share_manager_for_local_layers() is None
 
 
 @pytest.mark.cpu

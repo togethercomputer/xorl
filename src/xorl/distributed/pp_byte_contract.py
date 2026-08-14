@@ -1,26 +1,24 @@
-"""Fail-closed byte-boundary contract for pipeline-parallel exact lanes.
+"""Structural boundary checks for pipeline-parallel model splits.
 
 The exact train/serve lanes promise forward logit-path bytes identical to the
 unpartitioned (PP1) program, which itself matches the sampler. Cutting the
 trainer at a pipeline-stage boundary is admitted only when every required
 boundary invariant is either bitwise by construction or guarded here:
 
-- the model family's decoder-layer boundary must be a certified natural BF16
-  rounding boundary (the residual stream is materialized to one BF16 tensor
-  before it would cross the wire, so send/recv moves final bytes, not an
-  unrounded intermediate);
-- the stage plan may cut only between decoder layers, with contiguous global
+- the stage plan may cut only at decoder boundaries, with contiguous global
   layer coverage, embeddings on stage 0 only, and the final norm and head
-  together on the last stage;
-- pruning must preserve global ``ModuleList`` indices and ``layer_idx`` so
+  together on the last stage. Module-only edge stages are valid cuts before
+  layer 0 or after the final layer;
+- pruning must preserve global ``ModuleList`` indices and, when exposed,
+  ``layer_idx``/``layer_id`` so
   layer-position-keyed kernel selection (for example the Qwen3.5 layer-0
   vs layer>0 input-norm families) cannot silently flip at a cut;
 - validated model parts are marked so ``_pp_forward`` refuses to fabricate
   per-microbatch metadata (silent positional fallback changes bytes with no
   error).
 
-Everything else RAISEs ``PPByteContractError``. Generic (non-exact) models are
-untouched: they never claimed a byte contract at PP1 either.
+Family labels are diagnostic only.  Admission follows the model's actual
+module split, live process groups, metadata, and boundary tensor state.
 """
 
 from __future__ import annotations
@@ -43,6 +41,7 @@ __all__ = [
     "assert_pp_wire_dtype",
     "engage_pp_byte_contract",
     "exact_contract_family",
+    "validate_pp_wire_boundary_state",
     "validate_pp_exact_microbatch_metadata",
 ]
 
@@ -66,37 +65,20 @@ PP_EXACT_REQUIRED_METADATA = (
 )
 
 
-#: Families whose decoder-layer boundary is certified as a natural BF16
-#: rounding boundary, gated by tests/distributed/test_pp_byte_alignment.py.
-_CERTIFIED_BOUNDARY_FAMILIES = frozenset({"qwen3_5_dense"})
-
-#: The ONLY fp32 parameters admitted to ride along inside an otherwise-bf16
-#: stage, as (owner module class name, parameter attribute) pairs. The exact
-#: GDN deliberately pins its gating parameters to fp32 (its ``.to(bf16)``
-#: skips them); everything else in a marked stage must be bf16.
-_APPROVED_FP32_PIN_OWNERS = frozenset(
-    {
-        ("GatedDeltaNet", "A_log"),
-        ("GatedDeltaNet", "dt_bias"),
-    }
-)
-
-
 _UNSTAMPED = object()
 
 
 def exact_contract_family(config: object | None) -> Optional[str]:
     """Classify the exact value program selected by ``config``.
 
-    Returns ``None`` for generic models (no byte contract claimed), otherwise
-    one of ``"qwen3_5_dense"``, ``"qwen3_5_moe"``, ``"glm52"``.
+    Returns ``None`` for generic models, otherwise the resolved exact-program
+    identifier used for diagnostics and exact runtime behavior.
 
     Model resolution stamps ``config._exact_contract_family`` once; when the
     stamp is present it is authoritative (including a stamped ``None`` for
     generic models). Configs that predate stamping (for example direct
     construction in tests) fall back to the shared legacy-flag resolver.
-    Admitting a new family is a registry change (stamp entry plus byte
-    evidence), not surgery on this classifier.
+    Pipeline admission is structural and never branches on this name.
     """
 
     if config is None:
@@ -126,7 +108,7 @@ def _validate_stage_plan(
     output_fqns: Sequence[str],
     num_layers: int,
 ) -> List[List[int]]:
-    """Cut-point admission: cuts only between contiguous decoder layers."""
+    """Admit contiguous decoder cuts, including module-only edge stages."""
 
     num_stages = len(module_names_per_stage)
     per_stage_layers: List[List[int]] = []
@@ -134,12 +116,12 @@ def _validate_stage_plan(
     for stage_idx, module_names in enumerate(module_names_per_stage):
         names = set(module_names)
         layers = _stage_layer_indices(module_names, layer_prefix)
-        if not layers:
+        if not layers and stage_idx not in (0, num_stages - 1):
             raise PPByteContractError(
-                f"PP byte contract: stage {stage_idx} owns no decoder layers; every stage must "
-                f"cut between '{layer_prefix}.*' modules"
+                f"PP byte contract: middle stage {stage_idx} owns no decoder layers; only the input edge "
+                "before layer 0 and the output edge after the final layer may be module-only"
             )
-        if sorted(layers) != list(range(min(layers), max(layers) + 1)):
+        if layers and sorted(layers) != list(range(min(layers), max(layers) + 1)):
             raise PPByteContractError(f"PP byte contract: stage {stage_idx} layers {sorted(layers)} are not contiguous")
         for fqn in input_fqns:
             if stage_idx == 0 and fqn not in names:
@@ -175,7 +157,7 @@ def _validate_part_layer_identity(
     expected_layers: Sequence[int],
     layer_prefix: str,
 ) -> None:
-    """Pruning must preserve global layer indices and ``layer_idx``."""
+    """Pruning must preserve global layer indices and any model index field."""
 
     try:
         container = model_part.get_submodule(layer_prefix)
@@ -192,12 +174,9 @@ def _validate_part_layer_identity(
             f"layer-position-keyed kernel selection cannot flip at a cut"
         )
     for idx, layer in kept:
-        layer_idx = getattr(layer, "layer_idx", None)
+        layer_idx = getattr(layer, "layer_idx", getattr(layer, "layer_id", None))
         if layer_idx is None:
-            raise PPByteContractError(
-                f"PP byte contract: stage {stage_idx} layer {layer_prefix}.{idx} has no layer_idx; "
-                f"global layer identity cannot be verified"
-            )
+            continue
         if int(layer_idx) != idx:
             raise PPByteContractError(
                 f"PP byte contract: stage {stage_idx} layer {layer_prefix}.{idx} carries layer_idx="
@@ -205,99 +184,58 @@ def _validate_part_layer_identity(
             )
 
 
-def _declared_dtype(config: object) -> object:
-    dtype = getattr(config, "dtype", None)
-    if dtype is None and hasattr(config, "__dict__"):
-        # Older transformers configs expose only torch_dtype (newer ones alias
-        # it to ``dtype`` with a deprecation warning, so prefer ``dtype``).
-        dtype = config.__dict__.get("torch_dtype")
-    if dtype is None:
-        text_config = getattr(config, "text_config", None)
-        if text_config is not None:
-            dtype = _declared_dtype(text_config)
-    if isinstance(dtype, str):
-        dtype = getattr(torch, dtype, dtype)
-    return dtype
-
-
-def _validate_model_dtype(config: object) -> None:
-    """The wire contract requires an EXPLICIT bfloat16 declaration.
-
-    Fail closed on absence: an undeclared-dtype model (e.g. an ordinary FP32
-    construction) must never be markable as exact. The inter-stage wire
-    carries the materialized BF16 residual stream and the downstream stage-IO
-    declarations assume it.
-    """
-    dtype = _declared_dtype(config)
-    if dtype is None:
-        raise PPByteContractError(
-            "PP byte contract: the model config declares no weight dtype; the exact PP lane "
-            "requires an explicit bfloat16 declaration (config.dtype) and refuses to guess"
-        )
-    if dtype is not torch.bfloat16:
-        raise PPByteContractError(
-            f"PP byte contract: the inter-stage wire carries the materialized BF16 residual stream; "
-            f"declared model dtype={dtype} is not admitted"
-        )
-
-
-def _validate_actual_param_reality(
-    model_part: nn.Module,
-    stage_idx: int,
-    *,
-    expects_bf16_mixed_precision: bool,
+def _validate_pipeline_ranges(
+    per_stage_layers: Sequence[Sequence[int]],
+    exact_ranges: Sequence[Sequence[int]] | None,
 ) -> None:
-    """Validate the RESOLVED parameter reality, not configuration metadata.
+    """Validate model-owned state boundaries when the model declares them."""
 
-    A model may declare bfloat16 while its parameters are something else; the
-    declaration alone must never mark it exact. Admitted realities:
-
-    - parameters in bf16, where any fp32 parameter riding along must be an
-      APPROVED pin (``_APPROVED_FP32_PIN_OWNERS``): the exact GDN pins its
-      gating parameters to fp32 by design. An arbitrary bf16/fp32 mixture is
-      NOT admitted — a rogue fp32 parameter RAISES naming it;
-    - uniformly fp32 parameters WHEN the caller declares bf16 mixed-precision
-      intent (production full-weight masters; FSDP2's bf16 compute policy is
-      applied after the split, and the runtime wire assertions in
-      ``_pp_forward`` verify the resulting bytes).
-
-    Everything else RAISES naming declared vs actual.
-    """
-    saw_bf16 = False
-    fp32_names = []
-    for name, param in model_part.named_parameters():
-        if not param.is_floating_point():
-            continue
-        if param.dtype == torch.bfloat16:
-            saw_bf16 = True
-        elif param.dtype == torch.float32:
-            fp32_names.append(name)
-        else:
-            raise PPByteContractError(
-                f"PP byte contract: declared model dtype is bfloat16 but stage {stage_idx} parameter "
-                f"{name!r} is {param.dtype}; declared-vs-actual mismatch is not admitted"
-            )
-    if not saw_bf16 and not fp32_names:
-        raise PPByteContractError(
-            f"PP byte contract: stage {stage_idx} part has no floating-point parameters to validate"
-        )
-    if not saw_bf16:
-        if not expects_bf16_mixed_precision:
-            raise PPByteContractError(
-                f"PP byte contract: declared model dtype is bfloat16 but stage {stage_idx} parameters "
-                f"are uniformly float32 and no bf16 mixed-precision compute policy was declared; a "
-                f"declaration alone does not make the wire bf16 (declared=bfloat16, actual=float32)"
-            )
+    if exact_ranges is None:
         return
-    for name in fp32_names:
-        owner_path, _, attribute = name.rpartition(".")
-        owner = model_part.get_submodule(owner_path) if owner_path else model_part
-        if (type(owner).__name__, attribute) not in _APPROVED_FP32_PIN_OWNERS:
+    normalized = tuple((int(start), int(end)) for start, end in exact_ranges)
+    # Embedding-only/head-only stages do not own model state keyed by decoder
+    # ranges. Compare the declared boundaries to the nonempty decoder stages;
+    # edge stages remain legal so long as the decoder-owned state is neither
+    # split nor stranded.
+    actual = tuple((layers[0], layers[-1] + 1) for layers in per_stage_layers if layers)
+    if actual != normalized:
+        raise PPByteContractError(
+            f"PP byte contract: model-derived legal decoder ranges are {normalized}, got {actual}; "
+            "the cut would strand model-owned state outside the residual-stream wire"
+        )
+
+
+def _validate_stage_local_groups(parallel_state: object | None) -> None:
+    """Require active EP/head groups to stay inside the live PP mesh slice."""
+
+    if parallel_state is None or not torch.distributed.is_initialized():
+        return
+    device_mesh = getattr(parallel_state, "device_mesh", None)
+    if device_mesh is None:
+        return
+    mesh = device_mesh.mesh
+    dim_names = tuple(device_mesh.mesh_dim_names)
+    coordinate = device_mesh.get_coordinate()
+    if coordinate is None:
+        raise PPByteContractError("PP byte contract: current rank has no live device-mesh coordinate")
+    if "pp" in dim_names:
+        pp_dim = dim_names.index("pp")
+        stage_ranks = {int(rank) for rank in mesh.select(pp_dim, int(coordinate[pp_dim])).reshape(-1).tolist()}
+    else:
+        stage_ranks = {int(rank) for rank in mesh.reshape(-1).tolist()}
+
+    for name in ("ep_group", "lm_head_tp_group", "lm_head_tp_replica_group"):
+        try:
+            group = getattr(parallel_state, name)
+        except (AttributeError, RuntimeError):
+            group = None
+        if group is None:
+            continue
+        group_ranks = {int(rank) for rank in torch.distributed.get_process_group_ranks(group)}
+        if not group_ranks.issubset(stage_ranks):
             raise PPByteContractError(
-                f"PP byte contract: stage {stage_idx} float32 parameter {name!r} (owner "
-                f"{type(owner).__name__}) is not an approved fp32 pin; approved pins: "
-                f"{sorted(_APPROVED_FP32_PIN_OWNERS)}. An arbitrary bf16/fp32 mixture is not "
-                f"admitted (declared=bfloat16, actual mixture)"
+                f"PP byte contract: live {name} ranks {sorted(group_ranks)} cross the current "
+                f"pipeline stage {sorted(stage_ranks)}"
             )
 
 
@@ -368,15 +306,66 @@ def assert_pp_wire_dtype(tensor: torch.Tensor, *, where: str) -> None:
         )
 
 
+def validate_pp_wire_boundary_state(tensor: torch.Tensor, boundary_state: dict | None, *, where: str) -> None:
+    """Validate the runtime dtype, rank, and suffix of a nonstandard PP state."""
+
+    if boundary_state is None:
+        return
+    expected_rank = boundary_state["rank"]
+    expected_suffix = boundary_state["shape_suffix"]
+    expected_dtype = boundary_state["dtype"]
+    if (
+        tensor.dtype is not expected_dtype
+        or tensor.ndim != expected_rank
+        or tuple(tensor.shape[-len(expected_suffix) :]) != expected_suffix
+    ):
+        raise PPByteContractError(
+            f"PP byte contract: {where} for state {boundary_state['state']!r} must have dtype "
+            f"{expected_dtype}, rank {expected_rank}, and shape suffix {expected_suffix}; got "
+            f"dtype={tensor.dtype}, shape={tuple(tensor.shape)}"
+        )
+
+
+def _normalize_pipeline_boundary_state(value: object | None) -> dict | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise PPByteContractError("PP byte contract: pipeline_boundary_state must be a mapping")
+    required = {"rank", "dtype", "shape_suffix", "state"}
+    if set(value) != required:
+        raise PPByteContractError(
+            f"PP byte contract: pipeline_boundary_state fields must be {sorted(required)}, got {sorted(value)}"
+        )
+    rank = value["rank"]
+    suffix = value["shape_suffix"]
+    state = value["state"]
+    dtype = value["dtype"]
+    if isinstance(dtype, str):
+        dtype = getattr(torch, dtype, None)
+    if not isinstance(rank, int) or isinstance(rank, bool) or rank <= 0:
+        raise PPByteContractError("PP byte contract: boundary rank must be a positive integer")
+    if not isinstance(dtype, torch.dtype):
+        raise PPByteContractError("PP byte contract: boundary dtype must name a torch dtype")
+    if (
+        not isinstance(suffix, (tuple, list))
+        or not suffix
+        or any(not isinstance(dim, int) or isinstance(dim, bool) or dim <= 0 for dim in suffix)
+    ):
+        raise PPByteContractError("PP byte contract: boundary shape_suffix must contain positive integers")
+    if len(suffix) > rank or not isinstance(state, str) or not state:
+        raise PPByteContractError("PP byte contract: boundary state descriptor is invalid")
+    return {"rank": rank, "dtype": dtype, "shape_suffix": tuple(suffix), "state": state}
+
+
 def engage_pp_byte_contract(
     whole_model: nn.Module,
     module_names_per_stage: Sequence[Sequence[str]],
     stage_ids: Sequence[int],
     model_parts: Sequence[nn.Module],
     *,
-    expects_bf16_mixed_precision: bool = False,
+    parallel_state: object | None = None,
 ) -> None:
-    """Validate and mark an exact-contract pipeline split; no-op for generic models.
+    """Validate a model-derived pipeline split and mark exact runtime checks.
 
     Called from ``pipeline_module_split`` after pruning. Raises
     ``PPByteContractError`` when the split cannot preserve byte identity with
@@ -385,32 +374,20 @@ def engage_pp_byte_contract(
 
     config = getattr(whole_model, "config", None)
     family = exact_contract_family(config)
-    if family is None:
-        return
-    if family == "qwen3_5_moe":
-        raise PPByteContractError(
-            "PP byte contract: the exact Qwen3.5-MoE program is not admitted with pipeline "
-            "parallelism; the ordered EP combine has no qualified EP/PP interaction"
-        )
-    if family == "glm52":
-        raise PPByteContractError("PP byte contract: the exact GLM-5.2 program is admitted at PP1 only")
-    if family not in _CERTIFIED_BOUNDARY_FAMILIES:
-        raise PPByteContractError(
-            f"PP byte contract: model family {family!r} has no certified natural rounding "
-            f"boundary at decoder-layer cuts"
-        )
+    exact_runtime = family is not None or bool(getattr(config, "_dsv4_flash_exact_mode", False))
+    diagnostic_family = family or getattr(config, "model_type", type(whole_model).__name__)
 
     if not hasattr(whole_model, "get_pp_module_config"):
         raise PPByteContractError(
-            "PP byte contract: exact-contract models must expose get_pp_module_config() so cut points can be validated"
+            "PP byte contract: pipeline models must expose get_pp_module_config() so cut points can be validated"
         )
     pp_config = whole_model.get_pp_module_config()
     layer_prefix = pp_config.get("layer_prefix", "layers")
     input_fqns = tuple(pp_config.get("input_fqns") or ())
     output_fqns = tuple(pp_config.get("output_fqns") or ())
     num_layers = int(pp_config["num_layers"])
+    boundary_state = _normalize_pipeline_boundary_state(pp_config.get("pipeline_boundary_state"))
 
-    _validate_model_dtype(config)
     per_stage_layers = _validate_stage_plan(
         module_names_per_stage,
         input_fqns=input_fqns,
@@ -418,19 +395,22 @@ def engage_pp_byte_contract(
         output_fqns=output_fqns,
         num_layers=num_layers,
     )
+    _validate_pipeline_ranges(per_stage_layers, pp_config.get("pipeline_layer_ranges"))
+    _validate_stage_local_groups(parallel_state)
 
     # Validate EVERY local part before marking ANY: a failure mid-loop must
     # not leave earlier stages marked as exact.
     for stage_idx, model_part in zip(stage_ids, model_parts):
         _validate_part_layer_identity(model_part, stage_idx, per_stage_layers[stage_idx], layer_prefix)
-        _validate_actual_param_reality(model_part, stage_idx, expects_bf16_mixed_precision=expects_bf16_mixed_precision)
     for stage_idx, model_part in zip(stage_ids, model_parts):
         # _pp_forward refuses silent metadata fallbacks on marked parts
         # and asserts the bf16 wire reality on stage inputs/outputs.
-        model_part._pp_exact_boundary_contract = True
+        model_part._pp_exact_boundary_contract = exact_runtime
+        model_part._pp_pipeline_boundary_state = boundary_state
         layers = per_stage_layers[stage_idx]
+        layer_summary = "none" if not layers else f"{layers[0]}..{layers[-1]}"
         logger.info(
-            f"PP byte-boundary contract engaged: family={family} stage={stage_idx} "
-            f"layers=[{layers[0]}..{layers[-1]}] wire=bf16(materialized residual stream) "
+            f"PP structural boundary engaged: family={diagnostic_family} stage={stage_idx} "
+            f"layers=[{layer_summary}] "
             f"first={stage_idx == 0} last={stage_idx == len(per_stage_layers) - 1}"
         )

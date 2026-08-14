@@ -126,38 +126,6 @@ class Dsv4FlashAdapterInventory:
         return dict(Counter(target.role for target in self.targets))
 
 
-@dataclass(frozen=True)
-class Dsv4FlashTrainingTopology:
-    """First byte-proxy candidate; not a promotion-qualified topology."""
-
-    world_size: int
-    dp_size: int
-    dp_replicate_size: int
-    dp_shard_size: int
-    tp_size: int
-    pp_size: int
-    ep_size: int
-    cp_size: int
-    ringattn_size: int
-    ulysses_size: int
-    lm_head_tp_size: int
-
-
-DSV4_FLASH_RCA_TRAINING_TOPOLOGY = Dsv4FlashTrainingTopology(
-    world_size=8,
-    dp_size=8,
-    dp_replicate_size=1,
-    dp_shard_size=8,
-    tp_size=1,
-    pp_size=1,
-    ep_size=8,
-    cp_size=1,
-    ringattn_size=1,
-    ulysses_size=1,
-    lm_head_tp_size=8,
-)
-
-
 def is_dsv4_flash_config(config: Any) -> bool:
     architectures = set(getattr(config, "architectures", None) or ())
     return getattr(config, "model_type", None) == "deepseek_v4" and "DeepseekV4ForCausalLM" in architectures
@@ -265,31 +233,6 @@ def validate_dsv4_flash_official_geometry(config: Any) -> None:
         raise ValueError(
             "The exact DeepSeek-V4-Flash program supports only the official model geometry: " + ", ".join(mismatches)
         )
-
-
-def validate_dsv4_flash_training_topology(parallel_state: Any) -> Dsv4FlashTrainingTopology:
-    """Resolve and validate the first shape-preserving WORLD8 RCA proxy."""
-
-    actual = Dsv4FlashTrainingTopology(
-        world_size=int(parallel_state.world_size),
-        dp_size=int(parallel_state.dp_size),
-        dp_replicate_size=int(parallel_state.dp_replicate_size),
-        dp_shard_size=int(parallel_state.dp_shard_size),
-        tp_size=int(parallel_state.tp_size),
-        pp_size=int(parallel_state.pp_size),
-        ep_size=int(parallel_state.ep_size),
-        cp_size=int(parallel_state.cp_size),
-        ringattn_size=int(parallel_state.ringattn_size),
-        ulysses_size=int(parallel_state.ulysses_size),
-        lm_head_tp_size=int(getattr(parallel_state, "lm_head_tp_size", 1)),
-    )
-    if actual != DSV4_FLASH_RCA_TRAINING_TOPOLOGY:
-        raise ValueError(
-            "The DeepSeek-V4-Flash exact RCA lane currently admits only "
-            f"{DSV4_FLASH_RCA_TRAINING_TOPOLOGY}; got {actual}. This topology is "
-            "a byte-proxy candidate and is not promotion-qualified until full replay agrees."
-        )
-    return actual
 
 
 def validate_dsv4_flash_adapter_program(
@@ -521,18 +464,15 @@ __all__ = [
     "DSV4_FLASH_COMPRESS_RATIOS",
     "DSV4_FLASH_LOGICAL_FACTOR_COUNT",
     "DSV4_FLASH_NON_ROUTED_LOGICAL_PROJECTION_COUNT",
-    "DSV4_FLASH_RCA_TRAINING_TOPOLOGY",
     "DSV4_FLASH_REQUIRED_TARGET_MODULES",
     "DSV4_FLASH_ROUTED_BANK_COUNT",
     "DSV4_FLASH_TARGET_ENTITY_COUNT",
     "Dsv4FlashAdapterFactor",
     "Dsv4FlashAdapterInventory",
     "Dsv4FlashAdapterTarget",
-    "Dsv4FlashTrainingTopology",
     "build_dsv4_flash_adapter_inventory",
     "bind_dsv4_flash_adapter_inventory",
     "is_dsv4_flash_config",
     "validate_dsv4_flash_adapter_program",
     "validate_dsv4_flash_official_geometry",
-    "validate_dsv4_flash_training_topology",
 ]

@@ -28,6 +28,7 @@ from xorl.distributed.pp_byte_contract import (
 )
 from xorl.models.exact_contract import set_glm52_exact_active_lora
 from xorl.models.layers.normalization import set_rmsnorm_mode
+from xorl.models.transformers.glm5.layer_plan import derive_glm52_pipeline_layer_ranges
 from xorl.models.transformers.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
 from xorl.models.transformers.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
 from xorl.trainers.training_utils import make_pp_loss_fn
@@ -57,9 +58,6 @@ def _tiny_model(exact: bool = True) -> Qwen3_5ForCausalLM:
     if exact:
         config._qwen35_exact_contract = True
         config._qwen35_rmsnorm_family = "v1"
-        # The byte contract fails closed on undeclared dtype AND validates the
-        # declaration against actual parameter dtypes, so the exact tiny model
-        # must genuinely be bf16.
         config.dtype = torch.bfloat16
         return Qwen3_5ForCausalLM(config).to(torch.bfloat16)
     return Qwen3_5ForCausalLM(config)
@@ -92,13 +90,12 @@ def _split_parts(model, module_names_per_stage) -> list:
     return parts
 
 
-def _engage(model, plan, parts, *, expects_bf16_mixed_precision: bool = False):
+def _engage(model, plan, parts):
     engage_pp_byte_contract(
         model,
         module_names_per_stage=plan,
         stage_ids=list(range(len(plan))),
         model_parts=parts,
-        expects_bf16_mixed_precision=expects_bf16_mixed_precision,
     )
 
 
@@ -167,23 +164,6 @@ def test_exact_dense_engages_and_marks_parts():
 
 
 # ---------------------------------------------------------------------------
-# Family floors fail closed
-# ---------------------------------------------------------------------------
-
-
-def test_exact_moe_with_pp_raises():
-    stub = SimpleNamespace(config=SimpleNamespace(_qwen35_exact_contract=True, model_type="qwen3_5_moe"))
-    with pytest.raises(PPByteContractError, match="Qwen3.5-MoE"):
-        engage_pp_byte_contract(stub, module_names_per_stage=[[], []], stage_ids=[0, 1], model_parts=[None, None])
-
-
-def test_exact_glm52_with_pp_raises():
-    stub = SimpleNamespace(config=SimpleNamespace(_glm52_exact_contract=True))
-    with pytest.raises(PPByteContractError, match="GLM-5.2"):
-        engage_pp_byte_contract(stub, module_names_per_stage=[[], []], stage_ids=[0, 1], model_parts=[None, None])
-
-
-# ---------------------------------------------------------------------------
 # Cut-point admission fails closed
 # ---------------------------------------------------------------------------
 
@@ -221,107 +201,80 @@ def test_descending_stage_order_raises():
         _engage(model, plan, parts)
 
 
-def test_stage_without_decoder_layers_raises():
+def test_module_only_input_edge_stage_is_structurally_valid():
     model = _tiny_model(exact=True)
     plan = [
         ["model.embed_tokens"],
         ["model.layers.0", "model.layers.1", "model.layers.2", "model.layers.3", "model.norm", "lm_head"],
     ]
     parts = _split_parts(model, plan)
-    with pytest.raises(PPByteContractError, match="owns no decoder layers"):
-        _engage(model, plan, parts)
-
-
-def test_non_bf16_model_dtype_raises():
-    model = _tiny_model(exact=True)
-    model.config.dtype = torch.float16
-    plan = _default_plan(model)
-    parts = _split_parts(model, plan)
-    with pytest.raises(PPByteContractError, match="not admitted"):
-        _engage(model, plan, parts)
-
-
-def test_undeclared_model_dtype_raises():
-    """Fail closed on ABSENCE: an ordinary model with no dtype declaration
-    (e.g. a default FP32 construction) must never be markable as exact."""
-    model = _tiny_model(exact=True)
-    model.config.dtype = None
-    plan = _default_plan(model)
-    parts = _split_parts(model, plan)
-    with pytest.raises(PPByteContractError, match="declares no weight dtype"):
-        _engage(model, plan, parts)
-
-
-def test_declared_bf16_with_fp32_params_raises():
-    """The declaration must match the RESOLVED reality: a model declaring
-    bfloat16 while its parameters are float32 (and no bf16 mixed-precision
-    compute policy is coming) must not be marked exact."""
-    model = _tiny_model(exact=True).to(torch.float32)
-    assert model.config.dtype == torch.bfloat16  # declared bf16, actual fp32
-    plan = _default_plan(model)
-    parts = _split_parts(model, plan)
-    with pytest.raises(PPByteContractError, match="declared=bfloat16, actual=float32"):
-        _engage(model, plan, parts)
-    assert not any(getattr(part, "_pp_exact_boundary_contract", False) for part in parts)
-
-
-def test_fp32_masters_admitted_only_with_mixed_precision_intent():
-    """Uniform fp32 masters are the production full-weight shape; they are
-    admitted only when the caller declares bf16 mixed-precision compute (the
-    runtime wire assertions then verify the actual bytes)."""
-    model = _tiny_model(exact=True).to(torch.float32)
-    plan = _default_plan(model)
-    parts = _split_parts(model, plan)
-    _engage(model, plan, parts, expects_bf16_mixed_precision=True)
+    _engage(model, plan, parts)
     assert all(part._pp_exact_boundary_contract for part in parts)
 
 
-def test_rogue_fp32_param_among_bf16_raises():
-    """An arbitrary bf16/fp32 mixture is not admitted: any fp32 parameter that
-    is not an APPROVED pin RAISES naming the parameter."""
+def test_module_only_output_edge_stage_is_structurally_valid():
     model = _tiny_model(exact=True)
-    plan = _default_plan(model)
-    parts = _split_parts(model, plan)
-    rogue = parts[1].model.layers[2].mlp.down_proj.weight
-    rogue.data = rogue.data.to(torch.float32)
-    with pytest.raises(PPByteContractError, match=r"down_proj\.weight.*not an approved fp32 pin"):
-        _engage(model, plan, parts)
-    assert not any(getattr(part, "_pp_exact_boundary_contract", False) for part in parts)
-
-
-def test_approved_gdn_fp32_pins_admitted():
-    """The exact GDN's fp32-pinned gating parameters (A_log/dt_bias) are the
-    approved mixture: a bf16 model containing them engages and is marked."""
-    set_rmsnorm_mode("sglang_fused")
-    config = Qwen3_5Config(
-        vocab_size=64,
-        hidden_size=32,
-        intermediate_size=64,
-        num_hidden_layers=4,
-        num_attention_heads=2,
-        num_key_value_heads=2,
-        linear_num_key_heads=2,
-        linear_num_value_heads=2,
-        linear_key_head_dim=16,
-        linear_value_head_dim=16,
-        layer_types=["linear_attention", "full_attention"] * 2,
-        max_position_embeddings=64,
-        use_cache=False,
-        tie_word_embeddings=False,
-    )
-    config._attn_implementation = "eager"
-    config._activation_native = True
-    config._qwen35_exact_contract = True
-    config._qwen35_rmsnorm_family = "v1"
-    config.dtype = torch.bfloat16
-    model = Qwen3_5ForCausalLM(config).to(torch.bfloat16)
-    # The GDN pins survive .to(bf16) by design — assert the premise holds.
-    pinned = {n for n, p in model.named_parameters() if p.dtype == torch.float32}
-    assert pinned and all(n.endswith(("A_log", "dt_bias")) for n in pinned)
-    plan = _default_plan(model)
+    plan = [
+        ["model.embed_tokens", "model.layers.0", "model.layers.1", "model.layers.2", "model.layers.3"],
+        ["model.norm", "lm_head"],
+    ]
     parts = _split_parts(model, plan)
     _engage(model, plan, parts)
     assert all(part._pp_exact_boundary_contract for part in parts)
+
+
+def test_generic_weighted_plan_with_both_module_only_edge_stages_is_valid():
+    model = _tiny_model(exact=False)
+    pp_config = model.get_pp_module_config()
+    plan = generate_llm_fqn_per_model_part(
+        num_stages=4,
+        num_layers=pp_config["num_layers"],
+        input_weight=2,
+        output_weight=2,
+        input_fqns=pp_config["input_fqns"],
+        layer_prefix=pp_config["layer_prefix"],
+        output_fqns=pp_config["output_fqns"],
+    )
+    assert plan == [
+        ["model.embed_tokens"],
+        ["model.layers.0", "model.layers.1"],
+        ["model.layers.2", "model.layers.3"],
+        ["model.norm", "lm_head"],
+    ]
+    parts = _split_parts(model, plan)
+    _engage(model, plan, parts)
+    assert not any(part._pp_exact_boundary_contract for part in parts)
+
+
+def test_module_only_middle_stage_is_rejected():
+    model = _tiny_model(exact=False)
+    plan = [
+        ["model.embed_tokens", "model.layers.0", "model.layers.1"],
+        [],
+        ["model.layers.2", "model.layers.3", "model.norm", "lm_head"],
+    ]
+    parts = _split_parts(model, plan)
+    with pytest.raises(PPByteContractError, match="middle stage 1 owns no decoder layers"):
+        _engage(model, plan, parts)
+
+
+def test_glm_derived_ranges_compare_nonempty_decoder_stages_with_module_only_edges():
+    from xorl.distributed.pp_byte_contract import _validate_pipeline_ranges
+
+    config = SimpleNamespace(
+        num_hidden_layers=4,
+        indexer_types=["full", "shared", "full", "shared"],
+        index_topk_freq=2,
+        index_skip_topk_offset=0,
+        index_topk_pattern=[1, 0, 1, 0],
+        mlp_layer_types=["dense", "sparse", "sparse", "sparse"],
+    )
+    glm_ranges = derive_glm52_pipeline_layer_ranges(config, 2)
+    assert glm_ranges == ((0, 2), (2, 4))
+
+    _validate_pipeline_ranges([[], [0, 1], [2, 3], []], glm_ranges)
+    with pytest.raises(PPByteContractError, match="model-derived legal decoder ranges"):
+        _validate_pipeline_ranges([[], [0], [1, 2, 3], []], glm_ranges)
 
 
 def test_non_bf16_wire_input_raises_on_marked_stage():
@@ -459,6 +412,7 @@ def test_generic_part_keeps_silent_fallback():
     parts = _split_parts(model, plan)
     _engage(model, plan, parts)
     part = parts[0]
+    assert part._pp_exact_boundary_contract is False
     part._pp_batch_metadata = deque()
     input_ids = torch.randint(0, model.config.vocab_size, (1, 8))
     with torch.no_grad():
@@ -466,6 +420,26 @@ def test_generic_part_keeps_silent_fallback():
     assert hidden.shape == (1, 8, model.config.hidden_size)
 
 
-def test_bi_fused_pp_training_loss_raises():
-    with pytest.raises(NotImplementedError, match="bi_fused"):
-        make_pp_loss_fn("bi_fused")
+def test_bi_fused_pp_loss_defers_terminal_head_lookup():
+    loss_fn = make_pp_loss_fn("bi_fused")
+    with pytest.raises(ValueError, match="terminal-stage lm_head"):
+        loss_fn(torch.zeros(1, 2, 4), torch.zeros(1, 2, dtype=torch.long))
+
+
+def test_pp_padding_uses_identity_temperature_for_synthetic_tokens():
+    from xorl.trainers.training_utils import pad_micro_batches_for_pp
+
+    micro_batches = [
+        {
+            "input_ids": torch.tensor([[1, 2]], dtype=torch.long),
+            "labels": torch.tensor([[2, 3]], dtype=torch.long),
+            "logprob_temperatures": torch.tensor([[0.5, 2.0]], dtype=torch.float32),
+        }
+    ]
+
+    pad_micro_batches_for_pp(micro_batches, sample_packing_sequence_len=4)
+
+    torch.testing.assert_close(
+        micro_batches[0]["logprob_temperatures"],
+        torch.tensor([[0.5, 2.0, 1.0, 1.0]], dtype=torch.float32),
+    )

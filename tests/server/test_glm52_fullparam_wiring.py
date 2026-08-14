@@ -283,12 +283,12 @@ def test_server_arguments_fail_closed_on_invalid_fullparam_rows() -> None:
         ("reshard_after_forward", False),
     ],
 )
-def test_server_arguments_reject_unqualified_fullparam_topologies(field, value) -> None:
-    with pytest.raises(ValueError, match="WORLD16/EP16/Ulysses16"):
-        _fullparam_args(**{field: value})
+def test_server_arguments_carries_fullparam_topology_without_a_family_allowlist(field, value) -> None:
+    arguments = _fullparam_args(**{field: value})
+    assert getattr(arguments, field) == value
 
 
-def test_build_training_model_refuses_invalid_fullparam_combinations_before_any_build() -> None:
+def test_build_training_model_refuses_semantic_fullparam_contradictions_before_any_build() -> None:
     from xorl.trainers.model_builder import build_training_model
 
     common = dict(config_path="nonexistent/config", weights_path="nonexistent/weights")
@@ -333,11 +333,6 @@ def test_build_training_model_refuses_invalid_fullparam_combinations_before_any_
     ):
         with pytest.raises(ValueError, match="rejects unsupported configuration"):
             build_training_model(**{**mode_common, **override})
-
-    with pytest.raises(ValueError, match="WORLD16/EP16/Ulysses16"):
-        build_training_model(
-            **mode_common,
-        )
 
 
 def test_publish_dir_wiring_carries_to_train_config_and_fails_closed(tmp_path) -> None:

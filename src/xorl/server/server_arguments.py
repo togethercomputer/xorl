@@ -379,7 +379,7 @@ class ServerArguments:
                 "and ALL routers train through FP32 masters with per-step quantized byte caches; everything "
                 "else is frozen by the fail-closed admission. Exclusive full-weight mode; requires "
                 "glm52_fullparam_trainable_expert_layers, freeze_router=False, ep_dispatch='alltoall', "
-                "moe_implementation='triton', and the qualified WORLD16/EP16/Ulysses16 CUDA topology."
+                "moe_implementation='triton'; DP, CP, and PP are resolved from the runtime mesh."
             )
         },
     )
@@ -1305,7 +1305,7 @@ class ServerArguments:
                 )
             if not self.enable_mixed_precision:
                 raise ValueError(
-                    "glm52_fullparam_fp8_training requires enable_mixed_precision=True for the qualified BF16 build"
+                    "glm52_fullparam_fp8_training requires enable_mixed_precision=True for BF16 model compute"
                 )
             # This lane owns FP32 masters inside admitted components. A generic
             # whole-model fp32 upcast would corrupt the checkpoint-native BF16
@@ -1326,26 +1326,6 @@ class ServerArguments:
                 raise ValueError(
                     "GLM-5.2 full-param block-FP8 training rejects unsupported configuration: " + ", ".join(mismatches)
                 )
-            from xorl.models.transformers.glm5.support import (  # noqa: PLC0415
-                validate_glm52_fullparam_runtime_topology,
-            )
-
-            validate_glm52_fullparam_runtime_topology(
-                init_device=self.init_device,
-                data_parallel_mode=self.data_parallel_mode,
-                tensor_parallel_size=self.tensor_parallel_size,
-                pipeline_parallel_size=self.pipeline_parallel_size,
-                expert_parallel_size=self.expert_parallel_size,
-                ringattn_parallel_size=self.ringattn_parallel_size,
-                ulysses_parallel_size=self.ulysses_parallel_size,
-                data_parallel_replicate_size=self.data_parallel_replicate_size,
-                data_parallel_shard_size=self.data_parallel_shard_size,
-                cp_fsdp_mode=self.cp_fsdp_mode,
-                lm_head_tensor_parallel_size=self.lm_head_tensor_parallel_size,
-                fsdp_sharded_lm_head_loss=self.fsdp_sharded_lm_head_loss,
-                enable_full_shard=self.enable_full_shard,
-                reshard_after_forward=self.reshard_after_forward,
-            )
         elif self.glm52_fullparam_trainable_expert_layers is not None:
             raise ValueError(
                 "glm52_fullparam_trainable_expert_layers is only meaningful with glm52_fullparam_fp8_training=True"
@@ -1387,15 +1367,6 @@ class ServerArguments:
                 requirements.update(
                     {
                         "max_lora_rank": (self.max_lora_rank, self.lora_rank),
-                        "tensor_parallel_size": (self.tensor_parallel_size, 1),
-                        "pipeline_parallel_size": (self.pipeline_parallel_size, 1),
-                        "expert_parallel_size": (self.expert_parallel_size, 16),
-                        "ringattn_parallel_size": (self.ringattn_parallel_size, 1),
-                        "lm_head_tensor_parallel_size": (self.lm_head_tensor_parallel_size, 16),
-                        "data_parallel_replicate_size": (self.data_parallel_replicate_size, 1),
-                        "data_parallel_mode": (self.data_parallel_mode, "fsdp2"),
-                        "cp_fsdp_mode": (self.cp_fsdp_mode, "all"),
-                        "fsdp_sharded_lm_head_loss": (self.fsdp_sharded_lm_head_loss, True),
                     }
                 )
             mismatches = [
@@ -1405,17 +1376,6 @@ class ServerArguments:
             ]
             if mismatches:
                 raise ValueError("GLM-5.2 block-FP8 QLoRA rejects unsupported configuration: " + ", ".join(mismatches))
-            if exact_active_lora and (
-                self.ulysses_parallel_size,
-                self.data_parallel_shard_size,
-            ) not in {(16, 1), (1, 16)}:
-                raise ValueError(
-                    "GLM-5.2 exact active-LoRA admits exactly one WORLD16 row owner: "
-                    "CP-owned (ulysses_parallel_size=16, data_parallel_shard_size=1) or "
-                    "DP-owned (ulysses_parallel_size=1, data_parallel_shard_size=16); got "
-                    f"ulysses_parallel_size={self.ulysses_parallel_size}, "
-                    f"data_parallel_shard_size={self.data_parallel_shard_size}"
-                )
             if self.lora_target_modules is not None or self.lora_target_manifest is not None:
                 raise ValueError("GLM-5.2 block-FP8 QLoRA uses its complete deterministic target set")
             if self.qlora_exclude_modules is not None:
@@ -1466,11 +1426,6 @@ class ServerArguments:
             raise ValueError(
                 "adapter_state_load_mode must be 'all_ranks' or 'rank0_broadcast', "
                 f"got {self.adapter_state_load_mode!r}"
-            )
-        if self.enable_lora and self.pipeline_parallel_size > 1:
-            raise ValueError(
-                "pipeline_parallel_size > 1 is not supported with multi-adapter LoRA server training. "
-                "Adapter coordination currently assumes identical local LoRA layouts on every rank."
             )
         if (self.enable_lora or self.enable_qlora) and self.tensor_parallel_size > 1:
             raise ValueError(
