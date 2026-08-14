@@ -130,6 +130,58 @@ def test_fp32_tree_topology_is_not_reassociated_to_a_left_fold():
 
 @pytest.mark.cpu
 @pytest.mark.parametrize(
+    ("dtype", "magnitude", "epsilon"),
+    [
+        pytest.param(torch.bfloat16, 2**25, 1.0, id="bf16-2p25"),
+        # FP16 cannot encode 2**25 (it becomes inf). 2**12 with a finite
+        # FP16 subnormal epsilon crosses the same FP32-node tie boundary:
+        # epsilon is representable at transport but lost beside magnitude.
+        pytest.param(torch.float16, 2**12, 2**-20, id="fp16-finite-equivalent"),
+    ],
+)
+@pytest.mark.parametrize("contributors", [3, 5, 8, 17])
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_compiled_fp32_fold_preserves_adjacent_tree_reassociation_witness(
+    dtype: torch.dtype,
+    magnitude: float,
+    epsilon: float,
+    contributors: int,
+    dynamic: bool,
+):
+    partials = torch.zeros((contributors, 1), dtype=dtype)
+    if contributors == 3:
+        # Canonical: (M + -M) + e == e. The alternate M + (-M + e)
+        # loses e at the inner FP32 node and returns zero.
+        partials[:3, 0] = torch.tensor([magnitude, -magnitude, epsilon], dtype=dtype)
+        alternate = partials[0].float() + (partials[1].float() + partials[2].float())
+        expected_value = torch.tensor(epsilon, dtype=dtype)
+    else:
+        # Canonical adjacent pairs both lose e and cancel to zero. A linear
+        # left fold loses only the first e and retains the second.
+        partials[:4, 0] = torch.tensor([magnitude, epsilon, -magnitude, epsilon], dtype=dtype)
+        alternate = partials[0].float()
+        for contributor in partials[1:]:
+            alternate = alternate + contributor.float()
+        expected_value = torch.tensor(0.0, dtype=dtype)
+
+    def fold_fn(values: torch.Tensor) -> torch.Tensor:
+        return canonical_moe_fold_fp32_v2(values)
+
+    eager = fold_fn(partials)
+    # Each parameter is an independent compiler contract. Clear Dynamo's
+    # per-code-object backend cache so 16 intentionally distinct compile
+    # requests do not trip the global recompile limit before dynamic=True.
+    torch.compiler.reset()
+    compiled = torch.compile(fold_fn, fullgraph=True, dynamic=dynamic)(partials)
+
+    assert eager.item() == expected_value.item()
+    assert not torch.equal(eager, alternate.to(dtype))
+    assert torch.equal(eager, _explicit_tree(partials))
+    assert torch.equal(compiled.view(torch.uint16), eager.view(torch.uint16))
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
     ("dtype", "shared_value", "routed_value", "scale", "pre_cast_bits", "transport_bits"),
     [
         (torch.bfloat16, -0.01165771484375, 209920.0, 1.1, 0x48618000, 0x4862),
