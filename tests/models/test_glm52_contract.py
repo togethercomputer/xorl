@@ -123,6 +123,17 @@ def _official_schedule_config() -> SimpleNamespace:
     )
 
 
+def _six_layer_official_width_config() -> Glm5Config:
+    return Glm5Config(
+        num_hidden_layers=6,
+        indexer_types=["full", "full", "full", "shared", "shared", "shared"],
+        index_topk_freq=4,
+        index_skip_topk_offset=3,
+        index_topk_pattern=None,
+        mlp_layer_types=["dense", "dense", "dense", "sparse", "sparse", "sparse"],
+    )
+
+
 @pytest.mark.cpu
 def test_official_layer_plan_counts_producers_and_38_40_split():
     plan = Glm52LayerPlan.from_config(
@@ -137,6 +148,63 @@ def test_official_layer_plan_counts_producers_and_38_40_split():
     assert plan.layers[37].index_producer_layer == 34
     assert plan.layers[38].index_producer_layer == 38
     assert plan.layers[77].index_producer_layer == 74
+
+
+@pytest.mark.cpu
+def test_canonical_glm_scope_accepts_non78_structural_layer_schedules():
+    from xorl.models.auto import _validate_canonical_glm52_model_scope
+
+    config = _six_layer_official_width_config()
+    _validate_canonical_glm52_model_scope(config)
+
+    config.mlp_layer_types.pop()
+    with pytest.raises(ValueError, match="mlp_layer_types has length 5, expected 6"):
+        _validate_canonical_glm52_model_scope(config)
+
+
+@pytest.mark.cpu
+def test_foundation_model_installs_non78_glm_pipeline_plan_before_construction(monkeypatch):
+    import xorl.models.auto as auto_module
+
+    config = _six_layer_official_width_config()
+    observed_configs = []
+
+    class _Loader:
+        def load_model(self, *, init_kwargs, **_kwargs):
+            observed_configs.append(init_kwargs["config"])
+            return SimpleNamespace(config=init_kwargs["config"])
+
+    parallel_state = SimpleNamespace(
+        global_rank=0,
+        pp_size=2,
+        ringattn_size=1,
+        ringattn_enabled=False,
+        cp_enabled=False,
+    )
+    monkeypatch.setattr(auto_module, "get_parallel_state", lambda: parallel_state)
+    monkeypatch.setattr(auto_module, "get_loader", lambda _config: _Loader())
+    monkeypatch.setattr(auto_module, "get_attention_fn", lambda _implementation: object())
+
+    model = auto_module.build_foundation_model(
+        config,
+        attn_implementation="eager",
+        init_device="meta",
+    )
+
+    assert model.config is config
+    assert observed_configs == [config]
+    assert config._glm52_pipeline_layer_ranges == ((0, 2), (2, 6))
+    assert config._glm52_pipeline_module_names_per_stage == (
+        ("model.embed_tokens", "model.layers.0", "model.layers.1"),
+        (
+            "model.layers.2",
+            "model.layers.3",
+            "model.layers.4",
+            "model.layers.5",
+            "model.norm",
+            "lm_head",
+        ),
+    )
 
 
 @pytest.mark.cpu

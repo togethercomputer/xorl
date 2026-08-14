@@ -38,7 +38,7 @@ from .transformers.deepseek_v4.exact_contract import (
 from .transformers.glm4_moe.configuration_glm4_moe import Glm4MoeConfig
 from .transformers.glm5.configuration_glm5 import Glm5Config
 from .transformers.glm5.exact_lora_contract import glm52_exact_lora_scaling
-from .transformers.glm5.layer_plan import install_glm52_pipeline_module_plan
+from .transformers.glm5.layer_plan import Glm52LayerPlan, install_glm52_pipeline_module_plan
 from .transformers.glm5.support import validate_glm5_router_settings, validate_glm5_sequence_parallel
 from .transformers.gpt_oss.configuration_gpt_oss import GptOssConfig
 from .transformers.minimax_m3.configuration_minimax_m3 import MiniMaxM3Config
@@ -247,29 +247,24 @@ def _validate_canonical_glm52_model_scope(config: PretrainedConfig) -> None:
     expected = {
         "vocab_size": 154880,
         "hidden_size": 6144,
-        "num_hidden_layers": 78,
         "hidden_act": "silu",
-        "first_k_dense_replace": 3,
         "n_routed_experts": 256,
         "num_experts_per_tok": 8,
         "index_topk": 2048,
-        "index_topk_freq": 4,
     }
     mismatches = [
         f"{name}={getattr(config, name, None)!r} (requires {value!r})"
         for name, value in expected.items()
         if getattr(config, name, None) != value
     ]
-    indexer_types = tuple(config.indexer_types)
-    expected_indexer_types = tuple(
-        "full" if layer_idx < 3 or (layer_idx - 2) % 4 == 0 else "shared" for layer_idx in range(78)
-    )
-    if indexer_types != expected_indexer_types:
-        mismatches.append("indexer_types does not match the official 78-layer selector schedule")
-    mlp_layer_types = getattr(config, "mlp_layer_types", None)
-    expected_mlp_types = ("dense",) * 3 + ("sparse",) * 75
-    if mlp_layer_types is None or tuple(mlp_layer_types) != expected_mlp_types:
-        mismatches.append("mlp_layer_types does not match 3 dense + 75 sparse blocks")
+    try:
+        # Layer count and ownership are checkpoint schedules, not kernel
+        # geometry. Validate their lengths, supported values, producer chain,
+        # and legal full-index boundaries without assuming the 78-layer
+        # reference checkpoint.
+        Glm52LayerPlan.from_config(config)
+    except (TypeError, ValueError) as error:
+        mismatches.append(str(error))
     if mismatches:
         raise ValueError(
             "The exact GLM-5.2 program supports only the official model geometry: " + ", ".join(mismatches)
@@ -1056,7 +1051,9 @@ def build_foundation_model(
         )
 
     ps = get_parallel_state()
-    if isinstance(config, Glm5Config) and config.num_hidden_layers == 78:
+    if isinstance(config, Glm5Config) and (
+        getattr(config, "indexer_types", None) is not None or getattr(config, "mlp_layer_types", None) is not None
+    ):
         install_glm52_pipeline_module_plan(
             config,
             num_stages=ps.pp_size * int(pipeline_parallel_virtual_stages),
