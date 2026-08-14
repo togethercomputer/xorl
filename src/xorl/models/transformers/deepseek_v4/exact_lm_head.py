@@ -22,9 +22,10 @@ from xorl.lora.modules.linear import LoraLinear
 from xorl.ops.bi_families_v2 import exact_temperature_scale_bf16_logits
 from xorl.ops.exact_sampling_transforms import (
     EXACT_FILTER_ROW_CHUNK,
+    exact_sampling_identity_rows,
     exact_sampling_support,
-    exact_selected_logprob_chunked,
     exact_selected_logprob_from_support,
+    exact_selected_logprob_partitioned_from_support,
 )
 
 
@@ -208,6 +209,30 @@ def _selected_logprob_reference_grad_filtered(
         selected, _, _ = exact_selected_logprob_from_support(score_logits, token_ids, support)
         (gradient,) = torch.autograd.grad(selected, logits, grad_outputs=grad_logprob.float())
     return gradient.contiguous()
+
+
+def _selected_logprob_reference_grad_partitioned(
+    full_logits: Tensor,
+    token_ids: Tensor,
+    grad_logprob: Tensor,
+    temperature: Tensor | None,
+    support: Tensor,
+    identity_rows: Tensor,
+) -> Tensor:
+    native_grad = _selected_logprob_reference_grad(
+        full_logits,
+        token_ids,
+        grad_logprob,
+        temperature,
+    )
+    filtered_grad = _selected_logprob_reference_grad_filtered(
+        full_logits,
+        token_ids,
+        grad_logprob,
+        temperature,
+        support,
+    )
+    return torch.where(identity_rows.unsqueeze(1), native_grad, filtered_grad).contiguous()
 
 
 def _local_surrogate_vjp(
@@ -547,12 +572,34 @@ class Dsv4ExactTP8LmHeadSelectedLogprob(nn.Module):
         top_ks, top_ps, min_ps = sampling_transforms
         if top_ks is None or top_ps is None or min_ps is None:
             raise ValueError("filtered DSV4 exact scoring requires complete row metadata")
-        logprob, _, _ = exact_selected_logprob_chunked(
+        support = exact_sampling_support(
             score_logits,
-            token_ids,
             top_ks,
             top_ps,
             min_ps,
+        )
+        identity_rows = exact_sampling_identity_rows(
+            top_ks,
+            top_ps,
+            min_ps,
+            vocab_size=score_logits.shape[1],
+        )
+        from sglang.srt.batch_invariant_ops.batch_invariant_ops import (  # noqa: PLC0415
+            log_softmax as _bi_log_softmax,
+        )
+
+        def _native_score(native_logits: Tensor, native_ids: Tensor):
+            native_logprobs = _bi_log_softmax(native_logits, dim=-1)
+            native_selected = native_logits.gather(1, native_ids.unsqueeze(1)).squeeze(1)
+            native_logprob = native_logprobs.gather(1, native_ids.unsqueeze(1)).squeeze(1)
+            return native_logprob, native_selected - native_logprob, native_selected
+
+        logprob, _, _ = exact_selected_logprob_partitioned_from_support(
+            score_logits,
+            token_ids,
+            support,
+            identity_rows,
+            _native_score,
         )
         return logprob.contiguous()
 
@@ -654,6 +701,12 @@ class Dsv4ExactTP8LmHeadSelectedLogprob(nn.Module):
                     top_ps[row_slice],
                     min_ps[row_slice],
                 )
+                identity_rows = exact_sampling_identity_rows(
+                    top_ks[row_slice],
+                    top_ps[row_slice],
+                    min_ps[row_slice],
+                    vocab_size=score_logits.shape[1],
+                )
 
                 local_reference = (
                     (
@@ -669,12 +722,13 @@ class Dsv4ExactTP8LmHeadSelectedLogprob(nn.Module):
                 full_reference = _rank_order_vocab_all_gather(
                     local_reference.to(torch.bfloat16), group
                 ).float()
-                full_grad = _selected_logprob_reference_grad_filtered(
+                full_grad = _selected_logprob_reference_grad_partitioned(
                     full_reference,
                     token_ids[row_slice],
                     grad_logprob[row_slice],
                     None if temperature is None else temperature[row_slice],
                     support,
+                    identity_rows,
                 )
                 local_grad[row_slice] = full_grad[
                     :, self.shard.vocab_start : self.shard.vocab_end

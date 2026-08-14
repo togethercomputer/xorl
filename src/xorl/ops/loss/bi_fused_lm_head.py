@@ -35,12 +35,37 @@ from xorl.ops.bi_families_v2 import (
 )
 from xorl.ops.exact_sampling_transforms import (
     EXACT_FILTER_ROW_CHUNK,
+    exact_sampling_identity_rows,
     exact_sampling_support,
-    exact_selected_logprob,
+    exact_selected_logprob_partitioned_from_support,
 )
 
 
 _TEMPERATURE_MATERIALIZE_ROW_CHUNK = EXACT_FILTER_ROW_CHUNK
+
+
+def _score_exact_sampling_rows(
+    logits,
+    token_ids,
+    top_ks,
+    top_ps,
+    min_ps,
+    native_selected_score,
+):
+    support = exact_sampling_support(logits, top_ks, top_ps, min_ps)
+    identity_rows = exact_sampling_identity_rows(
+        top_ks,
+        top_ps,
+        min_ps,
+        vocab_size=logits.shape[1],
+    )
+    return exact_selected_logprob_partitioned_from_support(
+        logits,
+        token_ids,
+        support,
+        identity_rows,
+        native_selected_score,
+    )
 
 
 class _BiFusedLmHeadPerTokenCE(torch.autograd.Function):
@@ -83,12 +108,17 @@ class _BiFusedLmHeadPerTokenCE(torch.autograd.Function):
                         else exact_temperature_scale_fp32_logits(logits, temperature_chunk)
                     )
                     if has_sampling_filter:
-                        logprob_chunk, lse_chunk, _, _support = exact_selected_logprob(
+                        logprob_chunk, lse_chunk, _ = _score_exact_sampling_rows(
                             transformed_logits,
                             labels_chunk,
                             top_ks[start:end],
                             top_ps[start:end],
                             min_ps[start:end],
+                            lambda score_logits, score_ids: head_v2_selected_logprob_from_logits(
+                                score_logits,
+                                score_ids,
+                                temperature=None,
+                            ),
                         )
                     else:
                         logprob_chunk, lse_chunk, _ = head_v2_selected_logprob_from_logits(
@@ -104,12 +134,18 @@ class _BiFusedLmHeadPerTokenCE(torch.autograd.Function):
                         else exact_temperature_scale_fp32_logits(logits, temperature_chunk)
                     )
                     if has_sampling_filter:
-                        logprob_chunk, lse_chunk, _, _support = exact_selected_logprob(
+                        logprob_chunk, lse_chunk, _ = _score_exact_sampling_rows(
                             transformed_logits,
                             labels_chunk,
                             top_ks[start:end],
                             top_ps[start:end],
                             min_ps[start:end],
+                            lambda score_logits, score_ids: bi_lm_head_selected_logprob_from_logits(
+                                score_logits,
+                                score_ids,
+                                temperature=None,
+                                vocab_chunk=vocab_chunk,
+                            ),
                         )
                     else:
                         logprob_chunk, lse_chunk, _ = bi_lm_head_selected_logprob_from_logits(

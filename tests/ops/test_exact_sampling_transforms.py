@@ -15,6 +15,7 @@ from xorl.ops.exact_sampling_transforms import (
     exact_support_workspace_bytes,
     normalize_exact_sampling_transforms,
 )
+from xorl.ops.loss.bi_fused_lm_head import _score_exact_sampling_rows
 
 
 def _rows(values):
@@ -79,6 +80,54 @@ def test_equal_logits_use_token_id_as_stable_tie_break():
         _rows([0.0]),
     )
     assert support.tolist() == [[True, True, True, False, False, False]]
+
+
+def test_identity_top_p_one_is_full_support_despite_fp32_cumulative_overshoot():
+    generator = torch.Generator().manual_seed(20260814)
+    for _ in range(6):
+        logits = torch.randn((4, 32768), generator=generator, dtype=torch.float32)
+    row = logits[2:3]
+    sorted_probs = torch.softmax(row, dim=-1).sort(dim=-1, descending=True, stable=True).values
+    cumulative_before = sorted_probs.cumsum(dim=-1) - sorted_probs
+    assert cumulative_before[0, -1] > 1.0
+
+    support = exact_sampling_support(
+        row,
+        torch.tensor([TOP_K_ALL], dtype=torch.int64),
+        _rows([1.0]),
+        _rows([0.0]),
+    )
+    assert support.all()
+
+
+def test_trainer_identity_score_and_vjp_are_batch_composition_invariant():
+    def native_score(logits, token_ids):
+        selected = logits.gather(1, token_ids.unsqueeze(1)).squeeze(1)
+        # Deliberately distinguish the native reduction from the filtered one.
+        lse = torch.logsumexp(logits, dim=-1) + 0.125
+        return selected - lse, lse, selected
+
+    identity_logits = _rows([[3.0, 1.0, -2.0]]).requires_grad_(True)
+    identity_ids = torch.tensor([0], dtype=torch.int64)
+    native_logprob, native_lse, _ = native_score(identity_logits, identity_ids)
+    native_logprob.backward()
+    native_grad = identity_logits.grad.detach().clone()
+
+    mixed_logits = _rows([[3.0, 1.0, -2.0], [2.0, 0.0, -1.0]]).requires_grad_(True)
+    mixed_logprob, mixed_lse, _ = _score_exact_sampling_rows(
+        mixed_logits,
+        torch.tensor([0, 0], dtype=torch.int64),
+        torch.tensor([TOP_K_ALL, 1], dtype=torch.int64),
+        _rows([1.0, 1.0]),
+        _rows([0.0, 0.0]),
+        native_score,
+    )
+    mixed_logprob[0].backward()
+
+    assert torch.equal(mixed_logprob[0], native_logprob.detach()[0])
+    assert torch.equal(mixed_lse[0], native_lse.detach()[0])
+    assert torch.equal(mixed_logits.grad[0], native_grad[0])
+    assert torch.equal(mixed_logits.grad[1], torch.zeros_like(mixed_logits.grad[1]))
 
 
 def test_historical_action_outside_current_support_is_negative_infinity_with_zero_gradient():

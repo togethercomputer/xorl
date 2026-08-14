@@ -12,6 +12,7 @@ generic SGLang or FlashInfer filter semantics.
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 
 import torch
 
@@ -22,6 +23,10 @@ EXACT_SAMPLING_TRANSFORM_PROGRAM = (
     "temperature_then_stable_token_id_topk_inclusive_topp_original_max_minp_seeded_gumbel_v1"
 )
 SamplingTransformRows = tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]
+NativeSelectedScore = Callable[
+    [torch.Tensor, torch.Tensor],
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+]
 
 
 def _normalize_row_metadata(
@@ -128,9 +133,18 @@ def exact_sampling_support(
     if tuple(top_ks.shape) != (rows,) or tuple(top_ps.shape) != (rows,) or tuple(min_ps.shape) != (rows,):
         raise ValueError("exact sampling transform metadata must align one-to-one with logit rows")
 
+    identity_rows = exact_sampling_identity_rows(
+        top_ks,
+        top_ps,
+        min_ps,
+        vocab_size=vocab,
+    )
     # The support is discrete metadata.  Detaching is essential: current logits
     # choose the support every forward, but gradients do not pass through sort
-    # indices or threshold comparisons.
+    # indices or threshold comparisons.  Identity rows are overwritten to full
+    # support after the fixed-shape program: a rounded FP32 cumulative sum may
+    # exceed one, but top-p=1 is mathematically unconditional.  Keeping the
+    # fixed row shape also preserves CUDA-graph capture in serving.
     probabilities = torch.softmax(logits.detach(), dim=-1)
     sorted_probs, sorted_indices = torch.sort(probabilities, dim=-1, descending=True, stable=True)
     ranks = torch.arange(vocab, device=logits.device, dtype=top_ks.dtype).unsqueeze(0)
@@ -141,7 +155,24 @@ def exact_sampling_support(
 
     support = torch.zeros((rows, vocab), dtype=torch.bool, device=logits.device)
     support.scatter_(1, sorted_indices, keep_sorted)
+    support |= identity_rows.unsqueeze(1)
     return support
+
+
+def exact_sampling_identity_rows(
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    *,
+    vocab_size: int,
+) -> torch.Tensor:
+    """Return rows whose transforms are the exact mathematical identity."""
+
+    if vocab_size < 1:
+        raise ValueError("vocab_size must be >= 1")
+    if top_ks.ndim != 1 or top_ps.shape != top_ks.shape or min_ps.shape != top_ks.shape:
+        raise ValueError("exact sampling transform metadata must have aligned one-dimensional rows")
+    return (top_ks >= vocab_size) & (top_ps == 1.0) & (min_ps == 0.0)
 
 
 def exact_masked_logits(
@@ -176,6 +207,32 @@ def exact_selected_logprob_from_support(
     finite_logprob = torch.minimum(selected - lse, torch.zeros_like(selected))
     logprob = torch.where(selected_support, finite_logprob, torch.full_like(finite_logprob, -math.inf))
     return logprob, lse, selected_support
+
+
+def exact_selected_logprob_partitioned_from_support(
+    logits: torch.Tensor,
+    token_ids: torch.Tensor,
+    support: torch.Tensor,
+    identity_rows: torch.Tensor,
+    native_selected_score: NativeSelectedScore,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Score identity rows natively and filtered rows on their exact support."""
+
+    rows = logits.shape[0]
+    if identity_rows.dtype is not torch.bool or identity_rows.shape != (rows,):
+        raise ValueError("identity_rows must be a row-aligned bool tensor")
+
+    native_logprob, native_lse, _ = native_selected_score(logits, token_ids)
+    filtered_logprob, filtered_lse, filtered_selected_support = exact_selected_logprob_from_support(
+        logits,
+        token_ids,
+        support,
+    )
+    return (
+        torch.where(identity_rows, native_logprob, filtered_logprob),
+        torch.where(identity_rows, native_lse, filtered_lse),
+        torch.where(identity_rows, torch.ones_like(filtered_selected_support), filtered_selected_support),
+    )
 
 
 def exact_selected_logprob(
@@ -245,10 +302,12 @@ __all__ = [
     "EXACT_SAMPLING_TRANSFORM_PROGRAM",
     "TOP_K_ALL",
     "exact_masked_logits",
+    "exact_sampling_identity_rows",
     "exact_sampling_support",
     "exact_selected_logprob",
     "exact_selected_logprob_chunked",
     "exact_selected_logprob_from_support",
+    "exact_selected_logprob_partitioned_from_support",
     "exact_support_workspace_bytes",
     "normalize_exact_sampling_transforms",
 ]

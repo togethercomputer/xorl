@@ -10,6 +10,8 @@ from xorl.models.transformers.deepseek_v4.exact_lm_head import (
     _Dsv4ExactDistributedHeadFunction,
     _rank_order_variable_row_all_gather,
     _selected_logprob_reference_grad,
+    _selected_logprob_reference_grad_filtered,
+    _selected_logprob_reference_grad_partitioned,
     _temperature_scale_bf16_logits,
 )
 from xorl.ops.loss.per_token_ce import compute_per_token_ce
@@ -61,6 +63,31 @@ def test_dsv4_temperature_reference_gradient_contains_per_row_inverse() -> None:
     )
     (expected,) = torch.autograd.grad(selected, reference_logits, grad_outputs=grad_logprob)
     assert torch.equal(actual, expected)
+
+
+def test_dsv4_identity_reference_gradient_is_unchanged_beside_filtered_row() -> None:
+    logits = torch.tensor([[3.0, 1.0, -2.0], [2.0, 0.0, -1.0]], dtype=torch.float32)
+    token_ids = torch.tensor([0, 0], dtype=torch.int64)
+    grad_logprob = torch.tensor([0.5, -0.75], dtype=torch.float32)
+    temperature = torch.tensor([0.7, 1.3], dtype=torch.float32)
+    support = torch.tensor([[True, True, True], [True, False, False]])
+    identity_rows = torch.tensor([True, False])
+
+    actual = _selected_logprob_reference_grad_partitioned(
+        logits,
+        token_ids,
+        grad_logprob,
+        temperature,
+        support,
+        identity_rows,
+    )
+    native = _selected_logprob_reference_grad(logits[:1], token_ids[:1], grad_logprob[:1], temperature[:1])
+    filtered = _selected_logprob_reference_grad_filtered(
+        logits[1:], token_ids[1:], grad_logprob[1:], temperature[1:], support[1:]
+    )
+
+    assert torch.equal(actual[0], native[0])
+    assert torch.equal(actual[1], filtered[0])
 
 
 def test_dsv4_variable_row_gather_keeps_temperature_in_logical_rank_order(

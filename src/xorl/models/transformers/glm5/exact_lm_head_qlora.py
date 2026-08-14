@@ -35,9 +35,10 @@ from xorl.models.transformers.glm5.exact_lora_contract import glm52_exact_lora_s
 from xorl.ops.bi_families_v2 import exact_temperature_scale_fp32_logits
 from xorl.ops.exact_sampling_transforms import (
     EXACT_FILTER_ROW_CHUNK,
+    exact_sampling_identity_rows,
     exact_sampling_support,
-    exact_selected_logprob_chunked,
     exact_selected_logprob_from_support,
+    exact_selected_logprob_partitioned_from_support,
 )
 
 
@@ -384,6 +385,30 @@ def _selected_logprob_reference_grad_filtered(
         selected, _, _ = exact_selected_logprob_from_support(score_logits, token_ids, support)
         (grad_logits,) = torch.autograd.grad(selected, logits, grad_outputs=grad_logprob.float())
     return grad_logits.contiguous()
+
+
+def _selected_logprob_reference_grad_partitioned(
+    full_logits: Tensor,
+    token_ids: Tensor,
+    grad_logprob: Tensor,
+    temperature: Tensor | None,
+    support: Tensor,
+    identity_rows: Tensor,
+) -> Tensor:
+    native_grad = _selected_logprob_reference_grad(
+        full_logits,
+        token_ids,
+        grad_logprob,
+        temperature,
+    )
+    filtered_grad = _selected_logprob_reference_grad_filtered(
+        full_logits,
+        token_ids,
+        grad_logprob,
+        temperature,
+        support,
+    )
+    return torch.where(identity_rows.unsqueeze(1), native_grad, filtered_grad).contiguous()
 
 
 class _Glm52ExactTP16LmHeadFunction(torch.autograd.Function):
@@ -948,12 +973,34 @@ class Glm52ExactTP16LmHeadSelectedLogprob(nn.Module):
         top_ks, top_ps, min_ps = sampling_transforms
         if top_ks is None or top_ps is None or min_ps is None:
             raise ValueError("filtered GLM exact scoring requires complete row metadata")
-        logprob, _, _ = exact_selected_logprob_chunked(
+        support = exact_sampling_support(
             score_logits,
-            token_ids,
             top_ks,
             top_ps,
             min_ps,
+        )
+        identity_rows = exact_sampling_identity_rows(
+            top_ks,
+            top_ps,
+            min_ps,
+            vocab_size=score_logits.shape[1],
+        )
+        try:
+            from sglang.srt.batch_invariant_ops import (  # noqa: PLC0415
+                head_v2_selected_logprob_from_logits,
+            )
+        except Exception as exc:
+            raise RuntimeError("Pinned exact v2 selected-logprob tail is required") from exc
+        logprob, _, _ = exact_selected_logprob_partitioned_from_support(
+            score_logits,
+            token_ids,
+            support,
+            identity_rows,
+            lambda native_logits, native_ids: head_v2_selected_logprob_from_logits(
+                native_logits,
+                native_ids,
+                temperature=None,
+            ),
         )
         return logprob
 
@@ -1124,6 +1171,10 @@ class Glm52ExactTP16LmHeadSelectedLogprob(nn.Module):
                     else exact_temperature_scale_fp32_logits(exact_full_logits, temperature_chunk)
                 )
                 support = exact_sampling_support(exact_score_logits, *chunk_transforms)
+                identity_rows = exact_sampling_identity_rows(
+                    *chunk_transforms,
+                    vocab_size=exact_score_logits.shape[1],
+                )
                 local_reference_logits = _local_qlora_surrogate_logits(
                     hidden_chunk,
                     local_weight,
@@ -1137,12 +1188,13 @@ class Glm52ExactTP16LmHeadSelectedLogprob(nn.Module):
                     expected_world_size=GLM52_LM_HEAD_TP_SIZE,
                     expected_local_vocab_size=GLM52_LM_HEAD_LOCAL_VOCAB_SIZE,
                 )
-            full_grad_logits = _selected_logprob_reference_grad_filtered(
+            full_grad_logits = _selected_logprob_reference_grad_partitioned(
                 full_reference_logits,
                 token_ids_1d[start:end],
                 grad_logprob_1d[start:end],
                 temperature_chunk,
                 support,
+                identity_rows,
             )
             local_grad_logits[start:end] = full_grad_logits[
                 :, self.shard.vocab_start : self.shard.vocab_end
