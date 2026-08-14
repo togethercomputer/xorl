@@ -11,8 +11,9 @@ program in server training. Users do not assemble it from component flags.
 The resolver selects Class-B RoPE, RMSNorm-v2, exact GDN state handling,
 batch-invariant trunk and head programs, and the qualified attention program.
 The MoE model additionally selects deterministic routing, the serving-value
-expert forward, and `canonical_moe_fold_v1`: logical contributor order followed
-by a BF16-rounded adjacent-pair tree. Raw EP8 transport does not perform the
+expert forward, and `canonical_moe_fold_fp32_v2`: logical contributor order
+followed by an adjacent-pair tree whose leaves and nodes are FP32, with one
+final cast at the consumer boundary. Raw EP8 transport does not perform the
 addition.
 
 On serving, `--rl-on-policy-target xorl` activates the paired program. The

@@ -36,10 +36,10 @@ def test_native_combine_32_way_fallback_matches_explicit_adjacent_tree(monkeypat
 
     result = exchange_and_canonical_fold(contributors.reshape(96, 5), group=None, ep_size=32)
 
-    level = contributors
+    level = contributors.float()
     while level.shape[0] > 1:
-        level = (level[0::2] + level[1::2]).bfloat16()
-    assert torch.equal(result, level[0])
+        level = level[0::2] + level[1::2]
+    assert torch.equal(result, level[0].bfloat16())
 
 
 def test_qwen35_exchange_uses_canonical_tree_and_preserves_backward(monkeypatch):
@@ -60,10 +60,10 @@ def test_qwen35_exchange_uses_canonical_tree_and_preserves_backward(monkeypatch)
 
     result = exchange_and_canonical_fold(leaf.reshape(24, 2), group=None, ep_size=8)
 
-    level = leaf
+    level = leaf.float()
     while level.shape[0] > 1:
-        level = (level[0::2] + level[1::2]).bfloat16()
-    expected = level[0]
+        level = level[0::2] + level[1::2]
+    expected = level[0].bfloat16()
     legacy = leaf[-1]
     for ordinal in range(6, -1, -1):
         legacy = legacy + leaf[ordinal]

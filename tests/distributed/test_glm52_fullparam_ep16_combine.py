@@ -1,7 +1,7 @@
 """16-contributor ordered-combine byte gate for the full-param expert bank.
 
 This CPU/gloo test runs 16 ranks and covers full-param bank partials entering the GLM
-canonical contributor-tree reduce (`canonical_moe_reduce_v1`, the same code
+canonical contributor-tree reduce (`canonical_moe_reduce_fp32_v2`, the same code
 the GLM-5.2 model path calls) with byte equality against the logical-order
 pairwise-tree reference; variable per-rank row counts through the padded
 gather; sentinel/off-owner routing; and gradient plumbing from the combined
@@ -117,12 +117,13 @@ def _seed_bank(rank: int, device: torch.device = torch.device("cpu"), kind: str 
 
 def _canonical_tree_reference(partials: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
     """The contributor pairwise-tree reference from the canonical-MoE contract
-    gate (adjacent-pair BF16 tree over logical contributor order)."""
+    gate (adjacent-pair FP32 tree over logical contributor order, one final
+    cast to the transported dtype)."""
 
-    level = [partials[index] for index in range(partials.shape[0])]
+    level = [partials[index].float() for index in range(partials.shape[0])]
     while len(level) > 1:
-        level = [(level[index] + level[index + 1]).to(torch.bfloat16) for index in range(0, len(level), 2)]
-    result = level[0].clone()
+        level = [level[index] + level[index + 1] for index in range(0, len(level), 2)]
+    result = level[0].to(partials.dtype)
     result[~valid_mask] = 0
     return result
 
@@ -135,7 +136,7 @@ def _run_ep16_case() -> None:
         LocalMoEContribution,
         OutputDistribution,
         ParallelPlan,
-        canonical_moe_reduce_v1,
+        canonical_moe_reduce_fp32_v2,
     )
     from xorl.models.layers.moe.ep_native_combine import (
         gather_ids_for_ep_combine,
@@ -232,7 +233,7 @@ def _run_ep16_case() -> None:
         # primitive identity plan — same reduce arithmetic, no GLM row claim.
         plan = ParallelPlan.primitive(_CONTRIBUTORS)
     contribution = LocalMoEContribution(partial, metadata, GLM52_LOCAL_PARTIAL_POLICY)
-    replicated = canonical_moe_reduce_v1(
+    replicated = canonical_moe_reduce_fp32_v2(
         contribution,
         plan=plan,
         group=group,

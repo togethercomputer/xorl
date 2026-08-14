@@ -1,9 +1,11 @@
 """Versioned canonical reduction for additive MoE rank contributions.
 
 The forward contract in this module deliberately separates transport from
-floating-point arithmetic. Raw BF16 partials travel to one logical row owner,
-which evaluates an explicit adjacent-pairwise tree in logical-contributor
-order. Any later replication copies the completed owner bytes.
+floating-point arithmetic. Raw BF16/FP16 partials travel to one logical row
+owner, which promotes the leaves to FP32 and evaluates an explicit
+adjacent-pairwise tree in logical-contributor order. Every tree node remains
+FP32; the completed result is cast exactly once at the declared low-precision
+consumer boundary. Any later replication copies those completed bytes.
 
 The canonical arithmetic here is a DELIBERATE independent implementation of
 the serving side's canonical MoE fold (a shared implementation must not
@@ -24,8 +26,9 @@ import torch
 import torch.distributed as dist
 
 
-CANONICAL_MOE_FOLD_VERSION = "canonical_moe_fold_v1"
-CANONICAL_MOE_REDUCE_VERSION = "canonical_moe_reduce_v1"
+CANONICAL_MOE_FOLD_VERSION = "canonical_moe_fold_fp32_v2"
+CANONICAL_MOE_REDUCE_VERSION = "canonical_moe_reduce_fp32_v2"
+CANONICAL_MOE_LEAF_VERSION = "canonical_moe_leaf_fp32_v1"
 CANONICAL_MOE_PACKED_EP16_TRANSPORT_VERSION = "packed_ep16_v2"
 CANONICAL_MOE_CP_SHARDED_TRANSPORT_VERSION = "cp_sharded_v3"
 GLM52_NUM_LAYERS = 78
@@ -103,7 +106,7 @@ class OutputDistribution(str, Enum):
 
 
 class CanonicalMoETransport(str, Enum):
-    """Byte-transport implementation under the version-1 arithmetic contract."""
+    """Byte-transport implementation composed with the FP32-v2 fold."""
 
     AUTO = "auto"
     DENSE_V1 = "dense_v1"
@@ -247,7 +250,7 @@ class ParallelPlan:
         if self.world_size <= 0:
             raise ValueError("world_size must be positive")
         if self.ep_size <= 0:
-            raise ValueError("canonical_moe_reduce_v1 requires a positive contributor count")
+            raise ValueError("canonical_moe_reduce_fp32_v2 requires a positive contributor count")
         if len(self.combine_groups) != len(self.logical_ordinals_by_group):
             raise ValueError("combine_groups and logical_ordinals_by_group must have equal lengths")
 
@@ -274,7 +277,7 @@ class ParallelPlan:
         )
         if tuple(sorted(self.cp_ep_aliases)) != expected_cp_ep_aliases:
             raise ValueError(
-                "Version 1 requires an explicit identity CP/EP alias map only when the row-placement and "
+                "FP32-v2 requires an explicit identity CP/EP alias map only when the row-placement and "
                 "expert axes alias"
             )
 
@@ -536,9 +539,9 @@ class LocalMoEContribution:
 
     def __post_init__(self) -> None:
         if self.layout is not ContributionLayout.LOCAL_PARTIAL:
-            raise ValueError("canonical_moe_reduce_v1 accepts only typed local partial contributions")
-        if self.tensor.dtype is not torch.bfloat16:
-            raise TypeError(f"Local MoE partial must be BF16, got {self.tensor.dtype}")
+            raise ValueError("canonical_moe_reduce_fp32_v2 accepts only typed local partial contributions")
+        if self.tensor.dtype not in (torch.bfloat16, torch.float16):
+            raise TypeError(f"Local MoE partial must be BF16 or FP16, got {self.tensor.dtype}")
         if self.tensor.ndim < 2:
             raise ValueError("Local MoE partial must have a row dimension and at least one payload dimension")
         if self.tensor.shape[0] != self.metadata.capacity:
@@ -576,7 +579,7 @@ def _validate_runtime_plan(
     physical_global_rank: int,
 ) -> _RuntimePlan:
     if not dist.is_initialized():
-        raise RuntimeError("canonical_moe_reduce_v1 requires an initialized torch.distributed process group")
+        raise RuntimeError("canonical_moe_reduce_fp32_v2 requires an initialized torch.distributed process group")
     if dist.get_world_size() != plan.world_size:
         raise ValueError(f"Runtime world size {dist.get_world_size()} does not match plan {plan.world_size}")
 
@@ -605,40 +608,87 @@ def _validate_runtime_plan(
     )
 
 
-def canonical_moe_fold_v1(partials_by_logical_ordinal: torch.Tensor) -> torch.Tensor:
-    """Fold identity-ordered contributions with the version-1 BF16 tree.
+def _canonical_moe_leaf_fp32_fma(
+    shared: torch.Tensor,
+    routed: torch.Tensor,
+    routed_scale: float = 1.0,
+) -> torch.Tensor:
+    """Return the completed contributor leaf before its transport cast.
 
-    The trainer half of serving's ``canonical_moe_fold_v1`` (adjacent BF16
-    pairs at every level, carrying an unpaired final contributor unchanged,
-    with round-to-nearest-even after every add).
-    Per this module's doctrine the arithmetic is a deliberate independent
-    implementation — it must never import the serving fold, so the pair
-    cannot self-confirm.
+    ``torch.add(..., alpha=...)`` is intentionally one FP32 pointwise
+    operation: its numerical contract is ``fma(routed, FP32(scale), shared)``,
+    not a separately rounded multiply followed by an add. The serving mirror
+    uses an explicit ``tl.fma``. This helper remains private so production
+    callers cannot accidentally transport its FP32 result.
+    """
+    if shared.shape != routed.shape:
+        raise ValueError(
+            f"Canonical MoE leaf operands must have equal shapes, got {tuple(shared.shape)} and {tuple(routed.shape)}"
+        )
+    if shared.dtype != routed.dtype or shared.dtype not in (torch.bfloat16, torch.float16):
+        raise TypeError(
+            f"Canonical MoE leaf operands must have the same BF16 or FP16 dtype, got {shared.dtype} and {routed.dtype}"
+        )
+    if shared.device != routed.device:
+        raise ValueError(f"Canonical MoE leaf operands must share a device, got {shared.device} and {routed.device}")
+    if not shared.is_contiguous() or not routed.is_contiguous():
+        raise ValueError("Canonical MoE leaf operands must be contiguous")
+    return torch.add(shared.float(), routed.float(), alpha=float(routed_scale))
 
-    Transport must put contributor ``C_i`` at index ``i`` before calling this
-    primitive. Every adjacent-pair level is a separate BF16 tensor addition,
-    so each internal tree node rounds to BF16 before the next level consumes
-    it. The operation is intentionally independent of model family and row
-    placement.
+
+def canonical_moe_leaf_fp32_v1(
+    shared: torch.Tensor,
+    routed: torch.Tensor,
+    routed_scale: float = 1.0,
+) -> torch.Tensor:
+    """Build one low-precision transport leaf with one-round FP32 FMA.
+
+    Both operands are promoted, ``shared + routed * FP32(scale)`` is evaluated
+    as one FP32 FMA, and the completed leaf is cast exactly once to the shared
+    operand's declared transport dtype.
+    """
+    return _canonical_moe_leaf_fp32_fma(shared, routed, routed_scale).to(shared.dtype)
+
+
+def _canonical_moe_fold_fp32_tree(partials_by_logical_ordinal: torch.Tensor) -> torch.Tensor:
+    """Evaluate the source-ordered adjacent-pair tree entirely in FP32.
+
+    This internal helper exposes the completed pre-cast boundary to focused
+    arithmetic tests. Production callers use :func:`canonical_moe_fold_fp32_v2`,
+    which performs the single declared output cast.
     """
     if partials_by_logical_ordinal.ndim < 2:
         raise ValueError("Canonical MoE fold requires contributor and payload dimensions")
     partials = partials_by_logical_ordinal
-    if partials.dtype is not torch.bfloat16:
-        raise TypeError("Canonical MoE fold requires BF16 inputs")
+    if partials.dtype not in (torch.bfloat16, torch.float16):
+        raise TypeError("Canonical MoE fold requires BF16 or FP16 inputs")
     contributor_count = partials.shape[0]
     if contributor_count <= 0:
         raise ValueError("Canonical MoE fold requires a positive contributor count")
 
-    level = partials
+    level = partials.to(torch.float32)
     while level.shape[0] > 1:
         pair_count = level.shape[0] // 2
-        paired = (level[: 2 * pair_count : 2] + level[1 : 2 * pair_count : 2]).to(torch.bfloat16)
+        paired = level[: 2 * pair_count : 2] + level[1 : 2 * pair_count : 2]
         if level.shape[0] % 2:
             level = torch.cat((paired, level[-1:]), dim=0)
         else:
             level = paired
     return level[0]
+
+
+def canonical_moe_fold_fp32_v2(partials_by_logical_ordinal: torch.Tensor) -> torch.Tensor:
+    """Fold source-ordered low-precision contributions under the FP32-v2 contract.
+
+    Transport must put contributor ``C_i`` at index ``i`` before calling this
+    primitive. Leaves are promoted to FP32, each level preserves the declared
+    adjacent-pair plus odd-tail topology, and every internal node stays FP32.
+    The completed tree is cast exactly once to the transported input dtype at
+    the consumer boundary. The arithmetic is an independent implementation of
+    serving's identically versioned program; neither side imports the other.
+    """
+    output_dtype = partials_by_logical_ordinal.dtype
+    return _canonical_moe_fold_fp32_tree(partials_by_logical_ordinal).to(output_dtype)
 
 
 def canonical_moe_reduce_reference(
@@ -650,7 +700,7 @@ def canonical_moe_reduce_reference(
         raise ValueError("Reference partials must have contributor, row, and payload dimensions")
     if partials_by_logical_ordinal.shape[1] != metadata.capacity:
         raise ValueError("Reference partial row count must equal metadata capacity")
-    result = canonical_moe_fold_v1(partials_by_logical_ordinal)
+    result = canonical_moe_fold_fp32_v2(partials_by_logical_ordinal)
     return torch.where(
         metadata.valid_mask.view(-1, *([1] * (result.ndim - 1))),
         result,
@@ -700,7 +750,7 @@ def _transport_and_fold(
             physical_sources = receive.view(contributor_count, rows, *payload_shape)
             source_group_order = torch.tensor(logical_to_group, dtype=torch.long, device=chunk.device)
             logical_sources = physical_sources.index_select(0, source_group_order)
-            folded = canonical_moe_fold_v1(logical_sources)
+            folded = canonical_moe_fold_fp32_v2(logical_sources)
         elif transport is CanonicalMoETransport.PACKED_EP16_V2:
             if contributor_count != 16:
                 raise ValueError("packed_ep16_v2 requires exactly 16 logical contributors")
@@ -735,7 +785,7 @@ def _transport_and_fold(
             physical_sources = receive.view(contributor_count, packed_rows, *payload_shape)
             source_group_order = torch.tensor(logical_to_group, dtype=torch.long, device=chunk.device)
             logical_sources = physical_sources.index_select(0, source_group_order)
-            packed_folded = canonical_moe_fold_v1(logical_sources)
+            packed_folded = canonical_moe_fold_fp32_v2(logical_sources)
         else:
             raise ValueError(f"Unknown canonical MoE transport: {transport}")
 
@@ -854,7 +904,7 @@ class _CanonicalMoECPShardedV3(torch.autograd.Function):
         # contributor order before the first floating-point operation.
         logical_to_group = torch.tensor(runtime.logical_to_group_rank, dtype=torch.long, device=receive.device)
         logical_sources = receive.index_select(0, logical_to_group)
-        folded = canonical_moe_fold_v1(logical_sources)
+        folded = canonical_moe_fold_fp32_v2(logical_sources)
         local_valid = full_valid[runtime.local_group_rank]
         output = torch.where(
             local_valid.view(-1, *([1] * len(payload_shape))),
@@ -974,7 +1024,7 @@ def _canonical_moe_reduce(
     )
 
 
-def canonical_moe_reduce_v1(
+def canonical_moe_reduce_fp32_v2(
     contribution: LocalMoEContribution,
     *,
     plan: ParallelPlan,
@@ -984,7 +1034,7 @@ def canonical_moe_reduce_v1(
     chunk_rows: int | None = None,
     graph_mode: bool = False,
 ) -> CanonicalMoEOutput:
-    """Canonicalize one typed local partial under the version-1 contract."""
+    """Canonicalize one typed local partial under the FP32-v2 contract."""
     return _canonical_moe_reduce(
         contribution,
         plan=plan,
@@ -1007,12 +1057,12 @@ def canonical_moe_reduce_packed_ep16_v2(
     chunk_rows: int | None = None,
     graph_mode: bool = False,
 ) -> CanonicalMoEOutput:
-    """Use packed equal-split owner transport with version-1 fold arithmetic.
+    """Use packed equal-split owner transport with FP32-v2 fold arithmetic.
 
     Each destination receives at most ``ceil(chunk_rows / 16)`` rows from
     every logical contributor. The selected rows retain their original order,
-    so the existing adjacent-pairwise BF16 fold observes the exact same
-    contributor sequence as :func:`canonical_moe_reduce_v1`.
+    so the FP32 adjacent-pair tree observes the exact same contributor
+    sequence as :func:`canonical_moe_reduce_fp32_v2`.
     """
     return _canonical_moe_reduce(
         contribution,
@@ -1088,6 +1138,7 @@ def canonical_moe_reduce_cp_sharded_v3(
 __all__ = [
     "CANONICAL_MOE_CP_SHARDED_TRANSPORT_VERSION",
     "CANONICAL_MOE_FOLD_VERSION",
+    "CANONICAL_MOE_LEAF_VERSION",
     "CANONICAL_MOE_PACKED_EP16_TRANSPORT_VERSION",
     "CANONICAL_MOE_REDUCE_VERSION",
     "CanonicalMoEGraphMetadata",
@@ -1100,10 +1151,11 @@ __all__ = [
     "OutputDistribution",
     "ParallelPlan",
     "ParallelRole",
-    "canonical_moe_fold_v1",
+    "canonical_moe_fold_fp32_v2",
+    "canonical_moe_leaf_fp32_v1",
     "canonical_moe_reduce_reference",
     "canonical_moe_reduce_packed_ep16_v2",
     "canonical_moe_reduce_cp_sharded_v3",
-    "canonical_moe_reduce_v1",
+    "canonical_moe_reduce_fp32_v2",
     "resolve_canonical_moe_transport",
 ]

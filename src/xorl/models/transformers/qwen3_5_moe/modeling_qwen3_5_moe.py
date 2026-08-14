@@ -431,11 +431,12 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
         Every rank gathers the full token batch (backward: reduce-scatter sum),
         computes ITS routed partial through the masked serving-kernel Function
         on the LOCAL expert slice + ITS shared-expert TP slice (trainable BI
-        GEMMs, torch-native bf16 silu*mul, sigmoid gate) added in bf16 — exactly
-        serving's per-rank partial — then partials are exchanged RAW
+        GEMMs, one-round FP32 silu*mul, sigmoid gate) joined by serving's
+        FP32 fused gate/mul/add and cast once to BF16 — exactly serving's
+        per-rank partial — then partials are exchanged RAW
         (all-to-all, never NCCL-summed) and each rank folds its own tokens'
-        n partials with the canonical adjacent-pair BF16 tree
-        (``canonical_moe_fold_v1``, bitwise serving's post-experts combine).
+        n partials with the canonical adjacent-pair FP32 tree and one final cast
+        (``canonical_moe_fold_fp32_v2``, bitwise serving's post-experts combine).
         Forward bits match the serving engine; backward uses stock numerics
         throughout (cuBLAS shared-expert grads, grouped-GEMM expert grads,
         NCCL grad reductions)."""
@@ -489,7 +490,8 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
         self._capture_diagnostic_component("moe_native_gathered_ids", gathered_ids)
 
         # 2. this rank's partial: routed (masked serving kernel on the local
-        #    slice) + shared-expert TP slice, added in bf16 (serving semantics)
+        #    slice) + shared-expert TP slice, joined by serving's FP32 fused
+        #    gate/mul/add and cast once to BF16
         lo = ep_rank * e_local
         local_ids = torch.where(
             (gathered_ids >= lo) & (gathered_ids < lo + e_local),

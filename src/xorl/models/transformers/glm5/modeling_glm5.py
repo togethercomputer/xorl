@@ -15,9 +15,10 @@ from xorl.distributed.canonical_moe import (
     LogicalRowOwnership,
     OutputDistribution,
     ParallelPlan,
+    canonical_moe_leaf_fp32_v1,
     canonical_moe_reduce_cp_sharded_v3,
+    canonical_moe_reduce_fp32_v2,
     canonical_moe_reduce_packed_ep16_v2,
-    canonical_moe_reduce_v1,
     resolve_canonical_moe_transport,
 )
 from xorl.distributed.moe.deepep import sync_pending_combine
@@ -74,7 +75,7 @@ from xorl.utils import logging
 
 
 logger = logging.get_logger(__name__)
-GLM52_LOCAL_PARTIAL_POLICY = "glm52_routed_final_scaled_then_shared_ep_slice_bf16_v2"
+GLM52_LOCAL_PARTIAL_POLICY = "glm52_routed_final_scaled_then_shared_ep_slice_fp32_then_bf16_v3"
 
 
 def _glm52_serving_grouped_topk(
@@ -1180,7 +1181,7 @@ class Glm5MoEBlock(MoEBlock):
             contributor_ordinal=ep_rank,
             contributor_count=ps.ep_size,
         )
-        local_partial = (routed + shared).to(torch.bfloat16)
+        local_partial = canonical_moe_leaf_fp32_v1(shared, routed)
 
         capacity = int(getattr(self.config, "_glm52_canonical_moe_capacity", local_partial.shape[0]))
         if local_partial.shape[0] > capacity:
@@ -1268,7 +1269,7 @@ class Glm5MoEBlock(MoEBlock):
             canonical_reduce = (
                 canonical_moe_reduce_packed_ep16_v2
                 if resolved_transport is CanonicalMoETransport.PACKED_EP16_V2
-                else canonical_moe_reduce_v1
+                else canonical_moe_reduce_fp32_v2
             )
             canonical = canonical_reduce(
                 contribution,

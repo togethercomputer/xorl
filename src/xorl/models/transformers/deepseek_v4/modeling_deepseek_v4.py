@@ -952,7 +952,7 @@ class DeepseekV4MoE(MoEBlock):
         from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
 
         # Unified combine: DSV4 folds partials with the same canonical
-        # adjacent-pair BF16 tree as Qwen/GLM; only the variable-row
+        # adjacent-pair FP32 tree as Qwen/GLM; only the variable-row
         # transport remains DSV4-specific (see dsv4_native_combine).
         from xorl.models.layers.moe.dsv4_native_combine import (  # noqa: PLC0415
             compact_rank_padded_rows,

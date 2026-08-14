@@ -11,6 +11,7 @@ from distributed_utils import run_distributed_script
 from xorl.distributed.canonical_moe import (
     CANONICAL_MOE_DENSE_MAX_CHUNK_ROWS,
     CANONICAL_MOE_FOLD_VERSION,
+    CANONICAL_MOE_LEAF_VERSION,
     CANONICAL_MOE_REDUCE_VERSION,
     CanonicalMoEGraphMetadata,
     CanonicalMoETransport,
@@ -19,12 +20,15 @@ from xorl.distributed.canonical_moe import (
     OutputDistribution,
     ParallelPlan,
     ParallelRole,
+    _canonical_moe_fold_fp32_tree,
+    _canonical_moe_leaf_fp32_fma,
     _resolve_transport_chunk_rows,
-    canonical_moe_fold_v1,
+    canonical_moe_fold_fp32_v2,
+    canonical_moe_leaf_fp32_v1,
     canonical_moe_reduce_cp_sharded_v3,
+    canonical_moe_reduce_fp32_v2,
     canonical_moe_reduce_packed_ep16_v2,
     canonical_moe_reduce_reference,
-    canonical_moe_reduce_v1,
     resolve_canonical_moe_transport,
 )
 from xorl.distributed.parallel_state import init_ep_mesh_matrix
@@ -43,19 +47,20 @@ def test_dense_transport_default_bounds_dp_owned_capacity_without_a_selector():
 
 
 def _explicit_tree(partials: torch.Tensor) -> torch.Tensor:
-    current = [partials[index] for index in range(partials.shape[0])]
+    current = [partials[index].float() for index in range(partials.shape[0])]
     while len(current) > 1:
-        next_level = [(current[index] + current[index + 1]).bfloat16() for index in range(0, len(current) - 1, 2)]
+        next_level = [current[index] + current[index + 1] for index in range(0, len(current) - 1, 2)]
         if len(current) % 2:
             next_level.append(current[-1])
         current = next_level
-    return current[0]
+    return current[0].to(partials.dtype)
 
 
 @pytest.mark.cpu
 @pytest.mark.parametrize("contributors", [1, 2, 3, 4, 5, 6, 8, 16, 17, 32])
-def test_reference_is_the_adjacent_bf16_tree(contributors: int):
-    assert CANONICAL_MOE_FOLD_VERSION == "canonical_moe_fold_v1"
+def test_reference_is_the_adjacent_fp32_tree_with_one_output_cast(contributors: int):
+    assert CANONICAL_MOE_FOLD_VERSION == "canonical_moe_fold_fp32_v2"
+    assert CANONICAL_MOE_REDUCE_VERSION == "canonical_moe_reduce_fp32_v2"
     rows = contributors + 2
     values = torch.zeros((contributors, rows, 3), dtype=torch.bfloat16)
     adversarial = torch.tensor(
@@ -78,7 +83,61 @@ def test_reference_is_the_adjacent_bf16_tree(contributors: int):
     expected = _explicit_tree(padded)
     expected[~metadata.valid_mask] = 0
     assert torch.equal(result, expected)
-    assert torch.equal(canonical_moe_fold_v1(padded), _explicit_tree(padded))
+    assert torch.equal(canonical_moe_fold_fp32_v2(padded), _explicit_tree(padded))
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fp32_tree_preserves_adversarial_cancellation_before_final_cast(dtype: torch.dtype):
+    partials = torch.tensor([[4096.0], [1.0], [-4096.0], [1.0]], dtype=dtype)
+
+    pre_cast = _canonical_moe_fold_fp32_tree(partials)
+    transported = canonical_moe_fold_fp32_v2(partials)
+
+    assert pre_cast.dtype is torch.float32
+    assert pre_cast.item() == 2.0
+    assert transported.dtype is dtype
+    assert transported.item() == 2.0
+
+
+@pytest.mark.cpu
+def test_fp32_tree_topology_is_not_reassociated_to_a_left_fold():
+    # At 2**24 the negative pair's +1 remains representable, so both programs
+    # return 1. At 2**25 the unit terms are below the FP32 tie boundary: the
+    # adjacent pairs both round to their large operands and cancel to zero,
+    # while a left-linear fold loses the first +1 and retains the final +1.
+    partials = torch.tensor(
+        [[33554432.0], [1.0], [-33554432.0], [1.0]],
+        dtype=torch.bfloat16,
+    )
+    adjacent_tree = _canonical_moe_fold_fp32_tree(partials)
+    left_linear = partials[0].float()
+    for contributor in partials[1:]:
+        left_linear = left_linear + contributor.float()
+
+    assert adjacent_tree.item() == 0.0
+    assert left_linear.item() == 1.0
+
+
+@pytest.mark.cpu
+def test_leaf_uses_one_round_fp32_fma_before_the_transport_cast():
+    assert CANONICAL_MOE_LEAF_VERSION == "canonical_moe_leaf_fp32_v1"
+    shared = torch.tensor([-0.01165771484375], dtype=torch.bfloat16)
+    routed = torch.tensor([209920.0], dtype=torch.bfloat16)
+    scale = 1.1
+
+    pre_cast = _canonical_moe_leaf_fp32_fma(shared, routed, scale)
+    transported = canonical_moe_leaf_fp32_v1(shared, routed, scale)
+    # Independent one-round oracle: these BF16 operands and the rounded FP32
+    # scale are represented exactly in FP64 before the single FP32 rounding.
+    scale_fp32 = torch.tensor(scale, dtype=torch.float32)
+    fma_oracle = (shared.double() + routed.double() * scale_fp32.double()).float()
+    separately_rounded = shared.float() + routed.float() * scale_fp32
+
+    assert torch.equal(pre_cast.view(torch.int32), fma_oracle.view(torch.int32))
+    assert not torch.equal(pre_cast.view(torch.int32), separately_rounded.view(torch.int32))
+    assert transported.item() == 231424.0
+    assert separately_rounded.bfloat16().item() == 230400.0
 
 
 @pytest.mark.cpu
@@ -87,16 +146,16 @@ def test_reference_is_the_adjacent_bf16_tree(contributors: int):
     [
         (1, (0x4580, 0x3F80)),
         (2, (0x4580, 0x4040)),
-        (3, (0x0000, 0x40C0)),
-        (4, (0x0000, 0x4120)),
+        (3, (0x3F80, 0x40C0)),
+        (4, (0x4000, 0x4120)),
         (5, (0x4500, 0x4170)),
         (6, (0x4500, 0x41A8)),
-        (8, (0x0000, 0x4210)),
-        (16, (0x0000, 0x4308)),
-        (17, (0x3F80, 0x4319)),
+        (8, (0x4080, 0x4210)),
+        (16, (0x40B0, 0x4308)),
+        (17, (0x40D0, 0x4319)),
     ],
 )
-def test_fold_exact_vectors_and_legacy_power_of_two_bytes(
+def test_fold_exact_vectors_under_fp32_tree(
     contributors: int,
     expected_bits: tuple[int, int],
 ):
@@ -124,7 +183,7 @@ def test_fold_exact_vectors_and_legacy_power_of_two_bytes(
         dtype=torch.bfloat16,
     )
 
-    actual = canonical_moe_fold_v1(partials[:contributors])
+    actual = canonical_moe_fold_fp32_v2(partials[:contributors])
 
     assert tuple(actual.view(torch.uint16).tolist()) == expected_bits
     assert torch.equal(actual, _explicit_tree(partials[:contributors]))
@@ -135,12 +194,12 @@ def test_fold_exact_vectors_and_legacy_power_of_two_bytes(
 @pytest.mark.parametrize("contributors", [8, 16])
 def test_shared_fold_replays_in_cuda_graph(contributors: int):
     partials = torch.randn((contributors, 64, 32), device="cuda", dtype=torch.bfloat16)
-    canonical_moe_fold_v1(partials)
+    canonical_moe_fold_fp32_v2(partials)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        folded = canonical_moe_fold_v1(partials)
+        folded = canonical_moe_fold_fp32_v2(partials)
     first = folded.clone()
     partials[0].add_(8.0)
     graph.replay()
@@ -416,7 +475,7 @@ def test_parallel_plan_records_any_declared_positive_complete_contributor_group(
     # count is byte-equivalent to an EP1 trainer identity.
     if contributors == 1:
         local_complete = torch.tensor([[3.0, -2.0]], dtype=torch.bfloat16)
-        assert torch.equal(canonical_moe_fold_v1(local_complete), local_complete[0])
+        assert torch.equal(canonical_moe_fold_fp32_v2(local_complete), local_complete[0])
 
 
 @pytest.mark.cpu
@@ -424,7 +483,7 @@ def test_parallel_plan_and_fold_reject_only_nonpositive_contributor_counts():
     with pytest.raises(ValueError, match="positive"):
         ParallelPlan.primitive(0)
     with pytest.raises(ValueError, match="positive contributor count"):
-        canonical_moe_fold_v1(torch.empty((0, 2), dtype=torch.bfloat16))
+        canonical_moe_fold_fp32_v2(torch.empty((0, 2), dtype=torch.bfloat16))
 
 
 @pytest.mark.cpu
@@ -542,7 +601,7 @@ def _run_distributed_case() -> None:
     logical_stack = physical_stack[logical_to_physical]
     expected = canonical_moe_reduce_reference(logical_stack, metadata)
 
-    replicated = canonical_moe_reduce_v1(
+    replicated = canonical_moe_reduce_fp32_v2(
         contribution,
         plan=plan,
         group=dist.group.WORLD,
@@ -560,7 +619,7 @@ def _run_distributed_case() -> None:
         capacity=capacity,
         valid_rows=valid_rows,
     )
-    permuted = canonical_moe_reduce_v1(
+    permuted = canonical_moe_reduce_fp32_v2(
         LocalMoEContribution(
             local.index_select(0, permutation),
             permuted_metadata,
@@ -580,7 +639,7 @@ def _run_distributed_case() -> None:
             metadata.absolute_positions[row : row + 1],
             capacity=1,
         )
-        solo_row = canonical_moe_reduce_v1(
+        solo_row = canonical_moe_reduce_fp32_v2(
             LocalMoEContribution(
                 local[row : row + 1],
                 solo_metadata,
@@ -592,7 +651,7 @@ def _run_distributed_case() -> None:
         )
         assert torch.equal(solo_row.tensor[0], replicated.tensor[row])
 
-    solo = canonical_moe_reduce_v1(
+    solo = canonical_moe_reduce_fp32_v2(
         contribution,
         plan=plan,
         group=dist.group.WORLD,
@@ -601,7 +660,7 @@ def _run_distributed_case() -> None:
     )
     assert torch.equal(solo.tensor, replicated.tensor)
 
-    owner_sharded = canonical_moe_reduce_v1(
+    owner_sharded = canonical_moe_reduce_fp32_v2(
         contribution,
         plan=plan,
         group=dist.group.WORLD,
@@ -621,7 +680,7 @@ def _run_distributed_case() -> None:
     assert bool(torch.all(local.grad[metadata.valid_mask] != 0))
 
     with pytest.raises(TypeError, match="already reduced"):
-        canonical_moe_reduce_v1(
+        canonical_moe_reduce_fp32_v2(
             replicated,
             plan=plan,
             group=dist.group.WORLD,
@@ -646,7 +705,7 @@ def _packed_ep16_local_partial(capacity: int, payload: int) -> torch.Tensor:
     return values.to(torch.bfloat16)
 
 
-def _assert_packed_ep16_matches_v1(
+def _assert_packed_ep16_matches_fp32_v2(
     *,
     capacity: int,
     valid_rows: int,
@@ -687,7 +746,7 @@ def _assert_packed_ep16_matches_v1(
     local[valid_rows:] = torch.arange(capacity - valid_rows, dtype=torch.float32).unsqueeze(1).add(1).bfloat16()
     contribution = LocalMoEContribution(local, metadata, "test:packed_ep16:adversarial_bf16")
 
-    dense = canonical_moe_reduce_v1(
+    dense = canonical_moe_reduce_fp32_v2(
         contribution,
         plan=plan,
         group=dist.group.WORLD,
@@ -705,7 +764,7 @@ def _assert_packed_ep16_matches_v1(
         assert torch.equal(packed.tensor.view(torch.int16), dense.tensor.view(torch.int16))
         assert torch.count_nonzero(packed.tensor[~metadata.valid_mask]) == 0
 
-    dense_owner = canonical_moe_reduce_v1(
+    dense_owner = canonical_moe_reduce_fp32_v2(
         contribution,
         plan=plan,
         group=dist.group.WORLD,
@@ -724,7 +783,7 @@ def _assert_packed_ep16_matches_v1(
     if capacity == 35:
         dense_leaf = local.clone().requires_grad_(True)
         packed_leaf = local.clone().requires_grad_(True)
-        dense_for_backward = canonical_moe_reduce_v1(
+        dense_for_backward = canonical_moe_reduce_fp32_v2(
             LocalMoEContribution(dense_leaf, metadata, "test:packed_ep16:backward"),
             plan=plan,
             group=dist.group.WORLD,
@@ -742,7 +801,7 @@ def _assert_packed_ep16_matches_v1(
         assert torch.equal(packed_leaf.grad.view(torch.int16), dense_leaf.grad.view(torch.int16))
 
 
-def _assert_cp_sharded_v3_matches_v1(*, capacity: int, valid_rows: int, payload: int) -> None:
+def _assert_cp_sharded_v3_matches_fp32_v2(*, capacity: int, valid_rows: int, payload: int) -> None:
     if capacity % 16:
         raise ValueError("v3 test requires equal padded CP-source capacity")
     plan = ParallelPlan.primitive(16)
@@ -754,7 +813,7 @@ def _assert_cp_sharded_v3_matches_v1(*, capacity: int, valid_rows: int, payload:
     local = _packed_ep16_local_partial(capacity, payload)
     local[valid_rows:] = torch.arange(capacity - valid_rows, dtype=torch.float32).unsqueeze(1).add(1).bfloat16()
     contribution = LocalMoEContribution(local, metadata, "test:cp_sharded_v3:adversarial_bf16")
-    dense = canonical_moe_reduce_v1(
+    dense = canonical_moe_reduce_fp32_v2(
         contribution,
         plan=plan,
         group=dist.group.WORLD,
@@ -777,7 +836,7 @@ def _assert_cp_sharded_v3_matches_v1(*, capacity: int, valid_rows: int, payload:
     if capacity == 32:
         dense_leaf = local.clone().requires_grad_(True)
         v3_leaf = local.clone().requires_grad_(True)
-        dense_for_backward = canonical_moe_reduce_v1(
+        dense_for_backward = canonical_moe_reduce_fp32_v2(
             LocalMoEContribution(dense_leaf, metadata, "test:cp_sharded_v3:backward"),
             plan=plan,
             group=dist.group.WORLD,
@@ -802,24 +861,24 @@ def _run_packed_ep16_case() -> None:
     # by the 4,099-token trace: a 13-row CP tail and the server's 125-row
     # pad-to-128 tail. Padding resets position IDs to zero, so neither owner
     # histogram fits ceil(capacity / 16).
-    _assert_packed_ep16_matches_v1(capacity=35, valid_rows=32, payload=7)
-    _assert_packed_ep16_matches_v1(
+    _assert_packed_ep16_matches_fp32_v2(capacity=35, valid_rows=32, payload=7)
+    _assert_packed_ep16_matches_fp32_v2(
         capacity=4112,
         valid_rows=4112,
         payload=4,
         padded_reset_tail_rows=13,
         requested_chunk_rows=128,
     )
-    _assert_packed_ep16_matches_v1(
+    _assert_packed_ep16_matches_fp32_v2(
         capacity=4224,
         valid_rows=4224,
         payload=4,
         padded_reset_tail_rows=125,
         requested_chunk_rows=128,
     )
-    _assert_cp_sharded_v3_matches_v1(capacity=32, valid_rows=29, payload=7)
-    _assert_cp_sharded_v3_matches_v1(capacity=4112, valid_rows=4099, payload=4)
-    _assert_cp_sharded_v3_matches_v1(capacity=4224, valid_rows=4099, payload=4)
+    _assert_cp_sharded_v3_matches_fp32_v2(capacity=32, valid_rows=29, payload=7)
+    _assert_cp_sharded_v3_matches_fp32_v2(capacity=4112, valid_rows=4099, payload=4)
+    _assert_cp_sharded_v3_matches_fp32_v2(capacity=4224, valid_rows=4099, payload=4)
 
     dist.barrier()
     dist.destroy_process_group()
