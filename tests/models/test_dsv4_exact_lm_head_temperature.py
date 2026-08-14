@@ -125,6 +125,8 @@ def test_dsv4_custom_boundary_carries_temperature_through_adapter_backward(
     group = object()
 
     class FakeComponent:
+        source_ordinal = 0
+
         @staticmethod
         def _validate_tp_group():
             return group
