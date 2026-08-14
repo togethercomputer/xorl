@@ -259,6 +259,11 @@ class TestTrainerOrdering:
                 ce_mode="native",
                 enable_fp8_training=False,
                 enable_qarl=False,
+                pipeline_parallel_virtual_stages=1,
+                pipeline_parallel_input_weight=1,
+                pipeline_parallel_output_weight=1,
+                pipeline_parallel_num_layers_in_first_stage=None,
+                pipeline_parallel_num_layers_in_last_stage=None,
             ),
         )
         trainer._causallm_loss_params = {}
