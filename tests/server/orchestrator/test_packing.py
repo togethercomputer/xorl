@@ -405,6 +405,34 @@ def test_normalized_sampler_metadata_expands_to_each_decision(enable_packing):
     assert not any(key.startswith("sampling_") for key in batch)
 
 
+def test_normalized_greedy_sampler_payload_preserves_decision_logprob():
+    packer = SequentialPacker(
+        enable_packing=False,
+        log_stats=False,
+        pad_to_multiple_of=1,
+    )
+    datum = {
+        "model_input": {"input_ids": [11, 22]},
+        "loss_fn_inputs": {
+            "target_tokens": [22, 33],
+            "logprobs": [0.0, 0.0],
+            # SGLang normalizes user temperature=0 to this divide-safe pair.
+            "sampling_temperature": 1.0,
+            "sampling_top_k": 1,
+            "sampling_top_p": 1.0,
+            "sampling_min_p": 0.0,
+        },
+    }
+
+    batch = packer.pack([datum], max_seq_len=100, request_id="greedy")[0]
+
+    assert batch["logprobs"] == [[0.0, 0.0]]
+    assert batch["logprob_temperatures"] == [[1.0, 1.0]]
+    assert batch["logprob_top_ks"] == [[1, 1]]
+    assert batch["logprob_top_ps"] == [[1.0, 1.0]]
+    assert batch["logprob_min_ps"] == [[0.0, 0.0]]
+
+
 def test_normalized_sampler_metadata_follows_hf_causal_shift():
     packer = SequentialPacker(enable_packing=True, log_stats=False, pad_to_multiple_of=1)
     batch = packer.pack(

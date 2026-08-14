@@ -143,6 +143,25 @@ def test_historical_action_outside_current_support_is_negative_infinity_with_zer
     assert torch.equal(logits.grad, torch.zeros_like(logits))
 
 
+def test_greedy_decision_logprob_replay_is_positive_zero_with_zero_gradient():
+    logits = _rows([[3.0, 3.0, 1.0]]).requires_grad_(True)
+    logprob, _, selected_support, support = exact_selected_logprob(
+        logits,
+        torch.tensor([0], dtype=torch.int64),
+        torch.tensor([1], dtype=torch.int64),
+        _rows([1.0]),
+        _rows([0.0]),
+    )
+
+    assert support.tolist() == [[True, False, False]]
+    assert selected_support.item()
+    assert torch.equal(logprob, _rows([0.0]))
+    assert not torch.signbit(logprob).any()
+
+    logprob.backward()
+    assert torch.equal(logits.grad, torch.zeros_like(logits))
+
+
 def test_chunked_selected_score_and_vjp_equal_direct_program():
     direct_logits = _rows(
         [
