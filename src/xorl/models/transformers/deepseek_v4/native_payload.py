@@ -1484,7 +1484,7 @@ def dsv4_join_routed_shared_partial(
     *,
     routed_scaling_factor: float,
 ) -> torch.Tensor:
-    """Match the exact serving leaf: FP32 FMA, then one BF16 transport cast."""
+    """Match the exact serving leaf: FP32 FMA, then one BF16/FP16 store."""
 
     return _Dsv4RoutedSharedJoin.apply(routed, shared, routed_scaling_factor)
 

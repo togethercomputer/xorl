@@ -21,7 +21,6 @@ from xorl.distributed.canonical_moe import (
     ParallelPlan,
     ParallelRole,
     _canonical_moe_fold_fp32_tree,
-    _canonical_moe_leaf_fp32_fma,
     _resolve_transport_chunk_rows,
     canonical_moe_fold_fp32_v2,
     canonical_moe_leaf_fp32_v1,
@@ -54,6 +53,16 @@ def _explicit_tree(partials: torch.Tensor) -> torch.Tensor:
             next_level.append(current[-1])
         current = next_level
     return current[0].to(partials.dtype)
+
+
+def _one_round_leaf_oracle(
+    shared: torch.Tensor,
+    routed: torch.Tensor,
+    scale: float,
+) -> torch.Tensor:
+    """Independent pre-cast scalar program for one FP32 FMA rounding."""
+    scale_fp32 = torch.tensor(scale, dtype=torch.float32)
+    return (shared.cpu().double() + routed.cpu().double() * scale_fp32.double()).float()
 
 
 @pytest.mark.cpu
@@ -120,24 +129,161 @@ def test_fp32_tree_topology_is_not_reassociated_to_a_left_fold():
 
 
 @pytest.mark.cpu
-def test_leaf_uses_one_round_fp32_fma_before_the_transport_cast():
+@pytest.mark.parametrize(
+    ("dtype", "shared_value", "routed_value", "scale", "pre_cast_bits", "transport_bits"),
+    [
+        (torch.bfloat16, -0.01165771484375, 209920.0, 1.1, 0x48618000, 0x4862),
+        (
+            torch.float16,
+            0.046356201171875,
+            0.10186767578125,
+            -2.7744157314300537,
+            0xBE71EFFF,
+            0xB38F,
+        ),
+    ],
+)
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_leaf_uses_compile_stable_one_round_fp32_fma_before_transport_cast(
+    dtype: torch.dtype,
+    shared_value: float,
+    routed_value: float,
+    scale: float,
+    pre_cast_bits: int,
+    transport_bits: int,
+    dynamic: bool,
+):
     assert CANONICAL_MOE_LEAF_VERSION == "canonical_moe_leaf_fp32_v1"
-    shared = torch.tensor([-0.01165771484375], dtype=torch.bfloat16)
-    routed = torch.tensor([209920.0], dtype=torch.bfloat16)
-    scale = 1.1
+    shared = torch.tensor([shared_value], dtype=dtype)
+    routed = torch.tensor([routed_value], dtype=dtype)
 
-    pre_cast = _canonical_moe_leaf_fp32_fma(shared, routed, scale)
-    transported = canonical_moe_leaf_fp32_v1(shared, routed, scale)
-    # Independent one-round oracle: these BF16 operands and the rounded FP32
-    # scale are represented exactly in FP64 before the single FP32 rounding.
+    fma_oracle = _one_round_leaf_oracle(shared, routed, scale)
     scale_fp32 = torch.tensor(scale, dtype=torch.float32)
-    fma_oracle = (shared.double() + routed.double() * scale_fp32.double()).float()
     separately_rounded = shared.float() + routed.float() * scale_fp32
+    eager = canonical_moe_leaf_fp32_v1(shared, routed, scale)
 
-    assert torch.equal(pre_cast.view(torch.int32), fma_oracle.view(torch.int32))
-    assert not torch.equal(pre_cast.view(torch.int32), separately_rounded.view(torch.int32))
-    assert transported.item() == 231424.0
-    assert separately_rounded.bfloat16().item() == 230400.0
+    def leaf_fn(shared_arg: torch.Tensor, routed_arg: torch.Tensor) -> torch.Tensor:
+        return canonical_moe_leaf_fp32_v1(shared_arg, routed_arg, scale)
+
+    compiled = torch.compile(leaf_fn, fullgraph=True, dynamic=dynamic)(shared, routed)
+
+    assert (fma_oracle.view(torch.int32).item() & 0xFFFFFFFF) == pre_cast_bits
+    assert not torch.equal(fma_oracle.view(torch.int32), separately_rounded.view(torch.int32))
+    assert eager.dtype is dtype
+    assert eager.view(torch.uint16).item() == transport_bits
+    assert torch.equal(compiled.view(torch.uint16), eager.view(torch.uint16))
+    assert separately_rounded.to(dtype).view(torch.uint16).item() != transport_bits
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_leaf_autograd_matches_declared_fp32_scale_under_compile(
+    dtype: torch.dtype,
+    dynamic: bool,
+):
+    scale = -1.375
+    shared = torch.tensor([0.25, -0.5, 1.0], dtype=dtype, requires_grad=True)
+    routed = torch.tensor([-2.0, 0.75, 4.0], dtype=dtype, requires_grad=True)
+    grad_output = torch.tensor([0.5, -1.25, 2.0], dtype=dtype)
+
+    def leaf_fn(shared_arg: torch.Tensor, routed_arg: torch.Tensor) -> torch.Tensor:
+        return canonical_moe_leaf_fp32_v1(shared_arg, routed_arg, scale)
+
+    compiled = torch.compile(leaf_fn, fullgraph=True, dynamic=dynamic)
+    output = compiled(shared, routed)
+    grad_shared, grad_routed = torch.autograd.grad(
+        output,
+        (shared, routed),
+        grad_outputs=grad_output,
+    )
+
+    assert output.dtype is dtype
+    assert grad_shared.dtype is dtype
+    assert grad_routed.dtype is dtype
+    assert torch.equal(grad_shared, grad_output)
+    assert torch.equal(grad_routed, (grad_output.float() * scale).to(dtype))
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    ("dtype", "shared_value", "routed_value", "scale", "transport_bits"),
+    [
+        (torch.bfloat16, -0.01165771484375, 209920.0, 1.1, 0x4862),
+        (
+            torch.float16,
+            0.046356201171875,
+            0.10186767578125,
+            -2.7744157314300537,
+            0xB38F,
+        ),
+    ],
+)
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_cuda_leaf_matches_one_round_oracle_under_compile(
+    dtype: torch.dtype,
+    shared_value: float,
+    routed_value: float,
+    scale: float,
+    transport_bits: int,
+    dynamic: bool,
+):
+    shared = torch.tensor(
+        [shared_value],
+        device="cuda",
+        dtype=dtype,
+        requires_grad=True,
+    )
+    routed = torch.tensor(
+        [routed_value],
+        device="cuda",
+        dtype=dtype,
+        requires_grad=True,
+    )
+
+    def leaf_fn(shared_arg: torch.Tensor, routed_arg: torch.Tensor) -> torch.Tensor:
+        return canonical_moe_leaf_fp32_v1(shared_arg, routed_arg, scale)
+
+    eager = leaf_fn(shared, routed)
+    compiled = torch.compile(leaf_fn, fullgraph=True, dynamic=dynamic)(shared, routed)
+    grad_shared, grad_routed = torch.autograd.grad(
+        compiled,
+        (shared, routed),
+        grad_outputs=torch.ones_like(compiled),
+    )
+
+    assert eager.view(torch.uint16).item() == transport_bits
+    assert torch.equal(compiled.view(torch.uint16), eager.view(torch.uint16))
+    assert torch.equal(grad_shared, torch.ones_like(shared))
+    assert torch.equal(
+        grad_routed,
+        torch.ones_like(routed, dtype=torch.float32).mul(scale).to(dtype),
+    )
+
+
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_cuda_leaf_replays_in_cuda_graph_without_fp32_output(dtype: torch.dtype):
+    shared = torch.tensor([0.25, -0.5, 1.0], device="cuda", dtype=dtype)
+    routed = torch.tensor([-2.0, 0.75, 4.0], device="cuda", dtype=dtype)
+    scale = -1.375
+    canonical_moe_leaf_fp32_v1(shared, routed, scale)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = canonical_moe_leaf_fp32_v1(shared, routed, scale)
+    first = output.clone()
+    routed.copy_(torch.tensor([3.0, -1.0, 0.5], device="cuda", dtype=dtype))
+    graph.replay()
+
+    expected = _one_round_leaf_oracle(shared, routed, scale).to(dtype).to("cuda")
+    assert output.dtype is dtype
+    assert output.numel() == shared.numel()
+    assert not torch.equal(first, output)
+    assert torch.equal(output, expected)
 
 
 @pytest.mark.cpu

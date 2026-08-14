@@ -191,7 +191,7 @@ def sglang_fused_gate_sigmoid_mul_add(
 
 
 def exchange_and_canonical_fold(partial: torch.Tensor, group, ep_size: int) -> torch.Tensor:
-    """RAW partial exchange + the serving canonical BF16 contributor fold.
+    """RAW BF16 partial exchange + the serving canonical FP32 contributor fold.
 
     ``partial`` is this rank's [n*T, H] contribution for ALL gathered tokens.
     The all-to-all hands rank r the n per-rank partials for ITS OWN T rows;

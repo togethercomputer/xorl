@@ -25,6 +25,8 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
+from xorl.ops.canonical_moe_leaf import canonical_moe_leaf_fp32_v1_op
+
 
 CANONICAL_MOE_FOLD_VERSION = "canonical_moe_fold_fp32_v2"
 CANONICAL_MOE_REDUCE_VERSION = "canonical_moe_reduce_fp32_v2"
@@ -608,34 +610,6 @@ def _validate_runtime_plan(
     )
 
 
-def _canonical_moe_leaf_fp32_fma(
-    shared: torch.Tensor,
-    routed: torch.Tensor,
-    routed_scale: float = 1.0,
-) -> torch.Tensor:
-    """Return the completed contributor leaf before its transport cast.
-
-    ``torch.add(..., alpha=...)`` is intentionally one FP32 pointwise
-    operation: its numerical contract is ``fma(routed, FP32(scale), shared)``,
-    not a separately rounded multiply followed by an add. The serving mirror
-    uses an explicit ``tl.fma``. This helper remains private so production
-    callers cannot accidentally transport its FP32 result.
-    """
-    if shared.shape != routed.shape:
-        raise ValueError(
-            f"Canonical MoE leaf operands must have equal shapes, got {tuple(shared.shape)} and {tuple(routed.shape)}"
-        )
-    if shared.dtype != routed.dtype or shared.dtype not in (torch.bfloat16, torch.float16):
-        raise TypeError(
-            f"Canonical MoE leaf operands must have the same BF16 or FP16 dtype, got {shared.dtype} and {routed.dtype}"
-        )
-    if shared.device != routed.device:
-        raise ValueError(f"Canonical MoE leaf operands must share a device, got {shared.device} and {routed.device}")
-    if not shared.is_contiguous() or not routed.is_contiguous():
-        raise ValueError("Canonical MoE leaf operands must be contiguous")
-    return torch.add(shared.float(), routed.float(), alpha=float(routed_scale))
-
-
 def canonical_moe_leaf_fp32_v1(
     shared: torch.Tensor,
     routed: torch.Tensor,
@@ -643,11 +617,13 @@ def canonical_moe_leaf_fp32_v1(
 ) -> torch.Tensor:
     """Build one low-precision transport leaf with one-round FP32 FMA.
 
-    Both operands are promoted, ``shared + routed * FP32(scale)`` is evaluated
-    as one FP32 FMA, and the completed leaf is cast exactly once to the shared
-    operand's declared transport dtype.
+    Both operands are promoted in registers, ``shared + routed * FP32(scale)``
+    is evaluated as one FP32 FMA, and the completed leaf is stored exactly
+    once in the shared operand's declared transport dtype. The opaque
+    primitive prevents compiler reassociation without materializing an FP32
+    output tensor.
     """
-    return _canonical_moe_leaf_fp32_fma(shared, routed, routed_scale).to(shared.dtype)
+    return canonical_moe_leaf_fp32_v1_op(shared, routed, routed_scale)
 
 
 def _canonical_moe_fold_fp32_tree(partials_by_logical_ordinal: torch.Tensor) -> torch.Tensor:
