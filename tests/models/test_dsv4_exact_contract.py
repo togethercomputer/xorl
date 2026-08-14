@@ -270,7 +270,14 @@ def test_exact_lm_head_binds_to_a_pp2_stage_local_tp8_group(monkeypatch) -> None
         get_coordinate=lambda: [1, 0],
     )
     state = SimpleNamespace(
+        dp_size=8,
+        cp_size=1,
+        dp_rank=0,
+        cp_rank=0,
+        cp_enabled=False,
         tp_size=1,
+        ep_size=8,
+        ep_group=group,
         lm_head_tp_size=8,
         lm_head_tp_group=group,
         device_mesh=device_mesh,
@@ -294,16 +301,25 @@ def test_exact_lm_head_binds_to_a_pp2_stage_local_tp8_group(monkeypatch) -> None
     bind_dsv4_exact_lm_head(model)
 
     assert isinstance(model.lm_head, Dsv4ExactTP8LmHeadLoraLinear)
-    assert model.lm_head._dsv4_exact_selected_logprob.expected_group_ranks == tuple(range(8, 16))
+    assert model.lm_head._dsv4_exact_selected_logprob.physical_ranks == tuple(range(8, 16))
+    assert model.lm_head._dsv4_exact_selected_logprob.source_ordinal == 0
 
 
-def test_exact_lm_head_rejects_a_cross_stage_tp8_group(monkeypatch) -> None:
+def test_exact_lm_head_rejects_a_group_outside_the_owner_plane(monkeypatch) -> None:
     from xorl.distributed import parallel_state as parallel_state_impl  # noqa: PLC0415
     from xorl.lora.modules.linear import LoraLinear  # noqa: PLC0415
 
     group = object()
+    ep_group = object()
     state = SimpleNamespace(
+        dp_size=8,
+        cp_size=1,
+        dp_rank=0,
+        cp_rank=0,
+        cp_enabled=False,
         tp_size=1,
+        ep_size=8,
+        ep_group=ep_group,
         lm_head_tp_size=8,
         lm_head_tp_group=group,
         device_mesh=SimpleNamespace(
@@ -315,7 +331,11 @@ def test_exact_lm_head_rejects_a_cross_stage_tp8_group(monkeypatch) -> None:
     monkeypatch.setattr(parallel_state_impl, "get_parallel_state", lambda: state)
     monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
     monkeypatch.setattr(torch.distributed, "get_world_size", lambda actual: 8)
-    monkeypatch.setattr(torch.distributed, "get_process_group_ranks", lambda actual: tuple(range(4, 12)))
+    monkeypatch.setattr(
+        torch.distributed,
+        "get_process_group_ranks",
+        lambda actual: tuple(range(4, 12)) if actual is group else tuple(range(8, 16)),
+    )
     model = SimpleNamespace(
         lm_head=LoraLinear(
             4096,
@@ -327,7 +347,7 @@ def test_exact_lm_head_rejects_a_cross_stage_tp8_group(monkeypatch) -> None:
         )
     )
 
-    with pytest.raises(RuntimeError, match="crosses the current pipeline stage"):
+    with pytest.raises(RuntimeError, match="owner plane"):
         bind_dsv4_exact_lm_head(model)
 
 
