@@ -87,16 +87,22 @@ def _seeded_router(device: torch.device) -> Glm52ExactFullParamRouterWeight:
     return router
 
 
-def _rank_model(expert_start: int, device: torch.device, *, cpu_surrogate_refresh: bool) -> nn.Module:
-    """A model tree exposing checkpoint FQNs model.layers.3.mlp.{gate,experts}."""
+def _rank_model(
+    expert_start: int,
+    device: torch.device,
+    *,
+    cpu_surrogate_refresh: bool,
+    layer_index: int = 3,
+) -> nn.Module:
+    """A model tree exposing global checkpoint layer FQNs."""
 
     root = nn.Module()
     root.model = nn.Module()
-    root.model.layers = nn.ModuleList([nn.Module() for _ in range(4)])
+    root.model.layers = nn.ModuleList([nn.Module() for _ in range(layer_index + 1)])
     mlp = nn.Module()
     mlp.gate = _seeded_router(device)
     mlp.experts = _seeded_bank(expert_start, device)
-    root.model.layers[3].mlp = mlp
+    root.model.layers[layer_index].mlp = mlp
     if cpu_surrogate_refresh:
         # CPU surrogate for the CUDA-pinned quantizer: the plumbing gate
         # stages the already-seeded cache bytes and re-records identity while
@@ -192,11 +198,85 @@ def test_two_rank_step_publication_merges_to_one_complete_manifest(tmp_path) -> 
 
 
 @pytest.mark.cpu
+def test_pp2_publication_includes_each_stage_scope_exactly_once(tmp_path, monkeypatch) -> None:
+    from xorl.models.transformers.glm5.exact_fullparam_admission import (
+        iter_glm52_fullparam_publication,
+    )
+
+    device = torch.device("cpu")
+    models = {
+        0: _rank_model(0, device, cpu_surrogate_refresh=True, layer_index=3),
+        1: _rank_model(4, device, cpu_surrogate_refresh=True, layer_index=3),
+        2: _rank_model(0, device, cpu_surrogate_refresh=True, layer_index=7),
+        3: _rank_model(4, device, cpu_surrogate_refresh=True, layer_index=7),
+    }
+    plans = []
+    stage_by_rank = {0: 0, 1: 0, 2: 1, 3: 1}
+    pp_group_by_rank = {0: (0, 2), 1: (1, 3), 2: (0, 2), 3: (1, 3)}
+    ep_group_by_rank = {0: (0, 1), 1: (0, 1), 2: (2, 3), 3: (2, 3)}
+    owner_key_by_rank = {0: (0,), 1: (1,), 2: (0,), 3: (1,)}
+    for rank, model in models.items():
+        components = iter_glm52_fullparam_publication(model)
+        plans.append(
+            {
+                "rank": rank,
+                "error": None,
+                "targets": [
+                    (target, getattr(module, "glm52_fullparam_payload_kind", ""))
+                    for target, module in components
+                ],
+                "expected_targets": sorted(step_publish_module._expected_global_targets(model)),
+                # These values model live group membership: two PP columns
+                # (0,2)/(1,3), and one stage-local EP group per stage.
+                "pp_stage": stage_by_rank[rank],
+                "pp_group_ranks": pp_group_by_rank[rank],
+                "ep_owner": ep_group_by_rank[rank].index(rank),
+                "ep_group_ranks": ep_group_by_rank[rank],
+                "owner_key": owner_key_by_rank[rank],
+            }
+        )
+
+    monkeypatch.setattr(step_publish_module, "_gather_publication_plans", lambda _local, _world: plans)
+    publish_root = str(tmp_path / "publish")
+    for rank in (3, 2, 1):
+        receipt = glm52_fullparam_step_boundary(
+            models[rank],
+            step=1,
+            publish_root=publish_root,
+            rank=rank,
+            world_size=4,
+            barrier=lambda: None,
+        )
+        assert receipt["published"] is True
+
+    root_receipt = glm52_fullparam_step_boundary(
+        models[0],
+        step=1,
+        publish_root=publish_root,
+        rank=0,
+        world_size=4,
+        barrier=lambda: None,
+    )
+    expected = {
+        f"model.layers.{layer}.mlp.gate" for layer in (3, 7)
+    } | {
+        f"model.layers.{layer}.mlp.experts.{expert}"
+        for layer in (3, 7)
+        for expert in range(_GLOBAL_EXPERTS)
+    }
+    combined_targets = _combined_targets(root_receipt["combined_dir"])
+    assert set(combined_targets) == expected
+    assert len(combined_targets) == len(expected)
+    assert root_receipt["items"] == 2 * (1 + _GLOBAL_EXPERTS)
+    assert root_receipt["contributing_ranks"] == 4
+
+
+@pytest.mark.cpu
 def test_missing_rank_contribution_fails_the_completeness_gate(tmp_path) -> None:
     publish_root = str(tmp_path / "publish")
     with pytest.raises(
         Glm52FullParamPayloadError,
-        match="requires exactly one contribution directory per rank",
+        match="requires exactly one directory per selected live contributor",
     ):
         glm52_fullparam_step_boundary(
             _rank_model(0, torch.device("cpu"), cpu_surrogate_refresh=True),
@@ -278,6 +358,13 @@ def _run_step_publish_worker() -> None:
     dist.init_process_group("gloo")
     rank = dist.get_rank()
     assert dist.get_world_size() == 2
+    step_publish_module._live_publication_identity = lambda owner: {
+        "pp_stage": 0,
+        "pp_group_ranks": (owner,),
+        "ep_owner": owner,
+        "ep_group_ranks": (0, 1),
+        "owner_key": (owner,),
+    }
     base = os.path.join(tempfile.gettempdir(), f"glm52-step-rendezvous-{os.environ['MASTER_PORT']}")
     original_save = step_publish_module.save_glm52_fullparam_payload
 

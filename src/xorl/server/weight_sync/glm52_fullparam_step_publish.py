@@ -10,13 +10,14 @@ Distribution model:
 - ``refresh_glm52_fullparam_caches`` runs on EVERY rank, every step (the
   staleness gates would otherwise refuse the next publication, and the
   trainer's own next forward would consume stale bytes).
-- Expert items are rank-owned (globally-indexed targets, disjoint across EP
-  ranks by the bank's assigned range) and are published by every owning rank.
-- Dense composites and routers are replicated and byte-identical; rank 0
-  publishes them.
+- Each rank enumerates its stage-local targets.  Live PP/EP membership and the
+  model-derived target names select exactly one owner for every target, so a
+  later pipeline stage cannot be omitted and replicated items are not emitted
+  twice.
 - Every publishing rank saves its partial payload to
   ``{publish_root}/step_{step:06d}/rank_{rank:02d}`` on the SHARED
-  filesystem; after a collective error rendezvous, rank 0 loads every partial back (full
+  filesystem; after a collective error rendezvous, rank 0 loads every contributing
+  partial back (full
   checksum re-verification), merges them into one manifest, validates
   completeness against the model's own enumeration expectation, saves the
   combined payload to ``.../combined``, and writes a completion marker. A
@@ -117,6 +118,133 @@ def _expected_global_targets(model: nn.Module) -> set[str]:
     return expected
 
 
+def _live_publication_identity(rank: int) -> dict:
+    """Return this rank's logical owner coordinates from live process groups.
+
+    The coordinates are deliberately obtained from the initialized mesh and
+    PP/EP groups.  Publication never infers a stage or expert owner from a
+    global-rank interval.
+    """
+
+    from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
+
+    state = get_parallel_state()
+    coordinate = state.device_mesh.get_coordinate()
+    if coordinate is None:
+        raise Glm52FullParamPayloadError("The live parallel mesh has no coordinate for this rank")
+    dim_names = tuple(state.device_mesh.mesh_dim_names)
+    if len(coordinate) != len(dim_names):
+        raise Glm52FullParamPayloadError(
+            f"Parallel mesh coordinate {coordinate} does not match dimensions {dim_names}"
+        )
+    try:
+        pp_group = state.pp_group
+        pp_group_ranks = tuple(int(owner) for owner in dist.get_process_group_ranks(pp_group))
+        pp_stage = int(dist.get_rank(pp_group))
+    except Exception as exc:
+        raise Glm52FullParamPayloadError("Could not resolve live PP group membership for publication") from exc
+
+    if state.ep_enabled:
+        try:
+            ep_group = state.ep_group
+            ep_group_ranks = tuple(int(owner) for owner in dist.get_process_group_ranks(ep_group))
+            ep_owner = int(dist.get_rank(ep_group))
+        except Exception as exc:
+            raise Glm52FullParamPayloadError("Could not resolve live EP group membership for publication") from exc
+    else:
+        ep_group_ranks = (rank,)
+        ep_owner = 0
+
+    owner_key = tuple(int(value) for name, value in zip(dim_names, coordinate, strict=True) if name != "pp")
+    return {
+        "pp_stage": pp_stage,
+        "pp_group_ranks": pp_group_ranks,
+        "ep_owner": ep_owner,
+        "ep_group_ranks": ep_group_ranks,
+        "owner_key": owner_key,
+    }
+
+
+def _gather_publication_plans(local_plan: dict, world_size: int) -> list[dict]:
+    """Gather bounded control-plane target names before writing partials.
+
+    The single-plan return is the deterministic sequential-test seam used by
+    the existing CPU tests.  Production always takes the initialized-process-
+    group branch and receives one plan per live rank.
+    """
+
+    if dist.is_available() and dist.is_initialized():
+        gathered: list[dict | None] = [None] * world_size
+        dist.all_gather_object(gathered, local_plan)
+        return [plan for plan in gathered if plan is not None]
+    return [local_plan]
+
+
+def _select_publication_owners(plans: list[dict], world_size: int) -> tuple[dict[str, int], set[str], set[int]]:
+    """Select one live logical owner per model-derived publication target."""
+
+    ranks = [int(plan["rank"]) for plan in plans]
+    if sorted(ranks) != list(range(world_size)) or len(set(ranks)) != world_size:
+        raise Glm52FullParamPayloadError(
+            "Publication planning requires exactly one live plan per rank; "
+            f"expected={list(range(world_size))}, got={sorted(ranks)}"
+        )
+    failures = [f"rank {plan['rank']}: {plan['error']}" for plan in plans if plan.get("error")]
+    if failures:
+        raise Glm52FullParamPayloadError(
+            "GLM-5.2 full-param publication planning failed collectively: " + "; ".join(failures)
+        )
+
+    candidates: dict[str, list[dict]] = {}
+    expected_targets: set[str] = set()
+    for plan in plans:
+        expected_targets.update(str(target) for target in plan["expected_targets"])
+        for target, kind in plan["targets"]:
+            candidates.setdefault(str(target), []).append(
+                {
+                    "rank": int(plan["rank"]),
+                    "kind": str(kind),
+                    "pp_stage": int(plan["pp_stage"]),
+                    "ep_owner": int(plan["ep_owner"]),
+                    "owner_key": tuple(int(value) for value in plan["owner_key"]),
+                }
+            )
+
+    if set(candidates) != expected_targets:
+        missing = sorted(expected_targets - set(candidates))
+        surplus = sorted(set(candidates) - expected_targets)
+        raise Glm52FullParamPayloadError(
+            "Live publication plans do not cover the union of stage-local model scopes; "
+            f"missing={missing[:8]} (of {len(missing)}), unexpected={surplus[:8]} (of {len(surplus)})"
+        )
+
+    owners: dict[str, int] = {}
+    for target, target_candidates in candidates.items():
+        stages = {candidate["pp_stage"] for candidate in target_candidates}
+        if len(stages) != 1:
+            raise Glm52FullParamPayloadError(
+                f"Publication target {target!r} appears on multiple live PP stages {sorted(stages)}"
+            )
+        kinds = {candidate["kind"] for candidate in target_candidates}
+        if len(kinds) != 1:
+            raise Glm52FullParamPayloadError(
+                f"Publication target {target!r} has inconsistent component kinds {sorted(kinds)}"
+            )
+        if next(iter(kinds)) == _EXPERT_KIND:
+            ep_owners = {candidate["ep_owner"] for candidate in target_candidates}
+            if len(ep_owners) != 1:
+                raise Glm52FullParamPayloadError(
+                    f"Expert publication target {target!r} has inconsistent live EP owners {sorted(ep_owners)}"
+                )
+        ordered = sorted(target_candidates, key=lambda candidate: candidate["owner_key"])
+        if len(ordered) > 1 and ordered[0]["owner_key"] == ordered[1]["owner_key"]:
+            raise Glm52FullParamPayloadError(
+                f"Publication target {target!r} has duplicate logical owner coordinate {ordered[0]['owner_key']}"
+            )
+        owners[target] = ordered[0]["rank"]
+    return owners, expected_targets, set(owners.values())
+
+
 def _write_commit_marker(step_dir: str, result: dict) -> None:
     """Atomically and durably expose the marker after all payload bytes."""
 
@@ -206,45 +334,82 @@ def glm52_fullparam_step_boundary(
     receipt: dict = {"published": False, "step": step, "rank": rank}
     weight_version = f"{version_tag}-step-{step}"
     step_dir = os.path.join(publish_root, f"step_{step:06d}") if publish_root is not None else ""
-    contributed = False
+    components: list[tuple[str, object]] = []
     local_error: Exception | None = None
     try:
         refreshed = refresh_glm52_fullparam_caches(model)
         receipt["refreshed_components"] = refreshed
         if publish_root is not None:
-            rank_dir = os.path.join(step_dir, f"rank_{rank:02d}")
-            if os.path.exists(rank_dir):
-                raise Glm52FullParamPayloadError(
-                    f"Publication directory {rank_dir!r} already exists; refusing to overwrite a prior step artifact"
-                )
-
             components = iter_glm52_fullparam_publication(model)
-            if rank != 0:
-                components = [
-                    (target, module)
-                    for target, module in components
-                    if getattr(module, "glm52_fullparam_payload_kind", None) == _EXPERT_KIND
-                ]
-            if components:
-                partial = publish_glm52_fullparam_payload(components, weight_version=weight_version, weight_step=step)
-                save_glm52_fullparam_payload(partial, rank_dir)
-                contributed = True
-            receipt["contributed_items"] = len(components)
+    except Exception as exc:
+        local_error = exc
+
+    if publish_root is None:
+        _rendezvous_phase("local refresh", local_error, barrier=barrier)
+        return receipt
+
+    local_plan: dict = {
+        "rank": rank,
+        "error": None if local_error is None else f"{type(local_error).__name__}: {str(local_error)[:512]}",
+        "targets": [],
+        "expected_targets": [],
+        "pp_stage": 0,
+        "pp_group_ranks": (rank,),
+        "ep_owner": 0,
+        "ep_group_ranks": (rank,),
+        "owner_key": (rank,),
+    }
+    if local_error is None:
+        try:
+            local_plan["targets"] = [
+                (target, getattr(module, "glm52_fullparam_payload_kind", "")) for target, module in components
+            ]
+            local_plan["expected_targets"] = sorted(_expected_global_targets(model))
+            if dist.is_available() and dist.is_initialized():
+                local_plan.update(_live_publication_identity(rank))
+        except Exception as exc:
+            local_plan["error"] = f"{type(exc).__name__}: {str(exc)[:512]}"
+
+    plans = _gather_publication_plans(local_plan, world_size)
+    full_live_plan = len(plans) == world_size
+    if full_live_plan:
+        owner_by_target, expected_targets, expected_contributors = _select_publication_owners(plans, world_size)
+        components = [(target, module) for target, module in components if owner_by_target.get(target) == rank]
+    else:
+        # Existing deterministic single-process test seam. Production always
+        # has a full live plan; retaining the old partition here keeps the CPU
+        # filesystem orchestration tests independent of process-group setup.
+        if local_error is not None:
+            raise local_error
+        if rank != 0:
+            components = [
+                (target, module)
+                for target, module in components
+                if getattr(module, "glm52_fullparam_payload_kind", None) == _EXPERT_KIND
+            ]
+        expected_targets = _expected_global_targets(model)
+        expected_contributors = set(range(world_size))
+
+    local_error = None
+    try:
+        rank_dir = os.path.join(step_dir, f"rank_{rank:02d}")
+        if os.path.exists(rank_dir):
+            raise Glm52FullParamPayloadError(
+                f"Publication directory {rank_dir!r} already exists; refusing to overwrite a prior step artifact"
+            )
+        if components:
+            partial = publish_glm52_fullparam_payload(components, weight_version=weight_version, weight_step=step)
+            save_glm52_fullparam_payload(partial, rank_dir)
+        receipt["contributed_items"] = len(components)
     except Exception as exc:  # every rank must still enter the rendezvous
         local_error = exc
 
-    _rendezvous_phase("local refresh/publication", local_error, barrier=barrier)
-    if publish_root is None:
-        return receipt
+    _rendezvous_phase("local publication", local_error, barrier=barrier)
 
     merge_error: Exception | None = None
     try:
         if rank == 0:
-            if not contributed:
-                raise Glm52FullParamPayloadError(
-                    "rank 0 published no components; the admission guarantees at least dense/router items"
-                )
-            expected_rank_entries = [f"rank_{owner:02d}" for owner in range(world_size)]
+            expected_rank_entries = [f"rank_{owner:02d}" for owner in sorted(expected_contributors)]
             actual_rank_entries = sorted(
                 entry
                 for entry in os.listdir(step_dir)
@@ -252,14 +417,13 @@ def glm52_fullparam_step_boundary(
             )
             if actual_rank_entries != expected_rank_entries:
                 raise Glm52FullParamPayloadError(
-                    "Step publication requires exactly one contribution directory per rank; "
+                    "Step publication requires exactly one directory per selected live contributor; "
                     f"expected={expected_rank_entries}, got={actual_rank_entries}"
                 )
             rank_dirs = [os.path.join(step_dir, entry) for entry in expected_rank_entries]
             partials = [load_glm52_fullparam_payload(directory) for directory in rank_dirs]
             combined = merge_glm52_fullparam_payloads(partials)
 
-            expected_targets = _expected_global_targets(model)
             actual_targets = {item.target for item in combined.items}
             if actual_targets != expected_targets:
                 missing = sorted(expected_targets - actual_targets)
