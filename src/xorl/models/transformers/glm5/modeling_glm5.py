@@ -810,8 +810,6 @@ class Glm5MoEBlock(MoEBlock):
         stage = get_replay_stage()
         replay = self._routing_replay
 
-        if self.canonical_contract_version is not None and (stage is not None or replay is not None):
-            raise RuntimeError("GLM-5.2 canonical MoE canonical path forbids routing replay and recomputation")
         if self.canonical_contract_version is not None and not _moe_bi_router_enabled(self.config):
             raise RuntimeError("GLM-5.2 canonical MoE requires its model-level exact router declaration")
         router_logits = self.gate(flat_hidden_states)
@@ -820,12 +818,21 @@ class Glm5MoEBlock(MoEBlock):
             cached_weights = None
             if stage == "record":
                 with torch.no_grad():
-                    _, selected_experts = self._route_tokens_to_experts(
+                    recorded_weights, selected_experts = self._route_tokens_to_experts(
                         router_logits,
                         flat_hidden_states.dtype,
                         hidden_states=flat_hidden_states,
                     )
                 replay.record(selected_experts)
+                if self.canonical_contract_version is not None:
+                    # Canonical grouped-top-k weights are part of the serving
+                    # numerical contract.  They are FP32 and intentionally do
+                    # not include routed_scaling_factor (the canonical expert
+                    # kernel applies that once at output).  Preserve those
+                    # literal values for checkpoint recomputation instead of
+                    # reconstructing a generic trainer approximation.
+                    replay.record_weights(recorded_weights)
+                    cached_weights = recorded_weights
             elif stage == "replay_forward":
                 selected_experts = replay.pop_forward()
                 cached_weights = replay.pop_forward_weights()
@@ -836,8 +843,21 @@ class Glm5MoEBlock(MoEBlock):
                 raise RuntimeError(f"Unsupported routing replay stage: {stage}")
 
             if cached_weights is not None:
-                routing_weights = cached_weights.to(flat_hidden_states.dtype)
+                if self.canonical_contract_version is not None:
+                    if cached_weights.dtype is not torch.float32:
+                        raise TypeError(
+                            "GLM-5.2 canonical routing replay requires literal FP32 serving weights, "
+                            f"got {cached_weights.dtype}"
+                        )
+                    routing_weights = cached_weights
+                else:
+                    routing_weights = cached_weights.to(flat_hidden_states.dtype)
             else:
+                if self.canonical_contract_version is not None:
+                    raise RuntimeError(
+                        "GLM-5.2 canonical routing replay requires cached serving weights; "
+                        "expert ids alone cannot reproduce the serving numerical contract"
+                    )
                 selected_experts, routing_weights = self._regather_routing(
                     router_logits,
                     selected_experts,

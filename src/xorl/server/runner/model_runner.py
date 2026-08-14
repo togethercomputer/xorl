@@ -746,6 +746,14 @@ class ModelRunner:
 
         # Initialize extracted modules
         self._routing_handler = RoutingReplayHandler(self.model)
+        checkpoint_method = self.train_config.get("gradient_checkpointing_method")
+        # Full-layer checkpointing recomputes the MoE dispatch.  RoutingReplay
+        # is model-generic and consumed only by MoE blocks that were equipped
+        # with replay state during gradient-checkpoint setup, so this lifecycle
+        # deliberately has no model-family or parallel-geometry allowlist.
+        self._use_routing_replay = bool(self.train_config.get("enable_gradient_checkpointing", False)) and (
+            checkpoint_method is None or checkpoint_method == "recompute_full_layer"
+        )
         # Sync initial attributes
         self._checkpoint_mgr.lora_target_modules = getattr(self, "lora_target_modules", None)
         self._checkpoint_mgr.lora_alpha_value = getattr(self, "lora_alpha_value", None)
@@ -6759,6 +6767,7 @@ class ModelRunner:
         model_id="default",
         abort_callback=None,
     ):
+        checkpoint_replay = compute_backward and getattr(self, "_use_routing_replay", False) and not r3_enabled
         try:
             return self._forward_loop_impl(
                 micro_batches,
@@ -6770,6 +6779,8 @@ class ModelRunner:
                 abort_callback=abort_callback,
             )
         finally:
+            if checkpoint_replay:
+                self._routing_handler.cleanup()
             # A successful backward releases each micro-batch below. This
             # boundary owns setup/loss failures after a successful forward.
             self._release_index_share_contexts()
@@ -6866,9 +6877,12 @@ class ModelRunner:
                 (labels != IGNORE_INDEX).sum() if labels is not None else torch.tensor(0, device=get_device_type())
             )
 
-            # R3: switch to replay_forward so MoEBlock pops pre-populated routing
+            # R3 pops sampler-provided routing.  Standard full-layer gradient
+            # checkpointing records the original forward routing instead.
             if r3_enabled:
                 set_replay_stage("replay_forward")
+            elif compute_backward and getattr(self, "_use_routing_replay", False):
+                set_replay_stage("record")
 
             # Forward pass + loss computation
             profile_start = _profile_phase_now() if profile_phase_timings else 0.0
@@ -6969,8 +6983,10 @@ class ModelRunner:
                 if abort_callback and abort_callback():
                     raise RuntimeError("Execution aborted by request")
 
-                # R3: switch to replay_backward so grad ckpt recompute pops same routing
-                if r3_enabled:
+                # Checkpoint recompute must pop the routing from the matching
+                # original forward, whether it came from R3 or was recorded
+                # locally above.
+                if r3_enabled or getattr(self, "_use_routing_replay", False):
                     set_replay_stage("replay_backward")
 
                 profile_start = _profile_phase_now() if profile_phase_timings else 0.0
@@ -8212,6 +8228,11 @@ class ModelRunner:
                     scale_state=GradientScaleState.RAW_NUMERATOR,
                 )
             try:
+                if r3_enabled or getattr(self, "_use_routing_replay", False):
+                    # _pp_forward temporarily maps this outer stage to record
+                    # (standard checkpointing) or replay_forward (R3), then
+                    # restores replay_backward before scheduled recomputation.
+                    set_replay_stage("replay_backward")
                 raw_total_loss, objective_records = self._forward_backward_pp(
                     micro_batches,
                     global_valid_tokens,

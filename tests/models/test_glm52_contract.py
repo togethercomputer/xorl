@@ -15,6 +15,7 @@ from xorl.distributed.canonical_moe import (
     ParallelPlan,
     canonical_moe_reduce_reference,
 )
+from xorl.models.layers.moe.routing_replay import RoutingReplay, set_replay_stage
 from xorl.models.transformers.glm5 import indexer as indexer_module
 from xorl.models.transformers.glm5 import sparse_selector as sparse_selector_module
 from xorl.models.transformers.glm5.checkpoint_handler import Glm5CheckpointHandler
@@ -1137,13 +1138,113 @@ def test_correction_bias_stays_fp32_and_checkpoint_ingestion_fails_closed():
 
 
 @pytest.mark.cpu
-def test_canonical_moe_rejects_routing_replay_configuration():
+def test_canonical_moe_checkpoint_replay_preserves_serving_routing_bytes_and_router_gradients(monkeypatch):
+    config = _small_glm_config()
+    config._glm52_exact_contract = True
+    config.routed_scaling_factor = 3.25
+    block = Glm5MoEBlock(config, layer_idx=1)
+    block._routing_replay = RoutingReplay()
+    monkeypatch.setattr(block._routing_replay, "_target_device", lambda: torch.device("cpu"))
+    block.gate._glm52_exact_fullparam_component = True
+
+    serving_weights = torch.tensor(
+        [[0.12500001, 0.87499994], [0.33333334, 0.66666663]],
+        dtype=torch.float32,
+    )
+    serving_ids = torch.tensor([[1, 6], [4, 3]], dtype=torch.int32)
+    topk_calls = []
+
+    def serving_grouped_topk(
+        hidden_states,
+        router_logits,
+        correction_bias,
+        *,
+        top_k,
+        num_expert_group,
+        topk_group,
+        routed_scaling_factor,
+    ):
+        del router_logits, correction_bias, num_expert_group, topk_group
+        topk_calls.append(hidden_states.detach().clone())
+        assert top_k == serving_ids.shape[1]
+        assert routed_scaling_factor == 3.25
+        return serving_weights.to(hidden_states.device), serving_ids.to(hidden_states.device)
+
+    monkeypatch.setattr(glm5_modeling_module, "_glm52_serving_grouped_topk", serving_grouped_topk)
+    monkeypatch.setattr(
+        block.gate,
+        "forward",
+        lambda hidden_states: F.linear(hidden_states.float(), block.gate.weight.float()),
+    )
+
+    original_hidden = torch.randn(2, config.hidden_size, dtype=torch.bfloat16)
+    recompute_hidden = torch.randn_like(original_hidden)
+    try:
+        set_replay_stage("record")
+        recorded_weights, recorded_ids, _ = block.route(original_hidden)
+        assert len(topk_calls) == 1
+        assert recorded_weights.dtype is torch.float32
+        assert torch.equal(recorded_weights.detach().view(torch.uint8), serving_weights.view(torch.uint8))
+        assert torch.equal(recorded_ids, serving_ids)
+        assert torch.equal(
+            block._routing_replay.top_weights_list[0].view(torch.uint8),
+            serving_weights.view(torch.uint8),
+        )
+        # The cached values remain normalized and unscaled; the canonical
+        # expert kernel applies routed_scaling_factor exactly once.
+        torch.testing.assert_close(
+            block._routing_replay.top_weights_list[0].sum(dim=-1),
+            serving_weights.sum(dim=-1),
+            rtol=0,
+            atol=0,
+        )
+        assert not torch.equal(block._routing_replay.top_weights_list[0], serving_weights * 3.25)
+
+        set_replay_stage("replay_forward")
+        replayed_forward_weights, replayed_forward_ids, _ = block.route(recompute_hidden)
+        assert len(topk_calls) == 1
+        assert replayed_forward_weights.dtype is torch.float32
+        assert torch.equal(
+            replayed_forward_weights.detach().view(torch.uint8),
+            serving_weights.view(torch.uint8),
+        )
+        assert torch.equal(replayed_forward_ids, serving_ids)
+
+        set_replay_stage("replay_backward")
+        replayed_weights, replayed_ids, _ = block.route(recompute_hidden)
+        assert len(topk_calls) == 1
+        assert replayed_weights.dtype is torch.float32
+        assert torch.equal(replayed_weights.detach().view(torch.uint8), serving_weights.view(torch.uint8))
+        assert torch.equal(replayed_ids, serving_ids)
+
+        replayed_weights.mul(torch.tensor([[1.0, -0.5], [0.25, 2.0]])).sum().backward()
+        assert block.gate.weight.grad is not None
+        assert bool(torch.count_nonzero(block.gate.weight.grad))
+    finally:
+        set_replay_stage(None)
+        RoutingReplay.clear_all()
+
+
+@pytest.mark.cpu
+def test_canonical_moe_replay_fails_closed_without_literal_serving_weights(monkeypatch):
     config = _small_glm_config()
     config._glm52_exact_contract = True
     block = Glm5MoEBlock(config, layer_idx=1)
-    block._routing_replay = object()
-    with pytest.raises(RuntimeError, match="forbids routing replay"):
-        block.route(torch.zeros((1, 1, config.hidden_size)))
+    block._routing_replay = RoutingReplay()
+    monkeypatch.setattr(block._routing_replay, "_target_device", lambda: torch.device("cpu"))
+    block._routing_replay.record(torch.zeros((1, config.num_experts_per_tok), dtype=torch.int32))
+    monkeypatch.setattr(
+        block.gate,
+        "forward",
+        lambda hidden_states: F.linear(hidden_states.float(), block.gate.weight.float()),
+    )
+    try:
+        set_replay_stage("replay_backward")
+        with pytest.raises(RuntimeError, match="expert ids alone"):
+            block.route(torch.zeros((1, config.hidden_size), dtype=torch.bfloat16))
+    finally:
+        set_replay_stage(None)
+        RoutingReplay.clear_all()
 
 
 @pytest.mark.cpu
