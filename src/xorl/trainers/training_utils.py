@@ -717,6 +717,7 @@ _PP_EXACT_ROW_KEYS = (
     "_cp_request_positions",
     "_cp_live_mask",
     "_r3_sample_lengths",
+    "sampler_prefill_lengths",
     "num_samples",
 )
 

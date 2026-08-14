@@ -492,6 +492,7 @@ def test_pp_padding_and_queues_preserve_exact_row_side_channels():
             "_cp_request_positions": torch.tensor([[0, 1, 2]]),
             "_cp_live_mask": torch.tensor([[True, True, True]]),
             "_r3_sample_lengths": [3],
+            "sampler_prefill_lengths": torch.tensor([3]),
             "num_samples": 1,
         }
     ]
@@ -515,4 +516,5 @@ def test_pp_padding_and_queues_preserve_exact_row_side_channels():
         assert torch.equal(metadata["_pp_original_input_ids"], mb["input_ids"])
         assert torch.equal(metadata["_cp_live_mask"], mb["_cp_live_mask"])
         assert metadata["_r3_sample_lengths"] == [3]
+        assert torch.equal(metadata["sampler_prefill_lengths"], torch.tensor([3]))
         assert metadata["num_samples"] == 1

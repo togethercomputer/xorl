@@ -258,6 +258,36 @@ def test_packing_disabled_preserves_shifted_target_tokens():
     assert batch["advantages"] == [[1.0, 1.0, 1.0]]
 
 
+def test_packing_disabled_derives_sampler_boundaries_before_advantage_masking():
+    packer = SequentialPacker(enable_packing=False, log_stats=False, pad_to_multiple_of=1)
+    data = [
+        {
+            "model_input": {"input_ids": [11, 12, 13, 21]},
+            "loss_fn_inputs": {
+                "target_tokens": [IGNORE_INDEX, IGNORE_INDEX, 21, 22],
+                "logprobs": [0.0, 0.0, -0.1, -0.2],
+                # A zero-advantage trajectory masks every target downstream,
+                # but must not erase its prompt/decode arithmetic boundary.
+                "advantages": [0.0, 0.0, 0.0, 0.0],
+            },
+        },
+        {
+            "model_input": {"input_ids": [31, 41]},
+            "loss_fn_inputs": {
+                "target_tokens": [41, 42],
+                "logprobs": [-0.3, -0.4],
+                "advantages": [1.0, 1.0],
+            },
+        },
+    ]
+
+    batches = packer.pack(data, max_seq_len=1000, request_id="test-sampler-boundaries")
+
+    assert [batch["sampler_prefill_lengths"] for batch in batches] == [[3], [1]]
+    assert batches[0]["labels"] == [[IGNORE_INDEX] * 4]
+    assert batches[0]["target_tokens"] == [[IGNORE_INDEX] * 4]
+
+
 def test_packing_disabled_warns_on_hf_shift(monkeypatch):
     """HF labels should warn when shifted in the non-packed path."""
     packer = SequentialPacker(enable_packing=False, log_stats=False, pad_to_multiple_of=1)

@@ -418,6 +418,19 @@ def test_compute_micro_batch_loss_forwards_sampler_prefill_lengths_to_model():
     assert boundary.device == input_ids.device
     assert boundary.tolist() == [4096]
 
+    micro_batch_boundary = torch.tensor([1536], dtype=torch.int64)
+    runner._compute_micro_batch_loss(
+        {
+            "input_ids": input_ids,
+            "labels": torch.tensor([[2, 3]]),
+            "sampler_prefill_lengths": micro_batch_boundary,
+        },
+        "causallm_loss",
+        {},
+    )
+
+    assert runner.model.forward_kwargs["sampler_prefill_lengths"] is micro_batch_boundary
+
 
 def test_forward_backward_dispatches_drgrpo_through_standard_loop(monkeypatch):
     monkeypatch.setattr("xorl.server.runner.model_runner.synchronize", lambda: None)

@@ -1378,6 +1378,23 @@ class SequentialPacker(Packer):
 
         # Detect if tokens are already shifted (xorl_client API format)
         is_already_shifted = "target_tokens" in flattened_datum and len(input_ids) == len(labels)
+        sampler_prefill_length = None
+        if is_already_shifted:
+            # xorl_client's shifted policy datum retains the sampler boundary in
+            # its raw targets: row prompt_len - 1 predicts the first sampled
+            # token. Capture that boundary before weights/advantages can mask
+            # every generated target (for example, a zero-advantage sample).
+            raw_target_tokens = flattened_datum["target_tokens"]
+            if not isinstance(raw_target_tokens, list):
+                raw_target_tokens = (
+                    raw_target_tokens.tolist() if hasattr(raw_target_tokens, "tolist") else list(raw_target_tokens)
+                )
+            first_sampled_target = next(
+                (index for index, target in enumerate(raw_target_tokens) if target != IGNORE_INDEX),
+                None,
+            )
+            if first_sampled_target is not None:
+                sampler_prefill_length = first_sampled_target + 1
         if labels and not is_already_shifted and len(input_ids) == len(labels):
             logger.warning(
                 "Sample %s has labels with the same length as input_ids; treating it as HF-format data "
@@ -1404,6 +1421,10 @@ class SequentialPacker(Packer):
         seq_len = len(input_ids)
         batch["input_ids"].append(input_ids)
         batch["position_ids"].append(position_ids)
+        if sampler_prefill_length is not None:
+            # Packing-disabled batches contain exactly one datum, so this is
+            # one row boundary rather than a token-aligned sequence field.
+            batch["sampler_prefill_lengths"] = [sampler_prefill_length]
 
         # Apply weights mask to labels if weights field is present
         # weights=0 -> labels=-100 (IGNORE_INDEX), weights=1 -> labels unchanged
