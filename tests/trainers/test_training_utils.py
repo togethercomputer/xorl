@@ -216,9 +216,7 @@ def test_pp_padding_uses_exact_sampling_transform_identities():
     batch = micro_batches[0]
     assert batch["input_ids"].tolist() == [[7, 8, 0, 0]]
     assert batch["labels"].tolist() == [[8, 9, IGNORE_INDEX, IGNORE_INDEX]]
-    torch.testing.assert_close(
-        batch["logprob_temperatures"], torch.tensor([[0.7, 1.3, 1.0, 1.0]])
-    )
+    torch.testing.assert_close(batch["logprob_temperatures"], torch.tensor([[0.7, 1.3, 1.0, 1.0]]))
     assert batch["logprob_top_ks"].tolist() == [[4, 9, 1 << 30, 1 << 30]]
     torch.testing.assert_close(batch["logprob_top_ps"], torch.tensor([[0.8, 0.9, 1.0, 1.0]]))
     torch.testing.assert_close(batch["logprob_min_ps"], torch.tensor([[0.1, 0.2, 0.0, 0.0]]))

@@ -721,9 +721,7 @@ class Dsv4ExactTP8LmHeadSelectedLogprob(nn.Module):
                     .float()
                     .contiguous()
                 )
-                full_reference = _rank_order_vocab_all_gather(
-                    local_reference.to(torch.bfloat16), group
-                ).float()
+                full_reference = _rank_order_vocab_all_gather(local_reference.to(torch.bfloat16), group).float()
                 full_grad = _selected_logprob_reference_grad_partitioned(
                     full_reference,
                     token_ids[row_slice],
@@ -732,9 +730,7 @@ class Dsv4ExactTP8LmHeadSelectedLogprob(nn.Module):
                     support,
                     identity_rows,
                 )
-                local_grad[row_slice] = full_grad[
-                    :, self.shard.vocab_start : self.shard.vocab_end
-                ]
+                local_grad[row_slice] = full_grad[:, self.shard.vocab_start : self.shard.vocab_end]
         grad_hidden, grad_a, grad_b = _local_surrogate_vjp(
             hidden,
             local_weight,

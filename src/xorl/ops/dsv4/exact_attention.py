@@ -1046,8 +1046,7 @@ class _ExactHybridAttention(torch.autograd.Function):
                     f"got positions={tuple(query_positions.shape)} and Q rows={query_length}"
                 )
             if query_positions.numel() and (
-                int(query_positions.min().item()) < 0
-                or int(query_positions.max().item()) >= sequence_length
+                int(query_positions.min().item()) < 0 or int(query_positions.max().item()) >= sequence_length
             ):
                 raise RuntimeError(
                     "DSV4 exact compressed query positions must index the gathered logical KV sequence, "
