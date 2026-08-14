@@ -532,6 +532,155 @@ def test_dsv4_pipeline_carries_hyperconnection_state_first_middle_last(monkeypat
     assert parts[2].lm_head.weight.grad is not None
 
 
+def test_exact_ragged_cp_pipeline_uses_storage_row_wire_first_middle_last_and_backward(monkeypatch):
+    """Ragged exact rows stay compact for compute and storage-sized on the PP wire."""
+
+    import copy
+    import types
+    from types import SimpleNamespace
+
+    import torch.nn as nn
+
+    from xorl.distributed import pipeline_parallel
+    from xorl.distributed.pipeline_parallel import _pp_forward, _recursive_prune
+    from xorl.models.transformers.deepseek_v4 import modeling_deepseek_v4
+    from xorl.models.transformers.deepseek_v4.modeling_deepseek_v4 import DeepseekV4ForCausalLM
+    from xorl.trainers.training_utils import _set_pp_batch_metadata
+
+    parallel_state = SimpleNamespace(
+        cp_size=2,
+        fsdp_enabled=False,
+        ep_enabled=False,
+        fsdp_group=None,
+        ep_group=None,
+        sp_group=None,
+    )
+    monkeypatch.setattr(pipeline_parallel, "get_parallel_state", lambda: parallel_state)
+    monkeypatch.setattr(modeling_deepseek_v4, "get_parallel_state", lambda: parallel_state)
+
+    class _ScaleLayer(nn.Module):
+        def __init__(self, layer_id: int):
+            super().__init__()
+            self.layer_id = layer_id
+            self.scale = nn.Parameter(torch.tensor(1.0 + 0.125 * layer_id))
+            self.seen_rows = []
+
+        def forward(self, hidden, **_kwargs):
+            self.seen_rows.append(int(hidden.shape[1]))
+            return hidden * self.scale
+
+    class _MeanHyperConnection:
+        @staticmethod
+        def block_expand(hidden):
+            return hidden.unsqueeze(2).expand(-1, -1, 2, -1).clone()
+
+        @staticmethod
+        def block_head(hidden, *_args):
+            return hidden.mean(dim=2)
+
+    torch.manual_seed(37)
+    cfg = _tiny_config(compress_ratios=[0, 0, 0])
+    cfg.tie_word_embeddings = False
+    model = DeepseekV4ForCausalLM(cfg, moe_implementation="eager")
+    # The boundary row plan is selected dynamically by the resolved exact
+    # config.  Lightweight layers isolate that plan from the CUDA attention
+    # implementation while retaining real differentiable stage parameters.
+    cfg._dsv4_flash_exact_mode = True
+    model.model.layers = nn.ModuleList([_ScaleLayer(index) for index in range(3)])
+    model.model.hc_util = _MeanHyperConnection()
+    model.model.norm = nn.Identity()
+    model.to(torch.bfloat16)
+    model.train()
+
+    input_ids = torch.tensor([[3, 0, 5, 7, 0, 9, 11, 13]])
+    row_metadata = {
+        "_cp_logical_row_indices": torch.tensor([[0, -1, 1, 2, -1, 3, 4, 5]]),
+        "_cp_request_ids": torch.tensor([[0, -1, 0, 1, -1, 1, 1, 1]]),
+        "_cp_request_positions": torch.tensor([[0, 0, 1, 0, 0, 1, 2, 3]]),
+        "_cp_live_mask": torch.tensor([[True, False, True, True, False, True, True, True]]),
+        "_r3_sample_lengths": [2, 4],
+        "num_samples": 2,
+    }
+    # CP keeps local storage rows on each PP lane while position/FA metadata
+    # describe the full global stream.
+    position_ids = torch.arange(16).view(1, -1)
+    batch = {
+        "input_ids": input_ids,
+        "position_ids": position_ids,
+        "cu_seq_lens_q": torch.tensor([0, 16], dtype=torch.int32),
+        "cu_seq_lens_k": torch.tensor([0, 16], dtype=torch.int32),
+        "max_length_q": 16,
+        "max_length_k": 16,
+        **row_metadata,
+    }
+
+    baseline = copy.deepcopy(model)
+    baseline_hidden = baseline(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        **row_metadata,
+    ).last_hidden_state
+    baseline_logits = baseline.lm_head(baseline_hidden)
+    baseline_logits.square().sum().backward()
+
+    plan = [
+        ["model.embed_tokens", "model.layers.0"],
+        ["model.layers.1"],
+        ["model.layers.2", "model.norm", "lm_head"],
+    ]
+    parts = []
+    boundary_state = {
+        "rank": 4,
+        "dtype": torch.bfloat16,
+        "shape_suffix": (cfg.hc_mult, cfg.hidden_size),
+        "state": "completed_hyperconnection_residual",
+    }
+    for stage_idx, module_names in enumerate(plan):
+        part = copy.deepcopy(model)
+        _recursive_prune(part, "", set(module_names))
+        part._configure_pp_stage(stage_idx=stage_idx, num_stages=3)
+        part._pp_is_first = stage_idx == 0
+        part._pp_is_last = stage_idx == 2
+        part._pp_stage_idx = stage_idx
+        part._pp_exact_boundary_contract = True
+        part._pp_pipeline_boundary_state = boundary_state
+        part._pp_original_forward = part.forward
+        part.forward = types.MethodType(_pp_forward, part)
+        parts.append(part)
+
+    _set_pp_batch_metadata(parts, [batch])
+    first_wire = parts[0](input_ids)
+    first_wire.retain_grad()
+    assert first_wire.shape == (1, 8, cfg.hc_mult, cfg.hidden_size)
+    assert torch.count_nonzero(first_wire[:, 6:]) == 0
+
+    middle_wire = parts[1](first_wire)
+    middle_wire.retain_grad()
+    assert middle_wire.shape == first_wire.shape
+    assert torch.count_nonzero(middle_wire[:, 6:]) == 0
+
+    staged_logits = parts[2](middle_wire)
+    assert staged_logits.shape == (1, 8, cfg.vocab_size)
+    assert [parts[index].model.layers[index].seen_rows for index in range(3)] == [[6], [6], [6]]
+    staged_logits.square().sum().backward()
+
+    torch.testing.assert_close(staged_logits, baseline_logits, rtol=0, atol=0)
+    assert torch.count_nonzero(first_wire.grad[:, 6:]) == 0
+    assert torch.count_nonzero(middle_wire.grad[:, 6:]) == 0
+    baseline_params = dict(baseline.named_parameters())
+    staged_params = {}
+    for part in parts:
+        staged_params.update(dict(part.named_parameters()))
+    for name in (
+        "model.embed_tokens.weight",
+        "model.layers.0.scale",
+        "model.layers.1.scale",
+        "model.layers.2.scale",
+        "lm_head.weight",
+    ):
+        torch.testing.assert_close(staged_params[name].grad, baseline_params[name].grad, rtol=0, atol=0)
+
+
 def test_exact_layout_is_threaded_through_interleaved_checkpoint_microbatches(monkeypatch):
     """Checkpoint recompute receives each call's immutable layout, not layer state."""
 

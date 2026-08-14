@@ -406,6 +406,33 @@ def test_valid_varlen_metadata_passes_value_validation():
     validate_pp_exact_microbatch_metadata(x, position_ids, entry)
 
 
+def test_cp_varlen_metadata_uses_global_domain_and_local_storage_wire():
+    local_seq_len = 8
+    global_seq_len = 16
+    x = torch.zeros(1, local_seq_len, 2, 4, dtype=torch.bfloat16)
+    position_ids = torch.arange(global_seq_len).view(1, -1)
+    entry = {
+        "cu_seq_lens_q": torch.tensor([0, global_seq_len], dtype=torch.int32),
+        "cu_seq_lens_k": torch.tensor([0, global_seq_len], dtype=torch.int32),
+        "max_length_q": global_seq_len,
+        "max_length_k": global_seq_len,
+    }
+
+    validate_pp_exact_microbatch_metadata(
+        x,
+        position_ids,
+        entry,
+        sequence_parallel_size=2,
+    )
+    with pytest.raises(PPByteContractError, match="sequence-parallel size 1 require 8"):
+        validate_pp_exact_microbatch_metadata(
+            x,
+            position_ids,
+            entry,
+            sequence_parallel_size=1,
+        )
+
+
 def test_generic_part_keeps_silent_fallback():
     model = _tiny_model(exact=False)
     plan = _default_plan(model)

@@ -390,9 +390,10 @@ def _pp_forward(self, x):
     extra_kwargs = {}
     metadata_queue = getattr(self, "_pp_batch_metadata", None)
     if metadata_queue and (in_scheduled_forward or carries_hyperconnection_state):
-        # DSV4's PP shape is its compact live-row 4-D state, so shape
-        # inference needs the first microbatch's immutable row plan. Peek
-        # without consuming; the scheduled forward still pops the same entry.
+        # DSV4's PP shape is its storage-capacity 4-D state with live rows in
+        # a compact prefix. Shape inference still needs the first microbatch's
+        # immutable row plan. Peek without consuming; the scheduled forward
+        # still pops the same entry.
         metadata = metadata_queue.popleft() if in_scheduled_forward else dict(metadata_queue[0])
         position_ids = metadata.pop("position_ids", None)
         original_input_ids = metadata.pop("_pp_original_input_ids", None)
@@ -426,7 +427,12 @@ def _pp_forward(self, x):
                 )
             # Presence is not enough: a present-but-None (or malformed)
             # cu_seq_lens_* still reaches the single-document fallback.
-            validate_pp_exact_microbatch_metadata(x, position_ids, extra_kwargs)
+            validate_pp_exact_microbatch_metadata(
+                x,
+                position_ids,
+                extra_kwargs,
+                sequence_parallel_size=ps.cp_size,
+            )
             if not self._pp_is_first:
                 # The received wire bytes must be bf16 regardless of what any
                 # config declared (resolved reality, not metadata).

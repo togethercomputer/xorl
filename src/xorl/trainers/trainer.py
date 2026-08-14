@@ -75,6 +75,7 @@ from xorl.trainers.model_builder import (
 )
 from xorl.trainers.per_component_timer import PerComponentTimer
 from xorl.trainers.training_utils import (
+    align_dsv4_pp_storage_rows,
     clip_gradients,
     count_active_microbatches,
     count_valid_tokens,
@@ -2158,7 +2159,27 @@ class Trainer:
         normalizes gradients by global_valid_tokens in-place.  Returns the
         normalized loss for logging.
         """
-        if self.args.train.pp_variable_seq_lengths:
+        carries_compact_hyperconnection = any(
+            bool(getattr(model_part, "_pp_carries_hyperconnection_state", False)) for model_part in self.model_parts
+        )
+        if carries_compact_hyperconnection:
+            seq_len = self._time_step_phase(
+                "dsv4_pp_align_storage_rows",
+                lambda: align_dsv4_pp_storage_rows(
+                    micro_batches,
+                    cp_size=self.ps.cp_size,
+                    bucket_size=(
+                        self.args.train.pp_seq_len_bucket_size if self.args.train.pp_variable_seq_lengths else 1
+                    ),
+                    minimum_storage_rows=(
+                        0
+                        if self.args.train.pp_variable_seq_lengths
+                        else (self.args.data.sample_packing_sequence_len or 0) // self.ps.cp_size
+                    ),
+                    pad_to_multiple_of=self.args.data.pad_to_multiple_of or 1,
+                ),
+            )
+        elif self.args.train.pp_variable_seq_lengths:
             seq_len = self._time_step_phase(
                 "pp_negotiate_seq_len",
                 lambda: self._bucket_pp_seq_len(negotiate_pp_seq_len(micro_batches, self.ps.pp_group)),

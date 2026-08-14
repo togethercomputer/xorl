@@ -239,14 +239,29 @@ def _validate_stage_local_groups(parallel_state: object | None) -> None:
             )
 
 
-def validate_pp_exact_microbatch_metadata(x: torch.Tensor, position_ids, extra_kwargs: dict) -> None:
+def validate_pp_exact_microbatch_metadata(
+    x: torch.Tensor,
+    position_ids,
+    extra_kwargs: dict,
+    *,
+    sequence_parallel_size: int = 1,
+) -> None:
     """Value-validate the per-microbatch varlen metadata of a marked stage.
 
     Key presence is not enough: ``cu_seq_lens_q=None`` (or a malformed
     tensor) passes a presence check and still lets the attention entry treat
     a packed batch as one document. RAISES naming the offending field.
     """
-    total_tokens = int(x.shape[0]) * int(x.shape[1])
+    local_tokens = int(x.shape[0]) * int(x.shape[1])
+    sequence_parallel_size = int(sequence_parallel_size)
+    if sequence_parallel_size < 1:
+        raise PPByteContractError(
+            f"PP byte contract: sequence-parallel size must be positive, got {sequence_parallel_size}"
+        )
+    # SequenceShardCollator keeps position_ids and FlashAttention boundaries
+    # in the full CP domain while slicing input/wire rows into local storage
+    # shards. The domains coincide only at CP1.
+    metadata_tokens = local_tokens * sequence_parallel_size
 
     def _fail(name: str, why: str) -> None:
         raise PPByteContractError(
@@ -258,10 +273,11 @@ def validate_pp_exact_microbatch_metadata(x: torch.Tensor, position_ids, extra_k
         _fail("position_ids", f"expected an integer tensor, got {type(position_ids).__name__}")
     if position_ids.dtype not in (torch.int32, torch.int64):
         _fail("position_ids", f"expected int32/int64, got {position_ids.dtype}")
-    if position_ids.numel() < total_tokens:
+    if position_ids.numel() != metadata_tokens:
         _fail(
             "position_ids",
-            f"covers {position_ids.numel()} positions for {total_tokens} tokens",
+            f"covers {position_ids.numel()} positions, but {local_tokens} local wire rows at "
+            f"sequence-parallel size {sequence_parallel_size} require {metadata_tokens}",
         )
 
     spans = {}
@@ -275,8 +291,8 @@ def validate_pp_exact_microbatch_metadata(x: torch.Tensor, position_ids, extra_k
             _fail(name, f"expected 1-D with >= 2 boundaries, got shape {tuple(value.shape)}")
         if int(value[0]) != 0:
             _fail(name, f"first boundary must be 0, got {int(value[0])}")
-        if int(value[-1]) != total_tokens:
-            _fail(name, f"last boundary must equal total tokens {total_tokens}, got {int(value[-1])}")
+        if int(value[-1]) != metadata_tokens:
+            _fail(name, f"last boundary must equal total metadata tokens {metadata_tokens}, got {int(value[-1])}")
         if bool((value[1:] <= value[:-1]).any()):
             _fail(name, f"boundaries must be strictly increasing, got {value.tolist()}")
         spans[name] = value

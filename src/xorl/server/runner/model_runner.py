@@ -128,6 +128,7 @@ from xorl.trainers.model_builder import (
     resolve_training_model_dtype,
 )
 from xorl.trainers.training_utils import (
+    align_dsv4_pp_storage_rows,
     clip_gradients,
     count_active_microbatches,
     count_valid_tokens,
@@ -7526,7 +7527,26 @@ class ModelRunner:
         optim_step can normalize gradients by the full accumulated total.
         """
         ps = get_parallel_state()
-        if self.train_config.get("pp_variable_seq_lengths", False):
+        carries_compact_hyperconnection = any(
+            bool(getattr(model_part, "_pp_carries_hyperconnection_state", False)) for model_part in self.model_parts
+        )
+        if carries_compact_hyperconnection:
+            seq_len = align_dsv4_pp_storage_rows(
+                micro_batches,
+                cp_size=ps.cp_size,
+                bucket_size=(
+                    self.train_config.get("pp_seq_len_bucket_size", 1024)
+                    if self.train_config.get("pp_variable_seq_lengths", False)
+                    else 1
+                ),
+                minimum_storage_rows=(
+                    0
+                    if self.train_config.get("pp_variable_seq_lengths", False)
+                    else (self.train_config.get("sample_packing_sequence_len", 0) or 0) // ps.cp_size
+                ),
+                pad_to_multiple_of=self.train_config.get("pad_to_multiple_of", 1),
+            )
+        elif self.train_config.get("pp_variable_seq_lengths", False):
             seq_len = self._bucket_pp_seq_len(negotiate_pp_seq_len(micro_batches, ps.pp_group))
             pad_micro_batches_for_pp(
                 micro_batches,
@@ -7725,19 +7745,40 @@ class ModelRunner:
 
         global_valid_tokens = self._count_global_valid_tokens(micro_batches)
 
-        if self.train_config.get("pp_variable_seq_lengths", False):
+        carries_compact_hyperconnection = any(
+            bool(getattr(model_part, "_pp_carries_hyperconnection_state", False)) for model_part in self.model_parts
+        )
+        if carries_compact_hyperconnection:
+            seq_len = align_dsv4_pp_storage_rows(
+                micro_batches,
+                cp_size=ps.cp_size,
+                bucket_size=(
+                    self.train_config.get("pp_seq_len_bucket_size", 1024)
+                    if self.train_config.get("pp_variable_seq_lengths", False)
+                    else 1
+                ),
+                minimum_storage_rows=(
+                    0
+                    if self.train_config.get("pp_variable_seq_lengths", False)
+                    else (self.train_config.get("sample_packing_sequence_len", 0) or 0) // ps.cp_size
+                ),
+                pad_to_multiple_of=self.train_config.get("pad_to_multiple_of", 1),
+            )
+            pad_target = 0
+        elif self.train_config.get("pp_variable_seq_lengths", False):
             seq_len = self._bucket_pp_seq_len(negotiate_pp_seq_len(micro_batches, ps.pp_group))
             pad_target = seq_len * ps.cp_size
         else:
             # Static padding mirrors the training path: config value is the full
             # (unsharded) packed length.
             pad_target = self.train_config.get("sample_packing_sequence_len", 0)
-        pad_micro_batches_for_pp(
-            micro_batches,
-            sample_packing_sequence_len=pad_target,
-            sp_size=ps.cp_size,
-            pad_to_multiple_of=self.train_config.get("pad_to_multiple_of", 1),
-        )
+        if pad_target:
+            pad_micro_batches_for_pp(
+                micro_batches,
+                sample_packing_sequence_len=pad_target,
+                sp_size=ps.cp_size,
+                pad_to_multiple_of=self.train_config.get("pad_to_multiple_of", 1),
+            )
 
         micro_batches = [
             {k: v.to(get_device_type(), non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in mb.items()}

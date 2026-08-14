@@ -7,6 +7,7 @@ import torch.nn as nn
 import xorl.trainers.training_utils as training_utils_module
 from xorl.data.constants import IGNORE_INDEX
 from xorl.trainers.training_utils import (
+    align_dsv4_pp_storage_rows,
     clip_gradients,
     count_active_microbatches,
     count_valid_tokens,
@@ -27,6 +28,64 @@ class TinyModule(nn.Module):
     def __init__(self):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(2, dtype=torch.float32))
+
+
+def test_dsv4_pp_storage_alignment_covers_unequal_owner_planes(monkeypatch):
+    monkeypatch.setattr(training_utils_module, "get_device_type", lambda: "cpu")
+    monkeypatch.setattr(training_utils_module.dist, "is_available", lambda: True)
+    monkeypatch.setattr(training_utils_module.dist, "is_initialized", lambda: True)
+
+    def remote_owner_has_twelve_storage_rows(negotiation, op=None, group=None):
+        assert op is torch.distributed.ReduceOp.MAX
+        assert group is None
+        # [max storage rows, max microbatch count, -min microbatch count]
+        negotiation.copy_(torch.tensor([12, 1, -1]))
+
+    monkeypatch.setattr(training_utils_module.dist, "all_reduce", remote_owner_has_twelve_storage_rows)
+    sample_lengths = [2, 4]
+    micro_batches = [
+        {
+            "input_ids": torch.arange(8).view(1, -1),
+            "labels": torch.arange(8).view(1, -1),
+            "position_ids": torch.arange(16).view(1, -1),
+            "cu_seq_lens_q": torch.tensor([0, 16], dtype=torch.int32),
+            "cu_seq_lens_k": torch.tensor([0, 16], dtype=torch.int32),
+            "max_length_q": 16,
+            "max_length_k": 16,
+            "_cp_logical_row_indices": torch.tensor([[0, 1, 2, 3, 4, 5, -1, -1]]),
+            "_cp_request_ids": torch.tensor([[0, 0, 1, 1, 1, 1, -1, -1]]),
+            "_cp_request_positions": torch.tensor([[0, 1, 0, 1, 2, 3, 0, 0]]),
+            "_cp_live_mask": torch.tensor([[True, True, True, True, True, True, False, False]]),
+            "_r3_sample_lengths": sample_lengths,
+        }
+    ]
+
+    assert align_dsv4_pp_storage_rows(micro_batches, cp_size=2) == 12
+    batch = micro_batches[0]
+    assert batch["input_ids"].shape == (1, 12)
+    assert batch["_cp_live_mask"].shape == (1, 12)
+    assert torch.count_nonzero(batch["_cp_live_mask"]) == 6
+    assert batch["_r3_sample_lengths"] is sample_lengths
+    assert batch["position_ids"].shape == (1, 24)
+    assert int(batch["cu_seq_lens_q"][-1]) == 24
+    assert int(batch["cu_seq_lens_k"][-1]) == 24
+
+
+def test_dsv4_pp_storage_alignment_collectively_rejects_empty_rank(monkeypatch):
+    monkeypatch.setattr(training_utils_module, "get_device_type", lambda: "cpu")
+    monkeypatch.setattr(training_utils_module.dist, "is_available", lambda: True)
+    monkeypatch.setattr(training_utils_module.dist, "is_initialized", lambda: True)
+    participated = False
+
+    def one_rank_is_empty(negotiation, op=None, group=None):
+        nonlocal participated
+        participated = True
+        negotiation.copy_(torch.tensor([8, 1, 0]))
+
+    monkeypatch.setattr(training_utils_module.dist, "all_reduce", one_rank_is_empty)
+    with pytest.raises(ValueError, match="minimum=0, maximum=1"):
+        align_dsv4_pp_storage_rows([], cp_size=2)
+    assert participated
 
 
 def test_get_effective_grad_clip_value_preserves_regular_clipping():

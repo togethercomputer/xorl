@@ -655,6 +655,61 @@ def pad_micro_batches_for_pp(
                     mb[ml_key] = new_max
 
 
+def align_dsv4_pp_storage_rows(
+    micro_batches: List[Dict[str, Any]],
+    *,
+    cp_size: int,
+    bucket_size: int = 1,
+    minimum_storage_rows: int = 0,
+    pad_to_multiple_of: int = 1,
+) -> int:
+    """Align compact-hyperconnection PP storage before stage buffers exist.
+
+    Exact DSV4 compacts live rows for decoder compute, but its physical PP
+    wire has storage-row capacity. ``compute_rows`` spans several owner planes,
+    so PP-only length negotiation can leave a shorter rank unable to carry the
+    compact prefix. One world MAX is the deadlock-free transitive superset of
+    those overlapping PP/FSDP/EP/SP planes. Existing padding then grows local
+    storage side channels and full-domain position/FA metadata together without
+    changing ``_r3_sample_lengths`` or the live-row compute plan.
+    """
+    cp_size = int(cp_size)
+    if cp_size < 1:
+        raise ValueError(f"Exact DSV4 PP storage alignment requires cp_size >= 1, got {cp_size}")
+
+    local_count = len(micro_batches)
+    local_storage_rows = max(
+        max((int(mb["input_ids"].shape[-1]) for mb in micro_batches), default=0),
+        int(minimum_storage_rows),
+    )
+    negotiation = torch.tensor(
+        [local_storage_rows, local_count, -local_count],
+        dtype=torch.int64,
+        device=get_device_type(),
+    )
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(negotiation, op=dist.ReduceOp.MAX)
+    storage_rows, max_count, negative_min_count = (int(value) for value in negotiation.tolist())
+    min_count = -negative_min_count
+    if min_count != max_count:
+        raise ValueError(
+            f"Exact DSV4 PP ranks disagree on the number of microbatches: minimum={min_count}, maximum={max_count}"
+        )
+    if max_count == 0:
+        raise ValueError("Exact DSV4 PP storage alignment requires at least one microbatch on every rank")
+    if bucket_size > 1:
+        storage_rows = ((storage_rows + bucket_size - 1) // bucket_size) * bucket_size
+    if pad_to_multiple_of > 1:
+        storage_rows = ((storage_rows + pad_to_multiple_of - 1) // pad_to_multiple_of) * pad_to_multiple_of
+    pad_micro_batches_for_pp(
+        micro_batches,
+        sample_packing_sequence_len=storage_rows * cp_size,
+        sp_size=cp_size,
+        pad_to_multiple_of=pad_to_multiple_of,
+    )
+    return storage_rows
+
+
 _PP_FA_KEYS = ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k")
 _PP_EXACT_ROW_KEYS = (
     "_cp_logical_row_indices",
@@ -678,8 +733,9 @@ def _set_pp_batch_metadata(
     Each part gets its own dict copies: _pp_forward pops keys from the entry,
     so sharing dicts across virtual stages would corrupt later stages' metadata.
     Exact DSV4 also needs the original storage-order token IDs on every stage:
-    hidden states travel in compact compute order, while hash-routed MoE layers
-    must reproduce token ownership from the original IDs.
+    live hidden states occupy a compact prefix of the storage-capacity PP wire,
+    while hash-routed MoE layers must reproduce token ownership from the
+    original IDs.
     """
     pp_metadata_list = []
     for mb in micro_batches:

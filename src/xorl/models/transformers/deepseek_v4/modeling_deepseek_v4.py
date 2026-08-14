@@ -1838,11 +1838,18 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
                 )
                 live_token_count = exact_cp_layout.local_live_count
                 if incoming_hyperconnection_state:
-                    if hidden_states.shape[1] != compute_rows:
+                    if hidden_states.shape[1] != packed_sequence_length:
                         raise ValueError(
-                            "DeepSeek-V4 pipeline wire rows do not match the immutable exact layout: "
-                            f"wire={hidden_states.shape[1]}, layout={compute_rows}"
+                            "DeepSeek-V4 pipeline wire rows do not match storage-order CP metadata: "
+                            f"wire={hidden_states.shape[1]}, metadata={packed_sequence_length}"
                         )
+                    # Physical PP buffers and generic varlen metadata describe
+                    # storage rows.  The live HyperConnection state occupies a
+                    # compact prefix of that wire; strip its transport padding
+                    # before executing this stage's decoder layers.  Do not
+                    # index by local_storage_indices here: the preceding stage
+                    # already put live values in compact order.
+                    hidden_states = hidden_states[:, :compute_rows]
                 else:
                     compact_h = hidden_states.index_select(1, exact_cp_layout.local_storage_indices)
                     hidden_states = F.pad(compact_h, (0, 0, 0, compute_rows - live_token_count))
@@ -1920,6 +1927,17 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
         if is_pipeline_stage and not pp_stage_is_last:
             # Preserve the live multi-stream residual state across the PP wire.
             # Collapsing/re-expanding here would be a different model program.
+            # Keep live values in compact-prefix order, but restore the fixed
+            # storage-row capacity expected by PP buffers and cu_seq_lens.
+            if exact_cp_layout is not None:
+                transport_padding = packed_sequence_length - h4d.shape[1]
+                if transport_padding < 0:
+                    raise RuntimeError(
+                        "DeepSeek-V4 compact compute rows exceed the pipeline storage capacity: "
+                        f"compute={h4d.shape[1]}, storage={packed_sequence_length}; exact DSV4 PP must "
+                        "align storage rows across owner planes before building its schedule"
+                    )
+                h4d = F.pad(h4d, (0, 0, 0, 0, 0, transport_padding))
             return MoeModelOutput(
                 last_hidden_state=h4d,
                 router_logits=tuple(all_router_logits) if all_router_logits is not None else None,
