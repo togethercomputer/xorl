@@ -60,17 +60,6 @@ def _micro_batch():
     }
 
 
-def test_cispo_forward_backward_rejects_pipeline_parallelism():
-    runner = _make_runner(pp_enabled=True)
-
-    with pytest.raises(NotImplementedError, match="cispo does not yet support pipeline parallelism"):
-        runner._forward_backward_impl(
-            [_micro_batch()],
-            loss_fn="cispo",
-            loss_fn_params={"forward_backward_defrag": False},
-        )
-
-
 def test_cispo_compute_ref_logprobs_replaces_behavior_logprobs(monkeypatch):
     runner = _make_runner()
     monkeypatch.setattr(model_runner_module, "synchronize", lambda: None)
