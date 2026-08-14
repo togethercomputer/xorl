@@ -127,6 +127,7 @@ def compute_per_token_ce(
     logprob_top_k: LogprobTopK = TOP_K_ALL,
     logprob_top_p: LogprobProbability = 1.0,
     logprob_min_p: LogprobProbability = 0.0,
+    bi_fused_vocab_parallel: bool = False,
 ) -> torch.Tensor:
     """
     Compute per-token cross-entropy loss based on the specified mode.
@@ -259,10 +260,11 @@ def compute_per_token_ce(
     # transformed logits that serving samples and scores, unlike the
     # scale-hidden-pre-GEMM convention used by the other modes.
     if ce_mode == "bi_fused":
-        from xorl.ops.loss.bi_fused_lm_head import bi_fused_per_token_ce  # noqa: PLC0415
+        from xorl.ops.loss.bi_fused_lm_head import (  # noqa: PLC0415
+            bi_fused_per_token_ce,
+            bi_fused_vocab_parallel_per_token_ce,
+        )
 
-        if tp_group is not None:
-            raise NotImplementedError("ce_mode='bi_fused' does not support tensor parallelism yet")
         if use_lm_head_module:
             raise NotImplementedError("ce_mode='bi_fused' does not support FP8 lm_head modules")
         if not lm_head_fp32:
@@ -270,6 +272,22 @@ def compute_per_token_ce(
                 "ce_mode='bi_fused' implements the fp32-class lm-head contract; set lm_head_fp32: true"
             )
         local_weight = weight.to_local() if hasattr(weight, "to_local") else weight
+        if tp_group is not None and bi_fused_vocab_parallel:
+            return bi_fused_vocab_parallel_per_token_ce(
+                hidden_states_flat,
+                local_weight,
+                labels_flat,
+                tp_group,
+                ignore_index,
+                temperature=logprob_temperature,
+                top_ks=logprob_top_ks,
+                top_ps=logprob_top_ps,
+                min_ps=logprob_min_ps,
+            )
+        if tp_group is not None:
+            raise NotImplementedError(
+                "ce_mode='bi_fused' supports TP only through the dedicated vocabulary-sharded LM-head TP path"
+            )
         return bi_fused_per_token_ce(
             hidden_states_flat,
             local_weight,

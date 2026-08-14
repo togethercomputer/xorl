@@ -37,6 +37,7 @@ from xorl.models.checkpoint_handlers.buffers import (  # noqa: F401
     parse_expert_key,
 )
 from xorl.ops.loss import fsdp_sharded_causallm_loss_function, get_loss_function
+from xorl.ops.loss.reducers import TokenPartial
 from xorl.utils import logging
 from xorl.utils.device import get_device_id, get_device_type, synchronize
 from xorl.utils.helper import empty_cache, get_dtype_size
@@ -2872,10 +2873,35 @@ def compute_loss(
     """
     fn_name = loss_fn_name or "causallm_loss"
     loss_fn = get_loss_function(fn_name)
+    ps = get_parallel_state()
     exact_lm_head = bool(
         getattr(lm_head, "_glm52_exact_tp16_lm_head", False) or getattr(lm_head, "_dsv4_exact_tp8_lm_head", False)
     )
-    fsdp_sharded_loss = bool(getattr(lm_head, "_xorl_fsdp_sharded_lm_head_loss", False)) and not exact_lm_head
+    requested_ce_mode = (loss_fn_params or {}).get("ce_mode")
+    bi_fused_lm_head_tp = bool(
+        requested_ce_mode == "bi_fused"
+        and getattr(ps, "lm_head_tp_size", 1) > 1
+        and getattr(ps, "lm_head_tp_group", None) is not None
+    )
+    if bi_fused_lm_head_tp:
+        if not getattr(lm_head, "_xorl_fsdp_sharded_lm_head_loss", False):
+            raise RuntimeError(
+                "ce_mode='bi_fused' dedicated LM-head TP requires a vocabulary-sharded lm_head; "
+                "set fsdp_sharded_lm_head_loss: true"
+            )
+        loss_fn_params = dict(loss_fn_params or {})
+        global_valid_tokens = loss_fn_params.pop("fsdp_sharded_lm_head_loss_global_valid_tokens", None)
+        loss_fn_params.pop("fsdp_sharded_lm_head_loss_num_chunks", None)
+        loss_fn_params.pop("empty_cache_before_sharded_lm_head_loss", None)
+        if global_valid_tokens is not None:
+            loss_fn_params["loss_reducer"] = TokenPartial(
+                scale=global_valid_tokens.detach().to(last_hidden_state.device, dtype=torch.float32)
+            )
+    fsdp_sharded_loss = (
+        bool(getattr(lm_head, "_xorl_fsdp_sharded_lm_head_loss", False))
+        and not exact_lm_head
+        and not bi_fused_lm_head_tp
+    )
     if fsdp_sharded_loss and fn_name not in {"causallm_loss", "cross_entropy"}:
         raise NotImplementedError(f"fsdp_sharded_lm_head_loss is not supported for loss function {fn_name!r}.")
     weight = get_lm_head_weight(lm_head, fsdp_sharded_loss=fsdp_sharded_loss)
@@ -2883,7 +2909,6 @@ def compute_loss(
     slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
     hidden_states = last_hidden_state[:, slice_indices, :]
 
-    ps = get_parallel_state()
     if fsdp_sharded_loss:
         if ps.tp_enabled:
             raise NotImplementedError("fsdp_sharded_lm_head_loss is not supported together with tensor parallelism.")
@@ -2967,6 +2992,10 @@ def compute_loss(
             raise RuntimeError("The exact GLM-5.2 lm head was not prepared for sharded TP16 loss")
         loss_kwargs["lm_head"] = lm_head
         loss_kwargs["tp_group"] = ps.lm_head_tp_group
+    elif bi_fused_lm_head_tp:
+        loss_kwargs["tp_group"] = ps.lm_head_tp_group
+        loss_kwargs["bi_fused_vocab_parallel"] = True
+        loss_kwargs["bi_fused_loss_reduce_group"] = getattr(ps, "lm_head_tp_replica_group", None)
     elif ps.tp_enabled:
         loss_kwargs["tp_group"] = ps.tp_group
     if loss_fn_inputs:
