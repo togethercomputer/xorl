@@ -47,10 +47,17 @@ import torch.distributed as dist
 
 
 def validate_native_ep_combine_size(ep_size: int) -> None:
-    """Validate the contributor count supported by the balanced BF16 fold."""
+    """Require one complete positive contributor group.
 
-    if ep_size <= 1 or ep_size & (ep_size - 1):
-        raise ValueError("Native EP canonical combine requires a power-of-two contributor count greater than one")
+    The raw equal-split all-to-all and source-major reshape work for every
+    positive group size. The FP32 fold carries an odd final source unchanged
+    at each tree level, and EP1 is the mechanically valid identity. Model
+    geometry still independently requires expert and shared widths to divide
+    by the selected EP size.
+    """
+
+    if ep_size <= 0:
+        raise ValueError("Native EP canonical combine requires a positive contributor count")
 
 
 class _AllGatherSumBackward(torch.autograd.Function):

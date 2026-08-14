@@ -3,6 +3,7 @@
 import pytest
 import torch
 
+from xorl.distributed.canonical_moe import canonical_moe_fold_fp32_v2
 from xorl.models.layers.moe.ep_native_combine import (
     exchange_and_canonical_fold,
     gather_ids_for_ep_combine,
@@ -16,12 +17,33 @@ from xorl.models.layers.moe.ep_native_combine import (
 pytestmark = [pytest.mark.cpu]
 
 
-def test_native_combine_accepts_the_balanced_fold_geometries():
-    for size in (2, 4, 8, 16, 32, 64):
+def test_native_combine_accepts_every_positive_complete_contributor_group():
+    for size in (1, 2, 3, 4, 5, 6, 8, 16, 17, 32, 64):
         validate_native_ep_combine_size(size)
-    for size in (0, 1, 3, 6, 31):
-        with pytest.raises(ValueError, match="power-of-two contributor count greater than one"):
+    for size in (0, -1):
+        with pytest.raises(ValueError, match="positive contributor count"):
             validate_native_ep_combine_size(size)
+
+
+@pytest.mark.parametrize("ep_size", [1, 3, 5])
+def test_native_combine_odd_tail_and_identity_geometries_preserve_bytes_and_gradients(monkeypatch, ep_size):
+    from xorl.distributed.moe.comm import _AllToAll  # noqa: PLC0415
+
+    monkeypatch.setattr(
+        _AllToAll,
+        "apply",
+        staticmethod(lambda _group, partial, _out_splits, _in_splits: partial),
+    )
+    contributors = (
+        torch.arange(ep_size * 6, dtype=torch.float32).reshape(ep_size, 2, 3).sub_(7).div_(8).bfloat16()
+    ).requires_grad_(True)
+
+    result = exchange_and_canonical_fold(contributors.reshape(ep_size * 2, 3), group=None, ep_size=ep_size)
+    expected = canonical_moe_fold_fp32_v2(contributors)
+
+    assert torch.equal(result.view(torch.uint16), expected.view(torch.uint16))
+    result.float().sum().backward()
+    assert torch.equal(contributors.grad, torch.ones_like(contributors))
 
 
 def test_native_combine_32_way_fallback_matches_explicit_adjacent_tree(monkeypatch):
@@ -81,7 +103,7 @@ def test_qwen35_exchange_uses_canonical_tree_and_preserves_backward(monkeypatch)
     [
         (torch.zeros((16, 2), dtype=torch.float32), 8, "BF16"),
         (torch.zeros((15, 2), dtype=torch.bfloat16), 8, "divisible"),
-        (torch.zeros((18, 2), dtype=torch.bfloat16), 3, "power-of-two contributor count greater than one"),
+        (torch.zeros((18, 2), dtype=torch.bfloat16), 0, "positive contributor count"),
     ],
 )
 def test_qwen35_exchange_fails_closed_before_transport(monkeypatch, partial, ep_size, message):

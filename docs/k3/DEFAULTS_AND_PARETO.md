@@ -25,8 +25,8 @@ The selected program owns all bit-relevant choices together:
 - attention/GDN backend and state handling;
 - router arithmetic and selected-expert ordering;
 - expert projection, activation, routing-weight, and local-combine arithmetic;
-- distributed expert transport and the versioned logical adjacent-pair BF16
-  fold; and
+- distributed expert transport and the versioned logical adjacent-pair FP32
+  fold with one final low-precision cast; and
 - LM-head projection and vocabulary normalization.
 
 ## LoRA programs
