@@ -50,6 +50,7 @@ from xorl.ops.dsv4.cp_utils import (
     get_freqs_cis_for_cp,
     get_q_positions_for_cp,
     get_window_topk_idxs_cp,
+    get_zigzag_cp_layout,
 )
 from xorl.ops.dsv4.hyper_connection import DeepSeekV4HyperConnectionUtil
 from xorl.ops.dsv4.qat import fp8_simulate_qat
@@ -396,9 +397,35 @@ class DeepSeekV4Attention(nn.Module):
         else:
             freqs_cis = get_freqs_cis_for_cp(self.freqs_cis, seqlen_local, self.cp_size, self.cp_group)
         seqlen_global = seqlen_local * self.cp_size
-        q_positions = get_q_positions_for_cp(
-            seqlen_local, cp_size=self.cp_size, cp_group=self.cp_group, device=x.device
-        )
+        zigzag_rope_positions = self.__dict__.get("_dsv4_zigzag_rope_positions")
+        zigzag_query_positions = self.__dict__.get("_dsv4_zigzag_query_positions")
+        zigzag_restore_order = self.__dict__.get("_dsv4_zigzag_restore_order")
+        if zigzag_rope_positions is not None:
+            if not self._exact_attention or self.cp_size <= 1 or carry_offset is not None:
+                raise RuntimeError("DSV4 zigzag layout metadata is only valid for exact CP prefill")
+            if (
+                zigzag_rope_positions.numel() != seqlen_local
+                or zigzag_query_positions is None
+                or zigzag_query_positions.numel() != seqlen_local
+                or zigzag_restore_order is None
+                or zigzag_restore_order.numel() != seqlen_global
+            ):
+                raise RuntimeError("DSV4 zigzag layout metadata does not match the local attention shape")
+            if zigzag_rope_positions.numel() and int(zigzag_rope_positions.max().item()) >= self.freqs_cis.size(0):
+                raise ValueError(
+                    "DSV4 RoPE cache is too short for the ring-CP position layout: "
+                    f"max position={int(zigzag_rope_positions.max().item())}, "
+                    f"cache length={self.freqs_cis.size(0)}"
+                )
+            freqs_cis = self.freqs_cis.index_select(
+                0,
+                zigzag_rope_positions.to(device=self.freqs_cis.device),
+            ).to(device=x.device)
+            q_positions = zigzag_query_positions
+        else:
+            q_positions = get_q_positions_for_cp(
+                seqlen_local, cp_size=self.cp_size, cp_group=self.cp_group, device=x.device
+            )
         # SGLang's DSV4 CP path shards queries for execution, but explicitly
         # all-gathers and reranges BF16 KV plus compressor scores back into
         # logical token order before the cache/compressor kernels.  The trainer
@@ -475,9 +502,13 @@ class DeepSeekV4Attention(nn.Module):
                     self.eps,
                 )
                 exact_kv_pre_norm = all_gather_cp(exact_kv_pre_norm, dim=1, cp_group=self.cp_group)
+                if zigzag_restore_order is not None:
+                    exact_kv_pre_norm = exact_kv_pre_norm.index_select(1, zigzag_restore_order)
                 exact_kv_preprocessed = True
                 if ratio:
                     exact_x = all_gather_cp(exact_x, dim=1, cp_group=self.cp_group)
+                    if zigzag_restore_order is not None:
+                        exact_x = exact_x.index_select(1, zigzag_restore_order)
             if ratio == 0:
                 from xorl.ops.dsv4.exact_attention import exact_c0_attention  # noqa: PLC0415
 
@@ -1620,7 +1651,7 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
                 if position_ids is None:
                     raise ValueError("DSV4 decode-cache carry requires absolute position_ids")
                 carry_position_offset = int(position_ids.reshape(-1)[0].item())
-        del attention_mask, position_ids
+        del attention_mask
         if inputs_embeds is None:
             if input_ids is None:
                 raise ValueError("DeepseekV4Model.forward requires input_ids or inputs_embeds")
@@ -1641,6 +1672,7 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
         exact_compute_token_count = packed_sequence_length
         if getattr(self.config, "_dsv4_flash_exact_mode", False):
             parallel_state = get_parallel_state()
+            ring_cp_logical_row_indices = kwargs.pop("_ring_cp_logical_row_indices", None)
             sample_lengths = kwargs.pop("_r3_sample_lengths", None)
             num_samples = kwargs.pop("num_samples", None)
             packed_rows = int(h3d.shape[0] * h3d.shape[1])
@@ -1689,6 +1721,53 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
             h3d = h3d[:, :exact_compute_token_count]
             if input_ids is not None:
                 input_ids = input_ids[:, :exact_compute_token_count]
+            zigzag_layout_names = (
+                "_dsv4_zigzag_rope_positions",
+                "_dsv4_zigzag_query_positions",
+                "_dsv4_zigzag_restore_order",
+            )
+            for layer in self.layers:
+                for name in zigzag_layout_names:
+                    layer.self_attn.__dict__.pop(name, None)
+            if int(getattr(parallel_state, "ringattn_size", 1)) > 1:
+                if position_ids is None:
+                    raise ValueError("DSV4 exact ring CP requires the collator's full position IDs")
+                if ring_cp_logical_row_indices is None:
+                    raise ValueError("DSV4 exact ring CP requires the collator's logical row indices")
+                cp_size = int(parallel_state.cp_size)
+                cp_rank = int(parallel_state.cp_rank)
+                full_position_ids = position_ids.reshape(-1)
+                full_logical_row_indices = ring_cp_logical_row_indices.reshape(-1)
+                expected_full_length = packed_sequence_length * cp_size
+                if (
+                    full_position_ids.numel() != expected_full_length
+                    or full_logical_row_indices.numel() != expected_full_length
+                ):
+                    raise RuntimeError(
+                        "DSV4 exact ring CP side channels do not match the packed CP layout: "
+                        f"positions={full_position_ids.numel()}, logical_rows={full_logical_row_indices.numel()}, "
+                        f"expected={expected_full_length}"
+                    )
+                local_start = cp_rank * packed_sequence_length
+                local_rope_positions = full_position_ids.narrow(
+                    0,
+                    local_start,
+                    exact_compute_token_count,
+                ).to(device=h3d.device, dtype=torch.int64)
+                local_logical_row_indices = full_logical_row_indices.narrow(
+                    0,
+                    local_start,
+                    exact_compute_token_count,
+                ).to(device=h3d.device, dtype=torch.int64)
+                query_positions, restore_order = get_zigzag_cp_layout(
+                    local_logical_row_indices,
+                    cp_group=parallel_state.sp_group,
+                )
+                for layer in self.layers:
+                    attention = layer.self_attn
+                    attention._dsv4_zigzag_rope_positions = local_rope_positions
+                    attention._dsv4_zigzag_query_positions = query_positions
+                    attention._dsv4_zigzag_restore_order = restore_order
             # Stamp (or clear) the per-layer decode-carry offset before the
             # layer loop so every attention module replays this segment against
             # its carried serving state. Clearing on non-carry forwards keeps a
@@ -1701,6 +1780,7 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
                     attention._dsv4_decode_carry_offset = carry_position_offset
                 elif "_dsv4_decode_carry_offset" in attention.__dict__:
                     del attention.__dict__["_dsv4_decode_carry_offset"]
+        del position_ids
         del kwargs
 
         output_router_logits = (

@@ -302,3 +302,99 @@ def test_exact_cp_selects_the_serving_kv_boundary(monkeypatch, compress_ratio, c
                 dim=1,
             )
             assert torch.equal(attention_source, expected_source)
+
+
+@pytest.mark.parametrize("compress_ratio", [0, 128])
+def test_exact_ring_cp_restores_gathered_rows_and_uses_local_rope_positions(monkeypatch, compress_ratio):
+    """The exact seam consumes zigzag Q locally and logical KV/compressor rows globally."""
+
+    from xorl.models.transformers.deepseek_v4 import modeling_deepseek_v4  # noqa: PLC0415
+    from xorl.models.transformers.deepseek_v4.modeling_deepseek_v4 import (  # noqa: PLC0415
+        DeepSeekV4Attention,
+    )
+    from xorl.ops.dsv4 import exact_attention  # noqa: PLC0415
+
+    class _FakeCPGroup:
+        @staticmethod
+        def size():
+            return 2
+
+        @staticmethod
+        def rank():
+            return 1
+
+    cfg = _tiny_config(compress_ratios=[compress_ratio])
+    cfg._dsv4_flash_exact_mode = True
+    group = _FakeCPGroup()
+    layer = DeepSeekV4Attention(cfg, layer_id=0, cp_group=group)
+    local_length = 4
+    hidden = torch.arange(local_length * cfg.hidden_size, dtype=torch.float32).view(
+        1,
+        local_length,
+        cfg.hidden_size,
+    )
+    # ring2 storage for S=8 is rank0=[0,1,6,7], rank1=[2,3,4,5].
+    local_positions = torch.tensor([2, 3, 4, 5])
+    restore_order = torch.tensor([0, 1, 4, 5, 6, 7, 2, 3])
+    layer._dsv4_zigzag_rope_positions = local_positions
+    layer._dsv4_zigzag_query_positions = local_positions
+    layer._dsv4_zigzag_restore_order = restore_order
+
+    observed = {"q_freqs": None, "kv_freqs": None, "inverse_freqs": None, "attention": None, "gathers": []}
+    monkeypatch.setattr(
+        modeling_deepseek_v4._ExactBatchInvariantRmsNorm,
+        "apply",
+        lambda value, _weight, _eps: value,
+    )
+
+    def fake_q_norm_rope(value, freqs, *_args, **_kwargs):
+        observed["q_freqs"] = freqs.detach().clone()
+        return value
+
+    def fake_kv_norm_rope(value, _weight, freqs, *_args, **_kwargs):
+        observed["kv_freqs"] = freqs.detach().clone()
+        return value
+
+    def fake_inverse_rope(value, freqs, *_args, **_kwargs):
+        observed["inverse_freqs"] = freqs.detach().clone()
+        return value
+
+    def fake_gather(value, dim, cp_group):
+        assert cp_group is group
+        gathered = torch.cat((value + 1000.0, value), dim=dim)
+        observed["gathers"].append((gathered.detach().clone(), dim))
+        return gathered
+
+    def fake_c0(q, kv, *_args, **kwargs):
+        observed["attention"] = (kv.detach().clone(), None, kwargs)
+        return q
+
+    def fake_compressed(q, kv, source, *_args, **kwargs):
+        observed["attention"] = (kv.detach().clone(), source.detach().clone(), kwargs)
+        return q
+
+    monkeypatch.setattr(exact_attention, "exact_q_norm_rope", fake_q_norm_rope)
+    monkeypatch.setattr(exact_attention, "exact_kv_norm_rope", fake_kv_norm_rope)
+    monkeypatch.setattr(exact_attention, "exact_inverse_rope", fake_inverse_rope)
+    monkeypatch.setattr(modeling_deepseek_v4, "all_gather_cp", fake_gather)
+    monkeypatch.setattr(exact_attention, "exact_c0_attention", fake_c0)
+    monkeypatch.setattr(exact_attention, "exact_compressed_attention", fake_compressed)
+
+    output = layer(hidden)
+
+    assert output.shape == hidden.shape
+    expected_local_freqs = layer.freqs_cis.index_select(
+        0,
+        local_positions.to(layer.freqs_cis.device),
+    ).to(hidden.device)
+    assert torch.equal(observed["q_freqs"], expected_local_freqs)
+    assert torch.equal(observed["kv_freqs"], expected_local_freqs)
+    assert torch.equal(observed["inverse_freqs"], expected_local_freqs)
+    attention_kv, attention_source, kwargs = observed["attention"]
+    gathered_kv = observed["gathers"][0][0]
+    assert torch.equal(attention_kv, gathered_kv.index_select(1, restore_order))
+    assert torch.equal(kwargs["query_positions"], local_positions)
+    assert kwargs["kv_preprocessed"] is True
+    if compress_ratio:
+        gathered_source = observed["gathers"][1][0]
+        assert torch.equal(attention_source, gathered_source.index_select(1, restore_order))

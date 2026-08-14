@@ -117,6 +117,30 @@ class TestCollatorCall:
                 }
             )
 
+    @pytest.mark.parametrize("cp_rank", range(4))
+    @patch("xorl.data.collators.sequence_shard_collator.get_parallel_state")
+    def test_ring_cp_emits_unique_multi_document_logical_rows(self, mock_parallel_state, cp_rank):
+        mock_parallel_state.return_value = _make_mock_ps(cp_size=4, cp_rank=cp_rank, ringattn_size=2)
+        collator = TextSequenceShardCollator(pad_token_id=0)
+        input_ids = torch.arange(16).view(1, -1)
+        result = collator(
+            {
+                "input_ids": input_ids.clone(),
+                "attention_mask": torch.ones_like(input_ids),
+                "labels": torch.full_like(input_ids, IGNORE_INDEX),
+                "position_ids": torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7] * 2]),
+            }
+        )
+
+        # Two 8-row documents, each split into four ring2 chunks. Rows are
+        # grouped by ring rank, then sliced by the ring2 x Ulysses2 CP rank.
+        expected_full_rows = torch.tensor([[0, 1, 6, 7, 8, 9, 14, 15, 2, 3, 4, 5, 10, 11, 12, 13]])
+        assert torch.equal(result["_ring_cp_logical_row_indices"], expected_full_rows)
+        start = cp_rank * 4
+        local_rows = expected_full_rows[:, start : start + 4]
+        assert torch.equal(result["input_ids"], input_ids.gather(1, local_rows))
+        assert torch.unique(result["position_ids"]).numel() == 8
+
     @patch("xorl.data.collators.sequence_shard_collator.get_parallel_state")
     def test_sp_splitting_padding_and_flash_attn_kwargs(self, mock_parallel_state):
         """Covers SP padding to multiple, splitting across ranks, flash attention kwargs,

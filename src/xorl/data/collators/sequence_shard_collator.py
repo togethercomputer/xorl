@@ -375,6 +375,14 @@ class TextSequenceShardCollator(DataCollator):
         # 2. For Ulysses, all SP ranks use the SAME cu_seqlens for flash attention
         # 3. Each SP rank only processes a slice of the sequence but needs full cu_seqlens
         position_ids = self.sp_padding(position_ids, dim=-1, pad_value=0, pad_length=pad_length, sequential=True)
+        # Unique packed-row identity for restoring a rank-order gather after
+        # zigzag storage. Position IDs cannot serve this role because they
+        # reset at every packed-document boundary.
+        logical_row_indices = torch.arange(
+            position_ids.size(-1),
+            dtype=torch.int64,
+            device=position_ids.device,
+        ).view(1, -1)
 
         # Zigzag reorder: rearrange each document's tokens so that contiguous
         # sp_slice gives each CP rank balanced [early, late] sub-chunks.
@@ -384,6 +392,12 @@ class TextSequenceShardCollator(DataCollator):
         if self.ringattn_size > 1:
             input_ids = zigzag_reorder_packed_sequence(input_ids, original_position_ids, self.ringattn_size, dim=-1)
             labels = zigzag_reorder_packed_sequence(labels, original_position_ids, self.ringattn_size, dim=-1)
+            logical_row_indices = zigzag_reorder_packed_sequence(
+                logical_row_indices,
+                original_position_ids,
+                self.ringattn_size,
+                dim=-1,
+            )
             if "attention_mask" in batch:
                 batch["attention_mask"] = zigzag_reorder_packed_sequence(
                     batch["attention_mask"], original_position_ids, self.ringattn_size, dim=-1
@@ -397,6 +411,8 @@ class TextSequenceShardCollator(DataCollator):
         batch["input_ids"] = self.sp_slice(input_ids, dim=-1)
         batch["labels"] = self.sp_slice(labels, dim=-1)
         batch["position_ids"] = position_ids  # Keep full, not sliced
+        if self.ringattn_size > 1:
+            batch["_ring_cp_logical_row_indices"] = logical_row_indices
 
         # Handle loss side-channel fields. These need to be padded and sliced
         # the same way as labels because they are token-aligned.

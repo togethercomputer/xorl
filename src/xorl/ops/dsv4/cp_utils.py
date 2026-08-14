@@ -107,6 +107,56 @@ def all_gather_cp(tensor: Tensor, dim: int, cp_group: torch.distributed.ProcessG
     return _AllGatherCP.apply(tensor, dim, cp_group)
 
 
+def get_zigzag_cp_layout(
+    local_logical_row_indices: Tensor,
+    *,
+    cp_group: torch.distributed.ProcessGroup,
+) -> tuple[Tensor, Tensor]:
+    """Recover logical query and gathered-row order from a zigzag CP shard.
+
+    ``TextSequenceShardCollator`` stores ring-attention rows in CP-group-rank
+    order, while DSV4's exact attention consumes one ordinary logical token
+    packed stream. The collator emits unique logical row indices alongside its
+    ordinary, per-document position IDs. Gather that tiny integer side channel
+    once, derive the inverse storage permutation, and reuse it for every
+    attention layer.
+
+    Returns:
+        ``(query_positions, gathered_restore_order)`` where query positions
+        index the restored logical KV sequence and ``gathered_restore_order``
+        reranges a rank-order CP gather along its sequence dimension.
+    """
+
+    local_logical_row_indices = local_logical_row_indices.reshape(-1).to(dtype=torch.int64).contiguous()
+    world_size = cp_group.size()
+    gathered = [torch.empty_like(local_logical_row_indices) for _ in range(world_size)]
+    torch.distributed.all_gather(gathered, local_logical_row_indices, group=cp_group)
+    storage_row_indices = torch.cat(gathered)
+    restore_order = torch.argsort(storage_row_indices, stable=True)
+    logical_row_indices = storage_row_indices.index_select(0, restore_order)
+    expected_row_indices = torch.arange(
+        logical_row_indices.numel(),
+        dtype=logical_row_indices.dtype,
+        device=logical_row_indices.device,
+    )
+    if not torch.equal(logical_row_indices, expected_row_indices):
+        row_min = int(logical_row_indices.min().item()) if logical_row_indices.numel() else None
+        row_max = int(logical_row_indices.max().item()) if logical_row_indices.numel() else None
+        unique_rows = int(torch.unique(logical_row_indices).numel())
+        raise RuntimeError(
+            "DSV4 exact ring CP requires the gathered live rows to cover the "
+            "packed logical stream exactly once; "
+            f"rows={logical_row_indices.numel()}, unique={unique_rows}, range=[{row_min}, {row_max}]"
+        )
+
+    storage_to_logical = torch.empty_like(restore_order)
+    storage_to_logical.scatter_(0, restore_order, expected_row_indices)
+    local_length = local_logical_row_indices.numel()
+    start = cp_group.rank() * local_length
+    query_positions = storage_to_logical.narrow(0, start, local_length)
+    return query_positions, restore_order
+
+
 def get_q_positions_for_cp(
     seqlen_local: int,
     *,
