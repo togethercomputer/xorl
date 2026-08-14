@@ -45,12 +45,14 @@ from xorl.models.outputs import MoeCausalLMOutput, MoeModelOutput
 from xorl.ops.dsv4.attention_core import dense_attn_torch, sparse_attn_tilelang, sparse_attn_torch
 from xorl.ops.dsv4.compressor import DeepSeekV4Compressor
 from xorl.ops.dsv4.cp_utils import (
+    Dsv4ExactCPLayout,
     all_gather_cp,
+    build_dsv4_exact_cp_layout,
+    gather_dsv4_exact_cp_rows,
     get_compress_topk_idxs_cp,
     get_freqs_cis_for_cp,
     get_q_positions_for_cp,
     get_window_topk_idxs_cp,
-    get_zigzag_cp_layout,
 )
 from xorl.ops.dsv4.hyper_connection import DeepSeekV4HyperConnectionUtil
 from xorl.ops.dsv4.qat import fp8_simulate_qat
@@ -353,7 +355,12 @@ class DeepSeekV4Attention(nn.Module):
         if callable(capture):
             capture(name, value)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        exact_cp_layout: Dsv4ExactCPLayout | None = None,
+        decode_carry_offset: int | None = None,
+    ) -> torch.Tensor:
         """Run attention.
 
         Args:
@@ -376,12 +383,10 @@ class DeepSeekV4Attention(nn.Module):
         validate_lora_metadata("entry")
         self._capture_diagnostic_component("attention_input", x)
         bsz, seqlen_local, _ = x.size()
-        # Decode-cache carry: the exact scorer replays serving decode steps as
-        # M=1 segments over carried per-layer serving state. The model forward
-        # stamps the segment's absolute position offset on this module
-        # (``_dsv4_decode_carry_offset``); the carried caches live on
-        # ``_dsv4_decode_state`` until the scorer clears them.
-        carry_offset = self.__dict__.get("_dsv4_decode_carry_offset") if self._exact_attention else None
+        # Decode-cache carry replays M=1 segments over persistent serving
+        # cache state. The offset is an explicit per-call argument so pipeline
+        # interleaving and checkpoint recompute cannot overwrite it.
+        carry_offset = decode_carry_offset if self._exact_attention else None
         carry_state = None
         if carry_offset is not None:
             if self.cp_size != 1 or bsz != 1:
@@ -397,31 +402,27 @@ class DeepSeekV4Attention(nn.Module):
         else:
             freqs_cis = get_freqs_cis_for_cp(self.freqs_cis, seqlen_local, self.cp_size, self.cp_group)
         seqlen_global = seqlen_local * self.cp_size
-        zigzag_rope_positions = self.__dict__.get("_dsv4_zigzag_rope_positions")
-        zigzag_query_positions = self.__dict__.get("_dsv4_zigzag_query_positions")
-        zigzag_restore_order = self.__dict__.get("_dsv4_zigzag_restore_order")
-        if zigzag_rope_positions is not None:
-            if not self._exact_attention or self.cp_size <= 1 or carry_offset is not None:
-                raise RuntimeError("DSV4 zigzag layout metadata is only valid for exact CP prefill")
-            if (
-                zigzag_rope_positions.numel() != seqlen_local
-                or zigzag_query_positions is None
-                or zigzag_query_positions.numel() != seqlen_local
-                or zigzag_restore_order is None
-                or zigzag_restore_order.numel() != seqlen_global
-            ):
-                raise RuntimeError("DSV4 zigzag layout metadata does not match the local attention shape")
-            if zigzag_rope_positions.numel() and int(zigzag_rope_positions.max().item()) >= self.freqs_cis.size(0):
+        if exact_cp_layout is not None:
+            if not self._exact_attention or carry_offset is not None:
+                raise RuntimeError("DSV4 exact CP layout is only valid for an exact prefill call")
+            if exact_cp_layout.compute_rows != seqlen_local:
+                raise RuntimeError(
+                    "DSV4 exact CP layout does not match the local attention shape: "
+                    f"layout={exact_cp_layout.compute_rows}, attention={seqlen_local}"
+                )
+            rope_positions = exact_cp_layout.local_request_positions
+            if rope_positions.numel() and int(rope_positions.max().item()) >= self.freqs_cis.size(0):
                 raise ValueError(
-                    "DSV4 RoPE cache is too short for the ring-CP position layout: "
-                    f"max position={int(zigzag_rope_positions.max().item())}, "
+                    "DSV4 RoPE cache is too short for the CP request layout: "
+                    f"max position={int(rope_positions.max().item())}, "
                     f"cache length={self.freqs_cis.size(0)}"
                 )
             freqs_cis = self.freqs_cis.index_select(
                 0,
-                zigzag_rope_positions.to(device=self.freqs_cis.device),
+                rope_positions.to(device=self.freqs_cis.device),
             ).to(device=x.device)
-            q_positions = zigzag_query_positions
+            q_positions = rope_positions
+            seqlen_global = int(exact_cp_layout.global_logical_rows.numel())
         else:
             q_positions = get_q_positions_for_cp(
                 seqlen_local, cp_size=self.cp_size, cp_group=self.cp_group, device=x.device
@@ -432,7 +433,9 @@ class DeepSeekV4Attention(nn.Module):
         # owns contiguous CP shards, so rank-order concatenation is already that
         # logical order.  Keep Q local (and carry its absolute positions) while
         # replaying the literal serving attention against the gathered source.
-        exact_query_positions = q_positions if self._exact_attention and self.cp_size > 1 else None
+        exact_query_positions = (
+            q_positions if self._exact_attention and self.cp_size > 1 and exact_cp_layout is None else None
+        )
         exact_kv_freqs_cis = freqs_cis
         if exact_query_positions is not None:
             exact_kv_freqs_cis = get_freqs_cis_for_cp(
@@ -485,68 +488,147 @@ class DeepSeekV4Attention(nn.Module):
         validate_lora_metadata("KV projection")
         self._capture_diagnostic_component("k_pre_qk_norm", kv_pre_norm)
         if self._exact_attention:
-            exact_kv_pre_norm = kv_pre_norm
-            exact_x = x
-            exact_kv_preprocessed = False
-            if self.cp_size > 1:
-                from xorl.ops.dsv4.exact_attention import exact_kv_norm_rope  # noqa: PLC0415
+            if exact_cp_layout is not None:
+                global_kv = None
+                global_x = None
+                if self.cp_size > 1:
+                    from xorl.ops.dsv4.exact_attention import exact_kv_norm_rope  # noqa: PLC0415
 
-                # Serving's CP-prefill boundary materializes BF16 norm+RoPE KV
-                # locally, reranges those rows globally, and only then performs
-                # the separate FP8 cache store.  Preserve that two-kernel
-                # boundary; the CP1 path intentionally retains its fused store.
-                exact_kv_pre_norm = exact_kv_norm_rope(
-                    exact_kv_pre_norm,
-                    self.kv_norm.weight,
-                    freqs_cis,
-                    self.eps,
-                )
-                exact_kv_pre_norm = all_gather_cp(exact_kv_pre_norm, dim=1, cp_group=self.cp_group)
-                if zigzag_restore_order is not None:
-                    exact_kv_pre_norm = exact_kv_pre_norm.index_select(1, zigzag_restore_order)
-                exact_kv_preprocessed = True
-                if ratio:
-                    exact_x = all_gather_cp(exact_x, dim=1, cp_group=self.cp_group)
-                    if zigzag_restore_order is not None:
-                        exact_x = exact_x.index_select(1, zigzag_restore_order)
-            if ratio == 0:
-                from xorl.ops.dsv4.exact_attention import exact_c0_attention  # noqa: PLC0415
+                    # Match serving's CP seam: normalize and apply each local
+                    # request's RoPE before transport, then gather padded rows
+                    # differentiably and compact them in packed logical order.
+                    local_kv = exact_kv_norm_rope(
+                        kv_pre_norm,
+                        self.kv_norm.weight,
+                        freqs_cis,
+                        self.eps,
+                    )
+                    global_kv = gather_dsv4_exact_cp_rows(
+                        local_kv,
+                        dim=1,
+                        layout=exact_cp_layout,
+                        cp_group=self.cp_group,
+                    )
+                    if ratio:
+                        global_x = gather_dsv4_exact_cp_rows(
+                            x,
+                            dim=1,
+                            layout=exact_cp_layout,
+                            cp_group=self.cp_group,
+                        )
 
-                o = exact_c0_attention(
-                    q,
-                    exact_kv_pre_norm,
-                    self.kv_norm.weight,
-                    self.attn_sink,
-                    exact_kv_freqs_cis,
-                    self.eps,
-                    self.softmax_scale,
-                    carry_state=carry_state,
-                    position_offset=carry_offset or 0,
-                    query_positions=exact_query_positions,
-                    kv_preprocessed=exact_kv_preprocessed,
-                )
+                o = torch.zeros_like(q)
+                for local_rows, global_rows in zip(
+                    exact_cp_layout.local_request_row_indices,
+                    exact_cp_layout.global_request_row_indices,
+                ):
+                    if local_rows.numel() == 0:
+                        continue
+                    request_q = q.index_select(1, local_rows)
+                    request_positions = exact_cp_layout.local_request_positions.index_select(0, local_rows)
+                    request_length = int(global_rows.numel())
+                    request_freqs = get_freqs_cis_for_cp(self.freqs_cis, request_length, 1, None)
+                    if self.cp_size > 1:
+                        request_kv = global_kv.index_select(1, global_rows)
+                        request_x = global_x.index_select(1, global_rows) if ratio else None
+                        kv_preprocessed = True
+                    else:
+                        # CP1 retains the fused raw-KV serving store and simply
+                        # executes it once per packed request.
+                        request_kv = kv_pre_norm.index_select(1, local_rows)
+                        request_x = x.index_select(1, local_rows) if ratio else None
+                        kv_preprocessed = False
+
+                    if ratio == 0:
+                        from xorl.ops.dsv4.exact_attention import exact_c0_attention  # noqa: PLC0415
+
+                        request_o = exact_c0_attention(
+                            request_q,
+                            request_kv,
+                            self.kv_norm.weight,
+                            self.attn_sink,
+                            request_freqs,
+                            self.eps,
+                            self.softmax_scale,
+                            query_positions=request_positions,
+                            kv_preprocessed=kv_preprocessed,
+                        )
+                    else:
+                        from xorl.ops.dsv4.exact_attention import exact_compressed_attention  # noqa: PLC0415
+
+                        request_o = exact_compressed_attention(
+                            request_q,
+                            request_kv,
+                            request_x,
+                            self.kv_norm.weight,
+                            self.attn_sink,
+                            request_freqs,
+                            self.compressor.wkv.weight,
+                            self.compressor.wgate.weight,
+                            self.compressor.ape,
+                            self.compressor.norm.weight,
+                            self.eps,
+                            self.softmax_scale,
+                            ratio,
+                            query_positions=request_positions,
+                            kv_preprocessed=kv_preprocessed,
+                        )
+                    o = o.index_copy(1, local_rows, request_o)
             else:
-                from xorl.ops.dsv4.exact_attention import exact_compressed_attention  # noqa: PLC0415
+                exact_kv_pre_norm = kv_pre_norm
+                exact_x = x
+                exact_kv_preprocessed = False
+                if self.cp_size > 1:
+                    from xorl.ops.dsv4.exact_attention import exact_kv_norm_rope  # noqa: PLC0415
 
-                o = exact_compressed_attention(
-                    q,
-                    exact_kv_pre_norm,
-                    exact_x,
-                    self.kv_norm.weight,
-                    self.attn_sink,
-                    exact_kv_freqs_cis,
-                    self.compressor.wkv.weight,
-                    self.compressor.wgate.weight,
-                    self.compressor.ape,
-                    self.compressor.norm.weight,
-                    self.eps,
-                    self.softmax_scale,
-                    ratio,
-                    carry_state=carry_state,
-                    position_offset=carry_offset or 0,
-                    query_positions=exact_query_positions,
-                    kv_preprocessed=exact_kv_preprocessed,
-                )
+                    exact_kv_pre_norm = exact_kv_norm_rope(
+                        exact_kv_pre_norm,
+                        self.kv_norm.weight,
+                        freqs_cis,
+                        self.eps,
+                    )
+                    exact_kv_pre_norm = all_gather_cp(exact_kv_pre_norm, dim=1, cp_group=self.cp_group)
+                    exact_kv_preprocessed = True
+                    if ratio:
+                        exact_x = all_gather_cp(exact_x, dim=1, cp_group=self.cp_group)
+                if ratio == 0:
+                    from xorl.ops.dsv4.exact_attention import exact_c0_attention  # noqa: PLC0415
+
+                    o = exact_c0_attention(
+                        q,
+                        exact_kv_pre_norm,
+                        self.kv_norm.weight,
+                        self.attn_sink,
+                        exact_kv_freqs_cis,
+                        self.eps,
+                        self.softmax_scale,
+                        carry_state=carry_state,
+                        position_offset=carry_offset or 0,
+                        query_positions=exact_query_positions,
+                        kv_preprocessed=exact_kv_preprocessed,
+                    )
+                else:
+                    from xorl.ops.dsv4.exact_attention import exact_compressed_attention  # noqa: PLC0415
+
+                    o = exact_compressed_attention(
+                        q,
+                        exact_kv_pre_norm,
+                        exact_x,
+                        self.kv_norm.weight,
+                        self.attn_sink,
+                        exact_kv_freqs_cis,
+                        self.compressor.wkv.weight,
+                        self.compressor.wgate.weight,
+                        self.compressor.ape,
+                        self.compressor.norm.weight,
+                        self.eps,
+                        self.softmax_scale,
+                        ratio,
+                        carry_state=carry_state,
+                        position_offset=carry_offset or 0,
+                        query_positions=exact_query_positions,
+                        kv_preprocessed=exact_kv_preprocessed,
+                    )
             kv_vanilla = None
         else:
             kv_vanilla = self.kv_norm(kv_pre_norm)  # [B, S, D]
@@ -556,28 +638,28 @@ class DeepSeekV4Attention(nn.Module):
                 kv_vanilla[..., : self.nope_head_dim] = fp8_simulate_qat(kv_vanilla[..., : self.nope_head_dim], 64)
             self._capture_diagnostic_component("k_post_qk_norm", kv_vanilla)
 
-        # ---------------- topk indices: window + (optional) compress ----------------
-        topk_idxs = get_window_topk_idxs_cp(q_positions, window_size=win, cp_size=self.cp_size, bsz=bsz)
-
-        kv_compress_offset = seqlen_global  # compressed positions live after the global vanilla positions
-        if ratio and not self._exact_attention:
-            if self.indexer is not None:
-                # Indexer expects SBHD; rearrange at the boundary.
-                x_sbd = einops.rearrange(x, "b s d -> s b d")
-                qr_sbd = einops.rearrange(qr, "b s d -> s b d")
-                compress_topk_idxs = self.indexer(x_sbd, qr_sbd)  # [B, S, index_topk]
-                q_first_invalid_group = (q_positions + 1).unsqueeze(1) // ratio
-                topk_idx_mask = (compress_topk_idxs >= q_first_invalid_group) | (compress_topk_idxs < 0)
-                compress_topk_idxs = torch.where(topk_idx_mask, -1, compress_topk_idxs + kv_compress_offset)
-            else:
-                compress_topk_idxs = get_compress_topk_idxs_cp(q_positions, ratio=ratio, cp_size=self.cp_size, bsz=bsz)
-            topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
-        topk_idxs = topk_idxs.int()
-        # NOTE: GLM-5 sorts topk_idxs here for L2 locality (~11% bwd speedup
-        # in their kernel structure). On DSv4 the effect is within noise
-        # (±1.5%) — different head count / block layout — so we don't.
-
         if not self._exact_attention:
+            # ---------------- topk indices: window + (optional) compress ----------------
+            topk_idxs = get_window_topk_idxs_cp(q_positions, window_size=win, cp_size=self.cp_size, bsz=bsz)
+            kv_compress_offset = seqlen_global
+            if ratio:
+                if self.indexer is not None:
+                    # Indexer expects SBHD; rearrange at the boundary.
+                    x_sbd = einops.rearrange(x, "b s d -> s b d")
+                    qr_sbd = einops.rearrange(qr, "b s d -> s b d")
+                    compress_topk_idxs = self.indexer(x_sbd, qr_sbd)  # [B, S, index_topk]
+                    q_first_invalid_group = (q_positions + 1).unsqueeze(1) // ratio
+                    topk_idx_mask = (compress_topk_idxs >= q_first_invalid_group) | (compress_topk_idxs < 0)
+                    compress_topk_idxs = torch.where(topk_idx_mask, -1, compress_topk_idxs + kv_compress_offset)
+                else:
+                    compress_topk_idxs = get_compress_topk_idxs_cp(
+                        q_positions,
+                        ratio=ratio,
+                        cp_size=self.cp_size,
+                        bsz=bsz,
+                    )
+                topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
+            topk_idxs = topk_idxs.int()
             # ---------------- compressed KV ----------------
             kv_compress = None
             if ratio:
@@ -1247,6 +1329,8 @@ class DeepseekV4DecoderLayer(nn.Module):
         input_ids: torch.Tensor | None = None,
         output_router_logits: bool = False,
         live_token_count: int | None = None,
+        exact_cp_layout: Dsv4ExactCPLayout | None = None,
+        decode_carry_offset: int | None = None,
     ) -> torch.Tensor:
         """Run the layer.
 
@@ -1273,7 +1357,11 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             h3d = self.input_layernorm(h3d)
         self._capture_diagnostic_component("input_norm", h3d)
-        attn_out = self.self_attn(h3d)
+        attn_out = self.self_attn(
+            h3d,
+            exact_cp_layout=exact_cp_layout,
+            decode_carry_offset=decode_carry_offset,
+        )
         post_fn = self.hc_util.layer_post_exact if self._exact_mhc else self.hc_util.layer_post
         hidden_states_4d = post_fn(attn_out, hidden_states_4d, post, comb)
 
@@ -1637,9 +1725,12 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
         Returns:
             ``[batch, seqlen, hidden_size]``.
         """
-        pipeline_stage = bool(kwargs.pop("_dsv4_pipeline_stage", False))
-        pipeline_is_first = bool(kwargs.pop("_dsv4_pipeline_is_first", True))
-        pipeline_is_last = bool(kwargs.pop("_dsv4_pipeline_is_last", True))
+        pp_stage_is_first = kwargs.pop("_pp_stage_is_first", None)
+        pp_stage_is_last = kwargs.pop("_pp_stage_is_last", None)
+        if (pp_stage_is_first is None) != (pp_stage_is_last is None):
+            raise ValueError("DeepSeek-V4 pipeline stage flags must be supplied together")
+        is_pipeline_stage = pp_stage_is_first is not None
+        incoming_hyperconnection_state = bool(is_pipeline_stage and not pp_stage_is_first)
         decode_cache_carry = False
         carry_position_offset = 0
         if getattr(self.config, "_dsv4_flash_exact_mode", False):
@@ -1655,131 +1746,116 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
         if inputs_embeds is None:
             if input_ids is None:
                 raise ValueError("DeepseekV4Model.forward requires input_ids or inputs_embeds")
-            h3d = self.embed_tokens(input_ids)  # [B, S, H]
+            hidden_states = self.embed_tokens(input_ids)  # [B, S, H]
         else:
-            h3d = inputs_embeds
+            hidden_states = inputs_embeds
             if input_ids is None and int(getattr(self.config, "num_hash_layers", 0)) > 0:
                 raise ValueError("input_ids are required when DeepSeek-V4 hash-routed layers are enabled")
-        if pipeline_stage and not pipeline_is_first:
-            if h3d.ndim != 4 or tuple(h3d.shape[-2:]) != (self.hc_mult, self.hidden_size):
+        if incoming_hyperconnection_state:
+            if hidden_states.ndim != 4 or hidden_states.shape[2] != self.hc_mult:
                 raise ValueError(
-                    "DeepSeek-V4 PP stages receive the completed hyperconnection state "
-                    f"[batch, sequence, {self.hc_mult}, {self.hidden_size}], got {tuple(h3d.shape)}"
+                    "A non-first DeepSeek-V4 pipeline stage requires the live 4-D hyperconnection state; "
+                    f"got shape {tuple(hidden_states.shape)}"
                 )
+        elif hidden_states.ndim != 3:
+            raise ValueError(f"DeepSeek-V4 input stage requires a 3-D hidden state; got {tuple(hidden_states.shape)}")
 
         live_token_count = None
-        packed_sequence_length = int(h3d.shape[1])
-        exact_compute_token_count = packed_sequence_length
+        exact_cp_layout = None
+        packed_sequence_length = int(hidden_states.shape[1])
         if getattr(self.config, "_dsv4_flash_exact_mode", False):
             parallel_state = get_parallel_state()
-            ring_cp_logical_row_indices = kwargs.pop("_ring_cp_logical_row_indices", None)
+            cp_logical_rows = kwargs.pop("_cp_logical_row_indices", None)
+            cp_request_ids = kwargs.pop("_cp_request_ids", None)
+            cp_request_positions = kwargs.pop("_cp_request_positions", None)
+            cp_live_mask = kwargs.pop("_cp_live_mask", None)
             sample_lengths = kwargs.pop("_r3_sample_lengths", None)
             num_samples = kwargs.pop("num_samples", None)
-            packed_rows = int(h3d.shape[0] * h3d.shape[1])
-            if num_samples is not None and int(num_samples) == 0:
-                live_token_count = 0
-            elif sample_lengths is not None:
-                if isinstance(sample_lengths, torch.Tensor):
-                    sample_lengths = sample_lengths.detach().cpu().reshape(-1).tolist()
-                live_token_count = sum(int(length) for length in sample_lengths)
-            else:
-                live_token_count = packed_rows
-            if not 0 <= live_token_count <= packed_rows:
-                raise ValueError(
-                    f"Exact DSV4 live token metadata resolves to {live_token_count} rows for packed shape {tuple(h3d.shape[:2])}"
-                )
-            # The admitted exact lane is one request per DP rank. Dispatcher
-            # packing right-pads that request to its row block (128 in the
-            # qualification run), but serving executes only the real prefill
-            # or decode rows. DeepGEMM accumulation depends on that row
-            # geometry, so carrying padding through attention changes bytes.
-            #
-            # DP-attention/EP8 replicates the owning rank's input on all EP
-            # ranks while only that rank reports live ownership. Negotiate the
-            # largest local count so every rank enters FSDP and projection
-            # kernels with the same compute shape, but continue passing the
-            # rank-local count to the variable-row MoE exchange.
-            if h3d.shape[0] != 1:
-                raise RuntimeError(
-                    f"Exact DSV4 packed-row compaction admits one request per rank; got batch={h3d.shape[0]}"
-                )
-            compute_rows = torch.tensor([live_token_count], dtype=torch.int64, device=h3d.device)
-            if dist.is_available() and dist.is_initialized():
-                if parallel_state.ep_group is None:
-                    raise RuntimeError("Exact DSV4 row compaction requires a stage-local EP8 group")
-                dist.all_reduce(
-                    compute_rows,
-                    op=dist.ReduceOp.MAX,
-                    group=parallel_state.ep_group,
-                )
-            exact_compute_token_count = int(compute_rows.item())
-            if not 0 <= exact_compute_token_count <= packed_sequence_length:
-                raise RuntimeError(
-                    "Exact DSV4 EP-wide compute rows are outside the packed sequence: "
-                    f"compute_rows={exact_compute_token_count}, packed_sequence_length={packed_sequence_length}"
-                )
-            h3d = h3d[:, :exact_compute_token_count]
-            if input_ids is not None:
-                input_ids = input_ids[:, :exact_compute_token_count]
-            zigzag_layout_names = (
-                "_dsv4_zigzag_rope_positions",
-                "_dsv4_zigzag_query_positions",
-                "_dsv4_zigzag_restore_order",
-            )
-            for layer in self.layers:
-                for name in zigzag_layout_names:
-                    layer.self_attn.__dict__.pop(name, None)
-            if int(getattr(parallel_state, "ringattn_size", 1)) > 1:
-                if position_ids is None:
-                    raise ValueError("DSV4 exact ring CP requires the collator's full position IDs")
-                if ring_cp_logical_row_indices is None:
-                    raise ValueError("DSV4 exact ring CP requires the collator's logical row indices")
-                cp_size = int(parallel_state.cp_size)
-                cp_rank = int(parallel_state.cp_rank)
-                full_position_ids = position_ids.reshape(-1)
-                full_logical_row_indices = ring_cp_logical_row_indices.reshape(-1)
-                expected_full_length = packed_sequence_length * cp_size
-                if (
-                    full_position_ids.numel() != expected_full_length
-                    or full_logical_row_indices.numel() != expected_full_length
-                ):
-                    raise RuntimeError(
-                        "DSV4 exact ring CP side channels do not match the packed CP layout: "
-                        f"positions={full_position_ids.numel()}, logical_rows={full_logical_row_indices.numel()}, "
-                        f"expected={expected_full_length}"
+            if isinstance(sample_lengths, torch.Tensor):
+                sample_lengths = sample_lengths.detach().cpu().reshape(-1).tolist()
+            if not decode_cache_carry:
+                if hidden_states.shape[0] != 1:
+                    raise RuntimeError(f"Exact DSV4 row layout requires batch=1; got batch={hidden_states.shape[0]}")
+                side_channels = (cp_logical_rows, cp_request_ids, cp_request_positions, cp_live_mask)
+                if any(value is None for value in side_channels):
+                    if int(parallel_state.cp_size) > 1:
+                        raise ValueError("Exact DSV4 CP requires collator row/request/live side channels")
+                    cp_logical_rows = torch.arange(packed_sequence_length, device=hidden_states.device).view(1, -1)
+                    cp_request_ids = torch.full_like(cp_logical_rows, -1)
+                    cp_request_positions = torch.zeros_like(cp_logical_rows)
+                    cp_live_mask = torch.zeros_like(cp_logical_rows, dtype=torch.bool)
+                    if num_samples is not None and int(num_samples) == 0:
+                        fallback_lengths = []
+                    elif sample_lengths is not None:
+                        fallback_lengths = [int(length) for length in sample_lengths]
+                    else:
+                        fallback_lengths = [packed_sequence_length]
+                    cursor = 0
+                    for request_id, length in enumerate(fallback_lengths):
+                        if length < 0 or cursor + length > packed_sequence_length:
+                            raise ValueError(
+                                f"Exact DSV4 request lengths {fallback_lengths} do not fit {packed_sequence_length} rows"
+                            )
+                        cp_request_ids[:, cursor : cursor + length] = request_id
+                        cp_request_positions[:, cursor : cursor + length] = torch.arange(
+                            length,
+                            device=hidden_states.device,
+                        )
+                        cp_live_mask[:, cursor : cursor + length] = True
+                        cursor += length
+                cp_logical_rows = cp_logical_rows.to(device=hidden_states.device)
+                cp_request_ids = cp_request_ids.to(device=hidden_states.device)
+                cp_request_positions = cp_request_positions.to(device=hidden_states.device)
+                cp_live_mask = cp_live_mask.to(device=hidden_states.device)
+                packed_sequence_length = int(cp_logical_rows.numel())
+                local_live_count = int(cp_live_mask.count_nonzero().item())
+                compute_rows_tensor = torch.tensor([local_live_count], dtype=torch.int64, device=hidden_states.device)
+                if dist.is_available() and dist.is_initialized():
+                    # FSDP collectives require equal activation shapes; EP's
+                    # canonical fold and CP's padded gather require the same.
+                    # Equalize across every applicable owner plane rather than
+                    # assuming one topology subsumes the others.
+                    fsdp_group = (
+                        parallel_state.fsdp_group if bool(getattr(parallel_state, "fsdp_enabled", False)) else None
                     )
-                local_start = cp_rank * packed_sequence_length
-                local_rope_positions = full_position_ids.narrow(
-                    0,
-                    local_start,
-                    exact_compute_token_count,
-                ).to(device=h3d.device, dtype=torch.int64)
-                local_logical_row_indices = full_logical_row_indices.narrow(
-                    0,
-                    local_start,
-                    exact_compute_token_count,
-                ).to(device=h3d.device, dtype=torch.int64)
-                query_positions, restore_order = get_zigzag_cp_layout(
-                    local_logical_row_indices,
-                    cp_group=parallel_state.sp_group,
+                    ep_group = parallel_state.ep_group if bool(getattr(parallel_state, "ep_enabled", False)) else None
+                    sp_group = parallel_state.sp_group if int(parallel_state.cp_size) > 1 else None
+                    compute_groups = (fsdp_group, ep_group, sp_group)
+                    reduced_groups = set()
+                    for compute_group in compute_groups:
+                        if compute_group is None or id(compute_group) in reduced_groups:
+                            continue
+                        dist.all_reduce(compute_rows_tensor, op=dist.ReduceOp.MAX, group=compute_group)
+                        reduced_groups.add(id(compute_group))
+                compute_rows = max(1, int(compute_rows_tensor.item()))
+                exact_cp_layout = build_dsv4_exact_cp_layout(
+                    cp_logical_rows,
+                    cp_request_ids,
+                    cp_request_positions,
+                    cp_live_mask,
+                    compute_rows=compute_rows,
+                    cp_group=(parallel_state.sp_group if int(parallel_state.cp_size) > 1 else None),
                 )
-                for layer in self.layers:
-                    attention = layer.self_attn
-                    attention._dsv4_zigzag_rope_positions = local_rope_positions
-                    attention._dsv4_zigzag_query_positions = query_positions
-                    attention._dsv4_zigzag_restore_order = restore_order
-            # Stamp (or clear) the per-layer decode-carry offset before the
-            # layer loop so every attention module replays this segment against
-            # its carried serving state. Clearing on non-carry forwards keeps a
-            # stale offset from leaking out of an aborted diagnostic run.
-            for layer in self.layers:
-                if layer is None:
-                    continue
-                attention = layer.self_attn
-                if decode_cache_carry:
-                    attention._dsv4_decode_carry_offset = carry_position_offset
-                elif "_dsv4_decode_carry_offset" in attention.__dict__:
-                    del attention.__dict__["_dsv4_decode_carry_offset"]
+                live_token_count = exact_cp_layout.local_live_count
+                if incoming_hyperconnection_state:
+                    if hidden_states.shape[1] != compute_rows:
+                        raise ValueError(
+                            "DeepSeek-V4 pipeline wire rows do not match the immutable exact layout: "
+                            f"wire={hidden_states.shape[1]}, layout={compute_rows}"
+                        )
+                else:
+                    compact_h = hidden_states.index_select(1, exact_cp_layout.local_storage_indices)
+                    hidden_states = F.pad(compact_h, (0, 0, 0, compute_rows - live_token_count))
+                if input_ids is not None:
+                    if input_ids.shape[1] != packed_sequence_length:
+                        raise ValueError(
+                            "DeepSeek-V4 original input IDs do not match storage-order CP metadata: "
+                            f"ids={input_ids.shape[1]}, metadata={packed_sequence_length}"
+                        )
+                    compact_ids = input_ids.index_select(1, exact_cp_layout.local_storage_indices)
+                    input_ids = F.pad(compact_ids, (0, compute_rows - live_token_count), value=0)
+            else:
+                live_token_count = packed_sequence_length
         del position_ids
         del kwargs
 
@@ -1787,7 +1863,9 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
             self.config.output_router_logits if output_router_logits is None else output_router_logits
         )
         all_router_logits = [] if output_router_logits else None
-        h4d = h3d if pipeline_stage and not pipeline_is_first else self.hc_util.block_expand(h3d)
+        h4d = (
+            hidden_states if incoming_hyperconnection_state else self.hc_util.block_expand(hidden_states)
+        )  # [B, S, hc_mult, H]
 
         use_outer_checkpoint = (
             self.gradient_checkpointing
@@ -1804,6 +1882,8 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
                     input_ids=input_ids,
                     output_router_logits=output_router_logits,
                     live_token_count=live_token_count,
+                    exact_cp_layout=exact_cp_layout,
+                    decode_carry_offset=(carry_position_offset if decode_cache_carry else None),
                 )
             else:
                 layer_outputs = layer(
@@ -1811,6 +1891,8 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
                     input_ids=input_ids,
                     output_router_logits=output_router_logits,
                     live_token_count=live_token_count,
+                    exact_cp_layout=exact_cp_layout,
+                    decode_carry_offset=(carry_position_offset if decode_cache_carry else None),
                 )
 
             if os.environ.get("XORL_DSV4_DIAGNOSTIC_BASE_MARLIN") == "1":
@@ -1823,16 +1905,21 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
 
             if output_router_logits:
                 h4d, router_logits = layer_outputs
+                if exact_cp_layout is not None:
+                    live_router_logits = router_logits[: exact_cp_layout.local_live_count]
+                    storage_router_logits = router_logits.new_zeros((packed_sequence_length, *router_logits.shape[1:]))
+                    router_logits = storage_router_logits.index_copy(
+                        0,
+                        exact_cp_layout.local_storage_indices,
+                        live_router_logits,
+                    )
                 all_router_logits.append(router_logits)
             else:
                 h4d = layer_outputs
 
-        if pipeline_stage and not pipeline_is_last:
-            if exact_compute_token_count < packed_sequence_length:
-                h4d = F.pad(
-                    h4d,
-                    (0, 0, 0, 0, 0, packed_sequence_length - exact_compute_token_count),
-                )
+        if is_pipeline_stage and not pp_stage_is_last:
+            # Preserve the live multi-stream residual state across the PP wire.
+            # Collapsing/re-expanding here would be a different model program.
             return MoeModelOutput(
                 last_hidden_state=h4d,
                 router_logits=tuple(all_router_logits) if all_router_logits is not None else None,
@@ -1842,8 +1929,10 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
         self._capture_diagnostic_component("hc_head_output", h3d)
         h3d = self.norm(h3d)
         self._capture_diagnostic_component("final_norm", h3d)
-        if exact_compute_token_count < packed_sequence_length:
-            h3d = F.pad(h3d, (0, 0, 0, packed_sequence_length - exact_compute_token_count))
+        if exact_cp_layout is not None:
+            live_h3d = h3d[:, : exact_cp_layout.local_live_count]
+            storage_h3d = h3d.new_zeros((h3d.shape[0], packed_sequence_length, h3d.shape[-1]))
+            h3d = storage_h3d.index_copy(1, exact_cp_layout.local_storage_indices, live_h3d)
         return MoeModelOutput(
             last_hidden_state=h3d,
             router_logits=tuple(all_router_logits) if all_router_logits is not None else None,
@@ -1854,7 +1943,11 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel):
     """Causal-LM head wrapping :class:`DeepseekV4Model`."""
 
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
+    # Keep the generic alias while the exact DSV4 PP path uses the explicit
+    # original-ID contract below.
     _pp_requires_input_ids_on_all_stages = True
+    _pp_carries_hyperconnection_state = True
+    _pp_requires_original_input_ids = True
 
     def __init__(
         self,
@@ -1911,6 +2004,14 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel):
             },
         }
 
+    def _configure_pp_stage(self, *, stage_idx: int, num_stages: int) -> None:
+        """Give model-level HyperConnection head parameters one PP owner."""
+
+        if stage_idx == num_stages - 1:
+            return
+        for name in ("hc_head_fn", "hc_head_base", "hc_head_scale"):
+            self.model.register_parameter(name, None)
+
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -1921,10 +2022,6 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel):
     ) -> MoeCausalLMOutput:
         """Return hidden states for xorl's external CE/loss path."""
         output_router_logits = kwargs.pop("output_router_logits", self.config.output_router_logits)
-        if hasattr(self, "_pp_is_first"):
-            kwargs["_dsv4_pipeline_stage"] = True
-            kwargs["_dsv4_pipeline_is_first"] = bool(self._pp_is_first)
-            kwargs["_dsv4_pipeline_is_last"] = bool(self._pp_is_last)
         outputs = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,

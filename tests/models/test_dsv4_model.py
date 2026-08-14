@@ -89,12 +89,14 @@ def _lm_logits(model, input_ids):
 
 
 def test_for_causal_lm_declares_structural_hyperconnection_pipeline_boundary():
+    """DSv4's dedicated PP forward carries its 4-D HyperConnection state."""
     from xorl.models.transformers.deepseek_v4 import DeepseekV4ForCausalLM  # noqa: PLC0415
 
     cfg = _tiny_config(num_hidden_layers=1, compress_ratios=[0])
     model = DeepseekV4ForCausalLM(cfg, moe_implementation="eager")
 
     pp_config = model.get_pp_module_config()
+    assert model.config.base_model_pp_plan is None
     assert pp_config["layer_prefix"] == "model.layers"
     assert pp_config["pipeline_boundary_state"] == {
         "rank": 4,
@@ -102,6 +104,8 @@ def test_for_causal_lm_declares_structural_hyperconnection_pipeline_boundary():
         "shape_suffix": (cfg.hc_mult, cfg.hidden_size),
         "state": "completed_hyperconnection_residual",
     }
+    assert model._pp_carries_hyperconnection_state is True
+    assert model._pp_requires_original_input_ids is True
 
 
 @pytest.mark.parametrize(
@@ -186,10 +190,19 @@ def test_pipeline_cut_preserves_dsv4_hyperconnection_forward_and_backward(cut):
     baseline_logits = baseline.lm_head(baseline_hidden)
     baseline_logits.square().sum().backward()
 
-    wire = stage0(input_ids=input_ids).last_hidden_state
+    wire = stage0(
+        input_ids=input_ids,
+        _pp_stage_is_first=True,
+        _pp_stage_is_last=False,
+    ).last_hidden_state
     assert wire.shape == (1, 4, cfg.hc_mult, cfg.hidden_size)
     wire_leaf = wire.detach().requires_grad_(True)
-    staged_hidden = stage1(input_ids=input_ids, inputs_embeds=wire_leaf).last_hidden_state
+    staged_hidden = stage1(
+        input_ids=input_ids,
+        inputs_embeds=wire_leaf,
+        _pp_stage_is_first=False,
+        _pp_stage_is_last=True,
+    ).last_hidden_state
     assert staged_hidden.shape == (1, 4, cfg.hidden_size)
     staged_logits = stage1.lm_head(staged_hidden)
     staged_logits.square().sum().backward()

@@ -1,7 +1,6 @@
-"""
-Utility functions for DeepSeek V4 Context Parallelism support.
-"""
+"""Utility functions for DeepSeek V4 context-parallel support."""
 
+from dataclasses import dataclass
 from functools import lru_cache
 
 import torch
@@ -107,54 +106,144 @@ def all_gather_cp(tensor: Tensor, dim: int, cp_group: torch.distributed.ProcessG
     return _AllGatherCP.apply(tensor, dim, cp_group)
 
 
-def get_zigzag_cp_layout(
-    local_logical_row_indices: Tensor,
-    *,
-    cp_group: torch.distributed.ProcessGroup,
-) -> tuple[Tensor, Tensor]:
-    """Recover logical query and gathered-row order from a zigzag CP shard.
+@dataclass(frozen=True)
+class Dsv4ExactCPLayout:
+    """Immutable per-microbatch row plan for exact DSV4 attention.
 
-    ``TextSequenceShardCollator`` stores ring-attention rows in CP-group-rank
-    order, while DSV4's exact attention consumes one ordinary logical token
-    packed stream. The collator emits unique logical row indices alongside its
-    ordinary, per-document position IDs. Gather that tiny integer side channel
-    once, derive the inverse storage permutation, and reuse it for every
-    attention layer.
-
-    Returns:
-        ``(query_positions, gathered_restore_order)`` where query positions
-        index the restored logical KV sequence and ``gathered_restore_order``
-        reranges a rank-order CP gather along its sequence dimension.
+    Local tensors are in compact local-query order and padded to
+    ``compute_rows`` where noted. ``gather_order`` selects live rows from a
+    rank-major gather of those padded tensors and restores original packed-row
+    order. Per-request index tuples keep attention and compression isolated.
     """
 
-    local_logical_row_indices = local_logical_row_indices.reshape(-1).to(dtype=torch.int64).contiguous()
-    world_size = cp_group.size()
-    gathered = [torch.empty_like(local_logical_row_indices) for _ in range(world_size)]
-    torch.distributed.all_gather(gathered, local_logical_row_indices, group=cp_group)
-    storage_row_indices = torch.cat(gathered)
-    restore_order = torch.argsort(storage_row_indices, stable=True)
-    logical_row_indices = storage_row_indices.index_select(0, restore_order)
-    expected_row_indices = torch.arange(
-        logical_row_indices.numel(),
-        dtype=logical_row_indices.dtype,
-        device=logical_row_indices.device,
-    )
-    if not torch.equal(logical_row_indices, expected_row_indices):
-        row_min = int(logical_row_indices.min().item()) if logical_row_indices.numel() else None
-        row_max = int(logical_row_indices.max().item()) if logical_row_indices.numel() else None
-        unique_rows = int(torch.unique(logical_row_indices).numel())
-        raise RuntimeError(
-            "DSV4 exact ring CP requires the gathered live rows to cover the "
-            "packed logical stream exactly once; "
-            f"rows={logical_row_indices.numel()}, unique={unique_rows}, range=[{row_min}, {row_max}]"
-        )
+    local_storage_indices: Tensor
+    local_logical_rows: Tensor
+    local_request_ids: Tensor
+    local_request_positions: Tensor
+    local_live_count: int
+    compute_rows: int
+    gather_order: Tensor
+    global_logical_rows: Tensor
+    global_request_ids: Tensor
+    global_request_positions: Tensor
+    request_ids: tuple[int, ...]
+    local_request_row_indices: tuple[Tensor, ...]
+    global_request_row_indices: tuple[Tensor, ...]
 
-    storage_to_logical = torch.empty_like(restore_order)
-    storage_to_logical.scatter_(0, restore_order, expected_row_indices)
-    local_length = local_logical_row_indices.numel()
-    start = cp_group.rank() * local_length
-    query_positions = storage_to_logical.narrow(0, start, local_length)
-    return query_positions, restore_order
+
+def _all_gather_metadata(tensor: Tensor, group: torch.distributed.ProcessGroup | None) -> list[Tensor]:
+    if group is None:
+        return [tensor]
+    gathered = [torch.empty_like(tensor) for _ in range(group.size())]
+    torch.distributed.all_gather(gathered, tensor.contiguous(), group=group)
+    return gathered
+
+
+def build_dsv4_exact_cp_layout(
+    local_logical_rows: Tensor,
+    local_request_ids: Tensor,
+    local_request_positions: Tensor,
+    local_live_mask: Tensor,
+    *,
+    compute_rows: int,
+    cp_group: torch.distributed.ProcessGroup | None,
+) -> Dsv4ExactCPLayout:
+    """Build the variable-row CP plan once at the model boundary."""
+
+    logical = local_logical_rows.reshape(-1).to(dtype=torch.int64)
+    request_ids = local_request_ids.reshape(-1).to(device=logical.device, dtype=torch.int64)
+    request_positions = local_request_positions.reshape(-1).to(device=logical.device, dtype=torch.int64)
+    live_mask = local_live_mask.reshape(-1).to(device=logical.device, dtype=torch.bool)
+    if not (logical.numel() == request_ids.numel() == request_positions.numel() == live_mask.numel()):
+        raise ValueError("DSV4 exact CP row metadata must have identical local storage lengths")
+
+    storage_indices = live_mask.nonzero(as_tuple=False).reshape(-1)
+    live_count = int(storage_indices.numel())
+    if compute_rows < live_count:
+        raise ValueError(f"DSV4 exact CP compute rows {compute_rows} are shorter than {live_count} local live rows")
+    compact_logical = logical.index_select(0, storage_indices)
+    compact_request_ids = request_ids.index_select(0, storage_indices)
+    compact_request_positions = request_positions.index_select(0, storage_indices)
+
+    def _pad(values: Tensor, value: int) -> Tensor:
+        if values.numel() == compute_rows:
+            return values.contiguous()
+        return F.pad(values, (0, compute_rows - values.numel()), value=value).contiguous()
+
+    padded_logical = _pad(compact_logical, -1)
+    padded_request_ids = _pad(compact_request_ids, -1)
+    padded_request_positions = _pad(compact_request_positions, 0)
+    count_tensor = torch.tensor([live_count], dtype=torch.int64, device=logical.device)
+    counts = torch.cat(_all_gather_metadata(count_tensor, cp_group))
+    gathered_logical = torch.cat(_all_gather_metadata(padded_logical, cp_group))
+    gathered_request_ids = torch.cat(_all_gather_metadata(padded_request_ids, cp_group))
+    gathered_request_positions = torch.cat(_all_gather_metadata(padded_request_positions, cp_group))
+
+    valid_rank_major = torch.cat(
+        [
+            torch.arange(rank * compute_rows, rank * compute_rows + int(count.item()), device=logical.device)
+            for rank, count in enumerate(counts)
+        ]
+    )
+    live_logical_rank_major = gathered_logical.index_select(0, valid_rank_major)
+    logical_sort = torch.argsort(live_logical_rank_major, stable=True)
+    gather_order = valid_rank_major.index_select(0, logical_sort)
+    global_logical = gathered_logical.index_select(0, gather_order)
+    expected_logical = torch.arange(global_logical.numel(), dtype=torch.int64, device=logical.device)
+    if not torch.equal(global_logical, expected_logical):
+        raise RuntimeError(
+            "DSV4 exact CP live rows do not cover the packed logical stream exactly once: "
+            f"rows={global_logical.numel()}, unique={torch.unique(global_logical).numel()}"
+        )
+    global_request_ids = gathered_request_ids.index_select(0, gather_order)
+    global_request_positions = gathered_request_positions.index_select(0, gather_order)
+    unique_request_ids = tuple(int(value) for value in torch.unique(global_request_ids, sorted=True).tolist())
+    if any(request_id < 0 for request_id in unique_request_ids):
+        raise RuntimeError("DSV4 exact CP marked a padding row as live")
+
+    local_request_rows = []
+    global_request_rows = []
+    for request_id in unique_request_ids:
+        local_rows = (padded_request_ids == request_id).nonzero(as_tuple=False).reshape(-1)
+        global_rows = (global_request_ids == request_id).nonzero(as_tuple=False).reshape(-1)
+        positions = global_request_positions.index_select(0, global_rows)
+        expected_positions = torch.arange(positions.numel(), dtype=torch.int64, device=positions.device)
+        if not torch.equal(positions, expected_positions):
+            raise RuntimeError(
+                f"DSV4 exact CP request {request_id} positions are not a complete serving stream: "
+                f"rows={positions.numel()}"
+            )
+        local_request_rows.append(local_rows)
+        global_request_rows.append(global_rows)
+
+    return Dsv4ExactCPLayout(
+        local_storage_indices=storage_indices,
+        local_logical_rows=padded_logical,
+        local_request_ids=padded_request_ids,
+        local_request_positions=padded_request_positions,
+        local_live_count=live_count,
+        compute_rows=compute_rows,
+        gather_order=gather_order,
+        global_logical_rows=global_logical,
+        global_request_ids=global_request_ids,
+        global_request_positions=global_request_positions,
+        request_ids=unique_request_ids,
+        local_request_row_indices=tuple(local_request_rows),
+        global_request_row_indices=tuple(global_request_rows),
+    )
+
+
+def gather_dsv4_exact_cp_rows(
+    tensor: Tensor,
+    *,
+    dim: int,
+    layout: Dsv4ExactCPLayout,
+    cp_group: torch.distributed.ProcessGroup | None,
+) -> Tensor:
+    """Differentiably gather padded CP rows and compact them in logical order."""
+
+    gathered = tensor if cp_group is None else all_gather_cp(tensor, dim=dim, cp_group=cp_group)
+    return gathered.index_select(dim, layout.gather_order)
 
 
 def get_q_positions_for_cp(

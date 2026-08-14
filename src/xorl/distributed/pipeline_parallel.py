@@ -384,18 +384,29 @@ def _pp_forward(self, x):
     # --- Pop per-microbatch metadata (set by training loop) ---
     # Skip during shape inference to avoid consuming queue entries that are
     # needed for the actual scheduled forward passes.
+    carries_hyperconnection_state = getattr(self, "_pp_carries_hyperconnection_state", False)
     position_ids = None
-    pipeline_input_ids = None
+    original_input_ids = None
     extra_kwargs = {}
+    metadata_queue = getattr(self, "_pp_batch_metadata", None)
+    if metadata_queue and (in_scheduled_forward or carries_hyperconnection_state):
+        # DSV4's PP shape is its compact live-row 4-D state, so shape
+        # inference needs the first microbatch's immutable row plan. Peek
+        # without consuming; the scheduled forward still pops the same entry.
+        metadata = metadata_queue.popleft() if in_scheduled_forward else dict(metadata_queue[0])
+        position_ids = metadata.pop("position_ids", None)
+        original_input_ids = metadata.pop("_pp_original_input_ids", None)
+        if original_input_ids is None:
+            # Compatibility with batches queued by the generic exact-PP path.
+            original_input_ids = metadata.pop("_pp_input_ids", None)
+        else:
+            metadata.pop("_pp_input_ids", None)
+        if position_ids is not None:
+            position_ids = position_ids.to(x.device)
+        if original_input_ids is not None:
+            original_input_ids = original_input_ids.to(x.device)
+        extra_kwargs = {k: v.to(x.device) if isinstance(v, torch.Tensor) else v for k, v in metadata.items()}
     if in_scheduled_forward:
-        metadata_queue = getattr(self, "_pp_batch_metadata", None)
-        if metadata_queue:
-            metadata = metadata_queue.popleft()
-            pipeline_input_ids = metadata.pop("_pp_input_ids", None)
-            position_ids = metadata.pop("position_ids", None)
-            if position_ids is not None:
-                position_ids = position_ids.to(x.device)
-            extra_kwargs = {k: v.to(x.device) if isinstance(v, torch.Tensor) else v for k, v in metadata.items()}
         if getattr(self, "_pp_exact_boundary_contract", False):
             # Exact lanes fail closed on INCOMPLETE metadata, not just absent
             # position_ids: a fabricated positional fallback changes bytes
@@ -434,6 +445,10 @@ def _pp_forward(self, x):
         full_seq_len = seq_len * ps.cp_size
         position_ids = torch.arange(full_seq_len, device=x.device).unsqueeze(0).expand(x.shape[0], -1)
 
+    if carries_hyperconnection_state:
+        extra_kwargs["_pp_stage_is_first"] = self._pp_is_first
+        extra_kwargs["_pp_stage_is_last"] = self._pp_is_last
+
     if self._pp_is_first:
         # x is input_ids
         outputs = self._pp_original_forward(
@@ -445,15 +460,20 @@ def _pp_forward(self, x):
         )
     else:
         # x is hidden_states from previous stage
-        if getattr(self, "_pp_requires_input_ids_on_all_stages", False):
-            if pipeline_input_ids is None:
-                if in_scheduled_forward:
-                    raise PPByteContractError(
-                        "PP stage requires original input_ids for layer-local routing, but the microbatch metadata omitted them"
-                    )
-                pipeline_input_ids = torch.zeros(x.shape[:2], dtype=torch.long, device=x.device)
-            extra_kwargs["input_ids"] = pipeline_input_ids.to(x.device)
+        requires_original_ids = bool(
+            getattr(self, "_pp_requires_original_input_ids", False)
+            or getattr(self, "_pp_requires_input_ids_on_all_stages", False)
+        )
+        if requires_original_ids and original_input_ids is None:
+            if in_scheduled_forward:
+                raise PPByteContractError(
+                    "PP stage requires original input_ids for layer-local routing, but the microbatch metadata omitted them"
+                )
+            # Shape inference has no real microbatch metadata. Token values do
+            # not affect its shape contract, so provide a shape-matched dummy.
+            original_input_ids = torch.zeros(x.shape[:2], dtype=torch.long, device=x.device)
         outputs = self._pp_original_forward(
+            input_ids=(original_input_ids if requires_original_ids else None),
             inputs_embeds=x,
             position_ids=position_ids,
             use_cache=False,
@@ -619,6 +639,9 @@ def pipeline_module_split(
 
         # Recursive pruning handles nested HF model structures
         _recursive_prune(model, "", fqns_to_keep)
+        configure_stage = getattr(model, "_configure_pp_stage", None)
+        if callable(configure_stage):
+            configure_stage(stage_idx=stage_idx, num_stages=num_stages)
 
         model._pp_is_first = stage_idx == 0
         model._pp_is_last = stage_idx == num_stages - 1

@@ -135,11 +135,49 @@ class TestCollatorCall:
         # Two 8-row documents, each split into four ring2 chunks. Rows are
         # grouped by ring rank, then sliced by the ring2 x Ulysses2 CP rank.
         expected_full_rows = torch.tensor([[0, 1, 6, 7, 8, 9, 14, 15, 2, 3, 4, 5, 10, 11, 12, 13]])
-        assert torch.equal(result["_ring_cp_logical_row_indices"], expected_full_rows)
         start = cp_rank * 4
         local_rows = expected_full_rows[:, start : start + 4]
+        assert torch.equal(result["_cp_logical_row_indices"], local_rows)
+        expected_request_ids = torch.where(local_rows < 8, 0, 1)
+        expected_request_positions = local_rows.remainder(8)
+        assert torch.equal(result["_cp_request_ids"], expected_request_ids)
+        assert torch.equal(result["_cp_request_positions"], expected_request_positions)
+        assert result["_cp_live_mask"].all()
         assert torch.equal(result["input_ids"], input_ids.gather(1, local_rows))
         assert torch.unique(result["position_ids"]).numel() == 8
+
+    @patch("xorl.data.collators.sequence_shard_collator.get_parallel_state")
+    def test_exact_cp8_one_request_100_rows_keeps_true_local_live_counts(self, mock_parallel_state):
+        """The non-divisible production seam must not relabel four tail pads as live rows."""
+
+        input_ids = torch.arange(100).view(1, -1)
+        local_results = []
+        for cp_rank in range(8):
+            mock_parallel_state.return_value = _make_mock_ps(cp_size=8, cp_rank=cp_rank)
+            result = TextSequenceShardCollator(pad_token_id=0)(
+                {
+                    "input_ids": input_ids.clone(),
+                    "attention_mask": torch.ones_like(input_ids),
+                    "labels": torch.full_like(input_ids, IGNORE_INDEX),
+                    "position_ids": torch.arange(100).view(1, -1),
+                    "_r3_sample_lengths": [100],
+                    "num_samples": 1,
+                }
+            )
+            assert result["input_ids"].shape == (1, 13)
+            local_results.append(result)
+
+        logical = torch.cat([result["_cp_logical_row_indices"][result["_cp_live_mask"]] for result in local_results])
+        positions = torch.cat([result["_cp_request_positions"][result["_cp_live_mask"]] for result in local_results])
+        request_ids = torch.cat([result["_cp_request_ids"][result["_cp_live_mask"]] for result in local_results])
+        assert torch.equal(logical, torch.arange(100))
+        assert torch.equal(positions, torch.arange(100))
+        assert torch.equal(request_ids, torch.zeros(100, dtype=torch.int64))
+        assert [int(result["_cp_live_mask"].sum()) for result in local_results] == [13] * 7 + [9]
+        assert torch.equal(
+            local_results[-1]["_cp_logical_row_indices"],
+            torch.tensor([[91, 92, 93, 94, 95, 96, 97, 98, 99, -1, -1, -1, -1]]),
+        )
 
     @patch("xorl.data.collators.sequence_shard_collator.get_parallel_state")
     def test_sp_splitting_padding_and_flash_attn_kwargs(self, mock_parallel_state):

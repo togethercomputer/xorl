@@ -304,7 +304,7 @@ def test_exact_cp_selects_the_serving_kv_boundary(monkeypatch, compress_ratio, c
             assert torch.equal(attention_source, expected_source)
 
 
-@pytest.mark.parametrize("compress_ratio", [0, 128])
+@pytest.mark.parametrize("compress_ratio", [0, 4, 128])
 def test_exact_ring_cp_restores_gathered_rows_and_uses_local_rope_positions(monkeypatch, compress_ratio):
     """The exact seam consumes zigzag Q locally and logical KV/compressor rows globally."""
 
@@ -313,6 +313,7 @@ def test_exact_ring_cp_restores_gathered_rows_and_uses_local_rope_positions(monk
         DeepSeekV4Attention,
     )
     from xorl.ops.dsv4 import exact_attention  # noqa: PLC0415
+    from xorl.ops.dsv4.cp_utils import Dsv4ExactCPLayout  # noqa: PLC0415
 
     class _FakeCPGroup:
         @staticmethod
@@ -336,9 +337,21 @@ def test_exact_ring_cp_restores_gathered_rows_and_uses_local_rope_positions(monk
     # ring2 storage for S=8 is rank0=[0,1,6,7], rank1=[2,3,4,5].
     local_positions = torch.tensor([2, 3, 4, 5])
     restore_order = torch.tensor([0, 1, 4, 5, 6, 7, 2, 3])
-    layer._dsv4_zigzag_rope_positions = local_positions
-    layer._dsv4_zigzag_query_positions = local_positions
-    layer._dsv4_zigzag_restore_order = restore_order
+    layout = Dsv4ExactCPLayout(
+        local_storage_indices=torch.arange(4),
+        local_logical_rows=local_positions,
+        local_request_ids=torch.zeros(4, dtype=torch.int64),
+        local_request_positions=local_positions,
+        local_live_count=4,
+        compute_rows=4,
+        gather_order=restore_order,
+        global_logical_rows=torch.arange(8),
+        global_request_ids=torch.zeros(8, dtype=torch.int64),
+        global_request_positions=torch.arange(8),
+        request_ids=(0,),
+        local_request_row_indices=(torch.arange(4),),
+        global_request_row_indices=(torch.arange(8),),
+    )
 
     observed = {"q_freqs": None, "kv_freqs": None, "inverse_freqs": None, "attention": None, "gathers": []}
     monkeypatch.setattr(
@@ -359,11 +372,11 @@ def test_exact_ring_cp_restores_gathered_rows_and_uses_local_rope_positions(monk
         observed["inverse_freqs"] = freqs.detach().clone()
         return value
 
-    def fake_gather(value, dim, cp_group):
+    def fake_gather(value, *, dim, layout, cp_group):
         assert cp_group is group
         gathered = torch.cat((value + 1000.0, value), dim=dim)
         observed["gathers"].append((gathered.detach().clone(), dim))
-        return gathered
+        return gathered.index_select(dim, layout.gather_order)
 
     def fake_c0(q, kv, *_args, **kwargs):
         observed["attention"] = (kv.detach().clone(), None, kwargs)
@@ -376,11 +389,11 @@ def test_exact_ring_cp_restores_gathered_rows_and_uses_local_rope_positions(monk
     monkeypatch.setattr(exact_attention, "exact_q_norm_rope", fake_q_norm_rope)
     monkeypatch.setattr(exact_attention, "exact_kv_norm_rope", fake_kv_norm_rope)
     monkeypatch.setattr(exact_attention, "exact_inverse_rope", fake_inverse_rope)
-    monkeypatch.setattr(modeling_deepseek_v4, "all_gather_cp", fake_gather)
+    monkeypatch.setattr(modeling_deepseek_v4, "gather_dsv4_exact_cp_rows", fake_gather)
     monkeypatch.setattr(exact_attention, "exact_c0_attention", fake_c0)
     monkeypatch.setattr(exact_attention, "exact_compressed_attention", fake_compressed)
 
-    output = layer(hidden)
+    output = layer(hidden, exact_cp_layout=layout)
 
     assert output.shape == hidden.shape
     expected_local_freqs = layer.freqs_cis.index_select(
@@ -398,3 +411,206 @@ def test_exact_ring_cp_restores_gathered_rows_and_uses_local_rope_positions(monk
     if compress_ratio:
         gathered_source = observed["gathers"][1][0]
         assert torch.equal(attention_source, gathered_source.index_select(1, restore_order))
+
+
+@pytest.mark.parametrize("compress_ratio", [0, 4, 128])
+def test_exact_packed_requests_reset_c0_c4_c128_state(monkeypatch, compress_ratio):
+    """Every packed request gets its own attention/cache/compressor program."""
+
+    from xorl.models.transformers.deepseek_v4 import modeling_deepseek_v4  # noqa: PLC0415
+    from xorl.models.transformers.deepseek_v4.modeling_deepseek_v4 import DeepSeekV4Attention  # noqa: PLC0415
+    from xorl.ops.dsv4 import exact_attention  # noqa: PLC0415
+    from xorl.ops.dsv4.cp_utils import build_dsv4_exact_cp_layout  # noqa: PLC0415
+
+    cfg = _tiny_config(compress_ratios=[compress_ratio])
+    cfg._dsv4_flash_exact_mode = True
+    layer = DeepSeekV4Attention(cfg, layer_id=0)
+    hidden = torch.arange(9 * cfg.hidden_size, dtype=torch.float32).view(1, 9, cfg.hidden_size)
+    layout = build_dsv4_exact_cp_layout(
+        torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7, -1]]),
+        torch.tensor([[0, 0, 0, 1, 1, 1, 1, 1, -1]]),
+        torch.tensor([[0, 1, 2, 0, 1, 2, 3, 4, 0]]),
+        torch.tensor([[True, True, True, True, True, True, True, True, False]]),
+        compute_rows=9,
+        cp_group=None,
+    )
+    calls = []
+    monkeypatch.setattr(
+        modeling_deepseek_v4._ExactBatchInvariantRmsNorm,
+        "apply",
+        lambda value, _weight, _eps: value,
+    )
+    monkeypatch.setattr(exact_attention, "exact_q_norm_rope", lambda value, *_args, **_kwargs: value)
+    monkeypatch.setattr(exact_attention, "exact_inverse_rope", lambda value, *_args, **_kwargs: value)
+
+    def fake_c0(q, kv, _weight, _sink, freqs, *_args, **kwargs):
+        calls.append((q, kv, None, freqs, kwargs))
+        return q
+
+    def fake_compressed(q, kv, source, _weight, _sink, freqs, *_args, **kwargs):
+        calls.append((q, kv, source, freqs, kwargs))
+        return q
+
+    monkeypatch.setattr(exact_attention, "exact_c0_attention", fake_c0)
+    monkeypatch.setattr(exact_attention, "exact_compressed_attention", fake_compressed)
+
+    output = layer(hidden, exact_cp_layout=layout)
+    assert output.shape == hidden.shape
+    assert len(calls) == 2
+    for call, expected_length in zip(calls, (3, 5)):
+        q, kv, source, freqs, kwargs = call
+        assert q.shape[1] == kv.shape[1] == expected_length
+        assert torch.equal(kwargs["query_positions"], torch.arange(expected_length))
+        assert kwargs["kv_preprocessed"] is False
+        assert torch.equal(freqs, layer.freqs_cis[:expected_length])
+        if compress_ratio:
+            assert source.shape[1] == expected_length
+        else:
+            assert source is None
+    assert not any(name.startswith("_dsv4_zigzag") for name in layer.__dict__)
+
+
+def test_dsv4_pipeline_carries_hyperconnection_state_first_middle_last(monkeypatch):
+    """A physical PP cut carries 4-D state and matches the uncut model."""
+
+    import copy
+    import types
+    from types import SimpleNamespace
+
+    from xorl.distributed import pipeline_parallel
+    from xorl.distributed.pipeline_parallel import _pp_forward, _recursive_prune
+    from xorl.models.transformers.deepseek_v4.modeling_deepseek_v4 import DeepseekV4ForCausalLM
+    from xorl.trainers.training_utils import _set_pp_batch_metadata
+
+    monkeypatch.setattr(pipeline_parallel, "get_parallel_state", lambda: SimpleNamespace(cp_size=1))
+    cfg = _tiny_config(compress_ratios=[0, 0, 0])
+    cfg.tie_word_embeddings = False
+    cfg._moe_implementation = "eager"
+    model = DeepseekV4ForCausalLM(cfg, moe_implementation="eager")
+    model.eval()
+    input_ids = torch.tensor([[3, 5, 7, 9, 11, 13, 15, 17]])
+    position_ids = torch.arange(8).view(1, -1)
+    with torch.no_grad():
+        expected = model.lm_head(model(input_ids=input_ids, position_ids=position_ids).last_hidden_state)
+
+    plan = [
+        ["model.embed_tokens", "model.layers.0"],
+        ["model.layers.1"],
+        ["model.layers.2", "model.norm", "lm_head"],
+    ]
+    parts = []
+    for stage_idx, module_names in enumerate(plan):
+        part = copy.deepcopy(model)
+        _recursive_prune(part, "", set(module_names))
+        part._configure_pp_stage(stage_idx=stage_idx, num_stages=3)
+        part._pp_is_first = stage_idx == 0
+        part._pp_is_last = stage_idx == 2
+        part._pp_stage_idx = stage_idx
+        part._pp_original_forward = part.forward
+        part.forward = types.MethodType(_pp_forward, part)
+        parts.append(part)
+
+    assert parts[0].model.hc_head_fn is None
+    assert parts[1].model.hc_head_fn is None
+    assert parts[2].model.hc_head_fn is not None
+
+    _set_pp_batch_metadata(
+        parts,
+        [{"input_ids": input_ids, "position_ids": position_ids}],
+    )
+    first_wire = parts[0](input_ids)
+    assert first_wire.shape == (1, 8, cfg.hc_mult, cfg.hidden_size)
+    middle_wire = parts[1](first_wire)
+    assert middle_wire.shape == first_wire.shape
+    logits = parts[2](middle_wire)
+    assert logits.shape == (1, 8, cfg.vocab_size)
+    torch.testing.assert_close(logits, expected, rtol=0, atol=0)
+
+    logits.square().mean().backward()
+    assert parts[0].model.embed_tokens.weight.grad is not None
+    assert next(layer for layer in parts[1].model.layers if layer is not None).self_attn.wq_a.weight.grad is not None
+    assert parts[2].lm_head.weight.grad is not None
+
+
+def test_exact_layout_is_threaded_through_interleaved_checkpoint_microbatches(monkeypatch):
+    """Checkpoint recompute receives each call's immutable layout, not layer state."""
+
+    from functools import partial
+    from types import SimpleNamespace
+
+    import torch.nn as nn
+    from torch.utils.checkpoint import checkpoint
+
+    from xorl.models.transformers.deepseek_v4 import modeling_deepseek_v4
+    from xorl.models.transformers.deepseek_v4.modeling_deepseek_v4 import DeepseekV4Model
+
+    monkeypatch.setattr(
+        modeling_deepseek_v4,
+        "get_parallel_state",
+        lambda: SimpleNamespace(cp_size=1, fsdp_group=None, ep_group=None, sp_group=None),
+    )
+
+    calls = []
+
+    class _RecordingLayer(nn.Module):
+        layer_id = 0
+
+        def __init__(self):
+            super().__init__()
+            self.scale = nn.Parameter(torch.tensor(1.25))
+
+        def forward(self, hidden, *, exact_cp_layout, **_kwargs):
+            calls.append(tuple(int(rows.numel()) for rows in exact_cp_layout.global_request_row_indices))
+            return hidden * self.scale
+
+    class _IdentityHC:
+        @staticmethod
+        def block_expand(hidden):
+            return hidden.unsqueeze(2).expand(-1, -1, 2, -1).clone()
+
+        @staticmethod
+        def block_head(hidden, *_args):
+            return hidden.mean(dim=2)
+
+    cfg = _tiny_config(compress_ratios=[0])
+    cfg._dsv4_flash_exact_mode = True
+    model = DeepseekV4Model(cfg, moe_implementation="eager")
+    recorder = _RecordingLayer()
+    model.layers = nn.ModuleList([recorder])
+    model.hc_util = _IdentityHC()
+    model.norm = nn.Identity()
+    model.gradient_checkpointing = True
+    model._gradient_checkpointing_method = "recompute_full_layer"
+    model._gradient_checkpointing_func = partial(checkpoint, use_reentrant=False)
+    model.train()
+
+    def run(request_lengths, token_offset):
+        request_ids = []
+        request_positions = []
+        for request_id, length in enumerate(request_lengths):
+            request_ids.extend([request_id] * length)
+            request_positions.extend(range(length))
+        live_rows = sum(request_lengths)
+        storage_rows = 8
+        return model(
+            input_ids=(torch.arange(storage_rows) + token_offset).remainder(cfg.vocab_size).view(1, -1),
+            position_ids=torch.arange(storage_rows).view(1, -1),
+            _cp_logical_row_indices=torch.tensor([list(range(live_rows)) + [-1] * (storage_rows - live_rows)]),
+            _cp_request_ids=torch.tensor([request_ids + [-1] * (storage_rows - live_rows)]),
+            _cp_request_positions=torch.tensor([request_positions + [0] * (storage_rows - live_rows)]),
+            _cp_live_mask=torch.tensor([[True] * live_rows + [False] * (storage_rows - live_rows)]),
+            _r3_sample_lengths=request_lengths,
+            num_samples=len(request_lengths),
+        ).last_hidden_state
+
+    output_a = run([2, 4], 1)
+    output_b = run([3, 3], 9)
+    assert calls[:2] == [(2, 4), (3, 3)]
+    assert torch.count_nonzero(output_a[:, 6:]) == 0
+    assert torch.count_nonzero(output_b[:, 6:]) == 0
+    (output_a.square().sum() + output_b.square().sum()).backward()
+    assert calls.count((2, 4)) >= 2
+    assert calls.count((3, 3)) >= 2
+    assert recorder.scale.grad is not None
+    assert model.embed_tokens.weight.grad is not None
+    assert not hasattr(recorder, "exact_cp_layout")

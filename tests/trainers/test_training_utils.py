@@ -422,3 +422,40 @@ def test_sync_lm_head_tp_parameters_broadcasts_marked_module(monkeypatch):
     assert torch.equal(tensor, lm_head.weight)
     assert src == 7
     assert group == "lm-head-replica"
+
+
+def test_pp_padding_and_queues_preserve_exact_row_side_channels():
+    micro_batches = [
+        {
+            "input_ids": torch.tensor([[11, 12, 13]]),
+            "labels": torch.tensor([[12, 13, IGNORE_INDEX]]),
+            "position_ids": torch.tensor([[0, 1, 2]]),
+            "_cp_logical_row_indices": torch.tensor([[7, 8, 9]]),
+            "_cp_request_ids": torch.tensor([[2, 2, 2]]),
+            "_cp_request_positions": torch.tensor([[0, 1, 2]]),
+            "_cp_live_mask": torch.tensor([[True, True, True]]),
+            "_r3_sample_lengths": [3],
+            "num_samples": 1,
+        }
+    ]
+    training_utils_module.pad_micro_batches_for_pp(
+        micro_batches,
+        sample_packing_sequence_len=5,
+    )
+    mb = micro_batches[0]
+    assert torch.equal(mb["input_ids"], torch.tensor([[11, 12, 13, 0, 0]]))
+    assert torch.equal(mb["_cp_logical_row_indices"], torch.tensor([[7, 8, 9, -1, -1]]))
+    assert torch.equal(mb["_cp_request_ids"], torch.tensor([[2, 2, 2, -1, -1]]))
+    assert torch.equal(mb["_cp_request_positions"], torch.tensor([[0, 1, 2, 0, 0]]))
+    assert torch.equal(mb["_cp_live_mask"], torch.tensor([[True, True, True, False, False]]))
+
+    parts = [nn.Identity(), nn.Identity()]
+    training_utils_module._set_pp_batch_metadata(parts, micro_batches)
+    first = parts[0]._pp_batch_metadata.popleft()
+    second = parts[1]._pp_batch_metadata.popleft()
+    assert first is not second
+    for metadata in (first, second):
+        assert torch.equal(metadata["_pp_original_input_ids"], mb["input_ids"])
+        assert torch.equal(metadata["_cp_live_mask"], mb["_cp_live_mask"])
+        assert metadata["_r3_sample_lengths"] == [3]
+        assert metadata["num_samples"] == 1

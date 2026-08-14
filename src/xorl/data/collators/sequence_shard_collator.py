@@ -358,6 +358,35 @@ class TextSequenceShardCollator(DataCollator):
         if self.gdn_exact_cp_align:
             pad_multiple = GDN_CP_CHUNK * self.cp_size
         seq_length = input_ids.size(-1)
+        logical_row_indices = torch.arange(seq_length, dtype=torch.int64, device=input_ids.device).view(1, -1)
+        request_ids = torch.full((1, seq_length), -1, dtype=torch.int64, device=input_ids.device)
+        request_positions = torch.zeros((1, seq_length), dtype=torch.int64, device=input_ids.device)
+        live_mask = torch.zeros((1, seq_length), dtype=torch.bool, device=input_ids.device)
+        sample_lengths = batch.get("_r3_sample_lengths")
+        if isinstance(sample_lengths, torch.Tensor):
+            sample_lengths = sample_lengths.detach().cpu().reshape(-1).tolist()
+        if sample_lengths is not None:
+            cursor = 0
+            for request_id, length in enumerate(sample_lengths):
+                length = int(length)
+                if length < 0 or cursor + length > seq_length:
+                    raise ValueError(
+                        f"Packed request lengths {sample_lengths} do not fit the {seq_length}-row collator input"
+                    )
+                request_ids[:, cursor : cursor + length] = request_id
+                request_positions[:, cursor : cursor + length] = torch.arange(
+                    length,
+                    dtype=torch.int64,
+                    device=input_ids.device,
+                )
+                live_mask[:, cursor : cursor + length] = True
+                cursor += length
+        else:
+            boundaries = find_document_boundaries(position_ids[0])
+            for request_id, (start, end) in enumerate(zip(boundaries[:-1], boundaries[1:])):
+                request_ids[:, start:end] = request_id
+                request_positions[:, start:end] = position_ids[:, start:end]
+                live_mask[:, start:end] = True
         cp_chunk_size = (seq_length + pad_multiple - 1) // pad_multiple * pad_multiple // self.cp_size
         pad_length = cp_chunk_size * self.cp_size - seq_length
 
@@ -375,14 +404,15 @@ class TextSequenceShardCollator(DataCollator):
         # 2. For Ulysses, all SP ranks use the SAME cu_seqlens for flash attention
         # 3. Each SP rank only processes a slice of the sequence but needs full cu_seqlens
         position_ids = self.sp_padding(position_ids, dim=-1, pad_value=0, pad_length=pad_length, sequential=True)
-        # Unique packed-row identity for restoring a rank-order gather after
-        # zigzag storage. Position IDs cannot serve this role because they
-        # reset at every packed-document boundary.
-        logical_row_indices = torch.arange(
-            position_ids.size(-1),
-            dtype=torch.int64,
-            device=position_ids.device,
-        ).view(1, -1)
+        logical_row_indices = self.sp_padding(
+            logical_row_indices,
+            dim=-1,
+            pad_value=-1,
+            pad_length=pad_length,
+        )
+        request_ids = self.sp_padding(request_ids, dim=-1, pad_value=-1, pad_length=pad_length)
+        request_positions = self.sp_padding(request_positions, dim=-1, pad_value=0, pad_length=pad_length)
+        live_mask = self.sp_padding(live_mask, dim=-1, pad_value=0, pad_length=pad_length)
 
         # Zigzag reorder: rearrange each document's tokens so that contiguous
         # sp_slice gives each CP rank balanced [early, late] sub-chunks.
@@ -394,6 +424,24 @@ class TextSequenceShardCollator(DataCollator):
             labels = zigzag_reorder_packed_sequence(labels, original_position_ids, self.ringattn_size, dim=-1)
             logical_row_indices = zigzag_reorder_packed_sequence(
                 logical_row_indices,
+                original_position_ids,
+                self.ringattn_size,
+                dim=-1,
+            )
+            request_ids = zigzag_reorder_packed_sequence(
+                request_ids,
+                original_position_ids,
+                self.ringattn_size,
+                dim=-1,
+            )
+            request_positions = zigzag_reorder_packed_sequence(
+                request_positions,
+                original_position_ids,
+                self.ringattn_size,
+                dim=-1,
+            )
+            live_mask = zigzag_reorder_packed_sequence(
+                live_mask,
                 original_position_ids,
                 self.ringattn_size,
                 dim=-1,
@@ -411,8 +459,10 @@ class TextSequenceShardCollator(DataCollator):
         batch["input_ids"] = self.sp_slice(input_ids, dim=-1)
         batch["labels"] = self.sp_slice(labels, dim=-1)
         batch["position_ids"] = position_ids  # Keep full, not sliced
-        if self.ringattn_size > 1:
-            batch["_ring_cp_logical_row_indices"] = logical_row_indices
+        batch["_cp_logical_row_indices"] = self.sp_slice(logical_row_indices, dim=-1)
+        batch["_cp_request_ids"] = self.sp_slice(request_ids, dim=-1)
+        batch["_cp_request_positions"] = self.sp_slice(request_positions, dim=-1)
+        batch["_cp_live_mask"] = self.sp_slice(live_mask, dim=-1)
 
         # Handle loss side-channel fields. These need to be padded and sliced
         # the same way as labels because they are token-aligned.

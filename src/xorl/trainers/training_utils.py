@@ -620,6 +620,10 @@ def pad_micro_batches_for_pp(
         "logprob_top_ks": 1 << 30,
         "logprob_top_ps": 1.0,
         "logprob_min_ps": 0.0,
+        "_cp_logical_row_indices": -1,
+        "_cp_request_ids": -1,
+        "_cp_request_positions": 0,
+        "_cp_live_mask": False,
     }
     full_target = target_sharded * sp_size if sp_size > 1 else target_sharded
 
@@ -652,7 +656,14 @@ def pad_micro_batches_for_pp(
 
 
 _PP_FA_KEYS = ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k")
-_PP_MODEL_METADATA_KEYS = ("_r3_sample_lengths", "num_samples")
+_PP_EXACT_ROW_KEYS = (
+    "_cp_logical_row_indices",
+    "_cp_request_ids",
+    "_cp_request_positions",
+    "_cp_live_mask",
+    "_r3_sample_lengths",
+    "num_samples",
+)
 
 
 def _set_pp_batch_metadata(
@@ -666,6 +677,9 @@ def _set_pp_batch_metadata(
 
     Each part gets its own dict copies: _pp_forward pops keys from the entry,
     so sharing dicts across virtual stages would corrupt later stages' metadata.
+    Exact DSV4 also needs the original storage-order token IDs on every stage:
+    hidden states travel in compact compute order, while hash-routed MoE layers
+    must reproduce token ownership from the original IDs.
     """
     pp_metadata_list = []
     for mb in micro_batches:
@@ -678,10 +692,12 @@ def _set_pp_batch_metadata(
             md["_pp_input_ids"] = mb["input_ids"]
         if "position_ids" in mb:
             md["position_ids"] = mb["position_ids"]
+        if "input_ids" in mb:
+            md["_pp_original_input_ids"] = mb["input_ids"]
         for key in _PP_FA_KEYS:
             if key in mb:
                 md[key] = mb[key]
-        for key in _PP_MODEL_METADATA_KEYS:
+        for key in _PP_EXACT_ROW_KEYS:
             if key in mb:
                 md[key] = mb[key]
         pp_metadata_list.append(md)
