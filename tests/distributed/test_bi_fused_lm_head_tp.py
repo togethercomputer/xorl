@@ -6,10 +6,12 @@ Run through pytest (which self-launches torchrun) or directly with two ranks::
 """
 
 import os
+from types import SimpleNamespace
 
 import torch
 import torch.distributed as dist
 
+import xorl.distributed.parallel_state as parallel_state_impl
 from xorl.ops import bi_families_v2
 from xorl.ops.loss.bi_fused_lm_head import (
     bi_fused_per_token_ce,
@@ -55,11 +57,7 @@ def _assert_forward_bytes_and_backward(
     full_weight = _full_weight()
     local_vocab = _VOCAB // 2
     shard_start = rank * local_vocab
-    local_weight = (
-        full_weight[shard_start : shard_start + local_vocab]
-        .contiguous()
-        .requires_grad_(trainable_weight)
-    )
+    local_weight = full_weight[shard_start : shard_start + local_vocab].contiguous().requires_grad_(trainable_weight)
     hidden, labels = _local_rows(rank, row_counts, seed=1901 + sum(row_counts))
     hidden = hidden.requires_grad_(True)
 
@@ -104,15 +102,14 @@ def _assert_forward_bytes_and_backward(
         ce_mode="bi_fused",
         tp_group=dist.group.WORLD,
         lm_head_fp32=True,
+        lm_head=SimpleNamespace(_xorl_fsdp_sharded_lm_head_loss=True),
         loss_reducer=TokenPartial(scale=global_valid),
         logprob_temperature=temperature,
         logprob_top_k=top_ks if top_ks is not None else _VOCAB,
         logprob_top_p=top_ps if top_ps is not None else 1.0,
         logprob_min_p=min_ps if min_ps is not None else 0.0,
-        bi_fused_vocab_parallel=True,
     )
     expected_loss = reference.detach().sum() / global_valid
-    dist.all_reduce(expected_loss, op=dist.ReduceOp.SUM)
     assert torch.equal(
         loss_output.loss.reshape(1).view(torch.uint8),
         expected_loss.reshape(1).view(torch.uint8),
@@ -178,12 +175,20 @@ def _run_cases(rank: int, world_size: int) -> None:
 
 def main() -> None:
     rank, world_size = _setup()
+    previous_parallel_state = parallel_state_impl._PARALLEL_STATE
+    parallel_state_impl._PARALLEL_STATE = SimpleNamespace(
+        lm_head_tp_size=world_size,
+        lm_head_tp_group=dist.group.WORLD,
+        lm_head_tp_replica_group=None,
+        tp_enabled=False,
+    )
     try:
         _run_cases(rank, world_size)
         dist.barrier()
         if rank == 0:
             print("bi_fused LM-head TP ragged/empty forward+backward passed")
     finally:
+        parallel_state_impl._PARALLEL_STATE = previous_parallel_state
         dist.destroy_process_group()
 
 

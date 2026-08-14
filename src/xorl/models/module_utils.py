@@ -2884,11 +2884,6 @@ def compute_loss(
         and getattr(ps, "lm_head_tp_group", None) is not None
     )
     if bi_fused_lm_head_tp:
-        if not getattr(lm_head, "_xorl_fsdp_sharded_lm_head_loss", False):
-            raise RuntimeError(
-                "ce_mode='bi_fused' dedicated LM-head TP requires a vocabulary-sharded lm_head; "
-                "set fsdp_sharded_lm_head_loss: true"
-            )
         loss_fn_params = dict(loss_fn_params or {})
         global_valid_tokens = loss_fn_params.pop("fsdp_sharded_lm_head_loss_global_valid_tokens", None)
         loss_fn_params.pop("fsdp_sharded_lm_head_loss_num_chunks", None)
@@ -2993,9 +2988,8 @@ def compute_loss(
         loss_kwargs["lm_head"] = lm_head
         loss_kwargs["tp_group"] = ps.lm_head_tp_group
     elif bi_fused_lm_head_tp:
+        loss_kwargs["lm_head"] = lm_head
         loss_kwargs["tp_group"] = ps.lm_head_tp_group
-        loss_kwargs["bi_fused_vocab_parallel"] = True
-        loss_kwargs["bi_fused_loss_reduce_group"] = getattr(ps, "lm_head_tp_replica_group", None)
     elif ps.tp_enabled:
         loss_kwargs["tp_group"] = ps.tp_group
     if loss_fn_inputs:

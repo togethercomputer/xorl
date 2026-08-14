@@ -2078,12 +2078,17 @@ class ModelRunner:
             return None
         return lm_head if isinstance(lm_head, FP8Linear) else None
 
-    @staticmethod
-    def _get_loss_lm_head_module(lm_head):
+    def _get_loss_lm_head_module(self, lm_head):
         """Return a module that owns the loss projection, when one is required."""
 
         if lm_head is not None and (
             getattr(lm_head, "_glm52_exact_tp16_lm_head", False) or getattr(lm_head, "_dsv4_exact_tp8_lm_head", False)
+        ):
+            return lm_head
+        if (
+            self.ce_mode == "bi_fused"
+            and lm_head is not None
+            and getattr(lm_head, "_xorl_fsdp_sharded_lm_head_loss", False)
         ):
             return lm_head
         return ModelRunner._get_fp8_lm_head_module(lm_head)
@@ -3863,6 +3868,16 @@ class ModelRunner:
         ps = get_parallel_state()
         group = ps.loss_group if ps.loss_parallel_enabled else None
         return count_valid_tokens(micro_batches, group=group)
+
+    @staticmethod
+    def _reduce_loss_report(local_loss_sum: torch.Tensor) -> torch.Tensor:
+        """Sum detached local loss shares once over ranks owning distinct rows."""
+
+        loss_report = local_loss_sum.detach().float().clone()
+        ps = get_parallel_state()
+        if ps.loss_parallel_enabled:
+            dist.all_reduce(loss_report, op=dist.ReduceOp.SUM, group=ps.loss_group)
+        return loss_report
 
     def _count_active_microbatches(self, micro_batches) -> tuple[int, int]:
         """Return ``(active_microbatches, active_voter_total)`` over the DP group."""
@@ -6951,8 +6966,6 @@ class ModelRunner:
             # the full autograd graph through all parameters (including lm_head weight),
             # which is critical for FSDP2 reduce-scatter collectives.
             if compute_backward:
-                ps = get_parallel_state()
-
                 if abort_callback and abort_callback():
                     raise RuntimeError("Execution aborted by request")
 
@@ -6981,19 +6994,14 @@ class ModelRunner:
 
                 # Loss reporting (separately, no grad): compute normalized per-token loss
                 with torch.no_grad():
-                    # Cast to fp32 before the cross-rank reduction: with ulysses SP,
-                    # ranks holding only IGNORE_INDEX tokens may hit early-return
-                    # paths with a different dtype than the normal-return path.
-                    loss_report = local_loss_sum.detach().float()
-                    loss_report_group = ps.fsdp_group if self.pp_enabled else None
-                    if dist.get_world_size(group=loss_report_group) > 1:
-                        dist.all_reduce(loss_report, op=dist.ReduceOp.SUM, group=loss_report_group)
+                    loss_report = self._reduce_loss_report(local_loss_sum)
                     if global_valid_tokens.item() > 0:
                         total_loss += (loss_report / global_valid_tokens).item()
             else:
                 # Forward-only: accumulate weighted loss
                 if global_valid_tokens.item() > 0:
-                    total_loss += local_loss_sum.item() / global_valid_tokens.item()
+                    loss_report = self._reduce_loss_report(local_loss_sum)
+                    total_loss += loss_report.item() / global_valid_tokens.item()
 
             # Accumulate loss-specific metrics. RL losses keep the historical
             # `is_*` prefix; OPD metrics are already namespaced as `opd_*`.

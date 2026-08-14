@@ -18,6 +18,7 @@ from xorl.ops.loss.per_token_ce import (
     LogprobTopK,
     compute_per_token_ce,
     normalize_logprob_temperature,
+    resolve_bi_fused_lm_head_tp_groups,
 )
 from xorl.ops.loss.reducers import Reducer, TokenPartial
 from xorl.ops.loss.vocab_parallel_cross_entropy import (
@@ -459,8 +460,6 @@ def causallm_loss_function(
     logprob_top_k: LogprobTopK = TOP_K_ALL,
     logprob_top_p: LogprobProbability = 1.0,
     logprob_min_p: LogprobProbability = 0.0,
-    bi_fused_vocab_parallel: bool = False,
-    bi_fused_loss_reduce_group=None,
 ) -> "LossOutput":
     """
     Compute causal language modeling loss.
@@ -512,15 +511,16 @@ def causallm_loss_function(
     labels_flat = labels.view(-1)
     hidden_states_flat = hidden_states.view(-1, hidden_states.size(-1))
     valid_mask = labels_flat != ignore_index
+    bi_fused_tp_groups = resolve_bi_fused_lm_head_tp_groups(ce_mode, tp_group, lm_head)
+    has_explicit_loss_reducer = loss_reducer is not None
 
     if loss_reducer is None:
         scale = valid_mask.sum().float()
-        if bi_fused_vocab_parallel:
-            if tp_group is None:
-                raise ValueError("bi_fused_vocab_parallel requires a dedicated LM-head TP group")
-            dist.all_reduce(scale, op=dist.ReduceOp.SUM, group=tp_group)
-            if bi_fused_loss_reduce_group is not None:
-                dist.all_reduce(scale, op=dist.ReduceOp.SUM, group=bi_fused_loss_reduce_group)
+        if bi_fused_tp_groups is not None:
+            dedicated_group, replica_group = bi_fused_tp_groups
+            dist.all_reduce(scale, op=dist.ReduceOp.SUM, group=dedicated_group)
+            if replica_group is not None:
+                dist.all_reduce(scale, op=dist.ReduceOp.SUM, group=replica_group)
         loss_reducer = TokenPartial(scale=scale)
 
     mask_flat = valid_mask.float()
@@ -565,7 +565,7 @@ def causallm_loss_function(
         and (getattr(lm_head, "_glm52_exact_tp16_lm_head", False) or getattr(lm_head, "_dsv4_exact_tp8_lm_head", False))
     )
     if ce_mode == "bi_fused":
-        if tp_group is not None and not exact_lm_head and not bi_fused_vocab_parallel:
+        if tp_group is not None and not exact_lm_head and bi_fused_tp_groups is None:
             raise NotImplementedError(
                 "ce_mode='bi_fused' supports TP only through the dedicated vocabulary-sharded LM-head TP path"
             )
@@ -598,9 +598,7 @@ def causallm_loss_function(
                 per_token_loss=per_token_ce.view(original_shape),
             )
         return LossOutput(loss=loss)
-    if ce_mode == "bi_fused" and bi_fused_vocab_parallel:
-        if tp_group is None:
-            raise ValueError("bi_fused_vocab_parallel requires a dedicated LM-head TP group")
+    if bi_fused_tp_groups is not None:
         if z_loss_coef > 0.0:
             raise NotImplementedError("ce_mode='bi_fused' does not support softmax_auxiliary_loss")
         per_token_ce = compute_per_token_ce(
@@ -618,13 +616,25 @@ def causallm_loss_function(
             logprob_top_k=logprob_top_k,
             logprob_top_p=logprob_top_p,
             logprob_min_p=logprob_min_p,
-            bi_fused_vocab_parallel=True,
         )
         local_loss = loss_reducer(per_token_ce, mask_flat)
+        if has_explicit_loss_reducer:
+            if return_per_token:
+                return LossOutput(
+                    loss=local_loss,
+                    per_token_logprobs=-per_token_ce.detach().view(original_shape),
+                    per_token_loss=per_token_ce.view(original_shape),
+                )
+            return LossOutput(loss=local_loss)
+
+        # Standalone/default-reducer calls historically return the full scalar
+        # on every rank. Explicit reducers instead promise a local partial, and
+        # their caller owns detached reporting aggregation.
         global_loss = local_loss.detach().clone()
-        dist.all_reduce(global_loss, op=dist.ReduceOp.SUM, group=tp_group)
-        if bi_fused_loss_reduce_group is not None:
-            dist.all_reduce(global_loss, op=dist.ReduceOp.SUM, group=bi_fused_loss_reduce_group)
+        dedicated_group, replica_group = bi_fused_tp_groups
+        dist.all_reduce(global_loss, op=dist.ReduceOp.SUM, group=dedicated_group)
+        if replica_group is not None:
+            dist.all_reduce(global_loss, op=dist.ReduceOp.SUM, group=replica_group)
         loss = local_loss + (global_loss - local_loss.detach())
         if return_per_token:
             return LossOutput(

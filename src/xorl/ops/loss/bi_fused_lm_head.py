@@ -101,10 +101,7 @@ def _tp_collective_layout(
         raise ValueError(f"bi_fused TP hidden widths differ across ranks: {hidden_sizes.cpu().tolist()}")
     head_families = program_flags >> 2
     if bool((head_families != head_families[0]).any().item()):
-        raise ValueError(
-            "bi_fused TP ranks must use the same head-family program, got "
-            f"{head_families.cpu().tolist()}"
-        )
+        raise ValueError(f"bi_fused TP ranks must use the same head-family program, got {head_families.cpu().tolist()}")
     vocab_sizes = tuple(int(value) for value in layout[:, 1].cpu().tolist())
     if any(size <= 0 for size in vocab_sizes):
         raise ValueError(f"bi_fused TP requires a non-empty vocabulary shard on every rank, got {vocab_sizes}")
@@ -339,9 +336,7 @@ class _BiFusedVocabParallelPerTokenCE(torch.autograd.Function):
         empty_float = torch.empty((0,), dtype=torch.float32, device=local_hidden.device)
         empty_long = torch.empty((0,), dtype=torch.int64, device=local_hidden.device)
         lse_tensor = (
-            torch.cat(lse_slots)
-            if lse_slots
-            else torch.empty((0,), dtype=torch.float32, device=local_hidden.device)
+            torch.cat(lse_slots) if lse_slots else torch.empty((0,), dtype=torch.float32, device=local_hidden.device)
         )
         ctx.tp_group = tp_group
         ctx.vocab_chunk = int(vocab_chunk)
@@ -398,9 +393,7 @@ class _BiFusedVocabParallelPerTokenCE(torch.autograd.Function):
         compute_hidden = bool(need_hidden_tensor.item())
         grad_hidden = torch.zeros_like(local_hidden) if need_hidden else None
         grad_weight = (
-            torch.zeros(local_weight.shape, dtype=torch.float32, device=local_weight.device)
-            if need_weight
-            else None
+            torch.zeros(local_weight.shape, dtype=torch.float32, device=local_weight.device) if need_weight else None
         )
         grad_local_ce = grad_local_ce.float().contiguous()
         lse_offset = 0
@@ -500,10 +493,7 @@ class _BiFusedVocabParallelPerTokenCE(torch.autograd.Function):
                 if local_support is not None:
                     grad_logits *= local_support
                 target_in_shard = (
-                    selected_support
-                    & valid
-                    & (labels >= vocab_offset)
-                    & (labels < vocab_offset + local_vocab)
+                    selected_support & valid & (labels >= vocab_offset) & (labels < vocab_offset + local_vocab)
                 )
                 rows = torch.arange(labels.shape[0], device=labels.device)
                 grad_logits[rows[target_in_shard], labels[target_in_shard] - vocab_offset] -= g[target_in_shard]
@@ -535,6 +525,8 @@ class _BiFusedVocabParallelPerTokenCE(torch.autograd.Function):
             None,
             None,
         )
+
+
 class _BiFusedLmHeadPerTokenCE(torch.autograd.Function):
     @staticmethod
     def forward(

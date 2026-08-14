@@ -470,16 +470,6 @@ def _pp_lm_head_ce_sum(
     from xorl.models.module_utils import get_lm_head_weight  # noqa: PLC0415
     from xorl.ops.loss.per_token_ce import compute_per_token_ce  # noqa: PLC0415
 
-    exact_head = bool(
-        getattr(lm_head, "_glm52_exact_tp16_lm_head", False)
-        or getattr(lm_head, "_dsv4_exact_tp8_lm_head", False)
-    )
-    bi_fused_vocab_parallel = ce_mode == "bi_fused" and tp_group is not None and not exact_head
-    if bi_fused_vocab_parallel and not getattr(lm_head, "_xorl_fsdp_sharded_lm_head_loss", False):
-        raise RuntimeError(
-            "ce_mode='bi_fused' dedicated LM-head TP requires a vocabulary-sharded lm_head; "
-            "set fsdp_sharded_lm_head_loss: true"
-        )
     weight = get_lm_head_weight(
         lm_head,
         fsdp_sharded_loss=bool(getattr(lm_head, "_xorl_fsdp_sharded_lm_head_loss", False)),
@@ -495,7 +485,6 @@ def _pp_lm_head_ce_sum(
         lm_head_fp32=lm_head_fp32,
         lm_head=lm_head,
         logprob_temperature=logprob_temperature,
-        bi_fused_vocab_parallel=bi_fused_vocab_parallel,
     )
     return per_token_ce.sum()
 

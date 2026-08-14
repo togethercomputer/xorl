@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+from xorl.distributed.parallel_state import get_parallel_state
 from xorl.ops.exact_sampling_transforms import (
     TOP_K_ALL,
     normalize_exact_sampling_transforms,
@@ -26,6 +27,39 @@ _MODULE_LM_HEAD_MIN_CHUNK_ROWS = 128
 LogprobTemperature = float | torch.Tensor
 LogprobTopK = int | torch.Tensor
 LogprobProbability = float | torch.Tensor
+
+
+def resolve_bi_fused_lm_head_tp_groups(
+    ce_mode: str,
+    tp_group: Optional[dist.ProcessGroup],
+    lm_head: Optional[torch.nn.Module],
+) -> tuple[dist.ProcessGroup, Optional[dist.ProcessGroup]] | None:
+    """Resolve the generic bi-fused vocabulary-sharded LM-head topology.
+
+    The route is owned by the physical sharded head and the dedicated runtime
+    process group. A body-TP group cannot opt into this arithmetic merely by
+    being passed as ``tp_group``.
+    """
+
+    if ce_mode != "bi_fused" or lm_head is None:
+        return None
+    if getattr(lm_head, "_glm52_exact_tp16_lm_head", False) or getattr(lm_head, "_dsv4_exact_tp8_lm_head", False):
+        return None
+    if not getattr(lm_head, "_xorl_fsdp_sharded_lm_head_loss", False):
+        return None
+
+    ps = get_parallel_state()
+    dedicated_group = getattr(ps, "lm_head_tp_group", None)
+    if (
+        getattr(ps, "tp_enabled", False)
+        or getattr(ps, "lm_head_tp_size", 1) <= 1
+        or dedicated_group is None
+        or tp_group is not dedicated_group
+    ):
+        raise NotImplementedError(
+            "ce_mode='bi_fused' requires the marked vocabulary-sharded lm_head to use its dedicated LM-head TP group"
+        )
+    return dedicated_group, getattr(ps, "lm_head_tp_replica_group", None)
 
 
 def _flatten_row_metadata(value, *, rows: int, name: str):
@@ -127,7 +161,6 @@ def compute_per_token_ce(
     logprob_top_k: LogprobTopK = TOP_K_ALL,
     logprob_top_p: LogprobProbability = 1.0,
     logprob_min_p: LogprobProbability = 0.0,
-    bi_fused_vocab_parallel: bool = False,
 ) -> torch.Tensor:
     """
     Compute per-token cross-entropy loss based on the specified mode.
@@ -265,6 +298,7 @@ def compute_per_token_ce(
             bi_fused_vocab_parallel_per_token_ce,
         )
 
+        bi_fused_tp_groups = resolve_bi_fused_lm_head_tp_groups(ce_mode, tp_group, lm_head)
         if use_lm_head_module:
             raise NotImplementedError("ce_mode='bi_fused' does not support FP8 lm_head modules")
         if not lm_head_fp32:
@@ -272,7 +306,7 @@ def compute_per_token_ce(
                 "ce_mode='bi_fused' implements the fp32-class lm-head contract; set lm_head_fp32: true"
             )
         local_weight = weight.to_local() if hasattr(weight, "to_local") else weight
-        if tp_group is not None and bi_fused_vocab_parallel:
+        if bi_fused_tp_groups is not None:
             return bi_fused_vocab_parallel_per_token_ce(
                 hidden_states_flat,
                 local_weight,

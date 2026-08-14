@@ -2,7 +2,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+import torch.nn.functional as F
 
+import xorl.ops.loss.bi_fused_lm_head as bi_fused_lm_head_impl
+import xorl.ops.loss.causallm_loss as causallm_loss_impl
+import xorl.ops.loss.per_token_ce as per_token_ce_impl
 import xorl.server.runner.model_runner as model_runner_module
 from xorl.server.runner.model_runner import ModelRunner
 
@@ -35,6 +39,132 @@ class _NoopRoutingHandler:
     def setup(self, micro_batches, routed_experts, routed_expert_logits):
         self.calls.append((micro_batches, routed_experts, routed_expert_logits))
         return False
+
+
+class _TinyMarkedBiFusedModel(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.embed = torch.nn.Embedding(16, 4, dtype=torch.bfloat16)
+        self.lm_head = torch.nn.Linear(4, 8, bias=False, dtype=torch.bfloat16)
+        self.lm_head._xorl_fsdp_sharded_lm_head_loss = True
+
+    def forward(self, input_ids, **kwargs):
+        assert set(kwargs) == {"use_cache", "output_hidden_states"}
+        return SimpleNamespace(last_hidden_state=self.embed(input_ids))
+
+
+def _make_bi_fused_lm_head_tp_runner(monkeypatch):
+    tp_group = object()
+    ps = SimpleNamespace(
+        lm_head_tp_size=2,
+        lm_head_tp_group=tp_group,
+        lm_head_tp_replica_group=None,
+        tp_enabled=False,
+    )
+    monkeypatch.setattr(model_runner_module, "get_parallel_state", lambda: ps)
+    monkeypatch.setattr(per_token_ce_impl, "get_parallel_state", lambda: ps)
+    monkeypatch.setattr(causallm_loss_impl.dist, "all_reduce", lambda *_args, **_kwargs: None)
+    routed_groups = []
+
+    def fake_vocab_parallel_ce(
+        hidden,
+        weight,
+        labels,
+        group,
+        ignore_index=-100,
+        *,
+        temperature=1.0,
+        **_kwargs,
+    ):
+        routed_groups.append(group)
+        logits = hidden.float() @ weight.float().t()
+        if isinstance(temperature, torch.Tensor):
+            logits = logits / temperature[:, None]
+        elif float(temperature) != 1.0:
+            logits = logits / float(temperature)
+        return F.cross_entropy(logits, labels, reduction="none", ignore_index=ignore_index)
+
+    monkeypatch.setattr(
+        bi_fused_lm_head_impl,
+        "bi_fused_vocab_parallel_per_token_ce",
+        fake_vocab_parallel_ce,
+    )
+    runner = object.__new__(ModelRunner)
+    runner.model = _TinyMarkedBiFusedModel()
+    runner.ce_mode = "bi_fused"
+    runner.lm_head_fp32 = True
+    return runner, tp_group, routed_groups
+
+
+def test_compute_micro_batch_loss_routes_marked_bi_fused_causallm(monkeypatch):
+    runner, tp_group, routed_groups = _make_bi_fused_lm_head_tp_runner(monkeypatch)
+
+    loss, per_token_outputs, _metrics, _metric_ops, _outputs = runner._compute_micro_batch_loss(
+        {
+            "input_ids": torch.tensor([[1, 2, 3]]),
+            "labels": torch.tensor([[2, 3, 4]]),
+        },
+        "causallm_loss",
+        {"return_per_token": True},
+    )
+    loss.backward()
+
+    assert routed_groups == [tp_group]
+    assert per_token_outputs["logprobs"].shape == (1, 3)
+    assert runner.model.lm_head.weight.grad is not None
+
+
+def test_marked_ordinary_head_is_exposed_only_for_bi_fused_loss_metadata():
+    runner = object.__new__(ModelRunner)
+    runner.model = _TinyMarkedBiFusedModel()
+    runner.ce_mode = "eager"
+    assert runner._get_loss_lm_head_module(runner.model.lm_head) is None
+
+    runner.ce_mode = "bi_fused"
+    assert runner._get_loss_lm_head_module(runner.model.lm_head) is runner.model.lm_head
+
+
+def test_compute_micro_batch_loss_routes_marked_bi_fused_drgrpo_backward(monkeypatch):
+    runner, tp_group, routed_groups = _make_bi_fused_lm_head_tp_runner(monkeypatch)
+
+    loss, per_token_outputs, metrics, _metric_ops, _outputs = runner._compute_micro_batch_loss(
+        {
+            "input_ids": torch.tensor([[1, 2, 3]]),
+            "target_tokens": torch.tensor([[2, 3, 4]]),
+            "old_logprobs": torch.tensor([[-2.0, -2.1, -1.9]]),
+            "advantages": torch.tensor([[0.5, -0.25, 0.75]]),
+        },
+        "drgrpo",
+        {"beta": 0.0},
+    )
+    loss.backward()
+
+    assert routed_groups == [tp_group]
+    assert per_token_outputs["logprobs"].shape == (1, 3)
+    assert metrics["valid_tokens"] == 3
+    assert runner.model.lm_head.weight.grad is not None
+
+
+@pytest.mark.parametrize("loss_parallel_enabled", [False, True])
+def test_loss_reporting_reduces_once_over_loss_owner_group(monkeypatch, loss_parallel_enabled):
+    loss_group = object()
+    ps = SimpleNamespace(loss_parallel_enabled=loss_parallel_enabled, loss_group=loss_group)
+    monkeypatch.setattr(model_runner_module, "get_parallel_state", lambda: ps)
+    reduced_groups = []
+
+    def fake_all_reduce(value, *, group, **_kwargs):
+        reduced_groups.append(group)
+        value.add_(5.0)
+
+    monkeypatch.setattr(model_runner_module.dist, "all_reduce", fake_all_reduce)
+    local_loss = torch.tensor(2.0, requires_grad=True)
+
+    report = ModelRunner._reduce_loss_report(local_loss)
+
+    assert report.item() == (7.0 if loss_parallel_enabled else 2.0)
+    assert reduced_groups == ([loss_group] if loss_parallel_enabled else [])
+    assert local_loss.item() == 2.0
+    assert local_loss.grad is None
 
 
 def test_compute_micro_batch_loss_dispatches_drgrpo_and_filters_loss_inputs():
