@@ -222,8 +222,7 @@ def test_pp2_publication_includes_each_stage_scope_exactly_once(tmp_path, monkey
                 "rank": rank,
                 "error": None,
                 "targets": [
-                    (target, getattr(module, "glm52_fullparam_payload_kind", ""))
-                    for target, module in components
+                    (target, getattr(module, "glm52_fullparam_payload_kind", "")) for target, module in components
                 ],
                 "expected_targets": sorted(step_publish_module._expected_global_targets(model)),
                 # These values model live group membership: two PP columns
@@ -257,12 +256,8 @@ def test_pp2_publication_includes_each_stage_scope_exactly_once(tmp_path, monkey
         world_size=4,
         barrier=lambda: None,
     )
-    expected = {
-        f"model.layers.{layer}.mlp.gate" for layer in (3, 7)
-    } | {
-        f"model.layers.{layer}.mlp.experts.{expert}"
-        for layer in (3, 7)
-        for expert in range(_GLOBAL_EXPERTS)
+    expected = {f"model.layers.{layer}.mlp.gate" for layer in (3, 7)} | {
+        f"model.layers.{layer}.mlp.experts.{expert}" for layer in (3, 7) for expert in range(_GLOBAL_EXPERTS)
     }
     combined_targets = _combined_targets(root_receipt["combined_dir"])
     assert set(combined_targets) == expected

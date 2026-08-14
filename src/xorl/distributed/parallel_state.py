@@ -92,13 +92,10 @@ def _build_stage_local_lm_head_mesh(
     }
     nonpositive = [name for name, value in degrees.items() if value <= 0]
     if nonpositive:
-        raise ValueError(
-            "lm-head mesh degrees must be positive: " + ", ".join(nonpositive)
-        )
+        raise ValueError("lm-head mesh degrees must be positive: " + ", ".join(nonpositive))
     if tp_size != 1:
         raise NotImplementedError(
-            "lm_head_tp_size>1 requires body TP1 because the head consumes "
-            "the composed DP/CP token-owner plane"
+            "lm_head_tp_size>1 requires body TP1 because the head consumes the composed DP/CP token-owner plane"
         )
 
     contributors_per_stage = dp_size * cp_size
@@ -116,9 +113,7 @@ def _build_stage_local_lm_head_mesh(
         )
 
     replicas_per_stage = contributors_per_stage // lm_head_tp_size
-    return torch.arange(world_size, dtype=torch.int, device="cpu").view(
-        pp_size, replicas_per_stage, lm_head_tp_size
-    )
+    return torch.arange(world_size, dtype=torch.int, device="cpu").view(pp_size, replicas_per_stage, lm_head_tp_size)
 
 
 @dataclass(frozen=True)

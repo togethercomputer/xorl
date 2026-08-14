@@ -1196,9 +1196,7 @@ class Glm52ExactTP16LmHeadSelectedLogprob(nn.Module):
                 support,
                 identity_rows,
             )
-            local_grad_logits[start:end] = full_grad_logits[
-                :, self.shard.vocab_start : self.shard.vocab_end
-            ]
+            local_grad_logits[start:end] = full_grad_logits[:, self.shard.vocab_start : self.shard.vocab_end]
         grad_hidden, grad_A, grad_B = _local_qlora_surrogate_vjp(
             hidden_2d,
             local_weight,

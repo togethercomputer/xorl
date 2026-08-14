@@ -134,9 +134,7 @@ def _live_publication_identity(rank: int) -> dict:
         raise Glm52FullParamPayloadError("The live parallel mesh has no coordinate for this rank")
     dim_names = tuple(state.device_mesh.mesh_dim_names)
     if len(coordinate) != len(dim_names):
-        raise Glm52FullParamPayloadError(
-            f"Parallel mesh coordinate {coordinate} does not match dimensions {dim_names}"
-        )
+        raise Glm52FullParamPayloadError(f"Parallel mesh coordinate {coordinate} does not match dimensions {dim_names}")
     try:
         pp_group = state.pp_group
         pp_group_ranks = tuple(int(owner) for owner in dist.get_process_group_ranks(pp_group))

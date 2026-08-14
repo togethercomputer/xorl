@@ -61,9 +61,7 @@ def test_temperature_then_joint_filters_match_independent_reference():
     top_ks = torch.tensor([4, TOP_K_ALL, 3], dtype=torch.int64)
     top_ps = _rows([0.88, 0.70, 0.60])
     min_ps = _rows([0.05, 0.80, 0.0])
-    score_logits, expected = _independent_support_reference(
-        raw_logits, temperatures, top_ks, top_ps, min_ps
-    )
+    score_logits, expected = _independent_support_reference(raw_logits, temperatures, top_ks, top_ps, min_ps)
 
     support = exact_sampling_support(score_logits, top_ks, top_ps, min_ps)
 
@@ -159,9 +157,7 @@ def test_chunked_selected_score_and_vjp_equal_direct_program():
     top_ps = _rows([0.9, 0.95, 1.0])
     min_ps = _rows([0.0, 0.1, 0.0])
 
-    direct, direct_lse, direct_selected, _ = exact_selected_logprob(
-        direct_logits, token_ids, top_ks, top_ps, min_ps
-    )
+    direct, direct_lse, direct_selected, _ = exact_selected_logprob(direct_logits, token_ids, top_ks, top_ps, min_ps)
     chunked, chunked_lse, chunked_selected = exact_selected_logprob_chunked(
         chunked_logits,
         token_ids,
