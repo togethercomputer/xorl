@@ -1,9 +1,12 @@
-"""Exact full-vocabulary sampling transforms shared by trainer loss heads.
+"""The backend-independent sampling-transform program for exact RL lanes.
 
-The filtered path is intentionally correctness-first.  It derives one support
-from the current temperature-scaled logits, then uses that same support for the
-selected-token probability and its gradient.  The ordinary no-filter heads do
-not call this module, so their established numerical path is unchanged.
+Qwen, GLM, and DSV4 first apply their declared temperature dtype/store
+boundary, then call this module for one shared program: stable descending
+probability order (token ID breaks ties), joint top-k plus inclusive-crossing
+top-p plus min-p relative to the original row maximum, and normalization on
+exactly that support.  Serving performs per-row seeded Gumbel-max on the masked
+logits.  This is an exact-lane contract; it intentionally makes no claim about
+generic SGLang or FlashInfer filter semantics.
 """
 
 from __future__ import annotations
@@ -14,6 +17,10 @@ import torch
 
 
 TOP_K_ALL = 1 << 30
+EXACT_FILTER_ROW_CHUNK = 32
+EXACT_SAMPLING_TRANSFORM_PROGRAM = (
+    "temperature_then_stable_token_id_topk_inclusive_topp_original_max_minp_seeded_gumbel_v1"
+)
 SamplingTransformRows = tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor | None]
 
 
@@ -108,9 +115,9 @@ def exact_sampling_support(
 
     Temperature must already have been applied.  Sorting is stable, so equal
     probabilities are ordered by their original vocabulary index (token ID).
-    Top-p keeps the first token that crosses the threshold, matching SGLang's
-    ``(cumsum - probability) <= top_p`` convention.  Min-p is relative to the
-    unfiltered row maximum.  The three conditions are applied jointly.
+    Top-p keeps the first token that crosses the threshold via
+    ``cumulative_probability_before <= top_p``. Min-p is relative to the
+    unfiltered row maximum. The three conditions are applied jointly.
     """
 
     if logits.ndim != 2 or not logits.is_floating_point():
@@ -183,11 +190,65 @@ def exact_selected_logprob(
     return logprob, lse, selected_support, support
 
 
+def exact_selected_logprob_chunked(
+    logits: torch.Tensor,
+    token_ids: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    *,
+    row_chunk_size: int = EXACT_FILTER_ROW_CHUNK,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Score rows without retaining a dense ``[tokens, vocab]`` support mask."""
+
+    if row_chunk_size < 1:
+        raise ValueError("row_chunk_size must be >= 1")
+    logprob_chunks = []
+    lse_chunks = []
+    selected_support_chunks = []
+    for start in range(0, logits.shape[0], row_chunk_size):
+        end = min(start + row_chunk_size, logits.shape[0])
+        logprob, lse, selected_support, _support = exact_selected_logprob(
+            logits[start:end],
+            token_ids[start:end],
+            top_ks[start:end],
+            top_ps[start:end],
+            min_ps[start:end],
+        )
+        logprob_chunks.append(logprob)
+        lse_chunks.append(lse)
+        selected_support_chunks.append(selected_support)
+    if not logprob_chunks:
+        empty_float = logits.new_empty((0,))
+        return empty_float, empty_float.clone(), torch.empty((0,), dtype=torch.bool, device=logits.device)
+    return (
+        torch.cat(logprob_chunks),
+        torch.cat(lse_chunks),
+        torch.cat(selected_support_chunks),
+    )
+
+
+def exact_support_workspace_bytes(vocab_size: int, row_chunk_size: int = EXACT_FILTER_ROW_CHUNK) -> int:
+    """Upper bound for dense bool workspace in one support row chunk.
+
+    At most the sorted keep mask and token-order support mask coexist.  Float
+    probabilities and sort indices are separate value-program workspaces.
+    """
+
+    if vocab_size < 1 or row_chunk_size < 1:
+        raise ValueError("vocab_size and row_chunk_size must be >= 1")
+    return 2 * vocab_size * row_chunk_size
+
+
 __all__ = [
+    "EXACT_FILTER_ROW_CHUNK",
+    "EXACT_SAMPLING_TRANSFORM_PROGRAM",
     "TOP_K_ALL",
     "exact_masked_logits",
     "exact_sampling_support",
     "exact_selected_logprob",
+    "exact_selected_logprob_chunked",
     "exact_selected_logprob_from_support",
+    "exact_support_workspace_bytes",
     "normalize_exact_sampling_transforms",
 ]

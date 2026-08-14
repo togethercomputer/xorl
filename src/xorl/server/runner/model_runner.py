@@ -2989,7 +2989,9 @@ class ModelRunner:
                 )
             per_row_temperature = logprob_temperature.reshape(-1)
             if per_row_temperature.dtype is not torch.float32:
-                raise TypeError(f"per-row logprob_temperature must be FP32, got {per_row_temperature.dtype}")
+                raise TypeError(
+                    f"per-row logprob_temperature must be FP32, got {per_row_temperature.dtype}"
+                )
             if per_row_temperature.device != hidden_states.device:
                 raise ValueError(
                     "per-row logprob_temperature must share the hidden-state device, got "

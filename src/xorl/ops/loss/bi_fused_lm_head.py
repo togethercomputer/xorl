@@ -33,10 +33,14 @@ from xorl.ops.bi_families_v2 import (
     head_v2_selected_logprob,
     head_v2_selected_logprob_from_logits,
 )
-from xorl.ops.exact_sampling_transforms import exact_selected_logprob
+from xorl.ops.exact_sampling_transforms import (
+    EXACT_FILTER_ROW_CHUNK,
+    exact_sampling_support,
+    exact_selected_logprob,
+)
 
 
-_TEMPERATURE_MATERIALIZE_ROW_CHUNK = 32
+_TEMPERATURE_MATERIALIZE_ROW_CHUNK = EXACT_FILTER_ROW_CHUNK
 
 
 class _BiFusedLmHeadPerTokenCE(torch.autograd.Function):
@@ -55,7 +59,6 @@ class _BiFusedLmHeadPerTokenCE(torch.autograd.Function):
     ):
         use_v2 = families_v2_enabled()
         has_sampling_filter = top_ks is not None
-        support_chunks = []
         if temp_row is None and not has_sampling_filter and use_v2:
             # head v2 (families-v2 migration): same GEMM K-chain, epilogue-stats
             # online LSE; logits never materialize; backward only consumes lse.
@@ -80,14 +83,13 @@ class _BiFusedLmHeadPerTokenCE(torch.autograd.Function):
                         else exact_temperature_scale_fp32_logits(logits, temperature_chunk)
                     )
                     if has_sampling_filter:
-                        logprob_chunk, lse_chunk, _, support_chunk = exact_selected_logprob(
+                        logprob_chunk, lse_chunk, _, _support = exact_selected_logprob(
                             transformed_logits,
                             labels_chunk,
                             top_ks[start:end],
                             top_ps[start:end],
                             min_ps[start:end],
                         )
-                        support_chunks.append(support_chunk)
                     else:
                         logprob_chunk, lse_chunk, _ = head_v2_selected_logprob_from_logits(
                             transformed_logits,
@@ -102,14 +104,13 @@ class _BiFusedLmHeadPerTokenCE(torch.autograd.Function):
                         else exact_temperature_scale_fp32_logits(logits, temperature_chunk)
                     )
                     if has_sampling_filter:
-                        logprob_chunk, lse_chunk, _, support_chunk = exact_selected_logprob(
+                        logprob_chunk, lse_chunk, _, _support = exact_selected_logprob(
                             transformed_logits,
                             labels_chunk,
                             top_ks[start:end],
                             top_ps[start:end],
                             min_ps[start:end],
                         )
-                        support_chunks.append(support_chunk)
                     else:
                         logprob_chunk, lse_chunk, _ = bi_lm_head_selected_logprob_from_logits(
                             transformed_logits,
@@ -125,28 +126,106 @@ class _BiFusedLmHeadPerTokenCE(torch.autograd.Function):
             else:
                 logprob = torch.empty((0,), dtype=torch.float32, device=hidden.device)
                 lse = logprob.clone()
-        support = (
-            torch.cat(support_chunks, dim=0)
-            if support_chunks
-            else torch.empty((0, 0), dtype=torch.bool, device=hidden.device)
+        ctx.save_for_backward(
+            hidden,
+            weight,
+            labels_safe,
+            valid_mask,
+            lse,
+            temp_row,
+            top_ks,
+            top_ps,
+            min_ps,
         )
-        ctx.save_for_backward(hidden, weight, labels_safe, valid_mask, lse, temp_row, support)
         ctx.vocab_chunk = vocab_chunk
+        ctx.use_v2 = use_v2
         return torch.where(valid_mask, -logprob, torch.zeros_like(logprob))
 
     @staticmethod
     def backward(ctx, grad_ce):
-        hidden, weight, labels, valid_mask, lse, temp_row, support = ctx.saved_tensors
+        hidden, weight, labels, valid_mask, lse, temp_row, top_ks, top_ps, min_ps = ctx.saved_tensors
         vocab_chunk = ctx.vocab_chunk
         n_tokens = hidden.shape[0]
         vocab = weight.shape[0]
         need_h = ctx.needs_input_grad[0]
         need_w = ctx.needs_input_grad[1]
 
-        selected_support = (
-            torch.ones_like(valid_mask) if support.numel() == 0 else support.gather(1, labels.unsqueeze(1)).squeeze(1)
-        )
-        g = (grad_ce * valid_mask * selected_support).float()
+        if top_ks is not None:
+            grad_h = torch.zeros(hidden.shape, dtype=torch.float32, device=hidden.device) if need_h else None
+            grad_w = torch.zeros_like(weight) if need_w else None
+            for row_start in range(0, n_tokens, _TEMPERATURE_MATERIALIZE_ROW_CHUNK):
+                row_end = min(row_start + _TEMPERATURE_MATERIALIZE_ROW_CHUNK, n_tokens)
+                hidden_chunk = hidden[row_start:row_end]
+                labels_chunk = labels[row_start:row_end]
+                valid_chunk = valid_mask[row_start:row_end]
+                temperature_chunk = None if temp_row is None else temp_row[row_start:row_end]
+                if ctx.use_v2:
+                    exact_logits, _ = head_v2_full_logits_with_lse(hidden_chunk, weight, temperature=None)
+                else:
+                    exact_logits = bi_lm_head_full_logits(hidden_chunk, weight, vocab_chunk=vocab_chunk)
+                transformed_logits = (
+                    exact_logits
+                    if temperature_chunk is None
+                    else exact_temperature_scale_fp32_logits(exact_logits, temperature_chunk)
+                )
+                support = exact_sampling_support(
+                    transformed_logits,
+                    top_ks[row_start:row_end],
+                    top_ps[row_start:row_end],
+                    min_ps[row_start:row_end],
+                )
+                selected_support = support.gather(1, labels_chunk.unsqueeze(1)).squeeze(1)
+                g = (grad_ce[row_start:row_end] * valid_chunk * selected_support).float()
+                g_col = g.unsqueeze(1)
+                lse_col = lse[row_start:row_end].unsqueeze(1)
+                inv_t = None if temperature_chunk is None else (1.0 / temperature_chunk).unsqueeze(1)
+                grad_h_chunk = (
+                    torch.zeros(hidden_chunk.shape, dtype=torch.float32, device=hidden.device) if need_h else None
+                )
+                rows = torch.arange(row_end - row_start, device=hidden.device)
+
+                for col_start in range(0, vocab, vocab_chunk):
+                    col_end = min(col_start + vocab_chunk, vocab)
+                    w_c = weight[col_start:col_end]
+                    logits_c = torch.mm(hidden_chunk, w_c.t(), out_dtype=torch.float32)
+                    if inv_t is not None:
+                        logits_c *= inv_t
+                    grad_z = logits_c.sub_(lse_col).exp_().mul_(g_col)
+                    grad_z *= support[:, col_start:col_end]
+                    in_chunk = selected_support & (labels_chunk >= col_start) & (labels_chunk < col_end)
+                    grad_z[rows[in_chunk], labels_chunk[in_chunk] - col_start] -= g[in_chunk]
+                    if inv_t is not None:
+                        grad_z *= inv_t
+                    grad_z16 = grad_z.to(hidden.dtype)
+                    if need_h:
+                        torch.addmm(
+                            grad_h_chunk,
+                            grad_z16,
+                            w_c,
+                            out_dtype=torch.float32,
+                            out=grad_h_chunk,
+                        )
+                    if need_w:
+                        grad_w[col_start:col_end].add_(
+                            torch.mm(grad_z16.t(), hidden_chunk, out_dtype=torch.float32).to(weight.dtype)
+                        )
+                if need_h:
+                    grad_h[row_start:row_end] = grad_h_chunk
+
+            return (
+                grad_h.to(hidden.dtype) if need_h else None,
+                grad_w if need_w else None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+
+        selected_support = torch.ones_like(valid_mask)
+        g = (grad_ce * valid_mask).float()
         g_col = g.unsqueeze(1)
         lse_col = lse.unsqueeze(1)
         inv_t = None if temp_row is None else (1.0 / temp_row).unsqueeze(1)
@@ -162,8 +241,6 @@ class _BiFusedLmHeadPerTokenCE(torch.autograd.Function):
             if inv_t is not None:
                 logits_c *= inv_t
             grad_z = logits_c.sub_(lse_col).exp_().mul_(g_col)
-            if support.numel() != 0:
-                grad_z *= support[:, col_start:col_end]
             in_chunk = selected_support & (labels >= col_start) & (labels < col_end)
             grad_z[rows[in_chunk], labels[in_chunk] - col_start] -= g[in_chunk]
             if inv_t is not None:

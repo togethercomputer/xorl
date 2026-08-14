@@ -13,6 +13,7 @@ from xorl.trainers.training_utils import (
     forward_backward_pp,
     get_distsign_grad_scale_factor,
     get_effective_grad_clip_value,
+    pad_micro_batches_for_pp,
     sync_lm_head_tp_gradient,
     sync_lm_head_tp_parameters,
     sync_sp_gradients,
@@ -196,6 +197,31 @@ def test_count_active_microbatches_batches_reduce_and_returns_voter_total(monkey
 
 def test_count_active_microbatches_is_empty_input_safe():
     assert count_active_microbatches([]) == (0, 0)
+
+
+def test_pp_padding_uses_exact_sampling_transform_identities():
+    micro_batches = [
+        {
+            "input_ids": torch.tensor([[7, 8]], dtype=torch.int64),
+            "labels": torch.tensor([[8, 9]], dtype=torch.int64),
+            "logprob_temperatures": torch.tensor([[0.7, 1.3]], dtype=torch.float32),
+            "logprob_top_ks": torch.tensor([[4, 9]], dtype=torch.int64),
+            "logprob_top_ps": torch.tensor([[0.8, 0.9]], dtype=torch.float32),
+            "logprob_min_ps": torch.tensor([[0.1, 0.2]], dtype=torch.float32),
+        }
+    ]
+
+    pad_micro_batches_for_pp(micro_batches, sample_packing_sequence_len=4)
+
+    batch = micro_batches[0]
+    assert batch["input_ids"].tolist() == [[7, 8, 0, 0]]
+    assert batch["labels"].tolist() == [[8, 9, IGNORE_INDEX, IGNORE_INDEX]]
+    torch.testing.assert_close(
+        batch["logprob_temperatures"], torch.tensor([[0.7, 1.3, 1.0, 1.0]])
+    )
+    assert batch["logprob_top_ks"].tolist() == [[4, 9, 1 << 30, 1 << 30]]
+    torch.testing.assert_close(batch["logprob_top_ps"], torch.tensor([[0.8, 0.9, 1.0, 1.0]]))
+    torch.testing.assert_close(batch["logprob_min_ps"], torch.tensor([[0.1, 0.2, 0.0, 0.0]]))
 
 
 def test_pp_chunked_ce_matches_eager_loss_and_grad(monkeypatch):

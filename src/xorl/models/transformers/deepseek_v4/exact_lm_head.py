@@ -21,7 +21,9 @@ from torch import Tensor, nn
 from xorl.lora.modules.linear import LoraLinear
 from xorl.ops.bi_families_v2 import exact_temperature_scale_bf16_logits
 from xorl.ops.exact_sampling_transforms import (
-    exact_selected_logprob,
+    EXACT_FILTER_ROW_CHUNK,
+    exact_sampling_support,
+    exact_selected_logprob_chunked,
     exact_selected_logprob_from_support,
 )
 
@@ -302,7 +304,8 @@ class _Dsv4ExactDistributedHeadFunction(torch.autograd.Function):
             )
             for value in local_sampling_transforms
         )
-        if gathered_sampling_transforms[0] is None:
+        has_sampling_filter = gathered_sampling_transforms[0] is not None
+        if not has_sampling_filter:
             gathered_logprob = component._exact_forward_value(
                 gathered_hidden,
                 local_weight,
@@ -311,9 +314,8 @@ class _Dsv4ExactDistributedHeadFunction(torch.autograd.Function):
                 gathered_ids,
                 gathered_temperature,
             )
-            support = None
         else:
-            gathered_logprob, support = component._exact_forward_value_filtered(
+            gathered_logprob = component._exact_forward_value_filtered(
                 gathered_hidden,
                 local_weight,
                 effective_a,
@@ -333,7 +335,7 @@ class _Dsv4ExactDistributedHeadFunction(torch.autograd.Function):
         ctx.source_offset = source_offset
         ctx.row_counts = row_counts
         ctx.padded_rows = padded_rows
-        ctx.sampling_support = support
+        ctx.has_sampling_filter = has_sampling_filter
         ctx.save_for_backward(
             gathered_hidden,
             local_weight,
@@ -345,6 +347,7 @@ class _Dsv4ExactDistributedHeadFunction(torch.autograd.Function):
             else torch.empty((0,), dtype=torch.float32, device=local_hidden.device),
             lora_a,
             local_lora_b,
+            *gathered_sampling_transforms,
         )
         return local_logprob
 
@@ -362,6 +365,9 @@ class _Dsv4ExactDistributedHeadFunction(torch.autograd.Function):
             stored_temperature,
             _a_master,
             _b_master,
+            top_ks,
+            top_ps,
+            min_ps,
         ) = ctx.saved_tensors
         temperature = None if stored_temperature.numel() == 0 else stored_temperature
         group = ctx.component._validate_tp_group()
@@ -371,7 +377,7 @@ class _Dsv4ExactDistributedHeadFunction(torch.autograd.Function):
             row_counts=ctx.row_counts,
             padded_rows=ctx.padded_rows,
         )
-        vjp = ctx.component._surrogate_vjp if ctx.sampling_support is None else ctx.component._surrogate_vjp_filtered
+        vjp = ctx.component._surrogate_vjp_filtered if ctx.has_sampling_filter else ctx.component._surrogate_vjp
         args = (
             gathered_hidden,
             local_weight,
@@ -381,8 +387,8 @@ class _Dsv4ExactDistributedHeadFunction(torch.autograd.Function):
             gathered_grad,
             temperature,
         )
-        if ctx.sampling_support is not None:
-            args = (*args, ctx.sampling_support)
+        if ctx.has_sampling_filter:
+            args = (*args, (top_ks, top_ps, min_ps))
         grad_hidden, grad_a, grad_b = vjp(
             *args,
             needs_input_grad=(ctx.needs_input_grad[0], ctx.needs_input_grad[2], ctx.needs_input_grad[3]),
@@ -534,21 +540,21 @@ class Dsv4ExactTP8LmHeadSelectedLogprob(nn.Module):
         token_ids: Tensor,
         temperature: Tensor | None,
         sampling_transforms: tuple[Tensor | None, Tensor | None, Tensor | None],
-    ) -> tuple[Tensor, Tensor]:
+    ) -> Tensor:
         local_logits = self._exact_local_logits(hidden, local_weight, effective_a, effective_b)
         full_logits = _rank_order_vocab_all_gather(local_logits, self._validate_tp_group())
         score_logits = _temperature_scale_bf16_logits(full_logits, temperature)
         top_ks, top_ps, min_ps = sampling_transforms
         if top_ks is None or top_ps is None or min_ps is None:
             raise ValueError("filtered DSV4 exact scoring requires complete row metadata")
-        logprob, _, _, support = exact_selected_logprob(
+        logprob, _, _ = exact_selected_logprob_chunked(
             score_logits,
             token_ids,
             top_ks,
             top_ps,
             min_ps,
         )
-        return logprob.contiguous(), support
+        return logprob.contiguous()
 
     def _surrogate_vjp(
         self,
@@ -608,30 +614,71 @@ class Dsv4ExactTP8LmHeadSelectedLogprob(nn.Module):
         token_ids: Tensor,
         grad_logprob: Tensor,
         temperature: Tensor | None,
-        support: Tensor,
+        sampling_transforms: tuple[Tensor | None, Tensor | None, Tensor | None],
         *,
         needs_input_grad: tuple[bool, bool, bool],
     ) -> tuple[Tensor | None, Tensor | None, Tensor | None]:
         group = self._validate_tp_group()
         temperature = _validate_temperature_rows(temperature, rows=hidden.shape[0], device=hidden.device)
-        with torch.no_grad():
-            local_reference = (
-                (
-                    F.linear(hidden, local_weight)
-                    + F.linear(F.linear(hidden.float(), effective_a.float()), effective_b.float()).to(torch.bfloat16)
-                )
-                .float()
-                .contiguous()
-            )
-            full_reference = _rank_order_vocab_all_gather(local_reference.to(torch.bfloat16), group).float()
-        full_grad = _selected_logprob_reference_grad_filtered(
-            full_reference,
-            token_ids,
-            grad_logprob,
-            temperature,
-            support,
+        top_ks, top_ps, min_ps = sampling_transforms
+        if top_ks is None or top_ps is None or min_ps is None:
+            raise ValueError("filtered DSV4 exact scoring requires complete row metadata")
+        local_grad = torch.empty(
+            (hidden.shape[0], DSV4_LM_HEAD_LOCAL_VOCAB_SIZE),
+            dtype=torch.float32,
+            device=hidden.device,
         )
-        local_grad = full_grad[:, self.shard.vocab_start : self.shard.vocab_end].contiguous()
+        with torch.no_grad():
+            for row_start in range(0, hidden.shape[0], EXACT_FILTER_ROW_CHUNK):
+                row_end = min(row_start + EXACT_FILTER_ROW_CHUNK, hidden.shape[0])
+                row_slice = slice(row_start, row_end)
+                hidden_chunk = hidden[row_slice].contiguous()
+
+                # Recreate the literal value path only for this bounded row
+                # chunk.  The dense support mask is transient and never saved
+                # on the autograd context.
+                exact_local = self._exact_local_logits(
+                    hidden_chunk,
+                    local_weight,
+                    effective_a,
+                    effective_b,
+                )
+                exact_full = _rank_order_vocab_all_gather(exact_local, group)
+                score_logits = _temperature_scale_bf16_logits(
+                    exact_full,
+                    None if temperature is None else temperature[row_slice].contiguous(),
+                )
+                support = exact_sampling_support(
+                    score_logits,
+                    top_ks[row_slice],
+                    top_ps[row_slice],
+                    min_ps[row_slice],
+                )
+
+                local_reference = (
+                    (
+                        F.linear(hidden_chunk, local_weight)
+                        + F.linear(
+                            F.linear(hidden_chunk.float(), effective_a.float()),
+                            effective_b.float(),
+                        ).to(torch.bfloat16)
+                    )
+                    .float()
+                    .contiguous()
+                )
+                full_reference = _rank_order_vocab_all_gather(
+                    local_reference.to(torch.bfloat16), group
+                ).float()
+                full_grad = _selected_logprob_reference_grad_filtered(
+                    full_reference,
+                    token_ids[row_slice],
+                    grad_logprob[row_slice],
+                    None if temperature is None else temperature[row_slice],
+                    support,
+                )
+                local_grad[row_slice] = full_grad[
+                    :, self.shard.vocab_start : self.shard.vocab_end
+                ]
         grad_hidden, grad_a, grad_b = _local_surrogate_vjp(
             hidden,
             local_weight,

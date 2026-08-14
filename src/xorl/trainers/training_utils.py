@@ -614,7 +614,12 @@ def pad_micro_batches_for_pp(
         "input_ids": 0,
         "labels": IGNORE_INDEX,
         "attention_mask": 0,
+        # Exact sampling-transform metadata must pad with the mathematical
+        # identity so PP's fixed communication shape cannot change scoring.
         "logprob_temperatures": 1.0,
+        "logprob_top_ks": 1 << 30,
+        "logprob_top_ps": 1.0,
+        "logprob_min_ps": 0.0,
     }
     full_target = target_sharded * sp_size if sp_size > 1 else target_sharded
 
@@ -623,9 +628,9 @@ def pad_micro_batches_for_pp(
         if ids_len < target_sharded:
             pad_tokens = target_sharded - ids_len
 
-            for key in ("input_ids", "labels", "attention_mask", "logprob_temperatures"):
+            for key, pad_value in _PAD_VALUES.items():
                 if key in mb and isinstance(mb[key], torch.Tensor):
-                    mb[key] = F.pad(mb[key], (0, pad_tokens), value=_PAD_VALUES.get(key, 0))
+                    mb[key] = F.pad(mb[key], (0, pad_tokens), value=pad_value)
 
             if "position_ids" in mb and isinstance(mb["position_ids"], torch.Tensor):
                 scale = mb["position_ids"].shape[-1] // ids_len if ids_len > 0 else 1
