@@ -61,6 +61,66 @@ def init_ep_mesh_matrix(ep_size: int, ep_fsdp_size: int, ep_intranode: bool = Tr
     return mesh
 
 
+def _build_stage_local_lm_head_mesh(
+    *,
+    world_size: int,
+    pp_size: int,
+    dp_size: int,
+    cp_size: int,
+    tp_size: int,
+    lm_head_tp_size: int,
+) -> torch.Tensor:
+    """Lay out lm-head groups over each stage's DP-major/CP-minor plane.
+
+    The main mesh is ordered ``PP, DP, CP, TP`` after flattening the DP and CP
+    sub-axes.  The exact GLM head uses body TP1, so every PP stage is one
+    contiguous DP-major/CP-minor contributor plane.  Head TP may span both DP
+    and CP; requiring it to fit either source axis separately incorrectly
+    rejects mixed ownership layouts such as DP2/CP8.
+
+    The returned tensor retains PP as an outer dimension.  Consequently both
+    the head-TP rows and their replica columns are stage-local.
+    """
+
+    degrees = {
+        "world_size": world_size,
+        "pp_size": pp_size,
+        "dp_size": dp_size,
+        "cp_size": cp_size,
+        "tp_size": tp_size,
+        "lm_head_tp_size": lm_head_tp_size,
+    }
+    nonpositive = [name for name, value in degrees.items() if value <= 0]
+    if nonpositive:
+        raise ValueError(
+            "lm-head mesh degrees must be positive: " + ", ".join(nonpositive)
+        )
+    if tp_size != 1:
+        raise NotImplementedError(
+            "lm_head_tp_size>1 requires body TP1 because the head consumes "
+            "the composed DP/CP token-owner plane"
+        )
+
+    contributors_per_stage = dp_size * cp_size
+    expected_world = pp_size * contributors_per_stage
+    if world_size != expected_world:
+        raise ValueError(
+            "lm-head mesh must cover one complete DP/CP program per PP stage: "
+            f"WORLD={world_size}, expected PP{pp_size}*DP{dp_size}*CP{cp_size}="
+            f"{expected_world}"
+        )
+    if contributors_per_stage % lm_head_tp_size:
+        raise ValueError(
+            f"lm_head_tp_size ({lm_head_tp_size}) must divide the composed "
+            f"stage-local DP{dp_size}*CP{cp_size} plane ({contributors_per_stage})"
+        )
+
+    replicas_per_stage = contributors_per_stage // lm_head_tp_size
+    return torch.arange(world_size, dtype=torch.int, device="cpu").view(
+        pp_size, replicas_per_stage, lm_head_tp_size
+    )
+
+
 @dataclass(frozen=True)
 class ParallelState:
     dp_size: int = 1
@@ -717,15 +777,12 @@ def init_parallel_state(
     # PP stage. The model body keeps its own dp/fsdp/cp scheme; only the lm_head
     # sees this mesh. Opt-in (lm_head_tp_size == 1 -> no-op).
     #
-    # Two layouts are supported:
-    # - CP-sourced: factor CP as cp_replica x lm_head_tp. This keeps TP groups
-    #   inside sequence-parallel cells.
-    # - DP-sourced (no CP): factor the innermost DP shard axis as
-    #   dp_replica x lm_head_tp. The loss gathers hidden states over the
-    #   lm_head_tp group before vocab-parallel CE, so DP ranks in the TP group
-    #   may own different tokens while still computing correct local hidden grads
-    #   and vocab-shard weight grads. Replica reductions then sum the same vocab
-    #   shard across every non-TP axis, including HSDP's dp_replicate axis.
+    # Head TP is carved from the composed stage-local DP-major/CP-minor owner
+    # plane.  It may therefore span both axes (for example DP2/CP8 -> TP16).
+    # The loss gathers each group's hidden rows before vocab-parallel CE, so
+    # contributors may own different tokens while still computing the correct
+    # local hidden gradients and vocab-shard weight gradients. Replica
+    # reductions sum the same vocab shard across the remaining owner groups.
     lm_head_mesh = None
     lm_head_tp_group = None
     lm_head_tp_replica_group = None
@@ -733,10 +790,10 @@ def init_parallel_state(
         if not dist.is_initialized() or device_mesh is None:
             raise RuntimeError("lm_head_tp_size>1 requires an initialized process group and device mesh.")
         cp_size = ringattn_size * ulysses_size
-        if tp_size != 1 or pp_size != 1:
+        if tp_size != 1:
             raise NotImplementedError(
-                "lm_head_tp_size>1 currently supports data + context + expert parallelism "
-                "(tp_size=pp_size=1); combining it with tensor/pipeline parallelism is a separate design."
+                "lm_head_tp_size>1 currently requires body tp_size=1; "
+                "body tensor parallelism needs a separate head input layout."
             )
         # EP is allowed: it is a SEPARATE re-grouping (ep_fsdp_device_mesh) of the
         # same ranks for the *experts* only, and does not appear in the main
@@ -746,43 +803,35 @@ def init_parallel_state(
         # lm_head's CP-sharded hidden input is also unaffected by EP (which is
         # internal to the MoE layers). So the lm_head_mesh construction is identical
         # whether or not ep>1.
-        if cp_size > 1:
-            if cp_size % lm_head_tp_size != 0 or lm_head_tp_size > cp_size:
-                raise ValueError(f"lm_head_tp_size ({lm_head_tp_size}) must be a divisor of the CP size ({cp_size}).")
-            source_axis_size = cp_size
-            source_replica = cp_size // lm_head_tp_size
-            source_axis = "cp"
-        else:
-            if dp_shard_size % lm_head_tp_size != 0 or lm_head_tp_size > dp_shard_size:
-                raise ValueError(
-                    f"lm_head_tp_size ({lm_head_tp_size}) must be a divisor of "
-                    f"data_parallel_shard_size ({dp_shard_size}) when CP is disabled."
-                )
-            source_axis_size = dp_shard_size
-            source_replica = dp_shard_size // lm_head_tp_size
-            source_axis = "dp_shard" if dp_replicate_size > 1 else "dp"
         world = dist.get_world_size()
-        num_replica = world // lm_head_tp_size
-        # With tp=pp=1, EP is not a main-mesh axis and ranks are row-major over
-        # the main mesh. For CP-sourced TP, CP is the innermost contiguous block.
-        # For no-CP DP-sourced TP, each DP-shard row is the contiguous block. In
-        # both cases, consecutive lm_head_tp_size ranks form a TP group and the
-        # outer source_replica index contributes to the replica axis.
-        mesh_tensor = torch.empty((num_replica, lm_head_tp_size), dtype=torch.int)
-        for r in range(world):
-            pos = r % source_axis_size
-            replica_idx = (r // source_axis_size) * source_replica + pos // lm_head_tp_size
-            mesh_tensor[replica_idx, pos % lm_head_tp_size] = r
-        lm_head_mesh = DeviceMesh(
-            device_type=device_type,
-            mesh=mesh_tensor,
-            mesh_dim_names=("replica", "lm_head_tp"),
+        mesh_tensor = _build_stage_local_lm_head_mesh(
+            world_size=world,
+            pp_size=pp_size,
+            dp_size=dp_size,
+            cp_size=cp_size,
+            tp_size=tp_size,
+            lm_head_tp_size=lm_head_tp_size,
         )
+        if pp_size > 1:
+            full_lm_head_mesh = DeviceMesh(
+                device_type=device_type,
+                mesh=mesh_tensor,
+                mesh_dim_names=("_pp_lm_head", "replica", "lm_head_tp"),
+            )
+            # Select this rank's PP coordinate. Neither exposed collective
+            # group contains ranks from another pipeline stage.
+            lm_head_mesh = full_lm_head_mesh["replica", "lm_head_tp"]
+        else:
+            lm_head_mesh = DeviceMesh(
+                device_type=device_type,
+                mesh=mesh_tensor[0],
+                mesh_dim_names=("replica", "lm_head_tp"),
+            )
         lm_head_tp_group = lm_head_mesh.get_group("lm_head_tp")
         lm_head_tp_replica_group = lm_head_mesh.get_group("replica")
         logger.info_rank0(
-            f"lm-head TP: lm_head_tp_size={lm_head_tp_size}, source_axis={source_axis}, "
-            f"source_replica={source_replica}, mesh={tuple(mesh_tensor.shape)}"
+            f"lm-head TP: lm_head_tp_size={lm_head_tp_size}, composed DP{dp_size}/CP{cp_size}, "
+            f"per-stage mesh={tuple(lm_head_mesh.mesh.shape)}, PP={pp_size}"
         )
 
     _PARALLEL_STATE = ParallelState(
