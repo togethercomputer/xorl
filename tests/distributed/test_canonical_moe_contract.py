@@ -141,24 +141,51 @@ def test_chunked_fp32_tree_is_bitwise_exact_across_payload_boundaries(
 
 @pytest.mark.cpu
 @pytest.mark.parametrize("contributors", [3, 16, 17])
+@pytest.mark.parametrize("strided", [False, True])
 def test_chunked_fp32_tree_backward_matches_the_unchunked_tree(
     monkeypatch: pytest.MonkeyPatch,
+    contributors: int,
+    strided: bool,
+):
+    import xorl.distributed.canonical_moe as canonical_moe
+
+    monkeypatch.setattr(canonical_moe, "_CANONICAL_MOE_FP32_FOLD_MAX_LEVEL_BYTES", 128)
+    source_shape = (contributors, 11, 7) if strided else (contributors, 7, 11)
+    actual_source = torch.randn(source_shape, dtype=torch.bfloat16, requires_grad=True)
+    expected_source = actual_source.detach().clone().requires_grad_(True)
+    actual_leaf = actual_source.transpose(1, 2) if strided else actual_source
+    expected_leaf = expected_source.transpose(1, 2) if strided else expected_source
+    assert actual_leaf.is_contiguous() is not strided
+    grad_output = torch.randn((7, 11), dtype=torch.bfloat16)
+
+    actual = canonical_moe_fold_fp32_v2(actual_leaf)
+    expected = _explicit_tree(expected_leaf)
+    actual_grad = torch.autograd.grad(actual, actual_source, grad_outputs=grad_output)[0]
+    expected_grad = torch.autograd.grad(expected, expected_source, grad_outputs=grad_output)[0]
+
+    assert torch.equal(actual.view(torch.uint16), expected.view(torch.uint16))
+    assert torch.equal(actual_grad.view(torch.uint16), expected_grad.view(torch.uint16))
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("contributors", [3, 16, 17])
+def test_chunked_fp32_tree_strided_payload_is_bitwise_exact(
+    monkeypatch: pytest.MonkeyPatch,
+    dtype: torch.dtype,
     contributors: int,
 ):
     import xorl.distributed.canonical_moe as canonical_moe
 
     monkeypatch.setattr(canonical_moe, "_CANONICAL_MOE_FP32_FOLD_MAX_LEVEL_BYTES", 128)
-    actual_leaf = torch.randn((contributors, 7, 11), dtype=torch.bfloat16, requires_grad=True)
-    expected_leaf = actual_leaf.detach().clone().requires_grad_(True)
-    grad_output = torch.randn((7, 11), dtype=torch.bfloat16)
+    backing = torch.arange(contributors * 13 * 5, dtype=torch.float32).reshape(contributors, 13, 5)
+    partials = backing.transpose(1, 2).to(dtype)
+    assert not partials.is_contiguous()
 
-    actual = canonical_moe_fold_fp32_v2(actual_leaf)
-    expected = _explicit_tree(expected_leaf)
-    actual_grad = torch.autograd.grad(actual, actual_leaf, grad_outputs=grad_output)[0]
-    expected_grad = torch.autograd.grad(expected, expected_leaf, grad_outputs=grad_output)[0]
+    actual = canonical_moe_fold_fp32_v2(partials)
+    expected = _explicit_tree(partials)
 
-    assert torch.equal(actual.view(torch.uint16), expected.view(torch.uint16))
-    assert torch.equal(actual_grad.view(torch.uint16), expected_grad.view(torch.uint16))
+    assert torch.equal(actual.view(torch.uint16), expected.contiguous().view(torch.uint16))
 
 
 @pytest.mark.cpu
@@ -455,17 +482,27 @@ def test_fold_exact_vectors_under_fp32_tree(
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("contributors", [8, 16])
-def test_shared_fold_replays_in_cuda_graph(contributors: int):
+def test_shared_fold_replays_in_cuda_graph(monkeypatch: pytest.MonkeyPatch, contributors: int):
+    import xorl.distributed.canonical_moe as canonical_moe
+
+    # Force the graph through the chunk loop without making the unit test
+    # production-sized. The production-shape allocator bound is tested below.
+    monkeypatch.setattr(canonical_moe, "_CANONICAL_MOE_FP32_FOLD_MAX_LEVEL_BYTES", 32 * 1024)
     partials = torch.randn((contributors, 64, 32), device="cuda", dtype=torch.bfloat16)
+    assert _canonical_moe_fp32_fold_chunk_elements(contributors) < partials[0].numel()
     canonical_moe_fold_fp32_v2(partials)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         folded = canonical_moe_fold_fp32_v2(partials)
+    graph.replay()
+    torch.cuda.synchronize()
+    assert torch.equal(folded, _explicit_tree(partials))
     first = folded.clone()
     partials[0].add_(8.0)
     graph.replay()
+    torch.cuda.synchronize()
 
     assert not torch.equal(first, folded)
     assert torch.equal(folded, _explicit_tree(partials))
@@ -473,13 +510,13 @@ def test_shared_fold_replays_in_cuda_graph(contributors: int):
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_production_shaped_ep16_fold_has_bounded_peak_workspace():
+@pytest.mark.parametrize("strided", [False, True])
+def test_production_shaped_ep16_fold_has_bounded_peak_workspace(strided: bool):
     contributors, rows, payload = 16, 4096, 6144
-    partials = torch.empty(
-        (contributors, rows, payload),
-        device="cuda",
-        dtype=torch.bfloat16,
-    )
+    storage_shape = (contributors, payload, rows) if strided else (contributors, rows, payload)
+    storage = torch.empty(storage_shape, device="cuda", dtype=torch.bfloat16)
+    partials = storage.transpose(1, 2) if strided else storage
+    assert partials.is_contiguous() is not strided
     for contributor in range(contributors):
         partials[contributor].fill_(float(contributor - 8) / 16.0)
     torch.cuda.synchronize()

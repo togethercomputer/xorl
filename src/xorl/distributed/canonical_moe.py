@@ -20,6 +20,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from enum import Enum, IntEnum
+from itertools import product
 from typing import Any
 
 import torch
@@ -686,15 +687,8 @@ def canonical_moe_fold_fp32_v2(partials_by_logical_ordinal: torch.Tensor) -> tor
     if contributor_count <= 0:
         raise ValueError("Canonical MoE fold requires a positive contributor count")
 
-    # Production arrivals are contiguous, so this is a view and does not copy
-    # the complete BF16/FP16 transport tensor.  ``reshape`` preserves support
-    # for an unusual strided caller and may copy only in that fallback case.
-    payload_elements = partials.numel() // contributor_count
-    flat_partials = (
-        partials.view(contributor_count, payload_elements)
-        if partials.is_contiguous()
-        else partials.reshape(contributor_count, payload_elements)
-    )
+    payload_shape = partials.shape[1:]
+    payload_elements = partials[0].numel()
     chunk_elements = _canonical_moe_fp32_fold_chunk_elements(contributor_count)
     if payload_elements <= chunk_elements:
         return _canonical_moe_fold_fp32_tree(partials).to(partials.dtype)
@@ -704,12 +698,37 @@ def canonical_moe_fold_fp32_v2(partials_by_logical_ordinal: torch.Tensor) -> tor
     # axis therefore preserves the exact adjacent-pair FP32 tree.  Store every
     # completed element once at the declared low-precision boundary instead of
     # ever materializing the complete contributor tensor in FP32.
-    output = torch.empty((payload_elements,), dtype=partials.dtype, device=partials.device)
-    for start in range(0, payload_elements, chunk_elements):
-        end = min(start + chunk_elements, payload_elements)
-        folded_fp32 = _canonical_moe_fold_fp32_tree(flat_partials[:, start:end])
-        output[start:end] = folded_fp32.to(partials.dtype)
-    return output.view(partials.shape[1:])
+    output = torch.empty(payload_shape, dtype=partials.dtype, device=partials.device)
+    if partials.is_contiguous():
+        flat_partials = partials.view(contributor_count, -1)
+        flat_output = output.view(-1)
+        for start in range(0, payload_elements, chunk_elements):
+            end = min(start + chunk_elements, payload_elements)
+            folded_fp32 = _canonical_moe_fold_fp32_tree(flat_partials[:, start:end])
+            flat_output[start:end] = folded_fp32.to(partials.dtype)
+        return output
+
+    # A whole-tensor ``reshape`` of a strided arrival silently materializes the
+    # complete low-precision contributor payload before the bounded FP32 fold.
+    # Instead, choose a rectangular payload tile whose element count fits the
+    # same budget. Each sliced source view may be strided, but its promotion can
+    # materialize at most ``contributor_count * chunk_elements`` FP32 values.
+    remaining = chunk_elements
+    reversed_tile_shape = []
+    for extent in reversed(payload_shape):
+        tile_extent = min(extent, max(1, remaining))
+        reversed_tile_shape.append(tile_extent)
+        remaining = max(1, remaining // tile_extent)
+    tile_shape = tuple(reversed(reversed_tile_shape))
+    tile_starts = tuple(range(0, extent, tile_extent) for extent, tile_extent in zip(payload_shape, tile_shape))
+    for starts in product(*tile_starts):
+        payload_slice = tuple(
+            slice(start, min(start + tile_extent, extent))
+            for start, tile_extent, extent in zip(starts, tile_shape, payload_shape)
+        )
+        folded_fp32 = _canonical_moe_fold_fp32_tree(partials[(slice(None), *payload_slice)])
+        output[payload_slice] = folded_fp32.to(partials.dtype)
+    return output
 
 
 def canonical_moe_reduce_reference(
