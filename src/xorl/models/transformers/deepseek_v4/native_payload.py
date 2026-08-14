@@ -1464,14 +1464,18 @@ def dsv4_native_shared_expert_tp_partial(
 class _Dsv4RoutedSharedJoin(torch.autograd.Function):
     @staticmethod
     def forward(ctx, routed: torch.Tensor, shared: torch.Tensor, scale: float):
+        from xorl.distributed.canonical_moe import canonical_moe_leaf_fp32_v1  # noqa: PLC0415
+
         ctx.scale = scale
-        result = shared.clone()
-        result.add_(routed, alpha=scale)
-        return result
+        ctx.routed_dtype = routed.dtype
+        ctx.shared_dtype = shared.dtype
+        return canonical_moe_leaf_fp32_v1(shared, routed, routed_scale=scale)
 
     @staticmethod
     def backward(ctx, grad_output):
-        return grad_output * ctx.scale, grad_output, None
+        grad_routed = (grad_output.float() * ctx.scale).to(ctx.routed_dtype)
+        grad_shared = grad_output.to(ctx.shared_dtype)
+        return grad_routed, grad_shared, None
 
 
 def dsv4_join_routed_shared_partial(
@@ -1480,7 +1484,7 @@ def dsv4_join_routed_shared_partial(
     *,
     routed_scaling_factor: float,
 ) -> torch.Tensor:
-    """Match SGLang's ``shared.add_(routed, alpha=scale)`` boundary."""
+    """Match the exact serving leaf: FP32 FMA, then one BF16 transport cast."""
 
     return _Dsv4RoutedSharedJoin.apply(routed, shared, routed_scaling_factor)
 

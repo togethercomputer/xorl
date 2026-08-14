@@ -1,7 +1,7 @@
 """DSV4-Flash native-EP combine over the shared canonical FP32-v2 fold.
 
 Since the canonical-fold unification, DSV4 reduces MoE partials with the
-same adjacent-pair FP32 tree as the Qwen3.5/GLM exact lanes
+same version-2 adjacent-pair FP32 tree as the Qwen3.5/GLM exact lanes
 (``canonical_moe_fold_fp32_v2`` in ``xorl.distributed.canonical_moe``); serving
 mirrors this by routing its post-experts combine through the gated
 canonical all-reduce instead of relying on pinned NCCL tree behavior.
@@ -143,7 +143,7 @@ def exchange_variable_and_canonical_fold(
     row_counts: tuple[int, ...],
     source_ordinal: int,
 ) -> torch.Tensor:
-    """Variable-row partial exchange + the shared canonical FP32-v2 fold.
+    """Variable-row BF16 exchange + the shared canonical FP32-v2 fold.
 
     ``partial`` contains every rank's live rows in destination-rank order.
     Raw all-to-all returns this destination's rows from each source rank;

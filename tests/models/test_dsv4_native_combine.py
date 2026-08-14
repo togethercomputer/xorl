@@ -115,3 +115,40 @@ def test_variable_exchange_routes_a_ragged_nonzero_owner(monkeypatch):
     )
     expected = canonical_moe_fold_fp32_v2(arrivals.reshape(8, local_rows, 4))
     assert torch.equal(result, expected)
+
+
+def test_variable_exchange_folds_local_arrivals_in_fp32_and_backpropagates(monkeypatch):
+    """BF16 transport is unchanged; every source-tree add happens in FP32."""
+
+    import xorl.distributed.moe.comm as comm  # noqa: PLC0415
+
+    row_counts = (1,) * 8
+    partial = torch.tensor(
+        [[4096.0], [1.0], [-4096.0], [1.0], [0.0], [0.0], [0.0], [0.0]],
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+
+    def fake_apply(group, value, output_splits, input_splits):
+        assert group == "group"
+        assert value.dtype is torch.bfloat16
+        assert output_splits == [1] * 8
+        assert input_splits == [1] * 8
+        return value
+
+    monkeypatch.setattr(comm._AllToAll, "apply", fake_apply)
+    result = exchange_variable_and_canonical_fold(
+        partial,
+        "group",
+        row_counts,
+        source_ordinal=0,
+    )
+
+    # The retired BF16-node tree loses both unit contributions.  Promoting the
+    # rank-ordered arrivals once and retaining FP32 through the complete tree
+    # yields 2.0 before the single BF16 consumer-boundary cast.
+    assert result.dtype is torch.bfloat16
+    assert torch.equal(result, torch.tensor([[2.0]], dtype=torch.bfloat16))
+
+    result.float().sum().backward()
+    assert torch.equal(partial.grad, torch.ones_like(partial))
