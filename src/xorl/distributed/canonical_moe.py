@@ -235,7 +235,10 @@ class ParallelPlan:
         # Contributors are expert shards, not attention/row-placement shards.
         # CP16 happens to alias EP16 in the original admitted trainer topology,
         # but DP-attention keeps CP1 while retaining the same sixteen expert
-        # contributors and the same arithmetic tree.
+        # contributors and the same arithmetic tree. EP1 is therefore the
+        # identity only when the local partial is already the complete,
+        # unsharded arithmetic program; this plan does not imply parity with a
+        # sampler that still produces a larger TP-local contributor group.
         return self.ep_size
 
     def validate(self) -> None:
@@ -243,8 +246,8 @@ class ParallelPlan:
             raise ValueError(f"Unsupported canonical MoE contract version: {self.contract_version}")
         if self.world_size <= 0:
             raise ValueError("world_size must be positive")
-        if self.ep_size <= 1 or self.ep_size & (self.ep_size - 1):
-            raise ValueError("canonical_moe_reduce_v1 requires a power-of-two contributor count greater than one")
+        if self.ep_size <= 0:
+            raise ValueError("canonical_moe_reduce_v1 requires a positive contributor count")
         if len(self.combine_groups) != len(self.logical_ordinals_by_group):
             raise ValueError("combine_groups and logical_ordinals_by_group must have equal lengths")
 
@@ -605,8 +608,9 @@ def _validate_runtime_plan(
 def canonical_moe_fold_v1(partials_by_logical_ordinal: torch.Tensor) -> torch.Tensor:
     """Fold identity-ordered contributions with the version-1 BF16 tree.
 
-    The trainer half of serving's ``canonical_moe_fold_v1`` (the balanced
-    adjacent-pair BF16 tree with round-to-nearest-even after every add).
+    The trainer half of serving's ``canonical_moe_fold_v1`` (adjacent BF16
+    pairs at every level, carrying an unpaired final contributor unchanged,
+    with round-to-nearest-even after every add).
     Per this module's doctrine the arithmetic is a deliberate independent
     implementation — it must never import the serving fold, so the pair
     cannot self-confirm.
@@ -623,12 +627,17 @@ def canonical_moe_fold_v1(partials_by_logical_ordinal: torch.Tensor) -> torch.Te
     if partials.dtype is not torch.bfloat16:
         raise TypeError("Canonical MoE fold requires BF16 inputs")
     contributor_count = partials.shape[0]
-    if contributor_count <= 1 or contributor_count & (contributor_count - 1):
-        raise ValueError("Canonical MoE fold requires a power-of-two contributor count greater than one")
+    if contributor_count <= 0:
+        raise ValueError("Canonical MoE fold requires a positive contributor count")
 
     level = partials
     while level.shape[0] > 1:
-        level = (level[0::2] + level[1::2]).to(torch.bfloat16)
+        pair_count = level.shape[0] // 2
+        paired = (level[: 2 * pair_count : 2] + level[1 : 2 * pair_count : 2]).to(torch.bfloat16)
+        if level.shape[0] % 2:
+            level = torch.cat((paired, level[-1:]), dim=0)
+        else:
+            level = paired
     return level[0]
 
 

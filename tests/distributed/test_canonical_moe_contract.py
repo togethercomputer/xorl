@@ -45,12 +45,15 @@ def test_dense_transport_default_bounds_dp_owned_capacity_without_a_selector():
 def _explicit_tree(partials: torch.Tensor) -> torch.Tensor:
     current = [partials[index] for index in range(partials.shape[0])]
     while len(current) > 1:
-        current = [(current[index] + current[index + 1]).bfloat16() for index in range(0, len(current), 2)]
+        next_level = [(current[index] + current[index + 1]).bfloat16() for index in range(0, len(current) - 1, 2)]
+        if len(current) % 2:
+            next_level.append(current[-1])
+        current = next_level
     return current[0]
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize("contributors", [2, 4, 8, 16, 32])
+@pytest.mark.parametrize("contributors", [1, 2, 3, 4, 5, 6, 8, 16, 17, 32])
 def test_reference_is_the_adjacent_bf16_tree(contributors: int):
     assert CANONICAL_MOE_FOLD_VERSION == "canonical_moe_fold_v1"
     rows = contributors + 2
@@ -76,6 +79,55 @@ def test_reference_is_the_adjacent_bf16_tree(contributors: int):
     expected[~metadata.valid_mask] = 0
     assert torch.equal(result, expected)
     assert torch.equal(canonical_moe_fold_v1(padded), _explicit_tree(padded))
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("contributors", "expected_bits"),
+    [
+        (1, (0x4580, 0x3F80)),
+        (2, (0x4580, 0x4040)),
+        (3, (0x0000, 0x40C0)),
+        (4, (0x0000, 0x4120)),
+        (5, (0x4500, 0x4170)),
+        (6, (0x4500, 0x41A8)),
+        (8, (0x0000, 0x4210)),
+        (16, (0x0000, 0x4308)),
+        (17, (0x3F80, 0x4319)),
+    ],
+)
+def test_fold_exact_vectors_and_legacy_power_of_two_bytes(
+    contributors: int,
+    expected_bits: tuple[int, int],
+):
+    first_column = [
+        4096.0,
+        1.0,
+        -4096.0,
+        1.0,
+        2048.0,
+        1.0,
+        -2048.0,
+        1.0,
+        1024.0,
+        0.5,
+        -1024.0,
+        0.5,
+        512.0,
+        0.25,
+        -512.0,
+        0.25,
+        1.0,
+    ]
+    partials = torch.tensor(
+        list(zip(first_column, range(1, 18), strict=True)),
+        dtype=torch.bfloat16,
+    )
+
+    actual = canonical_moe_fold_v1(partials[:contributors])
+
+    assert tuple(actual.view(torch.uint16).tolist()) == expected_bits
+    assert torch.equal(actual, _explicit_tree(partials[:contributors]))
 
 
 @pytest.mark.gpu
@@ -144,6 +196,19 @@ def test_transport_auto_selects_only_regression_qualified_packed_geometry():
         )
         is CanonicalMoETransport.DENSE_V1
     )
+    for contributors in (1, 3, 5, 6, 17):
+        plan = ParallelPlan.primitive(contributors)
+        assert (
+            resolve_canonical_moe_transport(
+                "auto",
+                plan=plan,
+                capacity=34,
+                local_rows=2,
+                graph_mode=False,
+                consumer_sharded_output=True,
+            )
+            is CanonicalMoETransport.DENSE_V1
+        )
 
     ep8 = ParallelPlan.primitive(8)
     assert (
@@ -325,6 +390,41 @@ def test_exact_parallel_plans_hash_launcher_spelling_and_fail_closed():
     payload["logical_ordinals_by_group"] = (tuple(reversed(range(8))),)
     with pytest.raises(ValueError, match="identity logical contributor ordinals"):
         ParallelPlan(**payload)
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize("contributors", [1, 3, 5, 6, 17])
+def test_parallel_plan_records_any_declared_positive_complete_contributor_group(
+    contributors: int,
+):
+    primitive = ParallelPlan.primitive(contributors)
+    trainer = ParallelPlan.glm52_trainer(
+        world_size=contributors,
+        dp_size=1,
+        cp_size=contributors,
+        contributor_count=contributors,
+    )
+    sampler = ParallelPlan.glm52_sampler(launcher_tp_size=contributors)
+
+    for plan in (primitive, trainer, sampler):
+        assert plan.contributor_count == contributors
+        assert plan.combine_groups == (tuple(range(contributors)),)
+        assert plan.logical_ordinals_by_group == (tuple(range(contributors)),)
+
+    # These plans describe a declared complete local contributor group. They
+    # do not assert that a TP-sharded sampler with a different contributor
+    # count is byte-equivalent to an EP1 trainer identity.
+    if contributors == 1:
+        local_complete = torch.tensor([[3.0, -2.0]], dtype=torch.bfloat16)
+        assert torch.equal(canonical_moe_fold_v1(local_complete), local_complete[0])
+
+
+@pytest.mark.cpu
+def test_parallel_plan_and_fold_reject_only_nonpositive_contributor_counts():
+    with pytest.raises(ValueError, match="positive"):
+        ParallelPlan.primitive(0)
+    with pytest.raises(ValueError, match="positive contributor count"):
+        canonical_moe_fold_v1(torch.empty((0, 2), dtype=torch.bfloat16))
 
 
 @pytest.mark.cpu
