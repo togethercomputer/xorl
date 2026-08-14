@@ -11,9 +11,25 @@ from xorl.server.runner.adapters import manager as manager_impl
 from xorl.server.runner.adapters.manager import LocalModelPartsView, LoRAAdapterManager
 from xorl.server.runner.adapters.sharded_state import AdapterTensorLayout, discover_adapter_layouts
 from xorl.server.runner.model_runner import ModelRunner
+from xorl.trainers.model_builder import build_training_model
 
 
 pytestmark = [pytest.mark.cpu, pytest.mark.server]
+
+
+def test_server_virtual_pp_rejects_before_foundation_model_construction(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "xorl.trainers.model_builder.build_foundation_model",
+        lambda **_kwargs: pytest.fail("virtual server PP must reject before model construction"),
+    )
+
+    with pytest.raises(NotImplementedError, match="checkpoint, publication, and optimizer mutation"):
+        build_training_model(
+            config_path="unused",
+            weights_path="unused",
+            server_training=True,
+            pp_virtual_stages=2,
+        )
 
 
 def _bare_manager(*, pp_size: int, stage_group: object) -> LoRAAdapterManager:

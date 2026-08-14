@@ -937,9 +937,11 @@ def build_parallelize_model(
                 f"donated buffers (retain_graph backward through compiled regions)."
             )
         if pp_virtual_stages > 1 and ps.ep_enabled:
-            # EP-aware optimizer/state-dict plumbing is single-part-per-rank today.
+            # Server training rejects every virtual-stage configuration before
+            # model construction. This remaining guard is for the offline path,
+            # where dense virtual PP is supported but EP-aware state is not.
             raise NotImplementedError(
-                "Virtual PP stages (pipeline_parallel_virtual_stages > 1) are not yet supported with "
+                "Offline virtual PP stages (pipeline_parallel_virtual_stages > 1) are not yet supported with "
                 "expert parallelism; use a one-stage-per-rank schedule (1F1B/GPipe) for MoE+EP."
             )
 

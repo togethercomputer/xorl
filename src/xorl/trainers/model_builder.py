@@ -318,6 +318,13 @@ def build_training_model(
     Returns a :class:`TrainingModelResult` with model, config, PP state, etc.
     """
 
+    if server_training and pp_virtual_stages > 1:
+        raise NotImplementedError(
+            "Server training does not yet support pipeline_parallel_virtual_stages > 1: "
+            "checkpoint, publication, and optimizer mutation must cover every local model part first. "
+            "Use physical pipeline parallelism with one stage per rank "
+            "(pipeline_parallel_virtual_stages=1)."
+        )
     if rope_class_b is True and rope_native is False:
         raise ValueError(
             "rope_class_b=True requires rope_native=True: the Class-B contract uses "
