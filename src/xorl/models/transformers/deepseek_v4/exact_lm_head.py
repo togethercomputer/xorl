@@ -18,6 +18,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from xorl.distributed.canonical_moe import LogicalRowOwnership
 from xorl.lora.modules.linear import LoraLinear
 from xorl.ops.bi_families_v2 import exact_temperature_scale_bf16_logits
 from xorl.ops.exact_sampling_transforms import (
@@ -34,7 +35,6 @@ DSV4_LM_HEAD_VOCAB_SIZE = 129_280
 DSV4_LM_HEAD_HIDDEN_SIZE = 4_096
 DSV4_LM_HEAD_TP_SIZE = 8
 DSV4_LM_HEAD_LOCAL_VOCAB_SIZE = 16_160
-DSV4_LM_HEAD_GROUP_RANKS = tuple(range(DSV4_LM_HEAD_TP_SIZE))
 DSV4_EXACT_LM_HEAD_LOCAL_CHUNK_ROWS = 1
 
 
@@ -349,14 +349,14 @@ class _Dsv4ExactDistributedHeadFunction(torch.autograd.Function):
                 gathered_temperature,
                 gathered_sampling_transforms,
             )
-        source_rank = dist.get_rank(group)
-        rows = row_counts[source_rank]
-        source_offset = sum(row_counts[:source_rank])
+        source_ordinal = component.source_ordinal
+        rows = row_counts[source_ordinal]
+        source_offset = sum(row_counts[:source_ordinal])
         local_logprob = gathered_logprob.narrow(0, source_offset, rows).contiguous()
         ctx.set_materialize_grads(False)
         ctx.component = component
         ctx.local_rows = rows
-        ctx.source_rank = source_rank
+        ctx.source_ordinal = source_ordinal
         ctx.source_offset = source_offset
         ctx.row_counts = row_counts
         ctx.padded_rows = padded_rows
@@ -453,24 +453,26 @@ class Dsv4ExactTP8LmHeadSelectedLogprob(nn.Module):
         *,
         tp_rank: int,
         tp_group: dist.ProcessGroup,
-        expected_group_ranks: tuple[int, ...] = DSV4_LM_HEAD_GROUP_RANKS,
+        source_ordinal: int | None = None,
+        physical_ranks: tuple[int, ...] | None = None,
     ) -> None:
         super().__init__()
         self.shard = dsv4_lm_head_shard(tp_rank)
         self.tp_group = tp_group
-        self.expected_group_ranks = tuple(int(rank) for rank in expected_group_ranks)
-        if len(self.expected_group_ranks) != DSV4_LM_HEAD_TP_SIZE:
-            raise ValueError("DSV4 exact lm-head expected group must contain exactly 8 ranks")
+        self.source_ordinal = tp_rank if source_ordinal is None else source_ordinal
+        self.physical_ranks = physical_ranks
 
     def _validate_tp_group(self) -> dist.ProcessGroup:
         group = self.tp_group
         if group is None or not dist.is_initialized():
             raise RuntimeError("DSV4 exact lm head requires an initialized TP8 group")
         ranks = tuple(dist.get_process_group_ranks(group))
+        expected_ranks = ranks if self.physical_ranks is None else self.physical_ranks
         if (
             dist.get_world_size(group) != DSV4_LM_HEAD_TP_SIZE
-            or ranks != self.expected_group_ranks
+            or ranks != expected_ranks
             or dist.get_rank(group) != self.shard.tp_rank
+            or dist.get_rank(group) != self.source_ordinal
             or dist.get_rank() != ranks[self.shard.tp_rank]
         ):
             raise RuntimeError("DSV4 exact lm-head TP8 rank/order mismatch")
@@ -788,35 +790,35 @@ def bind_dsv4_exact_lm_head(model: nn.Module) -> None:
         raise TypeError("DSV4 exact active LoRA requires an injected LoraLinear lm_head")
     state = get_parallel_state()
     group = getattr(state, "lm_head_tp_group", None)
-    if getattr(state, "tp_size", 0) != 1:
-        raise RuntimeError("DSV4 exact active-LoRA lm head requires body TP1")
-    if getattr(state, "lm_head_tp_size", 0) != DSV4_LM_HEAD_TP_SIZE or group is None:
-        raise RuntimeError("DSV4 exact active-LoRA lm head requires an initialized lm-head TP8 group")
-    if not dist.is_initialized() or dist.get_world_size(group) != DSV4_LM_HEAD_TP_SIZE:
-        raise RuntimeError("DSV4 exact active-LoRA lm head requires an initialized lm-head TP8 group")
-    group_ranks = tuple(dist.get_process_group_ranks(group))
-    device_mesh = getattr(state, "device_mesh", None)
-    coordinate = None if device_mesh is None else device_mesh.get_coordinate()
-    if device_mesh is None or coordinate is None:
-        raise RuntimeError("DSV4 exact active-LoRA lm head requires a live device mesh")
-    mesh = device_mesh.mesh
-    dim_names = tuple(device_mesh.mesh_dim_names)
-    if "pp" in dim_names:
-        pp_dim = dim_names.index("pp")
-        stage_ranks = {int(rank) for rank in mesh.select(pp_dim, int(coordinate[pp_dim])).reshape(-1).tolist()}
-    else:
-        stage_ranks = {int(rank) for rank in mesh.reshape(-1).tolist()}
-    if not set(group_ranks).issubset(stage_ranks):
-        raise RuntimeError(
-            "DSV4 exact active-LoRA lm-head TP8 group crosses the current pipeline stage: "
-            f"group={group_ranks}, stage={sorted(stage_ranks)}"
-        )
+    ownership = LogicalRowOwnership(
+        dp_size=int(state.dp_size),
+        cp_size=int(state.cp_size),
+        dp_rank=int(state.dp_rank),
+        cp_rank=(int(state.cp_rank) if state.cp_enabled else 0),
+        contributor_count=DSV4_LM_HEAD_TP_SIZE,
+    )
+    if (
+        getattr(state, "tp_size", 0) != 1
+        or getattr(state, "ep_size", 0) != DSV4_LM_HEAD_TP_SIZE
+        or getattr(state, "lm_head_tp_size", 0) != DSV4_LM_HEAD_TP_SIZE
+        or group is None
+    ):
+        raise RuntimeError("DSV4 exact active-LoRA lm head requires body TP1, EP8, and stage-local lm-head TP8")
+    head_ranks = tuple(dist.get_process_group_ranks(group))
+    ep_group = state.ep_group
+    if (
+        ep_group is None
+        or tuple(dist.get_process_group_ranks(ep_group)) != head_ranks
+        or dist.get_rank(group) != ownership.source_ordinal
+    ):
+        raise RuntimeError("DSV4 exact lm-head TP8 must span the DP-major/CP-minor owner plane")
     tp_rank = int(dist.get_rank(group))
     lm_head.__class__ = Dsv4ExactTP8LmHeadLoraLinear
     lm_head._dsv4_exact_selected_logprob = Dsv4ExactTP8LmHeadSelectedLogprob(
         tp_rank=tp_rank,
         tp_group=group,
-        expected_group_ranks=group_ranks,
+        source_ordinal=ownership.source_ordinal,
+        physical_ranks=head_ranks,
     )
     lm_head._dsv4_exact_replicated_parameter_names = ("lora_A",)
 

@@ -30,6 +30,8 @@ import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 
+from xorl.distributed.canonical_moe import LogicalRowOwnership
+from xorl.distributed.parallel_state import get_parallel_state
 from xorl.lora.expert_adapter_contract import DSV4_CLAMPED_SWIGLU_LORA_PROGRAM
 from xorl.lora.modules.linear import LoraLinear
 from xorl.models.base import XorlPreTrainedModel
@@ -987,8 +989,31 @@ class DeepseekV4MoE(MoEBlock):
         ep_group = parallel_state.ep_group
         ep_size = int(parallel_state.ep_size)
         ep_rank = int(parallel_state.ep_rank)
+        ownership = LogicalRowOwnership(
+            dp_size=int(parallel_state.dp_size),
+            cp_size=int(parallel_state.cp_size),
+            dp_rank=int(parallel_state.dp_rank),
+            cp_rank=(int(parallel_state.cp_rank) if parallel_state.cp_enabled else 0),
+            contributor_count=ep_size,
+        )
+        if int(parallel_state.tp_size) != 1:
+            raise RuntimeError("Exact DSV4 requires stage-local body TP1")
         if ep_size != 8:
             raise RuntimeError("Exact DSV4 MoE combine requires EP8")
+        if ep_group is None or ep_rank != ownership.source_ordinal:
+            raise RuntimeError(
+                "Exact DSV4 EP order must match DP-major/CP-minor logical row ownership: "
+                f"ep_rank={ep_rank}, source_ordinal={ownership.source_ordinal}"
+            )
+        get_group_ranks = getattr(dist, "get_process_group_ranks", None)
+        if get_group_ranks is not None and ownership.cp_size > 1:
+            cp_group = parallel_state.sp_group
+            if cp_group is None:
+                raise RuntimeError("Exact DSV4 CP-owned rows require a stage-local CP group")
+            ep_ranks = tuple(get_group_ranks(ep_group))
+            expected_cp_ranks = tuple(ep_ranks[index] for index in ownership.context_source_ordinals)
+            if tuple(get_group_ranks(cp_group)) != expected_cp_ranks:
+                raise RuntimeError("Exact DSV4 CP membership does not match the DP-major owner plane")
         row_counts = row_counts_for_ep_combine(live_token_count, local_hidden.device, ep_group)
         if sum(row_counts) == 0:
             return torch.zeros_like(hidden_states), hidden_states.new_zeros(
@@ -1065,7 +1090,7 @@ class DeepseekV4MoE(MoEBlock):
             local_partial,
             ep_group,
             row_counts,
-            ep_rank,
+            ownership.source_ordinal,
         )
         validate_lora_metadata("EP exchange/combine")
         self._capture_diagnostic_component("moe_native_combined", combined)
@@ -1074,7 +1099,7 @@ class DeepseekV4MoE(MoEBlock):
                 f"Exact DSV4 combine returned {combined.shape[0]} rows for {live_token_count} live local rows"
             )
         padded_combined = torch.cat((combined, local_hidden[live_token_count:] * 0.0), dim=0)
-        own_start = sum(row_counts[:ep_rank])
+        own_start = sum(row_counts[: ownership.source_ordinal])
         local_router_logits = router_logits[own_start : own_start + live_token_count]
         local_router_logits = torch.cat(
             (
@@ -1198,7 +1223,11 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             h3d = self.post_attention_layernorm(h3d)
         self._capture_diagnostic_component("post_attention_norm", h3d)
-        ffn_out, router_logits = self.mlp(h3d, input_ids=input_ids, live_token_count=live_token_count)
+        ffn_out, router_logits = self.mlp(
+            h3d,
+            input_ids=input_ids,
+            live_token_count=live_token_count,
+        )
         if os.environ.get("XORL_DSV4_DIAGNOSTIC_BASE_MARLIN") == "1":
             from .native_payload import _validate_all_single_adapter_batch_infos  # noqa: PLC0415
 
@@ -1573,6 +1602,7 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
         packed_sequence_length = int(h3d.shape[1])
         exact_compute_token_count = packed_sequence_length
         if getattr(self.config, "_dsv4_flash_exact_mode", False):
+            parallel_state = get_parallel_state()
             sample_lengths = kwargs.pop("_r3_sample_lengths", None)
             num_samples = kwargs.pop("num_samples", None)
             packed_rows = int(h3d.shape[0] * h3d.shape[1])
@@ -1605,12 +1635,12 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
                 )
             compute_rows = torch.tensor([live_token_count], dtype=torch.int64, device=h3d.device)
             if dist.is_available() and dist.is_initialized():
-                from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
-
+                if parallel_state.ep_group is None:
+                    raise RuntimeError("Exact DSV4 row compaction requires a stage-local EP8 group")
                 dist.all_reduce(
                     compute_rows,
                     op=dist.ReduceOp.MAX,
-                    group=get_parallel_state().loss_group,
+                    group=parallel_state.ep_group,
                 )
             exact_compute_token_count = int(compute_rows.item())
             if not 0 <= exact_compute_token_count <= packed_sequence_length:

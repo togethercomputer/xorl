@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from xorl.distributed.canonical_moe import LogicalRowOwnership
 from xorl.models.auto import resolve_cross_entropy_mode
 from xorl.models.transformers.deepseek_v4 import DeepseekV4Config
 from xorl.models.transformers.deepseek_v4.exact_contract import (
@@ -101,6 +102,22 @@ def test_official_geometry_is_fail_closed() -> None:
     config.compress_ratios[2] = 128
     with pytest.raises(ValueError, match="C0/C4/C128 schedule"):
         validate_dsv4_flash_official_geometry(config)
+
+
+@pytest.mark.parametrize("dp_size,cp_size", [(1, 8), (2, 4), (4, 2), (8, 1)])
+def test_dsv4_owner_plane_accepts_every_dp_cp_factorization(dp_size: int, cp_size: int) -> None:
+    ordinals = []
+    for dp_rank in range(dp_size):
+        for cp_rank in range(cp_size):
+            ownership = LogicalRowOwnership(
+                dp_size,
+                cp_size,
+                dp_rank,
+                cp_rank,
+                contributor_count=8,
+            )
+            ordinals.append(ownership.source_ordinal)
+    assert ordinals == list(range(8))
 
 
 @pytest.mark.parametrize(

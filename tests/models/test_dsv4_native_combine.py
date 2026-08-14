@@ -41,7 +41,7 @@ def test_variable_exchange_applies_the_shared_canonical_fold(monkeypatch):
         return exchanged
 
     monkeypatch.setattr(comm._AllToAll, "apply", fake_apply)
-    result = exchange_variable_and_canonical_fold(partial, "group", row_counts, local_rank=0)
+    result = exchange_variable_and_canonical_fold(partial, "group", row_counts, source_ordinal=0)
     expected = canonical_moe_fold_fp32_v2(exchanged.reshape(ep_size, local_rows, 4))
     assert torch.equal(result, expected)
 
@@ -70,7 +70,7 @@ def test_canonical_fold_diverges_from_the_retired_nccl_chain(monkeypatch):
     )
     monkeypatch.setattr(comm._AllToAll, "apply", lambda *args: blocks)
 
-    result = exchange_variable_and_canonical_fold(partial, "group", row_counts, local_rank=0)
+    result = exchange_variable_and_canonical_fold(partial, "group", row_counts, source_ordinal=0)
     assert torch.equal(result, torch.full((1, 2), 2.015625, dtype=torch.bfloat16))
 
     chain = blocks[1]
@@ -86,5 +86,32 @@ def test_variable_exchange_returns_empty_for_zero_local_rows(monkeypatch):
     row_counts = (0, 2, 2, 2, 2, 2, 2, 2)
     partial = torch.randn(sum(row_counts), 4, dtype=torch.bfloat16)
     monkeypatch.setattr(comm._AllToAll, "apply", lambda *args: partial.new_zeros((0, 4)))
-    result = exchange_variable_and_canonical_fold(partial, "group", row_counts, local_rank=0)
+    result = exchange_variable_and_canonical_fold(partial, "group", row_counts, source_ordinal=0)
     assert result.shape == (0, 4)
+
+
+def test_variable_exchange_routes_a_ragged_nonzero_owner(monkeypatch):
+    import xorl.distributed.moe.comm as comm  # noqa: PLC0415
+
+    row_counts = (1, 3, 0, 2, 4, 1, 2, 1)
+    source_ordinal = 3
+    local_rows = row_counts[source_ordinal]
+    partial = torch.randn(sum(row_counts), 4, dtype=torch.bfloat16)
+    arrivals = torch.randn(8 * local_rows, 4, dtype=torch.bfloat16)
+
+    def fake_apply(group, value, output_splits, input_splits):
+        assert group == "group"
+        assert value is partial
+        assert output_splits == [local_rows] * 8
+        assert input_splits == list(row_counts)
+        return arrivals
+
+    monkeypatch.setattr(comm._AllToAll, "apply", fake_apply)
+    result = exchange_variable_and_canonical_fold(
+        partial,
+        "group",
+        row_counts,
+        source_ordinal=source_ordinal,
+    )
+    expected = canonical_moe_fold_fp32_v2(arrivals.reshape(8, local_rows, 4))
+    assert torch.equal(result, expected)

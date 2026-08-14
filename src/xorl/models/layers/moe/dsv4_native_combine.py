@@ -141,7 +141,7 @@ def exchange_variable_and_canonical_fold(
     partial: torch.Tensor,
     group,
     row_counts: tuple[int, ...],
-    local_rank: int,
+    source_ordinal: int,
 ) -> torch.Tensor:
     """Variable-row partial exchange + the shared canonical FP32-v2 fold.
 
@@ -157,13 +157,13 @@ def exchange_variable_and_canonical_fold(
     from xorl.distributed.moe.comm import _AllToAll  # noqa: PLC0415
 
     ep_size = len(row_counts)
-    if not 0 <= local_rank < ep_size:
-        raise ValueError(f"EP local rank {local_rank} is outside [0, {ep_size})")
+    if not 0 <= source_ordinal < ep_size:
+        raise ValueError(f"Logical row source {source_ordinal} is outside [0, {ep_size})")
     validate_dsv4_native_ep_combine_size(ep_size)
     total_rows = sum(row_counts)
     if partial.shape[0] != total_rows:
         raise ValueError(f"Partial rows {partial.shape[0]} do not match live row total {total_rows}")
-    local_rows = row_counts[local_rank]
+    local_rows = row_counts[source_ordinal]
     exchanged = _AllToAll.apply(
         group,
         partial.contiguous(),

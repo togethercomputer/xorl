@@ -132,6 +132,19 @@ def test_glm52_lm_head_tp_spans_composed_dp_cp_plane(dp_size: int, cp_size: int)
     assert mesh.tolist() == [[list(range(16))]]
 
 
+@pytest.mark.parametrize("dp_size,cp_size", [(1, 8), (2, 4), (4, 2), (8, 1)])
+def test_dsv4_lm_head_tp_spans_each_stage_owner_plane(dp_size: int, cp_size: int):
+    mesh = _build_stage_local_lm_head_mesh(
+        world_size=16,
+        pp_size=2,
+        dp_size=dp_size,
+        cp_size=cp_size,
+        tp_size=1,
+        lm_head_tp_size=8,
+    )
+    assert mesh.tolist() == [[list(range(8))], [list(range(8, 16))]]
+
+
 def test_glm52_lm_head_tp_groups_never_cross_pp_stages():
     mesh = _build_stage_local_lm_head_mesh(
         world_size=32,
