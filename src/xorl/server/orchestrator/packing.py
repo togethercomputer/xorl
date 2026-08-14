@@ -71,7 +71,19 @@ OPD_TOKEN_ALIGNED_FIELDS = (
     "opd_sample_ok",
 )
 
-CAUSAL_TARGET_ALIGNED_FIELDS = ("logprob_temperatures",)
+CAUSAL_TARGET_ALIGNED_FIELDS = (
+    "logprob_temperatures",
+    "logprob_top_ks",
+    "logprob_top_ps",
+    "logprob_min_ps",
+)
+
+NORMALIZED_SAMPLING_METADATA_FIELDS = {
+    "sampling_temperature": "logprob_temperatures",
+    "sampling_top_k": "logprob_top_ks",
+    "sampling_top_p": "logprob_top_ps",
+    "sampling_min_p": "logprob_min_ps",
+}
 
 # Packing strategies (see SequentialPacker for semantics).
 PACKING_STRATEGIES = ("sequential", "best_fit", "balanced_dp")
@@ -162,6 +174,57 @@ def shift_causal_target_aligned_fields(
                 f"({shifted_seq_len}) or original length ({original_seq_len})"
             )
         flattened_datum[key] = value[1:]
+
+
+def expand_normalized_sampling_metadata(
+    flattened_datum: Dict[str, Any],
+    seq_len: int,
+    sample_idx: int,
+) -> None:
+    """Expand normalized request-level sampler metadata to decision rows.
+
+    SGLang relays the normalized values actually consumed by its sampler under
+    ``sampling_*`` keys in response ``meta_info``.  The public XoRL request
+    schema represents scalar loss inputs as one-element lists, so accept either
+    a scalar or one-element container here and materialize the canonical
+    token-aligned ``logprob_*`` fields used by trainer replay.
+
+    This relays only transform parameters.  Exact support is recomputed from
+    each trainer forward's current logits; behavior-time support is never
+    accepted as replay input.
+    """
+    for source_key, target_key in NORMALIZED_SAMPLING_METADATA_FIELDS.items():
+        if source_key not in flattened_datum:
+            continue
+        if target_key in flattened_datum:
+            raise ValueError(f"Sample {sample_idx}: provide either {source_key} or {target_key}, not both")
+
+        value = flattened_datum.pop(source_key)
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+        if isinstance(value, (list, tuple)):
+            if len(value) != 1:
+                raise ValueError(f"Sample {sample_idx}: {source_key} must be a scalar or one-element container")
+            value = value[0]
+
+        if source_key == "sampling_top_k":
+            if isinstance(value, bool) or int(value) != value or int(value) < 1:
+                raise ValueError(f"Sample {sample_idx}: sampling_top_k must be an integer >= 1")
+            normalized_value: Union[int, float] = int(value)
+        else:
+            if isinstance(value, bool):
+                raise ValueError(f"Sample {sample_idx}: {source_key} must be numeric")
+            normalized_value = float(value)
+            if not math.isfinite(normalized_value):
+                raise ValueError(f"Sample {sample_idx}: {source_key} must be finite")
+            if source_key == "sampling_temperature" and normalized_value <= 0.0:
+                raise ValueError(f"Sample {sample_idx}: sampling_temperature must be > 0")
+            if source_key == "sampling_top_p" and not 0.0 < normalized_value <= 1.0:
+                raise ValueError(f"Sample {sample_idx}: sampling_top_p must be in (0, 1]")
+            if source_key == "sampling_min_p" and not 0.0 <= normalized_value <= 1.0:
+                raise ValueError(f"Sample {sample_idx}: sampling_min_p must be in [0, 1]")
+
+        flattened_datum[target_key] = [normalized_value] * seq_len
 
 
 def _resolve_teacher_cache_base(t_base: Any, t_cache: List[int]) -> int:
@@ -940,6 +1003,7 @@ class SequentialPacker(Packer):
             raise ValueError(f"Sample {sample_idx} missing 'input_ids'")
         if not isinstance(input_ids, list):
             input_ids = input_ids.tolist() if hasattr(input_ids, "tolist") else list(input_ids)
+        expand_normalized_sampling_metadata(flattened_datum, len(input_ids), sample_idx)
 
         # Extract labels/target_tokens
         if "labels" in flattened_datum:
@@ -1217,8 +1281,10 @@ class SequentialPacker(Packer):
                                 pad_value = (
                                     IGNORE_INDEX
                                     if key == "target_tokens"
+                                    else (1 << 30)
+                                    if key == "logprob_top_ks"
                                     else 1.0
-                                    if key == "logprob_temperatures"
+                                    if key in ("logprob_temperatures", "logprob_top_ps")
                                     else 0
                                 )
                                 value[0].extend([pad_value] * pad_length)
@@ -1278,6 +1344,7 @@ class SequentialPacker(Packer):
             raise ValueError(f"Sample {sample_idx} missing 'input_ids'")
         if not isinstance(input_ids, list):
             input_ids = input_ids.tolist() if hasattr(input_ids, "tolist") else list(input_ids)
+        expand_normalized_sampling_metadata(flattened_datum, len(input_ids), sample_idx)
 
         # Extract or generate position_ids
         if "position_ids" in flattened_datum:

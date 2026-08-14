@@ -100,6 +100,9 @@ def test_repack_loss_fields_and_token_roundtrip():
     ]
     b = _build_packed(seqs)
     b["logprob_temperatures"] = torch.linspace(0.7, 1.3, b["input_ids"].numel()).unsqueeze(0)
+    b["logprob_top_ks"] = torch.arange(1, b["input_ids"].numel() + 1).unsqueeze(0)
+    b["logprob_top_ps"] = torch.linspace(0.5, 0.9, b["input_ids"].numel()).unsqueeze(0)
+    b["logprob_min_ps"] = torch.linspace(0.0, 0.4, b["input_ids"].numel()).unsqueeze(0)
     out = shared_prefix_repack_batch(b)
     ctx = out["shared_prefix_context"]
     orig_ids = b["input_ids"].squeeze(0)
@@ -117,6 +120,11 @@ def test_repack_loss_fields_and_token_roundtrip():
         b["logprob_temperatures"].squeeze(0)[ctx.dec_orig_idx],
     )
     assert (out["logprob_temperatures"].squeeze(0)[ctx.shared_idx] == 1.0).all()
+    for key in ("logprob_top_ks", "logprob_top_ps", "logprob_min_ps"):
+        assert torch.equal(out[key].squeeze(0)[ctx.dec_idx], b[key].squeeze(0)[ctx.dec_orig_idx])
+    assert (out["logprob_top_ks"].squeeze(0)[ctx.shared_idx] == 1 << 30).all()
+    assert (out["logprob_top_ps"].squeeze(0)[ctx.shared_idx] == 1.0).all()
+    assert (out["logprob_min_ps"].squeeze(0)[ctx.shared_idx] == 0.0).all()
 
     # cu_seq_lens dropped (shared-prefix backend drives attention from the context)
     assert "cu_seq_lens_q" not in out

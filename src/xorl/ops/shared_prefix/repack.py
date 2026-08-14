@@ -45,12 +45,18 @@ _LOSS_FIELDS = (
     "logprobs",
     "rollout_logprobs",
     "logprob_temperatures",
+    "logprob_top_ks",
+    "logprob_top_ps",
+    "logprob_min_ps",
 )
 # Repacked fill values for the shared-prefix positions (never trained).
 _FILL = {
     "target_tokens": IGNORE_INDEX,
     "labels": IGNORE_INDEX,
     "logprob_temperatures": 1.0,
+    "logprob_top_ks": 1 << 30,
+    "logprob_top_ps": 1.0,
+    "logprob_min_ps": 0.0,
 }
 
 

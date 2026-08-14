@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional
 import torch
 import torch.distributed as dist
 
+from xorl.ops.exact_sampling_transforms import TOP_K_ALL
 from xorl.ops.loss.importance_sampling_loss import K3_DEBUG_THRESHOLDS
 from xorl.ops.loss.loss_output import LossOutput
 from xorl.ops.loss.per_token_ce import compute_per_token_ce
@@ -29,6 +30,9 @@ def cispo_loss_function(
     metric_reducer: Optional[Reducer] = None,
     lm_head: Optional[torch.nn.Module] = None,
     logprob_temperature: float = 1.0,
+    logprob_top_k: int | torch.Tensor = TOP_K_ALL,
+    logprob_top_p: float | torch.Tensor = 1.0,
+    logprob_min_p: float | torch.Tensor = 0.0,
 ) -> LossOutput:
     """Compute Tinker-compatible CISPO.
 
@@ -76,15 +80,20 @@ def cispo_loss_function(
         lm_head_fp32=lm_head_fp32,
         lm_head=lm_head,
         logprob_temperature=logprob_temperature,
+        logprob_top_k=logprob_top_k,
+        logprob_top_p=logprob_top_p,
+        logprob_min_p=logprob_min_p,
     )
 
+    current_support = torch.isfinite(per_token_ce)
     new_logprobs_flat = -per_token_ce.detach()
     log_ratio = (new_logprobs_flat - old_logprobs_flat).masked_fill(~valid_mask, 0.0)
     ratio = torch.exp(log_ratio)
     clipped_ratio = torch.clamp(ratio, clip_low_threshold, clip_high_threshold)
 
-    coefficient = (clipped_ratio.detach() * advantages_flat).masked_fill(~valid_mask, 0.0)
-    per_token_loss_flat = coefficient * per_token_ce
+    coefficient = (clipped_ratio.detach() * advantages_flat).masked_fill(~valid_mask | ~current_support, 0.0)
+    safe_per_token_ce = torch.where(current_support, per_token_ce, torch.zeros_like(per_token_ce))
+    per_token_loss_flat = coefficient * safe_per_token_ce
     loss = loss_reducer(per_token_loss_flat, valid_mask_f)
 
     is_clipped = (clipped_ratio != ratio) & valid_mask
@@ -105,12 +114,17 @@ def cispo_loss_function(
     metric_ops = {"ratio_min": "min", "ratio_max": "max"}
     if compute_kl_stats:
         with torch.no_grad():
-            per_token_k3 = ratio - log_ratio - 1.0
+            metric_log_ratio = torch.where(
+                current_support,
+                log_ratio,
+                torch.full_like(log_ratio, -20.0),
+            )
+            per_token_k3 = ratio - metric_log_ratio - 1.0
             if valid_mask.any():
                 k3_max = per_token_k3.masked_fill(~valid_mask, float("-inf")).max()
-                logratio_min = log_ratio.masked_fill(~valid_mask, float("inf")).min()
-                logratio_max = log_ratio.masked_fill(~valid_mask, float("-inf")).max()
-                abs_logratio_max = log_ratio.abs().masked_fill(~valid_mask, float("-inf")).max()
+                logratio_min = metric_log_ratio.masked_fill(~valid_mask, float("inf")).min()
+                logratio_max = metric_log_ratio.masked_fill(~valid_mask, float("-inf")).max()
+                abs_logratio_max = metric_log_ratio.abs().masked_fill(~valid_mask, float("-inf")).max()
             else:
                 k3_max = per_token_k3.new_tensor(float("-inf"))
                 logratio_min = log_ratio.new_tensor(float("inf"))
@@ -119,18 +133,19 @@ def cispo_loss_function(
             metrics["kl_sample_train_k3"] = metric_reducer(per_token_k3, valid_mask_f)
             metrics["kl_k3_debug_mean"] = metric_reducer(per_token_k3, valid_mask_f)
             metrics["kl_k3_debug_max"] = k3_max
-            metrics["kl_k3_debug_abs_logratio_mean"] = metric_reducer(log_ratio.abs(), valid_mask_f)
+            metrics["kl_k3_debug_abs_logratio_mean"] = metric_reducer(metric_log_ratio.abs(), valid_mask_f)
             metrics["kl_k3_debug_abs_logratio_max"] = abs_logratio_max
-            metrics["kl_k3_debug_logratio_mean"] = metric_reducer(log_ratio, valid_mask_f)
+            metrics["kl_k3_debug_logratio_mean"] = metric_reducer(metric_log_ratio, valid_mask_f)
             metrics["kl_k3_debug_logratio_min"] = logratio_min
             metrics["kl_k3_debug_logratio_max"] = logratio_max
-            metrics["kl_k3_debug_frac_logratio_positive"] = metric_reducer((log_ratio > 0).float(), valid_mask_f)
+            metrics["kl_k3_debug_frac_logratio_positive"] = metric_reducer((metric_log_ratio > 0).float(), valid_mask_f)
             for suffix, threshold in K3_DEBUG_THRESHOLDS:
                 metrics[f"kl_k3_debug_frac_gt_{suffix}"] = metric_reducer(
                     (per_token_k3 > threshold).float(), valid_mask_f
                 )
             metrics["entropy_sample"] = metric_reducer(-old_logprobs_flat, valid_mask_f)
             metrics["valid_tokens"] = valid_count.item()
+            metrics["current_support_fraction"] = metric_reducer(current_support.float(), valid_mask_f)
         metric_ops.update(
             {
                 "kl_k3_debug_max": "max",

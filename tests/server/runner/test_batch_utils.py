@@ -33,6 +33,19 @@ def test_convert_batch_to_tensors_uses_float_identity_padding_for_temperatures()
     )
 
 
+def test_convert_batch_to_tensors_uses_sampling_transform_identity_padding():
+    converted = convert_batch_to_tensors(
+        {
+            "logprob_top_ks": [[8, 7], [4]],
+            "logprob_top_ps": [[0.9, 0.8], [0.7]],
+            "logprob_min_ps": [[0.1, 0.2], [0.3]],
+        }
+    )
+    assert torch.equal(converted["logprob_top_ks"], torch.tensor([[8, 7], [4, 1 << 30]]))
+    torch.testing.assert_close(converted["logprob_top_ps"], torch.tensor([[0.9, 0.8], [0.7, 1.0]]))
+    torch.testing.assert_close(converted["logprob_min_ps"], torch.tensor([[0.1, 0.2], [0.3, 0.0]]))
+
+
 def test_convert_batch_to_tensors_preserves_teacher_hidden_state_floats():
     batch = {
         "teacher_hidden_states": [

@@ -368,13 +368,15 @@ def convert_batch_to_tensors(batch: Dict[str, Any], rank: int = 0) -> Dict[str, 
         "old_logprobs",
         "ref_logprobs",
         "logprob_temperatures",
+        "logprob_top_ps",
+        "logprob_min_ps",
         "values",
         "returns",
         "teacher_weights",
         "hidden_match_weights",
         "teacher_hidden_states",
     }
-    long_fields = {"teacher_ids", "teacher_cache_indices", "teacher_cache_local_indices"}
+    long_fields = {"teacher_ids", "teacher_cache_indices", "teacher_cache_local_indices", "logprob_top_ks"}
     # Fields that must be int32 (flash attention requires cu_seqlens as int32)
     int32_fields = {"cu_seq_lens_q", "cu_seq_lens_k"}
 
@@ -420,8 +422,10 @@ def convert_batch_to_tensors(batch: Dict[str, Any], rank: int = 0) -> Dict[str, 
                             pad_value = (
                                 -100
                                 if key in ("labels", "target_tokens")
+                                else (1 << 30)
+                                if key == "logprob_top_ks"
                                 else 1.0
-                                if key == "logprob_temperatures"
+                                if key in ("logprob_temperatures", "logprob_top_ps")
                                 else 0
                             )
                             padded = []
@@ -592,10 +596,14 @@ def simple_sequence_shard(batch: Dict[str, Any], rank: int = 0) -> Dict[str, Any
                 pad_val = -100  # IGNORE_INDEX
             elif key == "logprob_temperatures":
                 pad_val = 1.0
+            elif key == "logprob_top_ks":
+                pad_val = 1 << 30
+            elif key == "logprob_top_ps":
+                pad_val = 1.0
             else:
                 pad_val = 0
             sharded_value = pad_and_slice(value, pad_value=pad_val)
-            if key == "logprob_temperatures":
+            if key in ("logprob_temperatures", "logprob_top_ks", "logprob_top_ps", "logprob_min_ps"):
                 sharded_value = sharded_value.contiguous()
             sharded_batch[key] = sharded_value
         else:

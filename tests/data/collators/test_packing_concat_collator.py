@@ -194,11 +194,17 @@ class TestPackingConcatCollator:
                     "input_ids": torch.tensor([1, 2]),
                     "position_ids": torch.tensor([0, 1]),
                     "logprob_temperatures": torch.tensor([0.7, 0.7]),
+                    "logprob_top_ks": torch.tensor([8, 8]),
+                    "logprob_top_ps": torch.tensor([0.9, 0.9]),
+                    "logprob_min_ps": torch.tensor([0.1, 0.1]),
                 },
                 {
                     "input_ids": torch.tensor([3]),
                     "position_ids": torch.tensor([0]),
                     "logprob_temperatures": torch.tensor([1.3]),
+                    "logprob_top_ks": torch.tensor([4]),
+                    "logprob_top_ps": torch.tensor([0.8]),
+                    "logprob_min_ps": torch.tensor([0.2]),
                 },
             ]
         )
@@ -207,3 +213,6 @@ class TestPackingConcatCollator:
             batch["logprob_temperatures"],
             torch.tensor([[0.7, 0.7, 1.3, 1.0]]),
         )
+        assert torch.equal(batch["logprob_top_ks"], torch.tensor([[8, 8, 4, 1 << 30]]))
+        torch.testing.assert_close(batch["logprob_top_ps"], torch.tensor([[0.9, 0.9, 0.8, 1.0]]))
+        torch.testing.assert_close(batch["logprob_min_ps"], torch.tensor([[0.1, 0.1, 0.2, 0.0]]))

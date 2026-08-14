@@ -10,6 +10,7 @@ from typing import List, Literal, Tuple
 import torch
 import torch.distributed as dist
 
+from xorl.ops.exact_sampling_transforms import TOP_K_ALL
 from xorl.ops.loss.loss_output import LossOutput
 from xorl.ops.loss.per_token_ce import compute_per_token_ce
 from xorl.ops.loss.reducers import Reducer, TokenPartial
@@ -31,24 +32,47 @@ def compute_ratio(
     token:    r_t = exp(logprobs_t - generator_logprobs_t)
     sequence: r_seq = exp(mean_t[logprobs - generator_logprobs]), uses reparameterization.
     """
+    current_support = torch.isfinite(logprobs)
+    raw_token_log_ratio = torch.where(
+        current_support,
+        logprobs - generator_logprobs.detach(),
+        torch.full_like(logprobs, -torch.inf),
+    )
     if ratio_type == "token":
-        log_ratio = logprobs - generator_logprobs.detach()
+        log_ratio = raw_token_log_ratio
         ratio = torch.exp(log_ratio)
     elif ratio_type == "sequence":
-        token_log_ratio = logprobs - generator_logprobs.detach()
         seq_lengths = mask.sum(dim=-1).clamp(min=1)
-        seq_log_ratio = (token_log_ratio * mask).sum(dim=-1) / seq_lengths
+        finite_token_log_ratio = torch.where(
+            current_support,
+            raw_token_log_ratio,
+            torch.zeros_like(raw_token_log_ratio),
+        )
+        seq_log_ratio = (finite_token_log_ratio * mask).sum(dim=-1) / seq_lengths
+        seq_supported = (current_support | ~mask.bool()).all(dim=-1)
+        seq_log_ratio = torch.where(
+            seq_supported,
+            seq_log_ratio,
+            torch.full_like(seq_log_ratio, -torch.inf),
+        )
 
         # Reparameterization: forward uses seq ratio, backward uses token grads
-        log_ratio = logprobs - logprobs.detach() + seq_log_ratio.detach().unsqueeze(-1)
+        safe_logprobs = torch.where(current_support, logprobs, torch.zeros_like(logprobs))
+        log_ratio = safe_logprobs - safe_logprobs.detach() + seq_log_ratio.detach().unsqueeze(-1)
         ratio = torch.exp(log_ratio)
     else:
         raise ValueError(f"Unknown ratio_type: {ratio_type}")
 
     with torch.no_grad():
+        metric_log_ratio = torch.where(
+            torch.isfinite(log_ratio),
+            log_ratio,
+            torch.full_like(log_ratio, -20.0),
+        )
         metrics = [
             ("loss/ratio/mean", metric_reducer(ratio, mask)),
-            ("loss/kl_policy/mean", metric_reducer(-log_ratio, mask)),
+            ("loss/kl_policy/mean", metric_reducer(-metric_log_ratio, mask)),
+            ("loss/current_support_fraction", metric_reducer(current_support.float(), mask)),
         ]
 
     return ratio, log_ratio, metrics
@@ -62,7 +86,20 @@ def compute_kl(
     kl_type: KLType = "k3",
 ) -> Tuple[torch.Tensor, List[Tuple[str, torch.Tensor]]]:
     """KL divergence using Schulman's estimators (k1, k2, k3)."""
-    log_ratio = policy_logprobs - ref_logprobs.detach()
+    policy_support = torch.isfinite(policy_logprobs)
+    ref_support = torch.isfinite(ref_logprobs)
+    safe_policy_logprobs = torch.where(policy_support, policy_logprobs, torch.zeros_like(policy_logprobs))
+    safe_ref_logprobs = torch.where(ref_support, ref_logprobs, torch.zeros_like(ref_logprobs))
+    finite_log_ratio = safe_policy_logprobs - safe_ref_logprobs.detach()
+    log_ratio = torch.where(
+        policy_support & ref_support,
+        finite_log_ratio,
+        torch.where(
+            policy_support,
+            torch.full_like(finite_log_ratio, 20.0),
+            torch.where(ref_support, torch.full_like(finite_log_ratio, -20.0), torch.zeros_like(finite_log_ratio)),
+        ),
+    )
 
     if kl_type == "k1":
         kl = log_ratio
@@ -132,6 +169,9 @@ def drgrpo_loss_function(
     metric_reducer: Reducer | None = None,
     lm_head: torch.nn.Module | None = None,
     logprob_temperature: float = 1.0,
+    logprob_top_k: int | torch.Tensor = TOP_K_ALL,
+    logprob_top_p: float | torch.Tensor = 1.0,
+    logprob_min_p: float | torch.Tensor = 0.0,
 ) -> LossOutput:
     """DR-GRPO loss for RL training.
 
@@ -188,6 +228,9 @@ def drgrpo_loss_function(
         lm_head_fp32=lm_head_fp32,
         lm_head=lm_head,
         logprob_temperature=logprob_temperature,
+        logprob_top_k=logprob_top_k,
+        logprob_top_p=logprob_top_p,
+        logprob_min_p=logprob_min_p,
     )
     logprobs = -per_token_ce.view(B, S)
 

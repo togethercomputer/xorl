@@ -23,6 +23,9 @@ _2D_PAD_VALUES = {
     "advantages": 0.0,
     "rollout_logprobs": 0.0,
     "logprob_temperatures": 1.0,
+    "logprob_top_ks": 1 << 30,
+    "logprob_top_ps": 1.0,
+    "logprob_min_ps": 0.0,
 }
 
 # Pad values for known 3D sequence tensor keys: (1, seq_len, hidden_dim)

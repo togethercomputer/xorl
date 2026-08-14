@@ -9,6 +9,10 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+from xorl.ops.exact_sampling_transforms import (
+    TOP_K_ALL,
+    normalize_exact_sampling_transforms,
+)
 from xorl.ops.loss.compiled_cross_entropy import compiled_cross_entropy_function
 from xorl.ops.loss.fused_linear_logprob import fused_selected_logprob_ce
 from xorl.ops.loss.vocab_parallel_cross_entropy import (
@@ -20,6 +24,19 @@ from xorl.ops.loss.vocab_parallel_cross_entropy import (
 _MODULE_LM_HEAD_MIN_CHUNK_ROWS = 128
 
 LogprobTemperature = float | torch.Tensor
+LogprobTopK = int | torch.Tensor
+LogprobProbability = float | torch.Tensor
+
+
+def _flatten_row_metadata(value, *, rows: int, name: str):
+    """Flatten a collated ``[B, S]`` transform field to exact head row order."""
+    if not isinstance(value, torch.Tensor) or tuple(value.shape) == (rows,):
+        return value
+    if not value.is_contiguous():
+        raise ValueError(f"per-row {name} must be contiguous")
+    if value.numel() != rows:
+        raise ValueError(f"per-row {name} must contain {rows} values, got shape {tuple(value.shape)}")
+    return value.reshape(rows)
 
 
 def _module_lm_head_ce(
@@ -107,6 +124,9 @@ def compute_per_token_ce(
     lm_head_fp32: bool = False,
     lm_head: Optional[torch.nn.Module] = None,
     logprob_temperature: LogprobTemperature = 1.0,
+    logprob_top_k: LogprobTopK = TOP_K_ALL,
+    logprob_top_p: LogprobProbability = 1.0,
+    logprob_min_p: LogprobProbability = 0.0,
 ) -> torch.Tensor:
     """
     Compute per-token cross-entropy loss based on the specified mode.
@@ -140,11 +160,28 @@ def compute_per_token_ce(
     Returns:
         per_token_ce: Per-token cross-entropy loss, shape (BT,)
     """
+    rows = hidden_states_flat.shape[0]
+    logprob_temperature = _flatten_row_metadata(
+        logprob_temperature,
+        rows=rows,
+        name="logprob_temperature",
+    )
+    logprob_top_k = _flatten_row_metadata(logprob_top_k, rows=rows, name="logprob_top_k")
+    logprob_top_p = _flatten_row_metadata(logprob_top_p, rows=rows, name="logprob_top_p")
+    logprob_min_p = _flatten_row_metadata(logprob_min_p, rows=rows, name="logprob_min_p")
     logprob_temperature = normalize_logprob_temperature(
         logprob_temperature,
-        rows=hidden_states_flat.shape[0],
+        rows=rows,
         device=hidden_states_flat.device,
     )
+    logprob_top_ks, logprob_top_ps, logprob_min_ps = normalize_exact_sampling_transforms(
+        logprob_top_k,
+        logprob_top_p,
+        logprob_min_p,
+        rows=rows,
+        device=hidden_states_flat.device,
+    )
+    has_sampling_filter = logprob_top_ks is not None
 
     # The complete GLM-5.2 active-LoRA lane owns the selected-logprob value and
     # its hybrid VJP. Route before the generic lm_head_fp32/module precedence:
@@ -164,6 +201,9 @@ def compute_per_token_ce(
             ce_mode=ce_mode,
             lm_head_fp32=lm_head_fp32,
             logprob_temperature=logprob_temperature,
+            logprob_top_ks=logprob_top_ks,
+            logprob_top_ps=logprob_top_ps,
+            logprob_min_ps=logprob_min_ps,
             tp_group=tp_group,
         )
 
@@ -181,6 +221,9 @@ def compute_per_token_ce(
             ce_mode=ce_mode,
             lm_head_fp32=lm_head_fp32,
             logprob_temperature=logprob_temperature,
+            logprob_top_ks=logprob_top_ks,
+            logprob_top_ps=logprob_top_ps,
+            logprob_min_ps=logprob_min_ps,
             tp_group=tp_group,
         )
 
@@ -193,6 +236,8 @@ def compute_per_token_ce(
     # via chunked cuBLAS matmul + a fused CuTeDSL cross-entropy reduction
     # (chunk-sized logits, scalar TP reductions); it serves TP and non-TP cases.
     if ce_mode == "fused_quack":
+        if has_sampling_filter:
+            raise NotImplementedError("top-k/top-p/min-p replay is supported only by exact LM-head modes")
         if isinstance(logprob_temperature, torch.Tensor):
             raise NotImplementedError("per-row logprob_temperature is supported only by exact LM-head modes")
         local_weight = weight.to_local() if hasattr(weight, "to_local") else weight
@@ -231,7 +276,13 @@ def compute_per_token_ce(
             labels_flat,
             ignore_index,
             temperature=logprob_temperature,
+            top_ks=logprob_top_ks,
+            top_ps=logprob_top_ps,
+            min_ps=logprob_min_ps,
         )
+
+    if has_sampling_filter:
+        raise NotImplementedError("top-k/top-p/min-p replay is supported only by exact LM-head modes")
 
     if tp_group is not None:
         if isinstance(logprob_temperature, torch.Tensor):

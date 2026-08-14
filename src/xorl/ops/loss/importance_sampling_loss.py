@@ -5,6 +5,7 @@ from typing import Any, Dict, Optional
 import torch
 import torch.distributed as dist
 
+from xorl.ops.exact_sampling_transforms import TOP_K_ALL
 from xorl.ops.loss.loss_output import LossOutput
 from xorl.ops.loss.per_token_ce import compute_per_token_ce
 from xorl.ops.loss.reducers import Reducer, TokenPartial
@@ -37,6 +38,9 @@ def importance_sampling_loss_function(
     metric_reducer: Optional[Reducer] = None,
     lm_head: Optional[torch.nn.Module] = None,
     logprob_temperature: float = 1.0,
+    logprob_top_k: int | torch.Tensor = TOP_K_ALL,
+    logprob_top_p: float | torch.Tensor = 1.0,
+    logprob_min_p: float | torch.Tensor = 0.0,
 ) -> "LossOutput":
     """
     Compute importance sampling loss for GRPO/RL training.
@@ -111,15 +115,18 @@ def importance_sampling_loss_function(
         lm_head_fp32=lm_head_fp32,
         lm_head=lm_head,
         logprob_temperature=logprob_temperature,
+        logprob_top_k=logprob_top_k,
+        logprob_top_p=logprob_top_p,
+        logprob_min_p=logprob_min_p,
     )
 
+    current_support = torch.isfinite(per_token_ce)
     # new logprobs = log p(target) = -CE
     new_logprobs_flat = -per_token_ce.detach()
 
     # ---- ratio computation (no sanitization) ----
-    delta = new_logprobs_flat - old_logprobs_flat
-    delta = delta.masked_fill(~valid_mask, 0.0)
-    delta = delta.clamp(min=-20.0, max=20.0)
+    delta = (new_logprobs_flat - old_logprobs_flat).masked_fill(~valid_mask, 0.0)
+    delta = torch.where(current_support, delta.clamp(min=-20.0, max=20.0), torch.full_like(delta, -torch.inf))
     ratio = torch.exp(delta)
 
     # ---- Per-token policy gradient loss: -(ratio * advantages) ----
@@ -129,8 +136,9 @@ def importance_sampling_loss_function(
     # ---- Option B: value from true PG, grad from weighted CE surrogate ----
     true_pg = loss_reducer(per_token_pg, valid_mask_f)
 
-    w = (ratio.detach() * advantages_flat).masked_fill(~valid_mask, 0.0)
-    surrogate = loss_reducer(w * per_token_ce, valid_mask_f)
+    w = (ratio.detach() * advantages_flat).masked_fill(~valid_mask | ~current_support, 0.0)
+    safe_per_token_ce = torch.where(current_support, per_token_ce, torch.zeros_like(per_token_ce))
+    surrogate = loss_reducer(w * safe_per_token_ce, valid_mask_f)
 
     loss = true_pg.detach() + surrogate - surrogate.detach()
 
@@ -149,8 +157,13 @@ def importance_sampling_loss_function(
 
     if compute_kl_stats:
         with torch.no_grad():
-            log_ratio_full = (new_logprobs_flat - old_logprobs_flat).masked_fill(~valid_mask, 0.0)
-            ratio_full = torch.exp(log_ratio_full)
+            raw_log_ratio = (new_logprobs_flat - old_logprobs_flat).masked_fill(~valid_mask, 0.0)
+            log_ratio_full = torch.where(
+                current_support,
+                raw_log_ratio,
+                torch.full_like(raw_log_ratio, -20.0),
+            )
+            ratio_full = torch.where(current_support, torch.exp(raw_log_ratio), torch.zeros_like(raw_log_ratio))
             per_token_k3 = ratio_full - log_ratio_full - 1.0
             if valid_mask.any():
                 k3_max = per_token_k3.masked_fill(~valid_mask, float("-inf")).max()
@@ -177,6 +190,7 @@ def importance_sampling_loss_function(
                 )
             metrics["entropy_sample"] = metric_reducer(-old_logprobs_flat, valid_mask_f)
             metrics["valid_tokens"] = valid_count.item()
+            metrics["current_support_fraction"] = metric_reducer(current_support.float(), valid_mask_f)
 
     # Reshape per-token outputs
     per_token_logprobs = new_logprobs_flat.view(original_shape)

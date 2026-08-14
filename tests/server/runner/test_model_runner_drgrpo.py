@@ -162,6 +162,52 @@ def test_per_row_temperatures_reject_nonunit_scalar_override():
         )
 
 
+def test_compute_micro_batch_loss_forwards_per_row_sampling_transforms(monkeypatch):
+    runner = object.__new__(ModelRunner)
+    runner.model = _TinyModel()
+    runner.ce_mode = "eager"
+    runner.lm_head_fp32 = False
+    top_ks = torch.tensor([[4, 8]], dtype=torch.int64)
+    top_ps = torch.tensor([[0.8, 0.9]], dtype=torch.float32)
+    min_ps = torch.tensor([[0.1, 0.2]], dtype=torch.float32)
+    captured = {}
+
+    def fake_drgrpo_loss_function(*, hidden_states, labels, logprob_top_k, logprob_top_p, logprob_min_p, **_kwargs):
+        captured.update(top_k=logprob_top_k, top_p=logprob_top_p, min_p=logprob_min_p)
+        zero = hidden_states.float().sum() * 0.0
+        return SimpleNamespace(
+            loss=zero,
+            per_token_logprobs=torch.zeros_like(labels, dtype=torch.float32),
+            per_token_loss=torch.zeros_like(labels, dtype=torch.float32),
+            metrics={"valid_tokens": labels.numel()},
+            metric_ops=None,
+        )
+
+    monkeypatch.setattr(model_runner_module, "drgrpo_loss_function", fake_drgrpo_loss_function)
+    runner._compute_micro_batch_loss(
+        {
+            "input_ids": torch.tensor([[1, 2]]),
+            "target_tokens": torch.tensor([[2, 3]]),
+            "logprobs": torch.tensor([[-2.0, -2.1]]),
+            "advantages": torch.ones((1, 2)),
+            "logprob_top_ks": top_ks,
+            "logprob_top_ps": top_ps,
+            "logprob_min_ps": min_ps,
+        },
+        "drgrpo",
+        {"beta": 0.0},
+    )
+    assert captured == {"top_k": top_ks, "top_p": top_ps, "min_p": min_ps}
+
+
+def test_per_row_sampling_transforms_reject_nonidentity_scalar_override():
+    with pytest.raises(ValueError, match="cannot be combined"):
+        ModelRunner._resolve_logprob_sampling_transforms(
+            {"logprob_top_ks": torch.ones(2, dtype=torch.int64)},
+            {"logprob_top_k": 4},
+        )
+
+
 def test_compute_micro_batch_loss_drgrpo_skips_returned_logprobs_when_disabled():
     runner = object.__new__(ModelRunner)
     runner.model = _TinyModel()

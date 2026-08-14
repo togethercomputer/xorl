@@ -6,13 +6,16 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+from xorl.ops.exact_sampling_transforms import TOP_K_ALL
 from xorl.ops.loss.compiled_cross_entropy import (
     compiled_ce_and_lse_sq_function,
     compiled_cross_entropy_function,
 )
 from xorl.ops.loss.loss_output import LossOutput
 from xorl.ops.loss.per_token_ce import (
+    LogprobProbability,
     LogprobTemperature,
+    LogprobTopK,
     compute_per_token_ce,
     normalize_logprob_temperature,
 )
@@ -453,6 +456,9 @@ def causallm_loss_function(
     z_loss_coef: float = 0.0,
     lm_head: torch.nn.Module | None = None,
     logprob_temperature: LogprobTemperature = 1.0,
+    logprob_top_k: LogprobTopK = TOP_K_ALL,
+    logprob_top_p: LogprobProbability = 1.0,
+    logprob_min_p: LogprobProbability = 0.0,
 ) -> "LossOutput":
     """
     Compute causal language modeling loss.
@@ -523,7 +529,28 @@ def causallm_loss_function(
         rows=labels_flat.shape[0],
         device=hidden_states.device,
     )
+
+    def _flatten_sampling_metadata(value, name: str):
+        if not isinstance(value, torch.Tensor):
+            return value
+        if not value.is_contiguous():
+            raise ValueError(f"per-row {name} must be contiguous")
+        if tuple(value.shape) not in (tuple(labels.shape), (labels_flat.shape[0],)):
+            raise ValueError(f"per-row {name} must match labels or flattened labels")
+        return value.reshape(-1)
+
+    logprob_top_k = _flatten_sampling_metadata(logprob_top_k, "logprob_top_ks")
+    logprob_top_p = _flatten_sampling_metadata(logprob_top_p, "logprob_top_ps")
+    logprob_min_p = _flatten_sampling_metadata(logprob_min_p, "logprob_min_ps")
     has_temperature_transform = isinstance(logprob_temperature, torch.Tensor) or logprob_temperature != 1.0
+    has_sampling_filter = (
+        isinstance(logprob_top_k, torch.Tensor)
+        or isinstance(logprob_top_p, torch.Tensor)
+        or isinstance(logprob_min_p, torch.Tensor)
+        or int(logprob_top_k) < TOP_K_ALL
+        or float(logprob_top_p) != 1.0
+        or float(logprob_min_p) != 0.0
+    )
     exact_lm_head = bool(
         lm_head is not None
         and (getattr(lm_head, "_glm52_exact_tp16_lm_head", False) or getattr(lm_head, "_dsv4_exact_tp8_lm_head", False))
@@ -548,6 +575,9 @@ def causallm_loss_function(
             lm_head_fp32=lm_head_fp32,
             lm_head=lm_head,
             logprob_temperature=logprob_temperature,
+            logprob_top_k=logprob_top_k,
+            logprob_top_p=logprob_top_p,
+            logprob_min_p=logprob_min_p,
         )
         loss = loss_reducer(per_token_ce, mask_flat)
         if return_per_token:
@@ -557,7 +587,7 @@ def causallm_loss_function(
                 per_token_loss=per_token_ce.view(original_shape),
             )
         return LossOutput(loss=loss)
-    if has_temperature_transform:
+    if has_temperature_transform or has_sampling_filter:
         if z_loss_coef > 0.0:
             raise NotImplementedError("logprob_temperature is not supported with softmax_auxiliary_loss")
         per_token_ce = compute_per_token_ce(
@@ -572,6 +602,9 @@ def causallm_loss_function(
             lm_head_fp32=lm_head_fp32,
             lm_head=lm_head,
             logprob_temperature=logprob_temperature,
+            logprob_top_k=logprob_top_k,
+            logprob_top_p=logprob_top_p,
+            logprob_min_p=logprob_min_p,
         )
         loss = loss_reducer(per_token_ce, mask_flat)
         if return_per_token:

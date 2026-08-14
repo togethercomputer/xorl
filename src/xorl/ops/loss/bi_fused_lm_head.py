@@ -33,6 +33,7 @@ from xorl.ops.bi_families_v2 import (
     head_v2_selected_logprob,
     head_v2_selected_logprob_from_logits,
 )
+from xorl.ops.exact_sampling_transforms import exact_selected_logprob
 
 
 _TEMPERATURE_MATERIALIZE_ROW_CHUNK = 32
@@ -40,13 +41,26 @@ _TEMPERATURE_MATERIALIZE_ROW_CHUNK = 32
 
 class _BiFusedLmHeadPerTokenCE(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, hidden, weight, labels_safe, valid_mask, temp_row, vocab_chunk):
+    def forward(
+        ctx,
+        hidden,
+        weight,
+        labels_safe,
+        valid_mask,
+        temp_row,
+        top_ks,
+        top_ps,
+        min_ps,
+        vocab_chunk,
+    ):
         use_v2 = families_v2_enabled()
-        if temp_row is None and use_v2:
+        has_sampling_filter = top_ks is not None
+        support_chunks = []
+        if temp_row is None and not has_sampling_filter and use_v2:
             # head v2 (families-v2 migration): same GEMM K-chain, epilogue-stats
             # online LSE; logits never materialize; backward only consumes lse.
             logprob, lse, _ = head_v2_selected_logprob(hidden, weight, labels_safe, temperature=temp_row)
-        elif temp_row is None:
+        elif temp_row is None and not has_sampling_filter:
             logprob, lse, _ = bi_lm_head_selected_logprob(
                 hidden, weight, labels_safe, temperature=temp_row, vocab_chunk=vocab_chunk
             )
@@ -57,24 +71,52 @@ class _BiFusedLmHeadPerTokenCE(torch.autograd.Function):
                 end = min(start + _TEMPERATURE_MATERIALIZE_ROW_CHUNK, hidden.shape[0])
                 hidden_chunk = hidden[start:end]
                 labels_chunk = labels_safe[start:end]
-                temperature_chunk = temp_row[start:end]
+                temperature_chunk = None if temp_row is None else temp_row[start:end]
                 if use_v2:
                     logits, _ = head_v2_full_logits_with_lse(hidden_chunk, weight, temperature=None)
-                    transformed_logits = exact_temperature_scale_fp32_logits(logits, temperature_chunk)
-                    logprob_chunk, lse_chunk, _ = head_v2_selected_logprob_from_logits(
-                        transformed_logits,
-                        labels_chunk,
-                        temperature=None,
+                    transformed_logits = (
+                        logits
+                        if temperature_chunk is None
+                        else exact_temperature_scale_fp32_logits(logits, temperature_chunk)
                     )
+                    if has_sampling_filter:
+                        logprob_chunk, lse_chunk, _, support_chunk = exact_selected_logprob(
+                            transformed_logits,
+                            labels_chunk,
+                            top_ks[start:end],
+                            top_ps[start:end],
+                            min_ps[start:end],
+                        )
+                        support_chunks.append(support_chunk)
+                    else:
+                        logprob_chunk, lse_chunk, _ = head_v2_selected_logprob_from_logits(
+                            transformed_logits,
+                            labels_chunk,
+                            temperature=None,
+                        )
                 else:
                     logits = bi_lm_head_full_logits(hidden_chunk, weight, vocab_chunk=vocab_chunk)
-                    transformed_logits = exact_temperature_scale_fp32_logits(logits, temperature_chunk)
-                    logprob_chunk, lse_chunk, _ = bi_lm_head_selected_logprob_from_logits(
-                        transformed_logits,
-                        labels_chunk,
-                        temperature=None,
-                        vocab_chunk=vocab_chunk,
+                    transformed_logits = (
+                        logits
+                        if temperature_chunk is None
+                        else exact_temperature_scale_fp32_logits(logits, temperature_chunk)
                     )
+                    if has_sampling_filter:
+                        logprob_chunk, lse_chunk, _, support_chunk = exact_selected_logprob(
+                            transformed_logits,
+                            labels_chunk,
+                            top_ks[start:end],
+                            top_ps[start:end],
+                            min_ps[start:end],
+                        )
+                        support_chunks.append(support_chunk)
+                    else:
+                        logprob_chunk, lse_chunk, _ = bi_lm_head_selected_logprob_from_logits(
+                            transformed_logits,
+                            labels_chunk,
+                            temperature=None,
+                            vocab_chunk=vocab_chunk,
+                        )
                 logprob_chunks.append(logprob_chunk)
                 lse_chunks.append(lse_chunk)
             if logprob_chunks:
@@ -83,20 +125,28 @@ class _BiFusedLmHeadPerTokenCE(torch.autograd.Function):
             else:
                 logprob = torch.empty((0,), dtype=torch.float32, device=hidden.device)
                 lse = logprob.clone()
-        ctx.save_for_backward(hidden, weight, labels_safe, valid_mask, lse, temp_row)
+        support = (
+            torch.cat(support_chunks, dim=0)
+            if support_chunks
+            else torch.empty((0, 0), dtype=torch.bool, device=hidden.device)
+        )
+        ctx.save_for_backward(hidden, weight, labels_safe, valid_mask, lse, temp_row, support)
         ctx.vocab_chunk = vocab_chunk
         return torch.where(valid_mask, -logprob, torch.zeros_like(logprob))
 
     @staticmethod
     def backward(ctx, grad_ce):
-        hidden, weight, labels, valid_mask, lse, temp_row = ctx.saved_tensors
+        hidden, weight, labels, valid_mask, lse, temp_row, support = ctx.saved_tensors
         vocab_chunk = ctx.vocab_chunk
         n_tokens = hidden.shape[0]
         vocab = weight.shape[0]
         need_h = ctx.needs_input_grad[0]
         need_w = ctx.needs_input_grad[1]
 
-        g = (grad_ce * valid_mask).float()  # dCE/dy = g * (softmax(y) - onehot); y = z/T
+        selected_support = (
+            torch.ones_like(valid_mask) if support.numel() == 0 else support.gather(1, labels.unsqueeze(1)).squeeze(1)
+        )
+        g = (grad_ce * valid_mask * selected_support).float()
         g_col = g.unsqueeze(1)
         lse_col = lse.unsqueeze(1)
         inv_t = None if temp_row is None else (1.0 / temp_row).unsqueeze(1)
@@ -112,7 +162,9 @@ class _BiFusedLmHeadPerTokenCE(torch.autograd.Function):
             if inv_t is not None:
                 logits_c *= inv_t
             grad_z = logits_c.sub_(lse_col).exp_().mul_(g_col)
-            in_chunk = (labels >= col_start) & (labels < col_end)
+            if support.numel() != 0:
+                grad_z *= support[:, col_start:col_end]
+            in_chunk = selected_support & (labels >= col_start) & (labels < col_end)
             grad_z[rows[in_chunk], labels[in_chunk] - col_start] -= g[in_chunk]
             if inv_t is not None:
                 grad_z *= inv_t  # dy/dz = 1/T
@@ -129,6 +181,9 @@ class _BiFusedLmHeadPerTokenCE(torch.autograd.Function):
             None,
             None,
             None,
+            None,
+            None,
+            None,
         )
 
 
@@ -138,6 +193,9 @@ def bi_fused_per_token_ce(
     labels: torch.Tensor,
     ignore_index: int = -100,
     temperature: float | torch.Tensor = 1.0,
+    top_ks: torch.Tensor | None = None,
+    top_ps: torch.Tensor | None = None,
+    min_ps: torch.Tensor | None = None,
     vocab_chunk: int = BI_LM_HEAD_VOCAB_CHUNK,
 ) -> torch.Tensor:
     """Per-token CE (``-log p(labels)``; 0 at ignored positions) through the
@@ -170,4 +228,16 @@ def bi_fused_per_token_ce(
         if not math.isfinite(temperature) or temperature <= 0:
             raise ValueError("ce_mode='bi_fused' requires finite temperature > 0")
         temp_row = torch.full((hidden_states.shape[0],), temperature, dtype=torch.float32, device=hidden_states.device)
-    return _BiFusedLmHeadPerTokenCE.apply(hidden_states, weight, labels_safe, valid_mask, temp_row, vocab_chunk)
+    if (top_ks is None, top_ps is None, min_ps is None).count(True) not in (0, 3):
+        raise ValueError("ce_mode='bi_fused' requires all or none of top-k/top-p/min-p row metadata")
+    return _BiFusedLmHeadPerTokenCE.apply(
+        hidden_states,
+        weight,
+        labels_safe,
+        valid_mask,
+        temp_row,
+        top_ks,
+        top_ps,
+        min_ps,
+        vocab_chunk,
+    )

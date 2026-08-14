@@ -75,6 +75,7 @@ from xorl.models.transformers.deepseek_v4.exact_contract import DSV4_FLASH_REQUI
 from xorl.models.transformers.glm5.index_share import IndexShareMode
 from xorl.models.transformers.glm5.support import glm5_default_lora_targets
 from xorl.ops.batch_invariant_ops import enable_batch_invariant_mode, get_batch_invariant_ops
+from xorl.ops.exact_sampling_transforms import TOP_K_ALL
 from xorl.ops.loss import (
     LossOutput,
     OPDLossMetrics,
@@ -461,6 +462,9 @@ class ModelRunner:
             "_original_position_ids",
             "rollout_logprobs",
             "logprob_temperatures",
+            "logprob_top_ks",
+            "logprob_top_ps",
+            "logprob_min_ps",
         },
         "cross_entropy": {
             "labels",
@@ -469,6 +473,9 @@ class ModelRunner:
             "_original_position_ids",
             "rollout_logprobs",
             "logprob_temperatures",
+            "logprob_top_ks",
+            "logprob_top_ps",
+            "logprob_min_ps",
         },
         "importance_sampling": {
             "labels",
@@ -478,6 +485,9 @@ class ModelRunner:
             "_original_position_ids",
             "rollout_logprobs",
             "logprob_temperatures",
+            "logprob_top_ks",
+            "logprob_top_ps",
+            "logprob_min_ps",
         },
         "cispo": {
             "labels",
@@ -487,6 +497,9 @@ class ModelRunner:
             "_original_position_ids",
             "rollout_logprobs",
             "logprob_temperatures",
+            "logprob_top_ks",
+            "logprob_top_ps",
+            "logprob_min_ps",
         },
         "drgrpo": {
             "labels",
@@ -498,6 +511,9 @@ class ModelRunner:
             "_original_position_ids",
             "rollout_logprobs",
             "logprob_temperatures",
+            "logprob_top_ks",
+            "logprob_top_ps",
+            "logprob_min_ps",
         },
         "policy_loss": {
             "labels",
@@ -507,6 +523,9 @@ class ModelRunner:
             "_original_position_ids",
             "rollout_logprobs",
             "logprob_temperatures",
+            "logprob_top_ks",
+            "logprob_top_ps",
+            "logprob_min_ps",
         },
         "opd_loss": {
             "labels",
@@ -533,6 +552,9 @@ class ModelRunner:
             "teacher_cache_base",
             "_original_position_ids",
             "logprob_temperatures",
+            "logprob_top_ks",
+            "logprob_top_ps",
+            "logprob_min_ps",
         },
         "teacher_hidden_cache": {
             "labels",
@@ -549,6 +571,9 @@ class ModelRunner:
             "batch_id",
             "_shifted",
             "logprob_temperatures",
+            "logprob_top_ks",
+            "logprob_top_ps",
+            "logprob_min_ps",
         },
     }
 
@@ -5678,6 +5703,30 @@ class ModelRunner:
             )
         return per_row
 
+    @staticmethod
+    def _resolve_logprob_sampling_transforms(micro_batch, params):
+        resolved = {}
+        specs = (
+            ("logprob_top_k", "logprob_top_ks", TOP_K_ALL, int),
+            ("logprob_top_p", "logprob_top_ps", 1.0, float),
+            ("logprob_min_p", "logprob_min_ps", 0.0, float),
+        )
+        for scalar_name, row_name, identity, cast in specs:
+            raw_scalar = params.get(scalar_name, identity)
+            scalar = identity if raw_scalar is None else cast(raw_scalar)
+            per_row = micro_batch.get(row_name)
+            if per_row is None:
+                resolved[scalar_name] = scalar
+                continue
+            if not isinstance(per_row, torch.Tensor):
+                raise TypeError(f"{row_name} must be a tensor after collation")
+            if scalar != identity:
+                raise ValueError(
+                    f"per-row {row_name} cannot be combined with non-identity loss_fn_params.{scalar_name}"
+                )
+            resolved[scalar_name] = per_row
+        return resolved
+
     def _index_share_forward_kwargs(self, mode: IndexShareMode) -> Dict[str, IndexShareMode]:
         if callable(getattr(self.model, "release_index_share_context", None)):
             return {"index_share_mode": mode}
@@ -5732,6 +5781,7 @@ class ModelRunner:
         model_inputs,
         return_per_token: bool,
         logprob_temperature: float,
+        logprob_sampling_transforms: Dict[str, Any],
         diagnostic_topk: int = 0,
         diagnostic_reference_logits: bool = False,
         diagnostic_hidden_states: bool = False,
@@ -5896,6 +5946,7 @@ class ModelRunner:
             tp_group=loss_tp_group,
             lm_head=loss_lm_head,
             logprob_temperature=logprob_temperature,
+            **logprob_sampling_transforms,
         )
 
         per_token_outputs = {}
@@ -6013,6 +6064,7 @@ class ModelRunner:
         )
         diagnostic_hidden_component_path = params.get("diagnostic_hidden_component_path")
         logprob_temperature = self._resolve_logprob_temperature(micro_batch, params)
+        logprob_sampling_transforms = self._resolve_logprob_sampling_transforms(micro_batch, params)
         diagnostic_packed_sample_components = bool(params.get("opd_debug_packed_sample_components", False))
         diagnostic_component_captures = None
         diagnostic_component_handles = []
@@ -6051,6 +6103,7 @@ class ModelRunner:
                     model_inputs=model_inputs,
                     return_per_token=return_per_token,
                     logprob_temperature=logprob_temperature,
+                    logprob_sampling_transforms=logprob_sampling_transforms,
                     diagnostic_topk=diagnostic_topk,
                     diagnostic_reference_logits=bool(params.get("diagnostic_reference_logits", False)),
                     diagnostic_hidden_states=diagnostic_hidden_states,
@@ -6183,6 +6236,7 @@ class ModelRunner:
                 tp_group=loss_tp_group,
                 lm_head=loss_lm_head,
                 logprob_temperature=logprob_temperature,
+                **logprob_sampling_transforms,
             )
             local_loss_sum = _result.loss
             is_metrics = {"lm_head_fp32_effective": float(loss_lm_head_fp32)}
@@ -6243,6 +6297,7 @@ class ModelRunner:
                 tp_group=loss_tp_group,
                 lm_head=loss_lm_head,
                 logprob_temperature=logprob_temperature,
+                **logprob_sampling_transforms,
                 **loss_kwargs,
             )
             local_loss_sum = _result.loss
@@ -6315,6 +6370,7 @@ class ModelRunner:
                 metric_reducer=token_sum_reducer,
                 lm_head=loss_lm_head,
                 logprob_temperature=logprob_temperature,
+                **logprob_sampling_transforms,
             )
             local_loss_sum = _result.loss
             if return_per_token or params.get("compute_per_sample_k3", False):
@@ -6366,6 +6422,7 @@ class ModelRunner:
                 tp_group=loss_tp_group,
                 lm_head=loss_lm_head,
                 logprob_temperature=logprob_temperature,
+                **logprob_sampling_transforms,
             )
             local_loss_sum = _result.loss
             per_token_outputs["logprobs"] = _result.per_token_logprobs
@@ -7941,6 +7998,9 @@ class ModelRunner:
                             "_original_position_ids",
                             "rollout_logprobs",
                             "logprob_temperatures",
+                            "logprob_top_ks",
+                            "logprob_top_ps",
+                            "logprob_min_ps",
                         ]
                     }
 
@@ -7958,6 +8018,7 @@ class ModelRunner:
 
                     labels = mb.get("target_tokens", mb.get("labels"))
                     ref_logprob_temperature = self._resolve_logprob_temperature(mb, params)
+                    ref_sampling_transforms = self._resolve_logprob_sampling_transforms(mb, params)
 
                     # Compute per-token logprobs using same CE path as training
                     _ref_result = causallm_loss_function(
@@ -7970,6 +8031,7 @@ class ModelRunner:
                         tp_group=self._get_loss_tp_group(),
                         lm_head=loss_lm_head,
                         logprob_temperature=ref_logprob_temperature,
+                        **ref_sampling_transforms,
                     )
                     ref_logprobs = _ref_result.per_token_logprobs
 

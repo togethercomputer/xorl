@@ -90,6 +90,40 @@ def test_per_token_ce_preserves_exact_per_row_temperature_metadata(monkeypatch: 
     assert captures["logprob_temperature"] is temperature
 
 
+def test_per_token_ce_flattens_collated_sampling_transforms_in_decision_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captures = {}
+
+    def _fake_exact(_hidden, _weight, _labels, **kwargs):
+        captures.update(kwargs)
+        return torch.zeros(2, dtype=torch.float32)
+
+    monkeypatch.setattr(exact_lm_head_impl, "glm52_exact_lm_head_per_token_ce", _fake_exact)
+    lm_head = nn.Module()
+    lm_head._glm52_exact_tp16_lm_head = True
+
+    compute_per_token_ce(
+        torch.zeros((2, 4), dtype=torch.bfloat16),
+        torch.zeros((6, 4), dtype=torch.bfloat16),
+        torch.tensor([1, 2], dtype=torch.int64),
+        -100,
+        "bi_fused",
+        tp_group=object(),
+        lm_head_fp32=True,
+        lm_head=lm_head,
+        logprob_temperature=torch.tensor([[0.7, 1.3]], dtype=torch.float32),
+        logprob_top_k=torch.tensor([[4, 8]], dtype=torch.int64),
+        logprob_top_p=torch.tensor([[0.8, 0.9]], dtype=torch.float32),
+        logprob_min_p=torch.tensor([[0.1, 0.2]], dtype=torch.float32),
+    )
+
+    assert captures["logprob_temperature"].tolist() == pytest.approx([0.7, 1.3])
+    assert captures["logprob_top_ks"].tolist() == [4, 8]
+    assert captures["logprob_top_ps"].tolist() == pytest.approx([0.8, 0.9])
+    assert captures["logprob_min_ps"].tolist() == pytest.approx([0.1, 0.2])
+
+
 def test_causallm_exact_head_admits_its_tp_group_and_rejects_z_loss(monkeypatch: pytest.MonkeyPatch) -> None:
     causallm_impl = importlib.import_module("xorl.ops.loss.causallm_loss")
     lm_head = nn.Module()

@@ -65,6 +65,9 @@ class ShiftTokensCollator(DataCollator):
                 "advantages",
                 "logprobs",
                 "logprob_temperatures",
+                "logprob_top_ks",
+                "logprob_top_ps",
+                "logprob_min_ps",
             ]
 
     def _needs_shifting(self, sample: Dict[str, Any]) -> bool:

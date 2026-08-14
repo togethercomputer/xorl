@@ -229,6 +229,9 @@ class TestCollatorCall:
                 "labels": torch.tensor([[2, 3, 4, 5, IGNORE_INDEX]]),
                 "position_ids": torch.arange(5).unsqueeze(0),
                 "logprob_temperatures": torch.tensor([[0.7, 0.8, 0.9, 1.2, 1.3]]),
+                "logprob_top_ks": torch.tensor([[9, 8, 7, 6, 5]]),
+                "logprob_top_ps": torch.tensor([[0.5, 0.6, 0.7, 0.8, 0.9]]),
+                "logprob_min_ps": torch.tensor([[0.1, 0.2, 0.3, 0.4, 0.5]]),
             }
         )
 
@@ -237,6 +240,9 @@ class TestCollatorCall:
             result["logprob_temperatures"],
             torch.tensor([[1.2, 1.3, 1.0]]),
         )
+        assert torch.equal(result["logprob_top_ks"], torch.tensor([[6, 5, 1 << 30]]))
+        torch.testing.assert_close(result["logprob_top_ps"], torch.tensor([[0.8, 0.9, 1.0]]))
+        torch.testing.assert_close(result["logprob_min_ps"], torch.tensor([[0.4, 0.5, 0.0]]))
 
     @pytest.mark.parametrize("cp_rank", [0, 15])
     @patch("xorl.data.collators.sequence_shard_collator.get_parallel_state")

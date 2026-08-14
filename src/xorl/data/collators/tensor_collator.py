@@ -181,6 +181,8 @@ class ToTensorCollator(DataCollator):
             "teacher_weights",
             "hidden_match_weights",
             "logprob_temperatures",
+            "logprob_top_ps",
+            "logprob_min_ps",
         ]:
             return torch.float
 
