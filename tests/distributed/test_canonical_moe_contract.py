@@ -9,6 +9,7 @@ import torch.distributed as dist
 from distributed_utils import run_distributed_script
 
 from xorl.distributed.canonical_moe import (
+    _CANONICAL_MOE_DENSE_MAX_BUFFER_BYTES,
     _CANONICAL_MOE_FP32_FOLD_MAX_LEVEL_BYTES,
     CANONICAL_MOE_DENSE_MAX_CHUNK_ROWS,
     CANONICAL_MOE_FOLD_VERSION,
@@ -24,6 +25,8 @@ from xorl.distributed.canonical_moe import (
     _canonical_moe_fold_fp32_tree,
     _canonical_moe_fp32_fold_chunk_elements,
     _resolve_transport_chunk_rows,
+    _RuntimePlan,
+    _transport_and_fold,
     canonical_moe_fold_fp32_v2,
     canonical_moe_leaf_fp32_v1,
     canonical_moe_reduce_cp_sharded_v3,
@@ -41,10 +44,59 @@ pytestmark = [pytest.mark.distributed]
 @pytest.mark.cpu
 def test_dense_transport_default_bounds_dp_owned_capacity_without_a_selector():
     assert CANONICAL_MOE_DENSE_MAX_CHUNK_ROWS == 4096
-    assert _resolve_transport_chunk_rows(66544, None, CanonicalMoETransport.DENSE_V1) == 4096
-    assert _resolve_transport_chunk_rows(128, None, CanonicalMoETransport.DENSE_V1) == 128
-    assert _resolve_transport_chunk_rows(66544, 2048, CanonicalMoETransport.DENSE_V1) == 2048
-    assert _resolve_transport_chunk_rows(66544, None, CanonicalMoETransport.PACKED_EP16_V2) == 66544
+    assert _CANONICAL_MOE_DENSE_MAX_BUFFER_BYTES == 32 * 1024 * 1024
+    planner_inputs = {
+        "contributor_count": 16,
+        "payload_elements_per_row": 6144,
+        "element_size": 2,
+    }
+    assert (
+        _resolve_transport_chunk_rows(
+            16640,
+            None,
+            CanonicalMoETransport.DENSE_V1,
+            **planner_inputs,
+        )
+        == 170
+    )
+    assert (
+        _resolve_transport_chunk_rows(
+            16640,
+            2048,
+            CanonicalMoETransport.DENSE_V1,
+            **planner_inputs,
+        )
+        == 170
+    )
+    assert (
+        _resolve_transport_chunk_rows(
+            16640,
+            64,
+            CanonicalMoETransport.DENSE_V1,
+            **planner_inputs,
+        )
+        == 64
+    )
+    assert (
+        _resolve_transport_chunk_rows(
+            128,
+            None,
+            CanonicalMoETransport.DENSE_V1,
+            contributor_count=16,
+            payload_elements_per_row=8,
+            element_size=2,
+        )
+        == 128
+    )
+    assert (
+        _resolve_transport_chunk_rows(
+            66544,
+            None,
+            CanonicalMoETransport.PACKED_EP16_V2,
+            **planner_inputs,
+        )
+        == 66544
+    )
 
 
 def _explicit_tree(partials: torch.Tensor) -> torch.Tensor:
@@ -535,6 +587,84 @@ def test_production_shaped_ep16_fold_has_bounded_peak_workspace(strided: bool):
     assert incremental_peak < 128 * 1024 * 1024
 
 
+@pytest.mark.gpu
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_production_glm_dense_transport_has_bounded_transient_peak(monkeypatch: pytest.MonkeyPatch):
+    # WORLD16 DP4/CP4 expands 1,040 local rows across all 16 logical sources.
+    contributors, capacity, payload = 16, 16640, 6144
+    chunk_rows = _resolve_transport_chunk_rows(
+        capacity,
+        None,
+        CanonicalMoETransport.DENSE_V1,
+        contributor_count=contributors,
+        payload_elements_per_row=payload,
+        element_size=2,
+    )
+    assert chunk_rows == 170
+
+    local = torch.full((capacity, payload), 0.25, device="cuda", dtype=torch.bfloat16)
+    positions = torch.arange(capacity, device="cuda", dtype=torch.int64)
+    valid_mask = torch.ones(capacity, device="cuda", dtype=torch.bool)
+    runtime = _RuntimePlan(
+        group_physical_ranks=tuple(range(contributors)),
+        physical_to_logical=tuple(range(contributors)),
+        local_group_rank=0,
+        local_logical_ordinal=0,
+    )
+    all_to_all_rows: list[int] = []
+    all_gather_rows: list[int] = []
+
+    def fake_all_to_all(output: torch.Tensor, input_: torch.Tensor, *, group: object) -> None:
+        del group
+        all_to_all_rows.append(input_.shape[0] // contributors)
+        output.copy_(input_)
+
+    def fake_all_gather(output: torch.Tensor, input_: torch.Tensor, *, group: object) -> None:
+        del group
+        rows = input_.shape[0]
+        all_gather_rows.append(rows)
+        gathered = output.view(contributors, rows, payload)
+        gathered.zero_()
+        gathered[0].copy_(input_)
+
+    monkeypatch.setattr(dist, "all_to_all_single", fake_all_to_all)
+    monkeypatch.setattr(dist, "all_gather_into_tensor", fake_all_gather)
+    torch.cuda.synchronize()
+    baseline = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+
+    output, owner_mask = _transport_and_fold(
+        local,
+        positions,
+        valid_mask,
+        group=object(),
+        runtime=runtime,
+        distribution=OutputDistribution.REPLICATED_CANONICAL,
+        chunk_rows=chunk_rows,
+        transport=CanonicalMoETransport.DENSE_V1,
+    )
+    torch.cuda.synchronize()
+    incremental_peak = torch.cuda.max_memory_allocated() - baseline
+
+    expected_calls = (capacity + chunk_rows - 1) // chunk_rows
+    assert len(all_to_all_rows) == len(all_gather_rows) == expected_calls
+    assert sum(all_to_all_rows) == sum(all_gather_rows) == capacity
+    assert max(all_to_all_rows) == max(all_gather_rows) == chunk_rows
+    assert max(all_to_all_rows) * contributors * payload * local.element_size() <= _CANONICAL_MOE_DENSE_MAX_BUFFER_BYTES
+    expected_expanded_bytes = capacity * contributors * payload * local.element_size()
+    assert sum(all_to_all_rows) * contributors * payload * local.element_size() == expected_expanded_bytes
+    assert sum(all_gather_rows) * contributors * payload * local.element_size() == expected_expanded_bytes
+    assert torch.equal(owner_mask, positions.remainder(contributors) == 0)
+    assert torch.equal(output[::contributors].view(torch.uint16), local[::contributors].view(torch.uint16))
+    for source_ordinal in range(1, contributors):
+        assert torch.count_nonzero(output[source_ordinal::contributors]) == 0
+    # This includes the 195 MiB persistent output plus four potentially live
+    # expanded buffers, the bounded FP32 fold, and row-sized intermediates. It
+    # fits within the 437.62 MiB that the failed rank had free before trying to
+    # allocate its former single 768 MiB send buffer.
+    assert incremental_peak < 437 * 1024 * 1024
+
+
 @pytest.mark.cpu
 def test_graph_metadata_has_deterministic_padding_and_capacity_guard():
     metadata = CanonicalMoEGraphMetadata.build(
@@ -903,6 +1033,8 @@ def _make_partials(world: int, capacity: int) -> torch.Tensor:
 
 
 def _run_distributed_case() -> None:
+    import xorl.distributed.canonical_moe as canonical_moe
+
     dist.init_process_group("gloo")
     world = dist.get_world_size()
     physical_rank = dist.get_rank()
@@ -915,6 +1047,20 @@ def _run_distributed_case() -> None:
     row_ids = torch.tensor(list(reversed(range(valid_rows))), dtype=torch.int64)
     metadata = CanonicalMoEGraphMetadata.build(row_ids, positions, capacity=capacity)
     local = _make_partials(world, capacity).requires_grad_(True)
+    # Force the default byte planner through multiple transport chunks in this
+    # compact real-collective test. Every rank derives the same two-row cap.
+    canonical_moe._CANONICAL_MOE_DENSE_MAX_BUFFER_BYTES = world * local[0].numel() * local.element_size() * 2
+    assert (
+        _resolve_transport_chunk_rows(
+            capacity,
+            None,
+            CanonicalMoETransport.DENSE_V1,
+            contributor_count=world,
+            payload_elements_per_row=local[0].numel(),
+            element_size=local.element_size(),
+        )
+        == 2
+    )
     contribution = LocalMoEContribution(
         local,
         metadata,
@@ -933,9 +1079,8 @@ def _run_distributed_case() -> None:
         plan=plan,
         group=dist.group.WORLD,
         output_distribution=OutputDistribution.REPLICATED_CANONICAL,
-        chunk_rows=2,
     )
-    assert torch.equal(replicated.tensor, expected)
+    assert torch.equal(replicated.tensor.view(torch.int16), expected.view(torch.int16))
     assert torch.count_nonzero(replicated.tensor[~metadata.valid_mask]) == 0
 
     permutation = torch.tensor(list(reversed(range(capacity))), dtype=torch.long)
@@ -1003,8 +1148,9 @@ def _run_distributed_case() -> None:
 
     replicated.tensor.float().sum().backward()
     assert local.grad is not None
-    assert bool(torch.all(torch.isfinite(local.grad)))
-    assert bool(torch.all(local.grad[metadata.valid_mask] != 0))
+    expected_grad = torch.zeros_like(local)
+    expected_grad[metadata.valid_mask] = world
+    assert torch.equal(local.grad.view(torch.int16), expected_grad.view(torch.int16))
 
     with pytest.raises(TypeError, match="already reduced"):
         canonical_moe_reduce_fp32_v2(

@@ -45,6 +45,7 @@ _CANONICAL_MOE_FP32_FOLD_MAX_LEVEL_BYTES = 32 * 1024 * 1024
 # do not participate in the arithmetic contract: every row still sees the
 # complete logical-contributor tree before any completed bytes are copied.
 CANONICAL_MOE_DENSE_MAX_CHUNK_ROWS = 4096
+_CANONICAL_MOE_DENSE_MAX_BUFFER_BYTES = 32 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -992,15 +993,25 @@ def _resolve_transport_chunk_rows(
     capacity: int,
     requested_chunk_rows: int | None,
     transport: CanonicalMoETransport,
+    *,
+    contributor_count: int,
+    payload_elements_per_row: int,
+    element_size: int,
 ) -> int:
-    effective_chunk_rows = (
-        min(capacity, CANONICAL_MOE_DENSE_MAX_CHUNK_ROWS) if requested_chunk_rows is None else requested_chunk_rows
-    )
-    if effective_chunk_rows <= 0:
+    requested_limit = capacity if requested_chunk_rows is None else requested_chunk_rows
+    if requested_limit <= 0:
         raise ValueError("chunk_rows must be positive")
     if transport is CanonicalMoETransport.PACKED_EP16_V2:
         return capacity
-    return effective_chunk_rows
+
+    expanded_bytes_per_row = contributor_count * payload_elements_per_row * element_size
+    byte_bounded_rows = max(1, _CANONICAL_MOE_DENSE_MAX_BUFFER_BYTES // expanded_bytes_per_row)
+    return min(
+        capacity,
+        CANONICAL_MOE_DENSE_MAX_CHUNK_ROWS,
+        requested_limit,
+        byte_bounded_rows,
+    )
 
 
 def _canonical_moe_reduce(
@@ -1036,6 +1047,9 @@ def _canonical_moe_reduce(
         contribution.metadata.capacity,
         chunk_rows,
         transport,
+        contributor_count=plan.contributor_count,
+        payload_elements_per_row=contribution.tensor[0].numel(),
+        element_size=contribution.tensor.element_size(),
     )
     if transport is CanonicalMoETransport.PACKED_EP16_V2:
         # Dense-v1 chunks the 16x-expanded owner slots to bound its allocation.
