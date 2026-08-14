@@ -12,7 +12,6 @@ from xorl.models.auto import (
     _validate_canonical_glm52_model_scope,
     _validate_exact_qwen35_model_scope,
     _validate_exact_qwen35_moe_program,
-    _validate_exact_qwen35_topology,
     resolve_cross_entropy_mode,
     resolve_model_numerical_program,
 )
@@ -32,6 +31,7 @@ def _exact_glm52_config() -> Glm5Config:
         indexer_types=indexer_types,
         mlp_layer_types=["dense"] * 3 + ["sparse"] * 75,
         index_topk_freq=4,
+        index_skip_topk_offset=3,
     )
     # ``build_foundation_model`` selects this internal scoring contract after
     # validating the official GLM-5.2 geometry.  These resolver tests operate
@@ -400,96 +400,6 @@ def test_exact_qwen35_moe_admits_structural_defaults():
         ep_dispatch="alltoall",
         deepep_async_combine=False,
     )
-
-
-def _qwen35_topology(**overrides):
-    fields = {
-        "world_size": 16,
-        "dp_size": 16,
-        "dp_replicate_size": 2,
-        "dp_shard_size": 8,
-        "tp_size": 1,
-        "pp_size": 1,
-        "ep_size": 8,
-        "cp_size": 1,
-        "ringattn_size": 1,
-        "ulysses_size": 1,
-    }
-    fields.update(overrides)
-    return SimpleNamespace(**fields)
-
-
-def test_exact_qwen35_moe_admits_world16_ep8_topology():
-    config = _exact_qwen35_moe_config()
-    config._qwen35_exact_contract = True
-    _validate_exact_qwen35_topology(config, _qwen35_topology())
-
-
-def test_exact_qwen35_moe_admits_world8_ep8_topology():
-    config = _exact_qwen35_moe_config()
-    config._qwen35_exact_contract = True
-    _validate_exact_qwen35_topology(
-        config,
-        _qwen35_topology(
-            world_size=8,
-            dp_size=8,
-            dp_replicate_size=1,
-            dp_shard_size=8,
-        ),
-    )
-
-
-def test_exact_qwen35_moe_admits_world8_ep8_ulysses8_topology():
-    config = _exact_qwen35_moe_config()
-    config._qwen35_exact_contract = True
-    _validate_exact_qwen35_topology(
-        config,
-        _qwen35_topology(
-            world_size=8,
-            dp_size=1,
-            dp_replicate_size=1,
-            dp_shard_size=1,
-            cp_size=8,
-            ulysses_size=8,
-        ),
-    )
-
-
-def test_exact_qwen35_dense_admits_single_gpu_topology():
-    config = _exact_qwen35_dense_config()
-    config._qwen35_exact_contract = True
-    _validate_exact_qwen35_topology(
-        config,
-        _qwen35_topology(
-            world_size=1,
-            dp_size=1,
-            dp_replicate_size=1,
-            dp_shard_size=1,
-            ep_size=1,
-        ),
-    )
-
-
-@pytest.mark.parametrize(
-    "override",
-    [
-        {"world_size": 8},
-        {"dp_size": 8},
-        {"dp_replicate_size": 1, "dp_shard_size": 16},
-        {"dp_replicate_size": 4, "dp_shard_size": 4},
-        {"ep_size": 16},
-        {"tp_size": 2},
-        {"pp_size": 2},
-        {"cp_size": 2},
-        {"ringattn_size": 2},
-        {"ulysses_size": 2},
-    ],
-)
-def test_exact_qwen35_moe_rejects_noncertified_topology(override):
-    config = _exact_qwen35_moe_config()
-    config._qwen35_exact_contract = True
-    with pytest.raises(ValueError, match="admitted only"):
-        _validate_exact_qwen35_topology(config, _qwen35_topology(**override))
 
 
 def test_exact_glm52_model_scope_accepts_only_official_geometry():

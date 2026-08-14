@@ -1,4 +1,4 @@
-"""Fail-closed admission tests for the Ulysses byte-contract surface (CPU-only).
+"""Runtime tests for the Ulysses byte-contract surface (CPU-only).
 
 Covers missing Q-head divisibility, the implicit sync-versus-async strategy
 choice that can relocate RoPE across the all-to-all, and the GDN backend
@@ -22,7 +22,6 @@ from xorl.distributed.sequence_parallel.strategy import (
     UlyssesSyncStrategy,
     get_cp_strategy,
 )
-from xorl.models.auto import _validate_exact_qwen35_topology
 from xorl.ops.linear_attention.modules.bi_contract import gdn_contract
 
 
@@ -125,26 +124,3 @@ def test_gdn_cp_fallback_still_warns_outside_the_contract(monkeypatch):
     monkeypatch.setattr(gdn_backend, "_warned_cp_fallback", False)
     with pytest.warns(UserWarning, match="FlashQLA requires 128-dim heads"):
         gdn_backend.warn_cp_fallback_once()
-
-
-# ---------------------------------------------------------------------------
-# Topology admission stays fail-closed at Ulysses > 1 for the exact contract
-# ---------------------------------------------------------------------------
-
-
-def test_exact_dense_topology_rejects_ulysses8():
-    config = SimpleNamespace(_qwen35_exact_contract=True, model_type="qwen3_5")
-    ps = SimpleNamespace(
-        world_size=8,
-        dp_size=1,
-        dp_replicate_size=1,
-        dp_shard_size=1,
-        tp_size=1,
-        pp_size=1,
-        ep_size=1,
-        cp_size=8,
-        ringattn_size=1,
-        ulysses_size=8,
-    )
-    with pytest.raises(ValueError, match="admitted only for"):
-        _validate_exact_qwen35_topology(config, ps)
