@@ -492,19 +492,12 @@ class DeepSeekV4Attention(nn.Module):
                 global_kv = None
                 global_x = None
                 if self.cp_size > 1:
-                    from xorl.ops.dsv4.exact_attention import exact_kv_norm_rope  # noqa: PLC0415
-
-                    # Match serving's CP seam: normalize and apply each local
-                    # request's RoPE before transport, then gather padded rows
-                    # differentiably and compact them in packed logical order.
-                    local_kv = exact_kv_norm_rope(
-                        kv_pre_norm,
-                        self.kv_norm.weight,
-                        freqs_cis,
-                        self.eps,
-                    )
+                    # Gather raw WKV rows in logical request order.  The exact
+                    # attention program then invokes serving's fused FP32
+                    # norm/RoPE/FP8 store once over each complete request,
+                    # matching the CP1 cache-byte boundary.
                     global_kv = gather_dsv4_exact_cp_rows(
-                        local_kv,
+                        kv_pre_norm,
                         dim=1,
                         layout=exact_cp_layout,
                         cp_group=self.cp_group,
@@ -531,13 +524,9 @@ class DeepSeekV4Attention(nn.Module):
                     if self.cp_size > 1:
                         request_kv = global_kv.index_select(1, global_rows)
                         request_x = global_x.index_select(1, global_rows) if ratio else None
-                        kv_preprocessed = True
                     else:
-                        # CP1 retains the fused raw-KV serving store and simply
-                        # executes it once per packed request.
                         request_kv = kv_pre_norm.index_select(1, local_rows)
                         request_x = x.index_select(1, local_rows) if ratio else None
-                        kv_preprocessed = False
 
                     if ratio == 0:
                         from xorl.ops.dsv4.exact_attention import exact_c0_attention  # noqa: PLC0415
@@ -551,7 +540,7 @@ class DeepSeekV4Attention(nn.Module):
                             self.eps,
                             self.softmax_scale,
                             query_positions=request_positions,
-                            kv_preprocessed=kv_preprocessed,
+                            kv_preprocessed=False,
                         )
                     else:
                         from xorl.ops.dsv4.exact_attention import exact_compressed_attention  # noqa: PLC0415
@@ -571,24 +560,14 @@ class DeepSeekV4Attention(nn.Module):
                             self.softmax_scale,
                             ratio,
                             query_positions=request_positions,
-                            kv_preprocessed=kv_preprocessed,
+                            kv_preprocessed=False,
                         )
                     o = o.index_copy(1, local_rows, request_o)
             else:
                 exact_kv_pre_norm = kv_pre_norm
                 exact_x = x
-                exact_kv_preprocessed = False
                 if self.cp_size > 1:
-                    from xorl.ops.dsv4.exact_attention import exact_kv_norm_rope  # noqa: PLC0415
-
-                    exact_kv_pre_norm = exact_kv_norm_rope(
-                        exact_kv_pre_norm,
-                        self.kv_norm.weight,
-                        freqs_cis,
-                        self.eps,
-                    )
                     exact_kv_pre_norm = all_gather_cp(exact_kv_pre_norm, dim=1, cp_group=self.cp_group)
-                    exact_kv_preprocessed = True
                     if ratio:
                         exact_x = all_gather_cp(exact_x, dim=1, cp_group=self.cp_group)
                 if ratio == 0:
@@ -605,7 +584,7 @@ class DeepSeekV4Attention(nn.Module):
                         carry_state=carry_state,
                         position_offset=carry_offset or 0,
                         query_positions=exact_query_positions,
-                        kv_preprocessed=exact_kv_preprocessed,
+                        kv_preprocessed=False,
                     )
                 else:
                     from xorl.ops.dsv4.exact_attention import exact_compressed_attention  # noqa: PLC0415
@@ -627,7 +606,7 @@ class DeepSeekV4Attention(nn.Module):
                         carry_state=carry_state,
                         position_offset=carry_offset or 0,
                         query_positions=exact_query_positions,
-                        kv_preprocessed=exact_kv_preprocessed,
+                        kv_preprocessed=False,
                     )
             kv_vanilla = None
         else:

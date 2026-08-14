@@ -209,7 +209,7 @@ def test_tp_size_gt_1_rejected():
 @pytest.mark.parametrize("compress_ratio", [0, 128])
 @pytest.mark.parametrize("cp_size", [1, 2])
 def test_exact_cp_selects_the_serving_kv_boundary(monkeypatch, compress_ratio, cp_size):
-    """CP1 keeps fused raw-KV store; CP>1 gathers the serving BF16 KV seam."""
+    """Every CP layout gathers raw WKV before the fused serving cache store."""
 
     from xorl.models.transformers.deepseek_v4 import modeling_deepseek_v4  # noqa: PLC0415
     from xorl.models.transformers.deepseek_v4.modeling_deepseek_v4 import (  # noqa: PLC0415
@@ -235,7 +235,7 @@ def test_exact_cp_selects_the_serving_kv_boundary(monkeypatch, compress_ratio, c
     ).view(1, sequence_length, cfg.hidden_size)
     raw_kv = layer.wkv(hidden).detach()
 
-    observed = {"kv_norm": [], "gathers": [], "attention": []}
+    observed = {"gathers": [], "attention": []}
 
     monkeypatch.setattr(
         modeling_deepseek_v4._ExactBatchInvariantRmsNorm,
@@ -244,11 +244,6 @@ def test_exact_cp_selects_the_serving_kv_boundary(monkeypatch, compress_ratio, c
     )
     monkeypatch.setattr(exact_attention, "exact_q_norm_rope", lambda value, *_args, **_kwargs: value)
     monkeypatch.setattr(exact_attention, "exact_inverse_rope", lambda value, *_args, **_kwargs: value)
-
-    def fake_kv_norm_rope(value, *_args, **_kwargs):
-        result = value + 7.0
-        observed["kv_norm"].append((value.detach().clone(), result.detach().clone()))
-        return result
 
     def fake_gather(value, dim, cp_group):
         assert cp_group is group
@@ -264,7 +259,6 @@ def test_exact_cp_selects_the_serving_kv_boundary(monkeypatch, compress_ratio, c
         observed["attention"].append((kv.detach().clone(), source.detach().clone(), kwargs))
         return q
 
-    monkeypatch.setattr(exact_attention, "exact_kv_norm_rope", fake_kv_norm_rope)
     monkeypatch.setattr(modeling_deepseek_v4, "all_gather_cp", fake_gather)
     monkeypatch.setattr(exact_attention, "exact_c0_attention", fake_c0)
     monkeypatch.setattr(exact_attention, "exact_compressed_attention", fake_compressed)
@@ -275,7 +269,6 @@ def test_exact_cp_selects_the_serving_kv_boundary(monkeypatch, compress_ratio, c
     attention_kv, attention_source, kwargs = observed["attention"][0]
 
     if cp_size == 1:
-        assert observed["kv_norm"] == []
         assert observed["gathers"] == []
         assert torch.equal(attention_kv, raw_kv)
         assert kwargs["kv_preprocessed"] is False
@@ -283,14 +276,12 @@ def test_exact_cp_selects_the_serving_kv_boundary(monkeypatch, compress_ratio, c
         if compress_ratio:
             assert torch.equal(attention_source, hidden)
     else:
-        assert len(observed["kv_norm"]) == 1
-        normalized_local = observed["kv_norm"][0][1]
         expected_kv = torch.cat(
-            [normalized_local + 1000.0 * rank for rank in range(cp_size)],
+            [raw_kv + 1000.0 * rank for rank in range(cp_size)],
             dim=1,
         )
         assert torch.equal(attention_kv, expected_kv)
-        assert kwargs["kv_preprocessed"] is True
+        assert kwargs["kv_preprocessed"] is False
         assert torch.equal(
             kwargs["query_positions"],
             torch.arange(sequence_length, 2 * sequence_length),
@@ -353,7 +344,7 @@ def test_exact_ring_cp_restores_gathered_rows_and_uses_local_rope_positions(monk
         global_request_row_indices=(torch.arange(8),),
     )
 
-    observed = {"q_freqs": None, "kv_freqs": None, "inverse_freqs": None, "attention": None, "gathers": []}
+    observed = {"q_freqs": None, "inverse_freqs": None, "attention": None, "gathers": []}
     monkeypatch.setattr(
         modeling_deepseek_v4._ExactBatchInvariantRmsNorm,
         "apply",
@@ -362,10 +353,6 @@ def test_exact_ring_cp_restores_gathered_rows_and_uses_local_rope_positions(monk
 
     def fake_q_norm_rope(value, freqs, *_args, **_kwargs):
         observed["q_freqs"] = freqs.detach().clone()
-        return value
-
-    def fake_kv_norm_rope(value, _weight, freqs, *_args, **_kwargs):
-        observed["kv_freqs"] = freqs.detach().clone()
         return value
 
     def fake_inverse_rope(value, freqs, *_args, **_kwargs):
@@ -387,7 +374,6 @@ def test_exact_ring_cp_restores_gathered_rows_and_uses_local_rope_positions(monk
         return q
 
     monkeypatch.setattr(exact_attention, "exact_q_norm_rope", fake_q_norm_rope)
-    monkeypatch.setattr(exact_attention, "exact_kv_norm_rope", fake_kv_norm_rope)
     monkeypatch.setattr(exact_attention, "exact_inverse_rope", fake_inverse_rope)
     monkeypatch.setattr(modeling_deepseek_v4, "gather_dsv4_exact_cp_rows", fake_gather)
     monkeypatch.setattr(exact_attention, "exact_c0_attention", fake_c0)
@@ -401,13 +387,12 @@ def test_exact_ring_cp_restores_gathered_rows_and_uses_local_rope_positions(monk
         local_positions.to(layer.freqs_cis.device),
     ).to(hidden.device)
     assert torch.equal(observed["q_freqs"], expected_local_freqs)
-    assert torch.equal(observed["kv_freqs"], expected_local_freqs)
     assert torch.equal(observed["inverse_freqs"], expected_local_freqs)
     attention_kv, attention_source, kwargs = observed["attention"]
     gathered_kv = observed["gathers"][0][0]
     assert torch.equal(attention_kv, gathered_kv.index_select(1, restore_order))
     assert torch.equal(kwargs["query_positions"], local_positions)
-    assert kwargs["kv_preprocessed"] is True
+    assert kwargs["kv_preprocessed"] is False
     if compress_ratio:
         gathered_source = observed["gathers"][1][0]
         assert torch.equal(attention_source, gathered_source.index_select(1, restore_order))
