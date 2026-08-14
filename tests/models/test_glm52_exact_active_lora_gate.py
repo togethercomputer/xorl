@@ -116,11 +116,13 @@ def test_rank16_server_training_derives_the_complete_family_without_private_flag
     assert all(getattr(model.config, flag) is True for flag in GLM52_EXACT_ACTIVE_LORA_FLAGS)
 
 
-def test_rank1_server_training_rejects_non_tp16_lm_head_before_loading(
+def test_rank1_server_training_does_not_gate_launch_on_lm_head_tp_degree(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    with pytest.raises(ValueError, match="lm-head-TP16"):
-        _build_exact_active_lora(monkeypatch, lm_head_tp_size=1)
+    model = _build_exact_active_lora(monkeypatch, lm_head_tp_size=1)
+
+    assert glm52_exact_active_lora_enabled(model.config)
+    assert all(getattr(model.config, flag) is True for flag in GLM52_EXACT_ACTIVE_LORA_FLAGS)
 
 
 @pytest.mark.parametrize("missing_flag", GLM52_EXACT_ACTIVE_LORA_FLAGS)
