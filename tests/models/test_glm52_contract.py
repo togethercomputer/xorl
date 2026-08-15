@@ -1360,17 +1360,17 @@ def _semantic_rank_partials(block, hidden_states, routing_weights, selected_expe
     return torch.stack([(base + offset).to(torch.bfloat16) for offset in offsets])
 
 
-def _independent_serving_fp32_fold_reference(partials: torch.Tensor) -> torch.Tensor:
-    """Transcribe serving's adjacent-pair/odd-tail FP32 tree independently."""
+def _independent_serving_fp64_fold_reference(partials: torch.Tensor) -> torch.Tensor:
+    """Transcribe serving's adjacent-pair/odd-tail FP64 tree independently."""
 
-    level = tuple(partial.float() for partial in partials.unbind(0))
+    level = tuple(partial.double() for partial in partials.unbind(0))
     while len(level) > 1:
         paired = tuple(level[index] + level[index + 1] for index in range(0, len(level) - 1, 2))
         level = paired + ((level[-1],) if len(level) % 2 else ())
     return level[0].to(partials.dtype)
 
 
-def test_independent_serving_fold_reference_pins_fp32_nodes_and_tree_topology():
+def test_independent_serving_fold_reference_pins_fp64_nodes_and_tree_topology():
     cancellation = torch.tensor(
         [[4096.0], [1.0], [-4096.0], [1.0]],
         dtype=torch.bfloat16,
@@ -1379,17 +1379,27 @@ def test_independent_serving_fold_reference_pins_fp32_nodes_and_tree_topology():
     while retired_bf16_level.shape[0] > 1:
         retired_bf16_level = (retired_bf16_level[0::2] + retired_bf16_level[1::2]).bfloat16()
 
-    assert _independent_serving_fp32_fold_reference(cancellation).item() == 2.0
+    assert _independent_serving_fp64_fold_reference(cancellation).item() == 2.0
     assert retired_bf16_level.item() == 0.0
 
-    topology = torch.tensor(
+    fp64_discriminator = torch.tensor(
         [[33554432.0], [1.0], [-33554432.0], [1.0]],
         dtype=torch.bfloat16,
     )
-    left_linear = topology[0].float()
+    retired_fp32_tree = (fp64_discriminator[0].float() + fp64_discriminator[1].float()) + (
+        fp64_discriminator[2].float() + fp64_discriminator[3].float()
+    )
+    assert _independent_serving_fp64_fold_reference(fp64_discriminator).item() == 2.0
+    assert retired_fp32_tree.item() == 0.0
+
+    topology = torch.tensor(
+        [[2**54], [1.0], [-(2**54)], [1.0]],
+        dtype=torch.bfloat16,
+    )
+    left_linear = topology[0].double()
     for contributor in topology[1:]:
-        left_linear = left_linear + contributor.float()
-    assert _independent_serving_fp32_fold_reference(topology).item() == 0.0
+        left_linear = left_linear + contributor.double()
+    assert _independent_serving_fp64_fold_reference(topology).item() == 0.0
     assert left_linear.item() == 1.0
 
 
@@ -1415,7 +1425,7 @@ def _bind_semantic_canonicalizers(model, boundaries, *, serving: bool, skip_laye
             )
             flattened = partials.reshape(8, rows, hidden_states.shape[-1])
             if serving:
-                canonical = _independent_serving_fp32_fold_reference(flattened)
+                canonical = _independent_serving_fp64_fold_reference(flattened)
             else:
                 canonical = canonical_moe_reduce_reference(flattened, metadata)
             if _layer_id == skip_layer:

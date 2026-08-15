@@ -2,9 +2,9 @@
 
 The forward contract in this module deliberately separates transport from
 floating-point arithmetic. Raw BF16/FP16 partials travel to one logical row
-owner, which promotes the leaves to FP32 and evaluates an explicit
+owner, which promotes the leaves to FP64 and evaluates an explicit
 adjacent-pairwise tree in logical-contributor order. Every tree node remains
-FP32; the completed result is cast exactly once at the declared low-precision
+FP64; the completed result is cast exactly once at the declared low-precision
 consumer boundary. Any later replication copies those completed bytes.
 
 The canonical arithmetic here is a DELIBERATE independent implementation of
@@ -29,16 +29,16 @@ import torch.distributed as dist
 from xorl.ops.canonical_moe_leaf import canonical_moe_leaf_fp32_v1_op
 
 
-CANONICAL_MOE_FOLD_VERSION = "canonical_moe_fold_fp32_v2"
-CANONICAL_MOE_REDUCE_VERSION = "canonical_moe_reduce_fp32_v2"
+CANONICAL_MOE_FOLD_VERSION = "canonical_moe_fold_fp64_v3"
+CANONICAL_MOE_REDUCE_VERSION = "canonical_moe_reduce_fp64_v3"
 CANONICAL_MOE_LEAF_VERSION = "canonical_moe_leaf_fp32_v1"
 CANONICAL_MOE_PACKED_EP16_TRANSPORT_VERSION = "packed_ep16_v2"
 CANONICAL_MOE_CP_SHARDED_TRANSPORT_VERSION = "cp_sharded_v3"
 GLM52_NUM_LAYERS = 78
-# Bound only the first FP32 tree level.  Later adjacent-pair levels are at
+# Bound only the first FP64 tree level.  Later adjacent-pair levels are at
 # most half as large, so this keeps the local arithmetic workspace independent
 # of sequence length and payload width without changing any reduction bytes.
-_CANONICAL_MOE_FP32_FOLD_MAX_LEVEL_BYTES = 32 * 1024 * 1024
+_CANONICAL_MOE_FP64_FOLD_MAX_LEVEL_BYTES = 32 * 1024 * 1024
 # Dense transport expands each row across the complete contributor axis.  Keep
 # its transient send/receive tensors bounded even when DP-owned rows make the
 # logical capacity much larger than the per-rank sequence.  Chunk boundaries
@@ -114,7 +114,7 @@ class OutputDistribution(str, Enum):
 
 
 class CanonicalMoETransport(str, Enum):
-    """Byte-transport implementation composed with the FP32-v2 fold."""
+    """Byte-transport implementation composed with the FP64-v3 fold."""
 
     AUTO = "auto"
     DENSE_V1 = "dense_v1"
@@ -258,7 +258,7 @@ class ParallelPlan:
         if self.world_size <= 0:
             raise ValueError("world_size must be positive")
         if self.ep_size <= 0:
-            raise ValueError("canonical_moe_reduce_fp32_v2 requires a positive contributor count")
+            raise ValueError("canonical_moe_reduce_fp64_v3 requires a positive contributor count")
         if len(self.combine_groups) != len(self.logical_ordinals_by_group):
             raise ValueError("combine_groups and logical_ordinals_by_group must have equal lengths")
 
@@ -285,7 +285,7 @@ class ParallelPlan:
         )
         if tuple(sorted(self.cp_ep_aliases)) != expected_cp_ep_aliases:
             raise ValueError(
-                "FP32-v2 requires an explicit identity CP/EP alias map only when the row-placement and "
+                "FP64-v3 requires an explicit identity CP/EP alias map only when the row-placement and "
                 "expert axes alias"
             )
 
@@ -547,7 +547,7 @@ class LocalMoEContribution:
 
     def __post_init__(self) -> None:
         if self.layout is not ContributionLayout.LOCAL_PARTIAL:
-            raise ValueError("canonical_moe_reduce_fp32_v2 accepts only typed local partial contributions")
+            raise ValueError("canonical_moe_reduce_fp64_v3 accepts only typed local partial contributions")
         if self.tensor.dtype not in (torch.bfloat16, torch.float16):
             raise TypeError(f"Local MoE partial must be BF16 or FP16, got {self.tensor.dtype}")
         if self.tensor.ndim < 2:
@@ -587,7 +587,7 @@ def _validate_runtime_plan(
     physical_global_rank: int,
 ) -> _RuntimePlan:
     if not dist.is_initialized():
-        raise RuntimeError("canonical_moe_reduce_fp32_v2 requires an initialized torch.distributed process group")
+        raise RuntimeError("canonical_moe_reduce_fp64_v3 requires an initialized torch.distributed process group")
     if dist.get_world_size() != plan.world_size:
         raise ValueError(f"Runtime world size {dist.get_world_size()} does not match plan {plan.world_size}")
 
@@ -632,11 +632,11 @@ def canonical_moe_leaf_fp32_v1(
     return canonical_moe_leaf_fp32_v1_op(shared, routed, routed_scale)
 
 
-def _canonical_moe_fold_fp32_tree(partials_by_logical_ordinal: torch.Tensor) -> torch.Tensor:
-    """Evaluate the source-ordered adjacent-pair tree entirely in FP32.
+def _canonical_moe_fold_fp64_tree(partials_by_logical_ordinal: torch.Tensor) -> torch.Tensor:
+    """Evaluate the source-ordered adjacent-pair tree entirely in FP64.
 
     This internal helper exposes the completed pre-cast boundary to focused
-    arithmetic tests. Production callers use :func:`canonical_moe_fold_fp32_v2`,
+    arithmetic tests. Production callers use :func:`canonical_moe_fold_fp64_v3`,
     which performs the single declared output cast.
     """
     if partials_by_logical_ordinal.ndim < 2:
@@ -648,7 +648,7 @@ def _canonical_moe_fold_fp32_tree(partials_by_logical_ordinal: torch.Tensor) -> 
     if contributor_count <= 0:
         raise ValueError("Canonical MoE fold requires a positive contributor count")
 
-    level = partials.to(torch.float32)
+    level = partials.to(torch.float64)
     while level.shape[0] > 1:
         pair_count = level.shape[0] // 2
         paired = level[: 2 * pair_count : 2] + level[1 : 2 * pair_count : 2]
@@ -659,22 +659,22 @@ def _canonical_moe_fold_fp32_tree(partials_by_logical_ordinal: torch.Tensor) -> 
     return level[0]
 
 
-def _canonical_moe_fp32_fold_chunk_elements(contributor_count: int) -> int:
-    """Maximum payload elements whose initial FP32 level fits the bound."""
+def _canonical_moe_fp64_fold_chunk_elements(contributor_count: int) -> int:
+    """Maximum payload elements whose initial FP64 level fits the bound."""
     if contributor_count <= 0:
         raise ValueError("Canonical MoE fold requires a positive contributor count")
     return max(
         1,
-        _CANONICAL_MOE_FP32_FOLD_MAX_LEVEL_BYTES // (contributor_count * 4),
+        _CANONICAL_MOE_FP64_FOLD_MAX_LEVEL_BYTES // (contributor_count * 8),
     )
 
 
-def canonical_moe_fold_fp32_v2(partials_by_logical_ordinal: torch.Tensor) -> torch.Tensor:
-    """Fold source-ordered low-precision contributions under the FP32-v2 contract.
+def canonical_moe_fold_fp64_v3(partials_by_logical_ordinal: torch.Tensor) -> torch.Tensor:
+    """Fold source-ordered low-precision contributions under the FP64-v3 contract.
 
     Transport must put contributor ``C_i`` at index ``i`` before calling this
-    primitive. Leaves are promoted to FP32, each level preserves the declared
-    adjacent-pair plus odd-tail topology, and every internal node stays FP32.
+    primitive. Leaves are promoted to FP64, each level preserves the declared
+    adjacent-pair plus odd-tail topology, and every internal node stays FP64.
     The completed tree is cast exactly once to the transported input dtype at
     the consumer boundary. The arithmetic is an independent implementation of
     serving's identically versioned program; neither side imports the other.
@@ -690,30 +690,30 @@ def canonical_moe_fold_fp32_v2(partials_by_logical_ordinal: torch.Tensor) -> tor
 
     payload_shape = partials.shape[1:]
     payload_elements = partials[0].numel()
-    chunk_elements = _canonical_moe_fp32_fold_chunk_elements(contributor_count)
+    chunk_elements = _canonical_moe_fp64_fold_chunk_elements(contributor_count)
     if payload_elements <= chunk_elements:
-        return _canonical_moe_fold_fp32_tree(partials).to(partials.dtype)
+        return _canonical_moe_fold_fp64_tree(partials).to(partials.dtype)
 
     # Each payload element is independent: the only reduction axis is the
     # immutable logical-contributor axis.  Chunking that orthogonal payload
-    # axis therefore preserves the exact adjacent-pair FP32 tree.  Store every
+    # axis therefore preserves the exact adjacent-pair FP64 tree.  Store every
     # completed element once at the declared low-precision boundary instead of
-    # ever materializing the complete contributor tensor in FP32.
+    # ever materializing the complete contributor tensor in FP64.
     output = torch.empty(payload_shape, dtype=partials.dtype, device=partials.device)
     if partials.is_contiguous():
         flat_partials = partials.view(contributor_count, -1)
         flat_output = output.view(-1)
         for start in range(0, payload_elements, chunk_elements):
             end = min(start + chunk_elements, payload_elements)
-            folded_fp32 = _canonical_moe_fold_fp32_tree(flat_partials[:, start:end])
-            flat_output[start:end] = folded_fp32.to(partials.dtype)
+            folded_fp64 = _canonical_moe_fold_fp64_tree(flat_partials[:, start:end])
+            flat_output[start:end] = folded_fp64.to(partials.dtype)
         return output
 
     # A whole-tensor ``reshape`` of a strided arrival silently materializes the
-    # complete low-precision contributor payload before the bounded FP32 fold.
+    # complete low-precision contributor payload before the bounded FP64 fold.
     # Instead, choose a rectangular payload tile whose element count fits the
     # same budget. Each sliced source view may be strided, but its promotion can
-    # materialize at most ``contributor_count * chunk_elements`` FP32 values.
+    # materialize at most ``contributor_count * chunk_elements`` FP64 values.
     remaining = chunk_elements
     reversed_tile_shape = []
     for extent in reversed(payload_shape):
@@ -727,8 +727,8 @@ def canonical_moe_fold_fp32_v2(partials_by_logical_ordinal: torch.Tensor) -> tor
             slice(start, min(start + tile_extent, extent))
             for start, tile_extent, extent in zip(starts, tile_shape, payload_shape)
         )
-        folded_fp32 = _canonical_moe_fold_fp32_tree(partials[(slice(None), *payload_slice)])
-        output[payload_slice] = folded_fp32.to(partials.dtype)
+        folded_fp64 = _canonical_moe_fold_fp64_tree(partials[(slice(None), *payload_slice)])
+        output[payload_slice] = folded_fp64.to(partials.dtype)
     return output
 
 
@@ -741,7 +741,7 @@ def canonical_moe_reduce_reference(
         raise ValueError("Reference partials must have contributor, row, and payload dimensions")
     if partials_by_logical_ordinal.shape[1] != metadata.capacity:
         raise ValueError("Reference partial row count must equal metadata capacity")
-    result = canonical_moe_fold_fp32_v2(partials_by_logical_ordinal)
+    result = canonical_moe_fold_fp64_v3(partials_by_logical_ordinal)
     return torch.where(
         metadata.valid_mask.view(-1, *([1] * (result.ndim - 1))),
         result,
@@ -791,7 +791,7 @@ def _transport_and_fold(
             physical_sources = receive.view(contributor_count, rows, *payload_shape)
             source_group_order = torch.tensor(logical_to_group, dtype=torch.long, device=chunk.device)
             logical_sources = physical_sources.index_select(0, source_group_order)
-            folded = canonical_moe_fold_fp32_v2(logical_sources)
+            folded = canonical_moe_fold_fp64_v3(logical_sources)
         elif transport is CanonicalMoETransport.PACKED_EP16_V2:
             if contributor_count != 16:
                 raise ValueError("packed_ep16_v2 requires exactly 16 logical contributors")
@@ -826,7 +826,7 @@ def _transport_and_fold(
             physical_sources = receive.view(contributor_count, packed_rows, *payload_shape)
             source_group_order = torch.tensor(logical_to_group, dtype=torch.long, device=chunk.device)
             logical_sources = physical_sources.index_select(0, source_group_order)
-            packed_folded = canonical_moe_fold_fp32_v2(logical_sources)
+            packed_folded = canonical_moe_fold_fp64_v3(logical_sources)
         else:
             raise ValueError(f"Unknown canonical MoE transport: {transport}")
 
@@ -945,7 +945,7 @@ class _CanonicalMoECPShardedV3(torch.autograd.Function):
         # contributor order before the first floating-point operation.
         logical_to_group = torch.tensor(runtime.logical_to_group_rank, dtype=torch.long, device=receive.device)
         logical_sources = receive.index_select(0, logical_to_group)
-        folded = canonical_moe_fold_fp32_v2(logical_sources)
+        folded = canonical_moe_fold_fp64_v3(logical_sources)
         local_valid = full_valid[runtime.local_group_rank]
         output = torch.where(
             local_valid.view(-1, *([1] * len(payload_shape))),
@@ -1078,7 +1078,7 @@ def _canonical_moe_reduce(
     )
 
 
-def canonical_moe_reduce_fp32_v2(
+def canonical_moe_reduce_fp64_v3(
     contribution: LocalMoEContribution,
     *,
     plan: ParallelPlan,
@@ -1088,7 +1088,7 @@ def canonical_moe_reduce_fp32_v2(
     chunk_rows: int | None = None,
     graph_mode: bool = False,
 ) -> CanonicalMoEOutput:
-    """Canonicalize one typed local partial under the FP32-v2 contract."""
+    """Canonicalize one typed local partial under the FP64-v3 contract."""
     return _canonical_moe_reduce(
         contribution,
         plan=plan,
@@ -1111,12 +1111,12 @@ def canonical_moe_reduce_packed_ep16_v2(
     chunk_rows: int | None = None,
     graph_mode: bool = False,
 ) -> CanonicalMoEOutput:
-    """Use packed equal-split owner transport with FP32-v2 fold arithmetic.
+    """Use packed equal-split owner transport with FP64-v3 fold arithmetic.
 
     Each destination receives at most ``ceil(chunk_rows / 16)`` rows from
     every logical contributor. The selected rows retain their original order,
-    so the FP32 adjacent-pair tree observes the exact same contributor
-    sequence as :func:`canonical_moe_reduce_fp32_v2`.
+    so the FP64 adjacent-pair tree observes the exact same contributor
+    sequence as :func:`canonical_moe_reduce_fp64_v3`.
     """
     return _canonical_moe_reduce(
         contribution,
@@ -1205,11 +1205,11 @@ __all__ = [
     "OutputDistribution",
     "ParallelPlan",
     "ParallelRole",
-    "canonical_moe_fold_fp32_v2",
+    "canonical_moe_fold_fp64_v3",
     "canonical_moe_leaf_fp32_v1",
     "canonical_moe_reduce_reference",
     "canonical_moe_reduce_packed_ep16_v2",
     "canonical_moe_reduce_cp_sharded_v3",
-    "canonical_moe_reduce_fp32_v2",
+    "canonical_moe_reduce_fp64_v3",
     "resolve_canonical_moe_transport",
 ]

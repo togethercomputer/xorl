@@ -1,8 +1,8 @@
 """Byte and grad gates for the Qwen exact MoE canonical contributor fold.
 
 The exact Qwen3.5-MoE cross-rank combine is
-``canonical_moe_fold_fp32_v2``: the balanced adjacent-pair tree over
-source-ordered low-precision leaves, with every node in FP32 and one final
+``canonical_moe_fold_fp64_v3``: the balanced adjacent-pair tree over
+source-ordered low-precision leaves promoted to FP64, with every node in FP64 and one final
 cast on both engines (serving folds after an all-gather; the trainer folds
 after a raw all-to-all). These gates pin the three facts the pairing depends on:
 
@@ -26,7 +26,7 @@ import torch
 
 from xorl.distributed.canonical_moe import (
     CANONICAL_MOE_FOLD_VERSION,
-    canonical_moe_fold_fp32_v2,
+    canonical_moe_fold_fp64_v3,
 )
 
 
@@ -36,12 +36,12 @@ EP_SIZE = 8
 
 
 def _serving_fold_reference(partials: torch.Tensor) -> torch.Tensor:
-    """Serving's canonical_moe_fold_fp32_v2 arithmetic, transcribed independently.
+    """Serving's canonical_moe_fold_fp64_v3 arithmetic, transcribed independently.
 
     sglang canonical_moe.py ``_balanced_adjacent_tree``: pair adjacent
-    contributors level by level in FP32, then cast once at the output.
+    contributors level by level in FP64, then cast once at the output.
     """
-    level = [partials[index].float() for index in range(partials.shape[0])]
+    level = [partials[index].double() for index in range(partials.shape[0])]
     while len(level) > 1:
         level = [level[index] + level[index + 1] for index in range(0, len(level), 2)]
     return level[0].to(partials.dtype)
@@ -71,13 +71,13 @@ def _bits(tensor: torch.Tensor) -> torch.Tensor:
 
 
 def test_fold_version_tag():
-    assert CANONICAL_MOE_FOLD_VERSION == "canonical_moe_fold_fp32_v2"
+    assert CANONICAL_MOE_FOLD_VERSION == "canonical_moe_fold_fp64_v3"
 
 
 def test_trainer_fold_matches_serving_fold_arithmetic():
     partials = _partials()
     assert torch.equal(
-        _bits(canonical_moe_fold_fp32_v2(partials)),
+        _bits(canonical_moe_fold_fp64_v3(partials)),
         _bits(_serving_fold_reference(partials)),
     )
 
@@ -89,8 +89,8 @@ def test_trainer_fold_matches_live_serving_fold_bitwise():
         reason="serving package not importable in this venv",
     )
     partials = _partials()
-    serving_folded = serving_canonical.canonical_moe_fold_fp32_v2(partials.clone())
-    assert torch.equal(_bits(canonical_moe_fold_fp32_v2(partials)), _bits(serving_folded))
+    serving_folded = serving_canonical.canonical_moe_fold_fp64_v3(partials.clone())
+    assert torch.equal(_bits(canonical_moe_fold_fp64_v3(partials)), _bits(serving_folded))
 
 
 def test_fold_is_not_the_retired_chain():
@@ -101,26 +101,26 @@ def test_fold_is_not_the_retired_chain():
     profile rather than merely one differing element.
     """
     partials = _partials()
-    fold = canonical_moe_fold_fp32_v2(partials)
+    fold = canonical_moe_fold_fp64_v3(partials)
     chain = _retired_chain_reference(partials)
     differing = int((_bits(fold) != _bits(chain)).sum())
     assert differing > 0.2 * fold.numel(), f"chain-vs-fold discrimination collapsed: {differing}/{fold.numel()}"
 
 
 def test_fold_pairing_structure_is_the_program():
-    """A reassociation-sensitive FP32 witness pins the adjacent tree."""
+    """A reassociation-sensitive FP64 witness pins the adjacent tree."""
     partials = torch.tensor(
-        [2**24, 1.0, -(2**24), 1.0, 0.0, 0.0, 0.0, 0.0],
+        [2**54, 1.0, -(2**54), 1.0, 0.0, 0.0, 0.0, 0.0],
         dtype=torch.bfloat16,
     ).view(8, 1)
     assert torch.equal(
-        _bits(canonical_moe_fold_fp32_v2(partials)),
-        _bits(canonical_moe_fold_fp32_v2(partials.flip(0))),
+        _bits(canonical_moe_fold_fp64_v3(partials)),
+        _bits(canonical_moe_fold_fp64_v3(partials.flip(0))),
     )
     regrouped = partials[[0, 2, 1, 3, 4, 6, 5, 7]]
     assert not torch.equal(
-        _bits(canonical_moe_fold_fp32_v2(partials)),
-        _bits(canonical_moe_fold_fp32_v2(regrouped)),
+        _bits(canonical_moe_fold_fp64_v3(partials)),
+        _bits(canonical_moe_fold_fp64_v3(regrouped)),
     )
 
 
@@ -165,7 +165,7 @@ def test_exchange_and_canonical_fold_grad_engagement(monkeypatch):
     assert torch.isfinite(grads.float()).all(), "combine grad not finite"
     for contributor in range(EP_SIZE):
         # d(fold)/d(p_i) is the identity for every contributor; promotion,
-        # FP32 adds, and the final cast preserve the pass-through trajectory.
+        # FP64 adds, and the final cast preserve the pass-through trajectory.
         assert torch.equal(_bits(grads[contributor]), _bits(grad_out)), (
             f"contributor {contributor} grad diverged from the reference trajectory"
         )

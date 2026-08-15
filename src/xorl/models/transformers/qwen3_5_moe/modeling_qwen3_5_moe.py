@@ -435,8 +435,8 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
         FP32 fused gate/mul/add and cast once to BF16 — exactly serving's
         per-rank partial — then partials are exchanged RAW
         (all-to-all, never NCCL-summed) and each rank folds its own tokens'
-        n partials with the canonical adjacent-pair FP32 tree and one final cast
-        (``canonical_moe_fold_fp32_v2``, bitwise serving's post-experts combine).
+        n partials with the canonical adjacent-pair FP64 tree and one final cast
+        (``canonical_moe_fold_fp64_v3``, bitwise serving's post-experts combine).
         Forward bits match the serving engine; backward uses stock numerics
         throughout (cuBLAS shared-expert grads, grouped-GEMM expert grads,
         NCCL grad reductions)."""

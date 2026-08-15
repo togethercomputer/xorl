@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from xorl.distributed.canonical_moe import canonical_moe_fold_fp32_v2
+from xorl.distributed.canonical_moe import canonical_moe_fold_fp64_v3
 from xorl.models.layers.moe.dsv4_native_combine import (
     compact_rank_padded_rows,
     exchange_variable_and_canonical_fold,
@@ -23,7 +23,7 @@ def test_compact_rank_padded_rows_retains_only_live_prefixes():
 
 
 def test_variable_exchange_applies_the_shared_canonical_fold(monkeypatch):
-    """EP8 arrivals in rank order must reduce via canonical_moe_fold_fp32_v2."""
+    """EP8 arrivals in rank order must reduce via canonical_moe_fold_fp64_v3."""
 
     import xorl.distributed.moe.comm as comm  # noqa: PLC0415
 
@@ -42,7 +42,7 @@ def test_variable_exchange_applies_the_shared_canonical_fold(monkeypatch):
 
     monkeypatch.setattr(comm._AllToAll, "apply", fake_apply)
     result = exchange_variable_and_canonical_fold(partial, "group", row_counts, source_ordinal=0)
-    expected = canonical_moe_fold_fp32_v2(exchanged.reshape(ep_size, local_rows, 4))
+    expected = canonical_moe_fold_fp64_v3(exchanged.reshape(ep_size, local_rows, 4))
     assert torch.equal(result, expected)
 
 
@@ -113,7 +113,7 @@ def test_variable_exchange_routes_a_ragged_nonzero_owner(monkeypatch):
         row_counts,
         source_ordinal=source_ordinal,
     )
-    expected = canonical_moe_fold_fp32_v2(arrivals.reshape(8, local_rows, 4))
+    expected = canonical_moe_fold_fp64_v3(arrivals.reshape(8, local_rows, 4))
     assert torch.equal(result, expected)
 
 

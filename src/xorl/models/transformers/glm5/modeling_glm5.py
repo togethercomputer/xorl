@@ -17,7 +17,7 @@ from xorl.distributed.canonical_moe import (
     ParallelPlan,
     canonical_moe_leaf_fp32_v1,
     canonical_moe_reduce_cp_sharded_v3,
-    canonical_moe_reduce_fp32_v2,
+    canonical_moe_reduce_fp64_v3,
     canonical_moe_reduce_packed_ep16_v2,
     resolve_canonical_moe_transport,
 )
@@ -1289,7 +1289,7 @@ class Glm5MoEBlock(MoEBlock):
             canonical_reduce = (
                 canonical_moe_reduce_packed_ep16_v2
                 if resolved_transport is CanonicalMoETransport.PACKED_EP16_V2
-                else canonical_moe_reduce_fp32_v2
+                else canonical_moe_reduce_fp64_v3
             )
             canonical = canonical_reduce(
                 contribution,

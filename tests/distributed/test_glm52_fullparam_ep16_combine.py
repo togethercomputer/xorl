@@ -1,7 +1,7 @@
 """16-contributor ordered-combine byte gate for the full-param expert bank.
 
 This CPU/gloo test runs 16 ranks and covers full-param bank partials entering the GLM
-canonical contributor-tree reduce (`canonical_moe_reduce_fp32_v2`, the same code
+canonical contributor-tree reduce (`canonical_moe_reduce_fp64_v3`, the same code
 the GLM-5.2 model path calls) with byte equality against the logical-order
 pairwise-tree reference; variable per-rank row counts through the padded
 gather; sentinel/off-owner routing; and gradient plumbing from the combined
@@ -117,10 +117,10 @@ def _seed_bank(rank: int, device: torch.device = torch.device("cpu"), kind: str 
 
 def _canonical_tree_reference(partials: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
     """The contributor pairwise-tree reference from the canonical-MoE contract
-    gate (adjacent-pair FP32 tree over logical contributor order, one final
+    gate (adjacent-pair FP64 tree over logical contributor order, one final
     cast to the transported dtype)."""
 
-    level = [partials[index].float() for index in range(partials.shape[0])]
+    level = [partials[index].double() for index in range(partials.shape[0])]
     while len(level) > 1:
         level = [level[index] + level[index + 1] for index in range(0, len(level), 2)]
     result = level[0].to(partials.dtype)
@@ -136,7 +136,7 @@ def _run_ep16_case() -> None:
         LocalMoEContribution,
         OutputDistribution,
         ParallelPlan,
-        canonical_moe_reduce_fp32_v2,
+        canonical_moe_reduce_fp64_v3,
     )
     from xorl.models.layers.moe.ep_native_combine import (
         gather_ids_for_ep_combine,
@@ -233,7 +233,7 @@ def _run_ep16_case() -> None:
         # primitive identity plan — same reduce arithmetic, no GLM row claim.
         plan = ParallelPlan.primitive(_CONTRIBUTORS)
     contribution = LocalMoEContribution(partial, metadata, GLM52_LOCAL_PARTIAL_POLICY)
-    replicated = canonical_moe_reduce_fp32_v2(
+    replicated = canonical_moe_reduce_fp64_v3(
         contribution,
         plan=plan,
         group=group,
@@ -304,6 +304,19 @@ def _run_ep16_case() -> None:
 if __name__ != "__main__":
     import pytest
     from distributed_utils import run_distributed_script
+
+    @pytest.mark.cpu
+    def test_glm52_fullparam_tree_reference_uses_fp64_nodes():
+        partials = torch.zeros((16, 1), dtype=torch.bfloat16)
+        partials[:4, 0] = torch.tensor(
+            [33554432.0, 1.0, -33554432.0, 1.0],
+            dtype=torch.bfloat16,
+        )
+        actual = _canonical_tree_reference(partials, torch.ones(1, dtype=torch.bool))
+        retired_fp32 = (partials[0].float() + partials[1].float()) + (partials[2].float() + partials[3].float())
+
+        assert actual.item() == 2.0
+        assert retired_fp32.item() == 0.0
 
     @pytest.mark.cpu
     def test_glm52_fullparam_ep16_ordered_combine_byte_gate():

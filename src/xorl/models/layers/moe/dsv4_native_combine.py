@@ -1,8 +1,8 @@
-"""DSV4-Flash native-EP combine over the shared canonical FP32-v2 fold.
+"""DSV4-Flash native-EP combine over the shared canonical FP64-v3 fold.
 
 Since the canonical-fold unification, DSV4 reduces MoE partials with the
-same version-2 adjacent-pair FP32 tree as the Qwen3.5/GLM exact lanes
-(``canonical_moe_fold_fp32_v2`` in ``xorl.distributed.canonical_moe``); serving
+same version-3 adjacent-pair FP64 tree as the Qwen3.5/GLM exact lanes
+(``canonical_moe_fold_fp64_v3`` in ``xorl.distributed.canonical_moe``); serving
 mirrors this by routing its post-experts combine through the gated
 canonical all-reduce instead of relying on pinned NCCL tree behavior.
 The original NCCL-tree contributor-order reproduction (``[1, .., N-1, 0]``
@@ -143,17 +143,17 @@ def exchange_variable_and_canonical_fold(
     row_counts: tuple[int, ...],
     source_ordinal: int,
 ) -> torch.Tensor:
-    """Variable-row BF16 exchange + the shared canonical FP32-v2 fold.
+    """Variable-row BF16 exchange + the shared canonical FP64-v3 fold.
 
     ``partial`` contains every rank's live rows in destination-rank order.
     Raw all-to-all returns this destination's rows from each source rank;
     EP group-rank order is also DSV4's logical expert-slice ordinal order,
-    so the reshaped arrivals feed ``canonical_moe_fold_fp32_v2`` directly — the
+    so the reshaped arrivals feed ``canonical_moe_fold_fp64_v3`` directly — the
     same byte program serving evaluates through its gated canonical
     post-experts all-reduce.
     """
 
-    from xorl.distributed.canonical_moe import canonical_moe_fold_fp32_v2  # noqa: PLC0415
+    from xorl.distributed.canonical_moe import canonical_moe_fold_fp64_v3  # noqa: PLC0415
     from xorl.distributed.moe.comm import _AllToAll  # noqa: PLC0415
 
     ep_size = len(row_counts)
@@ -173,7 +173,7 @@ def exchange_variable_and_canonical_fold(
     if local_rows == 0:
         return exchanged[:0]
     logical_sources = exchanged.reshape(ep_size, local_rows, *exchanged.shape[1:])
-    return canonical_moe_fold_fp32_v2(logical_sources)
+    return canonical_moe_fold_fp64_v3(logical_sources)
 
 
 __all__ = [

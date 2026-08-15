@@ -4,8 +4,8 @@ The TRAINING half of the EP<n>/a2a-none BI-ops serving pairing: serving
 computes, on every rank, its contiguous expert slice's weighted contribution
 for ALL tokens plus a TP slice of the shared expert, joins them in the fused
 FP32 gate/mul/add kernel with one BF16 store,
-all-gathers the raw partials, and folds them with ``canonical_moe_fold_fp32_v2``
-— the balanced adjacent-pair FP32 tree with one final BF16 cast (sglang
+all-gathers the raw partials, and folds them with ``canonical_moe_fold_fp64_v3``
+— the balanced adjacent-pair FP64 tree with one final BF16 cast (sglang
 ``tensor_model_parallel_canonical_moe_all_reduce``). Which
 contributors pair at each tree level is part of the exact Qwen3.5 numerical
 program; the fold is NOT bitwise a summed NCCL collective, and it is not the
@@ -30,7 +30,7 @@ exactly serving-rank-r's contiguous expert slice):
 3. partials are exchanged RAW (all-to-all) — NEVER via an NCCL-summed
    collective (the reduction arithmetic must stay ours) — and every rank
    folds its own tokens' n partials locally with the canonical
-   adjacent-pair FP32 tree in serving rank order, then casts once;
+   adjacent-pair FP64 tree in serving rank order, then casts once;
 4. backward reverses the exchange (grad all-to-all), then the masked backward
    per rank. Grad REDUCTIONS (reduce-scatter of d(x), DP grad sync) stay stock
    NCCL — only forward bits are contracted.
@@ -50,7 +50,7 @@ def validate_native_ep_combine_size(ep_size: int) -> None:
     """Require one complete positive contributor group.
 
     The raw equal-split all-to-all and source-major reshape work for every
-    positive group size. The FP32 fold carries an odd final source unchanged
+    positive group size. The FP64 fold carries an odd final source unchanged
     at each tree level, and EP1 is the mechanically valid identity. Model
     geometry still independently requires expert and shared widths to divide
     by the selected EP size.
@@ -191,17 +191,17 @@ def sglang_fused_gate_sigmoid_mul_add(
 
 
 def exchange_and_canonical_fold(partial: torch.Tensor, group, ep_size: int) -> torch.Tensor:
-    """RAW BF16 partial exchange + the serving canonical FP32 contributor fold.
+    """RAW BF16 partial exchange + the serving canonical FP64 contributor fold.
 
     ``partial`` is this rank's [n*T, H] contribution for ALL gathered tokens.
     The all-to-all hands rank r the n per-rank partials for ITS OWN T rows;
-    they are then folded LOCALLY with ``canonical_moe_fold_fp32_v2`` — the
-    balanced adjacent-pair FP32 tree in serving rank order, bitwise
+    they are then folded LOCALLY with ``canonical_moe_fold_fp64_v3`` — the
+    balanced adjacent-pair FP64 tree in serving rank order, bitwise
     serving's post-experts combine (the K3 contract; never replace with a
     summed collective or a stacked ``.sum()``, and never reassociate the
     tree: the pairing structure is the program).
     """
-    from xorl.distributed.canonical_moe import canonical_moe_fold_fp32_v2  # noqa: PLC0415
+    from xorl.distributed.canonical_moe import canonical_moe_fold_fp64_v3  # noqa: PLC0415
     from xorl.distributed.moe.comm import _AllToAll  # noqa: PLC0415
 
     validate_native_ep_combine_size(ep_size)
@@ -218,4 +218,4 @@ def exchange_and_canonical_fold(partial: torch.Tensor, group, ep_size: int) -> t
     exchanged = _AllToAll.apply(group, partial.contiguous(), None, None)  # [n*T, H], segment s from rank s
     rows = exchanged.shape[0] // ep_size
     logical_sources = exchanged.reshape(ep_size, rows, *exchanged.shape[1:])
-    return canonical_moe_fold_fp32_v2(logical_sources)
+    return canonical_moe_fold_fp64_v3(logical_sources)

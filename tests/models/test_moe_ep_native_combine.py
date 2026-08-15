@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from xorl.distributed.canonical_moe import canonical_moe_fold_fp32_v2
+from xorl.distributed.canonical_moe import canonical_moe_fold_fp64_v3
 from xorl.models.layers.moe.ep_native_combine import (
     exchange_and_canonical_fold,
     gather_ids_for_ep_combine,
@@ -39,7 +39,7 @@ def test_native_combine_odd_tail_and_identity_geometries_preserve_bytes_and_grad
     ).requires_grad_(True)
 
     result = exchange_and_canonical_fold(contributors.reshape(ep_size * 2, 3), group=None, ep_size=ep_size)
-    expected = canonical_moe_fold_fp32_v2(contributors)
+    expected = canonical_moe_fold_fp64_v3(contributors)
 
     assert torch.equal(result.view(torch.uint16), expected.view(torch.uint16))
     result.float().sum().backward()
