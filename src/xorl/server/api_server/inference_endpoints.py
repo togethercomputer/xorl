@@ -449,6 +449,11 @@ class InferenceEndpointsMixin:
             )
             flush_cache = True
 
+        pause_mode = request.pause_mode
+        if flush_cache and pause_mode == "in_place":
+            logger.info("Normalizing pause_mode=in_place to retract because this weight sync flushes cache.")
+            pause_mode = "retract"
+
         postprocess_required = bool(
             fp8_weight_sync
             and fp8_kv_cache_enabled
@@ -457,6 +462,7 @@ class InferenceEndpointsMixin:
         return {
             "cache_invalidation_mode": mode,
             "flush_cache": flush_cache,
+            "pause_mode": pause_mode,
             "radix_cache_enabled": radix_cache_enabled,
             "fp8_kv_cache_enabled": fp8_kv_cache_enabled,
             "fp8_kv_cache_postprocess_required": postprocess_required,
@@ -969,7 +975,7 @@ class InferenceEndpointsMixin:
                     fp8_kv_cache_enabled=cache_behavior["fp8_kv_cache_enabled"],
                     fp8_kv_cache_postprocess_required=cache_behavior["fp8_kv_cache_postprocess_required"],
                     fp8_kv_cache_static_scales=cache_behavior["fp8_kv_cache_static_scales"],
-                    pause_mode=request.pause_mode,
+                    pause_mode=cache_behavior["pause_mode"],
                     weight_version=request.weight_version,
                     quantization=quantization,
                 ),

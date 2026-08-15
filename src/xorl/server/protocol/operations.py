@@ -117,7 +117,7 @@ class SyncWeightsData:
     fp8_kv_cache_enabled: bool = False
     fp8_kv_cache_postprocess_required: bool = False
     fp8_kv_cache_static_scales: bool = False
-    pause_mode: str = "in_place"
+    pause_mode: str = "retract"
     weight_version: Optional[str] = None
     quantization: Optional[Dict[str, Any]] = None
     sparse_delta_paths: Optional[List[str]] = None

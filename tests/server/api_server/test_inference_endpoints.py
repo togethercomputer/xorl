@@ -583,6 +583,7 @@ class TestInferenceEndpointRegistration:
             server.sync_inference_weights(
                 SyncInferenceWeightsRequest(
                     master_address="train.example",
+                    pause_mode="in_place",
                     quantization={"quant_method": "fp8", "weight_block_size": [128, 128]},
                 )
             )
@@ -591,6 +592,7 @@ class TestInferenceEndpointRegistration:
         payload = captured_request["request"].payload
         assert payload.flush_cache is True
         assert payload.cache_invalidation_mode == "auto"
+        assert payload.pause_mode == "retract"
         assert payload.fp8_kv_cache_enabled is True
         assert payload.fp8_kv_cache_postprocess_required is True
         assert payload.fp8_kv_cache_static_scales is True
@@ -873,8 +875,21 @@ class TestSyncCacheInvalidationPolicy:
             InferenceEndpointServerInfo(radix_cache_enabled=True, kv_cache_dtype="bfloat16")
         )
         behavior = server._resolve_sync_cache_behavior(self._request(), quantization=None)
+        assert self._request().pause_mode == "retract"
         assert behavior["flush_cache"] is True
         assert behavior["radix_cache_enabled"] is True
+        assert behavior["pause_mode"] == "retract"
+
+    def test_effective_flush_normalizes_explicit_in_place_mode(self):
+        server = self._server_with_endpoint(
+            InferenceEndpointServerInfo(radix_cache_enabled=True, kv_cache_dtype="bfloat16")
+        )
+        behavior = server._resolve_sync_cache_behavior(
+            self._request(pause_mode="in_place"),
+            quantization=None,
+        )
+        assert behavior["flush_cache"] is True
+        assert behavior["pause_mode"] == "retract"
 
     def test_auto_mode_keeps_client_flag_when_radix_disabled(self):
         server = self._server_with_endpoint(
@@ -883,6 +898,17 @@ class TestSyncCacheInvalidationPolicy:
         behavior = server._resolve_sync_cache_behavior(self._request(), quantization=None)
         assert behavior["flush_cache"] is False
         assert behavior["radix_cache_enabled"] is False
+
+    def test_no_flush_preserves_explicit_in_place_mode(self):
+        server = self._server_with_endpoint(
+            InferenceEndpointServerInfo(radix_cache_enabled=False, kv_cache_dtype="bfloat16")
+        )
+        behavior = server._resolve_sync_cache_behavior(
+            self._request(pause_mode="in_place"),
+            quantization=None,
+        )
+        assert behavior["flush_cache"] is False
+        assert behavior["pause_mode"] == "in_place"
 
     def test_auto_mode_assumes_radix_enabled_when_endpoint_does_not_report_it(self):
         server = self._server_with_endpoint(

@@ -1019,11 +1019,11 @@ class SyncInferenceWeightsRequest(BaseModel):
         ),
     )
     pause_mode: Literal["retract", "abort", "in_place"] = Field(
-        default="in_place",
+        default="retract",
         description="How to pause inference during weight sync. "
-        "'retract': retract running requests to waiting queue, re-execute after resume. "
+        "'retract' (default): retract running requests to waiting queue, re-execute after resume. "
         "'abort': abort and return all in-flight requests. "
-        "'in_place' (default): keep requests in place with KV cache (flush_cache must be False); do not use it to "
+        "'in_place': keep requests in place with KV cache (flush_cache must be False); do not use it to "
         "carry cached state across online weight updates against the pinned receiver.",
     )
     weight_version: Optional[str] = Field(

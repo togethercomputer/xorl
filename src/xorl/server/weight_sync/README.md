@@ -64,11 +64,13 @@ result = resp.json()
 ```
 
 **`pause_mode`** controls how in-flight inference requests are handled:
-- `"retract"`: drain and re-queue requests; they re-execute after sync
+- `"retract"` (default): drain and re-queue requests; they re-execute after sync
 - `"abort"`: drop in-flight requests immediately
-- `"in_place"` (default): keep KV cache in place (incompatible with flushing and unsafe across online weight changes when cached state may be reused)
+- `"in_place"`: keep KV cache in place (incompatible with flushing and unsafe across online weight changes when cached state may be reused)
 
 The pinned receiver does not namespace KV or prefix-cache entries by `weight_version`. Use `retract` plus `cache_invalidation_mode: "flush"` for online updates; do not rely on `none` or `in_place` to preserve cache state across a weight change.
+If an explicit `in_place` request resolves to `flush_cache: true`, XoRL sends
+`retract` instead so the receiver never sees an unsupported pause/flush pair.
 
 **`quantization`** can be specified per-call to override the default set by
 `set_sync_quantization`. If omitted, the server uses the default (or

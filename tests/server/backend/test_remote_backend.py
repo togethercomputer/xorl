@@ -1,6 +1,11 @@
 import pytest
 
 from xorl.server.backend.remote import RemoteBackend
+from xorl.server.protocol.operations import SyncWeightsData
+
+
+def test_sync_weights_protocol_defaults_to_retract():
+    assert SyncWeightsData().pause_mode == "retract"
 
 
 @pytest.mark.asyncio
@@ -29,8 +34,29 @@ async def test_sync_inference_weights_uses_backend_operation_timeout(monkeypatch
     assert captured["request_id"] == "sync-req"
     assert captured["timeout"] == 2400.0
     assert captured["payload"].cache_invalidation_mode == "none"
-    assert captured["payload"].pause_mode == "in_place"
+    assert captured["payload"].pause_mode == "retract"
     assert captured["payload"].sparse_delta_paths == ["/shared/delta.packed"]
+
+
+@pytest.mark.asyncio
+async def test_sync_inference_weights_normalizes_in_place_when_flushing(monkeypatch):
+    backend = RemoteBackend()
+    captured = {}
+
+    async def fake_execute(_operation, payload, **_kwargs):
+        captured["payload"] = payload
+        return {"success": True}
+
+    monkeypatch.setattr(backend, "_execute", fake_execute)
+
+    await backend.sync_inference_weights(
+        endpoints=[{"host": "inference.example", "port": 30000, "world_size": 1}],
+        flush_cache=True,
+        pause_mode="in_place",
+    )
+
+    assert captured["payload"].flush_cache is True
+    assert captured["payload"].pause_mode == "retract"
 
 
 @pytest.mark.asyncio
