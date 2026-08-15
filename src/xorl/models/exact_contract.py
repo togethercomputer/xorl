@@ -46,6 +46,20 @@ def resolve_exact_contract_family(config: object | None) -> Optional[str]:
     return None
 
 
+def exact_gdn_cp_alignment_required(config: object | None) -> bool:
+    """Return whether the resolved exact program requires GDN CP alignment.
+
+    This is an internal consequence of model resolution, not a launch option:
+    an installed exact chain that contains ``linear_attention`` layers must use
+    the GDN context-parallel sequence-alignment contract.
+    """
+
+    if config is None or not bool(getattr(config, "_qwen35_exact_contract", False)):
+        return False
+    scope = getattr(config, "text_config", None) or config
+    return "linear_attention" in tuple(getattr(scope, "layer_types", ()) or ())
+
+
 GLM52_EXACT_ACTIVE_LORA_FLAGS = (
     "_glm52_exact_active_lora_dense_component",
     "_glm52_exact_active_lora_attention_component",
@@ -145,6 +159,7 @@ __all__ = [
     "contains_dsv4_exact_active_lora_component",
     "contains_glm52_exact_active_lora_component",
     "contains_glm52_fullparam_component",
+    "exact_gdn_cp_alignment_required",
     "glm52_exact_active_lora_enabled",
     "glm52_exact_forward_enabled",
     "glm52_fullparam_training_enabled",

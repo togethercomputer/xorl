@@ -139,6 +139,7 @@ class DataLoaderBuilder:
         seed: int = 0,
         pad_to_multiple_of: int = 128,
         fa_max_length_bucket: int = 0,
+        gdn_exact_cp_align: bool = False,
     ):
         """
         Initialize the DataLoaderBuilder.
@@ -167,6 +168,7 @@ class DataLoaderBuilder:
         self.seed = seed
         self.pad_to_multiple_of = pad_to_multiple_of
         self.fa_max_length_bucket = fa_max_length_bucket
+        self.gdn_exact_cp_align = bool(gdn_exact_cp_align)
         self.parallel_state = get_parallel_state()
 
         # Initialize collator pipeline
@@ -194,7 +196,10 @@ class DataLoaderBuilder:
 
         if self.parallel_state.cp_enabled:
             collators.append(
-                TextSequenceShardCollator(fa_max_length_bucket=self.fa_max_length_bucket)
+                TextSequenceShardCollator(
+                    fa_max_length_bucket=self.fa_max_length_bucket,
+                    gdn_exact_cp_align=self.gdn_exact_cp_align,
+                )
             )  # 5. Shard sequences (if SP enabled)
 
         return collators

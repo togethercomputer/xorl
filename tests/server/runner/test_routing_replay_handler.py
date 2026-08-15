@@ -2,6 +2,7 @@ import base64
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from xorl.models.layers.moe.moe_block import MoEBlock
@@ -183,6 +184,104 @@ def test_routing_weight_builder_preserves_float_values_and_padding(monkeypatch):
         per_mb[0][:, 0, :],
         torch.tensor([[0.25, 0.75], [0.10, 0.90], [0.50, 0.50]], dtype=torch.float32),
     )
+
+
+def test_aligned_sp_routing_maps_source_rows_to_local_physical_rows(monkeypatch):
+    routed_experts = [_routing(10, 3), _routing(20, 2)]
+    routed_weights = [
+        [[[0.10, 0.90]], [[0.20, 0.80]], [[0.30, 0.70]]],
+        [[[0.40, 0.60]], [[0.60, 0.40]]],
+    ]
+    expected_by_rank = {
+        0: ([10, 11, 12], [[0.10, 0.90], [0.20, 0.80], [0.30, 0.70]]),
+        1: ([20, 21], [[0.40, 0.60], [0.60, 0.40]]),
+    }
+
+    for cp_rank, (expected_experts, expected_weights) in expected_by_rank.items():
+        monkeypatch.setattr(
+            rrh,
+            "get_parallel_state",
+            lambda cp_rank=cp_rank: SimpleNamespace(
+                cp_enabled=True,
+                cp_size=2,
+                cp_rank=cp_rank,
+                ringattn_size=1,
+            ),
+        )
+        if cp_rank == 0:
+            logical_rows = [0, 1, 2] + [-1] * 61
+            request_ids = [0, 0, 0] + [-1] * 61
+            request_positions = [0, 1, 2] + [0] * 61
+        else:
+            logical_rows = [3, 4] + [-1] * 62
+            request_ids = [1, 1] + [-1] * 62
+            request_positions = [0, 1] + [0] * 62
+        live_mask = [logical_row >= 0 for logical_row in logical_rows]
+        micro_batches = [
+            {
+                "input_ids": torch.zeros(1, 64, dtype=torch.long),
+                "position_ids": torch.zeros(1, 128, dtype=torch.long),
+                "num_samples": 2,
+                "_cp_logical_row_indices": torch.tensor([logical_rows]),
+                "_cp_live_mask": torch.tensor([live_mask]),
+                "_cp_request_ids": torch.tensor([request_ids]),
+                "_cp_request_positions": torch.tensor([request_positions]),
+            }
+        ]
+
+        per_mb_experts = _handler()._build_per_mb_routing(
+            micro_batches,
+            routed_experts,
+            num_layers_in_data=1,
+            topk=2,
+        )
+        per_mb_weights = _handler()._build_per_mb_routing(
+            micro_batches,
+            routed_weights,
+            num_layers_in_data=1,
+            topk=2,
+            tensor_dtype=torch.float32,
+        )
+
+        live_rows = len(expected_experts)
+        assert per_mb_experts[0].shape == (64, 1, 2)
+        assert per_mb_experts[0][:live_rows, 0, 0].tolist() == expected_experts
+        assert per_mb_experts[0][live_rows:, 0].tolist() == [[0, 1]] * (64 - live_rows)
+        torch.testing.assert_close(
+            per_mb_weights[0][:live_rows, 0],
+            torch.tensor(expected_weights, dtype=torch.float32),
+        )
+        torch.testing.assert_close(
+            per_mb_weights[0][live_rows:, 0],
+            torch.tensor([[0.5, 0.5]] * (64 - live_rows), dtype=torch.float32),
+        )
+
+
+def test_aligned_sp_routing_rejects_request_identity_mismatch(monkeypatch):
+    monkeypatch.setattr(
+        rrh,
+        "get_parallel_state",
+        lambda: SimpleNamespace(cp_enabled=True, cp_size=2, cp_rank=0, ringattn_size=1),
+    )
+    micro_batches = [
+        {
+            "input_ids": torch.zeros(1, 2, dtype=torch.long),
+            "position_ids": torch.zeros(1, 4, dtype=torch.long),
+            "num_samples": 2,
+            "_cp_logical_row_indices": torch.tensor([[0, -1]]),
+            "_cp_live_mask": torch.tensor([[True, False]]),
+            "_cp_request_ids": torch.tensor([[1, -1]]),
+            "_cp_request_positions": torch.tensor([[0, 0]]),
+        }
+    ]
+
+    with pytest.raises(ValueError, match="request .* maps to"):
+        _handler()._build_per_mb_routing(
+            micro_batches,
+            [_routing(10, 1), _routing(20, 1)],
+            num_layers_in_data=1,
+            topk=2,
+        )
 
 
 # --- SGLang routed_experts decode contract (Lever 2 shared-selection K3) ---

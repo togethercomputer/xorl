@@ -1,6 +1,6 @@
 from types import SimpleNamespace
 
-from xorl.models.exact_contract import resolve_exact_contract_family
+from xorl.models.exact_contract import exact_gdn_cp_alignment_required, resolve_exact_contract_family
 from xorl.models.transformers.glm5.modeling_glm5 import Glm5MLP
 from xorl.models.transformers.qwen3_5.modeling_qwen3_5 import Qwen3_5MLP
 from xorl.models.transformers.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeMLP
@@ -80,3 +80,30 @@ def test_resolve_exact_contract_family_classification():
     )
     assert resolve_exact_contract_family(SimpleNamespace(_qwen35_exact_contract=True, num_experts=256)) == "qwen3_5_moe"
     assert resolve_exact_contract_family(SimpleNamespace(_glm52_exact_contract=True)) == "glm52"
+
+
+def test_exact_gdn_alignment_is_derived_from_resolved_qwen_layers():
+    assert exact_gdn_cp_alignment_required(
+        SimpleNamespace(
+            _qwen35_exact_contract=True,
+            layer_types=["full_attention", "linear_attention"],
+        )
+    )
+    assert exact_gdn_cp_alignment_required(
+        SimpleNamespace(
+            _qwen35_exact_contract=True,
+            text_config=SimpleNamespace(layer_types=["linear_attention"]),
+        )
+    )
+    assert not exact_gdn_cp_alignment_required(
+        SimpleNamespace(
+            _qwen35_exact_contract=True,
+            layer_types=["full_attention"],
+        )
+    )
+    assert not exact_gdn_cp_alignment_required(
+        SimpleNamespace(
+            _qwen35_exact_contract=False,
+            layer_types=["linear_attention"],
+        )
+    )

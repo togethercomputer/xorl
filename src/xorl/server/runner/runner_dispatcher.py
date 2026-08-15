@@ -73,6 +73,7 @@ import zmq.asyncio
 
 from xorl.data.collators import TextSequenceShardCollator
 from xorl.distributed.parallel_state import get_parallel_state
+from xorl.models.exact_contract import exact_gdn_cp_alignment_required
 from xorl.ops.shared_prefix import shared_prefix_repack_batch
 from xorl.server.protocol.operations import (
     AbortGradientEpochData,
@@ -206,7 +207,9 @@ class RunnerDispatcher:
         self._sequence_shard_collator: Optional[TextSequenceShardCollator] = None
         parallel_state = get_parallel_state()
         if parallel_state.cp_enabled:
-            self._sequence_shard_collator = TextSequenceShardCollator()
+            self._sequence_shard_collator = TextSequenceShardCollator(
+                gdn_exact_cp_align=exact_gdn_cp_alignment_required(trainer.model_config_obj)
+            )
             logger.info(
                 f"Rank {rank}: Initialized TextSequenceShardCollator for sequence parallelism "
                 f"(cp_size={parallel_state.cp_size}, cp_rank={parallel_state.cp_rank})"

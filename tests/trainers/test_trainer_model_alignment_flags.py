@@ -66,6 +66,11 @@ def _trainer_args():
             enable_mixed_precision=True,
             skip_param_upcast=False,
             init_device="meta",
+            pipeline_parallel_virtual_stages=1,
+            pipeline_parallel_input_weight=1,
+            pipeline_parallel_output_weight=1,
+            pipeline_parallel_num_layers_in_first_stage=None,
+            pipeline_parallel_num_layers_in_last_stage=None,
             enable_fp8_training=False,
             enable_qarl=False,
             qarl_sync_format="fp8",
@@ -76,6 +81,7 @@ def _trainer_args():
         lora=SimpleNamespace(
             enable_lora=False,
             enable_qlora=False,
+            unfuse_for_lora=False,
             lora_rank=16,
             lora_alpha=16,
         ),
@@ -110,3 +116,52 @@ def test_local_trainer_forwards_model_numeric_alignment_flags(monkeypatch):
     assert captured["moe_routing_weights_before_down"] is True
     assert captured["lora_rank"] == 16
     assert captured["lora_alpha"] == 16
+
+
+@pytest.mark.parametrize(("exact_contract", "expected"), [(False, False), (True, True)])
+def test_local_trainer_derives_cp_alignment_from_resolved_exact_contract(
+    monkeypatch,
+    exact_contract,
+    expected,
+):
+    captured = {}
+
+    class Builder:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        def build(self):
+            return [object()]
+
+    trainer = Trainer.__new__(Trainer)
+    trainer.model_config = SimpleNamespace(
+        _qwen35_exact_contract=exact_contract,
+        layer_types=["full_attention", "linear_attention"],
+    )
+    trainer.args = SimpleNamespace(
+        model=SimpleNamespace(tokenizer_path="unused-tokenizer"),
+        train=SimpleNamespace(
+            micro_batch_size=1,
+            gradient_accumulation_steps=1,
+            seed=17,
+            num_train_epochs=1,
+            max_steps=None,
+            save_epochs=0,
+        ),
+        data=SimpleNamespace(
+            dataloader_num_workers=0,
+            dataloader_drop_last=False,
+            dataloader_pin_memory=False,
+            dataloader_prefetch_factor=None,
+            pad_to_multiple_of=128,
+            fa_max_length_bucket=0,
+        ),
+    )
+
+    monkeypatch.setattr("xorl.trainers.trainer.build_tokenizer", lambda _path: object())
+    monkeypatch.setattr("xorl.trainers.trainer.prepare_datasets", lambda _args, _tokenizer: ([object()], None))
+    monkeypatch.setattr("xorl.trainers.trainer.DataLoaderBuilder", Builder)
+
+    trainer._build_data()
+
+    assert captured["gdn_exact_cp_align"] is expected

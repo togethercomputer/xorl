@@ -48,6 +48,7 @@ from xorl.models import (
     save_model_weights,
 )
 from xorl.models.checkpoint_handlers.buffers import get_prequantized_exclude_modules
+from xorl.models.exact_contract import exact_gdn_cp_alignment_required
 from xorl.models.layers.moe.aux_loss import LoadBalancingBuffer, global_load_balancing_loss_func
 from xorl.models.layers.moe.routing_replay import RoutingReplay, set_replay_stage
 from xorl.models.module_utils import compute_loss
@@ -663,6 +664,7 @@ class Trainer:
             seed=args.train.seed,
             pad_to_multiple_of=args.data.pad_to_multiple_of,
             fa_max_length_bucket=args.data.fa_max_length_bucket,
+            gdn_exact_cp_align=exact_gdn_cp_alignment_required(self.model_config),
         ).build()
 
         self.train_steps_per_epoch = len(self.train_dataloader)

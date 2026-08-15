@@ -2108,6 +2108,68 @@ class ModelRunner:
             return lm_head
         return ModelRunner._get_fp8_lm_head_module(lm_head)
 
+    @staticmethod
+    def _gather_cp_source_metadata(
+        micro_batch: Dict[str, Any],
+        group,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Gather the physical-to-source row map for a CP batch."""
+
+        logical_rows = micro_batch.get("_cp_logical_row_indices")
+        live_mask = micro_batch.get("_cp_live_mask")
+        if not isinstance(logical_rows, torch.Tensor) or not isinstance(live_mask, torch.Tensor):
+            return None
+        if logical_rows.shape != live_mask.shape:
+            raise ValueError(
+                f"CP row metadata shapes differ: logical={tuple(logical_rows.shape)}, live={tuple(live_mask.shape)}"
+            )
+        gathered_logical_rows = gather_outputs(logical_rows, gather_dim=-1, group=group)
+        gathered_live_mask = gather_outputs(
+            live_mask.to(dtype=torch.uint8),
+            gather_dim=-1,
+            group=group,
+        ).bool()
+        return gathered_logical_rows, gathered_live_mask
+
+    @staticmethod
+    def _restore_cp_source_rows(
+        tensor: torch.Tensor,
+        logical_rows: torch.Tensor,
+        live_mask: torch.Tensor,
+        source_seq_len: int,
+        *,
+        dim: int,
+    ) -> torch.Tensor:
+        """Remove inserted CP rows and restore the original packed row order."""
+
+        if dim < 0:
+            dim += tensor.ndim
+        logical_flat = logical_rows.reshape(-1).to(device=tensor.device, dtype=torch.long)
+        live_flat = live_mask.reshape(-1).to(device=tensor.device, dtype=torch.bool)
+        if logical_flat.numel() != tensor.shape[dim] or live_flat.numel() != logical_flat.numel():
+            raise RuntimeError(
+                "CP row metadata does not match the gathered tensor: "
+                f"tensor={tuple(tensor.shape)}, dim={dim}, "
+                f"logical={tuple(logical_rows.shape)}, live={tuple(live_mask.shape)}"
+            )
+        if bool((live_flat & (logical_flat < 0)).any().item()):
+            raise RuntimeError("CP row metadata marks inserted padding as a live source row")
+
+        source_physical_rows = (logical_flat >= 0).nonzero(as_tuple=False).reshape(-1)
+        source_rows = logical_flat.index_select(0, source_physical_rows)
+        if bool((source_rows >= source_seq_len).any().item()):
+            raise RuntimeError(f"CP row metadata contains source indices outside [0, {source_seq_len})")
+        source_order = torch.argsort(source_rows, stable=True)
+        sorted_source_rows = source_rows.index_select(0, source_order)
+        expected_source_rows = torch.arange(source_seq_len, device=tensor.device, dtype=torch.long)
+        if not torch.equal(sorted_source_rows, expected_source_rows):
+            raise RuntimeError(
+                "CP row metadata does not cover each original packed row exactly once: "
+                f"expected={source_seq_len}, actual={sorted_source_rows.numel()}"
+            )
+        gather_indices = source_physical_rows.index_select(0, source_order)
+        return tensor.index_select(dim, gather_indices)
+
     def _collect_per_token_outputs(self, per_token_tensors, micro_batch, accumulators):
         """Gather per-token outputs across the unified SP group and append to accumulators."""
         ps = get_parallel_state()
@@ -2129,15 +2191,25 @@ class ModelRunner:
                 original_seq_len = first_tensor.shape[-1] * cp_size
                 position_ids = None
 
+            cp_source_metadata = self._gather_cp_source_metadata(micro_batch, sp_group)
             gathered = {}
             for key, tensor in per_token_tensors.items():
-                gathered[key] = gather_outputs(
-                    tensor,
-                    gather_dim=-1,
-                    padding_dim=-1,
-                    unpad_dim_size=original_seq_len,
-                    group=sp_group,
-                )
+                if cp_source_metadata is None:
+                    gathered[key] = gather_outputs(
+                        tensor,
+                        gather_dim=-1,
+                        padding_dim=-1,
+                        unpad_dim_size=original_seq_len,
+                        group=sp_group,
+                    )
+                else:
+                    physical = gather_outputs(tensor, gather_dim=-1, group=sp_group)
+                    gathered[key] = self._restore_cp_source_rows(
+                        physical,
+                        *cp_source_metadata,
+                        original_seq_len,
+                        dim=-1,
+                    )
 
         else:
             gathered = per_token_tensors
@@ -3316,29 +3388,46 @@ class ModelRunner:
             original_seq_len = hidden_states.shape[1] * max(int(getattr(ps, "cp_size", 1)), 1)
 
         sequence_group = getattr(ps, "sp_group", getattr(ps, "ulysses_group", None))
-        hidden_states = gather_outputs(
-            hidden_states,
-            gather_dim=1,
-            padding_dim=1,
-            unpad_dim_size=original_seq_len,
-            group=sequence_group,
-        )
+        cp_source_metadata = self._gather_cp_source_metadata(micro_batch, sequence_group)
+        if cp_source_metadata is None:
+            hidden_states = gather_outputs(
+                hidden_states,
+                gather_dim=1,
+                padding_dim=1,
+                unpad_dim_size=original_seq_len,
+                group=sequence_group,
+            )
+        else:
+            hidden_states = self._restore_cp_source_rows(
+                gather_outputs(hidden_states, gather_dim=1, group=sequence_group),
+                *cp_source_metadata,
+                original_seq_len,
+                dim=1,
+            )
 
         label_key = self._teacher_cache_label_key(micro_batch)
         if label_key is None:
             return hidden_states, micro_batch
 
         labels = micro_batch[label_key]
-        if labels.shape[-1] == hidden_states.shape[1]:
+        if cp_source_metadata is None and labels.shape[-1] == hidden_states.shape[1]:
             return hidden_states, micro_batch
 
-        full_labels = gather_outputs(
-            labels,
-            gather_dim=-1,
-            padding_dim=-1,
-            unpad_dim_size=original_seq_len,
-            group=sequence_group,
-        )
+        if cp_source_metadata is None:
+            full_labels = gather_outputs(
+                labels,
+                gather_dim=-1,
+                padding_dim=-1,
+                unpad_dim_size=original_seq_len,
+                group=sequence_group,
+            )
+        else:
+            full_labels = self._restore_cp_source_rows(
+                gather_outputs(labels, gather_dim=-1, group=sequence_group),
+                *cp_source_metadata,
+                original_seq_len,
+                dim=-1,
+            )
         micro_batch = dict(micro_batch)
         micro_batch[label_key] = full_labels
         return hidden_states, micro_batch
@@ -6533,6 +6622,8 @@ class ModelRunner:
         k3_values: torch.Tensor,
         valid_mask: torch.Tensor,
         position_ids: torch.Tensor,
+        logical_row_indices: torch.Tensor | None = None,
+        live_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Reassemble tokenwise K3 inputs before detecting packed samples.
 
@@ -6558,6 +6649,46 @@ class ModelRunner:
         local_tokens = k3_values.numel() // batch_size
         original_seq_len = int(position_ids.shape[-1])
         group = ps.sp_group
+        if (logical_row_indices is None) != (live_mask is None):
+            raise ValueError("Per-sample K3 CP restoration requires both logical rows and live mask")
+        if logical_row_indices is not None and live_mask is not None:
+            cp_source_metadata = ModelRunner._gather_cp_source_metadata(
+                {
+                    "_cp_logical_row_indices": logical_row_indices,
+                    "_cp_live_mask": live_mask,
+                },
+                group,
+            )
+            if cp_source_metadata is None:  # pragma: no cover - guarded by tensor arguments above.
+                raise RuntimeError("Per-sample K3 CP source metadata disappeared during gather")
+            full_k3 = ModelRunner._restore_cp_source_rows(
+                gather_outputs(
+                    k3_values.reshape(batch_size, local_tokens),
+                    gather_dim=-1,
+                    group=group,
+                ),
+                *cp_source_metadata,
+                original_seq_len,
+                dim=-1,
+            )
+            full_valid = ModelRunner._restore_cp_source_rows(
+                gather_outputs(
+                    valid_mask.reshape(batch_size, local_tokens).to(dtype=torch.uint8),
+                    gather_dim=-1,
+                    group=group,
+                ).bool(),
+                *cp_source_metadata,
+                original_seq_len,
+                dim=-1,
+            )
+            if full_k3.shape != position_ids.shape or full_valid.shape != position_ids.shape:
+                raise RuntimeError(
+                    "Per-sample K3 CP source restoration did not recover the original packed shape: "
+                    f"k3={tuple(full_k3.shape)}, valid={tuple(full_valid.shape)}, "
+                    f"position_ids={tuple(position_ids.shape)}"
+                )
+            return full_k3.reshape(-1), full_valid.reshape(-1), position_ids.reshape(-1)
+
         ringattn_size = int(getattr(ps, "ringattn_size", 1))
         if ringattn_size > 1:
             cp_size = int(getattr(ps, "cp_size", 0))
@@ -6684,6 +6815,10 @@ class ModelRunner:
         batch_idx: int,
         position_ids: torch.Tensor | None = None,
         cp_rank: int = 0,
+        logical_row_indices: torch.Tensor | None = None,
+        request_ids: torch.Tensor | None = None,
+        request_positions: torch.Tensor | None = None,
+        live_mask: torch.Tensor | None = None,
     ) -> List[Dict[str, Any]]:
         """Return the worst local valid tokens by K3 for live KL forensics."""
         if topk <= 0 or old_logprobs is None or labels is None:
@@ -6716,7 +6851,32 @@ class ModelRunner:
             global_indices = torch.arange(local_len, dtype=torch.long)
             local_position_ids = None
             sample_ids = None
-            if position_ids is not None:
+            sample_ids_are_local = False
+            cp_metadata = (logical_row_indices, request_ids, request_positions, live_mask)
+            if all(isinstance(value, torch.Tensor) for value in cp_metadata):
+                logical_flat = logical_row_indices.detach().view(-1).cpu().to(dtype=torch.long)[:local_len]
+                request_ids_flat = request_ids.detach().view(-1).cpu().to(dtype=torch.long)[:local_len]
+                request_positions_flat = request_positions.detach().view(-1).cpu().to(dtype=torch.long)[:local_len]
+                live_flat = live_mask.detach().view(-1).cpu().to(dtype=torch.bool)[:local_len]
+                if (
+                    min(
+                        logical_flat.numel(),
+                        request_ids_flat.numel(),
+                        request_positions_flat.numel(),
+                        live_flat.numel(),
+                    )
+                    != local_len
+                ):
+                    raise ValueError("KL token diagnostic CP metadata is shorter than the local token rows")
+                if bool((valid.cpu() & (~live_flat | (logical_flat < 0) | (request_ids_flat < 0))).any().item()):
+                    raise RuntimeError("A valid KL diagnostic token has no live CP source identity")
+                global_indices = logical_flat
+                local_position_ids = request_positions_flat
+                sample_ids = request_ids_flat
+                sample_ids_are_local = True
+            elif any(value is not None for value in cp_metadata):
+                raise ValueError("KL token diagnostics require the complete CP source metadata set")
+            elif position_ids is not None:
                 pos_flat = position_ids.detach().view(-1).cpu().to(dtype=torch.long)
                 if pos_flat.numel() >= local_len:
                     start = 0
@@ -6753,8 +6913,9 @@ class ModelRunner:
                 }
                 if local_position_ids is not None and local_idx < local_position_ids.numel():
                     item["position_id"] = int(local_position_ids[local_idx].item())
-                if sample_ids is not None and 0 <= global_idx < sample_ids.numel():
-                    item["sample_index_in_microbatch"] = int(sample_ids[global_idx].item())
+                sample_lookup_index = local_idx if sample_ids_are_local else global_idx
+                if sample_ids is not None and 0 <= sample_lookup_index < sample_ids.numel():
+                    item["sample_index_in_microbatch"] = int(sample_ids[sample_lookup_index].item())
                 diagnostics.append(item)
 
             return diagnostics
@@ -6944,6 +7105,8 @@ class ModelRunner:
                                 k3_vals,
                                 _valid,
                                 _pos,
+                                micro_batch.get("_cp_logical_row_indices"),
+                                micro_batch.get("_cp_live_mask"),
                             )
                             deferred_k3.append(
                                 {
@@ -6973,6 +7136,10 @@ class ModelRunner:
                         batch_idx=batch_idx,
                         position_ids=positions_for_diag,
                         cp_rank=cp_rank,
+                        logical_row_indices=micro_batch.get("_cp_logical_row_indices"),
+                        request_ids=micro_batch.get("_cp_request_ids"),
+                        request_positions=micro_batch.get("_cp_request_positions"),
+                        live_mask=micro_batch.get("_cp_live_mask"),
                     )
                 )
 

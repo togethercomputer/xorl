@@ -627,6 +627,124 @@ class RoutingReplayHandler:
                 return [int(v) for v in value]
             return None
 
+        def _flatten_cp_metadata(value: Any, key: str) -> List[Any]:
+            if isinstance(value, torch.Tensor):
+                return value.detach().reshape(-1).cpu().tolist()
+            if isinstance(value, np.ndarray):
+                return value.reshape(-1).tolist()
+            if isinstance(value, list):
+                array = np.asarray(value)
+                if array.dtype == object:
+                    raise ValueError(f"R3: CP row metadata {key} is ragged")
+                return array.reshape(-1).tolist()
+            raise ValueError(f"R3: CP row metadata {key} must be a tensor, array, or list")
+
+        def _local_routing_from_cp_source_map(
+            routing: Any,
+            datum_parts: List[Any],
+            micro_batch: Dict[str, Any],
+            expected_tokens: Optional[int],
+            mb_idx: int,
+        ) -> Any | None:
+            metadata_keys = (
+                "_cp_logical_row_indices",
+                "_cp_live_mask",
+                "_cp_request_ids",
+                "_cp_request_positions",
+            )
+            metadata_present = [micro_batch.get(key) is not None for key in metadata_keys]
+            if not any(metadata_present):
+                return None
+            if not all(metadata_present):
+                missing = [key for key, present in zip(metadata_keys, metadata_present) if not present]
+                raise ValueError(f"R3: MB{mb_idx} has incomplete CP row metadata; missing {missing}")
+
+            logical_rows = [
+                int(value) for value in _flatten_cp_metadata(micro_batch[metadata_keys[0]], metadata_keys[0])
+            ]
+            live_mask = [bool(value) for value in _flatten_cp_metadata(micro_batch[metadata_keys[1]], metadata_keys[1])]
+            request_ids = [
+                int(value) for value in _flatten_cp_metadata(micro_batch[metadata_keys[2]], metadata_keys[2])
+            ]
+            request_positions = [
+                int(value) for value in _flatten_cp_metadata(micro_batch[metadata_keys[3]], metadata_keys[3])
+            ]
+            physical_tokens = len(logical_rows)
+            metadata_lengths = {
+                len(live_mask),
+                len(request_ids),
+                len(request_positions),
+                physical_tokens,
+            }
+            if len(metadata_lengths) != 1:
+                raise ValueError(
+                    f"R3: MB{mb_idx} CP row metadata lengths differ: "
+                    f"logical={physical_tokens}, live={len(live_mask)}, "
+                    f"request_ids={len(request_ids)}, request_positions={len(request_positions)}"
+                )
+            if expected_tokens is not None and physical_tokens != expected_tokens:
+                raise ValueError(
+                    f"R3: MB{mb_idx} CP row metadata has {physical_tokens} rows, "
+                    f"but the local micro-batch has {expected_tokens} tokens"
+                )
+
+            datum_lengths = [_routing_len(part) for part in datum_parts]
+            datum_offsets = []
+            source_offset = 0
+            for datum_length in datum_lengths:
+                datum_offsets.append(source_offset)
+                source_offset += datum_length
+            if source_offset != _routing_len(routing):
+                raise RuntimeError(
+                    f"R3: MB{mb_idx} routing parts total {source_offset} rows, "
+                    f"but the concatenated routing has {_routing_len(routing)}"
+                )
+
+            local_routing = (
+                _pad_array(physical_tokens)
+                if isinstance(routing, np.ndarray)
+                else [_pad_entry() for _ in range(physical_tokens)]
+            )
+            seen_live_rows = set()
+            for physical_row, (logical_row, live, request_id, request_position) in enumerate(
+                zip(logical_rows, live_mask, request_ids, request_positions)
+            ):
+                if logical_row < -1:
+                    raise ValueError(
+                        f"R3: MB{mb_idx} CP row {physical_row} has invalid logical source row {logical_row}"
+                    )
+                if not live:
+                    if request_id != -1 or request_position != 0:
+                        raise ValueError(
+                            f"R3: MB{mb_idx} non-live CP row {physical_row} has request identity "
+                            f"({request_id}, {request_position})"
+                        )
+                    if 0 <= logical_row < source_offset:
+                        raise ValueError(f"R3: MB{mb_idx} routed source row {logical_row} is marked non-live")
+                    continue
+                if logical_row < 0:
+                    raise ValueError(f"R3: MB{mb_idx} live CP row {physical_row} is inserted padding")
+                if request_id < 0 or request_id >= len(datum_parts):
+                    raise ValueError(f"R3: MB{mb_idx} live CP row {physical_row} has invalid request id {request_id}")
+                datum_length = datum_lengths[request_id]
+                if request_position < 0 or request_position >= datum_length:
+                    raise ValueError(
+                        f"R3: MB{mb_idx} live CP row {physical_row} has request position "
+                        f"{request_position} outside request {request_id} length {datum_length}"
+                    )
+                expected_source_row = datum_offsets[request_id] + request_position
+                if logical_row != expected_source_row:
+                    raise ValueError(
+                        f"R3: MB{mb_idx} CP row {physical_row} maps logical source row {logical_row}, "
+                        f"but request ({request_id}, {request_position}) maps to {expected_source_row}"
+                    )
+                if logical_row in seen_live_rows:
+                    raise ValueError(f"R3: MB{mb_idx} repeats live source row {logical_row} in its local CP shard")
+                seen_live_rows.add(logical_row)
+                local_routing[physical_row] = routing[logical_row]
+
+            return local_routing
+
         def _resize_position_ids(position_ids: List[int], target_tokens: int) -> List[int]:
             if len(position_ids) < target_tokens:
                 pad_count = target_tokens - len(position_ids)
@@ -735,7 +853,25 @@ class RoutingReplayHandler:
             micro_batch = micro_batches[mb_idx] if mb_idx < len(micro_batches) else {}
             expected_mb_tokens = _num_tokens(micro_batch.get("input_ids"))
 
-            if cp_enabled and mb_total_tokens > 0:
+            source_mapped_routing = None
+            if cp_enabled:
+                source_mapped_routing = _local_routing_from_cp_source_map(
+                    mb_routing,
+                    datum_routing,
+                    micro_batch,
+                    expected_mb_tokens,
+                    mb_idx,
+                )
+
+            if source_mapped_routing is not None:
+                mb_routing = source_mapped_routing
+                logger.debug(
+                    "R3: SP MB%s mapped %s source routing rows onto %s local physical rows",
+                    mb_idx,
+                    mb_total_tokens,
+                    _routing_len(mb_routing),
+                )
+            elif cp_enabled and mb_total_tokens > 0:
                 # Match the actual sharded micro-batch shape. Packed batches may
                 # already be padded to 128-token boundaries by SequentialPacker,
                 # while unpacked/server batches are only padded to the CP size.

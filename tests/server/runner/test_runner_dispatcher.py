@@ -31,6 +31,31 @@ def _dispatcher(rank: int, world_size: int) -> RunnerDispatcher:
     return dispatcher
 
 
+def test_dispatcher_enables_cp_alignment_from_resolved_exact_gdn_contract(monkeypatch):
+    captured = {}
+
+    class SequenceCollator:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    parallel_state = SimpleNamespace(cp_enabled=True, cp_size=2, cp_rank=0)
+    monkeypatch.setattr(runner_dispatcher_module, "get_parallel_state", lambda: parallel_state)
+    monkeypatch.setattr(runner_dispatcher_module, "TextSequenceShardCollator", SequenceCollator)
+    monkeypatch.setattr(runner_dispatcher_module, "WeightSyncHandler", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(runner_dispatcher_module, "AdapterCoordinator", lambda *_args, **_kwargs: object())
+
+    trainer = SimpleNamespace(
+        model_config_obj=SimpleNamespace(
+            _qwen35_exact_contract=True,
+            layer_types=["full_attention", "linear_attention"],
+        )
+    )
+    dispatcher = RunnerDispatcher(trainer=trainer, rank=0, world_size=2)
+
+    assert dispatcher._sequence_shard_collator is not None
+    assert captured == {"gdn_exact_cp_align": True}
+
+
 class FakeMooncakeClient:
     def __init__(self) -> None:
         self.objects: dict[str, bytes] = {}

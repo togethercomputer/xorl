@@ -317,51 +317,18 @@ class TextSequenceShardCollator(DataCollator):
                     f"This suggests data is not properly shifted."
                 )
 
-        # C2 (exact-GDN CP alignment): splice inter-document pad-docs so every
-        # document start (and the stream end) sits on the 64-token chunk grid.
-        # Runs BEFORE the _original_position_ids capture: after splicing, the
-        # spliced stream IS the stream the model consumes (minus C1 tail pads),
-        # so token-aligned consumers must see the spliced layout.
-        alignment_segments = None
-        if self.gdn_exact_cp_align:
-            doc_bounds = find_document_boundaries(position_ids[0])
-            alignment_segments = gdn_cp_alignment_segments(doc_bounds)
-            inserted = gdn_cp_spliced_length(alignment_segments) - input_ids.size(-1)
-            input_ids = apply_alignment_segments(input_ids, alignment_segments, -1, self.pad_token_id)
-            labels = apply_alignment_segments(labels, alignment_segments, -1, IGNORE_INDEX)
-            position_ids = apply_alignment_segments(position_ids, alignment_segments, -1, sequential_positions=True)
-            if "attention_mask" in batch:
-                batch["attention_mask"] = apply_alignment_segments(batch["attention_mask"], alignment_segments, -1, 1)
-            # The pre-splice layout no longer matches the model's stream.
-            batch["_original_position_ids"] = position_ids.clone()
-            global _alignment_engagement_logged
-            if not _alignment_engagement_logged:
-                logger.info(
-                    "gdn-cp collator alignment engaged: +%d pad tokens on the first batch "
-                    "(%.3f%% of the spliced stream)",
-                    inserted,
-                    100.0 * inserted / max(1, position_ids.size(-1)),
-                )
-                _alignment_engagement_logged = True
-
-        # Store original position_ids before padding for unpacking per-token outputs later
-        if "_original_position_ids" not in batch:
-            batch["_original_position_ids"] = position_ids.clone()
-
-        # SP padding - pad to be divisible by cp_size (or 2*cp_size for zigzag)
-        # With zigzag, each doc must be divisible by 2*ringattn_size sub-chunks,
-        # and each sub-chunk must be divisible by ulysses_size. So total
-        # sequence must be divisible by 2*ringattn_size*ulysses_size = 2*cp_size.
-        # C1 (exact-GDN CP alignment): the per-rank shard length must also be a
-        # multiple of the 64-token chunk grid.
-        pad_multiple = 2 * self.cp_size if self.ringattn_size > 1 else self.cp_size
-        if self.gdn_exact_cp_align:
-            pad_multiple = GDN_CP_CHUNK * self.cp_size
-        seq_length = input_ids.size(-1)
-        logical_row_indices = torch.arange(seq_length, dtype=torch.int64, device=input_ids.device).view(1, -1)
-        request_ids = torch.full((1, seq_length), -1, dtype=torch.int64, device=input_ids.device)
-        request_positions = torch.zeros((1, seq_length), dtype=torch.int64, device=input_ids.device)
-        live_mask = torch.zeros((1, seq_length), dtype=torch.bool, device=input_ids.device)
+        # Build source/request identity on the original packed stream. Exact
+        # GDN alignment inserts model-compute rows, but those rows are not
+        # samples and must never acquire a source/request identity.
+        source_seq_length = input_ids.size(-1)
+        logical_row_indices = torch.arange(
+            source_seq_length,
+            dtype=torch.int64,
+            device=input_ids.device,
+        ).view(1, -1)
+        request_ids = torch.full((1, source_seq_length), -1, dtype=torch.int64, device=input_ids.device)
+        request_positions = torch.zeros((1, source_seq_length), dtype=torch.int64, device=input_ids.device)
+        live_mask = torch.zeros((1, source_seq_length), dtype=torch.bool, device=input_ids.device)
         sample_lengths = batch.get("_r3_sample_lengths")
         if isinstance(sample_lengths, torch.Tensor):
             sample_lengths = sample_lengths.detach().cpu().reshape(-1).tolist()
@@ -369,9 +336,9 @@ class TextSequenceShardCollator(DataCollator):
             cursor = 0
             for request_id, length in enumerate(sample_lengths):
                 length = int(length)
-                if length < 0 or cursor + length > seq_length:
+                if length < 0 or cursor + length > source_seq_length:
                     raise ValueError(
-                        f"Packed request lengths {sample_lengths} do not fit the {seq_length}-row collator input"
+                        f"Packed request lengths {sample_lengths} do not fit the {source_seq_length}-row collator input"
                     )
                 request_ids[:, cursor : cursor + length] = request_id
                 request_positions[:, cursor : cursor + length] = torch.arange(
@@ -387,6 +354,56 @@ class TextSequenceShardCollator(DataCollator):
                 request_ids[:, start:end] = request_id
                 request_positions[:, start:end] = position_ids[:, start:end]
                 live_mask[:, start:end] = True
+
+        # Preserve the pre-splice layout for output unpacking. The gathered
+        # outputs are restored to this source order through logical_row_indices
+        # before this position-id row is consumed.
+        if "_original_position_ids" not in batch:
+            batch["_original_position_ids"] = position_ids.clone()
+
+        # C2 (exact-GDN CP alignment): splice inter-document pad-docs so every
+        # document start (and the stream end) sits on the 64-token chunk grid.
+        # Apply the same plan to source/request metadata with non-live padding
+        # sentinels, so inserted rows cannot be mistaken for packed samples.
+        alignment_segments = None
+        if self.gdn_exact_cp_align:
+            doc_bounds = find_document_boundaries(position_ids[0])
+            alignment_segments = gdn_cp_alignment_segments(doc_bounds)
+            inserted = gdn_cp_spliced_length(alignment_segments) - input_ids.size(-1)
+            input_ids = apply_alignment_segments(input_ids, alignment_segments, -1, self.pad_token_id)
+            labels = apply_alignment_segments(labels, alignment_segments, -1, IGNORE_INDEX)
+            position_ids = apply_alignment_segments(position_ids, alignment_segments, -1, sequential_positions=True)
+            if "attention_mask" in batch:
+                batch["attention_mask"] = apply_alignment_segments(batch["attention_mask"], alignment_segments, -1, 1)
+            logical_row_indices = apply_alignment_segments(
+                logical_row_indices,
+                alignment_segments,
+                -1,
+                -1,
+            )
+            request_ids = apply_alignment_segments(request_ids, alignment_segments, -1, -1)
+            request_positions = apply_alignment_segments(request_positions, alignment_segments, -1, 0)
+            live_mask = apply_alignment_segments(live_mask, alignment_segments, -1, False)
+            global _alignment_engagement_logged
+            if not _alignment_engagement_logged:
+                logger.info(
+                    "gdn-cp collator alignment engaged: +%d pad tokens on the first batch "
+                    "(%.3f%% of the spliced stream)",
+                    inserted,
+                    100.0 * inserted / max(1, position_ids.size(-1)),
+                )
+                _alignment_engagement_logged = True
+
+        # SP padding - pad to be divisible by cp_size (or 2*cp_size for zigzag)
+        # With zigzag, each doc must be divisible by 2*ringattn_size sub-chunks,
+        # and each sub-chunk must be divisible by ulysses_size. So total
+        # sequence must be divisible by 2*ringattn_size*ulysses_size = 2*cp_size.
+        # C1 (exact-GDN CP alignment): the per-rank shard length must also be a
+        # multiple of the 64-token chunk grid.
+        pad_multiple = 2 * self.cp_size if self.ringattn_size > 1 else self.cp_size
+        if self.gdn_exact_cp_align:
+            pad_multiple = GDN_CP_CHUNK * self.cp_size
+        seq_length = input_ids.size(-1)
         cp_chunk_size = (seq_length + pad_multiple - 1) // pad_multiple * pad_multiple // self.cp_size
         pad_length = cp_chunk_size * self.cp_size - seq_length
 
@@ -483,6 +500,8 @@ class TextSequenceShardCollator(DataCollator):
             "teacher_weights": torch.float,
             "hidden_match_weights": torch.float,
             "teacher_hidden_states": torch.float,
+            "opd_region_ids": torch.long,
+            "opd_sample_ok": torch.long,
         }
         for field, dtype in rl_field_dtypes.items():
             if field in batch:
@@ -521,6 +540,8 @@ class TextSequenceShardCollator(DataCollator):
                     if field == "logprob_top_ks"
                     else 1.0
                     if field in ("logprob_temperatures", "logprob_top_ps")
+                    else 0
+                    if field in ("opd_region_ids", "opd_sample_ok")
                     else 0.0
                 )
                 if alignment_segments is not None:
