@@ -57,6 +57,8 @@ class FakeMooncakeClient:
     def __init__(self) -> None:
         self.objects: dict[str, bytes] = {}
         self.removed: list[str] = []
+        self.remove_calls: list[tuple[str, bool]] = []
+        self.remove_statuses: list[int] = []
 
     def put(self, key: str, value: bytes) -> int:
         self.objects[key] = bytes(value)
@@ -68,10 +70,13 @@ class FakeMooncakeClient:
     def is_exist(self, key: str) -> int:
         return 1 if key in self.objects else 0
 
-    def remove(self, key: str) -> int:
-        self.objects.pop(key, None)
-        self.removed.append(key)
-        return 0
+    def remove(self, key: str, force: bool = False) -> int:
+        self.remove_calls.append((key, force))
+        status = self.remove_statuses.pop(0) if self.remove_statuses else 0
+        if status == 0:
+            self.objects.pop(key, None)
+            self.removed.append(key)
+        return status
 
 
 def _mooncake_store() -> tuple[MooncakeSidePayloadStore, FakeMooncakeClient]:
@@ -357,6 +362,100 @@ async def test_model_pass_cleans_mooncake_routing_payloads_by_default():
     assert seen["keys"]
     assert client.objects == {}
     assert sorted(client.removed) == sorted(seen["keys"])
+    assert all(force for _, force in client.remove_calls)
+    assert output.outputs[0]["executor_r3_cleanup_failed"] == 0
+    assert output.outputs[0]["executor_r3_cleanup_pending"] == 0
+
+
+@pytest.mark.asyncio
+async def test_completed_model_pass_reports_cleanup_failure_and_blocks_next_externalization():
+    backend = DummyBackend()
+    client = FakeMooncakeClient()
+    store = MooncakeSidePayloadStore(
+        client=client,
+        get_retry_max_wait_s=0.0,
+        remove_retry_max_wait_s=0.0,
+    )
+    exec = RequestProcessor(
+        backend=backend,
+        sample_packing_sequence_len=100,
+        r3_payload_transport="mooncake",
+        routing_payload_store=store,
+    )
+    await exec.start()
+    exec.backend.forward_backward = AsyncMock(return_value={"total_loss": 1.25, "global_valid_tokens": 3})
+    request = OrchestratorRequest(
+        request_id="req-r3-cleanup-latch",
+        request_type=RequestType.ADD,
+        operation="forward_backward",
+        payload=ModelPassData(
+            data=[{"input_ids": [1, 2, 3], "labels": [2, 3, 4]}],
+            routed_experts=[[[[1, 2]]]],
+            routed_expert_logits=[[[[0.25, 0.75]]]],
+        ),
+    )
+    client.remove_statuses = [-706]
+
+    try:
+        completed = await exec.execute_forward_backward(request)
+        blocked = await exec.execute_forward_backward(request)
+    finally:
+        await exec.stop()
+
+    assert completed.output_type == OutputType.FORWARD_BACKWARD
+    assert completed.outputs[0]["executor_r3_cleanup_failed"] == 1
+    assert completed.outputs[0]["executor_r3_cleanup_pending"] == 1
+    assert blocked.output_type == OutputType.ERROR
+    assert "Refusing to externalize another R3 Mooncake payload" in blocked.error
+    assert exec.backend.forward_backward.await_count == 1
+    assert client.objects
+
+
+def test_incomplete_partial_put_rollback_blocks_next_externalization():
+    class FailingPutAndRollbackClient(FakeMooncakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.put_count = 0
+
+        def put(self, key: str, value: bytes) -> int:
+            self.put_count += 1
+            if self.put_count == 2:
+                return -1
+            return super().put(key, value)
+
+        def remove(self, key: str, force: bool = False) -> int:
+            self.remove_calls.append((key, force))
+            return -706
+
+    client = FailingPutAndRollbackClient()
+    store = MooncakeSidePayloadStore(
+        client=client,
+        get_retry_max_wait_s=0.0,
+        remove_retry_max_wait_s=0.0,
+    )
+    processor = RequestProcessor(
+        backend=DummyBackend(),
+        sample_packing_sequence_len=100,
+        r3_payload_transport="mooncake",
+        routing_payload_store=store,
+    )
+
+    with pytest.raises(RuntimeError, match="rollback incomplete"):
+        processor._externalize_routing_payloads(
+            "partial-put-latch",
+            [[[[1, 2]]]],
+            [[[[0.25, 0.75]]]],
+        )
+    with pytest.raises(RuntimeError, match="Refusing to externalize another R3 Mooncake payload"):
+        processor._externalize_routing_payloads(
+            "partial-put-latch-retry",
+            [[[[1, 2]]]],
+            [[[[0.25, 0.75]]]],
+        )
+
+    assert client.put_count == 2
+    assert client.remove_calls and all(force for _, force in client.remove_calls)
+    assert client.objects
 
 
 def test_mooncake_chunk_ranges_follow_dispatcher_dp_slices():
@@ -407,6 +506,7 @@ async def test_model_pass_cleans_mooncake_routing_payloads_on_backend_exception(
     assert "backend failed" in output.error
     assert client.objects == {}
     assert len(client.removed) == 2
+    assert all(not force for _, force in client.remove_calls)
 
 
 @pytest.mark.asyncio
@@ -1078,7 +1178,7 @@ def test_sglang_span_payloads_bypass_repacking_and_cleanup_sources(tmp_path, mon
     assert routed["transport"] == "sglang_files"
     assert routed["items"][0] is item
     assert source.exists()
-    processor._cleanup_routing_payloads(cleanup)
+    processor._cleanup_routing_payloads(cleanup, force=False)
     assert not source.exists()
 
 
@@ -1120,5 +1220,5 @@ def test_sglang_file_descriptor_is_normalized_to_span_payload(tmp_path, monkeypa
             "dtype": "int32",
         }
     ]
-    processor._cleanup_routing_payloads(cleanup)
+    processor._cleanup_routing_payloads(cleanup, force=False)
     assert not source.exists()

@@ -75,6 +75,8 @@ from xorl.server.side_payloads import (
     R3_ROUTED_EXPERTS,
     MooncakeSidePayloadStore,
     R3PayloadCleanup,
+    R3PayloadCleanupStats,
+    R3PayloadRollbackError,
     cleanup_r3_mooncake_payloads,
     iter_r3_packed_chunks,
     put_r3_mooncake_payload_refs,
@@ -239,6 +241,7 @@ class RequestProcessor:
         self.r3_payload_keep = bool(r3_payload_keep)
         self.r3_payload_namespace_prefix = r3_payload_namespace_prefix
         self._routing_payload_store = routing_payload_store
+        self._r3_cleanup_blocked_error: Optional[str] = None
 
         # Statistics
         self.total_operations = 0
@@ -278,19 +281,28 @@ class RequestProcessor:
         if self.r3_payload_transport == "inline":
             return routed_experts, routed_expert_logits, None
         if self.r3_payload_transport == "mooncake":
+            if self._r3_cleanup_blocked_error is not None:
+                raise RuntimeError(
+                    "Refusing to externalize another R3 Mooncake payload after incomplete cleanup: "
+                    f"{self._r3_cleanup_blocked_error}"
+                )
             if self._routing_payload_store is None:
                 self._routing_payload_store = MooncakeSidePayloadStore()
             store = self._routing_payload_store
-            refs = put_r3_mooncake_payload_refs(
-                request_id=request_id,
-                routed_experts=routed_experts,
-                routed_expert_logits=routed_expert_logits,
-                store=store,
-                namespace_prefix=self.r3_payload_namespace_prefix,
-                chunk_ranges=self._routing_payload_chunk_ranges(
-                    batches, len(routed_experts or routed_expert_logits or [])
-                ),
-            )
+            try:
+                refs = put_r3_mooncake_payload_refs(
+                    request_id=request_id,
+                    routed_experts=routed_experts,
+                    routed_expert_logits=routed_expert_logits,
+                    store=store,
+                    namespace_prefix=self.r3_payload_namespace_prefix,
+                    chunk_ranges=self._routing_payload_chunk_ranges(
+                        batches, len(routed_experts or routed_expert_logits or [])
+                    ),
+                )
+            except R3PayloadRollbackError as exc:
+                self._r3_cleanup_blocked_error = str(exc)
+                raise
             log_fn = logger.info if _r3_verbose_logging_enabled() else logger.debug
             log_fn(
                 "Externalized R3 routing payload request=%s transport=mooncake routed=%s routed_weights=%s",
@@ -544,22 +556,63 @@ class RequestProcessor:
         )
         return _ref("routed_experts", routed_experts), _ref("routed_expert_logits", routed_expert_logits), root
 
-    def _cleanup_routing_payloads(self, cleanup: Optional[Union[Path, R3PayloadCleanup, R3SourceFilesCleanup]]) -> None:
+    def _cleanup_routing_payloads(
+        self,
+        cleanup: Optional[Union[Path, R3PayloadCleanup, R3SourceFilesCleanup]],
+        *,
+        force: bool,
+    ) -> Optional[R3PayloadCleanupStats]:
         if cleanup is None or self.r3_payload_keep:
-            return
+            return None
         if isinstance(cleanup, R3PayloadCleanup):
-            cleanup_r3_mooncake_payloads(cleanup)
+            try:
+                stats = cleanup_r3_mooncake_payloads(cleanup, force=force)
+            except Exception as exc:
+                message = f"cleanup raised {type(exc).__name__}: {exc}"
+                self._r3_cleanup_blocked_error = message
+                logger.exception("R3 Mooncake cleanup failed before producing statistics")
+                return R3PayloadCleanupStats(
+                    total=0,
+                    attempted=0,
+                    succeeded=0,
+                    already_absent=0,
+                    failed=1,
+                    pending=1,
+                    retry_attempts=0,
+                    removed_bytes=0,
+                    retained_bytes=0,
+                    elapsed_s=0.0,
+                    oldest_key_age_s=0.0,
+                    failures=(message,),
+                )
+            if stats.failed or stats.pending:
+                message = (
+                    f"force={force} attempted={stats.attempted}/{stats.total} "
+                    f"succeeded={stats.succeeded} failed={stats.failed} pending={stats.pending} "
+                    f"retained_bytes={stats.retained_bytes} failures={stats.failures}"
+                )
+                self._r3_cleanup_blocked_error = message
+                logger.error("Incomplete R3 Mooncake cleanup: %s", message)
+                return stats
             log_fn = logger.info if _r3_verbose_logging_enabled() else logger.debug
-            log_fn("Cleaned external R3 Mooncake routing payload keys")
-            return
+            log_fn(
+                "Cleaned external R3 Mooncake routing payload keys force=%s keys=%d bytes=%d retries=%d elapsed=%.3fs",
+                force,
+                stats.succeeded,
+                stats.removed_bytes,
+                stats.retry_attempts,
+                stats.elapsed_s,
+            )
+            return stats
         if isinstance(cleanup, R3SourceFilesCleanup):
             for path in cleanup.paths:
                 try:
                     path.unlink(missing_ok=True)
                 except Exception as exc:
                     logger.warning("Failed to clean SGLang R3 source file %s: %s", path, exc)
-            return
+            return None
         self._cleanup_routing_payload_dir(cleanup)
+        return None
 
     def _cleanup_routing_payload_dir(self, root: Path) -> None:
         try:
@@ -824,10 +877,18 @@ class RequestProcessor:
                 request_id=request.request_id,
             )
 
+            routing_cleanup_stats = None
             try:
                 result = await backend_method(**kwargs)
-            finally:
-                self._cleanup_routing_payloads(routing_payload_root)
+            except BaseException:
+                # A failed/cancelled backend may still have a rank fetching a
+                # payload. Normal removal respects that lease; never force it.
+                self._cleanup_routing_payloads(routing_payload_root, force=False)
+                raise
+            else:
+                # RunnerDispatcher returns only after its mandatory all-rank
+                # completion rendezvous, so every synchronous get has returned.
+                routing_cleanup_stats = self._cleanup_routing_payloads(routing_payload_root, force=True)
 
             t_backend = time.perf_counter()
 
@@ -852,6 +913,22 @@ class RequestProcessor:
                 "executor_packed_row_batch_size": row_batch_size,
                 "executor_samples": len(data),
             }
+            if routing_cleanup_stats is not None:
+                output_dict.update(
+                    {
+                        "executor_r3_cleanup_total": routing_cleanup_stats.total,
+                        "executor_r3_cleanup_attempted": routing_cleanup_stats.attempted,
+                        "executor_r3_cleanup_succeeded": routing_cleanup_stats.succeeded,
+                        "executor_r3_cleanup_already_absent": routing_cleanup_stats.already_absent,
+                        "executor_r3_cleanup_failed": routing_cleanup_stats.failed,
+                        "executor_r3_cleanup_pending": routing_cleanup_stats.pending,
+                        "executor_r3_cleanup_retry_attempts": routing_cleanup_stats.retry_attempts,
+                        "executor_r3_cleanup_removed_bytes": routing_cleanup_stats.removed_bytes,
+                        "executor_r3_cleanup_retained_bytes": routing_cleanup_stats.retained_bytes,
+                        "executor_r3_cleanup_s": routing_cleanup_stats.elapsed_s,
+                        "executor_r3_cleanup_oldest_key_age_s": routing_cleanup_stats.oldest_key_age_s,
+                    }
+                )
 
             # Add loss-specific metrics (IS/KL divergence, OPD KL stats, ratio stats, etc.)
             for key in result:
