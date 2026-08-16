@@ -38,6 +38,8 @@ import torch
 
 from xorl.models.checkpoint_handlers.base import CheckpointHandler
 
+from .native_payload import pack_bytes_as_float32, pack_expert_rows_as_float32
+
 
 _LAYER_RE = re.compile(r"layers\.(\d+)\.(.+)")
 
@@ -48,6 +50,8 @@ class LoadSummary:
     fp8_dequantized: int = 0
     ape_unhotfixed: int = 0
     experts_fused: int = 0
+    native_dense_pairs: int = 0
+    native_mxfp4_banks: int = 0
     skipped_mtp: int = 0
     unmapped: list[str] = field(default_factory=list)
     missing_in_model: list[str] = field(default_factory=list)
@@ -316,6 +320,75 @@ def _is_compress_ratio_4(layer_idx: int, compress_ratios: Optional[list[int]]) -
     return False
 
 
+def _native_dense_payload_results(
+    xorl_weight_name: str,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+) -> list[tuple[str, torch.Tensor]]:
+    if weight.dtype is not torch.float8_e4m3fn:
+        raise TypeError(f"Exact DSV4 dense payload {xorl_weight_name} must be E4M3, got {weight.dtype}")
+    if scale.dtype is not torch.float8_e8m0fnu:
+        raise TypeError(f"Exact DSV4 dense scale {xorl_weight_name} must be E8M0, got {scale.dtype}")
+    prefix = xorl_weight_name.removesuffix(".weight") + ".native_base_payload"
+    packed_weight, _ = pack_bytes_as_float32(weight)
+    packed_scale, _ = pack_bytes_as_float32(scale)
+    return [
+        (f"{prefix}.packed_weight_f32", packed_weight),
+        (f"{prefix}.packed_scale_f32", packed_scale),
+    ]
+
+
+def _native_mxfp4_payload_results(
+    prefix: str,
+    tensors: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor],
+) -> list[tuple[str, torch.Tensor]]:
+    suffixes = (
+        "packed_w13_weight_f32",
+        "packed_w2_weight_f32",
+        "packed_w13_scale_f32",
+        "packed_w2_scale_f32",
+    )
+    return [
+        (f"{prefix}.{suffix}", pack_expert_rows_as_float32(tensor))
+        for suffix, tensor in zip(suffixes, tensors, strict=True)
+    ]
+
+
+def _fuse_native_mxfp4_bank(
+    by_projection: dict[str, dict[int, tuple[torch.Tensor, torch.Tensor]]],
+    num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    if not by_projection:
+        return None
+    for projection in ("w1", "w2", "w3"):
+        if len(by_projection.get(projection, {})) != num_experts:
+            raise RuntimeError(
+                f"native MXFP4 fusion got {len(by_projection.get(projection, {}))} {projection} pairs, "
+                f"expected {num_experts}"
+            )
+    # The exact lane pins SGLang's Marlin backend. Its activation consumes
+    # checkpoint-native [w1 (gate); w3 (up)] row order.
+    w13_rows, w13_scales, w2_rows, w2_scales = [], [], [], []
+    for expert_idx in range(num_experts):
+        w1, s1 = by_projection["w1"][expert_idx]
+        w2, s2 = by_projection["w2"][expert_idx]
+        w3, s3 = by_projection["w3"][expert_idx]
+        if any(weight.dtype is not torch.int8 for weight in (w1, w2, w3)):
+            raise TypeError("DSV4 routed native weights must remain packed int8 MXFP4 bytes")
+        if any(scale.dtype is not torch.float8_e8m0fnu for scale in (s1, s2, s3)):
+            raise TypeError("DSV4 routed native scales must remain E8M0")
+        w13_rows.append(torch.cat((w1, w3), dim=0))
+        w13_scales.append(torch.cat((s1, s3), dim=0))
+        w2_rows.append(w2)
+        w2_scales.append(s2)
+    return (
+        torch.stack(w13_rows, dim=0),
+        torch.stack(w2_rows, dim=0),
+        torch.stack(w13_scales, dim=0),
+        torch.stack(w2_scales, dim=0),
+    )
+
+
 def _fillable_state(model: torch.nn.Module) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor], set[str]]:
     """Return load targets, excluding non-persistent buffers.
 
@@ -364,21 +437,13 @@ def load_hf_state_dict_into_model(
         :class:`LoadSummary` with counts + lists of unmapped / missing names.
     """
     config = model.config
-    compress_ratios = config.compress_ratios
-    # Compressor head_dim drives the APE hotfix shape; pass it down so
-    # ``_undo_ape_hotfix`` can sanity-check the inferred reshape against
-    # the model's actual config rather than trusting tensor shape alone.
-    # The two compressors live at different head_dims:
-    #   .self_attn.compressor.ape          -> config.head_dim
-    #   .self_attn.indexer.compressor.ape  -> config.index_head_dim
-    attn_compressor_head_dim = config.head_dim
-    indexer_compressor_head_dim = getattr(config, "index_head_dim", config.head_dim)
-
     summary = LoadSummary()
 
     # First pass: collect per-layer expert tensors so we can fuse them.
     # ``expert_buf[layer_idx][("w1"|"w3"|"w2")][expert_idx] = tensor``.
     expert_buf: dict[int, dict[str, dict[int, torch.Tensor]]] = {}
+    native_expert_buf: dict[int, dict[str, dict[int, tuple[torch.Tensor, torch.Tensor]]]] = {}
+    preserve_native = bool(getattr(config, "_dsv4_flash_exact_mode", False))
 
     # Build a set of model parameter names so we can validate.
     model_params, model_buffers, fillable = _fillable_state(model)
@@ -406,8 +471,13 @@ def load_hf_state_dict_into_model(
                 w_name = em.group(2)  # w1 | w2 | w3
                 # Dequantize on the spot if needed.
                 t = tensor
+                scale_key = hf_name.replace(".weight", ".scale")
+                scale = hf_state_dict.get(scale_key)
+                if preserve_native:
+                    if not _is_mxfp4_packed(t, has_scale=scale is not None):
+                        raise TypeError(f"Exact DSV4 routed weight {hf_name} is not a packed MXFP4 pair")
+                    native_expert_buf.setdefault(layer_idx, {}).setdefault(w_name, {})[expert_idx] = (t, scale)
                 if dequantize_fp8:
-                    scale_key = hf_name.replace(".weight", ".scale")
                     if _is_fp8(t) and scale_key in hf_state_dict:
                         t = _dequantize_fp8_block(t, hf_state_dict[scale_key], out_dtype=target_dtype)
                         summary.fp8_dequantized += 1
@@ -434,25 +504,27 @@ def load_hf_state_dict_into_model(
             continue
 
         t = tensor
+        scale_key = hf_name.replace(".weight", ".scale")
+        scale = hf_state_dict.get(scale_key)
+        if preserve_native and _is_fp8(t):
+            if scale is None:
+                raise RuntimeError(f"Exact DSV4 dense weight {hf_name} is missing its .scale sidecar")
+            for payload_name, payload_tensor in _native_dense_payload_results(xorl_name, t, scale):
+                if payload_name not in fillable:
+                    raise RuntimeError(f"Exact DSV4 payload target {payload_name} is absent from the model")
+                _copy_into(model_params, model_buffers, payload_name, payload_tensor)
+                filled.add(payload_name)
+            summary.native_dense_pairs += 1
         if dequantize_fp8 and _is_fp8(t):
-            scale_key = hf_name.replace(".weight", ".scale")
             if scale_key in hf_state_dict:
                 t = _dequantize_fp8_block(t, hf_state_dict[scale_key], out_dtype=target_dtype)
                 summary.fp8_dequantized += 1
 
-        # APE hotfix undo for C4 layers (compressor.ape and indexer.compressor.ape).
-        if (
-            xorl_name.endswith(".compressor.ape")
-            and m is not None
-            and _is_compress_ratio_4(int(m.group(1)), compress_ratios)
-        ):
-            expected_hd = (
-                indexer_compressor_head_dim
-                if xorl_name.endswith(".indexer.compressor.ape")
-                else attn_compressor_head_dim
-            )
-            t = _undo_ape_hotfix(t, expected_head_dim=expected_hd)
-            summary.ape_unhotfixed += 1
+        # The HF checkpoint ships compressor.ape in the natural layout;
+        # the serving model applies its own hotfix permutation at load and
+        # the exact C4 path re-applies it before the compress kernel.
+        # Un-doing a hotfix that was never applied feeds the kernel a
+        # permuted table and changes the exact replay bytes.
 
         _copy_into(model_params, model_buffers, xorl_name, t)
         filled.add(xorl_name)
@@ -487,6 +559,18 @@ def load_hf_state_dict_into_model(
         # cheap relative to a 12 GB allocation drop.
         if layer_idx % 4 == 0:
             _gc.collect()
+
+    for layer_idx in sorted(native_expert_buf):
+        fused_native = _fuse_native_mxfp4_bank(native_expert_buf[layer_idx], config.n_routed_experts)
+        if fused_native is None:
+            continue
+        prefix = f"model.layers.{layer_idx}.mlp.experts.native_mxfp4_payload"
+        for name, tensor in _native_mxfp4_payload_results(prefix, fused_native):
+            if name not in fillable:
+                raise RuntimeError(f"Exact DSV4 payload target {name} is absent from the model")
+            _copy_into(model_params, model_buffers, name, tensor)
+            filled.add(name)
+        summary.native_mxfp4_banks += 1
 
     # Strict-mode checks.
     if strict:
@@ -584,7 +668,12 @@ class DeepseekV4CheckpointHandler(CheckpointHandler):
         self.attn_compressor_head_dim = config.head_dim
         self.indexer_compressor_head_dim = getattr(config, "index_head_dim", config.head_dim)
         self.checkpoint_keys = checkpoint_keys
-        self.dequantize_fp8 = dequantize_fp8
+        self.preserve_native = bool(getattr(config, "_dsv4_flash_exact_mode", False))
+        # The exact lane must not allocate a second BF16 image of every FP8
+        # dense projection and MXFP4 routed bank.  Native payloads are the
+        # executable base state; BF16 materialization would exceed WORLD8 H100
+        # memory and silently reintroduce a non-serving value path.
+        self.dequantize_fp8 = bool(dequantize_fp8 and not self.preserve_native)
         self.target_dtype = target_dtype
         self.summary = LoadSummary()
 
@@ -601,6 +690,7 @@ class DeepseekV4CheckpointHandler(CheckpointHandler):
         # safetensors shards.
         self.pending: dict[str, dict[str, torch.Tensor]] = {}
         self.expert_buf: dict[int, dict[str, dict[int, torch.Tensor]]] = {}
+        self.native_expert_buf: dict[int, dict[str, dict[int, tuple[torch.Tensor, torch.Tensor]]]] = {}
 
     def _scale_name_for(self, weight_name: str) -> str | None:
         if weight_name.endswith(".weight"):
@@ -637,6 +727,21 @@ class DeepseekV4CheckpointHandler(CheckpointHandler):
         return expert_idx - self.expert_start
 
     def _try_fuse_layer(self, layer_idx: int) -> list[tuple[str, torch.Tensor]]:
+        if self.preserve_native:
+            native_ws = self.native_expert_buf.get(layer_idx)
+            expected = self.local_num_experts
+            if native_ws is None or not all(
+                len(native_ws.get(projection, {})) == expected for projection in ("w1", "w2", "w3")
+            ):
+                return []
+            native_ws = self.native_expert_buf.pop(layer_idx)
+            fused_native = _fuse_native_mxfp4_bank(native_ws, expected)
+            if fused_native is None:
+                raise RuntimeError(f"Exact DSV4 layer {layer_idx} produced no native MXFP4 expert payload")
+            prefix = f"model.layers.{layer_idx}.mlp.experts.native_mxfp4_payload"
+            self.summary.native_mxfp4_banks += 1
+            return _native_mxfp4_payload_results(prefix, fused_native)
+
         ws = self.expert_buf.get(layer_idx)
         if ws is None:
             return []
@@ -684,6 +789,14 @@ class DeepseekV4CheckpointHandler(CheckpointHandler):
                 if local_expert_idx is None:
                     return []
                 w_name = em.group(2)  # w1 | w2 | w3
+                if self.preserve_native:
+                    if not _is_mxfp4_packed(weight, has_scale=scale is not None):
+                        raise TypeError(f"Exact DSV4 routed weight {weight_name} is not a packed MXFP4 pair")
+                    self.native_expert_buf.setdefault(layer_idx, {}).setdefault(w_name, {})[local_expert_idx] = (
+                        weight,
+                        scale,
+                    )
+                    return self._try_fuse_layer(layer_idx)
                 t = self._maybe_dequant(weight, scale)
                 self.expert_buf.setdefault(layer_idx, {}).setdefault(w_name, {})[local_expert_idx] = t
                 return self._try_fuse_layer(layer_idx)
@@ -697,22 +810,21 @@ class DeepseekV4CheckpointHandler(CheckpointHandler):
                 self.summary.unmapped.append(weight_name)
             return []
 
+        results: list[tuple[str, torch.Tensor]] = []
+        if self.preserve_native and _is_fp8(weight):
+            if scale is None:
+                raise RuntimeError(f"Exact DSV4 dense weight {weight_name} is missing its .scale sidecar")
+            results.extend(_native_dense_payload_results(xorl_name, weight, scale))
+            self.summary.native_dense_pairs += 1
+            self.summary.loaded += 1
+            return results
         t = self._maybe_dequant(weight, scale)
-        if (
-            xorl_name.endswith(".compressor.ape")
-            and m is not None
-            and _is_compress_ratio_4(int(m.group(1)), self.compress_ratios)
-        ):
-            expected_hd = (
-                self.indexer_compressor_head_dim
-                if xorl_name.endswith(".indexer.compressor.ape")
-                else self.attn_compressor_head_dim
-            )
-            t = _undo_ape_hotfix(t, expected_head_dim=expected_hd)
-            self.summary.ape_unhotfixed += 1
+        # compressor.ape ships in the natural layout; see the note in
+        # load_hf_state_dict_into_model. No hotfix undo.
 
         self.summary.loaded += 1
-        return [(xorl_name, t)]
+        results.append((xorl_name, t))
+        return results
 
     def on_load_weight(self, key: str, tensor: torch.Tensor) -> list[tuple[str, torch.Tensor]]:
         if self._is_layer_out_of_range(key):
@@ -770,6 +882,10 @@ class DeepseekV4CheckpointHandler(CheckpointHandler):
         }
         if pending_experts:
             warnings.warn(f"Incomplete DSv4 expert weights after loading: {pending_experts}")
+        if self.native_expert_buf:
+            raise RuntimeError(
+                f"Incomplete exact DSV4 native MXFP4 expert payloads after loading: {sorted(self.native_expert_buf)}"
+            )
         return []
 
 
@@ -805,9 +921,6 @@ def stream_load_hf_directory_into_model(
 
     hf_dir = Path(hf_dir)
     config = model.config
-    compress_ratios = config.compress_ratios
-    attn_compressor_head_dim = config.head_dim
-    indexer_compressor_head_dim = getattr(config, "index_head_dim", config.head_dim)
     summary = LoadSummary()
 
     with (hf_dir / "model.safetensors.index.json").open() as f:
@@ -916,19 +1029,8 @@ def stream_load_hf_directory_into_model(
             return
 
         t = _maybe_dequant(weight, scale)
-
-        if (
-            xorl_name.endswith(".compressor.ape")
-            and m is not None
-            and _is_compress_ratio_4(int(m.group(1)), compress_ratios)
-        ):
-            expected_hd = (
-                indexer_compressor_head_dim
-                if xorl_name.endswith(".indexer.compressor.ape")
-                else attn_compressor_head_dim
-            )
-            t = _undo_ape_hotfix(t, expected_head_dim=expected_hd)
-            summary.ape_unhotfixed += 1
+        # compressor.ape ships in the natural layout; see the note in
+        # load_hf_state_dict_into_model. No hotfix undo.
 
         _copy_into(model_params, model_buffers, xorl_name, t)
         filled.add(xorl_name)

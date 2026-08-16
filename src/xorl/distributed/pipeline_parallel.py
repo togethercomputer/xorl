@@ -42,11 +42,20 @@ from xorl.models.layers.moe.routing_replay import get_replay_stage, is_r3_mode, 
 
 from ..utils import logging
 from .parallel_state import get_parallel_state
+from .pp_byte_contract import (
+    PP_EXACT_REQUIRED_METADATA,
+    PPByteContractError,
+    assert_pp_wire_dtype,
+    engage_pp_byte_contract,
+    validate_pp_exact_microbatch_metadata,
+    validate_pp_wire_boundary_state,
+)
 
 
 logger = logging.get_logger(__name__)
 
 __all__ = [
+    "generate_llm_fqn_from_layer_ranges",
     "generate_llm_fqn_per_model_part",
     "pipeline_module_split",
     "build_pp_stage",
@@ -57,6 +66,39 @@ __all__ = [
     "schedule_splits_backward",
     "validate_pp_schedule_config",
 ]
+
+
+def generate_llm_fqn_from_layer_ranges(
+    layer_ranges,
+    *,
+    num_layers: int,
+    input_fqns: Optional[List[str]] = None,
+    layer_prefix: str = "layers",
+    output_fqns: Optional[List[str]] = None,
+) -> List[List[str]]:
+    """Build stage module assignments from model-derived legal ranges."""
+
+    input_fqns = ["tok_embeddings"] if input_fqns is None else list(input_fqns)
+    output_fqns = ["norm", "output"] if output_fqns is None else list(output_fqns)
+    ranges = tuple((int(start), int(end)) for start, end in layer_ranges)
+    expected_start = 0
+    for start, end in ranges:
+        if start != expected_start or end <= start:
+            raise ValueError("Pipeline layer ranges must be nonempty, contiguous, and start at layer 0")
+        expected_start = end
+    if not ranges or expected_start != num_layers:
+        raise ValueError(f"Pipeline layer ranges must cover exactly {num_layers} decoder layers")
+
+    assignments: List[List[str]] = []
+    for stage_index, (start, end) in enumerate(ranges):
+        modules: List[str] = []
+        if stage_index == 0:
+            modules.extend(input_fqns)
+        modules.extend(f"{layer_prefix}.{layer_index}" for layer_index in range(start, end))
+        if stage_index == len(ranges) - 1:
+            modules.extend(output_fqns)
+        assignments.append(modules)
+    return assignments
 
 
 # Schedules taking exactly one stage per rank use style "single"; multi-stage
@@ -342,16 +384,65 @@ def _pp_forward(self, x):
     # --- Pop per-microbatch metadata (set by training loop) ---
     # Skip during shape inference to avoid consuming queue entries that are
     # needed for the actual scheduled forward passes.
+    carries_hyperconnection_state = getattr(self, "_pp_carries_hyperconnection_state", False)
     position_ids = None
+    original_input_ids = None
     extra_kwargs = {}
+    metadata_queue = getattr(self, "_pp_batch_metadata", None)
+    if metadata_queue and (in_scheduled_forward or carries_hyperconnection_state):
+        # DSV4's PP shape is its storage-capacity 4-D state with live rows in
+        # a compact prefix. Shape inference still needs the first microbatch's
+        # immutable row plan. Peek without consuming; the scheduled forward
+        # still pops the same entry.
+        metadata = metadata_queue.popleft() if in_scheduled_forward else dict(metadata_queue[0])
+        position_ids = metadata.pop("position_ids", None)
+        original_input_ids = metadata.pop("_pp_original_input_ids", None)
+        if original_input_ids is None:
+            # Compatibility with batches queued by the generic exact-PP path.
+            original_input_ids = metadata.pop("_pp_input_ids", None)
+        else:
+            metadata.pop("_pp_input_ids", None)
+        if position_ids is not None:
+            position_ids = position_ids.to(x.device)
+        if original_input_ids is not None:
+            original_input_ids = original_input_ids.to(x.device)
+        extra_kwargs = {k: v.to(x.device) if isinstance(v, torch.Tensor) else v for k, v in metadata.items()}
     if in_scheduled_forward:
-        metadata_queue = getattr(self, "_pp_batch_metadata", None)
-        if metadata_queue:
-            metadata = metadata_queue.popleft()
-            position_ids = metadata.pop("position_ids", None)
-            if position_ids is not None:
-                position_ids = position_ids.to(x.device)
-            extra_kwargs = {k: v.to(x.device) if isinstance(v, torch.Tensor) else v for k, v in metadata.items()}
+        if getattr(self, "_pp_exact_boundary_contract", False):
+            # Exact lanes fail closed on INCOMPLETE metadata, not just absent
+            # position_ids: a fabricated positional fallback changes bytes
+            # silently, and a missing cu_seq_lens_* silently
+            # merges packed documents into one attention span — a silent
+            # numerics change with no downstream error.
+            missing = [
+                name
+                for name in PP_EXACT_REQUIRED_METADATA
+                if (position_ids is None if name == "position_ids" else name not in extra_kwargs)
+            ]
+            if missing:
+                raise PPByteContractError(
+                    f"PP byte contract: scheduled stage forward is missing required per-microbatch "
+                    f"varlen metadata {missing}; exact value programs require the complete set "
+                    f"{list(PP_EXACT_REQUIRED_METADATA)} (silent fallbacks/merges are not admitted)"
+                )
+            # Presence is not enough: a present-but-None (or malformed)
+            # cu_seq_lens_* still reaches the single-document fallback.
+            validate_pp_exact_microbatch_metadata(
+                x,
+                position_ids,
+                extra_kwargs,
+                sequence_parallel_size=ps.cp_size,
+            )
+            if not self._pp_is_first:
+                # The received wire bytes must be bf16 regardless of what any
+                # config declared (resolved reality, not metadata).
+                assert_pp_wire_dtype(x, where="received inter-stage hidden state")
+        if not self._pp_is_first:
+            validate_pp_wire_boundary_state(
+                x,
+                getattr(self, "_pp_pipeline_boundary_state", None),
+                where="received inter-stage hidden state",
+            )
 
     # Fallback: generate sequential position_ids covering the full SP range
     # so that RoPE embeddings have a large enough cache.
@@ -359,6 +450,10 @@ def _pp_forward(self, x):
         seq_len = x.shape[1]
         full_seq_len = seq_len * ps.cp_size
         position_ids = torch.arange(full_seq_len, device=x.device).unsqueeze(0).expand(x.shape[0], -1)
+
+    if carries_hyperconnection_state:
+        extra_kwargs["_pp_stage_is_first"] = self._pp_is_first
+        extra_kwargs["_pp_stage_is_last"] = self._pp_is_last
 
     if self._pp_is_first:
         # x is input_ids
@@ -371,7 +466,20 @@ def _pp_forward(self, x):
         )
     else:
         # x is hidden_states from previous stage
+        requires_original_ids = bool(
+            getattr(self, "_pp_requires_original_input_ids", False)
+            or getattr(self, "_pp_requires_input_ids_on_all_stages", False)
+        )
+        if requires_original_ids and original_input_ids is None:
+            if in_scheduled_forward:
+                raise PPByteContractError(
+                    "PP stage requires original input_ids for layer-local routing, but the microbatch metadata omitted them"
+                )
+            # Shape inference has no real microbatch metadata. Token values do
+            # not affect its shape contract, so provide a shape-matched dummy.
+            original_input_ids = torch.zeros(x.shape[:2], dtype=torch.long, device=x.device)
         outputs = self._pp_original_forward(
+            input_ids=(original_input_ids if requires_original_ids else None),
             inputs_embeds=x,
             position_ids=position_ids,
             use_cache=False,
@@ -383,6 +491,24 @@ def _pp_forward(self, x):
     set_replay_stage(old_stage)
 
     hidden_states = outputs.last_hidden_state
+
+    if getattr(self, "_pp_exact_boundary_contract", False) and in_scheduled_forward:
+        # The emitted wire bytes must be bf16 regardless of what any config
+        # declared: a bf16-declared model computing in fp32 is caught here at
+        # its first scheduled forward (resolved reality, not metadata).
+        assert_pp_wire_dtype(hidden_states, where="emitted stage hidden state")
+        if not self._pp_is_last:
+            validate_pp_wire_boundary_state(
+                hidden_states,
+                getattr(self, "_pp_pipeline_boundary_state", None),
+                where="emitted inter-stage hidden state",
+            )
+    elif in_scheduled_forward and not self._pp_is_last:
+        validate_pp_wire_boundary_state(
+            hidden_states,
+            getattr(self, "_pp_pipeline_boundary_state", None),
+            where="emitted inter-stage hidden state",
+        )
 
     if self._pp_is_last:
         # When the loss fn applies lm_head (fused quack_linear CE), return HIDDEN
@@ -519,11 +645,20 @@ def pipeline_module_split(
 
         # Recursive pruning handles nested HF model structures
         _recursive_prune(model, "", fqns_to_keep)
+        configure_stage = getattr(model, "_configure_pp_stage", None)
+        if callable(configure_stage):
+            configure_stage(stage_idx=stage_idx, num_stages=num_stages)
 
         model._pp_is_first = stage_idx == 0
         model._pp_is_last = stage_idx == num_stages - 1
         model._pp_stage_idx = stage_idx
         model._pp_original_forward = model.forward
+        decoder = getattr(model, "model", model)
+        decoder_layers = getattr(decoder, "layers", None)
+        owns_decoder_layers = decoder_layers is None or any(layer is not None for layer in decoder_layers)
+        model._pp_requires_index_share_mode = bool(
+            owns_decoder_layers and callable(getattr(model, "release_index_share_context", None))
+        )
         model.forward = types.MethodType(_pp_forward, model)
 
         stage = PipelineStage(
@@ -536,6 +671,17 @@ def pipeline_module_split(
         logger.info(f"PP rank {pp_rank} built stage {stage_idx} with modules {module_names}")
         stages.append(stage)
         model_parts.append(model)
+
+    # Validate the actual split structure. Exact programs additionally receive
+    # fail-closed metadata and runtime wire checks; family names never admit a
+    # topology.
+    engage_pp_byte_contract(
+        whole_model,
+        module_names_per_stage=module_names_per_stage,
+        stage_ids=stage_ids,
+        model_parts=model_parts,
+        parallel_state=get_parallel_state(),
+    )
 
     return stages, model_parts
 

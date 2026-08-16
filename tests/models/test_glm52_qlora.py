@@ -174,14 +174,14 @@ def test_glm52_exact_dense_component_preserves_logical_inventory_with_three_phys
         assert root.down_proj._source_fqn == f"{prefix}.down_proj"
 
 
-@pytest.mark.parametrize(("rank", "alpha"), ((16, 16), (1, 2), (2, 1)))
-def test_glm52_exact_dense_component_rejects_non_rank1_alpha1_before_mutation(rank: int, alpha: int) -> None:
+@pytest.mark.parametrize(("rank", "alpha"), ((0, 1), (1, 0), (-2, 1)))
+def test_glm52_exact_dense_component_rejects_nonpositive_rank_or_alpha_before_mutation(rank: int, alpha: int) -> None:
     config = _official_config()
     config._glm52_exact_active_lora_dense_component = True
     config._ep_dispatch = "alltoall"
     model = _meta_model(config)
 
-    with pytest.raises(ValueError, match="requires adapter_rank=1 and adapter_alpha=1"):
+    with pytest.raises(ValueError, match="must be positive"):
         prepare_glm52_block_fp8_qlora(model, config, adapter_rank=rank, adapter_alpha=alpha)
 
     assert not any("lora_" in name for name, _ in model.named_parameters())

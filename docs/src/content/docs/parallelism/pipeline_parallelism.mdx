@@ -189,7 +189,9 @@ GPUs {0, 1} form one FSDP shard group; GPUs {2, 3} form another.
 
 ---
 
-## 2. Schedules: GPipe and 1F1B
+## 2. Pipeline schedules
+
+XoRL supports single-stage-per-rank schedules and virtual-stage schedules. `pipeline_parallel_virtual_stages` is the number of model chunks owned by each PP rank.
 
 ### GPipe
 
@@ -243,14 +245,26 @@ reduces this).
 For most training scenarios the **1F1B schedule is preferred** because its
 activation memory is independent of `n_microbatches`.
 
+### Virtual-stage and zero-bubble schedules
+
+| Schedule | Stage placement | Virtual stages | Micro-batch constraint |
+|---|---|---|---|
+| `Interleaved1F1B` | Loop: rank `r` owns stages `r`, `r+PP`, ... | Use 2 or more model chunks per rank | Must satisfy the interleaved round-divisibility check |
+| `InterleavedZeroBubble` | Loop | Use 2 or more model chunks per rank | Same round-divisibility check; backward is split into input- and weight-gradient phases |
+| `ZBVZeroBubble` | V-shaped/zigzag | Exactly 2 | Backward is split into input- and weight-gradient phases |
+| `DualPipeV` | V-shaped/zigzag | Exactly 2 | `n_microbatches >= PP × virtual_stages` |
+
+Virtual stages can reduce pipeline bubbles, but they also create multiple model chunks per rank. They are currently incompatible with expert parallelism and with inference weight sync. Use `1F1B` or `GPipe` on those lanes.
+
 ### Configuring the schedule
 
 ```yaml
 train:
-  pipeline_parallel_schedule: "1F1B"   # or "GPipe"
+  pipeline_parallel_schedule: "1F1B"
+  pipeline_parallel_virtual_stages: 1
 ```
 
-Both schedules are backed by `torch.distributed.pipelining` via `get_schedule_class`.
+All schedules are backed by `torch.distributed.pipelining` via `get_schedule_class`.
 The schedule is constructed with `scale_grads=False` because xorl normalizes
 gradients manually after the backward (see Section 7).
 
@@ -619,6 +633,10 @@ the micro-batches flowing through the PP pipeline are the same batches that EP
 dispatches to experts.  No special handling is needed in `forward_backward_pp`;
 each stage's FSDP+EP wrapping handles expert dispatch transparently.
 
+This applies to one model chunk per rank. `pipeline_parallel_virtual_stages > 1`
+with EP is rejected because EP-aware optimizer and state-dict plumbing currently
+assumes one model part per rank.
+
 With routing replay (R3), the `_pp_forward` function correctly switches the routing
 stage from `"replay_backward"` to `"record"` (or `"replay_forward"`) before the
 forward and restores it afterward.  The `no_grad` guard inside `_pp_forward`
@@ -649,9 +667,9 @@ by the PP pipeline is `full_seq_len / cp_size`.  Two adjustments are needed:
 
 | Constraint | Reason |
 |---|---|
-| `gradient_accumulation_steps >= pipeline_parallel_size` | The pipeline must have enough micro-batches to fill all stages before any stage stalls waiting for work.  `n_microbatches = gradient_accumulation_steps`. |
+| Schedule-specific micro-batch count | `n_microbatches = gradient_accumulation_steps`. Interleaved schedules enforce round divisibility; `DualPipeV` requires at least `PP × virtual_stages`. GPipe and 1F1B do not impose the old universal `n_microbatches >= PP` validation rule. More micro-batches can still improve utilization. |
 | `tie_word_embeddings: false` | `embed_tokens` (stage 0) and `lm_head` (last stage) cannot share weights across different GPUs. |
-| Single model chunk per rank (no virtual stages) | The current implementation uses `pipeline_module_split` which assigns exactly one stage per rank.  Multi-stage (virtual) schedules like `ScheduleGPipe` with `num_microbatches > num_stages` in the looped sense are not supported. |
+| Virtual PP restrictions | Virtual stages are supported by the interleaved and V-style schedules, but not with EP or inference weight sync. |
 | Model must implement `get_pp_module_config()` | The stage-splitting algorithm requires structured metadata about input/layer/output FQNs. |
 | Padding must be a multiple of `pad_to_multiple_of` | FA3 varlen kernels may require sequence length alignment (e.g., multiples of 8 or 64). |
 | PP is not compatible with `torch.compile` on the whole model | Per-stage `torch.compile` of individual decoder layers (via `basic_modules`) is supported, but whole-model compile is not. |
@@ -750,9 +768,12 @@ train:
 | Parameter | Type | Default | Description |
 |---|---|---|---|
 | `train.pipeline_parallel_size` | `int` | `1` | Number of pipeline stages.  Set to `1` to disable PP. |
-| `train.pipeline_parallel_schedule` | `str` | `"1F1B"` | Schedule algorithm: `"1F1B"` or `"GPipe"`. |
+| `train.pipeline_parallel_schedule` | `str` | `"1F1B"` | `1F1B`, `GPipe`, `Interleaved1F1B`, `InterleavedZeroBubble`, `ZBVZeroBubble`, or `DualPipeV`. |
+| `train.pipeline_parallel_virtual_stages` | `int` | `1` | Model chunks per PP rank. Use 1 for GPipe/1F1B, normally 2+ for interleaved schedules, and exactly 2 for ZBV/DualPipeV. |
+| `train.pipeline_parallel_input_weight` | `int` | `1` | Layer-equivalent cost assigned to the embedding when balancing stages. |
+| `train.pipeline_parallel_output_weight` | `int` | `1` | Layer-equivalent cost assigned to final norm, LM head, and CE when balancing stages. |
 | `train.pp_variable_seq_lengths` | `bool` | `True` | Negotiate per-step max seq_len across PP ranks and pad dynamically, instead of padding to the static `sample_packing_sequence_len`. |
-| `train.gradient_accumulation_steps` | `int` | required | Sets `n_microbatches`.  Must be `>= pipeline_parallel_size`. |
+| `train.gradient_accumulation_steps` | `int` | required | Sets `n_microbatches`; constraints depend on the selected schedule. |
 | `train.reshard_after_forward` | `bool` or `None` | `None` (auto) | FSDP2 reshard behavior.  Auto-set to `False` for PP; set `True` to save memory at the cost of extra communication. |
 | `data.sample_packing_sequence_len` | `int` | required for PP | Maximum sequence length used as the static padding target when `pp_variable_seq_lengths=False`.  Also used as the upper bound for `negotiate_pp_seq_len`. |
 | `data.pad_to_multiple_of` | `int` | `128` | Rounds the padded sequence length up to this multiple for GPU efficiency. |
@@ -768,10 +789,10 @@ train:
 | `src/xorl/trainers/trainer.py` | Offline trainer: `_init_pp_schedule_cache`, `_get_pp_schedule`, `_forward_backward_pp`, `_reduce_metrics` |
 | `src/xorl/server/runner/model_runner.py` | Server (online) path: `_get_pp_schedule` (keyed by `(n_microbatches, seq_len)`), `_forward_backward_pp` |
 | `src/xorl/distributed/torch_parallelize.py` | Orchestrates stage split + FSDP2 wrapping (`build_parallelize_model`) |
-| `src/xorl/arguments.py` | `pipeline_parallel_size`, `pipeline_parallel_schedule`, `pp_variable_seq_lengths`, `reshard_after_forward` |
+| `src/xorl/arguments.py` | Pipeline size, schedule, virtual-stage and stage-balancing fields, variable sequence lengths, and reshard behavior |
 
 ## Source
 
 | File | Description |
 |---|---|
-| [`src/xorl/distributed/pipeline_parallel.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/distributed/pipeline_parallel.py) | Stage construction, 1F1B/GPipe schedule, `_pp_forward`, `build_pp_stage` |
+| [`src/xorl/distributed/pipeline_parallel.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/distributed/pipeline_parallel.py) | Stage construction, schedule validation/building, `_pp_forward`, and `build_pp_stage` |

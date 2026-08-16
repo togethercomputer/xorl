@@ -53,9 +53,10 @@ def _run_collective_case() -> None:
                 return group
 
             @staticmethod
-            def _exact_forward_value(hidden, weight, effective_A, effective_B, token_ids):
+            def _exact_forward_value(hidden, weight, effective_A, effective_B, token_ids, temperature):
                 del weight, effective_A, effective_B
-                return hidden.float().sum(dim=-1) + token_ids.float()
+                assert torch.equal(temperature, torch.tensor([0.7, 1.3], dtype=torch.float32))
+                return hidden.float().sum(dim=-1) + token_ids.float() + temperature
 
             @staticmethod
             def _surrogate_vjp(
@@ -65,10 +66,12 @@ def _run_collective_case() -> None:
                 effective_B,
                 token_ids,
                 grad_logprob,
+                temperature,
                 *,
                 needs_input_grad,
             ):
                 del weight, token_ids, needs_input_grad
+                assert torch.equal(temperature, torch.tensor([0.7, 1.3], dtype=torch.float32))
                 grad_sum = grad_logprob.sum()
                 return (
                     grad_logprob.unsqueeze(-1).expand_as(hidden).float(),
@@ -81,15 +84,20 @@ def _run_collective_case() -> None:
         lora_A = torch.tensor([[0.25, -0.5]], dtype=torch.float32, requires_grad=True)
         local_lora_B = torch.tensor([[0.75]], dtype=torch.float32, requires_grad=True)
         local_token_ids = torch.tensor([rank + 10], dtype=torch.int64)
+        local_temperature = torch.tensor([0.7 + rank * 0.6], dtype=torch.float32)
         local_logprob = _Glm52ExactDistributedTP16LmHeadFunction.apply(
             local_hidden,
             local_weight,
             lora_A,
             local_lora_B,
             local_token_ids,
+            local_temperature,
             _FakeDistributedComponent(),
         )
-        assert torch.equal(local_logprob, torch.tensor([13.0 if rank == 0 else 34.0]))
+        torch.testing.assert_close(
+            local_logprob,
+            torch.tensor([13.7 if rank == 0 else 35.3]),
+        )
 
         (local_logprob * (rank + 1)).sum().backward()
         assert torch.equal(local_hidden.grad, torch.full_like(local_hidden, rank + 1))

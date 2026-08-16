@@ -62,6 +62,7 @@ class GradientPresencePolicy(str, Enum):
 
 class ReductionAxis(str, Enum):
     FSDP_SHARD = "fsdp_shard"
+    DATA_PARALLEL_REPLICA = "data_parallel_replica"
     SEQUENCE_PARALLEL = "sequence_parallel"
     OUTPUT_PROJECTION_REPLICA = "output_projection_replica"
     EXPERT_PARALLEL_REPLICA = "expert_parallel_replica"

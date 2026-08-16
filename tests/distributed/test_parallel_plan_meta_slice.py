@@ -241,3 +241,82 @@ def test_glm52_exact_explicit_ep_dispositions_reject_malformed_singletons(
 
     with pytest.raises(ValueError, match=error_match):
         get_glm52_ep_plan().apply(model, _fake_ep_fsdp_mesh(ep_size=16), already_local=True)
+
+
+class _FakePreslicedExperts(nn.Module):
+    """Expert-like owner carrying the checkpoint load's presliced record."""
+
+    def __init__(self, rows: int, hidden: int, inter: int, *, global_rows: int, load_ep: int, meta: bool = False):
+        super().__init__()
+        device = "meta" if meta else "cpu"
+        self.gate_up_proj = nn.Parameter(
+            torch.empty(rows, hidden, 2 * inter, device=device, dtype=torch.bfloat16),
+            requires_grad=False,
+        )
+        if not meta:
+            with torch.no_grad():
+                self.gate_up_proj.copy_(
+                    torch.arange(self.gate_up_proj.numel(), dtype=torch.float32).reshape(self.gate_up_proj.shape)
+                )
+        self._xorl_ep_load_presliced = {"gate_up_proj": (global_rows, load_ep)}
+
+
+class _FakePreslicedModel(nn.Module):
+    def __init__(self, experts: nn.Module):
+        super().__init__()
+        self.experts = experts
+
+
+def test_load_presliced_params_are_verified_noops_and_double_slice_fails_closed():
+    """Enforce the single-EP-slicing-site contract.
+
+    A parameter the checkpoint load already sliced to EP-local shape
+    (recorded on its owner by ``_shrink_expert_params_for_ep``) must be a
+    VERIFIED no-op here — annotated, never sliced again — and every
+    inconsistent combination must fail closed instead of falling through
+    to the real-slice branch."""
+
+    plan = ParallelPlan(ep_plan={"experts.gate_up_proj": Shard(0)})
+    H, I = 8, 8
+
+    # Positive: real tensor at global//ep rows -> annotate, bytes untouched.
+    experts = _FakePreslicedExperts(4, H, I, global_rows=16, load_ep=4)
+    model = _FakePreslicedModel(experts)
+    before = experts.gate_up_proj.detach().clone()
+    specs = plan.apply(model, _fake_ep_fsdp_mesh(ep_size=4), already_local=False)
+    assert tuple(model.experts.gate_up_proj.shape) == (4, H, 2 * I), "presliced param must NOT be sliced again"
+    assert torch.equal(model.experts.gate_up_proj.detach(), before), "presliced bytes must be untouched"
+    info = specs["experts.gate_up_proj"]
+    assert isinstance(info.placement, Shard) and info.placement.dim == 0
+
+    # Positive corner: presliced down to ONE row must still annotate as a
+    # Shard (the singleton-Replicate shared-LoRA branch must not steal it).
+    experts = _FakePreslicedExperts(1, H, I, global_rows=4, load_ep=4)
+    specs = plan.apply(_FakePreslicedModel(experts), _fake_ep_fsdp_mesh(ep_size=4), already_local=False)
+    assert isinstance(specs["experts.gate_up_proj"].placement, Shard)
+    assert tuple(experts.gate_up_proj.shape) == (1, H, 2 * I)
+
+    # Fail closed: the shape neither matches the presliced record (a second
+    # slice or a lying record) ...
+    experts = _FakePreslicedExperts(16, H, I, global_rows=16, load_ep=4)
+    with pytest.raises(ValueError, match="would apply EP twice"):
+        plan.apply(_FakePreslicedModel(experts), _fake_ep_fsdp_mesh(ep_size=4), already_local=False)
+
+    # ... nor may the load-time and wrap-time EP worlds differ ...
+    experts = _FakePreslicedExperts(2, H, I, global_rows=16, load_ep=8)
+    with pytest.raises(ValueError, match="EP worlds must be identical"):
+        plan.apply(_FakePreslicedModel(experts), _fake_ep_fsdp_mesh(ep_size=4), already_local=False)
+
+    # ... nor may a presliced record cover a still-meta tensor ...
+    experts = _FakePreslicedExperts(4, H, I, global_rows=16, load_ep=4, meta=True)
+    with pytest.raises(ValueError, match="never materialized"):
+        plan.apply(_FakePreslicedModel(experts), _fake_ep_fsdp_mesh(ep_size=4), already_local=False)
+
+    # ... nor may force-shard contradict a presliced record (owner declares
+    # global-size storage so the force-shard branch falls through here).
+    experts = _FakePreslicedExperts(16, H, I, global_rows=16, load_ep=4)
+    experts.num_experts = 16
+    experts.num_local_experts = 4
+    experts.gate_up_proj._xorl_ep_force_shard = True
+    with pytest.raises(ValueError, match="slice it a second time"):
+        plan.apply(_FakePreslicedModel(experts), _fake_ep_fsdp_mesh(ep_size=4), already_local=False)

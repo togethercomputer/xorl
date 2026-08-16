@@ -59,7 +59,16 @@ class ShiftTokensCollator(DataCollator):
 
     def __post_init__(self):
         if self.shift_fields is None:
-            self.shift_fields = ["labels", "weights", "advantages", "logprobs"]
+            self.shift_fields = [
+                "labels",
+                "weights",
+                "advantages",
+                "logprobs",
+                "logprob_temperatures",
+                "logprob_top_ks",
+                "logprob_top_ps",
+                "logprob_min_ps",
+            ]
 
     def _needs_shifting(self, sample: Dict[str, Any]) -> bool:
         """

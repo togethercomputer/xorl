@@ -76,7 +76,7 @@ optimizer state already changed: restart from the last checkpoint. Never use
 | `POST` | `/add_inference_endpoint` | Register an SGLang inference server for weight sync. |
 | `POST` | `/remove_inference_endpoint` | Unregister an inference endpoint. |
 | `GET` | `/list_inference_endpoints` | List all registered endpoints. |
-| `POST` | `/api/v1/sync_inference_weights` | Broadcast current weights to all inference endpoints via NCCL. |
+| `POST` | `/api/v1/sync_inference_weights` | Transfer current weights to registered inference endpoints using the configured backend. |
 | `POST` | `/api/v1/set_sync_quantization` | Configure FP8 quantization for weight sync. |
 | `POST` | `/api/v1/create_sampling_session` | Load a LoRA adapter on inference server for sampling. |
 

@@ -6,12 +6,15 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from torch import nn
 from torch.distributed._tensor import Replicate
 from torch.distributed._tensor import Shard as DTShard
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
 
 from xorl.models import module_utils
+from xorl.models.transformers.glm5.native_fp8 import NativeBlockFP8PairBuffer
+from xorl.ops.block_fp8_native import NativeBlockFP8Linear
 
 
 pytestmark = [pytest.mark.cpu]
@@ -669,6 +672,93 @@ def test_grouped_load_weights_uses_filtered_prefetch_on_group_leader(monkeypatch
             ("model.layers.0.mlp.experts.gate_proj", torch.Size([1, 1, 1]), torch.float32, "expert_scatter"),
         ],
     )
+
+
+def test_qlora_source_only_skip_keys_reject_live_native_state() -> None:
+    model = nn.Module()
+    model.proj = NativeBlockFP8Linear(4, 4, device="cpu")
+    model.proj._qlora_expected_skip_keys = {"weight", "weight_scale_inv"}
+    live_state_names = {name for name, _ in model.named_parameters()} | {name for name, _ in model.named_buffers()}
+
+    with pytest.raises(RuntimeError, match=r"source-only.*proj\.weight_scale_inv"):
+        module_utils._collect_qlora_source_only_skip_keys(model, live_state_names)
+
+
+def test_grouped_load_dispatches_native_fp8_pair_scale(monkeypatch) -> None:
+    class _NativePairHandler:
+        def __init__(self, model: nn.Module, *, dense: bool) -> None:
+            self.pairs = NativeBlockFP8PairBuffer(model, {"proj": "proj"}) if dense else None
+
+        def get_skip_key_fn(self):
+            return None
+
+        def on_load_weight(self, key, tensor):
+            if self.pairs is None:
+                return [(key, tensor)]
+            results = self.pairs.try_consume(key, tensor)
+            return [(key, tensor)] if results is None else results
+
+        def on_load_complete(self):
+            if self.pairs is not None:
+                self.pairs.validate_complete()
+            return []
+
+    class _NativePairModel(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.config = SimpleNamespace(tie_word_embeddings=False)
+            self.proj = NativeBlockFP8Linear(4, 4, device="meta")
+            self.proj._source_fqn = "proj"
+            self.proj._qlora_expected_skip_keys = {"weight"}
+
+        def to_empty(self, device):
+            super().to_empty(device=device)
+            self.proj.packed_weight_f32.fill_(-777.0)
+            self.proj.weight_scale_inv.fill_(-777.0)
+            return self
+
+        def get_checkpoint_handler(self, **kwargs):
+            return _NativePairHandler(self, dense=kwargs["load_family"] == "dense")
+
+    model = _NativePairModel()
+    weight = torch.arange(16, dtype=torch.uint8).view(torch.float8_e4m3fn).reshape(4, 4)
+    scale = torch.tensor([[2.5]], dtype=torch.float32)
+    state = {
+        "proj.weight_scale_inv": scale,
+        "proj.weight": weight,
+    }
+    fake_group = object()
+    fake_dist = SimpleNamespace(
+        is_available=lambda: True,
+        is_initialized=lambda: True,
+        get_world_size=lambda group=None: 1,
+        get_process_group_ranks=lambda group: [0],
+    )
+
+    def fake_prefetch(state_dict_iterators, skip_key_fn, prefetch_count):
+        assert state_dict_iterators == ["shard-0"]
+        assert prefetch_count == 1
+        yield ({key: tensor for key, tensor in state.items() if not skip_key_fn(key)}, [])
+
+    monkeypatch.setattr(module_utils, "dist", fake_dist)
+    monkeypatch.setattr(
+        module_utils,
+        "get_parallel_state",
+        lambda: SimpleNamespace(global_rank=0, pp_enabled=False, ep_enabled=False, ep_rank=0, ep_size=1),
+    )
+    monkeypatch.setattr(module_utils, "_get_grouped_weight_load_group", lambda _ps: fake_group)
+    monkeypatch.setattr(module_utils, "_get_grouped_dense_weight_load_group", lambda: fake_group)
+    monkeypatch.setattr(module_utils, "_get_checkpoint_keys", lambda weights_path: set(state))
+    monkeypatch.setattr(module_utils, "_load_state_dict", lambda weights_path: ["shard-0"])
+    monkeypatch.setattr(module_utils, "_prefetch_shards_filtered", fake_prefetch)
+    monkeypatch.setattr(module_utils, "_shrink_expert_params_for_ep", lambda loaded_model: None)
+    monkeypatch.setattr(module_utils, "empty_cache", lambda: None)
+    monkeypatch.setattr(module_utils, "tqdm", lambda iterable, **kwargs: iterable)
+
+    module_utils.grouped_load_weights(model, "dummy-weights", init_device="cpu", strict=True)
+
+    assert torch.equal(model.proj.packed_weight_f32.view(torch.uint8), weight.view(torch.uint8))
+    assert torch.equal(model.proj.weight_scale_inv.view(torch.uint8), scale.view(torch.uint8))
 
 
 def test_grouped_load_weights_routes_hf_fused_experts_through_expert_queue(monkeypatch):

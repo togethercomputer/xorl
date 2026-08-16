@@ -1,7 +1,7 @@
 """Exact active-LoRA local partials for the GLM-5.2 shared expert.
 
 The admitted sampler executes the shared expert at genuine TP16.  Gate/up are
-merged-column projections with replicated rank-one A factors and output-row
+merged-column projections with replicated low-rank A factors and output-row
 sharded B factors.  Down is row parallel: its A input columns and frozen base
 columns are sharded, while B is replicated.  Each rank returns one unreduced
 BF16 partial; the already-versioned canonical MoE owner folds those partials
@@ -24,10 +24,12 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from xorl.models.transformers.glm5.exact_lora_contract import glm52_exact_lora_scaling
 from xorl.ops.block_fp8_native import NativeBlockFP8Linear, _sglang_native_block_fp8_linear_value
+from xorl.ops.fused_silu_and_mul import exact_fp32_silu_and_mul
 
 
-GLM52_EXACT_TP16_SHARED_EXPERT_QLORA_CONTRACT_VERSION = "glm52_exact_tp16_shared_expert_rank1_qlora_v1"
+GLM52_EXACT_TP16_SHARED_EXPERT_QLORA_CONTRACT_VERSION = "glm52_exact_tp16_shared_expert_qlora_v2"
 GLM52_SHARED_EXPERT_HIDDEN_SIZE = 6144
 GLM52_SHARED_EXPERT_INTERMEDIATE_SIZE = 2048
 GLM52_SHARED_EXPERT_TP_SIZE = 16
@@ -35,7 +37,7 @@ GLM52_SHARED_EXPERT_SHARD_SIZE = 128
 
 
 @lru_cache(maxsize=64)
-def _single_adapter_batch_info(device_index: int, rows: int):
+def _single_adapter_batch_info(device_index: int, rows: int, rank: int, scaling: float):
     """Return the one-live-adapter metadata consumed by literal SGLang kernels."""
 
     from sglang.srt.lora.utils import LoRABatchInfo  # noqa: PLC0415
@@ -47,8 +49,8 @@ def _single_adapter_batch_info(device_index: int, rows: int):
         num_segments=1,
         seg_indptr=torch.tensor([0, rows], dtype=torch.int32, device=device),
         weight_indices=torch.zeros(1, dtype=torch.int32, device=device),
-        lora_ranks=torch.ones(1, dtype=torch.int32, device=device),
-        scalings=torch.ones(1, dtype=torch.float32, device=device),
+        lora_ranks=torch.full((1,), rank, dtype=torch.int32, device=device),
+        scalings=torch.full((1,), scaling, dtype=torch.float32, device=device),
         max_len=rows,
         seg_lens=torch.tensor([rows], dtype=torch.int32, device=device),
         permutation=None,
@@ -58,7 +60,7 @@ def _single_adapter_batch_info(device_index: int, rows: int):
 
 
 class _SharedExpertProjection(NativeBlockFP8Linear):
-    """One frozen logical projection plus its FP32 rank-one masters."""
+    """One frozen logical projection plus its FP32 low-rank masters."""
 
     adapter_gradient_producer_family = "module_managed"
     fsdp_requires_full_precision = True
@@ -70,14 +72,15 @@ class _SharedExpertProjection(NativeBlockFP8Linear):
         out_features: int,
         *,
         role: str,
+        rank: int,
         device: torch.device | str | None,
     ) -> None:
         super().__init__(in_features, out_features, device=device)
         if role not in {"gate", "up", "down"}:
             raise ValueError(f"Unsupported GLM-5.2 shared-expert projection role {role!r}")
         self.role = role
-        self.lora_A = nn.Parameter(torch.empty((1, in_features), dtype=torch.float32, device=device))
-        self.lora_B = nn.Parameter(torch.empty((out_features, 1), dtype=torch.float32, device=device))
+        self.lora_A = nn.Parameter(torch.empty((rank, in_features), dtype=torch.float32, device=device))
+        self.lora_B = nn.Parameter(torch.empty((out_features, rank), dtype=torch.float32, device=device))
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B)
 
@@ -269,10 +272,7 @@ class Glm52ExactTP16SharedExpertBlockFP8QLoRA(nn.Module):
             )
         if tp_size != GLM52_SHARED_EXPERT_TP_SIZE:
             raise ValueError(f"GLM-5.2 exact shared expert requires TP{GLM52_SHARED_EXPERT_TP_SIZE}, got TP{tp_size}")
-        if (r, lora_alpha) != (1, 1):
-            raise ValueError(
-                f"GLM-5.2 exact shared expert requires rank=1 and alpha=1; received rank={r}, alpha={lora_alpha}"
-            )
+        scaling = glm52_exact_lora_scaling(r, lora_alpha)
         if bias:
             raise ValueError("GLM-5.2 exact shared expert is bias-free")
         if enable_aqn:
@@ -286,11 +286,11 @@ class Glm52ExactTP16SharedExpertBlockFP8QLoRA(nn.Module):
         self.shard_size = GLM52_SHARED_EXPERT_SHARD_SIZE
         self.r = self.active_r = int(r)
         self.lora_alpha = self.active_lora_alpha = int(lora_alpha)
-        self.scaling = 1.0
+        self.scaling = scaling
         self.enable_aqn = False
-        self.gate_proj = _SharedExpertProjection(hidden_size, intermediate_size, role="gate", device=device)
-        self.up_proj = _SharedExpertProjection(hidden_size, intermediate_size, role="up", device=device)
-        self.down_proj = _SharedExpertProjection(intermediate_size, hidden_size, role="down", device=device)
+        self.gate_proj = _SharedExpertProjection(hidden_size, intermediate_size, role="gate", rank=r, device=device)
+        self.up_proj = _SharedExpertProjection(hidden_size, intermediate_size, role="up", rank=r, device=device)
+        self.down_proj = _SharedExpertProjection(intermediate_size, hidden_size, role="down", rank=r, device=device)
         self._checkpoint_source_prefix: str | None = None
 
     def bind_checkpoint_sources(self, shared_expert_fqn: str) -> None:
@@ -310,17 +310,15 @@ class Glm52ExactTP16SharedExpertBlockFP8QLoRA(nn.Module):
             projection._source_quant_format = "block_fp8"
             projection._is_prequantized = True
             projection._merge_sources = None
-            projection._qlora_expected_skip_keys = {"weight", "weight_scale_inv"}
+            # The official FP8 weight is a source-only checkpoint key. The
+            # scale is transformed inline into this live native parameter and
+            # must remain eligible for ordinary checkpoint dispatch.
+            projection._qlora_expected_skip_keys = {"weight"}
 
     def set_runtime_lora_config(self, lora_rank: int, lora_alpha: int) -> None:
-        if (lora_rank, lora_alpha) != (1, 1):
-            raise ValueError(
-                "GLM-5.2 exact shared-expert runtime admits only lora_rank=1 and lora_alpha=1; "
-                f"got rank={lora_rank}, alpha={lora_alpha}"
-            )
-        self.active_r = 1
-        self.active_lora_alpha = 1
-        self.scaling = 1.0
+        self.scaling = glm52_exact_lora_scaling(lora_rank, lora_alpha)
+        self.active_r = lora_rank
+        self.active_lora_alpha = lora_alpha
 
     def load_prequantized(
         self,
@@ -348,12 +346,12 @@ class Glm52ExactTP16SharedExpertBlockFP8QLoRA(nn.Module):
 
     def _validate_factor_state(self) -> None:
         expected = {
-            "gate_proj.lora_A": (self.gate_proj.lora_A, (1, self.hidden_size)),
-            "gate_proj.lora_B": (self.gate_proj.lora_B, (self.intermediate_size, 1)),
-            "up_proj.lora_A": (self.up_proj.lora_A, (1, self.hidden_size)),
-            "up_proj.lora_B": (self.up_proj.lora_B, (self.intermediate_size, 1)),
-            "down_proj.lora_A": (self.down_proj.lora_A, (1, self.intermediate_size)),
-            "down_proj.lora_B": (self.down_proj.lora_B, (self.hidden_size, 1)),
+            "gate_proj.lora_A": (self.gate_proj.lora_A, (self.r, self.hidden_size)),
+            "gate_proj.lora_B": (self.gate_proj.lora_B, (self.intermediate_size, self.r)),
+            "up_proj.lora_A": (self.up_proj.lora_A, (self.r, self.hidden_size)),
+            "up_proj.lora_B": (self.up_proj.lora_B, (self.intermediate_size, self.r)),
+            "down_proj.lora_A": (self.down_proj.lora_A, (self.r, self.intermediate_size)),
+            "down_proj.lora_B": (self.down_proj.lora_B, (self.hidden_size, self.r)),
         }
         for name, (factor, shape) in expected.items():
             if factor.dtype is not torch.float32 or tuple(factor.shape) != shape:
@@ -364,11 +362,9 @@ class Glm52ExactTP16SharedExpertBlockFP8QLoRA(nn.Module):
         if (
             self.tp_size != GLM52_SHARED_EXPERT_TP_SIZE
             or self.shard_size != GLM52_SHARED_EXPERT_SHARD_SIZE
-            or self.r != 1
-            or self.active_r != 1
-            or self.lora_alpha != 1
-            or self.active_lora_alpha != 1
-            or self.scaling != 1.0
+            or self.active_r != self.r
+            or self.active_lora_alpha != self.lora_alpha
+            or self.scaling != glm52_exact_lora_scaling(self.r, self.lora_alpha)
             or self.enable_aqn
         ):
             raise RuntimeError("GLM-5.2 exact TP16 shared-expert runtime contract was mutated")
@@ -504,7 +500,7 @@ class Glm52ExactTP16SharedExpertBlockFP8QLoRA(nn.Module):
 
         rows = input.numel() // self.hidden_size
         input_2d = input.view(rows, self.hidden_size)
-        batch_info = _single_adapter_batch_info(input.device.index, rows)
+        batch_info = _single_adapter_batch_info(input.device.index, rows, self.r, self.scaling)
         factors = self._physical_factor_views_from_effective(*effective_factors, contributor_ordinal)
         base = self._physical_base_views(contributor_ordinal)
 
@@ -522,9 +518,10 @@ class Glm52ExactTP16SharedExpertBlockFP8QLoRA(nn.Module):
             self.shard_size,
             base_output=gate_up_base,
         )
-        # Exact SGLang target mode resolves SiluAndMul.forward_native to this
-        # two-operation expression, including its BF16 intermediate stores.
-        activated = F.silu(gate_up[:, : self.shard_size]) * gate_up[:, self.shard_size :]
+        # Exact SGLang target mode resolves SiluAndMul.forward_exact to the
+        # one-round FP32 SwiGLU (xorl-sglang f10b907d8); this site must
+        # produce those bytes.
+        activated = exact_fp32_silu_and_mul(gate_up)
 
         down_base = _sglang_native_block_fp8_linear_value(
             activated,
@@ -604,7 +601,7 @@ class Glm52ExactTP16SharedExpertBlockFP8QLoRA(nn.Module):
             B = reference_B
             if B_output_range is not None:
                 B = B[B_output_range[0] : B_output_range[1]]
-            lora_output = F.linear(F.linear(reference_input, A), B)
+            lora_output = self.scaling * F.linear(F.linear(reference_input, A), B)
 
             requested = []
             labels = []
@@ -675,7 +672,9 @@ class Glm52ExactTP16SharedExpertBlockFP8QLoRA(nn.Module):
         if need_activation:
             with torch.enable_grad(), torch.autocast(device_type=input.device.type, enabled=False):
                 gate_up_input = exact_gate_up.detach().requires_grad_(True)
-                activation = F.silu(gate_up_input[:, : self.shard_size]) * gate_up_input[:, self.shard_size :]
+                # VJP reference differentiates the same one-round program the
+                # forward emits (backward stays trainer-owned numerics).
+                activation = exact_fp32_silu_and_mul(gate_up_input)
                 (gate_up_grad,) = torch.autograd.grad(
                     activation,
                     gate_up_input,

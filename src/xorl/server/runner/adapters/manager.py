@@ -19,6 +19,7 @@ import logging
 import math
 import os
 import time
+from collections.abc import Iterator, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -117,6 +118,102 @@ _OPTIMIZER_STATE_METADATA_KEY = "xorl_optimizer_state_v1"
 _OPTIMIZER_STATE_MAX_DEPTH = 64
 
 
+class LocalModelPartsView:
+    """Present disjoint local PP chunks through their original global FQNs.
+
+    Registering the chunks in an ``nn.ModuleList`` would prefix every key with
+    a local ordinal, making checkpoints depend on virtual-stage placement.
+    This view instead merges the pruned chunks' existing FQNs.  Decoder and
+    output parameters are disjoint by construction; replicated helper modules
+    may repeat and are yielded once.
+    """
+
+    def __init__(self, model_parts: Sequence[nn.Module]) -> None:
+        parts = tuple(model_parts)
+        if not parts:
+            raise ValueError("LocalModelPartsView requires at least one model part")
+        if any(not isinstance(part, nn.Module) for part in parts):
+            raise TypeError("Every local model part must be an nn.Module")
+        self.model_parts = parts
+        self.config = getattr(parts[0], "config", None)
+
+        spec_info: dict[str, Any] = {}
+        for part in parts:
+            for name, value in (getattr(part, "_fqn2spec_info", None) or {}).items():
+                spec_info.setdefault(name, value)
+        self._fqn2spec_info = spec_info or None
+
+    @staticmethod
+    def _prefixed(prefix: str, name: str) -> str:
+        return f"{prefix}.{name}" if prefix and name else prefix or name
+
+    def named_parameters(
+        self,
+        prefix: str = "",
+        recurse: bool = True,
+        remove_duplicate: bool = True,
+    ) -> Iterator[tuple[str, nn.Parameter]]:
+        seen_names: dict[str, nn.Parameter] = {}
+        seen_parameters: set[int] = set()
+        for part in self.model_parts:
+            for name, parameter in part.named_parameters(recurse=recurse, remove_duplicate=remove_duplicate):
+                previous = seen_names.get(name)
+                if previous is not None:
+                    if previous is not parameter and ("lora_A" in name or "lora_B" in name):
+                        raise RuntimeError(f"Local PP model parts overlap on trainable adapter parameter {name!r}")
+                    continue
+                if remove_duplicate and id(parameter) in seen_parameters:
+                    continue
+                seen_names[name] = parameter
+                seen_parameters.add(id(parameter))
+                yield self._prefixed(prefix, name), parameter
+
+    def parameters(self, recurse: bool = True) -> Iterator[nn.Parameter]:
+        for _name, parameter in self.named_parameters(recurse=recurse):
+            yield parameter
+
+    def named_modules(
+        self,
+        memo: set[Any] | None = None,
+        prefix: str = "",
+        remove_duplicate: bool = True,
+    ) -> Iterator[tuple[str, Any]]:
+        memo = set() if memo is None else memo
+        if not remove_duplicate or self not in memo:
+            memo.add(self)
+            yield prefix, self
+        seen_names: set[str] = set()
+        for part in self.model_parts:
+            for name, module in part.named_modules(remove_duplicate=remove_duplicate):
+                if not name or name in seen_names:
+                    continue
+                if remove_duplicate and module in memo:
+                    continue
+                seen_names.add(name)
+                memo.add(module)
+                yield self._prefixed(prefix, name), module
+
+    def modules(self) -> Iterator[Any]:
+        for _name, module in self.named_modules():
+            yield module
+
+    def children(self) -> Iterator[nn.Module]:
+        yield from self.model_parts
+
+    def get_parallel_plan(self):
+        for part in self.model_parts:
+            getter = getattr(part, "get_parallel_plan", None)
+            if callable(getter):
+                return getter()
+        raise AttributeError("Local model parts do not expose get_parallel_plan")
+
+
+def _parameter_layout_tensor(param: Any) -> Any:
+    """Return the tensor carrying a Parameter's static layout metadata."""
+
+    return param.data if isinstance(param, nn.Parameter) else param
+
+
 def _first_restore_contract_difference(checkpoint: Any, live: Any, path: str = "contract") -> Optional[str]:
     """Return the first named field difference in two JSON-shaped contracts."""
 
@@ -145,11 +242,246 @@ def _first_restore_contract_difference(checkpoint: Any, live: Any, path: str = "
     return None
 
 
+_DP_REPLICA_COMPLETED_DOMAIN = ["data_parallel_replica", "fsdp", "sum", "data_parallel_replica"]
+
+
+def _normalize_dp_replica_resize_restore_contract(contract: Any) -> Any:
+    """Erase only a coherent FSDP HSDP-replica-size difference.
+
+    Adapter optimizer tensors are addressed by logical coordinates. Adding or
+    removing an HSDP replicate dimension duplicates those same coordinates; it
+    does not change the Adam state assigned to them. The gradient contract does
+    change mechanically: FSDP adds a completed DP-replica sum and divides the
+    resulting numerator by that replica count. Normalize that exact, internally
+    consistent combination so topology-aware optimizer resharding can proceed.
+
+    All other ownership fields remain fail-closed and are compared verbatim.
+    """
+
+    if not isinstance(contract, dict) or not isinstance(contract.get("parameters"), list):
+        return contract
+    normalized = deepcopy(contract)
+    dp_fqns: list[str] = []
+    for parameter in normalized["parameters"]:
+        if not isinstance(parameter, dict):
+            return contract
+        fields = parameter.get("config_guard_fields")
+        completed = parameter.get("completed_domains")
+        if not isinstance(fields, dict) or not isinstance(completed, list):
+            return contract
+        raw_size = fields.pop("dp_replicate_size", 1)
+        if type(raw_size) is not int or raw_size < 1:
+            return contract
+        matches = [domain for domain in completed if domain == _DP_REPLICA_COMPLETED_DOMAIN]
+        if len(matches) > 1 or (raw_size == 1 and matches):
+            return contract
+        # The global HSDP size is recorded on owner-sharded expert factors too,
+        # even though those coordinates are not replicated across that axis.
+        # In that case there is intentionally no completed DP domain or change
+        # to the parameter's replica divisor.
+        if not matches:
+            continue
+        divisor = parameter.get("norm_replica_divisor")
+        if type(divisor) is not int or divisor < raw_size or divisor % raw_size:
+            return contract
+        parameter["completed_domains"] = [domain for domain in completed if domain != _DP_REPLICA_COMPLETED_DOMAIN]
+        parameter["norm_replica_divisor"] = divisor // raw_size
+        fqn = parameter.get("fqn")
+        if not isinstance(fqn, str):
+            return contract
+        dp_fqns.append(fqn)
+
+    masks = normalized.get("authority_masks")
+    if not isinstance(masks, list):
+        return contract
+    dp_masks = [
+        mask
+        for mask in masks
+        if isinstance(mask, dict) and mask.get("axis") == "data_parallel_replica" and mask.get("authority") == "fsdp"
+    ]
+    if dp_fqns:
+        if len(dp_masks) != 1 or dp_masks[0].get("fqns") != sorted(dp_fqns):
+            return contract
+        normalized["authority_masks"] = [mask for mask in masks if mask is not dp_masks[0]]
+    elif dp_masks:
+        return contract
+    return normalized
+
+
 def _optimizer_shard_rank_world() -> Tuple[int, int]:
     """Current (rank, world_size); uninitialized torch.distributed counts as single-rank."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return torch.distributed.get_rank(), torch.distributed.get_world_size()
     return 0, 1
+
+
+def _adapter_layout_world_identity(adapter_state: "AdapterState") -> Tuple[int, Tuple[int, ...]]:
+    """Return the stage-local layout world captured during registration."""
+
+    layout_world_size = int(getattr(adapter_state, "layout_world_size", 1))
+    layout_group_ranks = tuple(int(rank) for rank in getattr(adapter_state, "layout_group_ranks", (0,)))
+    if layout_world_size <= 0:
+        raise RuntimeError("Adapter layout world size must be positive")
+    if len(layout_group_ranks) != layout_world_size or len(set(layout_group_ranks)) != layout_world_size:
+        raise RuntimeError("Adapter layout group ranks must be unique and match the stage-local layout world size")
+    return layout_world_size, layout_group_ranks
+
+
+def _adapter_optimizer_stage_identity(
+    adapter_state: "AdapterState",
+) -> Tuple[int, List[str], int, Tuple[int, ...]]:
+    """Build a stable physical-stage identity from local FQNs and layout topology."""
+
+    parameter_fqns = sorted(
+        {canonical_parameter_name(layout.fqn) for layout in adapter_state.tensor_layouts.values()}
+        or {canonical_parameter_name(name) for name in adapter_state.local_params}
+    )
+    if not parameter_fqns:
+        raise RuntimeError("Adapter optimizer stage identity requires at least one local parameter")
+    layout_world_size, layout_group_ranks = _adapter_layout_world_identity(adapter_state)
+    pipeline_stage_ordinal = int(getattr(adapter_state, "pipeline_stage_ordinal", 0))
+    if pipeline_stage_ordinal < 0:
+        raise RuntimeError("Adapter pipeline stage ordinal must be non-negative")
+    return pipeline_stage_ordinal, parameter_fqns, layout_world_size, layout_group_ranks
+
+
+def _adapter_optimizer_stage_record(adapter_state: "AdapterState") -> Dict[str, Any]:
+    pipeline_stage_ordinal, parameter_fqns, layout_world_size, layout_group_ranks = _adapter_optimizer_stage_identity(
+        adapter_state
+    )
+    plan = adapter_state.gradient_ownership_plan
+    return {
+        "schema": "adapter-optimizer-stage-v1",
+        "pipeline_stage_ordinal": pipeline_stage_ordinal,
+        "layout_world_size": layout_world_size,
+        "layout_group_ranks": list(layout_group_ranks),
+        "parameter_fqns": parameter_fqns,
+        "optimizer_restore_contract": plan.optimizer_restore_contract() if plan is not None else None,
+    }
+
+
+def _deduplicate_adapter_optimizer_stage_records(records: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Collapse data-parallel replicas while rejecting ambiguous stage metadata."""
+
+    by_identity: Dict[Tuple[int, int, Tuple[int, ...], Tuple[str, ...]], Dict[str, Any]] = {}
+    for record in records:
+        identity = (
+            int(record["pipeline_stage_ordinal"]),
+            int(record["layout_world_size"]),
+            tuple(record["layout_group_ranks"]),
+            tuple(record["parameter_fqns"]),
+        )
+        previous = by_identity.setdefault(identity, record)
+        if previous != record:
+            raise RuntimeError(f"Adapter optimizer metadata differs within physical PP stage {identity[0]}")
+    return [by_identity[identity] for identity in sorted(by_identity)]
+
+
+def adapter_gradient_ownership_checkpoint_metadata(
+    adapter_state: "AdapterState",
+    *,
+    stage_records: Optional[Sequence[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Build backward-compatible ownership metadata with stage-local contracts."""
+
+    records = _deduplicate_adapter_optimizer_stage_records(
+        list(stage_records) if stage_records is not None else [_adapter_optimizer_stage_record(adapter_state)]
+    )
+    plan = adapter_state.gradient_ownership_plan
+    legacy_contract = records[0]["optimizer_restore_contract"] if len(records) == 1 else None
+    return {
+        "plan_fingerprint": plan.fingerprint if plan is not None else None,
+        "optimizer_restore_contract": legacy_contract,
+        "optimizer_restore_contracts_by_stage": records,
+    }
+
+
+def _select_adapter_optimizer_restore_contract(
+    ownership_metadata: Any,
+    adapter_state: "AdapterState",
+) -> Any:
+    """Select this physical stage's contract, falling back to legacy PP1 metadata."""
+
+    if not isinstance(ownership_metadata, dict):
+        return None
+    records = ownership_metadata.get("optimizer_restore_contracts_by_stage")
+    if records is None:
+        return ownership_metadata.get("optimizer_restore_contract")
+    if type(records) is not list or not records:
+        raise ValueError("Authoritative optimizer checkpoint has invalid stage-local restore contracts")
+
+    records_by_identity: Dict[Tuple[int, int, Tuple[int, ...], Tuple[str, ...]], Dict[str, Any]] = {}
+    for ordinal, record in enumerate(records):
+        if type(record) is not dict or record.get("schema") != "adapter-optimizer-stage-v1":
+            raise ValueError(f"Invalid optimizer restore stage record {ordinal}")
+        pipeline_stage_ordinal = record.get("pipeline_stage_ordinal")
+        parameter_fqns = record.get("parameter_fqns")
+        layout_world_size = record.get("layout_world_size")
+        layout_group_ranks = record.get("layout_group_ranks")
+        if (
+            type(pipeline_stage_ordinal) is not int
+            or pipeline_stage_ordinal < 0
+            or type(parameter_fqns) is not list
+            or not parameter_fqns
+            or any(type(name) is not str for name in parameter_fqns)
+            or parameter_fqns != sorted(set(parameter_fqns))
+            or type(layout_world_size) is not int
+            or layout_world_size <= 0
+            or type(layout_group_ranks) is not list
+            or len(layout_group_ranks) != layout_world_size
+            or any(type(rank) is not int for rank in layout_group_ranks)
+            or len(set(layout_group_ranks)) != layout_world_size
+        ):
+            raise ValueError(f"Invalid optimizer restore stage identity {ordinal}")
+        identity = (
+            pipeline_stage_ordinal,
+            layout_world_size,
+            tuple(layout_group_ranks),
+            tuple(parameter_fqns),
+        )
+        if identity in records_by_identity:
+            raise ValueError(f"Duplicate optimizer restore record for physical PP stage {pipeline_stage_ordinal}")
+        records_by_identity[identity] = record
+
+    live_stage_ordinal, live_fqns, live_world, live_ranks = _adapter_optimizer_stage_identity(adapter_state)
+    live_identity = (live_stage_ordinal, live_world, live_ranks, tuple(live_fqns))
+    try:
+        return records_by_identity[live_identity].get("optimizer_restore_contract")
+    except KeyError:
+        pass
+
+    # HSDP replica resizing changes the stage-local layout world even though it
+    # leaves the logical parameter coordinates unchanged.  Select such a
+    # record only when the physical PP stage and complete FQN set are unique and
+    # the checkpoint/live ownership contracts become exactly equal under the
+    # narrow DP-replica normalization above.  This keeps all other topology
+    # changes fail-closed while allowing 1xFSDP <-> HSDP replica cutovers.
+    live_contract = (
+        adapter_state.gradient_ownership_plan.optimizer_restore_contract()
+        if adapter_state.gradient_ownership_plan is not None
+        else None
+    )
+    compatible_records = []
+    for identity, record in records_by_identity.items():
+        stage_ordinal, _layout_world, _layout_ranks, parameter_fqns = identity
+        if stage_ordinal != live_stage_ordinal or parameter_fqns != tuple(live_fqns):
+            continue
+        checkpoint_contract = record.get("optimizer_restore_contract")
+        if (
+            _first_restore_contract_difference(
+                _normalize_dp_replica_resize_restore_contract(checkpoint_contract),
+                _normalize_dp_replica_resize_restore_contract(live_contract),
+            )
+            is None
+        ):
+            compatible_records.append(record)
+    if len(compatible_records) == 1:
+        return compatible_records[0].get("optimizer_restore_contract")
+    if len(compatible_records) > 1:
+        raise ValueError(
+            "Checkpoint has ambiguous optimizer restore contracts for this physical PP stage after DP-replica normalization"
+        )
+    raise ValueError("Checkpoint has no optimizer restore contract for this physical PP stage or layout topology")
 
 
 def _optimizer_shard_filename(rank: int) -> str:
@@ -342,6 +674,9 @@ def save_adapter_optimizer_shards(adapter_state: "AdapterState", path: str) -> D
     layout_descriptors = [
         adapter_state.tensor_layouts[name].to_json_dict() for name in sorted(adapter_state.tensor_layouts)
     ]
+    stage_record = _adapter_optimizer_stage_record(adapter_state)
+    layout_world_size = int(stage_record["layout_world_size"])
+    layout_group_ranks = list(stage_record["layout_group_ranks"])
     session_rank = int(adapter_state.session_spec["lora_config"]["lora_rank"])
     if world > 1:
         fingerprints: List[Optional[str]] = [None] * world
@@ -357,6 +692,12 @@ def save_adapter_optimizer_shards(adapter_state: "AdapterState", path: str) -> D
         ]
         optimizer_orders_by_rank: List[Optional[List[str]]] = [None] * world
         torch.distributed.all_gather_object(optimizer_orders_by_rank, local_optimizer_order)
+        layout_world_sizes: List[Optional[int]] = [None] * world
+        torch.distributed.all_gather_object(layout_world_sizes, layout_world_size)
+        layout_group_ranks_by_rank: List[Optional[List[int]]] = [None] * world
+        torch.distributed.all_gather_object(layout_group_ranks_by_rank, layout_group_ranks)
+        stage_records_by_rank: List[Optional[Dict[str, Any]]] = [None] * world
+        torch.distributed.all_gather_object(stage_records_by_rank, stage_record)
     else:
         fingerprints = [fingerprint]
         layout_fingerprints = [adapter_state.layout_fingerprint]
@@ -368,15 +709,24 @@ def save_adapter_optimizer_shards(adapter_state: "AdapterState", path: str) -> D
                 if adapter_state.local_params[name].numel() > 0
             ]
         ]
+        layout_world_sizes = [layout_world_size]
+        layout_group_ranks_by_rank = [layout_group_ranks]
+        stage_records_by_rank = [stage_record]
+    optimizer_restore_contracts_by_stage = _deduplicate_adapter_optimizer_stage_records(
+        [record for record in stage_records_by_rank if record is not None]
+    )
     manifest = {
         "format_version": 3,
         "world_size": world,
         "per_rank_param_structure_sha256": fingerprints,
         "per_rank_layout_fingerprint": layout_fingerprints,
         "per_rank_layout_descriptors": layout_descriptors_by_rank,
+        "per_rank_layout_world_size": layout_world_sizes,
+        "per_rank_layout_group_ranks": layout_group_ranks_by_rank,
         "session_rank": session_rank,
         "optimizer_parameter_order": optimizer_orders_by_rank[0],
         "per_rank_optimizer_parameter_order": optimizer_orders_by_rank,
+        "optimizer_restore_contracts_by_stage": optimizer_restore_contracts_by_stage,
     }
     if rank == 0:
         with open(os.path.join(path, OPTIMIZER_SHARD_MANIFEST_FILENAME), "w") as f:
@@ -434,9 +784,41 @@ def load_adapter_optimizer_shards(
                     f"Adapter optimizer checkpoint declares world_size={saved_world} but its topology manifest "
                     "is incomplete"
                 )
+            raw_layout_world_sizes = manifest.get("per_rank_layout_world_size")
+            if raw_layout_world_sizes is None:
+                # Legacy v3 checkpoints discovered layouts over WORLD.
+                layout_world_sizes = [saved_world] * saved_world
+            elif type(raw_layout_world_sizes) is not list or len(raw_layout_world_sizes) != saved_world:
+                raise RuntimeError(
+                    f"Adapter optimizer checkpoint declares world_size={saved_world} but its stage-local "
+                    "layout-world metadata is incomplete"
+                )
+            else:
+                layout_world_sizes = raw_layout_world_sizes
+            raw_layout_group_ranks = manifest.get("per_rank_layout_group_ranks")
+            if raw_layout_group_ranks is not None and (
+                type(raw_layout_group_ranks) is not list or len(raw_layout_group_ranks) != saved_world
+            ):
+                raise RuntimeError(
+                    f"Adapter optimizer checkpoint declares world_size={saved_world} but its stage-local "
+                    "layout-group metadata is incomplete"
+                )
             for source_rank in range(saved_world):
                 descriptors = descriptors_by_rank[source_rank]
                 parameter_order = orders_by_rank[source_rank]
+                layout_world_size = layout_world_sizes[source_rank]
+                if type(layout_world_size) is not int or layout_world_size <= 0:
+                    raise RuntimeError(f"Invalid stage-local layout world size for saved rank {source_rank}")
+                if raw_layout_group_ranks is not None:
+                    layout_group_ranks = raw_layout_group_ranks[source_rank]
+                    if (
+                        type(layout_group_ranks) is not list
+                        or len(layout_group_ranks) != layout_world_size
+                        or any(type(member) is not int for member in layout_group_ranks)
+                        or len(set(layout_group_ranks)) != layout_world_size
+                        or source_rank not in layout_group_ranks
+                    ):
+                        raise RuntimeError(f"Invalid stage-local layout group for saved rank {source_rank}")
                 if type(descriptors) is not list or type(parameter_order) is not list:
                     raise RuntimeError(f"Invalid optimizer topology metadata for saved rank {source_rank}")
                 descriptor_names_list = []
@@ -463,7 +845,7 @@ def load_adapter_optimizer_shards(
                         f"on saved rank {source_rank}"
                     )
                 if layout_fingerprints[source_rank] != _layout_descriptor_fingerprint(
-                    descriptors, world_size=saved_world
+                    descriptors, world_size=layout_world_size
                 ):
                     raise RuntimeError(f"Layout fingerprint does not match descriptors for saved rank {source_rank}")
                 if structure_fingerprints[source_rank] != _descriptor_structure_fingerprint(
@@ -596,6 +978,9 @@ class AdapterState:
     tensor_layouts: Dict[str, AdapterTensorLayout]
     layout_fingerprint: str
     optimizer: torch.optim.Optimizer  # Per-adapter optimizer
+    layout_world_size: int = 1
+    layout_group_ranks: Tuple[int, ...] = (0,)
+    pipeline_stage_ordinal: int = 0
     registration_ordinal: int = 0
     gradient_ownership_plan: Optional[AdapterGradientOwnershipPlan] = None
     gradient_scratch: AdapterGradientScratch = field(default_factory=AdapterGradientScratch)
@@ -635,7 +1020,7 @@ class LoRAAdapterManager:
 
     def __init__(
         self,
-        model: nn.Module,
+        model: nn.Module | Sequence[nn.Module],
         device: torch.device,
         max_adapters: int = 10,
         checkpoint_dir: Optional[str] = None,
@@ -655,7 +1040,7 @@ class LoRAAdapterManager:
         Initialize the adapter manager.
 
         Args:
-            model: The model with LoRA layers injected
+            model: One model or all disjoint local PP model parts with LoRA layers injected
             device: Device to create adapter parameters on
             max_adapters: Maximum number of adapters to keep in memory (LRU eviction)
             checkpoint_dir: Directory for saving adapter checkpoints (default: outputs/adapters)
@@ -671,7 +1056,17 @@ class LoRAAdapterManager:
             optimizer_fused: Whether to request fused optimizer kernels
             gradient_ownership_bucket_bytes: Maximum residual-transport bucket bytes
         """
-        self.model = model
+        if isinstance(model, nn.Module):
+            self.model_parts = (model,)
+        else:
+            self.model_parts = tuple(model)
+            if not self.model_parts:
+                raise ValueError("LoRAAdapterManager requires at least one local model part")
+            if any(not isinstance(part, nn.Module) for part in self.model_parts):
+                raise TypeError("Every LoRAAdapterManager model part must be an nn.Module")
+        # Preserve the exact PP1/one-part object identity. Virtual PP receives
+        # an FQN-preserving view over every local chunk.
+        self.model = self.model_parts[0] if len(self.model_parts) == 1 else LocalModelPartsView(self.model_parts)
         self.device = device
         self.max_adapters = max_adapters
         self.checkpoint_dir = checkpoint_dir or "outputs/adapters"
@@ -699,43 +1094,64 @@ class LoRAAdapterManager:
             ],
         ] = {}
         self._model_param_ids: Dict[str, int] = {}
+        self._model_param_fsdp_managed: Dict[str, bool] = {}
         self._adapter_registration_ordinals: Dict[str, int] = {}
         exact_lm_head_a_ids = {
             id(module.lora_A)
             for module in self.model.modules()
-            if getattr(module, "_glm52_exact_tp16_lm_head", False) and getattr(module, "lora_A", None) is not None
+            if (
+                getattr(module, "_glm52_exact_tp16_lm_head", False) or getattr(module, "_dsv4_exact_tp8_lm_head", False)
+            )
+            and getattr(module, "lora_A", None) is not None
         }
         self._exact_lm_head_replicated_param_names: set[str] = set()
 
         # Cache the list of LoRA parameter names for efficient lookups
         self._lora_param_names: List[str] = []
         self._lora_param_metadata: Dict[str, Dict[str, Any]] = {}
+        named_modules = dict(self.model.named_modules())
         for name, param in self.model.named_parameters():
             if "lora_A" in name or "lora_B" in name:
                 self._lora_param_names.append(name)
-                param_shape = tuple(param.shape if _HAS_DTENSOR and isinstance(param, DTensor) else param.data.shape)
+                layout_tensor = _parameter_layout_tensor(param)
+                param_shape = tuple(layout_tensor.shape)
                 self._model_param_ids[name] = id(param)
+                owner_parts = name.rsplit(".", 1)[0].split(".")
+                owner_paths = [".".join(owner_parts[:index]) for index in range(len(owner_parts), -1, -1)]
+                self._model_param_fsdp_managed[name] = any(
+                    callable(getattr(named_modules.get(path), "unshard", None))
+                    and callable(getattr(named_modules.get(path), "reshard", None))
+                    for path in owner_paths
+                )
                 if id(param) in exact_lm_head_a_ids:
                     self._exact_lm_head_replicated_param_names.add(name)
                 self._lora_param_metadata[name] = {
                     "shape": param_shape,
-                    "dtype": param.dtype if _HAS_DTENSOR and isinstance(param, DTensor) else param.data.dtype,
+                    "dtype": layout_tensor.dtype,
                     "rank_dim": self._infer_lora_rank_dim(name, param_shape),
                 }
         self._pipeline_parallel_size = int(
             self.lora_config.get("pipeline_parallel_size", self.lora_config.get("pp_size", 1))
         )
+        self._pipeline_stage_ordinal = 0
+        self._adapter_process_group = None
         try:
             from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
 
-            self._pipeline_parallel_size = max(self._pipeline_parallel_size, int(get_parallel_state().pp_size))
+            parallel_state = get_parallel_state()
         except Exception:
-            pass
-        if self._pipeline_parallel_size > 1 and self._lora_param_names:
-            raise RuntimeError(
-                "Multi-adapter LoRA state requires a single pipeline stage; "
-                "pipeline parallelism has no known optimizer ownership group."
-            )
+            parallel_state = None
+        if parallel_state is not None:
+            self._pipeline_parallel_size = max(self._pipeline_parallel_size, int(parallel_state.pp_size))
+            if self._pipeline_parallel_size > 1:
+                self._pipeline_stage_ordinal = int(parallel_state.pp_rank)
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            if self._pipeline_parallel_size > 1:
+                if parallel_state is None or parallel_state.loss_group is None:
+                    raise RuntimeError("Pipeline adapter ownership requires the live stage-local loss group")
+                self._adapter_process_group = parallel_state.loss_group
+            else:
+                self._adapter_process_group = torch.distributed.group.WORLD
 
         logger.info(
             f"LoRAAdapterManager initialized with {len(self._lora_param_names)} LoRA parameters, "
@@ -757,6 +1173,22 @@ class LoRAAdapterManager:
             if len(shape) == 3:
                 return 1
         raise ValueError(f"Cannot infer LoRA rank dimension for parameter {name!r} with shape {shape!r}")
+
+    def _current_layout_world_identity(self) -> Tuple[int, Tuple[int, ...]]:
+        """Return the process-group identity used by layout discovery."""
+
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            return 1, (0,)
+        group = self._adapter_process_group
+        layout_world_size = int(torch.distributed.get_world_size(group=group))
+        layout_group_ranks = (
+            tuple(int(rank) for rank in torch.distributed.get_process_group_ranks(group))
+            if group is not None
+            else tuple(range(torch.distributed.get_world_size()))
+        )
+        if len(layout_group_ranks) != layout_world_size:
+            raise RuntimeError("Adapter layout process-group membership does not match its world size")
+        return layout_world_size, layout_group_ranks
 
     @staticmethod
     def _session_rank(session_spec: Dict[str, Any]) -> int:
@@ -833,7 +1265,9 @@ class LoRAAdapterManager:
                 "load weights-only (load_optimizer=False) and re-save it"
             )
         live_contract = live_plan.optimizer_restore_contract()
-        difference = _first_restore_contract_difference(checkpoint_contract, live_contract)
+        normalized_checkpoint = _normalize_dp_replica_resize_restore_contract(checkpoint_contract)
+        normalized_live = _normalize_dp_replica_resize_restore_contract(live_contract)
+        difference = _first_restore_contract_difference(normalized_checkpoint, normalized_live)
         if difference is not None:
             raise ValueError(f"Checkpoint adapter-gradient topology/producer contract is incompatible: {difference}")
 
@@ -895,6 +1329,11 @@ class LoRAAdapterManager:
 
             local_group_memberships = {}
             sp_group = parallel_state.sp_grad_sync_group
+            dp_replicate_group = (
+                parallel_state.dp_replicate_group
+                if bool(getattr(parallel_state, "dp_replicate_enabled", False))
+                else None
+            )
             output_group = getattr(parallel_state, "lm_head_tp_replica_group", None)
             output_tp_group = getattr(parallel_state, "lm_head_tp_group", None)
             ep_group = (
@@ -904,6 +1343,8 @@ class LoRAAdapterManager:
             )
             if sp_group is not None:
                 local_group_memberships["sequence_parallel"] = _public_group_members(sp_group)
+            if dp_replicate_group is not None:
+                local_group_memberships["data_parallel_replica"] = _public_group_members(dp_replicate_group)
             if output_group is not None:
                 local_group_memberships["output_projection_replica"] = _public_group_members(output_group)
             if output_tp_group is not None:
@@ -914,7 +1355,7 @@ class LoRAAdapterManager:
             self.model,
             self._lora_param_metadata,
             active_rank=session_rank,
-            pipeline_parallel_size=self._pipeline_parallel_size,
+            process_group=self._adapter_process_group,
             local_group_memberships=local_group_memberships,
         )
         self._layout_cache[session_rank] = layouts, fingerprint, group_memberships
@@ -939,7 +1380,9 @@ class LoRAAdapterManager:
 
         if not torch.distributed.is_available() or not torch.distributed.is_initialized():
             return
-        group = torch.distributed.group.WORLD
+        group = self._adapter_process_group
+        if group is None:
+            return
         if torch.distributed.get_world_size(group=group) <= 1:
             return
         fingerprint = torch.tensor(
@@ -955,17 +1398,50 @@ class LoRAAdapterManager:
             raise AdapterGradientOwnershipError("Adapter gradient ownership plan differs across ranks")
 
     def _validate_model_layout_identity(self, state: AdapterState) -> None:
-        """Fail closed if FSDP/EP replaced or moved a parameter after discovery."""
+        """Fail closed if FSDP/EP replaced or moved a parameter after discovery.
+
+        FSDP2 may replace a DTensor ``Parameter`` object during a legal lazy
+        unshard/reshard transition.  Object identity is therefore authoritative
+        for ordinary parameters, while DTensor replacements must preserve the
+        complete static layout contract discovered at registration time.
+        """
 
         current = {name: param for name, param in self.model.named_parameters() if name in self._model_param_ids}
         if set(current) != set(self._model_param_ids):
             raise RuntimeError("Trainable LoRA parameter set changed after adapter layout discovery")
         for name, expected_id in self._model_param_ids.items():
             param = current[name]
-            if id(param) != expected_id:
-                raise RuntimeError(f"LoRA parameter identity changed after layout discovery: {name}")
+            raw = _parameter_layout_tensor(param)
             layout = state.tensor_layouts[name]
-            raw = param.data if isinstance(param, nn.Parameter) else param
+            layout_was_dtensor = bool(layout.placement_signature and layout.placement_signature[0] == "dtensor")
+            if id(param) != expected_id:
+                if not layout_was_dtensor:
+                    raise RuntimeError(f"LoRA parameter identity changed after layout discovery: {name}")
+            if raw.dtype != layout.dtype:
+                legal_compute_view = (
+                    layout_was_dtensor
+                    and self._model_param_fsdp_managed.get(name, False)
+                    and layout.dtype is torch.float32
+                    and raw.dtype is torch.bfloat16
+                )
+                master = state.local_params.get(name)
+                if not legal_compute_view or master is None or master.dtype is not layout.dtype:
+                    raise RuntimeError(
+                        f"LoRA parameter dtype changed after layout discovery for {name}: "
+                        f"compute={raw.dtype}, layout={layout.dtype}, "
+                        f"master={None if master is None else master.dtype}"
+                    )
+            if _HAS_DTENSOR and isinstance(raw, DTensor):
+                mesh_names = tuple(getattr(raw.device_mesh, "mesh_dim_names", ()) or ())
+                placements = tuple(
+                    type(placement).__name__ + ":" + str(getattr(placement, "dim", "")) for placement in raw.placements
+                )
+                placement_signature = ("dtensor", mesh_names, placements, layout.is_ep_owned)
+                if placement_signature != layout.placement_signature:
+                    raise RuntimeError(
+                        f"LoRA parameter placement changed after layout discovery for {name}: "
+                        f"{placement_signature!r} != {layout.placement_signature!r}"
+                    )
             local = wait_for_local_tensor(raw.to_local() if _HAS_DTENSOR and isinstance(raw, DTensor) else raw)
             if tuple(local.shape) != layout.local_substrate_shape:
                 raise RuntimeError(
@@ -982,9 +1458,13 @@ class LoRAAdapterManager:
             raise RuntimeError("Exact GLM-5.2 adapter coherence requires initialized torch.distributed")
         from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
 
-        group = get_parallel_state().lm_head_tp_group
-        if group is None or torch.distributed.get_world_size(group) != 16:
-            raise RuntimeError("Exact GLM-5.2 adapter coherence requires the WORLD16 lm-head TP group")
+        parallel_state = get_parallel_state()
+        group = parallel_state.lm_head_tp_group
+        exact_dsv4 = bool(getattr(getattr(self.model, "config", None), "_dsv4_flash_exact_mode", False))
+        expected_world = 8 if exact_dsv4 else 16
+        model_label = "DSV4-Flash" if exact_dsv4 else "GLM-5.2"
+        if group is None or torch.distributed.get_world_size(group) != expected_world:
+            raise RuntimeError(f"Exact {model_label} adapter coherence requires an lm-head TP{expected_world} group")
 
         def _assert_equal(label: str, value: torch.Tensor) -> None:
             # AdamW stores ``step`` as a scalar tensor.  Flatten before the
@@ -1001,7 +1481,9 @@ class LoRAAdapterManager:
             torch.distributed.all_reduce(minimum, op=torch.distributed.ReduceOp.MIN, group=group)
             torch.distributed.all_reduce(maximum, op=torch.distributed.ReduceOp.MAX, group=group)
             if not torch.equal(minimum, maximum):
-                raise RuntimeError(f"Exact GLM-5.2 replicated adapter state diverged across TP16: {label}")
+                raise RuntimeError(
+                    f"Exact {model_label} replicated adapter state diverged across TP{expected_world}: {label}"
+                )
 
         for name in sorted(self._exact_lm_head_replicated_param_names):
             parameter = state.local_params[name]
@@ -1370,6 +1852,59 @@ class LoRAAdapterManager:
                     return int(source[key])
         return 0
 
+    def _lora_b_initialization_std(self, session_spec: Dict[str, Any]) -> float:
+        """Resolve the fresh-slot LoRA-B initialization contract."""
+
+        session_lora = session_spec.get("lora_config", {})
+        std = float(session_lora.get("lora_b_init_std", self.lora_config.get("lora_b_init_std", 0.0)))
+        if std < 0.0:
+            raise ValueError(f"lora_b_init_std must be nonnegative, got {std}")
+        return std
+
+    def _validate_exact_glm_session_contract(self, session_spec: Dict[str, Any]) -> None:
+        """Reject runtime rank/alpha changes unsupported by exact GLM components."""
+
+        construction_contracts: set[tuple[int, int]] = set()
+        component_names: list[str] = []
+        for module in self.model.modules():
+            if not (
+                getattr(module, "_glm52_exact_active_lora_component", False)
+                or getattr(module, "_glm52_exact_tp16_lm_head", False)
+            ):
+                continue
+            rank = getattr(module, "r", getattr(module, "max_lora_rank", None))
+            alpha = getattr(module, "lora_alpha", None)
+            if rank is None or alpha is None:
+                # Logical child projections carry the exact marker for
+                # publication/gradient policy, while their owning composite
+                # carries the immutable adapter shape and runtime setter.
+                if callable(getattr(module, "set_runtime_lora_config", None)):
+                    raise RuntimeError(
+                        "Exact GLM-5.2 active-LoRA runtime component does not expose its immutable "
+                        f"construction rank/alpha: {type(module).__qualname__}"
+                    )
+                continue
+            construction_contracts.add((int(rank), int(alpha)))
+            component_names.append(type(module).__qualname__)
+
+        if not construction_contracts:
+            return
+        if len(construction_contracts) != 1:
+            raise RuntimeError(
+                "Exact GLM-5.2 active-LoRA components disagree on construction rank/alpha: "
+                f"{sorted(construction_contracts)!r} across {sorted(set(component_names))!r}"
+            )
+
+        construction_rank, construction_alpha = next(iter(construction_contracts))
+        requested = (self._session_rank(session_spec), self._session_alpha(session_spec))
+        if requested != (construction_rank, construction_alpha):
+            raise ValueError(
+                "Exact GLM-5.2 active-LoRA sessions cannot mutate construction-time rank/alpha: "
+                f"requested rank={requested[0]}, alpha={requested[1]}; "
+                f"model rank={construction_rank}, alpha={construction_alpha}. "
+                "Restart with a model substrate built for the requested session contract."
+            )
+
     def _validate_session_rank_against_model_capacity(self, session_spec: Dict[str, Any]) -> None:
         """Reject session specs whose runtime rank exceeds the live model capacity."""
         session_rank = self._session_rank(session_spec)
@@ -1425,6 +1960,12 @@ class LoRAAdapterManager:
         checkpoint_target_modules = adapter_config.get("target_modules")
         if checkpoint_target_modules is not None:
             actual_target_modules = sorted(str(module) for module in checkpoint_target_modules)
+            if adapter_config.get("_sglang_lora_format") == "dsv4_expert_banks":
+                # SGLang disambiguates the physical query-B target with its
+                # parent path; XoRL's logical runtime inventory names it wq_b.
+                actual_target_modules = sorted(
+                    "wq_b" if module == "self_attn.wq_b" else module for module in actual_target_modules
+                )
             expected_target_modules = self._expected_target_modules()
             if actual_target_modules != expected_target_modules:
                 raise ValueError(
@@ -1672,6 +2213,7 @@ class LoRAAdapterManager:
             if effective_lr is not None:
                 session_spec["optimizer_config"]["learning_rate"] = effective_lr
 
+        self._validate_exact_glm_session_contract(session_spec)
         self._validate_session_rank_against_model_capacity(session_spec)
         session_rank = self._session_rank(session_spec)
         session_alpha = self._session_alpha(session_spec)
@@ -1698,15 +2240,28 @@ class LoRAAdapterManager:
         named_params = dict(self.model.named_parameters())
         local_params: Dict[str, nn.Parameter] = {}
         base_seed = self._base_initialization_seed(session_spec)
+        lora_b_init_std = self._lora_b_initialization_std(session_spec)
+        session_lora = session_spec.get("lora_config", {})
+        lora_b_init_seed = int(
+            session_lora.get(
+                "lora_b_init_seed",
+                self.lora_config.get("lora_b_init_seed", base_seed),
+            )
+        )
         for name in self._lora_param_names:
             model_param = named_params[name]
             layout = layouts[name]
-            if initialize_fresh:
+            preserve_initialized_lora_b = (
+                initialize_fresh and model_id == "default" and self._is_lora_b(name) and lora_b_init_std > 0.0
+            )
+            if initialize_fresh and not preserve_initialized_lora_b:
+                is_lora_b = self._is_lora_b(name)
                 new_tensor = deterministic_local_initialization(
                     layout,
-                    base_seed=base_seed,
+                    base_seed=lora_b_init_seed if is_lora_b else base_seed,
                     session_identity=model_id,
-                    is_lora_b=self._is_lora_b(name),
+                    is_lora_b=is_lora_b,
+                    lora_b_std=lora_b_init_std,
                 ).to(device=self.device, dtype=layout.dtype)
             else:
                 raw_model_param = model_param.data if isinstance(model_param, nn.Parameter) else model_param
@@ -1717,12 +2272,21 @@ class LoRAAdapterManager:
                 )
                 local_model_tensor = wait_for_local_tensor(local_model_tensor)
                 new_tensor = layout.pack_from_local(local_model_tensor).to(device=self.device, dtype=layout.dtype)
+                if preserve_initialized_lora_b and new_tensor.numel() and torch.count_nonzero(new_tensor).item() == 0:
+                    new_tensor = deterministic_local_initialization(
+                        layout,
+                        base_seed=lora_b_init_seed,
+                        session_identity=model_id,
+                        is_lora_b=True,
+                        lora_b_std=lora_b_init_std,
+                    ).to(device=self.device, dtype=layout.dtype)
             local_params[name] = nn.Parameter(new_tensor, requires_grad=True)
 
         # Build optimizer for this adapter using the session's optimizer contract.
         optimizer = self._build_adapter_optimizer_for_session(local_params, session_spec)
         registration_ordinal = self._adapter_registration_ordinals.get(model_id, 0) + 1
         self._adapter_registration_ordinals[model_id] = registration_ordinal
+        layout_world_size, layout_group_ranks = self._current_layout_world_identity()
 
         self.adapters[model_id] = AdapterState(
             model_id=model_id,
@@ -1731,6 +2295,9 @@ class LoRAAdapterManager:
             tensor_layouts=layouts,
             layout_fingerprint=layout_fp,
             optimizer=optimizer,
+            layout_world_size=layout_world_size,
+            layout_group_ranks=layout_group_ranks,
+            pipeline_stage_ordinal=self._pipeline_stage_ordinal,
             registration_ordinal=registration_ordinal,
             global_step=0,
             global_forward_backward_step=0,
@@ -2547,14 +3114,42 @@ class LoRAAdapterManager:
             raise KeyError(f"No adapter layout for {fqn!r}") from None
 
     def materialize_logical_state_dict(self, model_id: str, *, destination_rank: int = 0) -> Dict[str, torch.Tensor]:
-        """Collectively reconstruct full active logical weights for cold paths."""
+        """Collectively reconstruct every PP stage's active logical weights."""
 
         self.prepare_forward(model_id)
         from xorl.lora.utils import get_lora_state_dict  # noqa: PLC0415
 
-        state_dict = get_lora_state_dict(self.model)
-        rank, _world = _optimizer_shard_rank_world()
-        return state_dict if rank == destination_rank else {}
+        local_stage_state = get_lora_state_dict(self.model)
+        rank, world = _optimizer_shard_rank_world()
+        if world == 1 or self._pipeline_parallel_size <= 1:
+            return local_stage_state if rank == destination_rank else {}
+
+        stage_group = self._adapter_process_group
+        if stage_group is None:
+            raise RuntimeError("Pipeline adapter publication requires the live stage-local owner group")
+        stage_ranks = tuple(int(member) for member in torch.distributed.get_process_group_ranks(stage_group))
+        if not stage_ranks or rank not in stage_ranks:
+            raise RuntimeError("Current rank is absent from its pipeline-stage adapter owner group")
+        stage_payload = local_stage_state if rank == stage_ranks[0] else None
+        gathered = [None] * world if rank == destination_rank else None
+        torch.distributed.gather_object(
+            stage_payload,
+            object_gather_list=gathered,
+            dst=destination_rank,
+        )
+        if rank != destination_rank:
+            return {}
+
+        merged: Dict[str, torch.Tensor] = {}
+        assert gathered is not None
+        for payload in gathered:
+            if payload is None:
+                continue
+            for name, tensor in payload.items():
+                if name in merged:
+                    raise RuntimeError(f"Pipeline adapter publication produced duplicate parameter {name!r}")
+                merged[name] = tensor
+        return merged
 
     def load_logical_state_dict(self, model_id: str, state_dict: Dict[str, torch.Tensor]) -> None:
         """Pack full active logical tensors into this rank's local adapter slots."""
@@ -2577,7 +3172,7 @@ class LoRAAdapterManager:
         converted = convert_peft_lora_state_dict(state_dict, expected_shapes=expected_shapes)
         converted_by_name = {canonical_parameter_name(name): tensor for name, tensor in converted.items()}
         missing = sorted(set(expected_names) - set(converted_by_name))
-        unexpected = sorted(set(converted_by_name) - set(expected_names))
+        unexpected = [] if self._pipeline_parallel_size > 1 else sorted(set(converted_by_name) - set(expected_names))
         if missing or unexpected:
             raise ValueError(
                 "Logical adapter parameter set does not match the live adapter structure. "
@@ -2717,16 +3312,7 @@ class LoRAAdapterManager:
             "optimizer": deepcopy(checkpoint_session_spec["optimizer_config"]),
             "optimizer_state": self._optimizer_state_metadata(state.optimizer),
             "layout_fingerprint": state.layout_fingerprint,
-            "gradient_ownership": {
-                "plan_fingerprint": (
-                    state.gradient_ownership_plan.fingerprint if state.gradient_ownership_plan is not None else None
-                ),
-                "optimizer_restore_contract": (
-                    state.gradient_ownership_plan.optimizer_restore_contract()
-                    if state.gradient_ownership_plan is not None
-                    else None
-                ),
-            },
+            "gradient_ownership": adapter_gradient_ownership_checkpoint_metadata(state),
             "layout_descriptors": [state.tensor_layouts[name].to_json_dict() for name in sorted(state.tensor_layouts)],
         }
         metadata_path = os.path.join(path, "metadata.json")
@@ -2833,11 +3419,8 @@ class LoRAAdapterManager:
             raise RuntimeError(
                 "A poisoned adapter session cannot be recovered in-process; restart from the last committed checkpoint"
             )
-        checkpoint_plan_fingerprint = metadata.get("gradient_ownership", {}).get("plan_fingerprint")
-        checkpoint_restore_contract = metadata.get("gradient_ownership", {}).get("optimizer_restore_contract")
-        live_plan = registered_state.gradient_ownership_plan if registered_state is not None else None
-        if load_optimizer and live_plan is not None:
-            self._validate_ownership_restore_contract(checkpoint_restore_contract, live_plan)
+        checkpoint_ownership_metadata = metadata.get("gradient_ownership", {})
+        checkpoint_plan_fingerprint = checkpoint_ownership_metadata.get("plan_fingerprint")
         expected_session_spec = deepcopy(registered_state.session_spec) if registered_state is not None else None
         if expected_session_spec is None:
             expected_session_spec = self._legacy_session_spec(lr=effective_lr)
@@ -2882,6 +3465,24 @@ class LoRAAdapterManager:
             }
 
         try:
+            if load_optimizer:
+                contract_error: Optional[BaseException] = None
+                try:
+                    live_plan = state.gradient_ownership_plan
+                    # Direct manager loads historically register before the
+                    # public runner compiles the live execution contract. Keep
+                    # that path unchanged; authoritative coordinator restores
+                    # pre-register and compile every stage before loading.
+                    if live_plan is not None and not registered_here:
+                        checkpoint_restore_contract = _select_adapter_optimizer_restore_contract(
+                            checkpoint_ownership_metadata,
+                            state,
+                        )
+                        self._validate_ownership_restore_contract(checkpoint_restore_contract, live_plan)
+                except Exception as exc:
+                    contract_error = exc
+                _optimizer_restore_rank_errors(contract_error, phase="ownership contract preflight")
+
             # 3. Validate and pack logical LoRA weights without mutating the
             # resident adapter. The model-local adapter slots are never saved
             # as if they were complete PEFT tensors in distributed mode.

@@ -183,3 +183,36 @@ class TestPackingConcatCollator:
             batch["hidden_match_weights"],
             torch.tensor([[0.25, 0.5, 0.75, 0.0]]),
         )
+
+    @patch("xorl.data.collators.packing_concat_collator.get_parallel_state")
+    def test_logprob_temperatures_concatenate_with_identity_padding(self, mock_parallel_state):
+        mock_parallel_state.return_value = Mock(cp_enabled=False)
+        collator = PackingConcatCollator(pad_to_multiple_of=4)
+        batch = collator(
+            [
+                {
+                    "input_ids": torch.tensor([1, 2]),
+                    "position_ids": torch.tensor([0, 1]),
+                    "logprob_temperatures": torch.tensor([0.7, 0.7]),
+                    "logprob_top_ks": torch.tensor([8, 8]),
+                    "logprob_top_ps": torch.tensor([0.9, 0.9]),
+                    "logprob_min_ps": torch.tensor([0.1, 0.1]),
+                },
+                {
+                    "input_ids": torch.tensor([3]),
+                    "position_ids": torch.tensor([0]),
+                    "logprob_temperatures": torch.tensor([1.3]),
+                    "logprob_top_ks": torch.tensor([4]),
+                    "logprob_top_ps": torch.tensor([0.8]),
+                    "logprob_min_ps": torch.tensor([0.2]),
+                },
+            ]
+        )
+
+        torch.testing.assert_close(
+            batch["logprob_temperatures"],
+            torch.tensor([[0.7, 0.7, 1.3, 1.0]]),
+        )
+        assert torch.equal(batch["logprob_top_ks"], torch.tensor([[8, 8, 4, 1 << 30]]))
+        torch.testing.assert_close(batch["logprob_top_ps"], torch.tensor([[0.9, 0.9, 0.8, 1.0]]))
+        torch.testing.assert_close(batch["logprob_min_ps"], torch.tensor([[0.1, 0.1, 0.2, 0.0]]))

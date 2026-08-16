@@ -8,6 +8,8 @@ Server config is a **flat YAML** — all fields at the top level with no nesting
 python -m xorl.server.launcher --mode auto --config config.yaml
 ```
 
+This page is a curated reference for commonly used fields and important interactions, not a generated inventory of every `ServerArguments` member. `python -m xorl.server.launcher --help` documents launcher-level options; the exact flat config field set and field help live in `src/xorl/server/server_arguments.py`. To print the current field names, run `python -c "from dataclasses import fields; from xorl.server.server_arguments import ServerArguments; print(chr(10).join(f.name for f in fields(ServerArguments)))"`. A stored `null` may resolve to a model-specific effective value during startup.
+
 Any field can be overridden on the command line with `--server.key value` or `--server.key=value`:
 
 ```bash
@@ -28,9 +30,9 @@ python -m xorl.server.launcher --mode auto --config config.yaml \
 | `model_name` | same as `model_path` | Model identifier for validation. |
 | `config_path` | same as `model_path` | Path to model config. |
 | `tokenizer_path` | same as `config_path` | Path to tokenizer. |
-| `attn_implementation` | `flash_attention_4` | Attention backend: `eager`, `sdpa`, `native` (PyTorch SDPA+cuDNN, no deps, Hopper+Blackwell), `flash_attention_3` (FA3, Hopper), `flash_attention_4` (FA4 CUTE, Hopper+Blackwell). |
+| `attn_implementation` | `null` (resolved) | Attention backend: `eager`, `sdpa`, `native` (PyTorch SDPA+cuDNN, no deps, Hopper+Blackwell), `flash_attention_3` (FA3, Hopper), or `flash_attention_4` (FA4 CUTE, Hopper+Blackwell). The server resolves an omitted value to FA4. |
 | `moe_implementation` | `null` | MoE kernel: `null` (auto), `eager`, `triton`, `native`, `quack`. |
-| `ep_dispatch` | `alltoall` | Expert-parallel dispatch: `alltoall` or `deepep` (NVLink-optimized). |
+| `ep_dispatch` | `alltoall` | Expert-parallel dispatch: `alltoall` or `deepep` (GPU-resident dispatch using intra-node fabric and, when configured, NVSHMEM/RDMA across nodes). |
 | `deepep_buffer_size_gb` | `2.0` | DeepEP NVLink buffer size per GPU in GB. Only active when `ep_dispatch: deepep`. |
 | `deepep_num_sms` | `20` | SMs assigned to DeepEP communication kernels. Must be even. |
 | `deepep_async_combine` | `false` | Overlap DeepEP combine with the next layer's compute (experimental, unsafe). Forced to `false` in code unless `XORL_DEEPEP_UNSAFE_ASYNC_COMBINE=1` is exported; without that env var, deferring the comm-stream sync races the transformer block's read of the combined tensor on the default stream. |
@@ -42,16 +44,20 @@ python -m xorl.server.launcher --mode auto --config config.yaml \
 
 ### Numerical alignment flags
 
-These flags align the training model's numerics with the inference engine (SGLang) to avoid train/inference mismatch.
+These stored defaults are resolved after the model architecture is known. Ordinary models use the values noted below; exact dense Qwen3, Qwen3.5-family, GLM-5.2, and DSV4-Flash programs select and validate architecture-owned numerical paths. These settings are prerequisites for parity, not a K3 certificate by themselves.
 
 | Field | Default | Description |
 |---|---|---|
-| `router_fp32` | `true` | Upcast MoE router gate logits to float32 for numerical stability. |
-| `lm_head_fp32` | `true` | Upcast LM head logits to float32. |
-| `rmsnorm_mode` | `native` | RMSNorm implementation: `eager`, `native`, or `compile`. |
-| `activation_native` | `false` | Use unfused SiLU instead of fused Triton kernel. |
-| `rope_native` | `false` | Use unfused RoPE instead of flash_attn kernel. |
-| `attention_cast_bf16` | `false` | Explicitly cast Q/K to BF16 after RoPE. |
+| `router_fp32` | `null` (resolves `true`) | Upcast MoE router gate logits to float32. Exact DSV4-Flash requires its native non-upcast router program instead. |
+| `lm_head_fp32` | `null` (resolves `true`) | Upcast LM-head logits to float32. Exact DSV4-Flash requires its native distributed head program instead. |
+| `rmsnorm_mode` | `null` (resolved) | Ordinary models and exact DSV4-Flash resolve to `native`; exact dense Qwen3, Qwen3.5-family, and GLM-5.2 programs require `sglang_fused`. Other explicit diagnostic modes are also accepted by the argument type. |
+| `activation_native` | `false` (resolved) | Use native SiLU instead of the fused Triton kernel. Exact Qwen3.5-family programs resolve this to `true`; the other exact programs retain their architecture-owned fused arithmetic. |
+| `rope_native` | `null` (resolved) | Ordinary models and exact DSV4-Flash resolve to `false`; exact dense Qwen3, Qwen3.5-family, and GLM-5.2 programs resolve to `true`. |
+| `rope_class_b` | `null` (resolved) | Select the compiled Class-B RoPE FP32-chain path. It is enabled for exact dense Qwen3, Qwen3.5-family, and GLM-5.2 programs; DSV4 owns a separate RoPE program. |
+| `attention_cast_bf16` | `false` (resolved) | Explicitly cast Q/K to BF16 after RoPE. Exact Qwen3.5-family programs resolve this to `true`; dense Qwen3, GLM-5.2, and DSV4-Flash exact programs require `false`. |
+| `qwen35_rmsnorm_family` | `null` (resolved) | Exact Qwen3.5/3.6 programs require the qualified `v2` arithmetic; other architectures reject an override. |
+| `sparse_mla_enabled` | `null` (resolved) | Canonical GLM-5.2 enables the sparse-MLA path; ordinary models resolve to `false`. |
+| `sparse_mla_backend` | `auto` (resolved) | Canonical GLM-5.2 requires `flashmla`; other models preserve the selected backend. |
 
 ---
 
@@ -64,7 +70,8 @@ These flags align the training model's numerics with the inference engine (SGLan
 | `data_parallel_replicate_size` | `1` | Number of data replicas for HSDP. |
 | `tensor_parallel_size` | `1` | TP degree. |
 | `pipeline_parallel_size` | `1` | PP stages. |
-| `pipeline_parallel_schedule` | `1F1B` | PP schedule: `1F1B` or `GPipe`. |
+| `pipeline_parallel_schedule` | `1F1B` | PP schedule: `1F1B`, `GPipe`, `Interleaved1F1B`, `InterleavedZeroBubble`, `ZBVZeroBubble`, or `DualPipeV`. |
+| `pipeline_parallel_virtual_stages` | `1` | Model chunks per PP rank. Virtual stages are not supported with EP or inference weight sync. |
 | `pp_variable_seq_lengths` | `true` | Dynamically negotiate max seq length per PP step via all-reduce. |
 | `expert_parallel_size` | `1` | EP degree for MoE models. |
 | `ulysses_parallel_size` | `1` | Ulysses context parallelism degree. |
@@ -89,7 +96,10 @@ These flags align the training model's numerics with the inference engine (SGLan
 | `enable_forward_prefetch` | `false` | FSDP forward prefetch. |
 | `init_device` | `meta` | Model initialization device: `cpu`, `meta`, `cuda`. |
 | `load_weights_mode` | `grouped` | Weight loading mode: `grouped` (default, with rank-0 fallback), `all_ranks`, or `skip`. |
-| `ce_mode` | `compiled` | Cross-entropy implementation: `compiled` (recommended, `torch.compile`), `quack_linear` (scalar loss only; incompatible with `return_per_token: true`), or `eager` (may OOM at 32K+ seq len). |
+| `ce_mode` | `null` (resolved) | Ordinary models and exact DSV4-Flash resolve to `compiled`; exact dense Qwen3, Qwen3.5-family, and GLM-5.2 programs resolve to `bi_fused`. Explicit modes also include `eager`, `quack_linear`, and `fused_quack`, subject to loss/topology checks. |
+| `enable_fp8_training` | `false` | Experimental full-weight block-FP8 compute. Mutually exclusive with LoRA/QLoRA and QARL. |
+| `enable_qarl` | `false` | Experimental dynamic fake-quant training with full-precision masters and STE gradients. E4M3 applies to dense `nn.Linear` modules; NVFP4 also supports MoE expert containers. Mutually exclusive with LoRA/QLoRA and full-weight FP8 training. |
+| `qarl_quant_cfg` | `null` | QARL alias or dictionary. `null`/`FP8_DEFAULT_CFG` resolves to dynamic E4M3 W8A8 with `[128, 128]` weight blocks. `nvfp4` resolves to dynamic, weight-only W4 with `group_size: 16`; set `activation: true` for W4A4. NVFP4 covers dense linears and MoE expert containers, while E4M3 is dense-only. |
 
 ---
 
@@ -165,10 +175,12 @@ ZMQ communication between the launcher, workers, and API server.
 | `enable_lora` | `false` | Enable LoRA adapters. |
 | `lora_rank` | `32` | LoRA rank (`r`). Default is 32 for server (vs 16 for local). |
 | `lora_alpha` | `16` | LoRA scaling factor. |
+| `lora_b_init_std` | `0.0` | Optional deterministic normal initialization standard deviation for LoRA-B. `0.0` keeps the standard zero-B/no-op initialization. |
+| `lora_b_init_seed` | `0` | Seed for opt-in nonzero LoRA-B initialization. |
 | `lora_target_modules` | `null` | Module names to inject LoRA into. `null` = default for architecture. |
 | `moe_hybrid_shared_lora` | `false` | Share `lora_A` for gate/up projections and `lora_B` for down projections across experts. |
 | `enable_qlora` | `false` | Quantize base weights and train LoRA adapters on top. |
-| `quant_format` | `nvfp4` | Quantization format: `nvfp4`, `block_fp8`. |
+| `quant_format` | `nvfp4` | QLoRA quantization format: `nvfp4`, `block_fp8`, or `nf4`. |
 | `quant_group_size` | `16` | Quantization group size. |
 | `qlora_exclude_modules` | `null` | Modules to exclude from quantization (e.g., `[lm_head]`). |
 | `merge_lora_interval` | `0` | Merge LoRA into base weights every N steps. `0` = never. |
@@ -189,4 +201,5 @@ ZMQ communication between the launcher, workers, and API server.
 
 | Field | Default | Description |
 |---|---|---|
-| `sync_inference_method` | `nccl_broadcast` | Method for pushing updated weights to the inference endpoint after each step. Supported values: `nccl_broadcast` (SGLang `update_weights_from_distributed`), `p2p` (Mooncake RDMA writes), and experimental `sparse_delta` (packed sparse files via SGLang `update_weights_from_sparse_delta`). |
+| `sync_inference_method` | `nccl_broadcast` | Method for pushing updated weights to the inference endpoint after each step. The pinned xorl-sglang revision supports `nccl_broadcast` (two-phase distributed receive) and `p2p` (Mooncake RDMA writes). XoRL also accepts `sparse_delta`, but that mode is not usable with the pinned receiver because `/update_weights_from_sparse_delta` is absent. |
+| `receiver_kv_cache_dtype` | `null` | Expected receiver KV-cache dtype: `auto`, `fp8`, or `fp8_e4m3`. Validates registered endpoint metadata; it does not configure SGLang itself. |

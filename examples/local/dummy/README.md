@@ -1,168 +1,74 @@
-# Dummy Dataset Benchmarks & Training Configs
+# Dummy Dataset Training Configs
 
-Configs using the built-in `path: dummy` dataset. No real data needed -- random tokenized samples are generated in-memory at startup.
+These configs use the built-in `path: dummy` dataset, which generates random tokenized samples in memory. They are useful for configuration bring-up, memory checks, and throughput experiments without downloading a dataset.
 
-## Naming Convention
+## Directory layout
 
-Pattern: `{model}_{parallelism}_{optimizer}.yaml`
+| Directory | Contents |
+|---|---|
+| `configs/full/` | Full-weight dense and MoE examples, including FSDP, TP, PP, CP/Ulysses, EP, Muon, and interleaved PP |
+| `configs/lora/` | LoRA examples for Qwen3 and Llama |
+| `configs/qlora/` | NVFP4, block-FP8, and pre-quantized QLoRA examples |
 
-Parallelism abbreviations: `pp` (pipeline), `dp` (data parallel shard), `tp` (tensor), `ep` (expert), `cp` (context / ring attention), `sp` (Ulysses sequence parallel).
+List the exact current inventory instead of inferring filenames from older examples:
 
-## Benchmark Configs (8 GPUs)
+```bash
+find examples/local/dummy/configs -type f -name '*.yaml' | sort
+```
 
-### Optimizer Comparison
+Representative checked-in configurations include:
 
-| Config | Model | Optimizer | Parallelism |
-|--------|-------|-----------|-------------|
-| `qwen3_4b_instruct_adamw.yaml` | Qwen3-4B-Instruct | AdamW | FSDP dp=8 |
-| `qwen3_4b_instruct_muon.yaml` | Qwen3-4B-Instruct | Muon | FSDP dp=8 |
-| `qwen3_8b_adamw.yaml` | Qwen3-8B | AdamW | FSDP dp=8 |
-| `qwen3_8b_muon.yaml` | Qwen3-8B | Muon | FSDP dp=8 |
-| `qwen3_30b_a3b_adamw.yaml` | Qwen3-30B-A3B (MoE) | AdamW | EP=8, SP=8 |
-| `qwen3_30b_a3b_muon.yaml` | Qwen3-30B-A3B (MoE) | Muon | EP=8, SP=8 |
-
-### Tensor Parallelism Scaling (Qwen3-8B)
-
-| Config | TP | DP | Compile |
-|--------|----|----|---------|
-| `qwen3_8b_tp1.yaml` | 1 | 8 | - |
-| `qwen3_8b_tp2.yaml` | 2 | 4 | - |
-| `qwen3_8b_tp4.yaml` | 4 | 2 | - |
-| `qwen3_8b_tp4_compile.yaml` | 4 | 2 | yes |
-| `qwen3_8b_tp8.yaml` | 8 | 1 | - |
-
-### Pipeline Parallelism (Qwen3-8B)
-
-| Config | PP | DP | SP (Ulysses) |
-|--------|----|----|--------------|
-| `qwen3_8b_dp4.yaml` | - | 4 | - |
-| `qwen3_8b_pp2_dp2.yaml` | 2 | 2 | - |
-| `qwen3_8b_pp2_sp2.yaml` | 2 | 1 | 2 |
-
-### Pipeline Parallelism (Qwen3-30B-A3B MoE)
-
-| Config | PP | EP | CP | Optimizer |
-|--------|----|----|-----|-----------|
-| `qwen3_30b_a3b_pp2_ep4_muon.yaml` | 2 | 4 | - | Muon |
-| `qwen3_30b_a3b_pp2_ep2_cp2_muon.yaml` | 2 | 2 | 2 | Muon |
-| `qwen3_30b_a3b_pp2_ep4_cp4_muon.yaml` | 2 | 4 | 4 | Muon |
-
-### Context Parallel / Sequence Parallel (Qwen3-8B)
-
-| Config | CP | SP (Ulysses) | DP |
-|--------|----|--------------|----|
-| `qwen3_8b_cp1_sp8.yaml` | 1 | 8 | 1 |
-| `qwen3_8b_cp2_sp4.yaml` | 2 | 4 | 1 |
-| `qwen3_8b_cp4_sp2.yaml` | 4 | 2 | 1 |
-| `qwen3_8b_cp8_sp1.yaml` | 8 | 1 | 1 |
-| `qwen3_8b_cp1_sp4_dp2.yaml` | 1 | 4 | 2 |
-| `qwen3_8b_cp4_sp1_dp2.yaml` | 4 | 1 | 2 |
-
-### Context Parallel / Sequence Parallel (Qwen3-30B-A3B MoE)
-
-| Config | CP | SP (Ulysses) | EP |
-|--------|----|--------------|----|
-| `qwen3_30b_a3b_cp1_sp8.yaml` | 1 | 8 | 8 |
-| `qwen3_30b_a3b_cp2_sp4.yaml` | 2 | 4 | 8 |
-| `qwen3_30b_a3b_cp4_sp2.yaml` | 4 | 2 | 8 |
-| `qwen3_30b_a3b_cp8_sp1.yaml` | 8 | 1 | 8 |
-
-### Expert Parallel + Tensor Parallel (Qwen3-30B-A3B MoE)
-
-| Config | EP | TP | DP |
-|--------|----|----|-----|
-| `qwen3_30b_a3b_ep8.yaml` | 8 | 1 | 8 |
-| `qwen3_30b_a3b_ep4_tp2.yaml` | 4 | 2 | 4 |
-
-## Training Configs
-
-| Config | GPUs | Model | Parallelism | Notes |
-|--------|------|-------|-------------|-------|
-| `qwen3_8b.yaml` | 8 | Qwen3-8B | dp=8 | Dense, AdamW |
-| `qwen3_8b_pp2.yaml` | 8 | Qwen3-8B | PP=2, dp=4 | Dense, AdamW |
-| `qwen3_8b_pp2_sp2.yaml` | 4 | Qwen3-8B | PP=2, SP=2 | Dense, AdamW |
-| `qwen3_32b.yaml` | 8 | Qwen3-32B | SP=4, dp=2 | Dense, AdamW |
-| `qwen3_4b_instruct.yaml` | 8 | Qwen3-4B-Instruct | TP=8 | Dense, AdamW |
-| `qwen3_30b_a3b_pp2_dp4_ep4.yaml` | 8 | Qwen3-30B-A3B | PP=2, dp=4, EP=4 | MoE, AdamW |
-| `qwen3_30b_a3b_pp2_sp4.yaml` | 8 | Qwen3-30B-A3B | PP=2, SP=4 | MoE, AdamW |
-| `qwen3_coder_30b_a3b.yaml` | 8 | Qwen3-Coder-30B-A3B | EP=8, SP=8 | MoE, Muon, DeepEP |
-
-### LoRA / QLoRA (Qwen3-8B)
-
-| Config | Method | Quant | Parallelism | GPUs |
-|--------|--------|-------|-------------|------|
-| `qwen3_8b_lora.yaml` | LoRA | - | FSDP dp=4 | 4 |
-| `qwen3_8b_lora_cp4.yaml` | LoRA | - | CP=4 | 4 |
-| `qwen3_8b_lora_cp2_sp2.yaml` | LoRA | - | CP=2, SP=2 | 4 |
-| `qwen3_8b_qlora_nvfp4.yaml` | QLoRA | nvfp4 | FSDP dp=4 | 4 |
-| `qwen3_8b_qlora_nvfp4_requant.yaml` | QLoRA | nvfp4 | FSDP dp=4 | 4 |
-| `qwen3_8b_qlora_nvfp4_sp4.yaml` | QLoRA | nvfp4 | SP=4 | 4 |
-| `qwen3_8b_qlora_nvfp4_cp2_sp2.yaml` | QLoRA | nvfp4 | CP=2, SP=2 | 4 |
-| `qwen3_8b_qlora_nvfp4_pp2.yaml` | QLoRA | nvfp4 | PP=2, dp=4 | 8 |
-
-### QLoRA (Qwen3-32B)
-
-| Config | Quant | Parallelism | GPUs |
-|--------|-------|-------------|------|
-| `qwen3_32b_qlora_nvfp4.yaml` | nvfp4 | FSDP dp=4 | 4 |
-
-### LoRA / QLoRA (Qwen3-30B-A3B MoE)
-
-| Config | Method | Source | Parallelism | GPUs |
-|--------|--------|--------|-------------|------|
-| `qwen3_30b_a3b_instruct_lora_bf16.yaml` | LoRA | bf16 | EP=8, SP=8 | 8 |
-| `qwen3_30b_a3b_base_qlora_nvfp4.yaml` | QLoRA | on-the-fly (base) | EP=8, SP=8 | 8 |
-| `qwen3_30b_a3b_qlora_nvfp4.yaml` | QLoRA | pre-quantized (nvidia) | EP=8, SP=8 | 8 |
-| `qwen3_30b_a3b_instruct_qlora_nvfp4.yaml` | QLoRA | on-the-fly (instruct) | EP=8, SP=8 | 8 |
-
-### QLoRA (Qwen3-235B-A22B MoE)
-
-| Config | Source | Parallelism | GPUs |
-|--------|--------|-------------|------|
-| `qwen3_235b_a22b_base_qlora_nvfp4.yaml` | on-the-fly (base) | EP=4, dp=8 | 8 |
-| `qwen3_235b_a22b_qlora_nvfp4.yaml` | pre-quantized (nvidia) | EP=4, dp=8 | 8 |
-| `qwen3_235b_a22b_instruct_qlora_nvfp4.yaml` | on-the-fly (instruct) | EP=4, dp=4 | 4 |
-
-### QLoRA (Qwen3-Coder-30B-A3B MoE)
-
-| Config | Source | Parallelism | GPUs |
-|--------|--------|-------------|------|
-| `qwen3_coder_30b_a3b_instruct_qlora_nvfp4.yaml` | on-the-fly | EP=4, SP=4 | 8 |
+| Purpose | Config |
+|---|---|
+| Qwen3-8B full-weight baseline | `configs/full/qwen3_8b.yaml` |
+| Qwen3-8B tensor parallel | `configs/full/qwen3_8b_tp4_compile.yaml` |
+| Qwen3-8B pipeline parallel | `configs/full/qwen3_8b_pp2.yaml` |
+| Qwen3-8B interleaved pipeline | `configs/full/qwen3_8b_pp2_interleaved.yaml` |
+| Qwen3-8B context/Ulysses layouts | `configs/full/qwen3_8b_cp1_sp8.yaml`, `qwen3_8b_cp2_sp4.yaml`, `qwen3_8b_cp8_sp1.yaml` |
+| Qwen3-30B-A3B expert parallel | `configs/full/qwen3_30b_a3b_ep8.yaml` |
+| Qwen3-30B-A3B PP + EP + CP | `configs/full/qwen3_30b_a3b_pp2_ep4_cp4_muon.yaml` |
+| GLM-4.5-Air MoE | `configs/full/glm4_moe_ep8.yaml` |
+| GPT-OSS MoE | `configs/full/gpt_oss_20b_ep8.yaml`, `gpt_oss_120b_ep8.yaml` |
+| LoRA | `configs/lora/qwen3_8b_lora.yaml` |
+| QLoRA NVFP4 | `configs/qlora/qwen3_8b_qlora_nvfp4.yaml` |
+| QLoRA block-FP8 | `configs/qlora/qwen3_8b_qlora_block_fp8.yaml` |
 
 ## Usage
 
+Run commands from the repository root and include the mode subdirectory:
+
 ```bash
-# Example (8 GPUs)
-torchrun --nproc_per_node=8 -m xorl.cli.train examples/local/dummy/configs/qwen3_8b_tp2.yaml
+# Full-weight Qwen3-8B on 8 GPUs
+torchrun --nproc_per_node=8 -m xorl.cli.train \
+  examples/local/dummy/configs/full/qwen3_8b.yaml
 
-# Training (8 GPUs)
-torchrun --nproc_per_node=8 -m xorl.cli.train examples/local/dummy/configs/qwen3_8b.yaml
+# Interleaved PP on 8 GPUs
+torchrun --nproc_per_node=8 -m xorl.cli.train \
+  examples/local/dummy/configs/full/qwen3_8b_pp2_interleaved.yaml
 
-# Pipeline parallel (8 GPUs)
-torchrun --nproc_per_node=8 -m xorl.cli.train examples/local/dummy/configs/qwen3_8b_pp2.yaml
+# LoRA on 4 GPUs
+torchrun --nproc_per_node=4 -m xorl.cli.train \
+  examples/local/dummy/configs/lora/qwen3_8b_lora.yaml
 
-# QLoRA NVFP4 (4 GPUs)
-torchrun --nproc_per_node=4 -m xorl.cli.train examples/local/dummy/configs/qwen3_8b_qlora_nvfp4.yaml
+# QLoRA NVFP4 on 4 GPUs
+torchrun --nproc_per_node=4 -m xorl.cli.train \
+  examples/local/dummy/configs/qlora/qwen3_8b_qlora_nvfp4.yaml
 
-# QLoRA NVFP4 + Ulysses SP (4 GPUs)
-torchrun --nproc_per_node=4 -m xorl.cli.train examples/local/dummy/configs/qwen3_8b_qlora_nvfp4_sp4.yaml
-
-# QLoRA NVFP4 + pipeline parallel (8 GPUs)
-torchrun --nproc_per_node=8 -m xorl.cli.train examples/local/dummy/configs/qwen3_8b_qlora_nvfp4_pp2.yaml
+# QLoRA NVFP4 + PP on 8 GPUs
+torchrun --nproc_per_node=8 -m xorl.cli.train \
+  examples/local/dummy/configs/qlora/qwen3_8b_qlora_nvfp4_pp2.yaml
 ```
 
-## How Dummy Datasets Work
+The GPU count in a command must satisfy the topology encoded by that YAML. A checked-in config verifies that the shape is represented in source; it does not guarantee that the model fits a different GPU type or that every optional backend is installed.
 
-Set `path: dummy` in the dataset config:
+## Dummy dataset behavior
 
 ```yaml
 data:
   datasets:
     - path: dummy
       type: tokenized
-      max_seq_len: 8000  # length of each generated sample
+      max_seq_len: 8000
 ```
 
-- Generates 4096 samples of `max_seq_len` random token IDs (0-32000)
-- `labels = input_ids` (every token contributes to loss)
-- All ranks use the same seed -- identical data, no disk I/O
+The dummy loader generates random token IDs, uses the token sequence as labels, and avoids dataset I/O. Configuration files can override sample count, length, packing, and seed, so inspect the selected YAML for the effective workload.

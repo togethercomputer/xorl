@@ -71,6 +71,20 @@ OPD_TOKEN_ALIGNED_FIELDS = (
     "opd_sample_ok",
 )
 
+CAUSAL_TARGET_ALIGNED_FIELDS = (
+    "logprob_temperatures",
+    "logprob_top_ks",
+    "logprob_top_ps",
+    "logprob_min_ps",
+)
+
+NORMALIZED_SAMPLING_METADATA_FIELDS = {
+    "sampling_temperature": "logprob_temperatures",
+    "sampling_top_k": "logprob_top_ks",
+    "sampling_top_p": "logprob_top_ps",
+    "sampling_min_p": "logprob_min_ps",
+}
+
 # Packing strategies (see SequentialPacker for semantics).
 PACKING_STRATEGIES = ("sequential", "best_fit", "balanced_dp")
 # How to treat samples whose raw length exceeds max_seq_len.
@@ -134,6 +148,83 @@ def shift_opd_token_aligned_fields(
                 f"({shifted_seq_len}) or original length ({original_seq_len})"
             )
         flattened_datum[key] = value[:-1]
+
+
+def shift_causal_target_aligned_fields(
+    flattened_datum: Dict[str, Any],
+    original_seq_len: int,
+    shifted_seq_len: int,
+    sample_idx: int,
+) -> None:
+    """Align decision metadata with labels[1:] for HF-style causal shifting."""
+    for key in CAUSAL_TARGET_ALIGNED_FIELDS:
+        if key not in flattened_datum:
+            continue
+        value = flattened_datum[key]
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+        if not isinstance(value, list):
+            raise ValueError(f"Sample {sample_idx}: {key} must be token-aligned")
+        if len(value) == shifted_seq_len:
+            flattened_datum[key] = value
+            continue
+        if len(value) != original_seq_len:
+            raise ValueError(
+                f"Sample {sample_idx}: {key} length ({len(value)}) must match either shifted length "
+                f"({shifted_seq_len}) or original length ({original_seq_len})"
+            )
+        flattened_datum[key] = value[1:]
+
+
+def expand_normalized_sampling_metadata(
+    flattened_datum: Dict[str, Any],
+    seq_len: int,
+    sample_idx: int,
+) -> None:
+    """Expand normalized request-level sampler metadata to decision rows.
+
+    SGLang relays the normalized values actually consumed by its sampler under
+    ``sampling_*`` keys in response ``meta_info``.  The public XoRL request
+    schema represents scalar loss inputs as one-element lists, so accept either
+    a scalar or one-element container here and materialize the canonical
+    token-aligned ``logprob_*`` fields used by trainer replay.
+
+    This relays only transform parameters.  Exact support is recomputed from
+    each trainer forward's current logits; behavior-time support is never
+    accepted as replay input.
+    """
+    for source_key, target_key in NORMALIZED_SAMPLING_METADATA_FIELDS.items():
+        if source_key not in flattened_datum:
+            continue
+        if target_key in flattened_datum:
+            raise ValueError(f"Sample {sample_idx}: provide either {source_key} or {target_key}, not both")
+
+        value = flattened_datum.pop(source_key)
+        if hasattr(value, "tolist"):
+            value = value.tolist()
+        if isinstance(value, (list, tuple)):
+            if len(value) != 1:
+                raise ValueError(f"Sample {sample_idx}: {source_key} must be a scalar or one-element container")
+            value = value[0]
+
+        if source_key == "sampling_top_k":
+            if isinstance(value, bool) or int(value) != value or int(value) < 1:
+                raise ValueError(f"Sample {sample_idx}: sampling_top_k must be an integer >= 1")
+            normalized_value: Union[int, float] = int(value)
+        else:
+            if isinstance(value, bool):
+                raise ValueError(f"Sample {sample_idx}: {source_key} must be numeric")
+            normalized_value = float(value)
+            if not math.isfinite(normalized_value):
+                raise ValueError(f"Sample {sample_idx}: {source_key} must be finite")
+            if source_key == "sampling_temperature" and normalized_value <= 0.0:
+                raise ValueError(f"Sample {sample_idx}: sampling_temperature must be > 0")
+            if source_key == "sampling_top_p" and not 0.0 < normalized_value <= 1.0:
+                raise ValueError(f"Sample {sample_idx}: sampling_top_p must be in (0, 1]")
+            if source_key == "sampling_min_p" and not 0.0 <= normalized_value <= 1.0:
+                raise ValueError(f"Sample {sample_idx}: sampling_min_p must be in [0, 1]")
+
+        flattened_datum[target_key] = [normalized_value] * seq_len
 
 
 def _resolve_teacher_cache_base(t_base: Any, t_cache: List[int]) -> int:
@@ -912,6 +1003,7 @@ class SequentialPacker(Packer):
             raise ValueError(f"Sample {sample_idx} missing 'input_ids'")
         if not isinstance(input_ids, list):
             input_ids = input_ids.tolist() if hasattr(input_ids, "tolist") else list(input_ids)
+        expand_normalized_sampling_metadata(flattened_datum, len(input_ids), sample_idx)
 
         # Extract labels/target_tokens
         if "labels" in flattened_datum:
@@ -951,6 +1043,12 @@ class SequentialPacker(Packer):
                 f"Original len={len(input_ids)}, shifted len={len(input_ids) - 1}"
             )
             shift_opd_token_aligned_fields(
+                flattened_datum,
+                original_seq_len=len(input_ids),
+                shifted_seq_len=len(input_ids) - 1,
+                sample_idx=sample_idx,
+            )
+            shift_causal_target_aligned_fields(
                 flattened_datum,
                 original_seq_len=len(input_ids),
                 shifted_seq_len=len(input_ids) - 1,
@@ -1180,7 +1278,15 @@ class SequentialPacker(Packer):
                                 hidden_dim = len(value[0][0])
                                 value[0].extend([[0.0] * hidden_dim for _ in range(pad_length)])
                             else:
-                                pad_value = IGNORE_INDEX if key == "target_tokens" else 0
+                                pad_value = (
+                                    IGNORE_INDEX
+                                    if key == "target_tokens"
+                                    else (1 << 30)
+                                    if key == "logprob_top_ks"
+                                    else 1.0
+                                    if key in ("logprob_temperatures", "logprob_top_ps")
+                                    else 0
+                                )
                                 value[0].extend([pad_value] * pad_length)
 
         # For non-SP cases, pre-compute Flash Attention kwargs from position_ids.
@@ -1238,6 +1344,7 @@ class SequentialPacker(Packer):
             raise ValueError(f"Sample {sample_idx} missing 'input_ids'")
         if not isinstance(input_ids, list):
             input_ids = input_ids.tolist() if hasattr(input_ids, "tolist") else list(input_ids)
+        expand_normalized_sampling_metadata(flattened_datum, len(input_ids), sample_idx)
 
         # Extract or generate position_ids
         if "position_ids" in flattened_datum:
@@ -1271,6 +1378,23 @@ class SequentialPacker(Packer):
 
         # Detect if tokens are already shifted (xorl_client API format)
         is_already_shifted = "target_tokens" in flattened_datum and len(input_ids) == len(labels)
+        sampler_prefill_length = None
+        if is_already_shifted:
+            # xorl_client's shifted policy datum retains the sampler boundary in
+            # its raw targets: row prompt_len - 1 predicts the first sampled
+            # token. Capture that boundary before weights/advantages can mask
+            # every generated target (for example, a zero-advantage sample).
+            raw_target_tokens = flattened_datum["target_tokens"]
+            if not isinstance(raw_target_tokens, list):
+                raw_target_tokens = (
+                    raw_target_tokens.tolist() if hasattr(raw_target_tokens, "tolist") else list(raw_target_tokens)
+                )
+            first_sampled_target = next(
+                (index for index, target in enumerate(raw_target_tokens) if target != IGNORE_INDEX),
+                None,
+            )
+            if first_sampled_target is not None:
+                sampler_prefill_length = first_sampled_target + 1
         if labels and not is_already_shifted and len(input_ids) == len(labels):
             logger.warning(
                 "Sample %s has labels with the same length as input_ids; treating it as HF-format data "
@@ -1284,6 +1408,12 @@ class SequentialPacker(Packer):
                 weights = weights[1:]
             if advantages is not None:
                 advantages = advantages[1:]
+            shift_causal_target_aligned_fields(
+                flattened_datum,
+                original_seq_len=len(input_ids) + 1,
+                shifted_seq_len=len(input_ids),
+                sample_idx=sample_idx,
+            )
 
         if advantages is not None:
             flattened_datum["advantages"] = advantages
@@ -1291,6 +1421,10 @@ class SequentialPacker(Packer):
         seq_len = len(input_ids)
         batch["input_ids"].append(input_ids)
         batch["position_ids"].append(position_ids)
+        if sampler_prefill_length is not None:
+            # Packing-disabled batches contain exactly one datum, so this is
+            # one row boundary rather than a token-aligned sequence field.
+            batch["sampler_prefill_lengths"] = [sampler_prefill_length]
 
         # Apply weights mask to labels if weights field is present
         # weights=0 -> labels=-100 (IGNORE_INDEX), weights=1 -> labels unchanged

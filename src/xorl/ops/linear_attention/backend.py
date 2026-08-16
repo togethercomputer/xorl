@@ -70,7 +70,20 @@ def resolve_flashqla_auto_cp(auto_cp: bool | None) -> bool:
 
 
 def warn_cp_fallback_once() -> None:
-    """Warn (once) that a FlashQLA request fell back to the FLA Triton GDN kernel."""
+    """Warn (once) that a FlashQLA request fell back to the FLA Triton GDN kernel.
+
+    Under the exact GDN contract a silent backend swap is a byte hazard, not
+    a performance note: the contract RAISES instead. (Today the contract pins
+    the backend to ``fla`` before any FlashQLA request can be made, so this
+    is defense-in-depth against a future reordering of backend resolution.)
+    """
+    from xorl.ops.linear_attention.modules.bi_contract import _is_gdn_contract_enabled  # noqa: PLC0415
+
+    if _is_gdn_contract_enabled():
+        raise RuntimeError(
+            "Exact Qwen3.5 GDN: a FlashQLA->FLA backend fallback was requested while the GDN "
+            "contract is active; silently swapping the kernel program is not admitted"
+        )
     global _warned_cp_fallback
     if not _warned_cp_fallback:
         warnings.warn(

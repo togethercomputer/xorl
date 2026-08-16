@@ -5,10 +5,18 @@ title: "Installation"
 
 ## Requirements
 
-- Python 3.12
-- CUDA 12.9+
-- PyTorch 2.10+
-- NVIDIA Hopper GPU (H100/H800) or newer recommended for NVFP4 and DeepEP
+- Python 3.12 (the package requires `==3.12.*`)
+- An NVIDIA driver compatible with the selected wheel profile
+- NVIDIA Hopper (H100/H800) or newer for Hopper-specific NVFP4, DeepEP, and tuned kernel paths
+
+XoRL ships two deliberately different dependency profiles:
+
+| Profile | Manifest | PyTorch / CUDA runtime | Triton | Attention stack | Use it for |
+|---|---|---|---|---|---|
+| Default | `pyproject.toml` | 2.12.1 / CUDA 13.2 | 3.7.1 | FlashAttention 4 (`4.0.0b19`) | Local training and the XoRL training server |
+| Combined xorl-sglang | `pyproject.sglang.toml` | 2.11.0 / CUDA 13 | 3.6.0 | FlashAttention 4 (`4.0.0b19`) | A single environment that also runs the pinned xorl-sglang submodule |
+
+These profiles are not interchangeable. Use the manifest that matches the process you intend to run rather than upgrading or mixing their pinned Torch, Triton, or attention packages independently.
 
 ## Clone the repo
 
@@ -42,7 +50,7 @@ conda activate xorl
 pip install -e .
 ```
 
-## Install Submodules
+## Install submodules
 
 The repo ships two git submodules under `submodules/`:
 
@@ -51,20 +59,19 @@ The repo ships two git submodules under `submodules/`:
 | [xorl-client](https://github.com/togethercomputer/xorl-client) | Lightweight Python client for the XoRL training service. Required for server/RL training mode. |
 | [xorl-sglang](https://github.com/togethercomputer/xorl-sglang) | XoRL's fork of [SGLang](https://github.com/sgl-project/sglang). Used as the inference engine in online RL loops. |
 
-Install individually:
+The default XoRL dependency set already installs `xorl-client` from its public repository. To develop the checked-in client submodule in place, install it editable:
 
 ```bash
 pip install -e submodules/xorl-client
-pip install -e "submodules/xorl-sglang/python[all]"
 ```
 
-Alternatively, use the bundled `pyproject.sglang.toml` which pins PyTorch to 2.9.1 (required by sglang) and installs xorl, xorl-client, and xorl-sglang together:
+Do not install xorl-sglang into the default PyTorch 2.12 environment. To install XoRL, xorl-client, and xorl-sglang together, use the alternate manifest:
 
 **uv:**
 ```bash
 cp pyproject.sglang.toml pyproject.toml
-uv sync
-source .venv/bin/activate
+UV_PROJECT_ENVIRONMENT=.venv-sglang uv sync
+source .venv-sglang/bin/activate
 ```
 
 **conda:**
@@ -72,38 +79,33 @@ source .venv/bin/activate
 conda create -n xorl-sglang python=3.12
 conda activate xorl-sglang
 cp pyproject.sglang.toml pyproject.toml
-pip install -e .
+pip install -e . -e "submodules/xorl-sglang/python[all]"
 ```
 
-> **Note:** The default `pyproject.toml` uses PyTorch 2.10.0. sglang requires PyTorch 2.9.1, so the two cannot coexist in the same environment unless you use `pyproject.sglang.toml`.
+> **Note:** Copying the alternate manifest replaces the tracked `pyproject.toml`; `uv sync` also generates the ignored local `uv.lock` for this profile. Do this in a clean checkout, restore `pyproject.toml`, and do not add the generated lock with unrelated changes. The separate `.venv-sglang` keeps this profile isolated from the default `.venv`. The version table above is the source of truth for the two profiles.
 
 > These submodules are only needed for **server training / online RL**. If you are only running local SFT or pretraining, you can skip this step.
 
 
-## Key Dependencies
-
-| Package | Version | Notes |
-|---|---|---|
-| PyTorch | 2.10.0+cu129 | CUDA 12.9 build |
-| Flash Attention 3 | custom | FA3 + FA4 wheels |
-| Triton | 3.6.0 | MoE fused kernels |
-| Transformers | 5.0+ | Model loading |
-| FastAPI + uvicorn | latest | Server training API |
-| pyzmq | latest | Worker communication |
-| wandb | latest | Experiment tracking (optional) |
-
 ## Verify Installation
 
+For the default profile:
+
 ```bash
-python -c "import xorl; print('xorl ok')"
-python -c "import flash_attn_interface; print('flash_attn_3 ok')"
-python -c "from flash_attn.cute import flash_attn_func; print('flash_attn_4 ok')"
-python -c "import deep_ep; print('deepep ok')"  # optional
+python -c "import torch, triton, xorl; print(torch.__version__, triton.__version__, xorl.__version__)"
+python -c "from flash_attn.cute import flash_attn_func; print('FlashAttention 4 ok')"
+```
+
+For the combined xorl-sglang profile:
+
+```bash
+python -c "import torch, triton, xorl, sglang; print(torch.__version__, triton.__version__)"
+python -c "from flash_attn.cute import flash_attn_func; print('FlashAttention 4 ok')"
 ```
 
 ## DeepEP Install (Optional)
 
-DeepEP is an NVLink-optimized MoE dispatch backend. It is only required when using `ep_dispatch: deepep` in your config — the default `ep_dispatch: alltoall` works without it. Install it from [https://github.com/deepseek-ai/DeepEP](https://github.com/deepseek-ai/DeepEP).
+DeepEP is a GPU-resident MoE dispatch backend. It uses high-speed GPU interconnects within a node and NVSHMEM/GPUDirect RDMA for supported multi-node deployments. It is only required when using `ep_dispatch: deepep`; the default `ep_dispatch: alltoall` works without it. Install it from [DeepSeek's DeepEP repository](https://github.com/deepseek-ai/DeepEP), then verify it separately with `python -c "import deep_ep; print('DeepEP ok')"`.
 
 ### Multi-node prerequisites
 

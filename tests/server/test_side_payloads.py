@@ -83,6 +83,8 @@ def test_r3_mooncake_refs_load_only_requested_slice():
     assert expert_ref is not None and logits_ref is not None and cleanup is not None
     assert expert_ref[SIDE_PAYLOAD_REF_KEY] is True
     assert expert_ref["backend"] == "mooncake"
+    assert expert_ref["version"] == 2
+    assert expert_ref["format"] == "packed_rows"
     assert expert_ref["field"] == "routed_experts"
     assert expert_ref["count"] == 2
     assert r3_payload_count(expert_ref) == 2
@@ -94,8 +96,8 @@ def test_r3_mooncake_refs_load_only_requested_slice():
     assert np.array_equal(loaded_ids[0], arr1.astype(np.int32))
     assert np.allclose(loaded_weights[0], weights1)
     assert client.get_calls == [
-        expert_ref["items"]["routed_experts"][1]["key"],
-        logits_ref["items"]["routed_expert_logits"][1]["key"],
+        expert_ref["items"]["routed_experts"][0]["key"],
+        logits_ref["items"]["routed_expert_logits"][0]["key"],
     ]
 
     cleanup_r3_mooncake_payloads(cleanup)
@@ -120,6 +122,65 @@ def test_r3_payload_validation_failures_are_loud():
     expert_ref["count"] = 2
     with pytest.raises(ValueError, match="count mismatch"):
         r3_payload_count(expert_ref)
+
+
+def test_r3_packed_chunks_are_bounded_and_slice_fetches_only_overlap():
+    store, client = _store()
+    payloads = [np.full((2, 1, 2), idx, dtype=np.int32) for idx in range(4)]
+    expert_ref, _, _ = put_r3_mooncake_payload_refs(
+        request_id="bounded",
+        routed_experts=payloads,
+        routed_expert_logits=None,
+        store=store,
+        chunk_ranges=[(0, 2), (2, 2)],
+        max_chunk_bytes=1024,
+    )
+    assert expert_ref is not None
+    chunks = expert_ref["items"]["routed_experts"]
+    assert len(chunks) == 2
+    assert len(client.put_calls) == 2
+
+    loaded = load_r3_mooncake_payload_slice(expert_ref, 2, 1, store=store)
+    assert np.array_equal(loaded[0], payloads[2])
+    assert client.get_calls == [chunks[1]["key"]]
+
+
+def test_r3_v1_per_datum_ref_remains_readable():
+    store, _ = _store()
+    first = store.put_tensor("legacy/0", torch.tensor([[[1, 2]]], dtype=torch.int32))
+    second = store.put_tensor("legacy/1", torch.tensor([[[3, 4]]], dtype=torch.int32))
+    ref = {
+        SIDE_PAYLOAD_REF_KEY: True,
+        "backend": "mooncake",
+        "kind": "r3_routing",
+        "version": 1,
+        "field": "routed_experts",
+        "count": 2,
+        "items": {"routed_experts": [first, second]},
+        "mooncake": store.config.to_metadata(),
+    }
+
+    loaded = load_r3_mooncake_payload_slice(ref, 1, 1, store=store)
+    assert loaded[0].tolist() == [[[3, 4]]]
+
+
+def test_r3_original_base64_buffer_can_expose_a_prefix_view():
+    store, _ = _store()
+    full = np.arange(4 * 2 * 2, dtype=np.int32).reshape(4, 2, 2)
+    payload = {
+        "data": base64.b64encode(full.tobytes()).decode("ascii"),
+        "shape": [4, 2, 2],
+        "rows": 3,
+    }
+
+    expert_ref, _, _ = put_r3_mooncake_payload_refs(
+        request_id="prefix-view",
+        routed_experts=[payload],
+        routed_expert_logits=None,
+        store=store,
+    )
+    loaded = load_r3_mooncake_payload_slice(expert_ref, 0, 1, store=store)
+    assert np.array_equal(loaded[0], full[:3])
 
 
 def test_mooncake_side_payload_missing_key_raises():

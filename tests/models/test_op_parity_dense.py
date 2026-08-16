@@ -2,15 +2,13 @@
 
 These are the non-aten operators that must stay bit-for-bit aligned with SGLang
 for the static K3 (train/serve logprob) parity to hold: the eager RoPE apply and
-the eager SwiGLU. (RMSNorm is guarded by ``test_rmsnorm_sglang_fused.py``;
+the exact one-round SwiGLU. (RMSNorm is guarded by ``test_rmsnorm_sglang_fused.py``;
 attention is the shared FA kernel / irreducible paged-vs-contiguous floor and is
 not asserted here.) The SGLang reference is inlined verbatim from its
 ``forward_native`` so the test needs no SGLang install.
 
 The K3 recipe uses the *eager* RoPE (flash rope unavailable -> naive path,
-``rope_native``) and the *eager* SwiGLU (``activation_native``); the fused Triton
-SwiGLU is intentionally NOT asserted bit-exact here — it is rejected for K3 at
-network scale.
+``rope_native``) and the one-round FP32 SwiGLU shared by the exact model paths.
 """
 
 import pytest
@@ -18,7 +16,7 @@ import torch
 import torch.nn.functional as F
 
 from xorl.models.layers import rope as xrope
-from xorl.ops.fused_silu_and_mul import _native_silu_and_mul
+from xorl.ops.fused_silu_and_mul import exact_fp32_silu_and_mul
 
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -97,14 +95,14 @@ def test_rope_xorl_eager_bit_exact_vs_sglang_native():
 
 @requires_cuda
 @pytest.mark.gpu
-def test_swiglu_xorl_native_bit_exact_vs_sglang_native():
+def test_swiglu_xorl_one_round_bit_exact_vs_sglang_fp32():
     torch.manual_seed(1)
 
     inter = 6144
     gate_up = torch.randn(SEQ, 2 * inter, device=DEV, dtype=DT)
 
-    x_xorl_native = _native_silu_and_mul(gate_up)  # F.silu(gate) * up in bf16
+    x_xorl_exact = exact_fp32_silu_and_mul(gate_up)
     d = gate_up.shape[-1] // 2
-    x_sg = F.silu(gate_up[..., :d]) * gate_up[..., d:]  # SGLang forward_native
+    x_sg = (F.silu(gate_up[..., :d].float()) * gate_up[..., d:].float()).to(DT)
 
-    assert torch.equal(x_xorl_native, x_sg), "xorl eager SwiGLU diverged from SGLang forward_native"
+    assert torch.equal(x_xorl_exact, x_sg), "xorl exact SwiGLU diverged from SGLang fp32_silu_and_mul"

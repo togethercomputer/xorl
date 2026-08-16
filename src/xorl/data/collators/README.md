@@ -39,8 +39,10 @@ Flattens nested list structures into a single flat list. Passes through already-
 → [{"input_ids": [1, 2]}, {"input_ids": [3, 4]}, {"input_ids": [5, 6]}]
 ```
 
-### 3. ShiftTokensCollator (Optional)
+### 3. ShiftTokensCollator
 Shifts tokens for causal language modeling when data is in HF format (unshifted: `labels[i] == input_ids[i]`). Drops last token from `input_ids`, drops first token from `labels`.
+
+This auto-detecting collator is part of the default `DataLoaderBuilder` pipeline. It becomes optional only when constructing a custom pipeline.
 
 Auto-detects whether shifting is needed:
 - **HF format** (needs shift): `labels[i] == input_ids[i]` → shift applied
@@ -63,7 +65,7 @@ Concatenates all sequences into a single packed sequence for flash attention.
 # Input
 [{"input_ids": tensor([1, 2, 3])}, {"input_ids": tensor([4, 5])}]
 
-# Output
+# Output with PackingConcatCollator(pad_to_multiple_of=1)
 {
     "input_ids": tensor([[1, 2, 3, 4, 5]]),       # shape: [1, 5]
     "position_ids": tensor([[0, 1, 2, 0, 1]]),     # per-sequence positions
@@ -89,13 +91,12 @@ builder = DataLoaderBuilder(
     micro_batch_size=2,
     gradient_accumulation_steps=4
 )
-# Default pipeline: ToTensor → Flatten → PackingConcat → [SequenceShard]
+# Default pipeline: ToTensor → Flatten → ShiftTokens → PackingConcat → [SequenceShard]
 dataloader = builder.build()
 ```
 
 ### Custom Pipeline
 ```python
-builder.add_collator(ShiftTokensCollator(), position="start")
 builder.add_collator(MyPostprocessor(), position="end")
 builder.insert_collator(MyMiddleCollator(), index=2)
 builder.remove_collator(index=1)

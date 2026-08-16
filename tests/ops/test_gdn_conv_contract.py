@@ -245,8 +245,8 @@ class TestConvContractGuards:
     def test_forward_routes_through_contract_when_armed(self, monkeypatch):
         calls = []
 
-        def fake_contract(q_in, k_in, v_in, *convs, cu_seqlens=None):
-            calls.append(cu_seqlens)
+        def fake_contract(q_in, k_in, v_in, *convs, cu_seqlens=None, cp_context=None):
+            calls.append((cu_seqlens, cp_context))
             return F.silu(q_in), F.silu(k_in), F.silu(v_in)
 
         def fake_chunk(**kwargs):
@@ -269,10 +269,15 @@ class TestConvContractGuards:
         with pytest.raises(RuntimeError, match="prefill only"):
             layer(torch.randn(1, 128, 256), use_cache=True)
 
-    def test_cp_context_raises(self):
+    def test_malformed_cp_context_raises(self):
         layer = _tiny_gdn(exact_contract=True)
-        cp_context = SimpleNamespace(cu_seqlens=torch.tensor([0, 8]), group=object(), is_first_rank=True)
-        with pytest.raises(RuntimeError, match="does not support CP"):
+        local_cu = torch.tensor([0, 8])
+        cp_context = SimpleNamespace(
+            cu_seqlens=local_cu,
+            group=object(),
+            is_first_rank=True,
+        )
+        with pytest.raises(TypeError, match="FLACPContext"):
             layer(torch.randn(1, 8, 256), cp_context=cp_context)
 
     def test_no_short_conv_raises(self):

@@ -169,6 +169,8 @@ def test_moe_non_hash_has_bias_no_table():
 
     assert hasattr(block.gate, "e_score_correction_bias")
     assert block.gate.e_score_correction_bias.shape == (cfg.n_routed_experts,)
+    assert block.gate.e_score_correction_bias.dtype is torch.float32
+    assert block.gate.e_score_correction_bias._keep_fp32 is True
     # ``e_score_correction_bias`` is frozen (requires_grad=False) — gradients
     # never flow through it (selection-only argmax bias). DeepSeek updates it
     # OOB via an aux-loss controller during training.
@@ -283,6 +285,201 @@ def test_moe_hash_layer_requires_input_ids():
 
     with pytest.raises(AssertionError, match="hash-routed layer requires input_ids"):
         block(x, input_ids=None)
+
+
+def test_exact_dsv4_checkpointing_does_not_attach_or_activate_routing_replay():
+    from xorl.models.base import XorlPreTrainedModel
+    from xorl.models.layers.moe.routing_replay import RoutingReplay, get_replay_stage, set_replay_stage
+    from xorl.models.transformers.deepseek_v4.modeling_deepseek_v4 import DeepseekV4MoE
+    from xorl.server.runner.model_runner import ModelRunner
+    from xorl.server.runner.utils import RoutingReplayHandler
+
+    cfg = _tiny_config(num_hash_layers=1)
+    cfg._dsv4_flash_exact_mode = True
+    block = DeepseekV4MoE(cfg, layer_id=0)
+    block._routing_replay = RoutingReplay()  # Simulate stale state from a prior enable call.
+    container = nn.Module()
+    container.layer = nn.Module()
+    container.layer.mlp = block
+
+    try:
+        attached = XorlPreTrainedModel.enable_routing_replay(container)
+        handler = RoutingReplayHandler(container)
+
+        assert attached == []
+        assert block.supports_routing_replay() is False
+        assert block._routing_replay is None
+        assert handler.get_moe_blocks() == []
+        assert not ModelRunner._checkpoint_routing_replay_enabled(
+            {"enable_gradient_checkpointing": True, "gradient_checkpointing_method": "recompute_full_layer"},
+            handler,
+        )
+        assert get_replay_stage() is None
+    finally:
+        set_replay_stage(None)
+        RoutingReplay.clear_all()
+
+
+def test_exact_hash_route_disables_unarmed_pdl(monkeypatch):
+    import sys
+    from types import ModuleType
+
+    from xorl.models.transformers.deepseek_v4.modeling_deepseek_v4 import DeepseekV4MoE
+
+    cfg = _tiny_config(num_hash_layers=3)
+    block = DeepseekV4MoE(cfg, layer_id=0).to(torch.bfloat16)
+    _init_test_weights(block)
+    block._dsv4_exact_native = True
+    block.train_router = False
+    calls = []
+
+    def fake_hash_topk(**kwargs):
+        calls.append(kwargs)
+        rows = kwargs["router_logits"].shape[0]
+        return torch.full((rows, 2), 0.5), torch.zeros(rows, 2, dtype=torch.int32)
+
+    module_names = (
+        "sglang",
+        "sglang.kernels",
+        "sglang.kernels.ops",
+        "sglang.kernels.ops.attention",
+        "sglang.kernels.ops.attention.dsv4",
+        "sglang.srt",
+        "sglang.srt.batch_invariant_ops",
+        "sglang.srt.batch_invariant_ops.batch_invariant_ops",
+    )
+    leaf_names = {"sglang.kernels.ops.attention.dsv4", "sglang.srt.batch_invariant_ops.batch_invariant_ops"}
+    for module_name in module_names:
+        module = ModuleType(module_name)
+        if module_name not in leaf_names:
+            module.__path__ = []
+        monkeypatch.setitem(sys.modules, module_name, module)
+    sys.modules["sglang.kernels.ops.attention.dsv4"].hash_topk = fake_hash_topk
+    # The exact router mirrors the sampler's patched mm: a BF16-output GEMM.
+    sys.modules["sglang.srt.batch_invariant_ops.batch_invariant_ops"].matmul_persistent = lambda a, b: torch.mm(a, b)
+    from xorl.models.layers.moe.routing_replay import set_replay_stage
+
+    try:
+        # A replay-capable block elsewhere in the same process may own the
+        # global stage. Exact DSV4 has no local replay state and must continue
+        # through its deterministic serving route normally.
+        set_replay_stage("record")
+        block.route(
+            torch.ones(3, cfg.hidden_size, dtype=torch.bfloat16),
+            input_ids=torch.tensor([1, 2, 3]),
+        )
+    finally:
+        set_replay_stage(None)
+
+    assert len(calls) == 1
+    assert calls[0]["use_pdl"] is False
+
+
+@pytest.mark.parametrize("ep_rank", range(8))
+def test_exact_native_mlp_lora_is_live_on_every_ep_partial(monkeypatch, ep_rank):
+    from types import SimpleNamespace
+
+    import xorl.distributed.parallel_state as parallel_state_module
+    import xorl.models.layers.moe.dsv4_native_combine as combine_module
+    import xorl.models.transformers.deepseek_v4.native_payload as payload_module
+    from xorl.models.transformers.deepseek_v4.modeling_deepseek_v4 import (
+        DeepseekV4MoE,
+    )
+
+    observed = {}
+    row_counts = tuple(int(rank == ep_rank) for rank in range(8))
+
+    class _RecordingExperts:
+        def __call__(
+            self,
+            hidden_states,
+            routing_weights,
+            selected_experts,
+            **kwargs,
+        ):
+            observed["routed"] = kwargs["dsv4_exact_lora_live"]
+            return torch.zeros_like(hidden_states)
+
+    def _gather_one_rank(rows, _group, _padded_rows):
+        gathered = rows.new_zeros((8, *rows.shape[1:]))
+        gathered[ep_rank : ep_rank + 1] = rows
+        return gathered
+
+    def _shared_partial(hidden_states, _module, **kwargs):
+        observed["shared"] = kwargs["lora_live"]
+        return torch.zeros_like(hidden_states)
+
+    fake_moe = SimpleNamespace(
+        is_hash_layer=False,
+        layer_id=0,
+        num_experts=256,
+        experts=_RecordingExperts(),
+        shared_experts=object(),
+        routed_scaling_factor=1.5,
+        _capture_diagnostic_component=lambda *_args: None,
+        route=lambda hidden_states, input_ids=None: (
+            torch.ones(hidden_states.shape[0], 6),
+            torch.zeros(hidden_states.shape[0], 6, dtype=torch.int32),
+            torch.zeros(hidden_states.shape[0], 256),
+        ),
+    )
+    parallel_state = SimpleNamespace(
+        ep_group=object(),
+        ep_size=8,
+        ep_rank=ep_rank,
+        dp_size=8,
+        dp_rank=ep_rank,
+        cp_size=1,
+        cp_rank=0,
+        cp_enabled=False,
+        tp_size=1,
+    )
+
+    monkeypatch.setattr(
+        parallel_state_module,
+        "get_parallel_state",
+        lambda: parallel_state,
+    )
+    monkeypatch.setattr(
+        combine_module,
+        "row_counts_for_ep_combine",
+        lambda *_args: row_counts,
+    )
+    monkeypatch.setattr(
+        combine_module,
+        "gather_tokens_for_ep_combine",
+        _gather_one_rank,
+    )
+    monkeypatch.setattr(
+        combine_module,
+        "gather_ids_for_ep_combine",
+        _gather_one_rank,
+    )
+    monkeypatch.setattr(
+        combine_module,
+        "exchange_variable_and_canonical_fold",
+        lambda partial, *_args: partial,
+    )
+    monkeypatch.setattr(
+        payload_module,
+        "dsv4_native_shared_expert_tp_partial",
+        _shared_partial,
+    )
+    monkeypatch.setattr(
+        payload_module,
+        "dsv4_join_routed_shared_partial",
+        lambda routed, shared, **_kwargs: routed + shared,
+    )
+
+    output, _ = DeepseekV4MoE._forward_exact_native(
+        fake_moe,
+        torch.ones(1, 1, 4),
+        torch.ones(1, 1, dtype=torch.long),
+        live_token_count=1,
+    )
+
+    assert output.shape == (1, 1, 4)
+    assert observed == {"routed": True, "shared": True}
 
 
 # ---------------------------------------------------------------------------

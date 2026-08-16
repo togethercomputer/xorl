@@ -37,6 +37,7 @@ from xorl.models.checkpoint_handlers.buffers import (  # noqa: F401
     parse_expert_key,
 )
 from xorl.ops.loss import fsdp_sharded_causallm_loss_function, get_loss_function
+from xorl.ops.loss.reducers import TokenPartial
 from xorl.utils import logging
 from xorl.utils.device import get_device_id, get_device_type, synchronize
 from xorl.utils.helper import empty_cache, get_dtype_size
@@ -1254,6 +1255,15 @@ def _shrink_expert_params_for_ep(model: "nn.Module") -> None:
     This function replaces full-size meta expert parameters with EP-local-sized
     meta parameters.  Since meta tensors use no device memory, this is free.
     The subsequent ``to_empty`` then allocates only the local expert slice.
+
+    Every shrunk parameter is recorded on its OWNER MODULE in
+    ``_xorl_ep_load_presliced`` ({param_name: (global_rows, ep_size)}).  This
+    pre-shrink plus the EP-aware filtered checkpoint load is the ONE EP
+    slicing site on the pre-wrap load path; ``ParallelPlan.apply`` consumes
+    the record to verify the storage is already EP-local and to fail closed
+    instead of ever slicing the same tensor a second time.  The record lives on the module,
+    not the parameter: ``to_empty``/custom ``_apply`` overrides replace the
+    parameter OBJECTS, so parameter-attribute stamps would not survive.
     """
     _ps = get_parallel_state()
     if not _ps.ep_enabled:
@@ -1276,7 +1286,8 @@ def _shrink_expert_params_for_ep(model: "nn.Module") -> None:
             and param.shape[0] % ep_size == 0
             and param.shape[0] // ep_size < param.shape[0]
         ):
-            local_experts = param.shape[0] // ep_size
+            global_rows = int(param.shape[0])
+            local_experts = global_rows // ep_size
             local_shape = (local_experts,) + param.shape[1:]
             new_param = nn.Parameter(
                 torch.empty(local_shape, dtype=param.dtype, device="meta"),
@@ -1284,12 +1295,42 @@ def _shrink_expert_params_for_ep(model: "nn.Module") -> None:
             )
             sub_mod, local_name = _find_submodule(model, name)
             sub_mod._parameters[local_name] = new_param
+            presliced = getattr(sub_mod, "_xorl_ep_load_presliced", None)
+            if presliced is None:
+                presliced = {}
+                sub_mod._xorl_ep_load_presliced = presliced
+            presliced[local_name] = (global_rows, int(ep_size))
             shrunk += 1
     if shrunk > 0:
         logger.info_rank0(
             f"EP pre-shrink: resized {shrunk} expert params to EP-local shapes "
             f"(ep_size={ep_size}) before materialization"
         )
+
+
+def _collect_qlora_source_only_skip_keys(model: "nn.Module", live_state_names: Set[str]) -> tuple[Set[str], Set[str]]:
+    """Collect checkpoint-only QLoRA keys without masking live model state."""
+
+    skip_keys: Set[str] = set()
+    skip_prefixes: Set[str] = set()
+    for fqn, module in model.named_modules():
+        for suffix in getattr(module, "_qlora_expected_skip_keys", ()):
+            key = f"{fqn}.{suffix}" if fqn else suffix
+            skip_keys.add(key)
+            skip_prefixes.add(key)
+
+    collisions = skip_keys.intersection(live_state_names)
+    if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+        gathered_collisions = [None] * dist.get_world_size()
+        dist.all_gather_object(gathered_collisions, sorted(collisions))
+        collisions = set().union(*(set(rank_collisions) for rank_collisions in gathered_collisions))
+    if collisions:
+        raise RuntimeError(
+            "QLoRA source-only checkpoint skip keys collide with live model parameters or buffers: "
+            f"{sorted(collisions)}. Inline checkpoint transforms must leave their runtime "
+            "targets eligible for dispatch."
+        )
+    return skip_keys, skip_prefixes
 
 
 @torch.no_grad()
@@ -1332,6 +1373,9 @@ def all_ranks_load_weights(
 
     buffer_dict = {name: buffer.clone() for name, buffer in model.named_buffers()}
     parameter_names_to_load = {name for name, _ in model.named_parameters()}
+    _expected_skip_keys, _expected_skip_prefixes = _collect_qlora_source_only_skip_keys(
+        model, parameter_names_to_load | set(buffer_dict)
+    )
 
     # torch.compile wraps modules with '_orig_mod.' prefix in parameter names.
     # Checkpoint keys don't have this prefix. Build a mapping to bridge the gap.
@@ -1435,20 +1479,8 @@ def all_ranks_load_weights(
 
     # Collect keys that are expected to be absent from the model (e.g., QLoRA replaces
     # expert weight params with quantized buffers — base weights loaded separately).
-    _expected_skip_keys = set()
     # Prefix-based skip: for MoE expert modules, checkpoint has per-expert keys
     # like "experts.0.gate_proj.weight" that should match skip prefix "experts.gate_proj"
-    _expected_skip_prefixes = set()
-    for fqn, mod in model.named_modules():
-        if getattr(mod, "_qlora_expected_skip_keys", None):
-            for suffix in mod._qlora_expected_skip_keys:
-                key = f"{fqn}.{suffix}" if fqn else suffix
-                _expected_skip_keys.add(key)
-                # Also add as prefix for per-expert matching:
-                # "model.layers.0.mlp.experts.gate_proj" matches
-                # "model.layers.0.mlp.experts.0.gate_proj.weight"
-                _expected_skip_prefixes.add(key)
-
     # Remove expected skip keys from parameter_names_to_load: FSDP2 may materialize
     # None parameters on some layers (e.g., QLoRALinear.weight), which would cause
     # them to appear in named_parameters(). These weights are loaded separately by
@@ -1894,6 +1926,9 @@ def grouped_load_weights(
 
     buffer_dict = {name: buffer.clone() for name, buffer in model.named_buffers()}
     parameter_names_to_load = {name for name, _ in model.named_parameters()}
+    _expected_skip_keys, _expected_skip_prefixes = _collect_qlora_source_only_skip_keys(
+        model, parameter_names_to_load | set(buffer_dict)
+    )
     non_persistent_buffer_names: Set[str] = set()
     for module_fqn, module in model.named_modules():
         for local_name in getattr(module, "_non_persistent_buffers_set", set()):
@@ -1981,15 +2016,6 @@ def grouped_load_weights(
         f"fanout_group_size={len(fanout_ranks)} leader_count={leader_count}"
     )
     prefetch_count = _get_grouped_weight_load_prefetch_count(shard_count)
-
-    _expected_skip_keys = set()
-    _expected_skip_prefixes = set()
-    for fqn, mod in model.named_modules():
-        if getattr(mod, "_qlora_expected_skip_keys", None):
-            for suffix in mod._qlora_expected_skip_keys:
-                key = f"{fqn}.{suffix}" if fqn else suffix
-                _expected_skip_keys.add(key)
-                _expected_skip_prefixes.add(key)
 
     parameter_names_to_load -= _expected_skip_keys
     persistent_buffer_names_to_load -= _expected_skip_keys
@@ -2360,6 +2386,15 @@ def post_process_after_weight_loading(
         if qlora_skip_prefixes and _is_qlora_expert_key(name):
             continue
         _dispatch_buffer(model, name, buffer, dtensor_factory)
+
+    # named_buffers() deduplicates shared tensor objects, so the snapshot above
+    # restores a shared buffer under only its first FQN and to_empty leaves the
+    # other holders zeroed. Models that share large tables across layers (e.g.
+    # DSV4 RoPE freqs) rebuild them here.
+    rebuild_shared = getattr(model, "rebuild_shared_freqs_cis", None)
+    if callable(rebuild_shared):
+        rebuilt_count = rebuild_shared()
+        logger.info_rank0(f"Rebuilt {rebuilt_count} shared freqs_cis buffers after weight loading")
 
     if parameter_names_left:
         logger.info_rank0(f"Find missing key(s) in state dict: {parameter_names_left}, initialize them.")
@@ -2802,7 +2837,7 @@ def save_model_assets(output_dir: Union[str, "os.PathLike"], model_assets: Seque
 
 def get_lm_head_weight(lm_head: nn.Module, *, fsdp_sharded_loss: bool = False) -> torch.Tensor:
     """Get lm_head weight, merging LoRA delta if applicable."""
-    if getattr(lm_head, "_glm52_exact_tp16_lm_head", False):
+    if getattr(lm_head, "_glm52_exact_tp16_lm_head", False) or getattr(lm_head, "_dsv4_exact_tp8_lm_head", False):
         if lora_merged_forward_enabled(lm_head):
             raise RuntimeError("The exact GLM-5.2 lm head rejects merged-forward mode")
         return lm_head.weight
@@ -2838,8 +2873,30 @@ def compute_loss(
     """
     fn_name = loss_fn_name or "causallm_loss"
     loss_fn = get_loss_function(fn_name)
-    exact_lm_head = bool(getattr(lm_head, "_glm52_exact_tp16_lm_head", False))
-    fsdp_sharded_loss = bool(getattr(lm_head, "_xorl_fsdp_sharded_lm_head_loss", False)) and not exact_lm_head
+    ps = get_parallel_state()
+    exact_lm_head = bool(
+        getattr(lm_head, "_glm52_exact_tp16_lm_head", False) or getattr(lm_head, "_dsv4_exact_tp8_lm_head", False)
+    )
+    requested_ce_mode = (loss_fn_params or {}).get("ce_mode")
+    bi_fused_lm_head_tp = bool(
+        requested_ce_mode == "bi_fused"
+        and getattr(ps, "lm_head_tp_size", 1) > 1
+        and getattr(ps, "lm_head_tp_group", None) is not None
+    )
+    if bi_fused_lm_head_tp:
+        loss_fn_params = dict(loss_fn_params or {})
+        global_valid_tokens = loss_fn_params.pop("fsdp_sharded_lm_head_loss_global_valid_tokens", None)
+        loss_fn_params.pop("fsdp_sharded_lm_head_loss_num_chunks", None)
+        loss_fn_params.pop("empty_cache_before_sharded_lm_head_loss", None)
+        if global_valid_tokens is not None:
+            loss_fn_params["loss_reducer"] = TokenPartial(
+                scale=global_valid_tokens.detach().to(last_hidden_state.device, dtype=torch.float32)
+            )
+    fsdp_sharded_loss = (
+        bool(getattr(lm_head, "_xorl_fsdp_sharded_lm_head_loss", False))
+        and not exact_lm_head
+        and not bi_fused_lm_head_tp
+    )
     if fsdp_sharded_loss and fn_name not in {"causallm_loss", "cross_entropy"}:
         raise NotImplementedError(f"fsdp_sharded_lm_head_loss is not supported for loss function {fn_name!r}.")
     weight = get_lm_head_weight(lm_head, fsdp_sharded_loss=fsdp_sharded_loss)
@@ -2847,7 +2904,6 @@ def compute_loss(
     slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
     hidden_states = last_hidden_state[:, slice_indices, :]
 
-    ps = get_parallel_state()
     if fsdp_sharded_loss:
         if ps.tp_enabled:
             raise NotImplementedError("fsdp_sharded_lm_head_loss is not supported together with tensor parallelism.")
@@ -2929,6 +2985,9 @@ def compute_loss(
     if exact_lm_head:
         if not getattr(lm_head, "_xorl_fsdp_sharded_lm_head_loss", False):
             raise RuntimeError("The exact GLM-5.2 lm head was not prepared for sharded TP16 loss")
+        loss_kwargs["lm_head"] = lm_head
+        loss_kwargs["tp_group"] = ps.lm_head_tp_group
+    elif bi_fused_lm_head_tp:
         loss_kwargs["lm_head"] = lm_head
         loss_kwargs["tp_group"] = ps.lm_head_tp_group
     elif ps.tp_enabled:

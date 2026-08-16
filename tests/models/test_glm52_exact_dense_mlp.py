@@ -122,14 +122,15 @@ def test_dense_mlp_forward_composes_fused_gate_up_production_activation_and_exac
 
     def activation_value(gate_up):
         events.append(("activation", tuple(gate_up.shape)))
-        return F.silu(gate_up[..., :128]) * gate_up[..., 128:]
+        # One-round FP32 SwiGLU: SiLU and multiply in fp32, single rounding.
+        return (F.silu(gate_up[..., :128].float()) * gate_up[..., 128:].float()).to(gate_up.dtype)
 
     def down_value(input, factor_A, factor_B):
         events.append(("down", tuple(input.shape)))
         return _literal_linear_value(input, down_base, factor_A, factor_B)
 
     monkeypatch.setattr(module, "_exact_forward_value", gate_up_value)
-    monkeypatch.setattr(exact_dense_mlp_module, "fused_silu_and_mul", activation_value)
+    monkeypatch.setattr(exact_dense_mlp_module, "exact_fp32_silu_and_mul", activation_value)
     monkeypatch.setattr(module.down_proj, "_exact_forward_value", down_value)
     input = torch.arange(24, dtype=torch.float32).reshape(3, 8).sub_(7).div_(53).to(torch.bfloat16)
 
@@ -149,7 +150,9 @@ def test_dense_mlp_forward_composes_fused_gate_up_production_activation_and_exac
         effective_up_A,
         effective_up_B,
     )
-    expected_activation = F.silu(expected_gate_up[..., :128]) * expected_gate_up[..., 128:]
+    expected_activation = (F.silu(expected_gate_up[..., :128].float()) * expected_gate_up[..., 128:].float()).to(
+        expected_gate_up.dtype
+    )
     expected = _literal_linear_value(
         expected_activation,
         down_base,
@@ -165,10 +168,11 @@ def test_dense_mlp_forward_composes_fused_gate_up_production_activation_and_exac
 
 
 def test_dense_mlp_runtime_rank_alpha_contract_is_atomic_and_fails_before_forward() -> None:
-    with pytest.raises(ValueError, match="rank=1 and alpha=1"):
-        Glm52ExactTP1DenseMLP(8, 128, r=2, lora_alpha=1)
-    with pytest.raises(ValueError, match="rank=1 and alpha=1"):
-        Glm52ExactTP1DenseMLP(8, 128, r=1, lora_alpha=2)
+    rank_three = Glm52ExactTP1DenseMLP(8, 128, r=3, lora_alpha=7)
+    assert rank_three.down_proj.lora_A.shape == (3, 128)
+    assert rank_three.down_proj.lora_B.shape == (8, 3)
+    with pytest.raises(ValueError, match="positive integer rank"):
+        Glm52ExactTP1DenseMLP(8, 128, r=0, lora_alpha=1)
 
     module = _module()
     before = (
@@ -177,8 +181,8 @@ def test_dense_mlp_runtime_rank_alpha_contract_is_atomic_and_fails_before_forwar
         module.down_proj.active_r,
         module.down_proj.active_lora_alpha,
     )
-    with pytest.raises(ValueError, match="runtime requires rank=1 and alpha=1"):
-        module.set_runtime_lora_config(2, 2)
+    with pytest.raises(ValueError, match="positive integer alpha"):
+        module.set_runtime_lora_config(1, 0)
     assert (
         module.active_r,
         module.active_lora_alpha,
@@ -188,11 +192,11 @@ def test_dense_mlp_runtime_rank_alpha_contract_is_atomic_and_fails_before_forwar
 
     input = torch.zeros(1, 8, dtype=torch.bfloat16)
     module.down_proj.active_lora_alpha = 2
-    with pytest.raises(RuntimeError, match="gate, up, and down before forward"):
+    with pytest.raises(RuntimeError, match="one consistent adapter contract"):
         module(input)
     module.set_runtime_lora_config(1, 1)
     module.active_r = 2
-    with pytest.raises(RuntimeError, match="gate, up, and down before forward"):
+    with pytest.raises(RuntimeError, match="one consistent adapter contract"):
         module(input)
 
 

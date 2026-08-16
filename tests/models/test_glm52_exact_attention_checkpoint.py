@@ -111,7 +111,7 @@ def test_exact_attention_checkpoint_inventory_routes_only_absorbed_kv_b_through_
     assert case.module._source_quant_format == "block_fp8"
     assert case.module._is_prequantized is True
     assert case.module._merge_sources is None
-    assert case.module._qlora_expected_skip_keys == {"weight", "weight_scale_inv"}
+    assert case.module._qlora_expected_skip_keys == {"weight"}
 
     for projection in _ORDINARY_PROJECTIONS:
         fqn = f"{_ATTENTION_PREFIX}.{projection}"

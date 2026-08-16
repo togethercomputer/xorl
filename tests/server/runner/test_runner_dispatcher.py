@@ -31,6 +31,31 @@ def _dispatcher(rank: int, world_size: int) -> RunnerDispatcher:
     return dispatcher
 
 
+def test_dispatcher_enables_cp_alignment_from_resolved_exact_gdn_contract(monkeypatch):
+    captured = {}
+
+    class SequenceCollator:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    parallel_state = SimpleNamespace(cp_enabled=True, cp_size=2, cp_rank=0)
+    monkeypatch.setattr(runner_dispatcher_module, "get_parallel_state", lambda: parallel_state)
+    monkeypatch.setattr(runner_dispatcher_module, "TextSequenceShardCollator", SequenceCollator)
+    monkeypatch.setattr(runner_dispatcher_module, "WeightSyncHandler", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(runner_dispatcher_module, "AdapterCoordinator", lambda *_args, **_kwargs: object())
+
+    trainer = SimpleNamespace(
+        model_config_obj=SimpleNamespace(
+            _qwen35_exact_contract=True,
+            layer_types=["full_attention", "linear_attention"],
+        )
+    )
+    dispatcher = RunnerDispatcher(trainer=trainer, rank=0, world_size=2)
+
+    assert dispatcher._sequence_shard_collator is not None
+    assert captured == {"gdn_exact_cp_align": True}
+
+
 class FakeMooncakeClient:
     def __init__(self) -> None:
         self.objects: dict[str, bytes] = {}
@@ -66,6 +91,76 @@ def _batch(batch_id: int, *, num_samples: int = 1) -> dict:
         "position_ids": [[0, 1]],
         "num_samples": num_samples,
     }
+
+
+def _span_item(path, values: torch.Tensor) -> dict:
+    return {
+        "schema": "xorl.r3.spans.v1",
+        "rows": values.shape[0],
+        "shape": list(values.shape),
+        "dtype": "int32",
+        "spans": [
+            {
+                "path": str(path),
+                "offset": 0,
+                "source_row": 0,
+                "rows": values.shape[0],
+                "row_nbytes": values.shape[1] * values.shape[2] * 4,
+                "source_shape": list(values.shape),
+                "dtype": "int32",
+            }
+        ],
+    }
+
+
+def test_sglang_file_loader_mmaps_only_requested_datum_slice(tmp_path, monkeypatch):
+    values = torch.arange(12, dtype=torch.int32).reshape(3, 2, 2)
+    selected = tmp_path / "selected.bin"
+    selected.write_bytes(values.numpy().tobytes())
+    missing = _span_item(tmp_path / "must-not-be-read.bin", values)
+    ref = {
+        "__xorl_routing_payload_ref__": True,
+        "transport": "sglang_files",
+        "version": 1,
+        "format": "spans",
+        "kind": "routed_experts",
+        "count": 3,
+        "items": [missing, _span_item(selected, values), missing],
+    }
+    monkeypatch.setenv("XORL_R3_SHARED_ROOTS", str(tmp_path))
+
+    loaded = _dispatcher(0, 1)._load_routing_payload_slice(ref, 1, 1)
+
+    assert len(loaded) == 1
+    assert torch.equal(loaded[0], values)
+
+
+def test_sglang_file_loader_reassembles_prefix_spans_rank_locally(tmp_path, monkeypatch):
+    first = torch.arange(16, dtype=torch.int32).reshape(4, 2, 2)
+    second = torch.arange(100, 112, dtype=torch.int32).reshape(3, 2, 2)
+    first_path = tmp_path / "first.bin"
+    second_path = tmp_path / "second.bin"
+    first_path.write_bytes(first.numpy().tobytes())
+    second_path.write_bytes(second.numpy().tobytes())
+    item = _span_item(first_path, first)
+    item["rows"] = 5
+    item["shape"][0] = 5
+    item["spans"][0]["rows"] = 2
+    item["spans"].append(_span_item(second_path, second)["spans"][0] | {"rows": 3})
+    ref = {
+        "__xorl_routing_payload_ref__": True,
+        "transport": "sglang_files",
+        "version": 1,
+        "format": "spans",
+        "kind": "routed_experts",
+        "count": 1,
+        "items": [item],
+    }
+    monkeypatch.setenv("XORL_R3_SHARED_ROOTS", str(tmp_path))
+
+    loaded = _dispatcher(0, 1)._load_routing_payload_slice(ref, 0, 1)
+
+    assert torch.equal(loaded[0], torch.cat((first[:2], second), dim=0))
 
 
 def _parallel_state(**overrides):
@@ -345,6 +440,7 @@ def test_select_batches_loads_only_mooncake_routing_ref_slice(monkeypatch):
         routed_experts=[[[[idx, idx + 1]]] for idx in range(4)],
         routed_expert_logits=[[[[float(idx), float(idx + 1)]]] for idx in range(4)],
         store=store,
+        chunk_ranges=[(0, 1), (1, 1), (2, 1), (3, 1)],
     )
     assert expert_ref is not None and logits_ref is not None
 
@@ -391,9 +487,7 @@ def test_select_batches_world_size_one_loads_mooncake_routing_refs(monkeypatch):
     assert [item.tolist() for item in routed_logits] == [[[[0.0, 1.0]]], [[[2.0, 3.0]]]]
     assert client.get_calls == [
         expert_ref["items"]["routed_experts"][0]["key"],
-        expert_ref["items"]["routed_experts"][1]["key"],
         logits_ref["items"]["routed_expert_logits"][0]["key"],
-        logits_ref["items"]["routed_expert_logits"][1]["key"],
     ]
 
 

@@ -9,6 +9,9 @@ The tilelang/CUDA-only paths (compress_ratio=4 sparse-MLA, full Flash
 dims) are exercised in Phase-6 e2e jobs.
 """
 
+import copy
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn as nn
@@ -85,16 +88,141 @@ def _lm_logits(model, input_ids):
     return model.lm_head(outputs.last_hidden_state)
 
 
-def test_for_causal_lm_rejects_pipeline_parallelism():
-    """DSv4 requires a dedicated PP forward because hyperconnection state is 4-D."""
+def test_for_causal_lm_declares_structural_hyperconnection_pipeline_boundary():
+    """DSv4's dedicated PP forward carries its 4-D HyperConnection state."""
     from xorl.models.transformers.deepseek_v4 import DeepseekV4ForCausalLM  # noqa: PLC0415
 
     cfg = _tiny_config(num_hidden_layers=1, compress_ratios=[0])
     model = DeepseekV4ForCausalLM(cfg, moe_implementation="eager")
 
+    pp_config = model.get_pp_module_config()
     assert model.config.base_model_pp_plan is None
-    with pytest.raises(ValueError, match="Pipeline parallelism is not supported"):
-        model.get_pp_module_config()
+    assert pp_config["layer_prefix"] == "model.layers"
+    assert pp_config["pipeline_boundary_state"] == {
+        "rank": 4,
+        "dtype": "bfloat16",
+        "shape_suffix": (cfg.hc_mult, cfg.hidden_size),
+        "state": "completed_hyperconnection_residual",
+    }
+    assert model._pp_carries_hyperconnection_state is True
+    assert model._pp_requires_original_input_ids is True
+
+
+@pytest.mark.parametrize(
+    "runner_type",
+    [
+        pytest.param("trainer", id="trainer"),
+        pytest.param("model_runner", id="model-runner"),
+    ],
+)
+def test_dsv4_pipeline_meta_io_keeps_internal_state_4d_and_terminal_hidden_3d(runner_type):
+    if runner_type == "trainer":
+        from xorl.trainers.trainer import Trainer as Runner  # noqa: PLC0415
+    else:
+        from xorl.server.runner.model_runner import ModelRunner as Runner  # noqa: PLC0415
+
+    cfg = _tiny_config(num_hidden_layers=2, compress_ratios=[0, 0])
+    boundary = {
+        "rank": 4,
+        "dtype": torch.bfloat16,
+        "shape_suffix": (cfg.hc_mult, cfg.hidden_size),
+        "state": "completed_hyperconnection_residual",
+    }
+    runner = object.__new__(Runner)
+    runner.model = SimpleNamespace(config=cfg)
+    runner.pp_num_stages = 2
+    runner.model_parts = [
+        SimpleNamespace(_pp_pipeline_boundary_state=boundary),
+        SimpleNamespace(_pp_pipeline_boundary_state=boundary),
+    ]
+    runner.pp_stages = [SimpleNamespace(stage_index=0), SimpleNamespace(stage_index=1)]
+    input_ids = torch.empty(2, 5, dtype=torch.int64)
+
+    stage0_in, stage0_out = runner._build_pp_stage_io(input_ids, 0, True)
+    stage1_in, stage1_out = runner._build_pp_stage_io(input_ids, 1, True)
+    _, stage1_logits = runner._build_pp_stage_io(input_ids, 1, False)
+
+    assert stage0_in[0].shape == (2, 5)
+    assert stage0_out[0].shape == (2, 5, cfg.hc_mult, cfg.hidden_size)
+    assert stage1_in[0].shape == (2, 5, cfg.hc_mult, cfg.hidden_size)
+    assert stage1_out[0].shape == (2, 5, cfg.hidden_size)
+    assert stage1_logits[0].shape == (2, 5, cfg.vocab_size)
+
+
+@pytest.mark.parametrize("cut", [1, 3, 4])
+def test_pipeline_cut_preserves_dsv4_hyperconnection_forward_and_backward(cut):
+    """Exercise hash-ID handoff and later pure-hyperconnection boundaries."""
+
+    from xorl.distributed.pipeline_parallel import (  # noqa: PLC0415
+        _recursive_prune,
+        generate_llm_fqn_from_layer_ranges,
+    )
+    from xorl.models.transformers.deepseek_v4 import DeepseekV4ForCausalLM  # noqa: PLC0415
+
+    torch.manual_seed(17)
+    cfg = _tiny_config(num_hidden_layers=5, compress_ratios=[0] * 5, num_hash_layers=3)
+    template = _make_model(cfg, DeepseekV4ForCausalLM)
+    table = (
+        torch.arange(cfg.vocab_size).unsqueeze(1) + torch.arange(cfg.num_experts_per_tok).unsqueeze(0)
+    ) % cfg.n_routed_experts
+    for layer_index in range(cfg.num_hash_layers):
+        template.model.layers[layer_index].mlp.tid2eid.copy_(table.to(torch.int32))
+
+    baseline = copy.deepcopy(template)
+    stage0 = copy.deepcopy(template)
+    stage1 = copy.deepcopy(template)
+    assignments = generate_llm_fqn_from_layer_ranges(
+        ((0, cut), (cut, cfg.num_hidden_layers)),
+        num_layers=cfg.num_hidden_layers,
+        input_fqns=["model.embed_tokens"],
+        layer_prefix="model.layers",
+        output_fqns=["model.norm", "lm_head"],
+    )
+    _recursive_prune(stage0, "", set(assignments[0]))
+    _recursive_prune(stage1, "", set(assignments[1]))
+    stage0._pp_is_first = True
+    stage0._pp_is_last = False
+    stage1._pp_is_first = False
+    stage1._pp_is_last = True
+
+    input_ids = torch.randint(0, cfg.vocab_size, (1, 4), dtype=torch.long)
+    baseline_hidden = baseline(input_ids=input_ids).last_hidden_state
+    baseline_logits = baseline.lm_head(baseline_hidden)
+    baseline_logits.square().sum().backward()
+
+    wire = stage0(
+        input_ids=input_ids,
+        _pp_stage_is_first=True,
+        _pp_stage_is_last=False,
+    ).last_hidden_state
+    assert wire.shape == (1, 4, cfg.hc_mult, cfg.hidden_size)
+    wire_leaf = wire.detach().requires_grad_(True)
+    staged_hidden = stage1(
+        input_ids=input_ids,
+        inputs_embeds=wire_leaf,
+        _pp_stage_is_first=False,
+        _pp_stage_is_last=True,
+    ).last_hidden_state
+    assert staged_hidden.shape == (1, 4, cfg.hidden_size)
+    staged_logits = stage1.lm_head(staged_hidden)
+    staged_logits.square().sum().backward()
+    assert wire_leaf.grad is not None and torch.isfinite(wire_leaf.grad).all()
+    wire.backward(wire_leaf.grad)
+
+    torch.testing.assert_close(staged_logits, baseline_logits, rtol=0, atol=0)
+    baseline_params = dict(baseline.named_parameters())
+    stage0_params = dict(stage0.named_parameters())
+    stage1_params = dict(stage1.named_parameters())
+    gradient_names = (
+        "model.embed_tokens.weight",
+        f"model.layers.{cut - 1}.self_attn.wq_a.weight",
+        f"model.layers.{cut}.self_attn.wq_a.weight",
+        "lm_head.weight",
+    )
+    for name in gradient_names:
+        staged_param = stage0_params.get(name, stage1_params.get(name))
+        assert staged_param is not None and staged_param.grad is not None, name
+        torch.testing.assert_close(staged_param.grad, baseline_params[name].grad, rtol=1e-5, atol=1e-6)
 
 
 def test_model_forward_shape_window_only():

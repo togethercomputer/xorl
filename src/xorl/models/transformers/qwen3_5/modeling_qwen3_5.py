@@ -18,6 +18,7 @@ from xorl.models.layers.attention import (
     update_causal_mask,
 )
 from xorl.models.layers.attention.backend import get_attention_fn
+from xorl.models.layers.fused_projection_lora import project_fused_linear_with_lora
 from xorl.models.layers.normalization import (
     compiled_zero_centered_rms_norm,
     eager_zero_centered_rms_norm,
@@ -41,7 +42,7 @@ from xorl.models.transformers.qwen3_5_shared import (
     has_linear_attention_layers,
     qwen3_5_apply_rotary_pos_emb,
 )
-from xorl.ops.fused_silu_and_mul import fused_silu_and_mul
+from xorl.ops.fused_silu_and_mul import exact_fp32_silu_and_mul, fused_silu_and_mul
 from xorl.ops.linear_attention import GatedDeltaNet
 from xorl.ops.linear_attention.ops.cp import build_linear_attention_cp_context
 from xorl.utils import logging
@@ -63,6 +64,12 @@ def _adapt_qwen3_5_config(config):
         adapted = config
     adapted._qwen35_exact_contract = exact_contract
     adapted._qwen35_rmsnorm_family = rmsnorm_family
+    # Carry the family-neutral resolution-time stamps across config adaptation
+    # (only when present -- direct-construction configs stay unstamped so the
+    # legacy-flag fallbacks keep working).
+    for stamp in ("_exact_contract_family", "_exact_one_round_swiglu"):
+        if hasattr(config, stamp):
+            setattr(adapted, stamp, getattr(config, stamp))
     return adapted
 
 
@@ -73,6 +80,8 @@ def _raise_if_ring_fla_unsupported(config: Qwen3_5Config, ps) -> None:
 
 
 class Qwen3_5MLP(nn.Module):
+    _supports_fused_gate_up_lora = True
+
     def __init__(self, config):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -80,7 +89,23 @@ class Qwen3_5MLP(nn.Module):
         self.gate_up_proj = nn.Linear(self.hidden_size, 2 * self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
-        self._use_fused_silu = config.hidden_act == "silu" and not getattr(config, "_activation_native", False)
+        activation_native = getattr(config, "_activation_native", False)
+        if getattr(config, "_qwen35_exact_contract", False):
+            activation_native = False
+        self._use_fused_silu = config.hidden_act == "silu" and not activation_native
+        # One-round FP32 SwiGLU is scoped to the exact contract (serving-paired
+        # program); every other caller keeps the historical two-round bytes.
+        # Model resolution stamps the family-neutral ``_exact_one_round_swiglu``
+        # key; configs that predate stamping keep their historical selection
+        # through the legacy Qwen-named flag.
+        self._exact_one_round = bool(
+            getattr(config, "_exact_one_round_swiglu", getattr(config, "_qwen35_exact_contract", False))
+        )
+
+    def _fused_act(self, gate_up):
+        if self._exact_one_round:
+            return exact_fp32_silu_and_mul(gate_up)
+        return fused_silu_and_mul(gate_up)
 
     def unfuse_for_tp(self):
         """Replace fused gate_up_proj with separate gate_proj and up_proj for tensor parallelism."""
@@ -92,13 +117,25 @@ class Qwen3_5MLP(nn.Module):
 
     def forward(self, x):
         if hasattr(self, "gate_up_proj"):
+            gate_up = project_fused_linear_with_lora(
+                self,
+                x,
+                base_name="gate_up_proj",
+                projection_names=("gate_proj", "up_proj"),
+                projection_sizes=(self.intermediate_size, self.intermediate_size),
+            )
             if self._use_fused_silu:
-                x = fused_silu_and_mul(self.gate_up_proj(x))
+                x = self._fused_act(gate_up)
             else:
-                gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
+                gate, up = gate_up.chunk(2, dim=-1)
                 x = self.act_fn(gate) * up
         else:
-            x = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+            gate = self.gate_proj(x)
+            up = self.up_proj(x)
+            if self._use_fused_silu:
+                x = self._fused_act(torch.cat([gate, up], dim=-1))
+            else:
+                x = self.act_fn(gate) * up
         return self.down_proj(x)
 
 
@@ -272,7 +309,12 @@ class Qwen3_5Attention(nn.Module):
         **kwargs: Unpack[AttentionKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         del position_ids, past_key_values
-        attn_strategy = get_cp_strategy()
+        # Qwen3.5 PINS the sync Ulysses variant: this call site and the
+        # prepare_position_embeddings site must agree (RoPE is applied before
+        # the head-scattering all-to-all on sequence-sliced tables). The
+        # historical "auto" heuristic flips the variant — and with it the
+        # RoPE placement — based on whether num_kv_heads is passed.
+        attn_strategy = get_cp_strategy(variant="sync")
         query_states, key_states, value_states = attn_strategy.project_qkv(self, hidden_states, position_embeddings)
         attn_output = attn_strategy.compute_attention(
             self, query_states, key_states, value_states, attention_mask, **kwargs
@@ -411,10 +453,7 @@ class Qwen3_5PreTrainedModel(XorlPreTrainedModel):
             module.original_inv_freq = module.inv_freq
 
     def get_checkpoint_handler(self, **kwargs):
-        # When unfused for TP, checkpoint keys (q_proj, k_proj, v_proj, gate_proj,
-        # up_proj) already match the model's parameter names - no merging needed.
-        if getattr(self, "_unfused_for_tp", False):
-            return None
+        unfused = getattr(self, "_unfused_for_tp", False)
 
         weights_path = kwargs.get("weights_path", None)
         is_prequantized = detect_prequantized_checkpoint(weights_path)
@@ -435,6 +474,9 @@ class Qwen3_5PreTrainedModel(XorlPreTrainedModel):
             linear_key_dim=self.config.linear_num_key_heads * self.config.linear_key_head_dim,
             linear_value_dim=self.config.linear_num_value_heads * self.config.linear_value_head_dim,
             skip_qkv_merge=True,
+            # Only the merges are skipped, never the handler: it also remaps the
+            # GatedDeltaNet in_proj_qkv packing, regardless of how the MLP is stored.
+            skip_gate_up_merge=unfused,
             is_prequantized=is_prequantized,
             exclude_modules=exclude_modules,
         )
@@ -515,7 +557,9 @@ class Qwen3_5TextModel(Qwen3_5PreTrainedModel):
             linear_attn_mask = None
 
         position_embeddings = self.rotary_emb(hidden_states, position_ids)
-        position_embeddings = get_cp_strategy().prepare_position_embeddings(
+        # Same explicit variant as the attention call site: sequence-slice the
+        # cos/sin tables because RoPE runs before the sync all-to-all.
+        position_embeddings = get_cp_strategy(variant="sync").prepare_position_embeddings(
             position_embeddings,
             dim=1,
             sp_group=ps.sp_group,

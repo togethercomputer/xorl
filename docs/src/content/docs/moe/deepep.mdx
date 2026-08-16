@@ -2,11 +2,11 @@
 title: "DeepEP"
 ---
 
-DeepEP is an NVLink-optimized expert parallelism dispatch backend. It replaces NCCL AllToAll with direct GPU-to-GPU NVLink transfers, significantly reducing dispatch and combine latency for MoE models on NVLink clusters.
+DeepEP is a GPU-resident expert-parallel dispatch backend. It uses GPU interconnects such as NVLink within a node and NVSHMEM/GPUDirect RDMA on supported multi-node deployments. Whether it outperforms the default `alltoall` path depends on the model, token shape, EP topology, fabric, and SM allocation.
 
 ## Requirements
 
-- NVLink-connected GPU cluster (H100 NVLink or DGX H100)
+- Supported NVIDIA GPUs and an admitted intra-node or multi-node fabric
 - `deep_ep` wheel installed (see [Installation](/xorl/getting-started/installation/))
 - `ep_dispatch: deepep` in model config
 - For internode (multi-node) EP: `nvidia_peermem` kernel module loaded and IBGDA enabled on all nodes (see below)
@@ -14,7 +14,7 @@ DeepEP is an NVLink-optimized expert parallelism dispatch backend. It replaces N
 ## Installation
 
 ```bash
-pip install deep_ep-*.whl   # from xorl-org/xorl-wheels releases
+pip install deep_ep-*.whl   # use a wheel compatible with the selected CUDA/PyTorch profile
 ```
 
 Verify:
@@ -78,7 +78,7 @@ sudo cat /proc/driver/nvidia/params | grep -E "EnableStreamMemOPs|RegistryDwords
 ```yaml
 model:
   ep_dispatch: deepep
-  deepep_buffer_size_gb: 2.0    # NVLink buffer pool size per GPU (default: 2.0)
+  deepep_buffer_size_gb: 2.0    # communication buffer pool per GPU (default: 2.0)
   deepep_num_sms: 20            # SMs dedicated to communication (default: 20)
   deepep_async_combine: false   # async combine overlap (experimental)
 ```
@@ -86,7 +86,7 @@ model:
 | Parameter | Default | Description |
 |---|---|---|
 | `ep_dispatch` | `alltoall` | Set to `deepep` to enable |
-| `deepep_buffer_size_gb` | `2.0` | Per-GPU NVLink buffer pool in GB. Larger = fewer chunked transfers. Rule of thumb: `2 × token_budget × hidden_dim × sizeof(bf16)` |
+| `deepep_buffer_size_gb` | `2.0` | Per-GPU communication buffer pool in GB. Larger buffers can reduce chunking but consume more resident memory. |
 | `deepep_num_sms` | `20` | SMs dedicated to communication kernels. Must be even. |
 | `deepep_async_combine` | `false` | Overlap combine with next layer's compute (experimental, **currently disabled** — see [Async Combine](#async-combine-experimental)) |
 
@@ -94,17 +94,17 @@ model:
 
 ## How DeepEP Works
 
-Standard AllToAll routes tokens through the CPU-managed NCCL pipeline:
+The default path uses a device-side distributed AllToAll collective:
 ```
-GPU 0 → NCCL buffer → NVLink → NCCL buffer → GPU 1
-```
-
-DeepEP uses RDMA-style direct GPU memory access:
-```
-GPU 0 → NVLink (direct write to GPU 1 memory)
+GPU 0 → collective send/receive buffers → GPU 1
 ```
 
-This eliminates staging through NCCL buffers and CPU synchronization points, reducing dispatch latency from ~5ms to ~1ms per step on 64-GPU clusters.
+DeepEP uses GPU-initiated transport and specialized dispatch/combine kernels:
+```
+GPU 0 → NVLink within a node, or NVSHMEM/GPUDirect RDMA across nodes → GPU 1
+```
+
+The ordinary XoRL AllToAll path does not stage token payloads through host memory. Compare the two backends on the intended topology rather than assuming a fixed latency multiplier.
 
 <svg viewBox="0 0 700 240" style="max-width:700px;width:100%;margin:1.5rem 0" font-family="sans-serif">
   <defs>
@@ -129,11 +129,11 @@ This eliminates staging through NCCL buffers and CPU synchronization points, red
 
   <rect x="110" y="45" width="80" height="40" rx="5" fill="#fef3c7" stroke="#d97706" stroke-width="1.5"/>
   <text x="150" y="63" text-anchor="middle" font-size="10" fill="#92400e" font-weight="600">NCCL buffer</text>
-  <text x="150" y="77" text-anchor="middle" font-size="9" fill="#92400e">CPU staging</text>
+  <text x="150" y="77" text-anchor="middle" font-size="9" fill="#92400e">send buffer</text>
 
   <rect x="205" y="45" width="80" height="40" rx="5" fill="#fef3c7" stroke="#d97706" stroke-width="1.5"/>
   <text x="245" y="63" text-anchor="middle" font-size="10" fill="#92400e" font-weight="600">NCCL buffer</text>
-  <text x="245" y="77" text-anchor="middle" font-size="9" fill="#92400e">CPU staging</text>
+  <text x="245" y="77" text-anchor="middle" font-size="9" fill="#92400e">recv buffer</text>
 
   <rect x="300" y="45" width="30" height="40" rx="5" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
   <text x="315" y="62" text-anchor="middle" font-size="10" fill="#1e293b" font-weight="600">GPU</text>
@@ -146,20 +146,20 @@ This eliminates staging through NCCL buffers and CPU synchronization points, red
   <text x="150" y="103" text-anchor="middle" font-size="9" fill="#64748b">NVLink (via NCCL)</text>
 
   <rect x="25" y="120" width="130" height="40" rx="5" fill="#fee2e2" stroke="#dc2626" stroke-width="1"/>
-  <text x="90" y="137" text-anchor="middle" font-size="10" fill="#dc2626" font-weight="600">CPU sync required</text>
-  <text x="90" y="152" text-anchor="middle" font-size="9" fill="#64748b">blocking dispatch</text>
+  <text x="90" y="137" text-anchor="middle" font-size="10" fill="#dc2626" font-weight="600">collective schedule</text>
+  <text x="90" y="152" text-anchor="middle" font-size="9" fill="#64748b">device buffers</text>
 
   <rect x="170" y="120" width="140" height="40" rx="5" fill="#fee2e2" stroke="#dc2626" stroke-width="1"/>
-  <text x="240" y="137" text-anchor="middle" font-size="11" fill="#dc2626" font-weight="700">~5ms / step</text>
-  <text x="240" y="152" text-anchor="middle" font-size="9" fill="#64748b">EP=64, Qwen3-235B</text>
+  <text x="240" y="137" text-anchor="middle" font-size="11" fill="#dc2626" font-weight="700">measure this path</text>
+  <text x="240" y="152" text-anchor="middle" font-size="9" fill="#64748b">target shape + topology</text>
 
   <rect x="25" y="170" width="285" height="50" rx="5" fill="#f8fafc" stroke="#e2e8f0" stroke-width="1"/>
   <text x="167" y="189" text-anchor="middle" font-size="10" fill="#475569">GPU memory → NCCL staging buffer</text>
   <text x="167" y="204" text-anchor="middle" font-size="10" fill="#475569">→ NVLink → NCCL recv buffer → GPU memory</text>
-  <text x="167" y="218" text-anchor="middle" font-size="9" fill="#94a3b8">4 copies + 2 CPU sync points per transfer</text>
+  <text x="167" y="218" text-anchor="middle" font-size="9" fill="#94a3b8">collective-managed device data path</text>
 
   <rect x="360" y="10" width="330" height="220" rx="8" fill="#fff" stroke="#e2e8f0" stroke-width="1.5"/>
-  <text x="525" y="32" text-anchor="middle" font-size="12" fill="#1e293b" font-weight="700">DeepEP (NVLink Direct)</text>
+  <text x="525" y="32" text-anchor="middle" font-size="12" fill="#1e293b" font-weight="700">DeepEP (single-node view)</text>
 
   <rect x="375" y="45" width="70" height="40" rx="5" fill="#dbeafe" stroke="#2563eb" stroke-width="1.5"/>
   <text x="410" y="62" text-anchor="middle" font-size="11" fill="#1e293b" font-weight="600">GPU 0</text>
@@ -177,13 +177,13 @@ This eliminates staging through NCCL buffers and CPU synchronization points, red
   <text x="440" y="152" text-anchor="middle" font-size="9" fill="#64748b">GPU-initiated RDMA</text>
 
   <rect x="520" y="120" width="140" height="40" rx="5" fill="#dcfce7" stroke="#16a34a" stroke-width="1"/>
-  <text x="590" y="137" text-anchor="middle" font-size="11" fill="#16a34a" font-weight="700">~1ms / step</text>
-  <text x="590" y="152" text-anchor="middle" font-size="9" fill="#64748b">5× faster at EP=64</text>
+  <text x="590" y="137" text-anchor="middle" font-size="11" fill="#16a34a" font-weight="700">measure this path</text>
+  <text x="590" y="152" text-anchor="middle" font-size="9" fill="#64748b">same shape + topology</text>
 
   <rect x="375" y="170" width="285" height="50" rx="5" fill="#f8fafc" stroke="#e2e8f0" stroke-width="1"/>
   <text x="517" y="189" text-anchor="middle" font-size="10" fill="#475569">GPU memory → NVLink → GPU memory</text>
   <text x="517" y="204" text-anchor="middle" font-size="10" fill="#475569">SM kernels manage pipelining + flow control</text>
-  <text x="517" y="218" text-anchor="middle" font-size="9" fill="#94a3b8">1 copy, no CPU sync points</text>
+  <text x="517" y="218" text-anchor="middle" font-size="9" fill="#94a3b8">specialized GPU dispatch/combine path</text>
 </svg>
 
 ---
@@ -194,10 +194,10 @@ DeepEP dedicates a fixed number of SMs to communication kernels. This creates a 
 
 | `deepep_num_sms` | Communication bandwidth | Compute SMs remaining | Best for |
 |---|---|---|---|
-| 8 | Lower (fewer dispatch threads) | More (H100 has 132 SMs) | Expert FFN is the bottleneck |
-| 20 (default) | Balanced | Balanced | General purpose |
-| 32 | Higher | Fewer | Large token budgets or high EP sizes |
-| 48+ | Maximum | Fewer | Very large models, EP ≥ 64 |
+| 8 | Smaller communication allocation | More | Candidate when expert compute dominates |
+| 20 (default) | Default starting point | Default starting point | Initial bring-up and measurement |
+| 32 | Larger communication allocation | Fewer | Candidate when dispatch/combine dominates |
+| 48+ | High communication allocation | Fewer | Use only after a shape-matched profile shows a benefit |
 
 `deepep_num_sms` must be even. Start with 20 and tune based on profiling — if `XORL_DEBUG_EP=1` shows dispatch time > compute time, increase SMs; if compute time dominates, decrease.
 
@@ -205,19 +205,9 @@ DeepEP dedicates a fixed number of SMs to communication kernels. This creates a 
 
 ## Buffer Size Tuning
 
-The NVLink buffer pool is pre-allocated per GPU at startup. If the buffer is too small for a step's token volume, DeepEP sends in multiple chunks (increasing latency):
+The buffer is initialized lazily and shared across MoE layers. `deepep_buffer_size_gb` supplies the minimum NVLink allocation. For EP sizes supported by the installed DeepEP version, XoRL also asks DeepEP for dispatch and combine size hints and uses the maximum of those hints and the configured minimum. Older DeepEP versions or unrecognized EP sizes fall back to the configured value.
 
-```
-optimal_buffer_gb = (tokens_per_rank × hidden_dim × ep_size × 2 bytes) / (1024³)
-```
-
-For Qwen3-235B-A22B (hidden=7168, top_k=8, seq_len=4096, ep_size=64):
-```
-tokens_per_rank ≈ 4096 × 8 / 64 = 512 tokens
-buffer = 512 × 7168 × 64 × 2 / (1024³) ≈ 0.44 GB → set deepep_buffer_size_gb: 1.0 (2× headroom)
-```
-
-If you see OOM during initialization, reduce `deepep_buffer_size_gb`. If profiling shows multiple chunked transfers per step, increase it.
+For an EP group spanning nodes, the implementation also allocates the RDMA buffer from DeepEP's hints and rejects an NVLink allocation above DeepEP's signed-int32 limit; keep `deepep_buffer_size_gb <= 2.0` for that path. An initialization or dispatch allocation failure is a sizing error—XoRL does not implement the token-volume chunking formula previously shown here.
 
 ---
 
@@ -251,27 +241,14 @@ Step N+1:  [combine finishes] + next layer compute (overlapped)
 
 ---
 
-## Performance Benchmark
-
-On Qwen3-235B-A22B with EP=64 (8 nodes, 64 H100 NVLink GPUs):
-
-| Config | Dispatch + combine time | Throughput |
-|---|---|---|
-| AllToAll (NCCL) | ~5s per forward_backward | Baseline |
-| DeepEP (num_sms=20) | ~1s per forward_backward | ~5× faster |
-| DeepEP + async_combine | ~0.6s per forward_backward | ~8× faster (currently gated off, see [Async Combine](#async-combine-experimental)) |
-
-Gains are most pronounced at high EP sizes (≥ 32) where AllToAll's O(EP) staging bottleneck dominates.
-
 ## When to Use DeepEP vs AllToAll
 
 | Scenario | Recommendation |
 |---|---|
-| EP ≤ 8, single node | AllToAll — same physical GPUs, NVLink available via NCCL |
-| EP ≤ 8, multi-node InfiniBand | AllToAll — IB already uses RDMA |
-| EP ≥ 16, NVLink cluster | DeepEP |
-| EP ≥ 32, NVLink cluster | DeepEP strongly recommended |
-| EP ≥ 64, NVLink cluster | DeepEP (async_combine currently gated off) |
+| Bring-up, portability, or missing DeepEP/NVSHMEM prerequisites | Start with `alltoall` |
+| DeepEP prerequisites pass and dispatch/combine dominates a shape-matched profile | Benchmark DeepEP with the same model, batch, sequence, EP placement, and fabric |
+| Multi-node deployment | Validate `nvidia_peermem`, IBGDA, HCA reachability, and NVSHMEM before comparing throughput |
+| Async combine | Keep disabled unless the downstream stream-ordering contract has been independently validated |
 
 ---
 
@@ -281,7 +258,7 @@ Gains are most pronounced at high EP sizes (≥ 32) where AllToAll's O(EP) stagi
 ```
 AttributeError: module 'deep_ep' has no attribute 'Buffer'
 ```
-Install the DeepEP wheel matching your CUDA version from `xorl-org/xorl-wheels`.
+Install a DeepEP wheel matching the selected CUDA, PyTorch, GPU, and fabric environment.
 
 **SIGABRT / `num_recv_tokens: -1` on all ranks:**
 ```
@@ -306,7 +283,7 @@ XORL_DEBUG_EP=1 torchrun ... -m xorl.cli.train config.yaml
 ```
 
 **Shape mismatch errors during backward:**
-With the default `gradient_checkpointing_method: recompute_full_layer`, R3 routing replay is used automatically to ensure correct expert assignments when alltoall is recomputed. If you see shape mismatches, verify routing replay is enabled. Using `recompute_before_dispatch` or `no_recompute` avoids alltoall recomputation entirely and does not require replay. See [MoE Routing Replay](/xorl/moe/overview/#routing-replay-r3).
+With the default `gradient_checkpointing_method: recompute_full_layer`, R3 routing replay is used automatically to reuse the recorded expert assignments when AllToAll is recomputed. If you see shape mismatches, verify routing replay is enabled. Using `recompute_before_dispatch` or `no_recompute` avoids AllToAll recomputation and does not require local forward/backward route replay. See [MoE Routing Replay](/xorl/moe/router/#routing-replay-r3).
 
 **No fallback to AllToAll:**
 If DeepEP fails to initialize, xorl does not fall back automatically. Set `ep_dispatch: alltoall` explicitly.
@@ -317,5 +294,6 @@ If DeepEP fails to initialize, xorl does not fall back automatically. Set `ep_di
 
 | File | Description |
 |---|---|
+| [`src/xorl/distributed/moe/deepep.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/distributed/moe/deepep.py) | DeepEP buffer lifecycle, dispatch/combine autograd boundaries, and internode preflight |
 | [`src/xorl/models/layers/moe/moe_block.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/models/layers/moe/moe_block.py) | `MoEBlock` — DeepEP dispatch/combine integration, async combine stream management |
 | [`src/xorl/models/layers/moe/experts.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/models/layers/moe/experts.py) | `MoEExperts._ep_forward()` — DeepEP dispatch, compute, combine phases; XORL_DEBUG_EP timing |

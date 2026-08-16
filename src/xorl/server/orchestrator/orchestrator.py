@@ -189,6 +189,17 @@ from xorl.server.utils.zmq_channels import SyncDealerChannel, SyncPushChannel
 logger = logging.getLogger(__name__)
 
 
+def _validate_operation_contract(operation: str, train_config: Dict[str, Any]) -> None:
+    """Reject protocol aliases that bypass a mode's guarded implementation."""
+
+    if operation == "save_weights_for_sampler" and train_config.get("glm52_fullparam_fp8_training"):
+        raise RuntimeError(
+            "GLM-5.2 full-parameter block-FP8 training cannot use save_weights_for_sampler: "
+            "that legacy alias writes a generic DCP snapshot rather than the checksummed "
+            "step-boundary serving payload"
+        )
+
+
 # ============================================================================
 # Main Orchestrator Class
 # ============================================================================
@@ -727,6 +738,7 @@ class Orchestrator:
         t_scheduled = time.perf_counter()
 
         try:
+            _validate_operation_contract(operation, self.train_config)
             processor_method_name = self._OPERATION_DISPATCH.get(operation)
             if processor_method_name is None:
                 self._send_error_output(request, f"Unknown operation: {operation}")

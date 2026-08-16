@@ -555,7 +555,7 @@ class TrainingOpsMixin:
                 "learning_rate": response_learning_rate,
                 "step": result.get("step", 0),
             }
-            for key in ("optim_step_time", "optim_empty_cache_skipped"):
+            for key in ("optim_step_time", "optim_empty_cache_skipped", "glm52_fullparam_publish"):
                 if key in result:
                     metrics[key] = result[key]
 

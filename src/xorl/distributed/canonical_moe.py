@@ -1,15 +1,17 @@
 """Versioned canonical reduction for additive MoE rank contributions.
 
 The forward contract in this module deliberately separates transport from
-floating-point arithmetic. Raw BF16 partials travel to one logical row owner,
-which evaluates an explicit adjacent-pairwise tree in logical-contributor
-order. Any later replication copies the completed owner bytes.
+floating-point arithmetic. Raw BF16/FP16 partials travel to one logical row
+owner, which promotes the leaves to FP64 and evaluates an explicit
+adjacent-pairwise tree in logical-contributor order. Every tree node remains
+FP64; the completed result is cast exactly once at the declared low-precision
+consumer boundary. Any later replication copies those completed bytes.
 
 The canonical arithmetic here is a DELIBERATE independent implementation of
 the serving side's canonical MoE fold (a shared implementation must not
 self-confirm the trainer/sampler pair). The two implementations are
 K3-guarded: any divergence between them reads as nonzero behavior_k3 in the
-first training steps and in the qualification replays.
+training and replay tests.
 """
 
 from __future__ import annotations
@@ -18,16 +20,81 @@ import hashlib
 import json
 from dataclasses import dataclass
 from enum import Enum, IntEnum
+from itertools import product
 from typing import Any
 
 import torch
 import torch.distributed as dist
 
+from xorl.ops.canonical_moe_leaf import canonical_moe_leaf_fp32_v1_op
 
-CANONICAL_MOE_REDUCE_VERSION = "canonical_moe_reduce_v1"
+
+CANONICAL_MOE_FOLD_VERSION = "canonical_moe_fold_fp64_v3"
+CANONICAL_MOE_REDUCE_VERSION = "canonical_moe_reduce_fp64_v3"
+CANONICAL_MOE_LEAF_VERSION = "canonical_moe_leaf_fp32_v1"
 CANONICAL_MOE_PACKED_EP16_TRANSPORT_VERSION = "packed_ep16_v2"
 CANONICAL_MOE_CP_SHARDED_TRANSPORT_VERSION = "cp_sharded_v3"
 GLM52_NUM_LAYERS = 78
+# Bound only the first FP64 tree level.  Later adjacent-pair levels are at
+# most half as large, so this keeps the local arithmetic workspace independent
+# of sequence length and payload width without changing any reduction bytes.
+_CANONICAL_MOE_FP64_FOLD_MAX_LEVEL_BYTES = 32 * 1024 * 1024
+# Dense transport expands each row across the complete contributor axis.  Keep
+# its transient send/receive tensors bounded even when DP-owned rows make the
+# logical capacity much larger than the per-rank sequence.  Chunk boundaries
+# do not participate in the arithmetic contract: every row still sees the
+# complete logical-contributor tree before any completed bytes are copied.
+CANONICAL_MOE_DENSE_MAX_CHUNK_ROWS = 4096
+_CANONICAL_MOE_DENSE_MAX_BUFFER_BYTES = 32 * 1024 * 1024
+
+
+@dataclass(frozen=True)
+class LogicalRowOwnership:
+    """Two-dimensional logical row placement inside one contributor group.
+
+    Rank order is data-parallel major and context-parallel minor.  The
+    canonical MoE transport is allowed whenever those two ownership degrees
+    exactly cover the contributor group; no endpoint-specific topology table
+    is involved.
+    """
+
+    dp_size: int
+    cp_size: int
+    dp_rank: int
+    cp_rank: int
+    contributor_count: int
+
+    def __post_init__(self) -> None:
+        if self.dp_size <= 0 or self.cp_size <= 0:
+            raise ValueError("Logical row ownership degrees must be positive")
+        if self.dp_size * self.cp_size != self.contributor_count:
+            raise ValueError(
+                "Logical DP and CP ownership must exactly cover the canonical "
+                f"contributors: {self.dp_size} * {self.cp_size} != {self.contributor_count}"
+            )
+        if not 0 <= self.dp_rank < self.dp_size:
+            raise ValueError(f"DP rank {self.dp_rank} is outside DP size {self.dp_size}")
+        if not 0 <= self.cp_rank < self.cp_size:
+            raise ValueError(f"CP rank {self.cp_rank} is outside CP size {self.cp_size}")
+
+    @property
+    def source_ordinal(self) -> int:
+        return self.dp_rank * self.cp_size + self.cp_rank
+
+    @property
+    def context_source_ordinals(self) -> tuple[int, ...]:
+        start = self.dp_rank * self.cp_size
+        return tuple(range(start, start + self.cp_size))
+
+    def source_slice(self, *, padded_rows: int, local_rows: int) -> slice:
+        if padded_rows < 0 or local_rows < 0 or local_rows > padded_rows:
+            raise ValueError("Logical row source slice requires 0 <= local_rows <= padded_rows")
+        start = self.source_ordinal * padded_rows
+        return slice(start, start + local_rows)
+
+    @staticmethod
+    def valid_positions(absolute_positions: torch.Tensor) -> torch.Tensor:
+        return absolute_positions.reshape(-1) >= 0
 
 
 class ParallelRole(str, Enum):
@@ -47,7 +114,7 @@ class OutputDistribution(str, Enum):
 
 
 class CanonicalMoETransport(str, Enum):
-    """Byte-transport implementation under the version-1 arithmetic contract."""
+    """Byte-transport implementation composed with the FP64-v3 fold."""
 
     AUTO = "auto"
     DENSE_V1 = "dense_v1"
@@ -91,18 +158,18 @@ def resolve_canonical_moe_transport(
     graph_mode: bool,
     consumer_sharded_output: bool,
 ) -> CanonicalMoETransport:
-    """Resolve the public transport mode against the actual execution geometry.
+    """Resolve the internal transport mode against the actual execution geometry.
 
-    ``auto`` promotes only the fully admitted consumer-sharded EP16/CP16
-    trainer shape. Every other admitted canonical shape retains the dense
-    executable oracle. Explicit optimized modes never silently fall back.
+    ``auto`` selects only transports with full-model byte-parity evidence.
+    Every other admitted canonical shape retains the dense executable oracle.
+    Explicit optimized modes never silently fall back.
 
     The exact GLM-5.2 path resolves internally (there is no user-facing
     transport knob): the admitted eager EP16/CP16 consumer-sharded geometry
-    serves ``cp_sharded_v3`` — the transport with the strongest certified
-    performance evidence (a direct 64/64 zero-K3 replay and the faster
-    measured trainer forward) — and every other admitted canonical shape
-    retains the dense executable oracle.
+    serves ``packed_ep16_v2``, whose 64-decision regression anchor is byte
+    exact. ``cp_sharded_v3`` remains explicit-only until it independently
+    passes that anchor. Every other admitted canonical shape retains the dense
+    executable oracle.
     """
 
     try:
@@ -118,7 +185,10 @@ def resolve_canonical_moe_transport(
         consumer_sharded_output=consumer_sharded_output,
     )
     if mode is CanonicalMoETransport.AUTO:
-        return CanonicalMoETransport.CP_SHARDED_V3 if not cp_v3_reasons else CanonicalMoETransport.DENSE_V1
+        packed_admitted = (
+            plan.role is ParallelRole.TRAINER and plan.cp_size == 16 and plan.ep_size == 16 and not graph_mode
+        )
+        return CanonicalMoETransport.PACKED_EP16_V2 if packed_admitted else CanonicalMoETransport.DENSE_V1
     if mode is CanonicalMoETransport.CP_SHARDED_V3 and cp_v3_reasons:
         raise ValueError("cp_sharded_v3 requires " + ", ".join(cp_v3_reasons))
     if mode is CanonicalMoETransport.PACKED_EP16_V2:
@@ -163,29 +233,40 @@ class ParallelPlan:
     cp_ep_aliases: tuple[tuple[int, int], ...]
     launcher_tp_size: int | None = None
     contract_version: str = CANONICAL_MOE_REDUCE_VERSION
+    model_num_layers: int = GLM52_NUM_LAYERS
+    #: Descriptive identity only.  Family names do not admit or reject a
+    #: topology; runtime shape and arithmetic invariants do.
+    family: str = "glm52"
 
     def __post_init__(self) -> None:
         self.validate()
 
     @property
     def contributor_count(self) -> int:
-        return self.cp_size
+        # Contributors are expert shards, not attention/row-placement shards.
+        # CP16 happens to alias EP16 in the original admitted trainer topology,
+        # but DP-attention keeps CP1 while retaining the same sixteen expert
+        # contributors and the same arithmetic tree. EP1 is therefore the
+        # identity only when the local partial is already the complete,
+        # unsharded arithmetic program; this plan does not imply parity with a
+        # sampler that still produces a larger TP-local contributor group.
+        return self.ep_size
 
     def validate(self) -> None:
         if self.contract_version != CANONICAL_MOE_REDUCE_VERSION:
             raise ValueError(f"Unsupported canonical MoE contract version: {self.contract_version}")
         if self.world_size <= 0:
             raise ValueError("world_size must be positive")
-        if self.cp_size not in (2, 4, 8, 16):
-            raise ValueError("canonical_moe_reduce_v1 admits contributor counts 2, 4, 8, or 16")
+        if self.ep_size <= 0:
+            raise ValueError("canonical_moe_reduce_fp64_v3 requires a positive contributor count")
         if len(self.combine_groups) != len(self.logical_ordinals_by_group):
             raise ValueError("combine_groups and logical_ordinals_by_group must have equal lengths")
 
         seen_physical: set[int] = set()
-        expected_ordinals = tuple(range(self.cp_size))
+        expected_ordinals = tuple(range(self.contributor_count))
         for group, ordinals in zip(self.combine_groups, self.logical_ordinals_by_group, strict=True):
-            if len(group) != self.cp_size:
-                raise ValueError(f"Every combine group must contain exactly {self.cp_size} ranks")
+            if len(group) != self.contributor_count:
+                raise ValueError(f"Every combine group must contain exactly {self.contributor_count} ranks")
             if len(set(group)) != len(group):
                 raise ValueError(f"Combine group contains duplicate physical ranks: {group}")
             if tuple(sorted(ordinals)) != expected_ordinals:
@@ -199,69 +280,59 @@ class ParallelPlan:
 
         if seen_physical != set(range(self.world_size)):
             raise ValueError("Combine groups must partition every physical global rank exactly once")
-        if tuple(sorted(self.cp_ep_aliases)) != tuple((rank, rank) for rank in range(self.cp_size)):
-            raise ValueError("Version 1 requires an explicit identity CP/EP alias map")
+        expected_cp_ep_aliases = (
+            tuple((rank, rank) for rank in range(self.cp_size)) if self.cp_size == self.ep_size else ()
+        )
+        if tuple(sorted(self.cp_ep_aliases)) != expected_cp_ep_aliases:
+            raise ValueError(
+                "FP64-v3 requires an explicit identity CP/EP alias map only when the row-placement and "
+                "expert axes alias"
+            )
 
+        if self.model_num_layers <= 0:
+            raise ValueError("model_num_layers must be positive")
         expected_start = 0
         for start, end in self.pipeline_layer_ranges:
             if start != expected_start or end <= start:
                 raise ValueError("Pipeline layer ranges must be positive, contiguous, and start at layer 0")
             expected_start = end
-        if expected_start != GLM52_NUM_LAYERS and self.role is not ParallelRole.PRIMITIVE_TEST:
-            raise ValueError(f"Pipeline ranges must cover exactly {GLM52_NUM_LAYERS} GLM layers")
+        if expected_start != self.model_num_layers:
+            raise ValueError(
+                "Pipeline ranges must cover the model metadata exactly: "
+                f"covered={expected_start}, model_num_layers={self.model_num_layers}"
+            )
 
         if self.role is ParallelRole.TRAINER:
-            actual = (
-                self.world_size,
-                self.pp_size,
-                self.tp_size,
-                self.dp_size,
-                self.cp_size,
-                self.ep_size,
-                self.effective_dense_tp,
-            )
-            admitted = {(16, 1, 1, 1, 16, 16, 1): ((0, 78),)}
-            expected_ranges = admitted.get(actual)
-            if expected_ranges is None:
+            if len(self.pipeline_layer_ranges) != self.pp_size:
+                raise ValueError("Trainer pipeline ranges must name exactly one non-empty range per stage")
+            if self.tp_size != 1 or self.effective_dense_tp != 1:
+                raise ValueError("Canonical trainer rows require stage-local dense TP1 before the EP fold")
+            if self.dp_size <= 0 or self.cp_size <= 0 or self.dp_size * self.cp_size != self.ep_size:
                 raise ValueError(
-                    f"Unsupported GLM-5.2 trainer topology {actual}; admitted topologies are {tuple(admitted)}"
+                    "Trainer DP and CP ownership must exactly cover the stage-local "
+                    f"EP contributors: {self.dp_size} * {self.cp_size} != {self.ep_size}"
                 )
-            if self.pipeline_layer_ranges != expected_ranges:
-                raise ValueError(
-                    f"GLM-5.2 trainer topology {actual} requires pipeline ranges {expected_ranges}, "
-                    f"got {self.pipeline_layer_ranges}"
-                )
-            expected_groups = tuple(
-                tuple(range(group_start, group_start + self.cp_size))
-                for group_start in range(0, self.world_size, self.cp_size)
-            )
-            if self.combine_groups != expected_groups:
-                raise ValueError("GLM-5.2 trainer combine groups must be contiguous groups of cp_size physical ranks")
-            if self.logical_ordinals_by_group != (expected_ordinals,) * len(expected_groups):
-                raise ValueError("GLM-5.2 trainer requires identity logical contributor ordinals in every group")
+            if self.world_size != self.pp_size * self.ep_size:
+                raise ValueError("Trainer world size must equal pipeline stages times stage-local contributors")
+            if len(self.combine_groups) != self.pp_size:
+                raise ValueError("Trainer requires one live contributor group per pipeline stage")
+            if self.logical_ordinals_by_group != (expected_ordinals,) * len(self.combine_groups):
+                raise ValueError("Trainer requires identity logical contributor ordinals in every stage")
             if self.launcher_tp_size is not None:
                 raise ValueError("Trainer ParallelPlan does not accept a launcher_tp_size alias")
         elif self.role is ParallelRole.SAMPLER:
-            expected = (8, 1, 1, 1, 8, 8, 1)
-            actual = (
-                self.world_size,
-                self.pp_size,
-                self.tp_size,
-                self.dp_size,
-                self.cp_size,
-                self.ep_size,
-                self.effective_dense_tp,
-            )
-            if actual != expected:
-                raise ValueError(f"GLM-5.2 sampler topology must be {expected}, got {actual}")
-            if self.pipeline_layer_ranges != ((0, 78),):
-                raise ValueError("GLM-5.2 sampler must own all 78 layers in one pipeline stage")
-            if self.combine_groups != (tuple(range(8)),):
-                raise ValueError("GLM-5.2 sampler combine group must contain physical ranks 0..7")
+            if self.pp_size != 1 or len(self.pipeline_layer_ranges) != 1:
+                raise ValueError("Sampler plans currently require one complete pipeline stage")
+            if self.tp_size != 1 or self.effective_dense_tp != 1:
+                raise ValueError("Canonical sampler rows require effective dense TP1")
+            if self.dp_size <= 0 or self.cp_size <= 0 or self.dp_size * self.cp_size != self.ep_size:
+                raise ValueError("Sampler DP and CP ownership must exactly cover the contributor group")
+            if self.world_size != self.ep_size or self.launcher_tp_size != self.ep_size:
+                raise ValueError("Sampler launcher TP, world size, and contributor count must match")
+            if self.combine_groups != (tuple(range(self.ep_size)),):
+                raise ValueError("Sampler combine group must contain the complete launcher rank order")
             if self.logical_ordinals_by_group != (expected_ordinals,):
-                raise ValueError("GLM-5.2 sampler requires identity logical contributor ordinals")
-            if self.launcher_tp_size != 8:
-                raise ValueError("GLM-5.2 sampler launcher-level tp_size must be exactly 8")
+                raise ValueError("Sampler requires identity logical contributor ordinals")
         elif self.role is ParallelRole.PRIMITIVE_TEST:
             if self.world_size != self.cp_size or len(self.combine_groups) != 1:
                 raise ValueError("Primitive plans use one combine group spanning the test world")
@@ -274,48 +345,66 @@ class ParallelPlan:
     def glm52_trainer(
         cls,
         *,
-        world_size: int = 16,
+        world_size: int | None = None,
         pp_size: int = 1,
         dp_size: int = 1,
         contributor_count: int = 16,
+        cp_size: int | None = None,
+        combine_groups: tuple[tuple[int, ...], ...] | None = None,
+        pipeline_layer_ranges: tuple[tuple[int, int], ...] | None = None,
+        model_num_layers: int = GLM52_NUM_LAYERS,
     ) -> ParallelPlan:
+        if cp_size is None:
+            if dp_size <= 0 or contributor_count % dp_size:
+                raise ValueError("contributor_count must divide evenly across data-parallel owners")
+            cp_size = contributor_count // dp_size
+        if world_size is None:
+            world_size = pp_size * contributor_count
+        if pipeline_layer_ranges is None:
+            if pp_size != 1:
+                raise ValueError("Multi-stage trainer plans require explicit model-derived pipeline ranges")
+            pipeline_layer_ranges = ((0, model_num_layers),)
         identity = tuple(range(contributor_count))
-        combine_groups = tuple(
-            tuple(range(start, start + contributor_count)) for start in range(0, world_size, contributor_count)
-        )
-        pipeline_layer_ranges = ((0, 78),)
+        if combine_groups is None:
+            combine_groups = tuple(
+                tuple(range(start, start + contributor_count)) for start in range(0, world_size, contributor_count)
+            )
+        else:
+            combine_groups = tuple(tuple(int(rank) for rank in group) for group in combine_groups)
         return cls(
             role=ParallelRole.TRAINER,
             world_size=world_size,
             pp_size=pp_size,
             tp_size=1,
             dp_size=dp_size,
-            cp_size=contributor_count,
+            cp_size=cp_size,
             ep_size=contributor_count,
             effective_dense_tp=1,
             combine_groups=combine_groups,
             logical_ordinals_by_group=(identity,) * len(combine_groups),
             pipeline_layer_ranges=pipeline_layer_ranges,
-            cp_ep_aliases=tuple((rank, rank) for rank in identity),
+            cp_ep_aliases=tuple((rank, rank) for rank in range(cp_size)) if cp_size == contributor_count else (),
+            model_num_layers=model_num_layers,
         )
 
     @classmethod
-    def glm52_sampler(cls, *, launcher_tp_size: int) -> ParallelPlan:
-        identity = tuple(range(8))
+    def glm52_sampler(cls, *, launcher_tp_size: int, model_num_layers: int = GLM52_NUM_LAYERS) -> ParallelPlan:
+        identity = tuple(range(launcher_tp_size))
         return cls(
             role=ParallelRole.SAMPLER,
-            world_size=8,
+            world_size=launcher_tp_size,
             pp_size=1,
             tp_size=1,
             dp_size=1,
-            cp_size=8,
-            ep_size=8,
+            cp_size=launcher_tp_size,
+            ep_size=launcher_tp_size,
             effective_dense_tp=1,
             combine_groups=(identity,),
             logical_ordinals_by_group=(identity,),
-            pipeline_layer_ranges=((0, 78),),
+            pipeline_layer_ranges=((0, model_num_layers),),
             cp_ep_aliases=tuple((rank, rank) for rank in identity),
             launcher_tp_size=launcher_tp_size,
+            model_num_layers=model_num_layers,
         )
 
     @classmethod
@@ -340,6 +429,7 @@ class ParallelPlan:
             logical_ordinals_by_group=(ordinals,),
             pipeline_layer_ranges=((0, 1),),
             cp_ep_aliases=tuple((rank, rank) for rank in physical_ranks),
+            model_num_layers=1,
         )
 
     def group_index_for_physical_rank(self, physical_global_rank: int) -> int:
@@ -356,7 +446,11 @@ class ParallelPlan:
     def as_dict(self) -> dict[str, Any]:
         return {
             "contract_version": self.contract_version,
-            "role": self.role.value,
+            "family": self.family,
+            # ParallelRole inherits from str, so retaining the enum is still
+            # JSON-serializable while making ParallelPlan(**plan.as_dict()) a
+            # real typed round trip (validate() uses enum identity checks).
+            "role": self.role,
             "world_size": self.world_size,
             "pp_size": self.pp_size,
             "tp_size": self.tp_size,
@@ -365,6 +459,7 @@ class ParallelPlan:
             "ep_size": self.ep_size,
             "effective_dense_tp": self.effective_dense_tp,
             "launcher_tp_size": self.launcher_tp_size,
+            "model_num_layers": self.model_num_layers,
             "combine_groups": self.combine_groups,
             "logical_ordinals_by_group": self.logical_ordinals_by_group,
             "pipeline_layer_ranges": self.pipeline_layer_ranges,
@@ -452,9 +547,9 @@ class LocalMoEContribution:
 
     def __post_init__(self) -> None:
         if self.layout is not ContributionLayout.LOCAL_PARTIAL:
-            raise ValueError("canonical_moe_reduce_v1 accepts only typed local partial contributions")
-        if self.tensor.dtype is not torch.bfloat16:
-            raise TypeError(f"Local MoE partial must be BF16, got {self.tensor.dtype}")
+            raise ValueError("canonical_moe_reduce_fp64_v3 accepts only typed local partial contributions")
+        if self.tensor.dtype not in (torch.bfloat16, torch.float16):
+            raise TypeError(f"Local MoE partial must be BF16 or FP16, got {self.tensor.dtype}")
         if self.tensor.ndim < 2:
             raise ValueError("Local MoE partial must have a row dimension and at least one payload dimension")
         if self.tensor.shape[0] != self.metadata.capacity:
@@ -492,7 +587,7 @@ def _validate_runtime_plan(
     physical_global_rank: int,
 ) -> _RuntimePlan:
     if not dist.is_initialized():
-        raise RuntimeError("canonical_moe_reduce_v1 requires an initialized torch.distributed process group")
+        raise RuntimeError("canonical_moe_reduce_fp64_v3 requires an initialized torch.distributed process group")
     if dist.get_world_size() != plan.world_size:
         raise ValueError(f"Runtime world size {dist.get_world_size()} does not match plan {plan.world_size}")
 
@@ -521,17 +616,137 @@ def _validate_runtime_plan(
     )
 
 
-def _adjacent_pairwise_bf16(partials: torch.Tensor) -> torch.Tensor:
-    """Evaluate the version-1 balanced tree over logical contributor axis 0."""
-    if partials.dtype is not torch.bfloat16:
-        raise TypeError("Pairwise canonical MoE arithmetic requires BF16 inputs")
-    if partials.shape[0] not in (2, 4, 8, 16):
-        raise ValueError("Pairwise canonical MoE arithmetic admits 2, 4, 8, or 16 contributors")
+def canonical_moe_leaf_fp32_v1(
+    shared: torch.Tensor,
+    routed: torch.Tensor,
+    routed_scale: float = 1.0,
+) -> torch.Tensor:
+    """Build one low-precision transport leaf with one-round FP32 FMA.
 
-    level = [partials[index] for index in range(partials.shape[0])]
-    while len(level) > 1:
-        level = [(level[index] + level[index + 1]).to(torch.bfloat16) for index in range(0, len(level), 2)]
+    Both operands are promoted in registers, ``shared + routed * FP32(scale)``
+    is evaluated as one FP32 FMA, and the completed leaf is stored exactly
+    once in the shared operand's declared transport dtype. The opaque
+    primitive prevents compiler reassociation without materializing an FP32
+    output tensor.
+    """
+    return canonical_moe_leaf_fp32_v1_op(shared, routed, routed_scale)
+
+
+def _canonical_moe_fold_fp64_tree(partials_by_logical_ordinal: torch.Tensor) -> torch.Tensor:
+    """Evaluate the source-ordered adjacent-pair tree entirely in FP64.
+
+    This internal helper exposes the completed pre-cast boundary to focused
+    arithmetic tests. Production callers use :func:`canonical_moe_fold_fp64_v3`,
+    which performs the single declared output cast.
+    """
+    if partials_by_logical_ordinal.ndim < 2:
+        raise ValueError("Canonical MoE fold requires contributor and payload dimensions")
+    partials = partials_by_logical_ordinal
+    if partials.dtype not in (torch.bfloat16, torch.float16):
+        raise TypeError("Canonical MoE fold requires BF16 or FP16 inputs")
+    contributor_count = partials.shape[0]
+    if contributor_count <= 0:
+        raise ValueError("Canonical MoE fold requires a positive contributor count")
+
+    level = partials.to(torch.float64)
+    while level.shape[0] > 1:
+        pair_count = level.shape[0] // 2
+        paired = level[: 2 * pair_count : 2] + level[1 : 2 * pair_count : 2]
+        if level.shape[0] % 2:
+            level = torch.cat((paired, level[-1:]), dim=0)
+        else:
+            level = paired
     return level[0]
+
+
+def _canonical_moe_fp64_fold_chunk_elements(contributor_count: int) -> int:
+    """Maximum payload elements whose initial FP64 level fits the bound."""
+    if contributor_count <= 0:
+        raise ValueError("Canonical MoE fold requires a positive contributor count")
+    return max(
+        1,
+        _CANONICAL_MOE_FP64_FOLD_MAX_LEVEL_BYTES // (contributor_count * 8),
+    )
+
+
+def _canonical_moe_cast_fp64_to_transport(
+    folded_fp64: torch.Tensor,
+    transport_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Apply the declared final cast without a CUDA FP32 double round."""
+    if folded_fp64.dtype is not torch.float64:
+        raise TypeError(f"Canonical MoE final cast requires FP64 input, got {folded_fp64.dtype}")
+    if folded_fp64.is_cuda and transport_dtype in (torch.bfloat16, torch.float16):
+        from xorl.ops.canonical_moe_cast import canonical_moe_fp64_to_lowp_rne  # noqa: PLC0415
+
+        return canonical_moe_fp64_to_lowp_rne(folded_fp64.contiguous(), transport_dtype)
+    return folded_fp64.to(transport_dtype)
+
+
+def canonical_moe_fold_fp64_v3(partials_by_logical_ordinal: torch.Tensor) -> torch.Tensor:
+    """Fold source-ordered low-precision contributions under the FP64-v3 contract.
+
+    Transport must put contributor ``C_i`` at index ``i`` before calling this
+    primitive. Leaves are promoted to FP64, each level preserves the declared
+    adjacent-pair plus odd-tail topology, and every internal node stays FP64.
+    The completed tree is cast exactly once to the transported input dtype at
+    the consumer boundary. The arithmetic is an independent implementation of
+    serving's identically versioned program; neither side imports the other.
+    """
+    partials = partials_by_logical_ordinal
+    if partials.ndim < 2:
+        raise ValueError("Canonical MoE fold requires contributor and payload dimensions")
+    if partials.dtype not in (torch.bfloat16, torch.float16):
+        raise TypeError("Canonical MoE fold requires BF16 or FP16 inputs")
+    contributor_count = partials.shape[0]
+    if contributor_count <= 0:
+        raise ValueError("Canonical MoE fold requires a positive contributor count")
+
+    payload_shape = partials.shape[1:]
+    payload_elements = partials[0].numel()
+    chunk_elements = _canonical_moe_fp64_fold_chunk_elements(contributor_count)
+    if payload_elements <= chunk_elements:
+        return _canonical_moe_cast_fp64_to_transport(
+            _canonical_moe_fold_fp64_tree(partials),
+            partials.dtype,
+        )
+
+    # Each payload element is independent: the only reduction axis is the
+    # immutable logical-contributor axis.  Chunking that orthogonal payload
+    # axis therefore preserves the exact adjacent-pair FP64 tree.  Store every
+    # completed element once at the declared low-precision boundary instead of
+    # ever materializing the complete contributor tensor in FP64.
+    output = torch.empty(payload_shape, dtype=partials.dtype, device=partials.device)
+    if partials.is_contiguous():
+        flat_partials = partials.view(contributor_count, -1)
+        flat_output = output.view(-1)
+        for start in range(0, payload_elements, chunk_elements):
+            end = min(start + chunk_elements, payload_elements)
+            folded_fp64 = _canonical_moe_fold_fp64_tree(flat_partials[:, start:end])
+            flat_output[start:end] = _canonical_moe_cast_fp64_to_transport(folded_fp64, partials.dtype)
+        return output
+
+    # A whole-tensor ``reshape`` of a strided arrival silently materializes the
+    # complete low-precision contributor payload before the bounded FP64 fold.
+    # Instead, choose a rectangular payload tile whose element count fits the
+    # same budget. Each sliced source view may be strided, but its promotion can
+    # materialize at most ``contributor_count * chunk_elements`` FP64 values.
+    remaining = chunk_elements
+    reversed_tile_shape = []
+    for extent in reversed(payload_shape):
+        tile_extent = min(extent, max(1, remaining))
+        reversed_tile_shape.append(tile_extent)
+        remaining = max(1, remaining // tile_extent)
+    tile_shape = tuple(reversed(reversed_tile_shape))
+    tile_starts = tuple(range(0, extent, tile_extent) for extent, tile_extent in zip(payload_shape, tile_shape))
+    for starts in product(*tile_starts):
+        payload_slice = tuple(
+            slice(start, min(start + tile_extent, extent))
+            for start, tile_extent, extent in zip(starts, tile_shape, payload_shape)
+        )
+        folded_fp64 = _canonical_moe_fold_fp64_tree(partials[(slice(None), *payload_slice)])
+        output[payload_slice] = _canonical_moe_cast_fp64_to_transport(folded_fp64, partials.dtype)
+    return output
 
 
 def canonical_moe_reduce_reference(
@@ -543,7 +758,7 @@ def canonical_moe_reduce_reference(
         raise ValueError("Reference partials must have contributor, row, and payload dimensions")
     if partials_by_logical_ordinal.shape[1] != metadata.capacity:
         raise ValueError("Reference partial row count must equal metadata capacity")
-    result = _adjacent_pairwise_bf16(partials_by_logical_ordinal)
+    result = canonical_moe_fold_fp64_v3(partials_by_logical_ordinal)
     return torch.where(
         metadata.valid_mask.view(-1, *([1] * (result.ndim - 1))),
         result,
@@ -593,7 +808,7 @@ def _transport_and_fold(
             physical_sources = receive.view(contributor_count, rows, *payload_shape)
             source_group_order = torch.tensor(logical_to_group, dtype=torch.long, device=chunk.device)
             logical_sources = physical_sources.index_select(0, source_group_order)
-            folded = _adjacent_pairwise_bf16(logical_sources)
+            folded = canonical_moe_fold_fp64_v3(logical_sources)
         elif transport is CanonicalMoETransport.PACKED_EP16_V2:
             if contributor_count != 16:
                 raise ValueError("packed_ep16_v2 requires exactly 16 logical contributors")
@@ -628,7 +843,7 @@ def _transport_and_fold(
             physical_sources = receive.view(contributor_count, packed_rows, *payload_shape)
             source_group_order = torch.tensor(logical_to_group, dtype=torch.long, device=chunk.device)
             logical_sources = physical_sources.index_select(0, source_group_order)
-            packed_folded = _adjacent_pairwise_bf16(logical_sources)
+            packed_folded = canonical_moe_fold_fp64_v3(logical_sources)
         else:
             raise ValueError(f"Unknown canonical MoE transport: {transport}")
 
@@ -747,7 +962,7 @@ class _CanonicalMoECPShardedV3(torch.autograd.Function):
         # contributor order before the first floating-point operation.
         logical_to_group = torch.tensor(runtime.logical_to_group_rank, dtype=torch.long, device=receive.device)
         logical_sources = receive.index_select(0, logical_to_group)
-        folded = _adjacent_pairwise_bf16(logical_sources)
+        folded = canonical_moe_fold_fp64_v3(logical_sources)
         local_valid = full_valid[runtime.local_group_rank]
         output = torch.where(
             local_valid.view(-1, *([1] * len(payload_shape))),
@@ -791,6 +1006,31 @@ class _CanonicalMoECPShardedV3(torch.autograd.Function):
         return flat_grad, None, None, None
 
 
+def _resolve_transport_chunk_rows(
+    capacity: int,
+    requested_chunk_rows: int | None,
+    transport: CanonicalMoETransport,
+    *,
+    contributor_count: int,
+    payload_elements_per_row: int,
+    element_size: int,
+) -> int:
+    requested_limit = capacity if requested_chunk_rows is None else requested_chunk_rows
+    if requested_limit <= 0:
+        raise ValueError("chunk_rows must be positive")
+    if transport is CanonicalMoETransport.PACKED_EP16_V2:
+        return capacity
+
+    expanded_bytes_per_row = contributor_count * payload_elements_per_row * element_size
+    byte_bounded_rows = max(1, _CANONICAL_MOE_DENSE_MAX_BUFFER_BYTES // expanded_bytes_per_row)
+    return min(
+        capacity,
+        CANONICAL_MOE_DENSE_MAX_CHUNK_ROWS,
+        requested_limit,
+        byte_bounded_rows,
+    )
+
+
 def _canonical_moe_reduce(
     contribution: LocalMoEContribution,
     *,
@@ -820,9 +1060,14 @@ def _canonical_moe_reduce(
 
     physical_global_rank = dist.get_rank() if physical_global_rank is None else physical_global_rank
     runtime = _validate_runtime_plan(plan, group, physical_global_rank)
-    effective_chunk_rows = contribution.metadata.capacity if chunk_rows is None else chunk_rows
-    if effective_chunk_rows <= 0:
-        raise ValueError("chunk_rows must be positive")
+    effective_chunk_rows = _resolve_transport_chunk_rows(
+        contribution.metadata.capacity,
+        chunk_rows,
+        transport,
+        contributor_count=plan.contributor_count,
+        payload_elements_per_row=contribution.tensor[0].numel(),
+        element_size=contribution.tensor.element_size(),
+    )
     if transport is CanonicalMoETransport.PACKED_EP16_V2:
         # Dense-v1 chunks the 16x-expanded owner slots to bound its allocation.
         # Packed-v2's full-capacity send is already only one payload tensor, and
@@ -830,7 +1075,7 @@ def _canonical_moe_reduce(
         # source-grouped order: an arbitrary subrange need not contain a
         # balanced number of logical owners even though the complete capacity
         # does. Keep one equal-split A2A over the complete logical row set.
-        effective_chunk_rows = contribution.metadata.capacity
+        assert effective_chunk_rows == contribution.metadata.capacity
 
     tensor = _CanonicalMoEReduce.apply(
         contribution.tensor,
@@ -850,7 +1095,7 @@ def _canonical_moe_reduce(
     )
 
 
-def canonical_moe_reduce_v1(
+def canonical_moe_reduce_fp64_v3(
     contribution: LocalMoEContribution,
     *,
     plan: ParallelPlan,
@@ -860,7 +1105,7 @@ def canonical_moe_reduce_v1(
     chunk_rows: int | None = None,
     graph_mode: bool = False,
 ) -> CanonicalMoEOutput:
-    """Canonicalize one typed local partial under the version-1 contract."""
+    """Canonicalize one typed local partial under the FP64-v3 contract."""
     return _canonical_moe_reduce(
         contribution,
         plan=plan,
@@ -883,12 +1128,12 @@ def canonical_moe_reduce_packed_ep16_v2(
     chunk_rows: int | None = None,
     graph_mode: bool = False,
 ) -> CanonicalMoEOutput:
-    """Use packed equal-split owner transport with version-1 fold arithmetic.
+    """Use packed equal-split owner transport with FP64-v3 fold arithmetic.
 
     Each destination receives at most ``ceil(chunk_rows / 16)`` rows from
     every logical contributor. The selected rows retain their original order,
-    so the existing adjacent-pairwise BF16 fold observes the exact same
-    contributor sequence as :func:`canonical_moe_reduce_v1`.
+    so the FP64 adjacent-pair tree observes the exact same contributor
+    sequence as :func:`canonical_moe_reduce_fp64_v3`.
     """
     return _canonical_moe_reduce(
         contribution,
@@ -962,8 +1207,10 @@ def canonical_moe_reduce_cp_sharded_v3(
 
 
 __all__ = [
-    "CANONICAL_MOE_PACKED_EP16_TRANSPORT_VERSION",
     "CANONICAL_MOE_CP_SHARDED_TRANSPORT_VERSION",
+    "CANONICAL_MOE_FOLD_VERSION",
+    "CANONICAL_MOE_LEAF_VERSION",
+    "CANONICAL_MOE_PACKED_EP16_TRANSPORT_VERSION",
     "CANONICAL_MOE_REDUCE_VERSION",
     "CanonicalMoEGraphMetadata",
     "CanonicalMoEOutput",
@@ -971,12 +1218,15 @@ __all__ = [
     "ContributionLayout",
     "GraphContractStatus",
     "LocalMoEContribution",
+    "LogicalRowOwnership",
     "OutputDistribution",
     "ParallelPlan",
     "ParallelRole",
+    "canonical_moe_fold_fp64_v3",
+    "canonical_moe_leaf_fp32_v1",
     "canonical_moe_reduce_reference",
     "canonical_moe_reduce_packed_ep16_v2",
     "canonical_moe_reduce_cp_sharded_v3",
-    "canonical_moe_reduce_v1",
+    "canonical_moe_reduce_fp64_v3",
     "resolve_canonical_moe_transport",
 ]

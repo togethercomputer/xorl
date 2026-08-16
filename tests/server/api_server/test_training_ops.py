@@ -32,6 +32,11 @@ def _build_wait_for_response():
                     "step": 1,
                     "optim_step_time": 0.125,
                     "optim_empty_cache_skipped": True,
+                    "glm52_fullparam_publish": {
+                        "published": True,
+                        "step": 1,
+                        "manifest_checksum": "manifest-1",
+                    },
                 }
             ]
         )
@@ -59,6 +64,11 @@ async def test_optim_step_uses_orchestrator_learning_rate_key():
     assert response.metrics["learning_rate"] == pytest.approx(2e-4)
     assert response.metrics["optim_step_time"] == pytest.approx(0.125)
     assert response.metrics["optim_empty_cache_skipped"] is True
+    assert response.metrics["glm52_fullparam_publish"] == {
+        "published": True,
+        "step": 1,
+        "manifest_checksum": "manifest-1",
+    }
     assert server.orchestrator_client.last_request.payload.lr == pytest.approx(2e-4)
 
 

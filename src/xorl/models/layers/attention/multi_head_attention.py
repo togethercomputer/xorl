@@ -7,6 +7,7 @@ from torch import nn
 
 from xorl.distributed.sequence_parallel.strategy import get_cp_strategy
 from xorl.models.layers.attention.backend import AttentionKwargs, get_attention_fn
+from xorl.models.layers.fused_projection_lora import project_fused_linear_with_lora
 from xorl.models.layers.normalization import RMS_NORM_FAMILY_NO_RESIDUAL, RMSNorm
 from xorl.models.layers.rope import apply_rotary_pos_emb
 
@@ -21,6 +22,8 @@ class MultiHeadAttention(nn.Module):
     SP strategy is resolved at forward time from ParallelState via
     ``get_cp_strategy()``.
     """
+
+    _supports_fused_qkv_lora = True
 
     def __init__(self, config, layer_idx: int):
         super().__init__()
@@ -78,7 +81,13 @@ class MultiHeadAttention(nn.Module):
         hidden_shape = (*input_shape, -1, self.head_dim)
 
         if hasattr(self, "qkv_proj"):
-            qkv = self.qkv_proj(hidden_states)
+            qkv = project_fused_linear_with_lora(
+                self,
+                hidden_states,
+                base_name="qkv_proj",
+                projection_names=("q_proj", "k_proj", "v_proj"),
+                projection_sizes=(self.q_dim, self.kv_dim, self.kv_dim),
+            )
             q, k, v = qkv.split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
         else:
             q = self.q_proj(hidden_states)

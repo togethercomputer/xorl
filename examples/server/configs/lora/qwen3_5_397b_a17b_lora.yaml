@@ -43,7 +43,7 @@ enable_packing: true
 enable_lora: true
 lora_rank: 32
 lora_alpha: 32
-lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "g_proj", "down_proj"]
 
 skip_initial_checkpoint: true
 # bi_fused = K3 lm-head contract CE (fp32-class, tp1, no z-loss); requires tree >= 09a5ae3d3 (older trees silently ran eager for bi_fused)

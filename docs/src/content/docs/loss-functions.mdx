@@ -2,15 +2,18 @@
 title: "Loss Functions"
 ---
 
-xorl supports multiple loss functions for different training objectives. Each is selected via the `loss_fn` field in the forward_backward request (server training) or configured automatically for local training.
+XoRL supports several loss functions for local and server training. Server requests select one with `loss_fn`. Put per-token tensors such as targets, behavior log probabilities, and advantages in each datum's `loss_fn_inputs`; put scalar options such as clipping thresholds in the request's `loss_fn_params`.
 
 ## Supported Loss Functions
 
-| `loss_fn` name | Use case | Returns |
+| `loss_fn` name | Required datum inputs | Use case |
 |---|---|---|
-| `causallm_loss` | Standard next-token prediction (SFT, continued pretraining) | Scalar cross-entropy loss |
-| `policy_loss` | PPO-style policy gradient (RLHF, GRPO) | Scalar policy gradient loss |
-| `importance_sampling` | Off-policy RL training with IS correction | Scalar IS-weighted loss |
+| `causallm_loss` | `target_tokens` (or `labels`) | Standard next-token prediction for SFT and continued pretraining |
+| `cross_entropy` | Same as `causallm_loss` | Alias for `causallm_loss` |
+| `importance_sampling` | `target_tokens`, `logprobs`, `advantages` | Unclipped importance-sampling policy gradient |
+| `policy_loss` | `target_tokens`, `logprobs`, `advantages` | PPO-clipped policy gradient, with optional TIS and IcePop |
+| `drgrpo` | `target_tokens`, `logprobs` or `old_logprobs`, `advantages`; `ref_logprobs` when `beta > 0` | DR-GRPO with token- or sequence-level ratios and optional reference KL |
+| `opd_loss` | Student targets plus teacher data selected by the OPD server configuration | Online policy distillation and optional hidden-state matching |
 
 ### causallm_loss
 
@@ -22,48 +25,61 @@ loss = CE_sum(logits, labels) / global_valid_tokens
 
 This is the default loss for local training and the most common choice for SFT and continued pretraining.
 
-### policy_loss
+### `policy_loss`
 
-PPO-style policy gradient loss for online RL training. Requires `logprobs_ref` in `loss_fn_params` (log probabilities from the reference model) and per-token `advantages`.
+PPO-style policy gradient loss for online RL training. The per-token `logprobs` datum field is the old or behavior-policy log probability. The trainer independently computes `new_logprobs` for the retained target tokens.
 
-The loss applies clipped importance sampling:
-
-```
-ratio = exp(logprobs - logprobs_ref)
-loss = -mean(min(ratio * advantages, clip(ratio, 1-eps, 1+eps) * advantages))
-```
-
-where `eps` is controlled by the `eps_clip` parameter (default `0.2`). Used with PPO, GRPO, and related algorithms.
-
-### importance_sampling_loss
-
-Off-policy RL training where the behavior policy differs from the current policy. Requires per-token importance weights `iw` passed in `loss_fn_params`.
+The per-token loss is:
 
 ```
-loss = -mean(iw * logprobs * advantages)
+ratio = exp(new_logprobs - old_logprobs)
+loss_t = max(-ratio * advantages,
+             -clip(ratio, 1-eps_clip, 1+eps_clip_high) * advantages)
 ```
 
-The `eps_clip` parameter bounds the importance weights to `[1-eps, 1+eps]` to prevent excessive policy updates from stale data.
+`eps_clip` and `eps_clip_high` default to `0.2`. `eps_clip_c` enables dual clipping for negative advantages. `use_tis` applies a second, separately clipped correction using the optional per-token `rollout_logprobs`; `icepop_beta` hard-masks gradients outside its admitted ratio interval.
+
+### `importance_sampling`
+
+An unclipped importance-sampling policy-gradient loss. The implementation computes the ratio from the trainer and behavior log probabilities; callers do not provide a precomputed importance weight:
+
+```
+ratio = exp(new_logprobs - old_logprobs)
+loss = mean(-(ratio * advantages))
+```
+
+This loss has no `eps_clip` parameter. Use `policy_loss` or `drgrpo` when policy-ratio clipping is required.
+
+### `drgrpo`
+
+DR-GRPO applies a PPO-clipped policy loss using either token-level or sequence-level ratios. `ratio_type` is `token` by default; `clip_low` defaults to `0.2` and `clip_high` to `0.28`. Setting `beta > 0` adds a reference-policy KL term and requires per-token `ref_logprobs`; `kl_type` selects `k1`, `k2`, or `k3`.
+
+### `opd_loss`
+
+OPD compares a student policy with teacher hidden states and a teacher LM head. It supports full-vocabulary forward or reverse KL, sampled-token estimators, optional teacher weights, hidden-state matching, and a policy-gradient mode. Teacher caching, transport, and normalization are configured by the server, so use the checked-in server configurations together with the implementation rather than treating OPD as a drop-in three-tensor loss.
 
 ### Per-token outputs
 
-The `causallm_loss` and `policy_loss` functions can return per-token log probabilities and elementwise cross-entropy values alongside the scalar loss. These are used for:
+The causal-LM and RL loss paths can return selected-token log probabilities and, where supported, per-token losses alongside the scalar loss. These are used for:
 - Computing KL divergence against a reference model
 - Logging token-level reward signals
 - Debugging training dynamics
 
-Per-token outputs are controlled by the `return_per_token` parameter in the model runner, not by a separate loss function name.
+Per-token output behavior depends on the selected loss and the request's `return_per_token` option; it is not a separate loss function name.
 
 ## Loss Function Backends
 
 ### Compiled cross-entropy (`ce_mode`)
 
-For `causallm_loss`, xorl supports two cross-entropy backends controlled by `ce_mode`:
+The `ce_mode` setting controls the LM-head and cross-entropy implementation. When omitted, XoRL resolves it from the model: ordinary models and exact DSV4-Flash use `compiled`, while exact dense Qwen3, Qwen3.5-family, and GLM-5.2 numerical programs require `bi_fused`.
 
-| Value | Description | When to use |
+| Value | Description | Important constraints |
 |---|---|---|
-| `compiled` (default) | `torch.compile`-compiled chunked cross-entropy | Production training; fuses logit computation with CE for reduced peak memory |
-| `eager` | Standard `F.cross_entropy` | Debugging; incompatible with `torch.compile` on the full model |
+| `compiled` | `torch.compile`-compiled chunked cross-entropy | General production default |
+| `eager` | Standard eager cross-entropy | Debugging; may materialize the full logits tensor |
+| `bi_fused` | Batch-invariant selected-token logprob/CE path | Required by the current exact dense Qwen3, Qwen3.5-family, and GLM-5.2 programs; topology and dtype restrictions are checked at runtime |
+| `quack_linear` | Quack chunked linear plus scalar cross-entropy | Causal-LM path; pipeline parallelism supports this mode on its last stage |
+| `fused_quack` | Chunked matmul plus fused selected-token CE | Used by supported per-token loss paths; not supported by every loss/topology combination |
 
 The compiled backend computes cross-entropy in chunks along the sequence dimension, avoiding materializing the full `[B × S, vocab_size]` float32 tensor at once. This is particularly important for large vocabulary models (Qwen3 has vocab_size=151,936) where the naive logit tensor can be 2–4 GB per micro-batch.
 
@@ -119,7 +135,8 @@ This avoids an all-gather of the full logit tensor before CE, saving `vocab_size
 
 | File | Description |
 |---|---|
-| [`src/xorl/ops/loss/`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/ops/loss/) | Loss function implementations: `causallm_loss`, `policy_loss`, `importance_sampling` |
+| [`src/xorl/ops/loss/__init__.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/ops/loss/__init__.py) | Public loss registry and cross-entropy mode names |
+| [`src/xorl/ops/loss/`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/ops/loss/) | Causal-LM, policy, importance-sampling, DR-GRPO, and OPD implementations |
 | [`src/xorl/ops/loss/compiled_cross_entropy.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/ops/loss/compiled_cross_entropy.py) | Compiled chunked cross-entropy |
 | [`src/xorl/ops/loss/vocab_parallel_cross_entropy.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/ops/loss/vocab_parallel_cross_entropy.py) | Vocabulary-parallel cross-entropy for TP |
 | [`src/xorl/distributed/gradient_accumulate_loss.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/distributed/gradient_accumulate_loss.py) | `GradientAccumulateLoss` — token-normalized loss accumulation across micro-batches |

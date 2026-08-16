@@ -17,7 +17,6 @@ from xorl.models.transformers.glm5.exact_absorbed_kv_b_qlora import (
 )
 from xorl.models.transformers.glm5.exact_dense_mlp import Glm52ExactTP1DenseMLP
 from xorl.models.transformers.glm5.exact_lm_head_qlora import (
-    GLM52_LM_HEAD_GROUP_RANKS,
     GLM52_LM_HEAD_TP_SIZE,
     Glm52ExactTP16LmHeadLoraLinear,
     Glm52ExactTP16LmHeadSelectedLogprob,
@@ -347,6 +346,7 @@ def _replace_exact_attention_target(
             device=original.weight.device,
             tp_size=1,
         )
+        source_only_keys = {"weight"}
     else:
         replacement = Glm52ExactTP1BlockFP8QLoRALinear(
             in_features=target.in_features,
@@ -357,11 +357,12 @@ def _replace_exact_attention_target(
             device=original.weight.device,
             enable_aqn=False,
         )
+        source_only_keys = {"weight", "weight_scale_inv"}
     replacement._is_prequantized = True
     replacement._source_quant_format = "block_fp8"
     replacement._source_fqn = target.name
     replacement._merge_sources = None
-    replacement._qlora_expected_skip_keys = {"weight", "weight_scale_inv"}
+    replacement._qlora_expected_skip_keys = source_only_keys
     _set_submodule(model, target.name, replacement)
 
 
@@ -456,8 +457,8 @@ def _replace_exact_routed_target(
 
 def _validate_exact_lm_head_topology() -> tuple[int, dist.ProcessGroup]:
     parallel_state = get_parallel_state()
-    if getattr(parallel_state, "tp_size", 1) != 1 or getattr(parallel_state, "pp_size", 1) != 1:
-        raise RuntimeError("GLM-5.2 exact active-LoRA lm head requires body TP1 and PP1")
+    if getattr(parallel_state, "tp_size", 1) != 1:
+        raise RuntimeError("GLM-5.2 exact active-LoRA lm head requires body TP1")
     if getattr(parallel_state, "lm_head_tp_size", 1) != GLM52_LM_HEAD_TP_SIZE:
         raise RuntimeError("GLM-5.2 exact active-LoRA lm head requires initialized lm-head TP16")
     group = getattr(parallel_state, "lm_head_tp_group", None)
@@ -466,8 +467,22 @@ def _validate_exact_lm_head_topology() -> tuple[int, dist.ProcessGroup]:
     if dist.get_world_size(group) != GLM52_LM_HEAD_TP_SIZE:
         raise RuntimeError("GLM-5.2 exact active-LoRA lm head requires initialized lm-head TP16")
     group_ranks = tuple(dist.get_process_group_ranks(group))
-    if group_ranks != GLM52_LM_HEAD_GROUP_RANKS or dist.get_world_size() != GLM52_LM_HEAD_TP_SIZE:
-        raise RuntimeError("GLM-5.2 exact active-LoRA lm head requires WORLD16 with lm-head group ranks 0..15")
+    device_mesh = getattr(parallel_state, "device_mesh", None)
+    coordinate = None if device_mesh is None else device_mesh.get_coordinate()
+    if device_mesh is None or coordinate is None:
+        raise RuntimeError("GLM-5.2 exact active-LoRA lm head requires a live device mesh")
+    mesh = device_mesh.mesh
+    dim_names = tuple(device_mesh.mesh_dim_names)
+    if "pp" in dim_names:
+        pp_dim = dim_names.index("pp")
+        stage_ranks = {int(rank) for rank in mesh.select(pp_dim, int(coordinate[pp_dim])).reshape(-1).tolist()}
+    else:
+        stage_ranks = {int(rank) for rank in mesh.reshape(-1).tolist()}
+    if not set(group_ranks).issubset(stage_ranks):
+        raise RuntimeError(
+            "GLM-5.2 exact active-LoRA lm-head TP16 group crosses the current pipeline stage: "
+            f"group={group_ranks}, stage={sorted(stage_ranks)}"
+        )
     if str(dist.get_backend(group)).lower() != "nccl":
         raise RuntimeError("GLM-5.2 exact active-LoRA lm head requires an NCCL lm-head TP16 group")
     tp_rank = int(dist.get_rank(group))
@@ -498,7 +513,10 @@ def _replace_exact_lm_head_target(
         vocab_end=shard.vocab_end,
         padded_vocab_start=shard.padded_vocab_start,
         padded_vocab_end=shard.padded_vocab_end,
+        rank=adapter_rank,
+        lora_alpha=adapter_alpha,
         tp_group=tp_group,
+        expected_group_ranks=tuple(dist.get_process_group_ranks(tp_group)),
     )
     replacement._glm52_exact_replicated_parameter_names = ("lora_A",)
     replacement._source_fqn = target.name
@@ -737,11 +755,19 @@ def prepare_glm52_block_fp8_qlora(
             exact_lm_head_component,
         )
     )
-    if exact_component_enabled and (adapter_rank, adapter_alpha) != (1, 1):
-        raise ValueError(
-            "GLM-5.2 exact active-LoRA component requires adapter_rank=1 and adapter_alpha=1; "
-            f"got rank={adapter_rank}, alpha={adapter_alpha}"
+    if exact_component_enabled:
+        from xorl.models.transformers.glm5.exact_lora_contract import (  # noqa: PLC0415
+            glm52_exact_lora_scaling,
         )
+
+        try:
+            glm52_exact_lora_scaling(adapter_rank, adapter_alpha)
+        except ValueError as exc:
+            raise ValueError(
+                "GLM-5.2 exact active-LoRA component requires positive integer "
+                "adapter_rank and adapter_alpha; "
+                f"got rank={adapter_rank}, alpha={adapter_alpha}"
+            ) from exc
     targets = _expected_targets(model, config)
     excluded = quantization_config["modules_to_not_convert"]
     accidentally_excluded = sorted(

@@ -23,8 +23,16 @@ from typing import Optional
 
 import torch
 
-from xorl.ops.quack.gemm_interface import gemm as quack_gemm
-from xorl.ops.quack.gemm_interface import gemm_gated as quack_gemm_gated
+
+def _gemm_interface():
+    # Deferred: importing the quack CuTe kernels requires the trainer
+    # profile's pinned nvidia-cutlass-dsl. Environments that never select the
+    # quack backend (e.g. the torch-2.11 combined environment used by the
+    # DSV4 exact lane, which carries SGLang's cutlass-dsl pin) must still be
+    # able to import this package.
+    from xorl.ops.quack import gemm_interface  # noqa: PLC0415
+
+    return gemm_interface
 
 
 def _quack_tuned_enabled() -> bool:
@@ -96,7 +104,7 @@ def quack_group_gemm_same_nk(
     # so each new total_M triggers a full ~60-config benchmark — making training
     # orders of magnitude slower.  Set XORL_QUACK_TUNED=1 to enable autotuning
     # (useful if shapes are stable or disk cache is warm).
-    quack_gemm(
+    _gemm_interface().gemm(
         A=a,
         B=b_quack,
         out=out,
@@ -124,7 +132,7 @@ def quack_group_gemm_gated_same_nk(
     if cu_seqlens_m is None:
         cu_seqlens_m = cumsum_to_cu_seqlens(cumsum_M)
 
-    return quack_gemm_gated(
+    return _gemm_interface().gemm_gated(
         A=a,
         B=b,
         preact_out=preact_out,
@@ -163,7 +171,7 @@ def quack_group_gemm_same_mn(
             a_quack = a
 
     # tuned: same rationale as quack_group_gemm_same_nk.
-    quack_gemm(
+    _gemm_interface().gemm(
         A=a_quack,
         B=b,
         out=c,

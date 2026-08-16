@@ -17,15 +17,28 @@ from transformers import (
 from ..distributed.parallel_state import get_parallel_state
 from ..ops.moe.triton import resolve_routing_weights_before_down, set_routing_weights_before_down
 from ..utils import logging
-from .exact_contract import glm52_exact_active_lora_enabled, glm52_exact_forward_enabled, set_glm52_exact_active_lora
+from .exact_contract import (
+    EXACT_CONTRACT_FAMILY_GLM52,
+    glm52_exact_forward_enabled,
+    resolve_exact_contract_family,
+    set_glm52_exact_active_lora,
+)
 from .layers.attention import get_attention_fn
 from .layers.normalization import set_rmsnorm_mode
 from .layers.rope import set_rope_class_b, set_rope_native
 from .loader import ModelLoader, get_loader
 from .transformers.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 from .transformers.deepseek_v3.support import validate_deepseek_v3_router_settings
+from .transformers.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
+from .transformers.deepseek_v4.exact_contract import (
+    is_dsv4_flash_config,
+    validate_dsv4_flash_adapter_program,
+    validate_dsv4_flash_official_geometry,
+)
 from .transformers.glm4_moe.configuration_glm4_moe import Glm4MoeConfig
 from .transformers.glm5.configuration_glm5 import Glm5Config
+from .transformers.glm5.exact_lora_contract import glm52_exact_lora_scaling
+from .transformers.glm5.layer_plan import Glm52LayerPlan, install_glm52_pipeline_module_plan
 from .transformers.glm5.support import validate_glm5_router_settings, validate_glm5_sequence_parallel
 from .transformers.gpt_oss.configuration_gpt_oss import GptOssConfig
 from .transformers.minimax_m3.configuration_minimax_m3 import MiniMaxM3Config
@@ -129,6 +142,9 @@ def _load_local_xorl_config(
     if model_type in {"deepseek_v3", "kimi_k2", "kimi_k25"}:
         return DeepseekV3Config.from_hf_config(_namespace_from_dict(config_dict))
 
+    if model_type == "deepseek_v4":
+        return DeepseekV4Config.from_hf_config(_namespace_from_dict(config_dict))
+
     if model_type == "nemotron_h":
         return NemotronHConfig.from_hf_config(_namespace_from_dict(config_dict))
 
@@ -231,28 +247,24 @@ def _validate_canonical_glm52_model_scope(config: PretrainedConfig) -> None:
     expected = {
         "vocab_size": 154880,
         "hidden_size": 6144,
-        "num_hidden_layers": 78,
-        "first_k_dense_replace": 3,
+        "hidden_act": "silu",
         "n_routed_experts": 256,
         "num_experts_per_tok": 8,
         "index_topk": 2048,
-        "index_topk_freq": 4,
     }
     mismatches = [
         f"{name}={getattr(config, name, None)!r} (requires {value!r})"
         for name, value in expected.items()
         if getattr(config, name, None) != value
     ]
-    indexer_types = tuple(config.indexer_types)
-    expected_indexer_types = tuple(
-        "full" if layer_idx < 3 or (layer_idx - 2) % 4 == 0 else "shared" for layer_idx in range(78)
-    )
-    if indexer_types != expected_indexer_types:
-        mismatches.append("indexer_types does not match the official 78-layer selector schedule")
-    mlp_layer_types = getattr(config, "mlp_layer_types", None)
-    expected_mlp_types = ("dense",) * 3 + ("sparse",) * 75
-    if mlp_layer_types is None or tuple(mlp_layer_types) != expected_mlp_types:
-        mismatches.append("mlp_layer_types does not match 3 dense + 75 sparse blocks")
+    try:
+        # Layer count and ownership are checkpoint schedules, not kernel
+        # geometry. Validate their lengths, supported values, producer chain,
+        # and legal full-index boundaries without assuming the 78-layer
+        # reference checkpoint.
+        Glm52LayerPlan.from_config(config)
+    except (TypeError, ValueError) as error:
+        mismatches.append(str(error))
     if mismatches:
         raise ValueError(
             "The exact GLM-5.2 program supports only the official model geometry: " + ", ".join(mismatches)
@@ -263,12 +275,165 @@ def _is_exact_qwen35(config: PretrainedConfig) -> bool:
     return bool(getattr(config, "_qwen35_exact_contract", False))
 
 
+def _is_exact_qwen3_dense(config: PretrainedConfig) -> bool:
+    return bool(getattr(config, "_qwen3_dense_exact_contract", False))
+
+
+def _validate_exact_qwen3_dense_model_scope(config: PretrainedConfig) -> None:
+    if not _is_exact_qwen3_dense(config):
+        return
+    mismatches = []
+
+    positive_integer_fields = (
+        "hidden_size",
+        "intermediate_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "vocab_size",
+        "max_position_embeddings",
+    )
+    for name in positive_integer_fields:
+        value = getattr(config, name, None)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            mismatches.append(f"{name}={value!r} (requires a positive integer)")
+
+    required_values = {
+        "head_dim": 128,
+        "hidden_act": "silu",
+        "attention_bias": False,
+        "use_sliding_window": False,
+        "attention_dropout": 0.0,
+    }
+    for name, required in required_values.items():
+        actual = getattr(config, name, None)
+        if actual != required:
+            mismatches.append(f"{name}={actual!r} (requires {required!r})")
+
+    rope_scaling = getattr(config, "rope_scaling", None)
+    if isinstance(rope_scaling, dict):
+        rope_type = rope_scaling.get("rope_type", rope_scaling.get("type", "default"))
+        unsupported_keys = set(rope_scaling) - {"rope_type", "type", "rope_theta"}
+        if rope_type not in (None, "default") or unsupported_keys:
+            mismatches.append(f"rope_scaling={rope_scaling!r} (only default RoPE is supported)")
+    elif rope_scaling:
+        mismatches.append(f"rope_scaling={rope_scaling!r} (only default RoPE is supported)")
+
+    rope_theta = getattr(config, "rope_theta", None)
+    if rope_theta is None:
+        rope_parameters = getattr(config, "rope_parameters", None)
+        if isinstance(rope_parameters, dict):
+            rope_theta = rope_parameters.get("rope_theta")
+    if not isinstance(rope_theta, (int, float)) or isinstance(rope_theta, bool) or rope_theta <= 0:
+        mismatches.append(f"rope_theta={rope_theta!r} (requires a positive number)")
+
+    rms_norm_eps = getattr(config, "rms_norm_eps", None)
+    if not isinstance(rms_norm_eps, (int, float)) or isinstance(rms_norm_eps, bool) or rms_norm_eps <= 0:
+        mismatches.append(f"rms_norm_eps={rms_norm_eps!r} (requires a positive number)")
+
+    num_attention_heads = getattr(config, "num_attention_heads", None)
+    num_key_value_heads = getattr(config, "num_key_value_heads", None)
+    if (
+        isinstance(num_attention_heads, int)
+        and isinstance(num_key_value_heads, int)
+        and num_attention_heads > 0
+        and num_key_value_heads > 0
+        and num_attention_heads % num_key_value_heads != 0
+    ):
+        mismatches.append(
+            "num_attention_heads must be divisible by num_key_value_heads "
+            f"(got {num_attention_heads} and {num_key_value_heads})"
+        )
+
+    if mismatches:
+        raise ValueError(
+            "The exact dense Qwen3 program does not support this architecture configuration: " + ", ".join(mismatches)
+        )
+
+
 def _is_qwen35_moe(config: PretrainedConfig) -> bool:
     return getattr(config, "model_type", None) in {
         "xorl_qwen3_5_moe",
         "qwen3_5_moe",
         "qwen3_5_moe_text",
     }
+
+
+def _validate_exact_qwen35_dense_capabilities(config: PretrainedConfig) -> list[str]:
+    mismatches = []
+
+    positive_integer_fields = (
+        "hidden_size",
+        "intermediate_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "num_key_value_heads",
+        "vocab_size",
+        "max_position_embeddings",
+        "linear_num_value_heads",
+    )
+    for name in positive_integer_fields:
+        value = getattr(config, name, None)
+        if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+            mismatches.append(f"{name}={value!r} (requires a positive integer)")
+
+    required_values = {
+        "head_dim": 256,
+        "hidden_act": "silu",
+        "attention_bias": False,
+        "use_sliding_window": False,
+        "attention_dropout": 0.0,
+        "attn_output_gate": True,
+        "linear_num_key_heads": 16,
+        "linear_key_head_dim": 128,
+        "linear_value_head_dim": 128,
+        "linear_conv_kernel_dim": 4,
+        "full_attention_interval": 4,
+    }
+    for name, required in required_values.items():
+        actual = getattr(config, name, None)
+        if actual != required:
+            mismatches.append(f"{name}={actual!r} (requires {required!r})")
+
+    rms_norm_eps = getattr(config, "rms_norm_eps", None)
+    if not isinstance(rms_norm_eps, (int, float)) or isinstance(rms_norm_eps, bool) or rms_norm_eps <= 0:
+        mismatches.append(f"rms_norm_eps={rms_norm_eps!r} (requires a positive number)")
+
+    rope_theta = getattr(config, "rope_theta", None)
+    if rope_theta is None:
+        rope_parameters = getattr(config, "rope_parameters", None)
+        if isinstance(rope_parameters, dict):
+            rope_theta = rope_parameters.get("rope_theta")
+    if not isinstance(rope_theta, (int, float)) or isinstance(rope_theta, bool) or rope_theta <= 0:
+        mismatches.append(f"rope_theta={rope_theta!r} (requires a positive number)")
+
+    partial_rotary_factor = getattr(config, "partial_rotary_factor", None)
+    if partial_rotary_factor != 0.25:
+        mismatches.append(f"partial_rotary_factor={partial_rotary_factor!r} (requires 0.25)")
+
+    num_attention_heads = getattr(config, "num_attention_heads", None)
+    num_key_value_heads = getattr(config, "num_key_value_heads", None)
+    if (
+        isinstance(num_attention_heads, int)
+        and isinstance(num_key_value_heads, int)
+        and num_attention_heads > 0
+        and num_key_value_heads > 0
+        and num_attention_heads % num_key_value_heads != 0
+    ):
+        mismatches.append(
+            "num_attention_heads must be divisible by num_key_value_heads "
+            f"(got {num_attention_heads} and {num_key_value_heads})"
+        )
+
+    linear_num_value_heads = getattr(config, "linear_num_value_heads", None)
+    if isinstance(linear_num_value_heads, int) and linear_num_value_heads > 0 and linear_num_value_heads % 16 != 0:
+        mismatches.append(f"linear_num_value_heads={linear_num_value_heads!r} (requires a multiple of 16)")
+
+    return mismatches
+
+
+def _is_exact_dsv4_flash(config: PretrainedConfig) -> bool:
+    return bool(getattr(config, "_dsv4_flash_exact_mode", False))
 
 
 def _validate_exact_qwen35_model_scope(config: PretrainedConfig) -> None:
@@ -295,41 +460,31 @@ def _validate_exact_qwen35_model_scope(config: PretrainedConfig) -> None:
             "linear_conv_kernel_dim": 4,
             "full_attention_interval": 4,
         }
+        mismatches = [
+            f"{name}={getattr(scope_config, name, None)!r} (requires {value!r})"
+            for name, value in expected.items()
+            if getattr(scope_config, name, None) != value
+        ]
         model_name = "Qwen3.6-35B-A3B"
     else:
-        expected = {
-            "vocab_size": 248320,
-            "hidden_size": 1024,
-            "num_hidden_layers": 24,
-            "num_attention_heads": 8,
-            "num_key_value_heads": 2,
-            "linear_num_key_heads": 16,
-            "linear_num_value_heads": 16,
-            "linear_key_head_dim": 128,
-            "linear_value_head_dim": 128,
-            "linear_conv_kernel_dim": 4,
-            "full_attention_interval": 4,
-        }
-        model_name = "Qwen3.5-0.8B"
-    mismatches = [
-        f"{name}={getattr(scope_config, name, None)!r} (requires {value!r})"
-        for name, value in expected.items()
-        if getattr(scope_config, name, None) != value
-    ]
-    expected_layer_types = tuple(
-        "full_attention" if (layer_idx + 1) % 4 == 0 else "linear_attention"
-        for layer_idx in range(expected["num_hidden_layers"])
-    )
+        mismatches = _validate_exact_qwen35_dense_capabilities(scope_config)
+        model_name = "dense Qwen3.5"
+    num_hidden_layers = getattr(scope_config, "num_hidden_layers", None)
     # ``full_attention_interval`` uniquely defines this schedule.  Some HF
     # config representations materialize ``layer_types`` while others retain
     # only the interval, so validate the derived list when it is present rather
     # than rejecting an otherwise identical checkpoint representation.
     layer_types = getattr(scope_config, "layer_types", None)
-    if layer_types is not None and tuple(layer_types) != expected_layer_types:
-        mismatches.append("layer_types does not match the certified full-attention interval")
+    if isinstance(num_hidden_layers, int) and num_hidden_layers > 0 and layer_types is not None:
+        expected_layer_types = tuple(
+            "full_attention" if (layer_idx + 1) % 4 == 0 else "linear_attention"
+            for layer_idx in range(num_hidden_layers)
+        )
+        if tuple(layer_types) != expected_layer_types:
+            mismatches.append("layer_types does not match the certified full-attention interval")
     if mismatches:
         raise ValueError(
-            f"The exact Qwen3.5-family server-training program is certified only for {model_name}: "
+            f"The exact Qwen3.5-family server-training program does not support this {model_name} configuration: "
             + ", ".join(mismatches)
         )
 
@@ -353,37 +508,6 @@ def _validate_exact_qwen35_moe_program(
     if incompatible:
         raise ValueError(
             "Exact Qwen3.5-MoE server training rejects incompatible MoE overrides: " + ", ".join(incompatible)
-        )
-
-
-def _validate_exact_qwen35_topology(config: PretrainedConfig, parallel_state: Any) -> None:
-    if not _is_exact_qwen35(config):
-        return
-    topology = (
-        parallel_state.world_size,
-        parallel_state.dp_size,
-        parallel_state.dp_replicate_size,
-        parallel_state.dp_shard_size,
-        parallel_state.tp_size,
-        parallel_state.pp_size,
-        parallel_state.ep_size,
-        parallel_state.cp_size,
-        parallel_state.ringattn_size,
-        parallel_state.ulysses_size,
-    )
-    admitted = (
-        (
-            (8, 8, 1, 8, 1, 1, 8, 1, 1, 1),
-            (16, 16, 2, 8, 1, 1, 8, 1, 1, 1),
-        )
-        if _is_qwen35_moe(config)
-        else ((1, 1, 1, 1, 1, 1, 1, 1, 1, 1),)
-    )
-    if topology not in admitted:
-        raise ValueError(
-            "The Qwen3.5-family exact server-training path is admitted only for "
-            "WORLD/DP/DP-replicate/DP-shard/TP/PP/EP/CP/Ring/Ulysses="
-            f"{admitted}; got {topology}"
         )
 
 
@@ -422,6 +546,15 @@ def _resolve_rope_modes(
         if rope_native is False or rope_class_b is False:
             raise ValueError(
                 "Exact Qwen3.5-family server training requires native Class-B RoPE; "
+                "explicit rope_native=false or rope_class_b=false is incompatible "
+                "with the model's numerical contract"
+            )
+        return True, True
+
+    if _is_exact_qwen3_dense(config):
+        if rope_native is False or rope_class_b is False:
+            raise ValueError(
+                "Exact dense Qwen3 server training requires native Class-B RoPE; "
                 "explicit rope_native=false or rope_class_b=false is incompatible "
                 "with the model's numerical contract"
             )
@@ -500,6 +633,73 @@ def resolve_model_numerical_program(
             sparse_mla_backend="auto",
         )
 
+    if _is_exact_qwen3_dense(config):
+        requirements = {
+            "attn_implementation": (attn_implementation, "flash_attention_4"),
+            "lm_head_fp32": (lm_head_fp32, True),
+            "rmsnorm_mode": (rmsnorm_mode, "sglang_fused"),
+            "activation_native": (activation_native, False),
+        }
+        incompatible = [
+            f"{name}={requested!r} (requires {required!r})"
+            for name, (requested, required) in requirements.items()
+            if requested is not None and requested != required
+        ]
+        if incompatible:
+            raise ValueError(
+                "Exact dense Qwen3 server training rejects incompatible numerical overrides: " + ", ".join(incompatible)
+            )
+        return ResolvedModelNumericalProgram(
+            attn_implementation="flash_attention_4",
+            router_fp32=True,
+            lm_head_fp32=True,
+            rmsnorm_mode="sglang_fused",
+            qwen35_rmsnorm_family=None,
+            activation_native=False,
+            rope_native=True,
+            rope_class_b=effective_rope_class_b,
+            attention_cast_bf16=False,
+            sparse_mla_enabled=False,
+            sparse_mla_backend="auto",
+        )
+
+    if _is_exact_dsv4_flash(config):
+        requirements = {
+            "attn_implementation": (attn_implementation, "flash_attention_4"),
+            "router_fp32": (router_fp32, False),
+            "lm_head_fp32": (lm_head_fp32, False),
+            "rmsnorm_mode": (rmsnorm_mode, "native"),
+            "activation_native": (activation_native, False),
+            "attention_cast_bf16": (attention_cast_bf16, False),
+            "sparse_mla_enabled": (sparse_mla_enabled, False),
+        }
+        incompatible = [
+            f"{name}={requested!r} (requires {required!r})"
+            for name, (requested, required) in requirements.items()
+            if requested is not None and requested != required
+        ]
+        if qwen35_rmsnorm_family is not None:
+            incompatible.append(f"qwen35_rmsnorm_family={qwen35_rmsnorm_family!r} (unsupported for DSV4-Flash)")
+        if sparse_mla_backend not in (None, "auto"):
+            incompatible.append(f"sparse_mla_backend={sparse_mla_backend!r} (requires 'auto')")
+        if incompatible:
+            raise ValueError(
+                "The DSV4-Flash exact RCA lane rejects incompatible numerical overrides: " + ", ".join(incompatible)
+            )
+        return ResolvedModelNumericalProgram(
+            attn_implementation="flash_attention_4",
+            router_fp32=False,
+            lm_head_fp32=False,
+            rmsnorm_mode="native",
+            qwen35_rmsnorm_family=None,
+            activation_native=False,
+            rope_native=False,
+            rope_class_b=False,
+            attention_cast_bf16=False,
+            sparse_mla_enabled=False,
+            sparse_mla_backend="auto",
+        )
+
     if not _is_exact_glm52(config):
         if qwen35_rmsnorm_family is not None:
             raise ValueError(
@@ -561,9 +761,19 @@ def resolve_model_numerical_program(
 def resolve_cross_entropy_mode(config: PretrainedConfig, ce_mode: Optional[str]) -> str:
     """Resolve the loss-side member of the canonical numerical program."""
 
+    if _is_exact_dsv4_flash(config):
+        if ce_mode not in (None, "compiled"):
+            raise ValueError(
+                f"Exact DeepSeek-V4-Flash server training requires ce_mode='compiled'; received {ce_mode!r}"
+            )
+        return "compiled"
     if _is_exact_qwen35(config):
         if ce_mode not in (None, "bi_fused"):
             raise ValueError(f"Exact Qwen3.5-family server training requires ce_mode='bi_fused'; received {ce_mode!r}")
+        return "bi_fused"
+    if _is_exact_qwen3_dense(config):
+        if ce_mode not in (None, "bi_fused"):
+            raise ValueError(f"Exact dense Qwen3 server training requires ce_mode='bi_fused'; received {ce_mode!r}")
         return "bi_fused"
     if not _is_exact_glm52(config):
         return ce_mode or "compiled"
@@ -605,11 +815,19 @@ def build_foundation_model(
     sparse_mla_backend: Optional[str] = None,
     flash_attention_deterministic: bool = False,
     server_training: bool = False,
+    enable_lora: bool = False,
     block_fp8_qlora_training: bool = False,
+    glm52_fullparam_fp8_training: bool = False,
     lora_rank: Optional[int] = None,
     lora_alpha: Optional[int] = None,
+    lora_target_modules: Optional[list[str]] = None,
     init_device: Literal["cpu", "cuda", "npu", "meta"] = "cuda",
     config_kwargs: Optional[Dict[str, Any]] = None,
+    pipeline_parallel_virtual_stages: int = 1,
+    pipeline_parallel_input_weight: int = 1,
+    pipeline_parallel_output_weight: int = 1,
+    pipeline_parallel_num_layers_in_first_stage: Optional[int] = None,
+    pipeline_parallel_num_layers_in_last_stage: Optional[int] = None,
 ) -> nn.Module:
     """
     Builds the foundation model.
@@ -629,11 +847,23 @@ def build_foundation_model(
     glm52_model = _is_canonical_glm52(config)
     if block_fp8_qlora_training and not glm52_model:
         raise ValueError("block_fp8_qlora_training is supported only for the official GLM-5.2 model")
-    exact_active_lora = bool(
-        server_training and glm52_model and block_fp8_qlora_training and (lora_rank, lora_alpha) == (1, 1)
-    )
+    if glm52_fullparam_fp8_training and not glm52_model:
+        raise ValueError("glm52_fullparam_fp8_training is supported only for the official canonical GLM-5.2 model")
+    if glm52_fullparam_fp8_training and block_fp8_qlora_training:
+        raise ValueError(
+            "glm52_fullparam_fp8_training and block_fp8_qlora_training are mutually exclusive training lanes"
+        )
+    exact_active_lora = bool(server_training and glm52_model and block_fp8_qlora_training and ep_dispatch == "alltoall")
+    if exact_active_lora:
+        glm52_exact_lora_scaling(lora_rank, lora_alpha)
+    # Training lanes select the same exact value family through their own
+    # admission flags.  The scoring-only flag must remain off for either one:
+    # it describes a frozen trunk, which neither training admission permits.
     config._glm52_block_fp8_qlora = bool(block_fp8_qlora_training)
-    config._glm52_exact_contract = bool(server_training and glm52_model and not block_fp8_qlora_training)
+    config._glm52_fullparam_training = bool(glm52_fullparam_fp8_training)
+    config._glm52_exact_contract = bool(
+        server_training and glm52_model and not block_fp8_qlora_training and not glm52_fullparam_fp8_training
+    )
     set_glm52_exact_active_lora(config, enabled=exact_active_lora)
     canonical_glm52 = _is_exact_glm52(config)
     qwen35_model_type = getattr(config, "model_type", None) in {
@@ -645,7 +875,60 @@ def build_foundation_model(
         "qwen3_5_moe_text",
     }
     config._qwen35_exact_contract = bool(server_training and qwen35_model_type)
+    config._qwen3_dense_exact_contract = bool(
+        server_training
+        and getattr(config, "model_type", None) == "qwen3"
+        and "Qwen3ForCausalLM" in _get_architectures(config)
+    )
+    dsv4_flash_exact = bool(server_training and is_dsv4_flash_config(config))
+    config._dsv4_flash_exact_mode = dsv4_flash_exact
+    config._dsv4_flash_exact_active_lora = bool(dsv4_flash_exact and enable_lora)
+    if dsv4_flash_exact:
+        validate_dsv4_flash_official_geometry(config)
+        if not enable_lora:
+            # The exact TP8 selected-logprob head exists only as the injected
+            # LoRA head class; without it a base-only trainer would silently
+            # pair an exact trunk with a non-exact head. The admitted lane is
+            # active-LoRA only; static parity replays load certified all-zero
+            # factors instead of dropping the adapter.
+            raise ValueError(
+                "Exact DeepSeek-V4-Flash server training admits only the active-LoRA "
+                "lane (enable_lora=true with the complete rank-1/alpha-1 adapter); "
+                "for static parity replays load the certified all-zero adapter."
+            )
+        if lora_rank is None or lora_alpha is None:
+            raise ValueError("DSV4-Flash exact active-LoRA construction requires explicit rank and alpha")
+        validate_dsv4_flash_adapter_program(
+            adapter_rank=lora_rank,
+            adapter_alpha=lora_alpha,
+            target_modules=lora_target_modules,
+        )
+        incompatible = []
+        if moe_implementation not in (None, "triton"):
+            incompatible.append(f"moe_implementation={moe_implementation!r} (requires 'triton')")
+        if ep_dispatch != "alltoall":
+            incompatible.append(f"ep_dispatch={ep_dispatch!r} (requires 'alltoall')")
+        if deepep_async_combine:
+            incompatible.append("deepep_async_combine=True (requires False)")
+        if incompatible:
+            raise ValueError(
+                "The DSV4-Flash exact RCA lane rejects incompatible trainer runtime choices: " + ", ".join(incompatible)
+            )
+
+    # Family-neutral exact-contract keys, stamped once at model resolution so
+    # downstream contract sites key off the resolved program rather than
+    # family-branded flags. ``_exact_contract_family`` names the exact value
+    # program (or ``None`` for generic models); ``_exact_one_round_swiglu``
+    # selects the serving-paired one-round FP32 SwiGLU. Serving applies the
+    # one-round program universally in exact mode (xorl-sglang f10b907d8), so
+    # every admitted contracted family pairs with it, including Qwen3.5
+    # dense/MoE and GLM-5.2.
+    config._exact_contract_family = resolve_exact_contract_family(config)
+    config._exact_one_round_swiglu = bool(config._qwen35_exact_contract) or (
+        config._exact_contract_family == EXACT_CONTRACT_FAMILY_GLM52
+    )
     _validate_exact_qwen35_model_scope(config)
+    _validate_exact_qwen3_dense_model_scope(config)
     _validate_exact_qwen35_moe_program(
         config,
         moe_implementation=moe_implementation,
@@ -692,6 +975,11 @@ def build_foundation_model(
         logger.info_rank0(
             "Exact Qwen3.5-family server-training numerical program "
             f"(Class-B RoPE, RMSNorm {numerical_program.qwen35_rmsnorm_family}): {numerical_program}"
+        )
+    elif config._qwen3_dense_exact_contract:
+        logger.info_rank0(
+            "Exact dense Qwen3 server-training numerical program "
+            f"(Class-B RoPE, RMSNorm families-v2): {numerical_program}"
         )
 
     if moe_implementation is not None:
@@ -763,49 +1051,17 @@ def build_foundation_model(
         )
 
     ps = get_parallel_state()
-    _validate_exact_qwen35_topology(config, ps)
-    if isinstance(config, Glm5Config) and config.num_hidden_layers == 78:
-        if glm52_exact_active_lora_enabled(config):
-            topology = (
-                ps.world_size,
-                ps.pp_size,
-                ps.tp_size,
-                ps.dp_size,
-                ps.ep_size,
-                ps.cp_size,
-            )
-            certified = (16, 1, 1, 1, 16, 16)
-            lm_head_tp_size = getattr(ps, "lm_head_tp_size", 1)
-            if topology != certified or ps.ringattn_size != 1 or ps.ulysses_size != 16 or lm_head_tp_size != 16:
-                raise ValueError(
-                    "The GLM-5.2 exact active-LoRA path is certified only for "
-                    f"WORLD/PP/TP/DP/EP/CP={certified} with Ring1/Ulysses16/lm-head-TP16; got {topology} "
-                    f"with Ring{ps.ringattn_size}/Ulysses{ps.ulysses_size}/lm-head-TP{lm_head_tp_size}"
-                )
-            config._glm52_pipeline_layer_ranges = ((0, 78),)
-        elif canonical_glm52 and server_training:
-            topology = (
-                ps.world_size,
-                ps.pp_size,
-                ps.tp_size,
-                ps.dp_size,
-                ps.ep_size,
-                ps.cp_size,
-            )
-            certified = (16, 1, 1, 1, 16, 16)
-            if topology != certified or ps.ringattn_size != 1 or ps.ulysses_size != 16:
-                raise ValueError(
-                    "The GLM-5.2 exact server-training path is certified only for "
-                    f"WORLD/PP/TP/DP/EP/CP={certified} with Ring1/Ulysses16; got {topology} "
-                    f"with Ring{ps.ringattn_size}/Ulysses{ps.ulysses_size}"
-                )
-            config._glm52_pipeline_layer_ranges = ((0, 78),)
-        elif ps.pp_size == 1:
-            config._glm52_pipeline_layer_ranges = ((0, 78),)
-        elif ps.pp_size == 2:
-            config._glm52_pipeline_layer_ranges = ((0, 38), (38, 78))
-        else:
-            raise ValueError("GLM-5.2 supports only PP1 or the supported 38/40 PP2 split")
+    if isinstance(config, Glm5Config) and (
+        getattr(config, "indexer_types", None) is not None or getattr(config, "mlp_layer_types", None) is not None
+    ):
+        install_glm52_pipeline_module_plan(
+            config,
+            num_stages=ps.pp_size * int(pipeline_parallel_virtual_stages),
+            input_weight=pipeline_parallel_input_weight,
+            output_weight=pipeline_parallel_output_weight,
+            num_layers_in_first_stage=pipeline_parallel_num_layers_in_first_stage,
+            num_layers_in_last_stage=pipeline_parallel_num_layers_in_last_stage,
+        )
     if ps.ringattn_size > 1 and has_linear_attention_layers(config):
         logger.warning_once(LINEAR_ATTENTION_RING_UNSUPPORTED_MESSAGE)
         raise ValueError(LINEAR_ATTENTION_RING_UNSUPPORTED_MESSAGE)
@@ -870,5 +1126,18 @@ def build_foundation_model(
     # Set the real implementation name so our model code dispatches correctly
     # via ATTENTION_FUNCTIONS (not HF's ALL_ATTENTION_FUNCTIONS).
     model.config._attn_implementation = attn_implementation
+
+    if config._qwen3_dense_exact_contract:
+        from xorl.ops.batch_invariant_ops import (  # noqa: PLC0415
+            wrap_trunk_linears_batch_invariant,
+        )
+        from xorl.ops.bi_families_v2 import (  # noqa: PLC0415
+            _select_qwen3_dense_families_v2,
+        )
+
+        _select_qwen3_dense_families_v2()
+        wrapped = wrap_trunk_linears_batch_invariant(model)
+        if not wrapped:
+            raise RuntimeError("Exact dense Qwen3 model construction produced no batch-invariant trunk linears")
 
     return model

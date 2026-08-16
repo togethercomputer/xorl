@@ -225,6 +225,11 @@ class Qwen3_5Config(PretrainedConfig):
             bos_token_id=getattr(text_config, "bos_token_id", getattr(hf_config, "bos_token_id", None)),
             eos_token_id=getattr(text_config, "eos_token_id", getattr(hf_config, "eos_token_id", None)),
             architectures=["Qwen3_5ForConditionalGeneration"],
+            # Carry the checkpoint's declared weight dtype through adaptation.
+            # The PP byte-boundary contract fails closed on models without an
+            # explicit bfloat16 declaration, so dropping this field here would
+            # reject the certified checkpoints at the PP admission gate.
+            dtype=getattr(text_config, "dtype", None) or getattr(hf_config, "dtype", None),
         )
 
 

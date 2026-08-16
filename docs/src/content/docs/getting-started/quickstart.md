@@ -149,7 +149,7 @@ python examples/server/password_memorization/run_password_test.py \
     --model Qwen/Qwen3-8B --steps 16 --lr 1e-5
 ```
 
-Supports all training modes (full, LoRA, QLoRA nvfp4/block_fp8/nf4), LR schedules (constant, cosine, warmup+cosine), and FP8 weight sync re-quantization. See the [example README](https://github.com/togethercomputer/xorl/tree/main/examples/server/password_memorization/README.md) for the full test matrix across Qwen3-8B, Qwen3-30B, and Qwen3-235B.
+The checked-in server configs cover selected full-weight, LoRA, and QLoRA modes, multiple LR schedules, and FP8 weight-sync re-quantization. The [example README](https://github.com/togethercomputer/xorl/tree/main/examples/server/password_memorization/README.md) records its historical smoke matrix across Qwen3-8B, Qwen3-Coder-30B-A3B, and Qwen3-235B-A22B; treat that matrix as example history, not a current certificate for every mode or topology.
 
 ## LoRA Fine-tuning
 

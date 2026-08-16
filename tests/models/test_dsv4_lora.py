@@ -8,6 +8,7 @@ unchanged thanks to ``DeepseekV4MoE`` inheriting from ``MoEBlock``.
 
 import pytest
 import torch
+from torch import nn
 
 
 pytestmark = pytest.mark.cpu
@@ -81,6 +82,52 @@ def _lm_logits(model, input_ids):
 ATTN_LORA_TARGETS = ["wq_a", "wq_b", "wkv", "wo_a", "wo_b"]
 
 
+def test_exact_active_lora_targets_only_the_inventory_wkv(monkeypatch):
+    """Frozen compressor/indexer ``wkv`` linears must never gain adapters."""
+    from types import SimpleNamespace
+
+    from xorl.lora.modules.linear import LoraLinear
+    from xorl.lora.utils import inject_lora_into_model
+    from xorl.models.transformers.deepseek_v4 import exact_contract
+
+    class FakeAttention(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.wkv = nn.Linear(4, 4, bias=False)
+            self.compressor = nn.Module()
+            self.compressor.wkv = nn.Linear(4, 4, bias=False)
+            self.indexer = nn.Module()
+            self.indexer.compressor = nn.Module()
+            self.indexer.compressor.wkv = nn.Linear(4, 4, bias=False)
+
+    model = nn.Module()
+    model.config = SimpleNamespace(_dsv4_flash_exact_active_lora=True)
+    model.model = nn.Module()
+    model.model.layers = nn.ModuleList([nn.Module()])
+    model.model.layers[0].self_attn = FakeAttention()
+    allowed_path = "model.layers.0.self_attn.wkv"
+    inventory = SimpleNamespace(target_names=frozenset({allowed_path}))
+    monkeypatch.setattr(exact_contract, "build_dsv4_flash_adapter_inventory", lambda _config: inventory)
+
+    inject_lora_into_model(model, r=1, lora_alpha=1, target_modules=["wkv"])
+
+    attention = model.model.layers[0].self_attn
+    assert isinstance(attention.wkv, LoraLinear)
+    assert type(attention.compressor.wkv) is nn.Linear
+    assert type(attention.indexer.compressor.wkv) is nn.Linear
+
+
+def test_exact_model_keeps_dense_native_payloads_outside_fsdp_mixed_precision():
+    from xorl.models.transformers.deepseek_v4.native_payload import (
+        Dsv4NativeBlockFp8Payload,
+    )
+
+    config, model = _build_model()
+    assert model.get_ignore_modules_in_mixed_precision() is None
+    config._dsv4_flash_exact_mode = True
+    assert model.get_ignore_modules_in_mixed_precision() == (Dsv4NativeBlockFp8Payload,)
+
+
 def test_attention_lora_inject_freezes_base_and_adds_adapters():
     """``wq_a/wq_b/wkv/wo_b`` get LoraLinear adapters."""
     from xorl.lora.utils import inject_lora_into_model
@@ -129,6 +176,8 @@ def test_moe_expert_lora_inject_freezes_base_and_adds_adapters():
         assert isinstance(layer.mlp.experts, MoEExpertsLoRA), (
             f"layer {layer.layer_id} experts not LoRA: {type(layer.mlp.experts).__name__}"
         )
+        assert layer.mlp.experts.expert_lora_semantics == "dsv4_gate_only_clamped_swiglu_v1"
+        assert layer.mlp.experts.swiglu_limit == 10.0
         # Base experts weights frozen; LoRA params trainable.
         assert layer.mlp.experts.gate_up_proj.requires_grad is False
         # Find at least one LoRA param.

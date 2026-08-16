@@ -7,6 +7,7 @@ from torch import nn
 
 from xorl.distributed.parallel_state import get_parallel_state
 from xorl.distributed.sequence_parallel.strategy import get_cp_strategy
+from xorl.lora.fold import lora_merged_forward_enabled
 from xorl.models.base import XorlPreTrainedModel
 from xorl.models.checkpoint_handlers.buffers import (
     checkpoint_has_per_expert_weights,
@@ -18,7 +19,7 @@ from xorl.models.layers.attention import AttentionKwargs, update_causal_mask
 from xorl.models.layers.attention.backend import ATTENTION_FUNCTIONS
 from xorl.models.layers.attention.backend.eager import eager_attention_forward
 from xorl.models.layers.moe import MoEBlock
-from xorl.models.layers.moe.ep_native_combine import validate_qwen35_native_ep_combine_size
+from xorl.models.layers.moe.ep_native_combine import validate_native_ep_combine_size
 from xorl.models.layers.normalization import (
     compiled_zero_centered_rms_norm,
     eager_zero_centered_rms_norm,
@@ -42,7 +43,7 @@ from xorl.models.transformers.qwen3_5_shared import (
     has_linear_attention_layers,
     qwen3_5_apply_rotary_pos_emb,
 )
-from xorl.ops.fused_silu_and_mul import fused_silu_and_mul
+from xorl.ops.fused_silu_and_mul import exact_fp32_silu_and_mul, fused_silu_and_mul
 from xorl.ops.linear_attention import GatedDeltaNet
 from xorl.ops.linear_attention.ops.cp import build_linear_attention_cp_context
 from xorl.utils import logging
@@ -64,6 +65,12 @@ def _adapt_qwen3_5_moe_config(config):
         adapted = config
     adapted._qwen35_exact_contract = exact_contract
     adapted._qwen35_rmsnorm_family = rmsnorm_family
+    # Carry the family-neutral resolution-time stamps across config adaptation
+    # (only when present -- direct-construction configs stay unstamped so the
+    # legacy-flag fallbacks keep working).
+    for stamp in ("_exact_contract_family", "_exact_one_round_swiglu"):
+        if hasattr(config, stamp):
+            setattr(adapted, stamp, getattr(config, stamp))
     return adapted
 
 
@@ -74,6 +81,8 @@ def _raise_if_ring_fla_unsupported(config: Qwen3_5MoeConfig, ps) -> None:
 
 
 class Qwen3_5MoeMLP(nn.Module):
+    _supports_fused_gate_up_lora = True
+
     def __init__(self, config, intermediate_size=None):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -81,7 +90,23 @@ class Qwen3_5MoeMLP(nn.Module):
         self.gate_up_proj = nn.Linear(self.hidden_size, 2 * self.intermediate_size, bias=False)
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
-        self._use_fused_silu = config.hidden_act == "silu" and not getattr(config, "_activation_native", False)
+        activation_native = getattr(config, "_activation_native", False)
+        if getattr(config, "_qwen35_exact_contract", False):
+            activation_native = False
+        self._use_fused_silu = config.hidden_act == "silu" and not activation_native
+        # One-round FP32 SwiGLU is scoped to the exact contract (serving-paired
+        # program); every other caller keeps the historical two-round bytes.
+        # Model resolution stamps the family-neutral ``_exact_one_round_swiglu``
+        # key; configs that predate stamping keep their historical selection
+        # through the legacy Qwen-named flag.
+        self._exact_one_round = bool(
+            getattr(config, "_exact_one_round_swiglu", getattr(config, "_qwen35_exact_contract", False))
+        )
+
+    def _fused_act(self, gate_up):
+        if self._exact_one_round:
+            return exact_fp32_silu_and_mul(gate_up)
+        return fused_silu_and_mul(gate_up)
 
     def unfuse_for_tp(self):
         device = self.gate_up_proj.weight.device
@@ -90,15 +115,69 @@ class Qwen3_5MoeMLP(nn.Module):
         self.up_proj = nn.Linear(self.hidden_size, self.intermediate_size, bias=False, device=device, dtype=dtype)
         del self.gate_up_proj
 
+    @staticmethod
+    def _linear_with_contract(module: nn.Linear, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        if getattr(module, "_xorl_bi_trunk_wrapped", False):
+            from xorl.ops.batch_invariant_ops import _BatchInvariantTrunkLinearFn  # noqa: PLC0415
+
+            return _BatchInvariantTrunkLinearFn.apply(x, weight, module.bias)
+        return F.linear(x, weight, module.bias)
+
+    def _gate_up_weights_for_forward(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return independently folded gate/up weights for the fused base GEMM."""
+        if not hasattr(self, "gate_up_proj"):
+            raise RuntimeError("Fused gate/up weights requested after unfuse_for_tp()")
+        gate_base, up_base = self.gate_up_proj.weight.split(self.intermediate_size, dim=0)
+        gate_adapter = getattr(self, "gate_proj", None)
+        up_adapter = getattr(self, "up_proj", None)
+        gate_weight = (
+            gate_adapter.merged_weight_for_forward(gate_base)
+            if gate_adapter is not None and lora_merged_forward_enabled(gate_adapter)
+            else gate_base
+        )
+        up_weight = (
+            up_adapter.merged_weight_for_forward(up_base)
+            if up_adapter is not None and lora_merged_forward_enabled(up_adapter)
+            else up_base
+        )
+        return gate_weight, up_weight
+
+    def _project_gate_up(self, x: torch.Tensor) -> torch.Tensor:
+        gate_adapter = getattr(self, "gate_proj", None)
+        up_adapter = getattr(self, "up_proj", None)
+        if gate_adapter is None and up_adapter is None:
+            return self.gate_up_proj(x)
+
+        adapters = tuple(adapter for adapter in (gate_adapter, up_adapter) if adapter is not None)
+        merged = tuple(lora_merged_forward_enabled(adapter) for adapter in adapters)
+        if any(merged):
+            if not all(merged):
+                raise RuntimeError("Qwen shared-expert gate/up adapters must select merged forward together")
+            gate_weight, up_weight = self._gate_up_weights_for_forward()
+            return self._linear_with_contract(self.gate_up_proj, x, torch.cat((gate_weight, up_weight), dim=0))
+
+        gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
+        if gate_adapter is not None:
+            gate = gate + gate_adapter(x).to(gate.dtype)
+        if up_adapter is not None:
+            up = up + up_adapter(x).to(up.dtype)
+        return torch.cat((gate, up), dim=-1)
+
     def forward(self, x):
         if hasattr(self, "gate_up_proj"):
+            gate_up = self._project_gate_up(x)
             if self._use_fused_silu:
-                x = fused_silu_and_mul(self.gate_up_proj(x))
+                x = self._fused_act(gate_up)
             else:
-                gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
+                gate, up = gate_up.chunk(2, dim=-1)
                 x = self.act_fn(gate) * up
         else:
-            x = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+            gate = self.gate_proj(x)
+            up = self.up_proj(x)
+            if self._use_fused_silu:
+                x = self._fused_act(torch.cat([gate, up], dim=-1))
+            else:
+                x = self.act_fn(gate) * up
         return self.down_proj(x)
 
 
@@ -347,21 +426,23 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
         routing_weights: torch.Tensor,
         selected_experts: torch.Tensor,
     ) -> torch.Tensor:
-        """Native-EP ordered combine for the trainer's real EP group.
+        """Native-EP canonical combine for the trainer's real EP group.
 
         Every rank gathers the full token batch (backward: reduce-scatter sum),
         computes ITS routed partial through the masked serving-kernel Function
         on the LOCAL expert slice + ITS shared-expert TP slice (trainable BI
-        GEMMs, torch-native bf16 silu*mul, sigmoid gate) added in bf16 — exactly
-        serving's per-rank partial — then partials are exchanged RAW
-        (all-to-all, never NCCL-summed) and each rank chain-sums its own tokens'
-        n partials in serving rank order (n-1) -> 0. Forward bits match the
-        serving engine; backward uses stock numerics throughout
-        (cuBLAS shared-expert grads, grouped-GEMM expert grads, NCCL grad
-        reductions)."""
+        GEMMs, one-round FP32 silu*mul, sigmoid gate) joined by serving's
+        FP32 fused gate/mul/add and cast once to BF16 — exactly serving's
+        per-rank partial — then partials are exchanged RAW
+        (all-to-all, never NCCL-summed) and each rank folds its own tokens'
+        n partials with the canonical adjacent-pair FP64 tree and one final cast
+        (``canonical_moe_fold_fp64_v3``, bitwise serving's post-experts combine).
+        Forward bits match the serving engine; backward uses stock numerics
+        throughout (cuBLAS shared-expert grads, grouped-GEMM expert grads,
+        NCCL grad reductions)."""
         from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
         from xorl.models.layers.moe.ep_native_combine import (  # noqa: PLC0415
-            exchange_and_chain_sum,
+            exchange_and_canonical_fold,
             gather_ids_for_ep_combine,
             gather_tokens_for_ep_combine,
             max_rows_for_ep_combine,
@@ -371,21 +452,23 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
 
         ps = get_parallel_state()
         if not ps.ep_enabled:
-            raise RuntimeError("Qwen3.5-MoE exact ordered combine requires trainer EP mirroring the serving EP size")
+            raise RuntimeError("Qwen3.5-MoE exact canonical combine requires trainer EP mirroring the serving EP size")
         if not hasattr(self.shared_expert, "gate_up_proj"):
-            raise NotImplementedError("Qwen3.5-MoE exact ordered combine requires the fused shared-expert gate_up_proj")
+            raise NotImplementedError(
+                "Qwen3.5-MoE exact canonical combine requires the fused shared-expert gate_up_proj"
+            )
         ep_size, ep_rank, ep_group = ps.ep_size, ps.ep_rank, ps.ep_group
-        validate_qwen35_native_ep_combine_size(ep_size)
+        validate_native_ep_combine_size(ep_size)
         inter = self.shared_expert.intermediate_size
         if inter % ep_size != 0:
             raise ValueError(
-                f"Qwen3.5-MoE exact ordered combine: shared_expert intermediate_size={inter} "
+                f"Qwen3.5-MoE exact canonical combine: shared_expert intermediate_size={inter} "
                 f"not divisible by ep_size={ep_size}"
             )
         e_local = int(self.experts.gate_up_proj.shape[0])
         if e_local * ep_size != self.experts.num_experts:
             raise RuntimeError(
-                f"Qwen3.5-MoE exact ordered combine: local expert slice {e_local} x ep_size {ep_size} "
+                f"Qwen3.5-MoE exact canonical combine: local expert slice {e_local} x ep_size {ep_size} "
                 f"!= num_experts {self.experts.num_experts} (trainer EP must mirror serving EP)"
             )
 
@@ -397,7 +480,7 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
         # 1. full token batch on every rank (serving's DP-attention gather)
         # Packed DP slices can have different local row counts, so negotiate one
         # equal-count collective shape and discard this rank's padding after the
-        # ordered combine. BI kernels make those extra rows forward-independent.
+        # canonical combine. BI kernels make those extra rows forward-independent.
         padded_rows = max_rows_for_ep_combine(flat.shape[0], flat.device, ep_group)
         gathered = gather_tokens_for_ep_combine(flat, ep_group, padded_rows)
         gathered_routing = gather_tokens_for_ep_combine(routing_flat, ep_group, padded_rows)
@@ -407,7 +490,8 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
         self._capture_diagnostic_component("moe_native_gathered_ids", gathered_ids)
 
         # 2. this rank's partial: routed (masked serving kernel on the local
-        #    slice) + shared-expert TP slice, added in bf16 (serving semantics)
+        #    slice) + shared-expert TP slice, joined by serving's FP32 fused
+        #    gate/mul/add and cast once to BF16
         lo = ep_rank * e_local
         local_ids = torch.where(
             (gathered_ids >= lo) & (gathered_ids < lo + e_local),
@@ -424,8 +508,12 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
         ).to(torch.bfloat16)
         self._capture_diagnostic_component("moe_native_routed", routed)
 
-        w_gu = self.shared_expert.gate_up_proj.weight  # [2I, H], gate rows first
-        w_down = self.shared_expert.down_proj.weight  # [H, I]
+        gate_weight, up_weight = self.shared_expert._gate_up_weights_for_forward()
+        w_gu = torch.cat((gate_weight, up_weight), dim=0)  # [2I, H], gate rows first
+        down_proj = self.shared_expert.down_proj
+        w_down = (
+            down_proj.merged_weight_for_forward() if lora_merged_forward_enabled(down_proj) else down_proj.weight
+        )  # [H, I]
         shard = inter // ep_size
         lo_s = ep_rank * shard
         # Retain the decomposed gate only when operand diagnostics request it.
@@ -438,8 +526,9 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
         w_slice = torch.cat((w_gu[lo_s : lo_s + shard], w_gu[inter + lo_s : inter + lo_s + shard]), dim=0)
         gate_up = _BatchInvariantTrunkLinearFn.apply(gathered, w_slice, None)
         self._capture_diagnostic_component("moe_native_shared_gate_up", gate_up)
-        gate, up = gate_up.chunk(2, dim=-1)
-        act = F.silu(gate) * up  # torch-native bf16 (serving's BI-ops lane; NOT the fused kernel)
+        # Exact serving-value path: one-round FP32, paired with serving's
+        # fp32_silu_and_mul (in-scope for the exact contract by construction).
+        act = exact_fp32_silu_and_mul(gate_up)
         self._capture_diagnostic_component("moe_native_shared_act", act)
         down = _BatchInvariantTrunkLinearFn.apply(act, w_down[:, lo_s : lo_s + shard].contiguous(), None)
         self._capture_diagnostic_component("moe_native_shared_down", down)
@@ -451,8 +540,8 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
         )
         self._capture_diagnostic_component("moe_native_local_partial", partial)
 
-        # 3./4. raw exchange + serving-order chain sum (autograd reverses the exchange)
-        out = exchange_and_chain_sum(partial, ep_group, ep_size)
+        # 3./4. raw exchange + the canonical serving fold (autograd reverses the exchange)
+        out = exchange_and_canonical_fold(partial, ep_group, ep_size)
         self._capture_diagnostic_component("moe_native_combined", out)
         return out[: flat.shape[0]].reshape(batch_size, sequence_length, hidden_dim)
 

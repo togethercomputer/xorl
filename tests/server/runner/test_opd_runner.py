@@ -366,6 +366,71 @@ def test_opd_runner_runs_lm_head_anchor_for_fsdp(_mock_get_device_type, tmp_path
     assert lm_head.weight.grad is not None and lm_head.weight.grad.isfinite().all()
 
 
+@patch("xorl.server.runner.model_runner.get_device_type", return_value="cpu")
+@patch("xorl.server.runner.model_runner.get_parallel_state")
+def test_physical_pp_dispatcher_runs_ordinary_terminal_opd(
+    mock_parallel_state,
+    _mock_get_device_type,
+    tmp_path,
+):
+    mock_parallel_state.return_value = Mock(
+        tp_enabled=False,
+        cp_enabled=False,
+        lm_head_tp_group=None,
+    )
+    torch.manual_seed(13)
+    seq_len = 3
+    hidden_size = 4
+    teacher_hidden_size = 5
+    vocab_size = 9
+    teacher_heads = {"0": torch.randn(vocab_size, teacher_hidden_size) / teacher_hidden_size**0.5}
+    teacher_caches = {"0": torch.randn(seq_len, teacher_hidden_size) / teacher_hidden_size**0.5}
+    teacher_files = make_teacher_files(tmp_path, teacher_heads, teacher_caches)
+    store = MooncakeHiddenStore(client=_FakeMooncakeClient(), get_retry_max_wait_s=0.0)
+    hidden_caches = {tid: store.put_hidden(f"opd/test/teacher/{tid}/hidden", t) for tid, t in teacher_caches.items()}
+
+    runner = _make_opd_runner()
+    runner.pp_enabled = True
+    runner.pp_num_stages = 1
+    runner.ce_mode = "eager"
+    runner._opd_hidden_cache = TeacherActivationCache(hidden_caches, mooncake_store=store, enable_async=False)
+    runner._opd_hidden_config = repr(hidden_caches)
+    terminal_part = torch.nn.Module()
+    terminal_part.lm_head = _RecordingLmHead(hidden_size, vocab_size)
+    runner.model = terminal_part
+    runner.model_parts = [terminal_part]
+    runner.pp_stages = [SimpleNamespace(stage_index=0)]
+    micro_batch = {
+        "labels": torch.tensor([[1, 2, 3]]),
+        "teacher_ids": torch.zeros(1, seq_len, dtype=torch.long),
+        "teacher_cache_indices": torch.arange(seq_len, dtype=torch.long).unsqueeze(0),
+    }
+    params = {
+        "teacher_heads": teacher_files.heads,
+        "teacher_hidden_caches": hidden_caches,
+        "opd_kl_backend": "streaming",
+        "opd_vocab_chunk_size": 4,
+    }
+
+    dispatcher = runner._make_pp_train_loss_fn()
+    dispatcher.begin_step(
+        [micro_batch],
+        loss_fn="opd_loss",
+        loss_fn_params=params,
+        model_id="policy-a",
+        assert_consumed=True,
+    )
+    hidden_states = (torch.randn(1, seq_len, hidden_size) / hidden_size**0.5).requires_grad_(True)
+    loss = dispatcher(hidden_states, torch.tensor([0], dtype=torch.long))
+    loss.backward()
+    records = dispatcher.end_step()
+
+    assert hidden_states.grad is not None and hidden_states.grad.isfinite().all()
+    assert terminal_part.lm_head.weight.grad is not None and terminal_part.lm_head.weight.grad.isfinite().all()
+    assert records[0]["metrics"]["valid_tokens"] == seq_len
+    assert records[0]["metrics"]["opd_num_teachers"] == 1
+
+
 def test_teacher_hidden_cache_splits_packed_batch_and_drops_padding():
     runner = _make_opd_runner()
     hidden_states = torch.arange(1 * 8 * 2, dtype=torch.float32).reshape(1, 8, 2)

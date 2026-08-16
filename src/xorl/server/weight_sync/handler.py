@@ -46,7 +46,11 @@ from xorl.lora.fold import lora_merged_forward_enabled
 from xorl.lora.modules.base import LoraModule
 from xorl.lora.modules.delta_linear import LoraDeltaLinear
 from xorl.lora.modules.linear import LoraLinear
-from xorl.models.exact_contract import contains_glm52_exact_active_lora_component
+from xorl.models.exact_contract import (
+    contains_dsv4_exact_active_lora_component,
+    contains_glm52_exact_active_lora_component,
+    contains_glm52_fullparam_component,
+)
 from xorl.models.layers.moe.experts import MoEExperts
 from xorl.models.layers.moe.lora import MoEExpertsLoRA
 from xorl.models.transformers.nemotron_h.checkpoint_handler import (
@@ -468,6 +472,12 @@ class WeightSyncHandler:
             return None
 
         model = getattr(self.trainer, "model", None)
+        if contains_dsv4_exact_active_lora_component(model):
+            raise RuntimeError(
+                "DSV4-Flash exact active-LoRA requires complete factor-only adapter publication; "
+                "legacy merged full-weight synchronization is not admitted. Export all 948 factors "
+                "as dsv4_expert_banks and load a fresh sampler adapter version."
+            )
         if contains_glm52_exact_active_lora_component(model):
             raise RuntimeError(
                 "GLM-5.2 exact active-LoRA composites require a complete factor-only adapter synchronization "
@@ -716,11 +726,26 @@ class WeightSyncHandler:
         logger.info(f"Rank {self.rank}: [WeightSync] Starting sync_inference_weights")
 
         model = getattr(self.trainer, "model", None)
+        if contains_dsv4_exact_active_lora_component(model):
+            raise RuntimeError(
+                "DSV4-Flash exact active-LoRA requires factor-only adapter publication; "
+                "legacy merged/full-weight synchronization, including prepacked sparse-delta sync, is not admitted. "
+                "Export all 948 factors as dsv4_expert_banks and load a fresh sampler adapter version."
+            )
         if contains_glm52_exact_active_lora_component(model):
             raise RuntimeError(
                 "GLM-5.2 exact active-LoRA composites require factor-only adapter publication; "
                 "legacy merged/full-weight synchronization, including prepacked sparse-delta sync, is not admitted. "
                 "Export all 1,700 factors and start a fresh sampler adapter lifecycle."
+            )
+        train_config = getattr(self.trainer, "train_config", {}) or {}
+        if (
+            isinstance(train_config, dict) and train_config.get("glm52_fullparam_fp8_training")
+        ) or contains_glm52_fullparam_component(model):
+            raise RuntimeError(
+                "GLM-5.2 full-parameter block-FP8 training cannot use legacy /sync_inference_weights. "
+                "Publish the checksummed step-boundary payload and atomically reload the materialized "
+                "SGLang checkpoint; no generic NCCL, P2P, merged-weight, or sparse-delta route is admitted."
             )
 
         p: SyncWeightsData = command_dict.get("payload", SyncWeightsData())
@@ -746,7 +771,6 @@ class WeightSyncHandler:
             )
         except UnsupportedSyncQuantizationError as exc:
             return {"success": False, "message": str(exc)}
-        train_config = getattr(self.trainer, "train_config", {}) or {}
         if self.trainer is not None and getattr(self.trainer, "model", None) is not None:
             try:
                 qarl_quantization = qarl_sync_quantization_config(self.trainer.model, quantization)
@@ -2056,6 +2080,11 @@ class WeightSyncHandler:
         """
         if collect_results is None:
             collect_results = self.rank == 0
+        if contains_dsv4_exact_active_lora_component(fsdp_mod):
+            raise RuntimeError(
+                "DSV4-Flash exact active-LoRA cannot enter merged-weight collectives; "
+                "export all 948 factors as dsv4_expert_banks"
+            )
         if contains_glm52_exact_active_lora_component(fsdp_mod):
             raise RuntimeError(
                 "GLM-5.2 exact active-LoRA composites cannot enter QLoRA merged-weight collectives; "
@@ -4124,6 +4153,11 @@ class WeightSyncHandler:
         """
         buffer = []
 
+        if contains_dsv4_exact_active_lora_component(fsdp_mod):
+            raise RuntimeError(
+                "DSV4-Flash exact active-LoRA factors cannot be extracted by legacy merged-weight sync; "
+                "export all 948 factors as dsv4_expert_banks"
+            )
         if contains_glm52_exact_active_lora_component(fsdp_mod):
             raise RuntimeError(
                 "GLM-5.2 exact active-LoRA composite internals cannot be extracted by legacy merged-weight sync; "
@@ -4150,6 +4184,8 @@ class WeightSyncHandler:
         # (LoraDeltaLinear, start, end) row-slice of the fused delta to fold into it.
         lora_param_names = set()
         fused_gdn_base_deltas = {}
+        fused_gate_up_deltas = {}
+        fused_qkv_deltas = {}
         for mname, mod in lora_modules.items():
             prefix = f"{mname}." if mname else ""
             if isinstance(mod, QLoRALinear):
@@ -4179,6 +4215,22 @@ class WeightSyncHandler:
                         )
                 elif gdn_leaf == "out_proj":
                     fused_gdn_base_deltas[f"{gdn_parent_name}.o_proj"] = (mod, 0, mod.out_features)
+                elif gdn_leaf in {"q_proj", "k_proj", "v_proj"} and hasattr(gdn_parent, "qkv_proj"):
+                    base_name = f"{gdn_parent_name}.qkv_proj"
+                    entry = fused_qkv_deltas.setdefault(
+                        base_name,
+                        {
+                            "sizes": (
+                                int(getattr(gdn_parent, "q_dim")),
+                                int(getattr(gdn_parent, "kv_dim")),
+                                int(getattr(gdn_parent, "kv_dim")),
+                            )
+                        },
+                    )
+                    entry[gdn_leaf] = mod
+                elif gdn_leaf in {"gate_proj", "up_proj"} and hasattr(gdn_parent, "gate_up_proj"):
+                    base_name = f"{gdn_parent_name}.gate_up_proj"
+                    fused_gate_up_deltas.setdefault(base_name, {})[gdn_leaf] = mod
                 else:
                     raise RuntimeError(f"Unexpected fused-GDN LoRA leaf {gdn_leaf!r} for {mname}")
             elif isinstance(mod, LoraLinear):
@@ -4228,6 +4280,45 @@ class WeightSyncHandler:
             #   parent module "self_attn.q_proj" is the LoraLinear
             parent_name = ".".join(pname.split(".")[:-1])
             param_leaf = pname.split(".")[-1]  # e.g. "weight", "gate_proj"
+
+            # Fused base projections retain one GEMM while training independent
+            # logical factors. Publish the same canonical fold used by forward.
+            fused_qkv = fused_qkv_deltas.get(parent_name)
+            if fused_qkv is not None and param_leaf == "weight":
+                sizes = fused_qkv["sizes"]
+                base_parts = param.data.split(sizes, dim=0)
+                folded_parts = []
+                for leaf, base in zip(("q_proj", "k_proj", "v_proj"), base_parts, strict=True):
+                    delta_module = fused_qkv.get(leaf)
+                    folded = base if delta_module is None else delta_module._merged_weight(base)
+                    folded_parts.append(folded.to(dtype=torch.bfloat16))
+                buffer.append((full_name, torch.cat(folded_parts, dim=0).clone()))
+                continue
+
+            fused_gate_up = fused_gate_up_deltas.get(parent_name)
+            if fused_gate_up is not None and param_leaf == "weight":
+                if param.shape[0] % 2:
+                    raise RuntimeError(f"Fused gate/up projection {full_name} has odd output size {param.shape[0]}")
+                gate_base, up_base = param.data.chunk(2, dim=0)
+                folded_parts = []
+                for leaf, base in (("gate_proj", gate_base), ("up_proj", up_base)):
+                    delta_module = fused_gate_up.get(leaf)
+                    if delta_module is None:
+                        folded_parts.append(base.to(dtype=torch.bfloat16))
+                        continue
+                    if lora_merged_forward_enabled(delta_module):
+                        folded = delta_module._merged_weight(base).to(dtype=torch.bfloat16)
+                    else:
+                        delta = delta_module.get_delta_weight()
+                        if tuple(delta.shape) != tuple(base.shape):
+                            raise RuntimeError(
+                                f"Fused {leaf} delta for {full_name} has shape "
+                                f"{tuple(delta.shape)}, expected {tuple(base.shape)}"
+                            )
+                        folded = base.to(dtype=torch.bfloat16) + delta.to(dtype=torch.bfloat16)
+                    folded_parts.append(folded)
+                buffer.append((full_name, torch.cat(folded_parts, dim=0).clone()))
+                continue
 
             # Fused-GDN fold: this base projection (q/k/v/g/o_proj) gets the
             # corresponding row-slice of the fused in_proj_qkvz / out_proj delta.

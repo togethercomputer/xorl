@@ -65,7 +65,13 @@ def _exact_world16_state(*, lm_head_tp_size: int = 16) -> SimpleNamespace:
     )
 
 
-def _build_exact_rank1(monkeypatch: pytest.MonkeyPatch, *, lm_head_tp_size: int = 16):
+def _build_exact_active_lora(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    lora_rank: int = 1,
+    lora_alpha: int = 1,
+    lm_head_tp_size: int = 16,
+):
     class _Loader:
         def load_model(self, *, init_kwargs, **_kwargs):
             return SimpleNamespace(config=init_kwargs["config"])
@@ -84,8 +90,8 @@ def _build_exact_rank1(monkeypatch: pytest.MonkeyPatch, *, lm_head_tp_size: int 
         ep_dispatch="alltoall",
         server_training=True,
         block_fp8_qlora_training=True,
-        lora_rank=1,
-        lora_alpha=1,
+        lora_rank=lora_rank,
+        lora_alpha=lora_alpha,
         init_device="meta",
     )
 
@@ -93,18 +99,30 @@ def _build_exact_rank1(monkeypatch: pytest.MonkeyPatch, *, lm_head_tp_size: int 
 def test_rank1_server_training_derives_the_complete_family_without_private_flags(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    model = _build_exact_rank1(monkeypatch)
+    model = _build_exact_active_lora(monkeypatch)
 
     assert glm52_exact_active_lora_enabled(model.config)
     assert model.config._glm52_exact_contract is False
     assert all(getattr(model.config, flag) is True for flag in GLM52_EXACT_ACTIVE_LORA_FLAGS)
 
 
-def test_rank1_server_training_rejects_non_tp16_lm_head_before_loading(
+def test_rank16_server_training_derives_the_complete_family_without_private_flags(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    with pytest.raises(ValueError, match="lm-head-TP16"):
-        _build_exact_rank1(monkeypatch, lm_head_tp_size=1)
+    model = _build_exact_active_lora(monkeypatch, lora_rank=16, lora_alpha=32)
+
+    assert glm52_exact_active_lora_enabled(model.config)
+    assert model.config._glm52_exact_contract is False
+    assert all(getattr(model.config, flag) is True for flag in GLM52_EXACT_ACTIVE_LORA_FLAGS)
+
+
+def test_rank1_server_training_does_not_gate_launch_on_lm_head_tp_degree(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _build_exact_active_lora(monkeypatch, lm_head_tp_size=1)
+
+    assert glm52_exact_active_lora_enabled(model.config)
+    assert all(getattr(model.config, flag) is True for flag in GLM52_EXACT_ACTIVE_LORA_FLAGS)
 
 
 @pytest.mark.parametrize("missing_flag", GLM52_EXACT_ACTIVE_LORA_FLAGS)

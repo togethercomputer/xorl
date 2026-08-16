@@ -1,5 +1,6 @@
 """LM-head LoRA folding on the server loss path."""
 
+import json
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -71,6 +72,66 @@ def test_effective_lm_head_keeps_legacy_unmerged_formula_without_contract():
 
     expected = head.weight + head.get_delta_weight().to(head.weight.dtype)
     assert torch.equal(runner._get_effective_lm_head_weight(), expected)
+
+
+def test_runner_lora_target_source_precedence(tmp_path):
+    root = tmp_path / "target-resolution"
+    root.mkdir()
+
+    def make_runner(model_type, lora_config):
+        config_dir = root / model_type
+        config_dir.mkdir()
+        (config_dir / "config.json").write_text(json.dumps({"model_type": model_type}))
+        runner = object.__new__(ModelRunner)
+        runner.model_config = {"config_path": str(config_dir)}
+        runner.lora_config = lora_config
+        return runner
+
+    for model_type, config, expected in (
+        (
+            "glm_moe_dsa",
+            {"train_attn": True, "train_mlp": False, "train_unembed": False},
+            ["q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj"],
+        ),
+        (
+            "kimi_k25",
+            {"train_attn": True, "train_mlp": False, "train_unembed": True},
+            ["q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj", "lm_head"],
+        ),
+        (
+            "qwen3_5_moe",
+            {"train_attn": True, "train_mlp": True, "train_unembed": False},
+            ["q_proj", "k_proj", "v_proj", "g_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        ),
+    ):
+        assert make_runner(model_type, config)._resolve_lora_target_modules() == expected
+
+    explicit = ["q_b_proj", "o_proj"]
+    runner = make_runner(
+        "deepseek_v3",
+        {
+            "lora_target_modules": explicit,
+            "train_attn": False,
+            "train_mlp": False,
+            "train_unembed": False,
+        },
+    )
+    assert runner._resolve_lora_target_modules() == explicit
+
+    runner.lora_config = {
+        "lora_target_manifest": {
+            "schema_version": 1,
+            "target_modules": explicit,
+            "expected_modules": [
+                {"pattern": "model.layers.*.self_attn.q_b_proj", "count": 4, "rank": 8},
+            ],
+            "allow_unlisted": False,
+        },
+        "train_attn": False,
+        "train_mlp": False,
+        "train_unembed": False,
+    }
+    assert runner._resolve_lora_target_modules() == explicit
 
 
 def test_runner_compiles_module_and_direct_output_properties_at_registration(tmp_path, monkeypatch):

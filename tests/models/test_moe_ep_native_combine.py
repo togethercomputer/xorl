@@ -3,25 +3,123 @@
 import pytest
 import torch
 
+from xorl.distributed.canonical_moe import canonical_moe_fold_fp64_v3
 from xorl.models.layers.moe.ep_native_combine import (
-    QWEN35_NATIVE_EP_COMBINE_SIZES,
+    exchange_and_canonical_fold,
     gather_ids_for_ep_combine,
     gather_tokens_for_ep_combine,
     max_rows_for_ep_combine,
     sglang_fused_gate_sigmoid_mul_add,
-    validate_qwen35_native_ep_combine_size,
+    validate_native_ep_combine_size,
 )
 
 
 pytestmark = [pytest.mark.cpu]
 
 
-def test_qwen35_native_combine_admits_only_ep8():
-    assert QWEN35_NATIVE_EP_COMBINE_SIZES == frozenset({8})
-    validate_qwen35_native_ep_combine_size(8)
-    for size in (1, 2, 4, 16):
-        with pytest.raises(ValueError, match="EP8"):
-            validate_qwen35_native_ep_combine_size(size)
+def test_native_combine_accepts_every_positive_complete_contributor_group():
+    for size in (1, 2, 3, 4, 5, 6, 8, 16, 17, 32, 64):
+        validate_native_ep_combine_size(size)
+    for size in (0, -1):
+        with pytest.raises(ValueError, match="positive contributor count"):
+            validate_native_ep_combine_size(size)
+
+
+@pytest.mark.parametrize("ep_size", [1, 3, 5])
+def test_native_combine_odd_tail_and_identity_geometries_preserve_bytes_and_gradients(monkeypatch, ep_size):
+    from xorl.distributed.moe.comm import _AllToAll  # noqa: PLC0415
+
+    monkeypatch.setattr(
+        _AllToAll,
+        "apply",
+        staticmethod(lambda _group, partial, _out_splits, _in_splits: partial),
+    )
+    contributors = (
+        torch.arange(ep_size * 6, dtype=torch.float32).reshape(ep_size, 2, 3).sub_(7).div_(8).bfloat16()
+    ).requires_grad_(True)
+
+    result = exchange_and_canonical_fold(contributors.reshape(ep_size * 2, 3), group=None, ep_size=ep_size)
+    expected = canonical_moe_fold_fp64_v3(contributors)
+
+    assert torch.equal(result.view(torch.uint16), expected.view(torch.uint16))
+    result.float().sum().backward()
+    assert torch.equal(contributors.grad, torch.ones_like(contributors))
+
+
+def test_native_combine_32_way_fallback_matches_explicit_adjacent_tree(monkeypatch):
+    from xorl.distributed.moe.comm import _AllToAll  # noqa: PLC0415
+
+    monkeypatch.setattr(
+        _AllToAll,
+        "apply",
+        staticmethod(lambda _group, partial, _out_splits, _in_splits: partial),
+    )
+    contributors = torch.randn(32, 3, 5, generator=torch.Generator().manual_seed(41)).to(torch.bfloat16)
+
+    result = exchange_and_canonical_fold(contributors.reshape(96, 5), group=None, ep_size=32)
+
+    level = contributors.float()
+    while level.shape[0] > 1:
+        level = level[0::2] + level[1::2]
+    assert torch.equal(result, level[0].bfloat16())
+
+
+def test_qwen35_exchange_uses_canonical_tree_and_preserves_backward(monkeypatch):
+    from xorl.distributed.moe.comm import _AllToAll  # noqa: PLC0415
+
+    monkeypatch.setattr(
+        _AllToAll,
+        "apply",
+        staticmethod(lambda _group, partial, _out_splits, _in_splits: partial),
+    )
+    contributors = torch.tensor(
+        [4096.0, -4096.0, 1.0, 1.0, 0.5, -0.5, 2.0, -2.0],
+        dtype=torch.bfloat16,
+    ).view(8, 1, 1)
+    leaf = contributors.expand(8, 3, 2).clone()
+    leaf[:, -1].zero_()  # deterministic padded row
+    leaf.requires_grad_(True)
+
+    result = exchange_and_canonical_fold(leaf.reshape(24, 2), group=None, ep_size=8)
+
+    level = leaf.float()
+    while level.shape[0] > 1:
+        level = level[0::2] + level[1::2]
+    expected = level[0].bfloat16()
+    legacy = leaf[-1]
+    for ordinal in range(6, -1, -1):
+        legacy = legacy + leaf[ordinal]
+    assert torch.equal(result, expected)
+    assert not torch.equal(result[0], legacy[0])
+    assert torch.equal(result[-1], torch.zeros_like(result[-1]))
+
+    result.float().sum().backward()
+    assert leaf.grad is not None
+    assert torch.equal(leaf.grad, torch.ones_like(leaf.grad))
+
+
+@pytest.mark.parametrize(
+    ("partial", "ep_size", "message"),
+    [
+        (torch.zeros((16, 2), dtype=torch.float32), 8, "BF16"),
+        (torch.zeros((15, 2), dtype=torch.bfloat16), 8, "divisible"),
+        (torch.zeros((18, 2), dtype=torch.bfloat16), 0, "positive contributor count"),
+    ],
+)
+def test_qwen35_exchange_fails_closed_before_transport(monkeypatch, partial, ep_size, message):
+    from xorl.distributed.moe.comm import _AllToAll  # noqa: PLC0415
+
+    called = False
+
+    def unexpected_transport(*_args):
+        nonlocal called
+        called = True
+        raise AssertionError("transport must not run")
+
+    monkeypatch.setattr(_AllToAll, "apply", staticmethod(unexpected_transport))
+    with pytest.raises((TypeError, ValueError), match=message):
+        exchange_and_canonical_fold(partial, group=None, ep_size=ep_size)
+    assert not called
 
 
 def _qwen_block(*, exact: bool = False):
@@ -195,7 +293,7 @@ def test_native_combine_captures_actual_operands(monkeypatch):
     monkeypatch.setattr(combine, "max_rows_for_ep_combine", lambda rows, _device, _group: rows)
     monkeypatch.setattr(combine, "gather_tokens_for_ep_combine", lambda value, _group, _rows: value)
     monkeypatch.setattr(combine, "gather_ids_for_ep_combine", lambda value, _group, _rows: value)
-    monkeypatch.setattr(combine, "exchange_and_chain_sum", lambda value, _group, _size: value)
+    monkeypatch.setattr(combine, "exchange_and_canonical_fold", lambda value, _group, _size: value)
     monkeypatch.setattr(
         combine,
         "sglang_fused_gate_sigmoid_mul_add",

@@ -1,4 +1,4 @@
-"""Exact GLM-5.2 absorbed-MLA ``kv_b_proj`` with active rank-one LoRA.
+"""Exact GLM-5.2 absorbed-MLA ``kv_b_proj`` with active LoRA.
 
 SGLang never invokes ``kv_b_proj`` as an ordinary linear in its absorbed MLA
 path.  It dequantizes the frozen block-FP8 weight, creates deliberately laid
@@ -19,10 +19,11 @@ from typing import Any
 import torch
 from torch import Tensor, nn
 
+from xorl.models.transformers.glm5.exact_lora_contract import glm52_exact_lora_scaling
 from xorl.ops.block_fp8_native import NativeBlockFP8Linear
 
 
-GLM52_EXACT_TP1_ABSORBED_KV_B_QLORA_CONTRACT_VERSION = "glm52_exact_tp1_absorbed_kv_b_rank1_qlora_v1"
+GLM52_EXACT_TP1_ABSORBED_KV_B_QLORA_CONTRACT_VERSION = "glm52_exact_tp1_absorbed_kv_b_qlora_v2"
 
 _GLM52_NUM_HEADS = 64
 _GLM52_QK_NOPE_HEAD_DIM = 192
@@ -33,7 +34,7 @@ _GLM52_FIXED_GRAPH_LORA_SLOTS = 8
 
 
 @lru_cache(maxsize=64)
-def _single_adapter_absorbed_batch_info(device_index: int, rows: int):
+def _single_adapter_absorbed_batch_info(device_index: int, rows: int, rank: int, scaling: float):
     """Cache the trainer's immutable one-active-adapter kernel metadata."""
 
     from sglang.srt.lora.utils import LoRABatchInfo  # noqa: PLC0415
@@ -45,8 +46,8 @@ def _single_adapter_absorbed_batch_info(device_index: int, rows: int):
         num_segments=1,
         seg_indptr=torch.tensor([0, rows], dtype=torch.int32, device=device),
         weight_indices=torch.zeros(1, dtype=torch.int32, device=device),
-        lora_ranks=torch.ones(1, dtype=torch.int32, device=device),
-        scalings=torch.ones(1, dtype=torch.float32, device=device),
+        lora_ranks=torch.full((1,), rank, dtype=torch.int32, device=device),
+        scalings=torch.full((1,), scaling, dtype=torch.float32, device=device),
         max_len=rows,
         seg_lens=torch.tensor([rows], dtype=torch.int32, device=device),
         permutation=None,
@@ -134,7 +135,7 @@ class Glm52ExactTP1AbsorbedKvBBlockFP8QLoRA(NativeBlockFP8Linear):
     adapter_gradient_producer_family = "module_managed"
     contract_version = GLM52_EXACT_TP1_ABSORBED_KV_B_QLORA_CONTRACT_VERSION
     logical_factor_names = ("lora_A", "lora_B")
-    max_lora_rank = 1
+    max_lora_rank: int
     fixed_graph_lora_slots = _GLM52_FIXED_GRAPH_LORA_SLOTS
 
     def __init__(
@@ -162,10 +163,7 @@ class Glm52ExactTP1AbsorbedKvBBlockFP8QLoRA(NativeBlockFP8Linear):
                 "GLM-5.2 exact absorbed kv_b supports only official "
                 f"(heads, qk_nope, v_head, kv_rank)={official}, got {geometry}"
             )
-        if (r, lora_alpha) != (1, 1):
-            raise ValueError(
-                f"GLM-5.2 exact absorbed kv_b requires rank=1 and alpha=1; received rank={r}, alpha={lora_alpha}"
-            )
+        scaling = glm52_exact_lora_scaling(r, lora_alpha)
         if bias:
             raise ValueError("GLM-5.2 exact absorbed kv_b is bias-free")
         if tp_size != 1:
@@ -179,10 +177,11 @@ class Glm52ExactTP1AbsorbedKvBBlockFP8QLoRA(NativeBlockFP8Linear):
         self.kv_lora_rank = int(kv_lora_rank)
         self.r = self.active_r = int(r)
         self.lora_alpha = self.active_lora_alpha = int(lora_alpha)
-        self.scaling = 1.0
+        self.scaling = scaling
+        self.max_lora_rank = r
         self.tp_size = 1
-        self.lora_A = nn.Parameter(torch.empty((1, kv_lora_rank), dtype=torch.float32, device=device))
-        self.lora_B = nn.Parameter(torch.empty((out_features, 1), dtype=torch.float32, device=device))
+        self.lora_A = nn.Parameter(torch.empty((r, kv_lora_rank), dtype=torch.float32, device=device))
+        self.lora_B = nn.Parameter(torch.empty((out_features, r), dtype=torch.float32, device=device))
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B)
         self._validated_batch_info_signature: tuple[Any, ...] | None = None
@@ -223,7 +222,10 @@ class Glm52ExactTP1AbsorbedKvBBlockFP8QLoRA(NativeBlockFP8Linear):
         unexpected_keys,
         error_msgs,
     ):
-        for name, shape in (("lora_A", (1, self.kv_lora_rank)), ("lora_B", (self.out_features, 1))):
+        for name, shape in (
+            ("lora_A", (self.r, self.kv_lora_rank)),
+            ("lora_B", (self.out_features, self.r)),
+        ):
             tensor = state_dict.get(f"{prefix}{name}")
             if tensor is not None and (tensor.dtype is not torch.float32 or tuple(tensor.shape) != shape):
                 raise TypeError(
@@ -241,14 +243,9 @@ class Glm52ExactTP1AbsorbedKvBBlockFP8QLoRA(NativeBlockFP8Linear):
         )
 
     def set_runtime_lora_config(self, lora_rank: int, lora_alpha: int) -> None:
-        if (lora_rank, lora_alpha) != (1, 1):
-            raise ValueError(
-                "GLM-5.2 exact absorbed kv_b runtime admits only rank=1 and alpha=1; "
-                f"got rank={lora_rank}, alpha={lora_alpha}"
-            )
-        self.active_r = 1
-        self.active_lora_alpha = 1
-        self.scaling = 1.0
+        self.scaling = glm52_exact_lora_scaling(lora_rank, lora_alpha)
+        self.active_r = lora_rank
+        self.active_lora_alpha = lora_alpha
 
     def _validate_state_contract(self, device: torch.device) -> None:
         if (
@@ -260,11 +257,20 @@ class Glm52ExactTP1AbsorbedKvBBlockFP8QLoRA(NativeBlockFP8Linear):
             self.tp_size,
             self.max_lora_rank,
             self.fixed_graph_lora_slots,
-        ) != (1, 1, 1, 1, 1.0, 1, 1, _GLM52_FIXED_GRAPH_LORA_SLOTS):
+        ) != (
+            self.r,
+            self.r,
+            self.lora_alpha,
+            self.lora_alpha,
+            glm52_exact_lora_scaling(self.r, self.lora_alpha),
+            1,
+            self.r,
+            _GLM52_FIXED_GRAPH_LORA_SLOTS,
+        ):
             raise RuntimeError("GLM-5.2 exact absorbed kv_b rank/alpha/scaling/TP/slot contract was mutated")
         expected_factors = {
-            "lora_A": (self.lora_A, (1, self.kv_lora_rank)),
-            "lora_B": (self.lora_B, (self.out_features, 1)),
+            "lora_A": (self.lora_A, (self.r, self.kv_lora_rank)),
+            "lora_B": (self.lora_B, (self.out_features, self.r)),
         }
         for name, (factor, shape) in expected_factors.items():
             if factor.dtype is not torch.float32 or tuple(factor.shape) != shape:
@@ -368,10 +374,12 @@ class Glm52ExactTP1AbsorbedKvBBlockFP8QLoRA(NativeBlockFP8Linear):
         scalings = batch_info.scalings.detach().to(device="cpu", dtype=torch.float32)
         expected_ranks = torch.zeros(slot_count, dtype=torch.int64)
         expected_scalings = torch.zeros(slot_count, dtype=torch.float32)
-        expected_ranks[0] = 1
-        expected_scalings[0] = 1.0
+        expected_ranks[0] = self.r
+        expected_scalings[0] = self.scaling
         if not torch.equal(ranks, expected_ranks) or not torch.equal(scalings, expected_scalings):
-            raise ValueError("Exact absorbed kv_b requires slot0 rank1/scale1 and every padded slot rank0/scale0")
+            raise ValueError(
+                "Exact absorbed kv_b requires the configured rank/scaling in slot0 and every padded slot rank0/scale0"
+            )
         if batch_info.use_cuda_graph:
             expected_indices = torch.arange(_GLM52_FIXED_GRAPH_LORA_SLOTS, dtype=torch.int64)
             expected_lengths = torch.zeros(_GLM52_FIXED_GRAPH_LORA_SLOTS, dtype=torch.int64)
@@ -434,7 +442,7 @@ class Glm52ExactTP1AbsorbedKvBBlockFP8QLoRA(NativeBlockFP8Linear):
             raise ValueError("GLM-5.2 exact absorbed kv_b v input must use the contiguous [B,S,H,512] layout")
         self._validate_state_contract(input.device)
         if batch_info is None:
-            batch_info = _single_adapter_absorbed_batch_info(input.device.index, rows)
+            batch_info = _single_adapter_absorbed_batch_info(input.device.index, rows, self.r, self.scaling)
         self._validate_batch_info(batch_info, rows, input.device)
         try:
             flat_input = input.view(rows, self.num_heads, input_width)
@@ -481,10 +489,9 @@ class Glm52ExactTP1AbsorbedKvBBlockFP8QLoRA(NativeBlockFP8Linear):
         if effective_A.dtype is not torch.bfloat16 or effective_B.dtype is not torch.bfloat16:
             raise TypeError("GLM-5.2 exact absorbed kv_b effective factors must be BF16")
         slot_count = batch_info.lora_ranks.numel()
-        # Adapter-slot padding is real; rank padding is not. Every physical
-        # buffer keeps rank dimension exactly one in the admitted rank-one path.
-        A_buffer = effective_A.new_zeros((slot_count, 1, self.kv_lora_rank))
-        B_buffer = effective_B.new_zeros((slot_count, self.out_features, 1))
+        # Adapter-slot padding is real; the live rank dimension is not padded.
+        A_buffer = effective_A.new_zeros((slot_count, self.r, self.kv_lora_rank))
+        B_buffer = effective_B.new_zeros((slot_count, self.out_features, self.r))
         A_buffer[0].copy_(effective_A)
         B_buffer[0].copy_(effective_B)
         return A_buffer, B_buffer
@@ -581,10 +588,10 @@ class Glm52ExactTP1AbsorbedKvBBlockFP8QLoRA(NativeBlockFP8Linear):
             B_k = reference_B.view(
                 self.num_heads,
                 self.qk_nope_head_dim + self.v_head_dim,
-                1,
+                self.r,
             )[:, : self.qk_nope_head_dim]
             q_low_rank = torch.einsum("shd,hdr->shr", reference_q, B_k)
-            q_correction = torch.einsum("shr,rc->shc", q_low_rank, reference_A)
+            q_correction = self.scaling * torch.einsum("shr,rc->shc", q_low_rank, reference_A)
             requested = []
             labels = []
             for label, required, value in (
@@ -635,10 +642,10 @@ class Glm52ExactTP1AbsorbedKvBBlockFP8QLoRA(NativeBlockFP8Linear):
             B_v = reference_B.view(
                 self.num_heads,
                 self.qk_nope_head_dim + self.v_head_dim,
-                1,
+                self.r,
             )[:, self.qk_nope_head_dim :]
             v_low_rank = torch.einsum("shc,rc->shr", reference_attn, reference_A)
-            v_correction = torch.einsum("shr,hdr->shd", v_low_rank, B_v)
+            v_correction = self.scaling * torch.einsum("shr,hdr->shd", v_low_rank, B_v)
             requested = []
             labels = []
             for label, required, value in (

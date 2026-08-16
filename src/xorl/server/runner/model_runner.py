@@ -24,7 +24,9 @@ import shutil
 import time
 import uuid
 from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Callable, Dict, List, Mapping, Optional
 
 import torch
@@ -40,6 +42,7 @@ except ImportError:  # pragma: no cover - DTensor-enabled torch provides this.
     compute_local_shape_and_global_offset = None
 
 from xorl.checkpoint import build_checkpointer
+from xorl.data.collators.sequence_shard_collator import zigzag_restore_packed_sequence
 from xorl.data.constants import IGNORE_INDEX
 from xorl.distillation import (
     MooncakeHiddenStore,
@@ -68,14 +71,17 @@ from xorl.lora.fold import lora_merged_forward_enabled
 from xorl.models import resolve_cross_entropy_mode
 from xorl.models.layers.moe.routing_replay import set_replay_stage
 from xorl.models.transformers.deepseek_v3.support import deepseek_v3_default_lora_targets
+from xorl.models.transformers.deepseek_v4.exact_contract import DSV4_FLASH_REQUIRED_TARGET_MODULES
 from xorl.models.transformers.glm5.index_share import IndexShareMode
 from xorl.models.transformers.glm5.support import glm5_default_lora_targets
 from xorl.ops.batch_invariant_ops import enable_batch_invariant_mode, get_batch_invariant_ops
+from xorl.ops.exact_sampling_transforms import TOP_K_ALL
 from xorl.ops.loss import (
     LossOutput,
     OPDLossMetrics,
     TokenPartial,
     causallm_loss_function,
+    cispo_loss_function,
     drgrpo_loss_function,
     importance_sampling_loss_function,
     opd_loss_function,
@@ -122,6 +128,7 @@ from xorl.trainers.model_builder import (
     resolve_training_model_dtype,
 )
 from xorl.trainers.training_utils import (
+    align_dsv4_pp_storage_rows,
     clip_gradients,
     count_active_microbatches,
     count_valid_tokens,
@@ -129,7 +136,6 @@ from xorl.trainers.training_utils import (
     forward_only_pp,
     get_distsign_grad_scale_factor,
     get_effective_grad_clip_value,
-    make_pp_loss_fn,
     negotiate_pp_seq_len,
     pad_micro_batches_for_pp,
     scale_model_gradients,
@@ -147,6 +153,126 @@ from xorl.utils.seqlen_pos_transform_utils import pos2culen
 
 
 logger = logging.getLogger(__name__)
+
+
+class FullParamOptimizerMutationFailure(RuntimeError):
+    """Fatal failure after a full-parameter optimizer mutation may have begun."""
+
+
+@dataclass(frozen=True)
+class _PhysicalPPMicrobatchObjective:
+    microbatch_id: int
+    micro_batch: Mapping[str, Any]
+    loss_fn: str
+    loss_fn_params: Mapping[str, Any]
+    model_id: str
+
+
+class _PhysicalPPObjectiveDispatcher:
+    """Stable schedule loss callable with step-local objective metadata.
+
+    Torch pipeline schedules retain their ``loss_fn`` for the life of the
+    cached schedule.  This object is therefore stable; each step binds a fresh
+    immutable ID->metadata table and schedule targets carry only tensor IDs.
+    """
+
+    def __init__(self, runner: "ModelRunner") -> None:
+        self._runner = runner
+        self._active: dict[int, _PhysicalPPMicrobatchObjective] | None = None
+        self._expected: frozenset[int] = frozenset()
+        self._consumed: set[int] = set()
+        self._records: dict[int, dict[str, Any]] = {}
+        self._assert_consumed = False
+
+    @property
+    def active(self) -> bool:
+        return self._active is not None
+
+    def begin_step(
+        self,
+        micro_batches: List[Dict[str, Any]],
+        *,
+        loss_fn: str,
+        loss_fn_params: Mapping[str, Any],
+        model_id: str,
+        assert_consumed: bool,
+    ) -> None:
+        if self._active is not None:
+            raise RuntimeError("Physical PP objective dispatcher already has an active step")
+        params = MappingProxyType(dict(loss_fn_params))
+        self._active = {
+            microbatch_id: _PhysicalPPMicrobatchObjective(
+                microbatch_id=microbatch_id,
+                micro_batch=MappingProxyType(dict(micro_batch)),
+                loss_fn=str(loss_fn),
+                loss_fn_params=params,
+                model_id=str(model_id),
+            )
+            for microbatch_id, micro_batch in enumerate(micro_batches)
+        }
+        self._expected = frozenset(self._active)
+        self._consumed = set()
+        self._records = {}
+        self._assert_consumed = bool(assert_consumed)
+
+    @staticmethod
+    def _target_id(target: torch.Tensor) -> int:
+        if not isinstance(target, torch.Tensor):
+            raise TypeError("Physical PP schedule targets must be tensor microbatch IDs")
+        if target.numel() == 0 or target.dtype not in (torch.int32, torch.int64):
+            raise ValueError("Physical PP schedule targets must contain at least one integer microbatch ID")
+        flat = target.reshape(-1)
+        microbatch_id = int(flat[0].item())
+        if not bool(torch.all(flat == microbatch_id).item()):
+            raise RuntimeError("A physical PP schedule target mixed multiple microbatch IDs")
+        return microbatch_id
+
+    def __call__(self, terminal_hidden: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        if self._active is None:
+            raise RuntimeError("Physical PP objective dispatcher was called without an active step")
+        microbatch_id = self._target_id(target)
+        metadata = self._active.get(microbatch_id)
+        if metadata is None:
+            raise RuntimeError(f"Physical PP objective received unknown microbatch ID {microbatch_id}")
+        if microbatch_id in self._consumed:
+            raise RuntimeError(f"Physical PP objective consumed microbatch ID {microbatch_id} more than once")
+        self._consumed.add(microbatch_id)
+        loss, per_token_outputs, metrics, metric_ops = self._runner._compute_pp_terminal_objective(
+            terminal_hidden,
+            metadata,
+        )
+        self._records[microbatch_id] = {
+            "microbatch_id": microbatch_id,
+            "loss": loss.detach().float().cpu(),
+            "per_token_outputs": self._runner._pp_payload_to_cpu(per_token_outputs),
+            "metrics": self._runner._pp_payload_to_cpu(metrics),
+            "metric_ops": dict(metric_ops or {}),
+        }
+        return loss
+
+    def end_step(self) -> tuple[dict[str, Any], ...]:
+        if self._active is None:
+            return ()
+        try:
+            if self._assert_consumed:
+                missing = self._expected - self._consumed
+                extra = self._consumed - self._expected
+                if missing or extra or len(self._consumed) != len(self._expected):
+                    raise RuntimeError(
+                        "Physical PP objective did not consume each microbatch ID exactly once: "
+                        f"missing={sorted(missing)}, extra={sorted(extra)}, "
+                        f"consumed={len(self._consumed)}, expected={len(self._expected)}"
+                    )
+            return tuple(self._records[microbatch_id] for microbatch_id in sorted(self._records))
+        finally:
+            self.abort_step()
+
+    def abort_step(self) -> None:
+        self._active = None
+        self._expected = frozenset()
+        self._consumed = set()
+        self._records = {}
+        self._assert_consumed = False
 
 
 def _truthy_flag(value: Any) -> bool:
@@ -330,8 +456,28 @@ class ModelRunner:
     _LOSS_EXCLUDE_KEYS = {
         # target_tokens/weights are loss-side fields (packing folds them into labels);
         # they must never reach the model forward as kwargs.
-        "causallm_loss": {"labels", "target_tokens", "weights", "_original_position_ids", "rollout_logprobs"},
-        "cross_entropy": {"labels", "target_tokens", "weights", "_original_position_ids", "rollout_logprobs"},
+        "causallm_loss": {
+            "labels",
+            "target_tokens",
+            "weights",
+            "_original_position_ids",
+            "rollout_logprobs",
+            "logprob_temperatures",
+            "logprob_top_ks",
+            "logprob_top_ps",
+            "logprob_min_ps",
+        },
+        "cross_entropy": {
+            "labels",
+            "target_tokens",
+            "weights",
+            "_original_position_ids",
+            "rollout_logprobs",
+            "logprob_temperatures",
+            "logprob_top_ks",
+            "logprob_top_ps",
+            "logprob_min_ps",
+        },
         "importance_sampling": {
             "labels",
             "target_tokens",
@@ -339,6 +485,22 @@ class ModelRunner:
             "advantages",
             "_original_position_ids",
             "rollout_logprobs",
+            "logprob_temperatures",
+            "logprob_top_ks",
+            "logprob_top_ps",
+            "logprob_min_ps",
+        },
+        "cispo": {
+            "labels",
+            "target_tokens",
+            "logprobs",
+            "advantages",
+            "_original_position_ids",
+            "rollout_logprobs",
+            "logprob_temperatures",
+            "logprob_top_ks",
+            "logprob_top_ps",
+            "logprob_min_ps",
         },
         "drgrpo": {
             "labels",
@@ -349,6 +511,10 @@ class ModelRunner:
             "ref_logprobs",
             "_original_position_ids",
             "rollout_logprobs",
+            "logprob_temperatures",
+            "logprob_top_ks",
+            "logprob_top_ps",
+            "logprob_min_ps",
         },
         "policy_loss": {
             "labels",
@@ -357,6 +523,10 @@ class ModelRunner:
             "advantages",
             "_original_position_ids",
             "rollout_logprobs",
+            "logprob_temperatures",
+            "logprob_top_ks",
+            "logprob_top_ps",
+            "logprob_min_ps",
         },
         "opd_loss": {
             "labels",
@@ -382,6 +552,10 @@ class ModelRunner:
             "teacher_cache_local_indices",
             "teacher_cache_base",
             "_original_position_ids",
+            "logprob_temperatures",
+            "logprob_top_ks",
+            "logprob_top_ps",
+            "logprob_min_ps",
         },
         "teacher_hidden_cache": {
             "labels",
@@ -397,6 +571,10 @@ class ModelRunner:
             "request_id",
             "batch_id",
             "_shifted",
+            "logprob_temperatures",
+            "logprob_top_ks",
+            "logprob_top_ps",
+            "logprob_min_ps",
         },
     }
 
@@ -535,8 +713,9 @@ class ModelRunner:
             # Each adapter has its own optimizer instance
             device = torch.device(f"{get_device_type()}:{self.local_rank}")
             # Only rank 0 should save on eviction to avoid multi-rank file conflicts
+            adapter_models = self.model_parts if self.pp_enabled else self.model
             self._adapter_manager = LoRAAdapterManager(
-                self.model,
+                adapter_models,
                 device,
                 checkpoint_dir=self._get_adapter_checkpoint_dir(),
                 auto_save_on_eviction=(self.rank == 0),
@@ -566,7 +745,12 @@ class ModelRunner:
             self.tokenizer = None
 
         # Initialize extracted modules
-        self._routing_handler = RoutingReplayHandler(self.model)
+        routing_models = self.model_parts if self.pp_enabled else self.model
+        self._routing_handler = RoutingReplayHandler(routing_models)
+        self._use_routing_replay = self._checkpoint_routing_replay_enabled(
+            self.train_config,
+            self._routing_handler,
+        )
         # Sync initial attributes
         self._checkpoint_mgr.lora_target_modules = getattr(self, "lora_target_modules", None)
         self._checkpoint_mgr.lora_alpha_value = getattr(self, "lora_alpha_value", None)
@@ -586,6 +770,16 @@ class ModelRunner:
     def lora_enabled(self) -> bool:
         """Check if LoRA training mode is enabled."""
         return self.lora_config.get("enable_lora", False)
+
+    @staticmethod
+    def _checkpoint_routing_replay_enabled(train_config, routing_handler) -> bool:
+        """Derive replay lifecycle from checkpointing and live block capability."""
+
+        checkpoint_method = train_config.get("gradient_checkpointing_method")
+        recomputes_full_moe = bool(train_config.get("enable_gradient_checkpointing", False)) and (
+            checkpoint_method is None or checkpoint_method == "recompute_full_layer"
+        )
+        return recomputes_full_moe and bool(routing_handler.get_moe_blocks())
 
     @property
     def adapter_manager(self):
@@ -694,6 +888,9 @@ class ModelRunner:
 
         memberships: dict[str, tuple[int, ...]] = {}
         sp_group = parallel_state.sp_grad_sync_group
+        dp_replicate_group = (
+            parallel_state.dp_replicate_group if bool(getattr(parallel_state, "dp_replicate_enabled", False)) else None
+        )
         output_group = getattr(parallel_state, "lm_head_tp_replica_group", None)
         output_tp_group = getattr(parallel_state, "lm_head_tp_group", None)
         ep_group = (
@@ -703,6 +900,8 @@ class ModelRunner:
         )
         if sp_group is not None:
             memberships["sequence_parallel"] = _public_group_members(sp_group)
+        if dp_replicate_group is not None:
+            memberships["data_parallel_replica"] = _public_group_members(dp_replicate_group)
         if output_group is not None:
             memberships["output_projection_replica"] = _public_group_members(output_group)
         if output_tp_group is not None:
@@ -723,13 +922,21 @@ class ModelRunner:
             return
         state = self._adapter_manager.get_adapter_state(model_id)
         parallel_state = get_parallel_state()
-        named_parameters = dict(self.model.named_parameters())
+        adapter_model = self._adapter_manager.model
+        named_parameters = dict(adapter_model.named_parameters())
         try:
             from torch.distributed.fsdp import FSDPModule  # noqa: PLC0415
         except ImportError:  # pragma: no cover - pinned torch provides this public type
             FSDPModule = ()  # type: ignore[assignment,misc]
 
-        lm_head = getattr(self.model, "lm_head", None)
+        lm_head = next(
+            (
+                candidate
+                for part in self._adapter_manager.model_parts
+                if (candidate := getattr(part, "lm_head", None)) is not None
+            ),
+            None,
+        )
         direct_parameter_ids: set[int] = set()
         managed_fsdp_parameter_ids: set[int] = set()
         producer_by_parameter_id: dict[int, ProducerFamily] = {}
@@ -841,17 +1048,21 @@ class ModelRunner:
                         expert_guard_by_parameter_id[id(parameter)] = dict(expert_guard)
                     if expert_contract is not None:
                         expert_contract_by_parameter_id[id(parameter)] = expert_contract
-                    if getattr(module, "_glm52_exact_tp16_lm_head", False):
+                    exact_glm_head = bool(getattr(module, "_glm52_exact_tp16_lm_head", False))
+                    exact_dsv4_head = bool(getattr(module, "_dsv4_exact_tp8_lm_head", False))
+                    if exact_glm_head or exact_dsv4_head:
                         exact_op = getattr(module, "_glm52_exact_selected_logprob", None)
+                        if exact_dsv4_head:
+                            exact_op = getattr(module, "_dsv4_exact_selected_logprob", None)
                         contract_version = getattr(exact_op, "contract_version", None)
                         if not isinstance(contract_version, str) or not contract_version:
                             raise AdapterGradientOwnershipError(
-                                "Exact GLM-5.2 lm-head factors require a selected-logprob contract version"
+                                "Exact lm-head factors require a selected-logprob contract version"
                             )
                         exact_lm_head_guard_by_parameter_id[id(parameter)] = {
                             "exact_lm_head_contract": contract_version,
                             "exact_lm_head_factor": local_name,
-                            "exact_lm_head_tp_size": 16,
+                            "exact_lm_head_tp_size": 16 if exact_glm_head else 8,
                             "exact_lm_head_vjp_tp_completed": True,
                         }
                     if direct:
@@ -861,7 +1072,7 @@ class ModelRunner:
             for child in module.children():
                 _walk_module_tree(child, inherited_fsdp=managed_fsdp, direct=direct)
 
-        _walk_module_tree(self.model)
+        _walk_module_tree(adapter_model)
 
         expert_factor_groups: dict[str, set[str]] = {}
         expert_contracts_by_owner: dict[str, ExpertAdapterGradientContract] = {}
@@ -996,6 +1207,17 @@ class ModelRunner:
                         "fsdp_shard",
                     )
                 )
+                if topology is TopologyFamily.DENSE_REPLICATED and bool(
+                    getattr(parallel_state, "dp_replicate_enabled", False)
+                ):
+                    completed.append(
+                        ReductionDomainPlan(
+                            ReductionAxis.DATA_PARALLEL_REPLICA,
+                            ReductionAuthority.FSDP,
+                            ReductionOperation.SUM,
+                            "data_parallel_replica",
+                        )
+                    )
             exact_lm_head_guard = exact_lm_head_guard_by_parameter_id.get(id(parameter))
             if exact_lm_head_guard is not None and exact_lm_head_guard["exact_lm_head_factor"] == "lora_A":
                 completed.append(
@@ -1054,6 +1276,7 @@ class ModelRunner:
                 "representation": representation.value,
                 "merged_forward": merged_forward_by_parameter_id[id(parameter)],
                 "sp_pending": sp_group is not None,
+                "dp_replicate_size": int(getattr(parallel_state, "dp_replicate_size", 1)),
                 "output_replica_size": output_group_size,
                 "ep_size": int(getattr(parallel_state, "ep_size", 1)),
                 "managed_fsdp_shard": id(parameter) in managed_fsdp_parameter_ids,
@@ -1133,6 +1356,11 @@ class ModelRunner:
 
     def _check_not_sleeping(self, operation: str) -> None:
         """Raise if the model is in sleep mode (CPU-offloaded)."""
+        if getattr(self, "_glm52_fullparam_poisoned", False):
+            raise FullParamOptimizerMutationFailure(
+                f"Cannot perform {operation}: the full-parameter session failed after optimizer mutation; "
+                "restart from the last committed checkpoint"
+            )
         if self.is_sleeping:
             raise RuntimeError(f"Cannot perform {operation}: model is in sleep mode. Call wake_up first.")
 
@@ -1357,8 +1585,11 @@ class ModelRunner:
             enable_lora=lora_enabled,
             lora_rank=self.lora_config.get("max_lora_rank", self.lora_config.get("lora_rank", 32)),
             lora_alpha=self.lora_config.get("lora_alpha", 16),
+            lora_b_init_std=self.lora_config.get("lora_b_init_std", 0.0),
+            lora_b_init_seed=self.lora_config.get("lora_b_init_seed", 0),
             lora_target_modules=construction_target_modules,
             lora_target_manifest=self.lora_config.get("lora_target_manifest"),
+            unfuse_for_lora=self.lora_config.get("unfuse_for_lora", False),
             moe_hybrid_shared_lora=self.lora_config.get("moe_hybrid_shared_lora", False),
             enable_qlora=enable_qlora,
             block_fp8_qlora_training=block_fp8_qlora_training,
@@ -1371,6 +1602,18 @@ class ModelRunner:
             skip_param_upcast=self.train_config.get("skip_param_upcast", False),
             enable_fp8_training=self.train_config.get("enable_fp8_training", False),
             enable_qarl=self.train_config.get("enable_qarl", False),
+            glm52_fullparam_fp8_training=self.train_config.get("glm52_fullparam_fp8_training", False),
+            glm52_fullparam_trainable_expert_layers=self.train_config.get("glm52_fullparam_trainable_expert_layers"),
+            data_parallel_mode=self.train_config.get("data_parallel_mode", "fsdp2"),
+            tensor_parallel_size=self.train_config.get("tensor_parallel_size", 1),
+            pipeline_parallel_size=self.train_config.get("pipeline_parallel_size", 1),
+            expert_parallel_size=self.train_config.get("expert_parallel_size", 1),
+            ringattn_parallel_size=self.train_config.get("ringattn_parallel_size", 1),
+            ulysses_parallel_size=self.train_config.get("ulysses_parallel_size", 1),
+            data_parallel_replicate_size=self.train_config.get("data_parallel_replicate_size", 1),
+            data_parallel_shard_size=self.train_config.get("data_parallel_shard_size", 1),
+            cp_fsdp_mode=self.train_config.get("cp_fsdp_mode", "all"),
+            lm_head_tensor_parallel_size=self.train_config.get("lm_head_tensor_parallel_size", 1),
             qarl_quant_cfg=self.train_config.get("qarl_quant_cfg"),
             qarl_calib_data=self.train_config.get("qarl_calib_data"),
             qarl_calib_size=self.train_config.get("qarl_calib_size", 0),
@@ -1433,13 +1676,14 @@ class ModelRunner:
         )
 
         self.model = result.model
+        self.model_config_obj = result.model_config
+        self._select_exact_dsv4_lora_export_format()
         if getattr(get_parallel_state(), "lm_head_tp_size", 1) > 1:
             sync_lm_head_tp_parameters(
                 self.model,
                 get_parallel_state().lm_head_tp_replica_group,
                 get_parallel_state().lm_head_tp_group,
             )
-        self.model_config_obj = result.model_config
         numerical_program = self.model_config_obj._resolved_numerical_program
         self.model_config.update(
             {
@@ -1469,6 +1713,7 @@ class ModelRunner:
         self.checkpoint_quant_format = result.checkpoint_quant_format
         self.exclude_modules = result.exclude_modules
         self.glm52_adapter_inventory = getattr(result, "glm52_adapter_inventory", None)
+        self.glm52_fullparam_admission_report = getattr(result, "glm52_fullparam_admission_report", None)
 
         # Save LoRA metadata for checkpoint manager
         if lora_enabled or enable_qlora:
@@ -1518,12 +1763,34 @@ class ModelRunner:
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
             )
+        elif model_type == "deepseek_v4":
+            if not (train_attn and train_mlp and train_unembed):
+                raise ValueError(
+                    "DSV4-Flash exact active-LoRA requires train_attn, train_mlp, and train_unembed all enabled"
+                )
+            target_modules = sorted(DSV4_FLASH_REQUIRED_TARGET_MODULES)
         elif model_type in {"glm_moe_dsa", "xorl_glm5"}:
             target_modules = glm5_default_lora_targets(
                 train_attn=train_attn,
                 train_mlp=train_mlp,
                 train_unembed=train_unembed,
             )
+        elif model_type in {
+            "qwen3_5",
+            "qwen3_5_text",
+            "qwen3_5_moe",
+            "qwen3_5_moe_text",
+            "xorl_qwen3_5",
+            "xorl_qwen3_5_moe",
+        }:
+            target_modules = []
+            if train_attn:
+                # GDN's g_proj is the serving in_proj_z surface.
+                target_modules.extend(["q_proj", "k_proj", "v_proj", "g_proj", "o_proj"])
+            if train_mlp:
+                target_modules.extend(["gate_proj", "up_proj", "down_proj"])
+            if train_unembed:
+                target_modules.append("lm_head")
         else:
             target_modules = []
             if train_attn:
@@ -1536,15 +1803,19 @@ class ModelRunner:
             raise ValueError("At least one of train_mlp, train_attn, or train_unembed must be True")
         return target_modules
 
+    def _select_exact_dsv4_lora_export_format(self) -> None:
+        """Select the complete-bank serving artifact for exact DSV4 adapters."""
+        if getattr(self.model_config_obj, "_dsv4_flash_exact_active_lora", False):
+            # Exact DSV4 checkpoints are serving artifacts, not ordinary PEFT
+            # adapters. Select the only loader-compatible complete-bank format
+            # before the checkpoint manager and session specs retain this
+            # shared configuration.
+            self.lora_config["lora_export_format"] = "dsv4_expert_banks"
+
     def _validate_multi_adapter_lora_config(self) -> None:
         """Reject LoRA features that are not supported by the multi-adapter server path."""
         if self.lora_config.get("enable_lora", False) and self.lora_config.get("merge_lora_interval", 0) > 0:
             raise ValueError("merge_lora_interval is not supported with multi-adapter LoRA server training")
-        if self.lora_config.get("enable_lora", False) and self.train_config.get("pipeline_parallel_size", 1) > 1:
-            raise ValueError(
-                "pipeline_parallel_size > 1 is not supported with multi-adapter LoRA server training. "
-                "Adapter coordination currently assumes identical local LoRA layouts on every rank."
-            )
         max_lora_rank = self.lora_config.get("max_lora_rank", self.lora_config.get("lora_rank", 32))
         default_rank = self.lora_config.get("lora_rank", 32)
         if max_lora_rank < default_rank:
@@ -1795,9 +2066,15 @@ class ModelRunner:
 
     def _get_effective_lm_head_weight(self):
         """Get lm_head weight, merging LoRA delta on-the-fly if needed."""
-        lm_head = self.model.lm_head
+        return self._get_effective_lm_head_weight_for(self.model.lm_head)
+
+    @staticmethod
+    def _get_effective_lm_head_weight_for(lm_head):
+        """Resolve the effective weight for an explicitly owned terminal head."""
         if isinstance(lm_head, LoraLinear):
-            if getattr(lm_head, "_glm52_exact_tp16_lm_head", False):
+            if getattr(lm_head, "_glm52_exact_tp16_lm_head", False) or getattr(
+                lm_head, "_dsv4_exact_tp8_lm_head", False
+            ):
                 # The exact selected-logprob op consumes the physical local
                 # base shard plus live A/B factors. Materializing B@A here
                 # would both duplicate TP16 state and change the value program.
@@ -1833,13 +2110,82 @@ class ModelRunner:
             return None
         return lm_head if isinstance(lm_head, FP8Linear) else None
 
-    @staticmethod
-    def _get_loss_lm_head_module(lm_head):
+    def _get_loss_lm_head_module(self, lm_head):
         """Return a module that owns the loss projection, when one is required."""
 
-        if lm_head is not None and getattr(lm_head, "_glm52_exact_tp16_lm_head", False):
+        if lm_head is not None and (
+            getattr(lm_head, "_glm52_exact_tp16_lm_head", False) or getattr(lm_head, "_dsv4_exact_tp8_lm_head", False)
+        ):
+            return lm_head
+        if (
+            self.ce_mode == "bi_fused"
+            and lm_head is not None
+            and getattr(lm_head, "_xorl_fsdp_sharded_lm_head_loss", False)
+        ):
             return lm_head
         return ModelRunner._get_fp8_lm_head_module(lm_head)
+
+    @staticmethod
+    def _gather_cp_source_metadata(
+        micro_batch: Dict[str, Any],
+        group,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Gather the physical-to-source row map for a CP batch."""
+
+        logical_rows = micro_batch.get("_cp_logical_row_indices")
+        live_mask = micro_batch.get("_cp_live_mask")
+        if not isinstance(logical_rows, torch.Tensor) or not isinstance(live_mask, torch.Tensor):
+            return None
+        if logical_rows.shape != live_mask.shape:
+            raise ValueError(
+                f"CP row metadata shapes differ: logical={tuple(logical_rows.shape)}, live={tuple(live_mask.shape)}"
+            )
+        gathered_logical_rows = gather_outputs(logical_rows, gather_dim=-1, group=group)
+        gathered_live_mask = gather_outputs(
+            live_mask.to(dtype=torch.uint8),
+            gather_dim=-1,
+            group=group,
+        ).bool()
+        return gathered_logical_rows, gathered_live_mask
+
+    @staticmethod
+    def _restore_cp_source_rows(
+        tensor: torch.Tensor,
+        logical_rows: torch.Tensor,
+        live_mask: torch.Tensor,
+        source_seq_len: int,
+        *,
+        dim: int,
+    ) -> torch.Tensor:
+        """Remove inserted CP rows and restore the original packed row order."""
+
+        if dim < 0:
+            dim += tensor.ndim
+        logical_flat = logical_rows.reshape(-1).to(device=tensor.device, dtype=torch.long)
+        live_flat = live_mask.reshape(-1).to(device=tensor.device, dtype=torch.bool)
+        if logical_flat.numel() != tensor.shape[dim] or live_flat.numel() != logical_flat.numel():
+            raise RuntimeError(
+                "CP row metadata does not match the gathered tensor: "
+                f"tensor={tuple(tensor.shape)}, dim={dim}, "
+                f"logical={tuple(logical_rows.shape)}, live={tuple(live_mask.shape)}"
+            )
+        if bool((live_flat & (logical_flat < 0)).any().item()):
+            raise RuntimeError("CP row metadata marks inserted padding as a live source row")
+
+        source_physical_rows = (logical_flat >= 0).nonzero(as_tuple=False).reshape(-1)
+        source_rows = logical_flat.index_select(0, source_physical_rows)
+        if bool((source_rows >= source_seq_len).any().item()):
+            raise RuntimeError(f"CP row metadata contains source indices outside [0, {source_seq_len})")
+        source_order = torch.argsort(source_rows, stable=True)
+        sorted_source_rows = source_rows.index_select(0, source_order)
+        expected_source_rows = torch.arange(source_seq_len, device=tensor.device, dtype=torch.long)
+        if not torch.equal(sorted_source_rows, expected_source_rows):
+            raise RuntimeError(
+                "CP row metadata does not cover each original packed row exactly once: "
+                f"expected={source_seq_len}, actual={sorted_source_rows.numel()}"
+            )
+        gather_indices = source_physical_rows.index_select(0, source_order)
+        return tensor.index_select(dim, gather_indices)
 
     def _collect_per_token_outputs(self, per_token_tensors, micro_batch, accumulators):
         """Gather per-token outputs across the unified SP group and append to accumulators."""
@@ -1862,15 +2208,25 @@ class ModelRunner:
                 original_seq_len = first_tensor.shape[-1] * cp_size
                 position_ids = None
 
+            cp_source_metadata = self._gather_cp_source_metadata(micro_batch, sp_group)
             gathered = {}
             for key, tensor in per_token_tensors.items():
-                gathered[key] = gather_outputs(
-                    tensor,
-                    gather_dim=-1,
-                    padding_dim=-1,
-                    unpad_dim_size=original_seq_len,
-                    group=sp_group,
-                )
+                if cp_source_metadata is None:
+                    gathered[key] = gather_outputs(
+                        tensor,
+                        gather_dim=-1,
+                        padding_dim=-1,
+                        unpad_dim_size=original_seq_len,
+                        group=sp_group,
+                    )
+                else:
+                    physical = gather_outputs(tensor, gather_dim=-1, group=sp_group)
+                    gathered[key] = self._restore_cp_source_rows(
+                        physical,
+                        *cp_source_metadata,
+                        original_seq_len,
+                        dim=-1,
+                    )
 
         else:
             gathered = per_token_tensors
@@ -2250,6 +2606,8 @@ class ModelRunner:
             "gdn_beta": 70,
             "gdn_scan_out": 71,
             "gdn_normed": 72,
+            "hc_head_output": 95,
+            "final_norm": 96,
         }
 
         layer_output_overrides = self._load_diagnostic_layer_output_overrides()
@@ -2262,7 +2620,17 @@ class ModelRunner:
         def capture(layer_idx: int, name: str, value: Any) -> None:
             tensor = self._first_tensor(value)
             if tensor is not None:
+                # Some exact DSV4 components finish on communication/custom
+                # streams and return a tensor before the default stream has a
+                # dependency on the producer.  Diagnostic snapshots are
+                # intentionally cold-path: fence the device on both sides of
+                # the clone so a later allocator reuse cannot turn the saved
+                # component into stale/uninitialised bytes.
+                if tensor.device.type == "cuda":
+                    torch.cuda.synchronize(tensor.device)
                 snapshot = tensor.detach().clone()
+                if tensor.device.type == "cuda":
+                    torch.cuda.synchronize(tensor.device)
                 captures.append(
                     {
                         "capture_index": len(captures),
@@ -2489,6 +2857,14 @@ class ModelRunner:
                     setattr(mlp, "_shared_expert", wrapped_shared_expert)
                     handles.append(restore_handle)
 
+        # Model-level tail components (post-layer stream reduction + final
+        # norm) recorded under pseudo-layer -1 when the model exposes the
+        # capture seam (DSV4 exact tail localization).
+        if hasattr(type(model), "_capture_diagnostic_component"):
+            restore_handle = _AttributeRestoreHandle(model, "_diagnostic_capture_component")
+            model._diagnostic_capture_component = lambda name, value: capture(-1, name, value)
+            handles.append(restore_handle)
+
         return captures, handles
 
     def _install_moe_routing_reference(
@@ -2685,7 +3061,7 @@ class ModelRunner:
         hidden_components: list[dict[str, Any]] | None = None,
         hidden_sample_count: int = 8,
         hidden_sample_indices: Any = None,
-        logprob_temperature: float = 1.0,
+        logprob_temperature: float | torch.Tensor = 1.0,
     ) -> dict[str, Any] | None:
         """Return target ranks/top-k logprobs for valid labels in one micro-batch.
 
@@ -2700,10 +3076,6 @@ class ModelRunner:
         """
         if labels is None or topk <= 0:
             return None
-        logprob_temperature = float(logprob_temperature)
-        if logprob_temperature <= 0.0:
-            raise ValueError(f"logprob_temperature must be > 0, got {logprob_temperature}")
-
         labels_flat = labels.reshape(-1)
         valid = labels_flat != IGNORE_INDEX
         if not valid.any():
@@ -2715,6 +3087,34 @@ class ModelRunner:
                 "topk_ids": [],
                 "topk_logprobs": [],
             }
+
+        per_row_temperature = None
+        if isinstance(logprob_temperature, torch.Tensor):
+            if not logprob_temperature.is_contiguous():
+                raise ValueError("per-row logprob_temperature must be contiguous")
+            if tuple(logprob_temperature.shape) not in (tuple(labels.shape), (labels_flat.shape[0],)):
+                raise ValueError(
+                    "per-row logprob_temperature must match labels or flattened labels, got "
+                    f"{tuple(logprob_temperature.shape)} for labels {tuple(labels.shape)}"
+                )
+            per_row_temperature = logprob_temperature.reshape(-1)
+            if per_row_temperature.dtype is not torch.float32:
+                raise TypeError(f"per-row logprob_temperature must be FP32, got {per_row_temperature.dtype}")
+            if per_row_temperature.device != hidden_states.device:
+                raise ValueError(
+                    "per-row logprob_temperature must share the hidden-state device, got "
+                    f"{per_row_temperature.device} and {hidden_states.device}"
+                )
+            if per_row_temperature.requires_grad:
+                raise ValueError("per-row logprob_temperature is sampling metadata and cannot require gradients")
+            torch._assert_async(
+                (torch.isfinite(per_row_temperature) & (per_row_temperature > 0)).all(),
+                "per-row logprob_temperature must contain finite values > 0",
+            )
+        else:
+            logprob_temperature = float(logprob_temperature)
+            if not math.isfinite(logprob_temperature) or logprob_temperature <= 0.0:
+                raise ValueError(f"logprob_temperature must be finite and > 0, got {logprob_temperature}")
 
         with torch.no_grad():
             hidden_flat = hidden_states.reshape(-1, hidden_states.shape[-1])
@@ -2731,10 +3131,10 @@ class ModelRunner:
                 logits = (valid_hidden.float() @ weight.float().t()).float()
             else:
                 logits = (valid_hidden @ weight.t()).float()
-            logprob_temperature = float(logprob_temperature)
-            if logprob_temperature <= 0.0:
-                raise ValueError(f"logprob_temperature must be > 0, got {logprob_temperature}")
-            if logprob_temperature != 1.0:
+            if per_row_temperature is not None:
+                valid_temperature = per_row_temperature[valid_indices]
+                logits = logits * (1.0 / valid_temperature).unsqueeze(1)
+            elif logprob_temperature != 1.0:
                 logits = logits / logprob_temperature
             valid_log_probs = F.log_softmax(logits, dim=-1)
             target_ids = labels_flat[valid_indices].to(device=valid_log_probs.device, dtype=torch.long)
@@ -2769,7 +3169,9 @@ class ModelRunner:
 
             if include_weight_reference:
                 reference_logits = (valid_hidden.float() @ weight.float().t()).float()
-                if logprob_temperature != 1.0:
+                if per_row_temperature is not None:
+                    reference_logits = reference_logits * (1.0 / valid_temperature).unsqueeze(1)
+                elif logprob_temperature != 1.0:
                     reference_logits = reference_logits / logprob_temperature
                 reference_log_probs = F.log_softmax(reference_logits, dim=-1)
                 reference_target_logprobs = reference_log_probs[row_indices, target_ids]
@@ -3003,29 +3405,46 @@ class ModelRunner:
             original_seq_len = hidden_states.shape[1] * max(int(getattr(ps, "cp_size", 1)), 1)
 
         sequence_group = getattr(ps, "sp_group", getattr(ps, "ulysses_group", None))
-        hidden_states = gather_outputs(
-            hidden_states,
-            gather_dim=1,
-            padding_dim=1,
-            unpad_dim_size=original_seq_len,
-            group=sequence_group,
-        )
+        cp_source_metadata = self._gather_cp_source_metadata(micro_batch, sequence_group)
+        if cp_source_metadata is None:
+            hidden_states = gather_outputs(
+                hidden_states,
+                gather_dim=1,
+                padding_dim=1,
+                unpad_dim_size=original_seq_len,
+                group=sequence_group,
+            )
+        else:
+            hidden_states = self._restore_cp_source_rows(
+                gather_outputs(hidden_states, gather_dim=1, group=sequence_group),
+                *cp_source_metadata,
+                original_seq_len,
+                dim=1,
+            )
 
         label_key = self._teacher_cache_label_key(micro_batch)
         if label_key is None:
             return hidden_states, micro_batch
 
         labels = micro_batch[label_key]
-        if labels.shape[-1] == hidden_states.shape[1]:
+        if cp_source_metadata is None and labels.shape[-1] == hidden_states.shape[1]:
             return hidden_states, micro_batch
 
-        full_labels = gather_outputs(
-            labels,
-            gather_dim=-1,
-            padding_dim=-1,
-            unpad_dim_size=original_seq_len,
-            group=sequence_group,
-        )
+        if cp_source_metadata is None:
+            full_labels = gather_outputs(
+                labels,
+                gather_dim=-1,
+                padding_dim=-1,
+                unpad_dim_size=original_seq_len,
+                group=sequence_group,
+            )
+        else:
+            full_labels = self._restore_cp_source_rows(
+                gather_outputs(labels, gather_dim=-1, group=sequence_group),
+                *cp_source_metadata,
+                original_seq_len,
+                dim=-1,
+            )
         micro_batch = dict(micro_batch)
         micro_batch[label_key] = full_labels
         return hidden_states, micro_batch
@@ -3566,17 +3985,25 @@ class ModelRunner:
                 result[f"is_{k}"] = v["sum"] / v["count"]
 
     def _count_global_valid_tokens(self, micro_batches):
-        """Count valid tokens across all micro-batches and all-reduce across DP group.
-
-        Uses fsdp_group (not world group) when PP is enabled, so that PP ranks
-        processing the same data don't double-count valid tokens.
-        """
-        group = get_parallel_state().fsdp_group if self.pp_enabled else None
+        """Count valid tokens over the stage-local DP x CP loss group."""
+        ps = get_parallel_state()
+        group = ps.loss_group if ps.loss_parallel_enabled else None
         return count_valid_tokens(micro_batches, group=group)
+
+    @staticmethod
+    def _reduce_loss_report(local_loss_sum: torch.Tensor) -> torch.Tensor:
+        """Sum detached local loss shares once over ranks owning distinct rows."""
+
+        loss_report = local_loss_sum.detach().float().clone()
+        ps = get_parallel_state()
+        if ps.loss_parallel_enabled:
+            dist.all_reduce(loss_report, op=dist.ReduceOp.SUM, group=ps.loss_group)
+        return loss_report
 
     def _count_active_microbatches(self, micro_batches) -> tuple[int, int]:
         """Return ``(active_microbatches, active_voter_total)`` over the DP group."""
-        group = get_parallel_state().fsdp_group if self.pp_enabled else None
+        ps = get_parallel_state()
+        group = ps.loss_group if ps.loss_parallel_enabled else None
         return count_active_microbatches(micro_batches, group=group)
 
     @staticmethod
@@ -4790,11 +5217,6 @@ class ModelRunner:
     ) -> LossOutput:
         if get_parallel_state().tp_enabled:
             raise NotImplementedError("opd_loss does not yet support tensor parallelism")
-        if self.pp_enabled:
-            # Mirrors the dispatcher-level guard in _run_forward_backward / _run_forward —
-            # belt-and-suspenders so a future direct caller can't accidentally launch
-            # OPD under PP without that pathway being thought through.
-            raise NotImplementedError("opd_loss does not yet support pipeline parallelism")
 
         labels = micro_batch.get("labels", micro_batch.get("target_tokens"))
         if labels is None:
@@ -5400,6 +5822,48 @@ class ModelRunner:
             return torch.zeros((), dtype=torch.float32, device=tensor.device)
         return tensor.reshape(-1)[:1].float().sum() * 0.0
 
+    @staticmethod
+    def _resolve_logprob_temperature(micro_batch, params):
+        raw_scalar = params.get("logprob_temperature", 1.0)
+        scalar = 1.0 if raw_scalar is None else float(raw_scalar)
+        if not math.isfinite(scalar) or scalar <= 0.0:
+            raise ValueError(f"logprob_temperature must be finite and > 0, got {scalar}")
+
+        per_row = micro_batch.get("logprob_temperatures")
+        if per_row is None:
+            return scalar
+        if not isinstance(per_row, torch.Tensor):
+            raise TypeError("logprob_temperatures must be a tensor after collation")
+        if scalar != 1.0:
+            raise ValueError(
+                "per-row logprob_temperatures cannot be combined with a non-unit loss_fn_params.logprob_temperature"
+            )
+        return per_row
+
+    @staticmethod
+    def _resolve_logprob_sampling_transforms(micro_batch, params):
+        resolved = {}
+        specs = (
+            ("logprob_top_k", "logprob_top_ks", TOP_K_ALL, int),
+            ("logprob_top_p", "logprob_top_ps", 1.0, float),
+            ("logprob_min_p", "logprob_min_ps", 0.0, float),
+        )
+        for scalar_name, row_name, identity, cast in specs:
+            raw_scalar = params.get(scalar_name, identity)
+            scalar = identity if raw_scalar is None else cast(raw_scalar)
+            per_row = micro_batch.get(row_name)
+            if per_row is None:
+                resolved[scalar_name] = scalar
+                continue
+            if not isinstance(per_row, torch.Tensor):
+                raise TypeError(f"{row_name} must be a tensor after collation")
+            if scalar != identity:
+                raise ValueError(
+                    f"per-row {row_name} cannot be combined with non-identity loss_fn_params.{scalar_name}"
+                )
+            resolved[scalar_name] = per_row
+        return resolved
+
     def _index_share_forward_kwargs(self, mode: IndexShareMode) -> Dict[str, IndexShareMode]:
         if callable(getattr(self.model, "release_index_share_context", None)):
             return {"index_share_mode": mode}
@@ -5421,11 +5885,22 @@ class ModelRunner:
         for module in model.modules():
             if hasattr(module, "_diagnostic_past_key_value"):
                 delattr(module, "_diagnostic_past_key_value")
+            # DSV4 exact decode-cache carry: drop the carried serving caches
+            # (paged FP8 raw/compressed keys + compressor kv-score ring) and
+            # the per-segment position-offset stamp.
+            for carry_attribute in ("_dsv4_decode_state", "_dsv4_decode_carry_offset"):
+                if carry_attribute in module.__dict__:
+                    del module.__dict__[carry_attribute]
 
     @staticmethod
     def _diagnostic_decode_cache_lengths(model: nn.Module) -> list[int]:
         lengths: list[tuple[int, int]] = []
         for module in model.modules():
+            dsv4_state = module.__dict__.get("_dsv4_decode_state")
+            if dsv4_state is not None:
+                layer_idx = int(getattr(module, "layer_id", len(lengths)))
+                lengths.append((layer_idx, int(dsv4_state.num_tokens)))
+                continue
             past = getattr(module, "_diagnostic_past_key_value", None)
             if past is None:
                 continue
@@ -5443,6 +5918,7 @@ class ModelRunner:
         model_inputs,
         return_per_token: bool,
         logprob_temperature: float,
+        logprob_sampling_transforms: Dict[str, Any],
         diagnostic_topk: int = 0,
         diagnostic_reference_logits: bool = False,
         diagnostic_hidden_states: bool = False,
@@ -5484,6 +5960,14 @@ class ModelRunner:
 
         first_valid = int(bounds[0].item())
         last_valid = -int(bounds[1].item())
+        dsv4_exact_decode_carry = bool(getattr(getattr(self.model, "config", None), "_dsv4_flash_exact_mode", False))
+        # DSV4 exact mode replays each decode decision exactly as serving does:
+        # an M=1 segment over carried per-layer attention state (paged FP8
+        # raw/compressed key caches + compressor kv-score ring), seeded by the
+        # prefill segment. Trunk kernels are not row-count invariant (e.g. the
+        # mHC pre kernel buckets n_splits by token count), so a full-prefix
+        # recompute drifts from the original bytes at some segment lengths;
+        # M=1 segments keep every trunk op serving-shaped.
         segments = [(0, first_valid + 1), *((pos, pos + 1) for pos in range(first_valid + 1, last_valid + 1))]
 
         past_key_values = []
@@ -5505,6 +5989,13 @@ class ModelRunner:
                     device=input_ids.device,
                 )
                 segment_position_ids = torch.arange(start, end, device=input_ids.device, dtype=torch.long).unsqueeze(0)
+                # Serving idle DP ranks contribute zero rows to the EP-gathered
+                # expert batch, and the Marlin MoE kernels are not row-count
+                # invariant. Dummy ranks (no valid labels) must therefore
+                # declare zero live tokens so the gathered population matches
+                # the serving forward exactly.
+                dummy_rank_kwargs = {} if local_has_valid else {"num_samples": 0}
+                carry_kwargs = {"decode_cache_carry": True} if dsv4_exact_decode_carry else {}
                 outputs = self.model(
                     input_ids=segment_input_ids,
                     attention_mask=segment_attention_mask,
@@ -5512,6 +6003,8 @@ class ModelRunner:
                     past_key_values=past_key_values,
                     output_hidden_states=diagnostic_hidden_states,
                     diagnostic_decode_cache=True,
+                    **dummy_rank_kwargs,
+                    **carry_kwargs,
                     **self._index_share_forward_kwargs(IndexShareMode.FORWARD_ONLY),
                 )
                 returned_past_key_values = getattr(outputs, "past_key_values", None)
@@ -5590,6 +6083,7 @@ class ModelRunner:
             tp_group=loss_tp_group,
             lm_head=loss_lm_head,
             logprob_temperature=logprob_temperature,
+            **logprob_sampling_transforms,
         )
 
         per_token_outputs = {}
@@ -5706,7 +6200,8 @@ class ModelRunner:
             params.get("diagnostic_hidden_component_layers", [])
         )
         diagnostic_hidden_component_path = params.get("diagnostic_hidden_component_path")
-        logprob_temperature = float(params.get("logprob_temperature", 1.0) or 1.0)
+        logprob_temperature = self._resolve_logprob_temperature(micro_batch, params)
+        logprob_sampling_transforms = self._resolve_logprob_sampling_transforms(micro_batch, params)
         diagnostic_packed_sample_components = bool(params.get("opd_debug_packed_sample_components", False))
         diagnostic_component_captures = None
         diagnostic_component_handles = []
@@ -5745,6 +6240,7 @@ class ModelRunner:
                     model_inputs=model_inputs,
                     return_per_token=return_per_token,
                     logprob_temperature=logprob_temperature,
+                    logprob_sampling_transforms=logprob_sampling_transforms,
                     diagnostic_topk=diagnostic_topk,
                     diagnostic_reference_logits=bool(params.get("diagnostic_reference_logits", False)),
                     diagnostic_hidden_states=diagnostic_hidden_states,
@@ -5853,10 +6349,6 @@ class ModelRunner:
                 loss_lm_head_fp32 = raw_lm_head_fp32.strip().lower() in {"1", "true", "yes", "on"}
             else:
                 loss_lm_head_fp32 = bool(raw_lm_head_fp32)
-        logprob_temperature = float(params.get("logprob_temperature", 1.0) or 1.0)
-        if logprob_temperature <= 0.0:
-            raise ValueError(f"logprob_temperature must be > 0, got {logprob_temperature}")
-
         # scale=1 → loss_fns return raw masked sums; normalization deferred to
         # optim_step / _finalize_is_metrics.
         token_sum_reducer = TokenPartial(scale=torch.tensor(1.0, device=hidden_states.device))
@@ -5881,6 +6373,7 @@ class ModelRunner:
                 tp_group=loss_tp_group,
                 lm_head=loss_lm_head,
                 logprob_temperature=logprob_temperature,
+                **logprob_sampling_transforms,
             )
             local_loss_sum = _result.loss
             is_metrics = {"lm_head_fp32_effective": float(loss_lm_head_fp32)}
@@ -5912,14 +6405,22 @@ class ModelRunner:
                 if token_diagnostics is not None:
                     per_token_outputs["token_diagnostics"] = token_diagnostics
 
-        elif loss_fn == "importance_sampling":
+        elif loss_fn in {"importance_sampling", "cispo"}:
             target_tokens = micro_batch.get("target_tokens", micro_batch.get("labels"))
             old_logprobs = micro_batch["logprobs"]
             advantages = micro_batch["advantages"]
             compute_kl_stats = params.get("compute_kl_stats", False)
             diagnostic_reference_logits = bool(params.get("diagnostic_reference_logits", False))
 
-            _result = importance_sampling_loss_function(
+            loss_function = cispo_loss_function if loss_fn == "cispo" else importance_sampling_loss_function
+            loss_kwargs = {}
+            if loss_fn == "cispo":
+                loss_kwargs = {
+                    "clip_low_threshold": float(params.get("clip_low_threshold", 0.0)),
+                    "clip_high_threshold": float(params.get("clip_high_threshold", 4.0)),
+                }
+
+            _result = loss_function(
                 hidden_states=hidden_states,
                 weight=effective_weight,
                 labels=target_tokens,
@@ -5933,6 +6434,8 @@ class ModelRunner:
                 tp_group=loss_tp_group,
                 lm_head=loss_lm_head,
                 logprob_temperature=logprob_temperature,
+                **logprob_sampling_transforms,
+                **loss_kwargs,
             )
             local_loss_sum = _result.loss
             per_token_outputs["logprobs"] = _result.per_token_logprobs
@@ -5941,7 +6444,7 @@ class ModelRunner:
             if is_metrics is not None and "valid_tokens" not in is_metrics:
                 is_metrics["valid_tokens"] = int((target_tokens != IGNORE_INDEX).sum().item())
 
-            if compute_kl_stats and get_parallel_state().cp_enabled and is_metrics:
+            if (compute_kl_stats or loss_fn == "cispo") and get_parallel_state().cp_enabled and is_metrics:
                 is_metrics = _sp_allreduce_kl_metrics(
                     is_metrics,
                     get_parallel_state().ulysses_group,
@@ -6004,6 +6507,7 @@ class ModelRunner:
                 metric_reducer=token_sum_reducer,
                 lm_head=loss_lm_head,
                 logprob_temperature=logprob_temperature,
+                **logprob_sampling_transforms,
             )
             local_loss_sum = _result.loss
             if return_per_token or params.get("compute_per_sample_k3", False):
@@ -6055,6 +6559,7 @@ class ModelRunner:
                 tp_group=loss_tp_group,
                 lm_head=loss_lm_head,
                 logprob_temperature=logprob_temperature,
+                **logprob_sampling_transforms,
             )
             local_loss_sum = _result.loss
             per_token_outputs["logprobs"] = _result.per_token_logprobs
@@ -6130,6 +6635,147 @@ class ModelRunner:
     # =========================================================================
 
     @staticmethod
+    def _gather_per_sample_k3_inputs(
+        k3_values: torch.Tensor,
+        valid_mask: torch.Tensor,
+        position_ids: torch.Tensor,
+        logical_row_indices: torch.Tensor | None = None,
+        live_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Reassemble tokenwise K3 inputs before detecting packed samples.
+
+        Ulysses ranks own contiguous token shards. Computing sample boundaries
+        and means on each shard independently both splits samples at rank
+        boundaries and produces a different number of observer rows per rank.
+        Reassemble the tokenwise values first so every CP replica emits the same
+        full packed-sample result at the completion rendezvous.
+        """
+        position_ids = position_ids.view(1, -1) if position_ids.ndim == 1 else position_ids
+        batch_size = int(position_ids.shape[0])
+        if batch_size <= 0 or k3_values.numel() % batch_size != 0 or valid_mask.numel() != k3_values.numel():
+            raise ValueError(
+                "Per-sample K3 inputs have incompatible shapes: "
+                f"k3={tuple(k3_values.shape)}, valid={tuple(valid_mask.shape)}, "
+                f"position_ids={tuple(position_ids.shape)}"
+            )
+
+        ps = get_parallel_state()
+        if not ps.cp_enabled:
+            return k3_values.view(-1), valid_mask.view(-1), position_ids.reshape(-1)
+
+        local_tokens = k3_values.numel() // batch_size
+        original_seq_len = int(position_ids.shape[-1])
+        group = ps.sp_group
+        if (logical_row_indices is None) != (live_mask is None):
+            raise ValueError("Per-sample K3 CP restoration requires both logical rows and live mask")
+        if logical_row_indices is not None and live_mask is not None:
+            cp_source_metadata = ModelRunner._gather_cp_source_metadata(
+                {
+                    "_cp_logical_row_indices": logical_row_indices,
+                    "_cp_live_mask": live_mask,
+                },
+                group,
+            )
+            if cp_source_metadata is None:  # pragma: no cover - guarded by tensor arguments above.
+                raise RuntimeError("Per-sample K3 CP source metadata disappeared during gather")
+            full_k3 = ModelRunner._restore_cp_source_rows(
+                gather_outputs(
+                    k3_values.reshape(batch_size, local_tokens),
+                    gather_dim=-1,
+                    group=group,
+                ),
+                *cp_source_metadata,
+                original_seq_len,
+                dim=-1,
+            )
+            full_valid = ModelRunner._restore_cp_source_rows(
+                gather_outputs(
+                    valid_mask.reshape(batch_size, local_tokens).to(dtype=torch.uint8),
+                    gather_dim=-1,
+                    group=group,
+                ).bool(),
+                *cp_source_metadata,
+                original_seq_len,
+                dim=-1,
+            )
+            if full_k3.shape != position_ids.shape or full_valid.shape != position_ids.shape:
+                raise RuntimeError(
+                    "Per-sample K3 CP source restoration did not recover the original packed shape: "
+                    f"k3={tuple(full_k3.shape)}, valid={tuple(full_valid.shape)}, "
+                    f"position_ids={tuple(position_ids.shape)}"
+                )
+            return full_k3.reshape(-1), full_valid.reshape(-1), position_ids.reshape(-1)
+
+        ringattn_size = int(getattr(ps, "ringattn_size", 1))
+        if ringattn_size > 1:
+            cp_size = int(getattr(ps, "cp_size", 0))
+            if cp_size <= 0:
+                raise RuntimeError("Ring-attention K3 reassembly requires a positive CP size")
+            gathered_seq_len = local_tokens * cp_size
+            if gathered_seq_len < original_seq_len:
+                raise RuntimeError(
+                    "Ring-attention K3 shards are shorter than the original packed sequence: "
+                    f"gathered={gathered_seq_len}, original={original_seq_len}"
+                )
+        else:
+            gathered_seq_len = original_seq_len
+        full_k3 = gather_outputs(
+            k3_values.reshape(batch_size, local_tokens),
+            gather_dim=-1,
+            padding_dim=-1,
+            unpad_dim_size=gathered_seq_len,
+            group=group,
+        )
+        full_valid = gather_outputs(
+            valid_mask.reshape(batch_size, local_tokens).to(dtype=torch.uint8),
+            gather_dim=-1,
+            padding_dim=-1,
+            unpad_dim_size=gathered_seq_len,
+            group=group,
+        ).bool()
+        if ringattn_size > 1:
+            pad_length = gathered_seq_len - original_seq_len
+            if pad_length:
+                pad_positions = (
+                    torch.arange(pad_length, device=position_ids.device, dtype=position_ids.dtype) % 1024
+                ).view(1, -1)
+                pad_positions = pad_positions.expand(batch_size, -1)
+                padded_position_ids = torch.cat((position_ids, pad_positions), dim=-1)
+            else:
+                padded_position_ids = position_ids
+            full_k3 = torch.cat(
+                [
+                    zigzag_restore_packed_sequence(
+                        full_k3[row : row + 1],
+                        padded_position_ids[row : row + 1],
+                        ringattn_size,
+                        dim=-1,
+                    )
+                    for row in range(batch_size)
+                ],
+                dim=0,
+            )[:, :original_seq_len]
+            full_valid = torch.cat(
+                [
+                    zigzag_restore_packed_sequence(
+                        full_valid[row : row + 1],
+                        padded_position_ids[row : row + 1],
+                        ringattn_size,
+                        dim=-1,
+                    )
+                    for row in range(batch_size)
+                ],
+                dim=0,
+            )[:, :original_seq_len]
+        if full_k3.shape != position_ids.shape or full_valid.shape != position_ids.shape:
+            raise RuntimeError(
+                "Per-sample K3 CP reassembly did not recover the original packed shape: "
+                f"k3={tuple(full_k3.shape)}, valid={tuple(full_valid.shape)}, "
+                f"position_ids={tuple(position_ids.shape)}"
+            )
+        return full_k3.reshape(-1), full_valid.reshape(-1), position_ids.reshape(-1)
+
+    @staticmethod
     def _compute_per_sample_k3(
         k3_values: torch.Tensor,
         valid_mask: torch.Tensor,
@@ -6186,6 +6832,10 @@ class ModelRunner:
         batch_idx: int,
         position_ids: torch.Tensor | None = None,
         cp_rank: int = 0,
+        logical_row_indices: torch.Tensor | None = None,
+        request_ids: torch.Tensor | None = None,
+        request_positions: torch.Tensor | None = None,
+        live_mask: torch.Tensor | None = None,
     ) -> List[Dict[str, Any]]:
         """Return the worst local valid tokens by K3 for live KL forensics."""
         if topk <= 0 or old_logprobs is None or labels is None:
@@ -6218,7 +6868,32 @@ class ModelRunner:
             global_indices = torch.arange(local_len, dtype=torch.long)
             local_position_ids = None
             sample_ids = None
-            if position_ids is not None:
+            sample_ids_are_local = False
+            cp_metadata = (logical_row_indices, request_ids, request_positions, live_mask)
+            if all(isinstance(value, torch.Tensor) for value in cp_metadata):
+                logical_flat = logical_row_indices.detach().view(-1).cpu().to(dtype=torch.long)[:local_len]
+                request_ids_flat = request_ids.detach().view(-1).cpu().to(dtype=torch.long)[:local_len]
+                request_positions_flat = request_positions.detach().view(-1).cpu().to(dtype=torch.long)[:local_len]
+                live_flat = live_mask.detach().view(-1).cpu().to(dtype=torch.bool)[:local_len]
+                if (
+                    min(
+                        logical_flat.numel(),
+                        request_ids_flat.numel(),
+                        request_positions_flat.numel(),
+                        live_flat.numel(),
+                    )
+                    != local_len
+                ):
+                    raise ValueError("KL token diagnostic CP metadata is shorter than the local token rows")
+                if bool((valid.cpu() & (~live_flat | (logical_flat < 0) | (request_ids_flat < 0))).any().item()):
+                    raise RuntimeError("A valid KL diagnostic token has no live CP source identity")
+                global_indices = logical_flat
+                local_position_ids = request_positions_flat
+                sample_ids = request_ids_flat
+                sample_ids_are_local = True
+            elif any(value is not None for value in cp_metadata):
+                raise ValueError("KL token diagnostics require the complete CP source metadata set")
+            elif position_ids is not None:
                 pos_flat = position_ids.detach().view(-1).cpu().to(dtype=torch.long)
                 if pos_flat.numel() >= local_len:
                     start = 0
@@ -6255,8 +6930,9 @@ class ModelRunner:
                 }
                 if local_position_ids is not None and local_idx < local_position_ids.numel():
                     item["position_id"] = int(local_position_ids[local_idx].item())
-                if sample_ids is not None and 0 <= global_idx < sample_ids.numel():
-                    item["sample_index_in_microbatch"] = int(sample_ids[global_idx].item())
+                sample_lookup_index = local_idx if sample_ids_are_local else global_idx
+                if sample_ids is not None and 0 <= sample_lookup_index < sample_ids.numel():
+                    item["sample_index_in_microbatch"] = int(sample_ids[sample_lookup_index].item())
                 diagnostics.append(item)
 
             return diagnostics
@@ -6276,6 +6952,8 @@ class ModelRunner:
         model_id="default",
         abort_callback=None,
     ):
+        checkpoint_replay = compute_backward and getattr(self, "_use_routing_replay", False) and not r3_enabled
+        routing_replay_active = checkpoint_replay or r3_enabled
         try:
             return self._forward_loop_impl(
                 micro_batches,
@@ -6287,6 +6965,8 @@ class ModelRunner:
                 abort_callback=abort_callback,
             )
         finally:
+            if routing_replay_active:
+                self._routing_handler.cleanup()
             # A successful backward releases each micro-batch below. This
             # boundary owns setup/loss failures after a successful forward.
             self._release_index_share_contexts()
@@ -6309,11 +6989,7 @@ class ModelRunner:
         if loss_fn == "teacher_hidden_cache":
             if compute_backward:
                 raise ValueError("teacher_hidden_cache is a forward-only operation")
-            try:
-                return self._forward_teacher_hidden_cache(micro_batches, params, abort_callback=abort_callback)
-            finally:
-                if r3_enabled:
-                    self._routing_handler.cleanup()
+            return self._forward_teacher_hidden_cache(micro_batches, params, abort_callback=abort_callback)
         if compute_backward and bool(params.get("diagnostic_decode_cache", False)):
             raise ValueError("diagnostic_decode_cache is a forward-only diagnostic")
 
@@ -6383,9 +7059,12 @@ class ModelRunner:
                 (labels != IGNORE_INDEX).sum() if labels is not None else torch.tensor(0, device=get_device_type())
             )
 
-            # R3: switch to replay_forward so MoEBlock pops pre-populated routing
+            # R3 pops sampler-provided routing.  Standard full-layer gradient
+            # checkpointing records the original forward routing instead.
             if r3_enabled:
                 set_replay_stage("replay_forward")
+            elif compute_backward and getattr(self, "_use_routing_replay", False):
+                set_replay_stage("record")
 
             # Forward pass + loss computation
             profile_start = _profile_phase_now() if profile_phase_timings else 0.0
@@ -6437,20 +7116,15 @@ class ModelRunner:
                         )
                         log_ratio = new_lp - old_lp
                         k3_vals = (torch.exp(log_ratio) - log_ratio - 1.0).masked_fill(~_valid, 0.0)
-                        # position_ids and _original_position_ids are both kept
-                        # unsharded (full packed sequence length) for cu_seq_lens.
-                        # Slice to match local token count (k3_vals length) using
-                        # the Ulysses/CP shard boundaries.
                         _pos = micro_batch.get("_original_position_ids", micro_batch.get("position_ids"))
                         if _pos is not None:
-                            _pos_flat = _pos.view(-1)
-                            local_len = k3_vals.shape[0]
-                            if _pos_flat.shape[0] > local_len:
-                                # Slice position_ids to this rank's Ulysses shard
-                                ps = get_parallel_state()
-                                cp_rank = ps.ulysses_rank if ps.ulysses_enabled else 0
-                                start = cp_rank * local_len
-                                _pos_flat = _pos_flat[start : start + local_len]
+                            k3_vals, _valid, _pos_flat = self._gather_per_sample_k3_inputs(
+                                k3_vals,
+                                _valid,
+                                _pos,
+                                micro_batch.get("_cp_logical_row_indices"),
+                                micro_batch.get("_cp_live_mask"),
+                            )
                             deferred_k3.append(
                                 {
                                     "k3_values": k3_vals.cpu(),
@@ -6479,6 +7153,10 @@ class ModelRunner:
                         batch_idx=batch_idx,
                         position_ids=positions_for_diag,
                         cp_rank=cp_rank,
+                        logical_row_indices=micro_batch.get("_cp_logical_row_indices"),
+                        request_ids=micro_batch.get("_cp_request_ids"),
+                        request_positions=micro_batch.get("_cp_request_positions"),
+                        live_mask=micro_batch.get("_cp_live_mask"),
                     )
                 )
 
@@ -6490,13 +7168,13 @@ class ModelRunner:
             # the full autograd graph through all parameters (including lm_head weight),
             # which is critical for FSDP2 reduce-scatter collectives.
             if compute_backward:
-                ps = get_parallel_state()
-
                 if abort_callback and abort_callback():
                     raise RuntimeError("Execution aborted by request")
 
-                # R3: switch to replay_backward so grad ckpt recompute pops same routing
-                if r3_enabled:
+                # Checkpoint recompute must pop the routing from the matching
+                # original forward, whether it came from R3 or was recorded
+                # locally above.
+                if r3_enabled or getattr(self, "_use_routing_replay", False):
                     set_replay_stage("replay_backward")
 
                 profile_start = _profile_phase_now() if profile_phase_timings else 0.0
@@ -6520,19 +7198,14 @@ class ModelRunner:
 
                 # Loss reporting (separately, no grad): compute normalized per-token loss
                 with torch.no_grad():
-                    # Cast to fp32 before the cross-rank reduction: with ulysses SP,
-                    # ranks holding only IGNORE_INDEX tokens may hit early-return
-                    # paths with a different dtype than the normal-return path.
-                    loss_report = local_loss_sum.detach().float()
-                    loss_report_group = ps.fsdp_group if self.pp_enabled else None
-                    if dist.get_world_size(group=loss_report_group) > 1:
-                        dist.all_reduce(loss_report, op=dist.ReduceOp.SUM, group=loss_report_group)
+                    loss_report = self._reduce_loss_report(local_loss_sum)
                     if global_valid_tokens.item() > 0:
                         total_loss += (loss_report / global_valid_tokens).item()
             else:
                 # Forward-only: accumulate weighted loss
                 if global_valid_tokens.item() > 0:
-                    total_loss += local_loss_sum.item() / global_valid_tokens.item()
+                    loss_report = self._reduce_loss_report(local_loss_sum)
+                    total_loss += loss_report.item() / global_valid_tokens.item()
 
             # Accumulate loss-specific metrics. RL losses keep the historical
             # `is_*` prefix; OPD metrics are already namespaced as `opd_*`.
@@ -6553,10 +7226,6 @@ class ModelRunner:
             if not getattr(self, "_fb_defrag_announced", False):
                 self._fb_defrag_announced = True
                 logger.info("XORL_FB_PER_CALL_DEFRAG active: gc+empty_cache per forward_backward call")
-
-        # R3 cleanup
-        if r3_enabled:
-            self._routing_handler.cleanup()
 
         # CP/SP gradient sync (backward only)
         if compute_backward:
@@ -6671,15 +7340,265 @@ class ModelRunner:
     # Pipeline Parallelism support
     # =========================================================================
 
+    @staticmethod
+    def _pp_payload_to_cpu(value):
+        if isinstance(value, torch.Tensor):
+            return value.detach().cpu()
+        if isinstance(value, Mapping):
+            return {key: ModelRunner._pp_payload_to_cpu(item) for key, item in value.items()}
+        if isinstance(value, tuple):
+            return tuple(ModelRunner._pp_payload_to_cpu(item) for item in value)
+        if isinstance(value, list):
+            return [ModelRunner._pp_payload_to_cpu(item) for item in value]
+        return value
+
+    @staticmethod
+    def _validate_physical_pp_objective(loss_fn: str, params: Mapping[str, Any]) -> None:
+        supported = {
+            "causallm_loss",
+            "cross_entropy",
+            "policy_loss",
+            "importance_sampling",
+            "drgrpo",
+            "cispo",
+            "opd_loss",
+        }
+        if loss_fn == "teacher_hidden_cache":
+            raise NotImplementedError(
+                "teacher_hidden_cache requires intermediate activation capture and transport, which physical PP "
+                "does not provide"
+            )
+        if loss_fn not in supported:
+            raise ValueError(f"Unknown physical PP loss_fn: {loss_fn}")
+        if loss_fn == "opd_loss" and bool(params.get("opd_oprd_enabled", False)):
+            raise NotImplementedError(
+                "OPRD/intermediate-layer OPD requires cross-stage activation capture and transport; "
+                "ordinary terminal-hidden OPD remains supported under physical PP"
+            )
+
+    def _pp_sampling_transform_kwargs(self, micro_batch, params) -> Dict[str, Any]:
+        """Compose with the frozen sampling-transform helper when it is present."""
+
+        resolver = getattr(self, "_resolve_logprob_sampling_transforms", None)
+        if callable(resolver):
+            return resolver(micro_batch, params)
+        row_fields = ("logprob_top_ks", "logprob_top_ps", "logprob_min_ps")
+        scalar_nonidentity = (
+            params.get("logprob_top_k") not in (None, 1 << 30)
+            or params.get("logprob_top_p") not in (None, 1.0)
+            or params.get("logprob_min_p") not in (None, 0.0)
+        )
+        if any(field in micro_batch for field in row_fields) or scalar_nonidentity:
+            raise RuntimeError(
+                "Physical PP received top-k/top-p/min-p metadata before the exact sampling-transform "
+                "loss helpers were composed"
+            )
+        return {}
+
+    def _compute_pp_terminal_objective(
+        self,
+        terminal_hidden: torch.Tensor,
+        metadata: _PhysicalPPMicrobatchObjective,
+    ) -> tuple[torch.Tensor, Dict[str, Any], Optional[Dict[str, Any]], Optional[Dict[str, str]]]:
+        """Compute one requested objective from the terminal stage's real hidden state."""
+
+        loss_fn = metadata.loss_fn
+        params = metadata.loss_fn_params
+        self._validate_physical_pp_objective(loss_fn, params)
+        micro_batch = {
+            key: value.to(terminal_hidden.device, non_blocking=True) if isinstance(value, torch.Tensor) else value
+            for key, value in metadata.micro_batch.items()
+        }
+        last_part = self._pp_last_stage_part()
+        if last_part is None or getattr(last_part, "lm_head", None) is None:
+            raise RuntimeError("Physical PP terminal objective requires the local terminal lm_head")
+        lm_head = last_part.lm_head
+        effective_weight = self._get_effective_lm_head_weight_for(lm_head)
+        loss_lm_head = self._get_loss_lm_head_module(lm_head)
+        loss_lm_head_fp32 = self.lm_head_fp32
+        if "lm_head_fp32" in params:
+            raw_lm_head_fp32 = params["lm_head_fp32"]
+            loss_lm_head_fp32 = (
+                raw_lm_head_fp32.strip().lower() in {"1", "true", "yes", "on"}
+                if isinstance(raw_lm_head_fp32, str)
+                else bool(raw_lm_head_fp32)
+            )
+        token_sum_reducer = TokenPartial(scale=torch.tensor(1.0, device=terminal_hidden.device))
+        loss_tp_group = self._get_loss_tp_group()
+        logprob_temperature = self._resolve_logprob_temperature(micro_batch, params)
+        if isinstance(logprob_temperature, torch.Tensor):
+            if not logprob_temperature.is_contiguous():
+                raise ValueError("per-row logprob_temperatures must be contiguous")
+            logprob_temperature = logprob_temperature.reshape(-1)
+        sampling_kwargs = self._pp_sampling_transform_kwargs(micro_batch, params)
+        return_per_token = bool(params.get("return_per_token", True))
+        per_token_outputs: Dict[str, Any] = {}
+        metrics = None
+        metric_ops = None
+
+        if loss_fn in {"causallm_loss", "cross_entropy"}:
+            labels = (
+                micro_batch.get("target_tokens", micro_batch.get("labels"))
+                if params.get("_prefer_target_tokens", False)
+                else micro_batch.get("labels", micro_batch.get("target_tokens"))
+            )
+            if labels is None:
+                raise ValueError(f"{loss_fn} requires labels or target_tokens")
+            result = causallm_loss_function(
+                hidden_states=terminal_hidden,
+                weight=effective_weight,
+                labels=labels,
+                return_per_token=return_per_token,
+                ce_mode=self.ce_mode,
+                lm_head_fp32=loss_lm_head_fp32,
+                loss_reducer=token_sum_reducer,
+                tp_group=loss_tp_group,
+                lm_head=loss_lm_head,
+                logprob_temperature=logprob_temperature,
+                **sampling_kwargs,
+            )
+            metrics = {"lm_head_fp32_effective": float(loss_lm_head_fp32)}
+            if return_per_token:
+                per_token_outputs["logprobs"] = result.per_token_logprobs
+                per_token_outputs["loss"] = result.per_token_loss
+
+        elif loss_fn in {"importance_sampling", "cispo"}:
+            target_tokens = micro_batch.get("target_tokens", micro_batch.get("labels"))
+            if target_tokens is None:
+                raise ValueError(f"{loss_fn} requires target_tokens or labels")
+            loss_function = cispo_loss_function if loss_fn == "cispo" else importance_sampling_loss_function
+            loss_kwargs = (
+                {
+                    "clip_low_threshold": float(params.get("clip_low_threshold", 0.0)),
+                    "clip_high_threshold": float(params.get("clip_high_threshold", 4.0)),
+                }
+                if loss_fn == "cispo"
+                else {}
+            )
+            result = loss_function(
+                hidden_states=terminal_hidden,
+                weight=effective_weight,
+                labels=target_tokens,
+                old_logprobs=micro_batch["logprobs"],
+                advantages=micro_batch["advantages"],
+                ce_mode=self.ce_mode,
+                compute_kl_stats=bool(params.get("compute_kl_stats", False)),
+                lm_head_fp32=loss_lm_head_fp32,
+                loss_reducer=token_sum_reducer,
+                metric_reducer=token_sum_reducer,
+                tp_group=loss_tp_group,
+                lm_head=loss_lm_head,
+                logprob_temperature=logprob_temperature,
+                **sampling_kwargs,
+                **loss_kwargs,
+            )
+            per_token_outputs["logprobs"] = result.per_token_logprobs
+            metrics = dict(result.metrics or {})
+            metrics.setdefault("valid_tokens", int((target_tokens != IGNORE_INDEX).sum().item()))
+            metric_ops = result.metric_ops
+            if (
+                (bool(params.get("compute_kl_stats", False)) or loss_fn == "cispo")
+                and get_parallel_state().cp_enabled
+                and metrics
+            ):
+                metrics = _sp_allreduce_kl_metrics(metrics, get_parallel_state().ulysses_group, metric_ops)
+
+        elif loss_fn == "drgrpo":
+            target_tokens = micro_batch.get("target_tokens", micro_batch.get("labels"))
+            old_logprobs = micro_batch.get("old_logprobs", micro_batch.get("logprobs"))
+            if target_tokens is None or old_logprobs is None:
+                raise ValueError("drgrpo requires target_tokens/labels and old_logprobs/logprobs")
+            kl_type = params.get("kl_type", "k3")
+            if kl_type in {"low_var_kl", "low_variance_kl"}:
+                kl_type = "k3"
+            result = drgrpo_loss_function(
+                hidden_states=terminal_hidden,
+                weight=effective_weight,
+                labels=target_tokens,
+                old_logprobs=old_logprobs,
+                advantages=micro_batch["advantages"],
+                ref_logprobs=micro_batch.get("ref_logprobs"),
+                clip_low=params.get("clip_low", 0.2),
+                clip_high=params.get("clip_high", 0.28),
+                beta=params.get("beta", 0.0),
+                ratio_type=params.get("ratio_type", "token"),
+                kl_type=kl_type,
+                ce_mode=self.ce_mode,
+                num_chunks=params.get("num_chunks", 8),
+                tp_group=loss_tp_group,
+                lm_head_fp32=loss_lm_head_fp32,
+                loss_reducer=token_sum_reducer,
+                metric_reducer=token_sum_reducer,
+                lm_head=loss_lm_head,
+                logprob_temperature=logprob_temperature,
+                **sampling_kwargs,
+            )
+            if return_per_token or params.get("compute_per_sample_k3", False):
+                per_token_outputs["logprobs"] = result.per_token_logprobs
+            if return_per_token:
+                per_token_outputs["loss"] = result.per_token_loss
+            metrics = dict(result.metrics or {})
+            metrics.setdefault("valid_tokens", int((target_tokens != IGNORE_INDEX).sum().item()))
+
+        elif loss_fn == "policy_loss":
+            target_tokens = micro_batch.get("target_tokens", micro_batch.get("labels"))
+            if target_tokens is None:
+                raise ValueError("policy_loss requires target_tokens or labels")
+            result = policy_loss_function(
+                hidden_states=terminal_hidden,
+                weight=effective_weight,
+                labels=target_tokens,
+                old_logprobs=micro_batch["logprobs"],
+                advantages=micro_batch["advantages"],
+                rollout_logprobs=micro_batch.get("rollout_logprobs"),
+                eps_clip=params.get("eps_clip", 0.2),
+                eps_clip_high=params.get("eps_clip_high", 0.2),
+                eps_clip_c=params.get("eps_clip_c"),
+                use_tis=params.get("use_tis", False),
+                tis_clip_low=params.get("tis_clip_low", 0.1),
+                tis_clip_high=params.get("tis_clip_high", 2.0),
+                ce_mode=self.ce_mode,
+                num_chunks=params.get("num_chunks", 8),
+                compute_kl_stats=params.get("compute_kl_stats", False),
+                lm_head_fp32=loss_lm_head_fp32,
+                icepop_beta=params.get("icepop_beta"),
+                loss_reducer=token_sum_reducer,
+                metric_reducer=token_sum_reducer,
+                tp_group=loss_tp_group,
+                lm_head=loss_lm_head,
+                logprob_temperature=logprob_temperature,
+                **sampling_kwargs,
+            )
+            per_token_outputs["logprobs"] = result.per_token_logprobs
+            metrics = result.metrics
+            metric_ops = result.metric_ops
+            if params.get("compute_kl_stats", False) and get_parallel_state().cp_enabled and metrics:
+                metrics = _sp_allreduce_kl_metrics(metrics, get_parallel_state().ulysses_group, metric_ops)
+
+        else:
+            # The validator leaves only ordinary terminal-hidden OPD here.
+            result = self._compute_opd_micro_batch_loss(
+                hidden_states=terminal_hidden,
+                student_weight=effective_weight,
+                micro_batch=micro_batch,
+                params=dict(params),
+                loss_reducer=token_sum_reducer,
+                student_lm_head=lm_head,
+            )
+            metrics = result.metrics
+
+        if loss_fn != "opd_loss":
+            metrics = dict(metrics or {})
+            metrics.setdefault("lm_head_fp32_effective", float(loss_lm_head_fp32))
+        return result.loss, per_token_outputs, metrics, metric_ops
+
     def _make_pp_train_loss_fn(self):
-        """Training PP loss fn; under quack_linear it consumes the last stage's
-        HIDDEN states and needs that stage's lm_head (mirrors the Trainer)."""
-        pp_lm_head = None
-        if self.ce_mode == "quack_linear":
-            for model_part, init_stage in zip(self.model_parts, self.pp_stages):
-                if init_stage.stage_index == self.pp_num_stages - 1:
-                    pp_lm_head = getattr(model_part, "lm_head", None)
-        return make_pp_loss_fn(self.ce_mode, lm_head=pp_lm_head)
+        """Return the one stable objective dispatcher captured by PP schedules."""
+        dispatcher = getattr(self, "_pp_objective_dispatcher", None)
+        if dispatcher is None:
+            dispatcher = _PhysicalPPObjectiveDispatcher(self)
+            self._pp_objective_dispatcher = dispatcher
+        return dispatcher
 
     def _bucket_pp_seq_len(self, seq_len: int) -> int:
         """Round the negotiated seq_len up to the configured bucket so the
@@ -6722,30 +7641,54 @@ class ModelRunner:
         s = example_input_ids.shape[-1]
         cfg = self.model.config
         dt = torch.bfloat16
+        boundary_state = None
+        for model_part, init_stage in zip(self.model_parts, self.pp_stages):
+            if init_stage.stage_index == stage_index:
+                boundary_state = getattr(model_part, "_pp_pipeline_boundary_state", None)
+                break
+        if boundary_state is None:
+            boundary_shape = (mbs, s, cfg.hidden_size)
+        else:
+            boundary_shape = (mbs, s, *tuple(boundary_state["shape_suffix"]))
+            dt = boundary_state["dtype"]
         if stage_index == 0:
             input_args = (torch.empty(mbs, s, dtype=example_input_ids.dtype, device="meta"),)
         else:
-            input_args = (torch.empty(mbs, s, cfg.hidden_size, dtype=dt, device="meta"),)
-        if stage_index == self.pp_num_stages - 1 and not lm_head_in_loss:
-            output_args = (torch.empty(mbs, s, cfg.vocab_size, dtype=dt, device="meta"),)
+            input_args = (torch.empty(*boundary_shape, dtype=dt, device="meta"),)
+        if stage_index == self.pp_num_stages - 1:
+            terminal_shape = (mbs, s, cfg.hidden_size) if lm_head_in_loss else (mbs, s, cfg.vocab_size)
+            output_args = (torch.empty(*terminal_shape, dtype=torch.bfloat16, device="meta"),)
+        elif boundary_state is not None:
+            output_args = (torch.empty(*boundary_shape, dtype=dt, device="meta"),)
         else:
             output_args = (torch.empty(mbs, s, cfg.hidden_size, dtype=dt, device="meta"),)
         return input_args, output_args
 
     def _get_pp_schedule(self, n_microbatches, seq_len, loss_fn=None, example_input_ids=None):
-        """Return a cached PP schedule keyed by (n_microbatches, seq_len, has_loss).
+        """Return a cached PP schedule keyed by physical input geometry.
 
         A new PipelineStage per local model chunk (cheap, no deepcopy) is created
-        for each unique bucketed seq_len so P2P buffers match the actual tensor
-        shape. ``loss_fn=None`` builds a forward-only schedule (eval / ref
-        logprobs) whose last stage returns HIDDEN states; the caller applies
-        lm_head + loss outside the schedule.
+        for each unique ``(n_microbatches, physical_batch_size, seq_len,
+        schedule)`` so P2P buffers match the actual tensor shape.
+        ``loss_fn=None`` builds a forward-only schedule (eval / ref logprobs)
+        whose last stage returns HIDDEN states; the caller applies lm_head +
+        loss outside the schedule.
         """
         has_loss = loss_fn is not None
-        key = (n_microbatches, seq_len, has_loss)
-        # Forward-only always keeps lm_head out of the stage output (hidden out);
-        # training does so only under quack_linear.
-        lm_head_in_loss = (self.ce_mode == "quack_linear") if has_loss else True
+        schedule_name = self.train_config.get("pipeline_parallel_schedule", "1F1B")
+        if n_microbatches == 1 and self.pp_num_stages > 1 and schedule_stage_style(schedule_name) == "single":
+            # Torch's single-stage-per-rank GPipe/1F1B classes reject m < p,
+            # even though one ordered chunk is a valid fill/drain pipeline.
+            # Its interleaved runtime accepts the same one-stage-per-rank
+            # placement and provides that mechanical one-chunk schedule.
+            schedule_name = "Interleaved1F1B"
+        physical_batch_size = None if example_input_ids is None else int(example_input_ids.shape[0])
+        key = (n_microbatches, physical_batch_size, seq_len, has_loss, schedule_name.lower())
+        # ModelRunner objectives always consume terminal hidden states.  The
+        # stable dispatcher selects the requested CE/RL/OPD program and the
+        # terminal local head; no schedule ever caches first-call logits or an
+        # objective-specific closure.
+        lm_head_in_loss = True
         if key not in self._pp_schedule_cache:
             ps = get_parallel_state()
             stages = []
@@ -6768,12 +7711,20 @@ class ModelRunner:
                 stages=stages,
                 n_microbatches=n_microbatches,
                 loss_fn=loss_fn,
-                schedule_name=self.train_config.get("pipeline_parallel_schedule", "1F1B"),
+                schedule_name=schedule_name,
             )
         self._set_pp_lm_head_in_loss(lm_head_in_loss)
         return self._pp_schedule_cache[key]
 
-    def _forward_backward_pp(self, micro_batches, global_valid_tokens):
+    def _forward_backward_pp(
+        self,
+        micro_batches,
+        global_valid_tokens,
+        *,
+        loss_fn: str,
+        loss_fn_params: Mapping[str, Any],
+        model_id: str,
+    ):
         """Pipeline parallel forward-backward step.
 
         With pp_variable_seq_lengths: negotiates per-step max seq_len across PP
@@ -6784,7 +7735,26 @@ class ModelRunner:
         optim_step can normalize gradients by the full accumulated total.
         """
         ps = get_parallel_state()
-        if self.train_config.get("pp_variable_seq_lengths", False):
+        carries_compact_hyperconnection = any(
+            bool(getattr(model_part, "_pp_carries_hyperconnection_state", False)) for model_part in self.model_parts
+        )
+        if carries_compact_hyperconnection:
+            seq_len = align_dsv4_pp_storage_rows(
+                micro_batches,
+                cp_size=ps.cp_size,
+                bucket_size=(
+                    self.train_config.get("pp_seq_len_bucket_size", 1024)
+                    if self.train_config.get("pp_variable_seq_lengths", False)
+                    else 1
+                ),
+                minimum_storage_rows=(
+                    0
+                    if self.train_config.get("pp_variable_seq_lengths", False)
+                    else (self.train_config.get("sample_packing_sequence_len", 0) or 0) // ps.cp_size
+                ),
+                pad_to_multiple_of=self.train_config.get("pad_to_multiple_of", 1),
+            )
+        elif self.train_config.get("pp_variable_seq_lengths", False):
             seq_len = self._bucket_pp_seq_len(negotiate_pp_seq_len(micro_batches, ps.pp_group))
             pad_micro_batches_for_pp(
                 micro_batches,
@@ -6795,32 +7765,183 @@ class ModelRunner:
         else:
             seq_len = micro_batches[0]["input_ids"].shape[-1]
 
-        pp_schedule = self._get_pp_schedule(
-            len(micro_batches),
-            seq_len,
-            loss_fn=self._make_pp_train_loss_fn(),
-            example_input_ids=micro_batches[0]["input_ids"],
+        dispatcher = self._make_pp_train_loss_fn()
+        physical_batch_sizes = [int(micro_batch["input_ids"].shape[0]) for micro_batch in micro_batches]
+        ragged_physical_batches = len(set(physical_batch_sizes)) > 1
+        dispatcher.begin_step(
+            micro_batches,
+            loss_fn=loss_fn,
+            loss_fn_params=loss_fn_params,
+            model_id=model_id,
+            assert_consumed=self.has_last_stage,
         )
-        return forward_backward_pp(
-            model_parts=self.model_parts,
-            pp_schedule=pp_schedule,
-            micro_batches=micro_batches,
-            has_first_stage=self.has_first_stage,
-            has_last_stage=self.has_last_stage,
-            pp_group=ps.pp_group,
-        )
+        try:
+            logprob_temperature = float(loss_fn_params.get("logprob_temperature", 1.0) or 1.0)
+            if ragged_physical_batches:
+                # torch.distributed.pipelining schedules split concatenated
+                # inputs evenly and retain one fixed P2P tensor shape. Preserve
+                # the caller's real row boundaries by executing ordered,
+                # geometry-keyed one-microbatch schedules. The dispatcher
+                # remains bound once for the whole logical step, so IDs,
+                # objective metadata, records, and signed loss accumulation
+                # retain the same semantics as the pipelined fast path.
+                raw_loss = 0.0
+                for microbatch_id, micro_batch in enumerate(micro_batches):
+                    pp_schedule = self._get_pp_schedule(
+                        1,
+                        seq_len,
+                        loss_fn=dispatcher,
+                        example_input_ids=micro_batch["input_ids"],
+                    )
+                    schedule_targets = torch.full(
+                        (physical_batch_sizes[microbatch_id],),
+                        microbatch_id,
+                        dtype=torch.long,
+                        device=get_device_type(),
+                    )
+                    raw_loss += forward_backward_pp(
+                        model_parts=self.model_parts,
+                        pp_schedule=pp_schedule,
+                        micro_batches=[micro_batch],
+                        has_first_stage=self.has_first_stage,
+                        has_last_stage=self.has_last_stage,
+                        pp_group=ps.pp_group,
+                        logprob_temperature=logprob_temperature,
+                        schedule_targets=schedule_targets,
+                    )
+            else:
+                pp_schedule = self._get_pp_schedule(
+                    len(micro_batches),
+                    seq_len,
+                    loss_fn=dispatcher,
+                    example_input_ids=micro_batches[0]["input_ids"],
+                )
+                schedule_targets = torch.cat(
+                    [
+                        torch.full(
+                            (physical_batch_sizes[microbatch_id],),
+                            microbatch_id,
+                            dtype=torch.long,
+                            device=get_device_type(),
+                        )
+                        for microbatch_id in range(len(micro_batches))
+                    ],
+                    dim=0,
+                )
+                raw_loss = forward_backward_pp(
+                    model_parts=self.model_parts,
+                    pp_schedule=pp_schedule,
+                    micro_batches=micro_batches,
+                    has_first_stage=self.has_first_stage,
+                    has_last_stage=self.has_last_stage,
+                    pp_group=ps.pp_group,
+                    logprob_temperature=logprob_temperature,
+                    schedule_targets=schedule_targets,
+                )
+            if self.has_last_stage:
+                try:
+                    wire = ["ok", dispatcher.end_step()]
+                except Exception as exc:
+                    wire = ["error", f"{type(exc).__name__}: {exc}"]
+            else:
+                dispatcher.end_step()
+                wire = [None, None]
+            dist.broadcast_object_list(wire, src=self._pp_last_stage_src_rank(), group=ps.pp_group)
+            if wire[0] == "error":
+                raise RuntimeError(f"Physical PP terminal objective bookkeeping failed: {wire[1]}")
+            return raw_loss, tuple(wire[1])
+        finally:
+            dispatcher.abort_step()
+            self._release_index_share_contexts()
 
-    _PP_FORWARD_ONLY_LOSS_FNS = frozenset({"causallm_loss", "cross_entropy"})
+    def _finalize_pp_objective_records(
+        self,
+        records: tuple[dict[str, Any], ...],
+        micro_batches: List[Dict[str, Any]],
+        *,
+        loss_fn: str,
+        loss_fn_params: Mapping[str, Any],
+        global_valid_tokens: torch.Tensor,
+        raw_local_loss: float,
+    ) -> Dict[str, Any]:
+        """Recompose terminal-stage outputs on every physical PP rank."""
+
+        ps = get_parallel_state()
+        loss_sum = torch.tensor(float(raw_local_loss), dtype=torch.float32, device=get_device_type())
+        if ps.loss_parallel_enabled:
+            dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM, group=ps.loss_group)
+        gvt = float(global_valid_tokens.item())
+        result: Dict[str, Any] = {
+            "total_loss": float(loss_sum.item() / gvt) if gvt > 0 else 0.0,
+            "global_valid_tokens": int(gvt) if gvt.is_integer() else gvt,
+        }
+        accumulators = {"logprobs": [], "losses": [], "position_ids": [], "token_diagnostics": []}
+        accumulated_metrics: Dict[str, Any] = {}
+        by_id = {int(record["microbatch_id"]): record for record in records}
+        expected_ids = set(range(len(micro_batches)))
+        if set(by_id) != expected_ids:
+            raise RuntimeError(
+                "Physical PP terminal records do not match the submitted microbatches: "
+                f"records={sorted(by_id)}, expected={sorted(expected_ids)}"
+            )
+        for microbatch_id, micro_batch in enumerate(micro_batches):
+            record = by_id[microbatch_id]
+            per_token_outputs = {
+                key: value.to(get_device_type(), non_blocking=True) if isinstance(value, torch.Tensor) else value
+                for key, value in record["per_token_outputs"].items()
+            }
+            if per_token_outputs:
+                self._collect_per_token_outputs(per_token_outputs, micro_batch, accumulators)
+            self._accumulate_loss_metrics(
+                accumulated_metrics,
+                record.get("metrics"),
+                loss_fn,
+                record.get("metric_ops"),
+            )
+
+        if loss_fn == "opd_loss":
+            self._ensure_opd_loss_metric_accumulators(
+                accumulated_metrics,
+                include_profile_metrics=bool(
+                    loss_fn_params.get(
+                        "profile_phase_timings",
+                        loss_fn_params.get("opd_profile_timings", False),
+                    )
+                ),
+            )
+        self._finalize_loss_metrics(accumulated_metrics, result, loss_fn)
+        if accumulators["logprobs"]:
+            result["packed_logprobs"] = [tensor.tolist() for tensor in accumulators["logprobs"]]
+            if accumulators["losses"]:
+                result["packed_losses"] = [tensor.tolist() for tensor in accumulators["losses"]]
+            if accumulators["position_ids"]:
+                result["packed_position_ids"] = [tensor.tolist() for tensor in accumulators["position_ids"]]
+            if accumulators["token_diagnostics"]:
+                result["packed_token_diagnostics"] = accumulators["token_diagnostics"]
+        return result
+
+    _PP_FORWARD_ONLY_LOSS_FNS = frozenset(
+        {
+            "causallm_loss",
+            "cross_entropy",
+            "policy_loss",
+            "importance_sampling",
+            "drgrpo",
+            "cispo",
+            "opd_loss",
+        }
+    )
 
     @torch.no_grad()
     def _pp_forward_only_loop(self, micro_batches, loss_fn, loss_fn_params, r3_enabled=False):
         """Pipeline-aware forward-only pass (eval / reference logprobs).
 
-        Runs the full pipeline schedule in forward-only mode (all microbatches in
-        one pipelined step), computes loss + per-token logprobs from the last
-        stage's hidden states, and broadcasts per-microbatch results across
-        pp_group so every rank returns the same result dict as the non-PP
-        ``_forward_loop``.
+        Runs equal-size microbatches in one pipelined step. Ragged physical
+        batches use ordered one-microbatch schedules so the fixed-shape torch
+        pipeline transport cannot change caller row boundaries. Computes loss +
+        per-token logprobs from the last stage's hidden states, and broadcasts
+        per-microbatch results across pp_group so every rank returns the same
+        result dict as the non-PP ``_forward_loop``.
         """
         if loss_fn not in self._PP_FORWARD_ONLY_LOSS_FNS:
             raise NotImplementedError(
@@ -6828,24 +7949,44 @@ class ModelRunner:
                 f"(supported: {sorted(self._PP_FORWARD_ONLY_LOSS_FNS)})."
             )
         params = loss_fn_params or {}
-        return_per_token = params.get("return_per_token", True)
         ps = get_parallel_state()
 
         global_valid_tokens = self._count_global_valid_tokens(micro_batches)
 
-        if self.train_config.get("pp_variable_seq_lengths", False):
+        carries_compact_hyperconnection = any(
+            bool(getattr(model_part, "_pp_carries_hyperconnection_state", False)) for model_part in self.model_parts
+        )
+        if carries_compact_hyperconnection:
+            seq_len = align_dsv4_pp_storage_rows(
+                micro_batches,
+                cp_size=ps.cp_size,
+                bucket_size=(
+                    self.train_config.get("pp_seq_len_bucket_size", 1024)
+                    if self.train_config.get("pp_variable_seq_lengths", False)
+                    else 1
+                ),
+                minimum_storage_rows=(
+                    0
+                    if self.train_config.get("pp_variable_seq_lengths", False)
+                    else (self.train_config.get("sample_packing_sequence_len", 0) or 0) // ps.cp_size
+                ),
+                pad_to_multiple_of=self.train_config.get("pad_to_multiple_of", 1),
+            )
+            pad_target = 0
+        elif self.train_config.get("pp_variable_seq_lengths", False):
             seq_len = self._bucket_pp_seq_len(negotiate_pp_seq_len(micro_batches, ps.pp_group))
             pad_target = seq_len * ps.cp_size
         else:
             # Static padding mirrors the training path: config value is the full
             # (unsharded) packed length.
             pad_target = self.train_config.get("sample_packing_sequence_len", 0)
-        pad_micro_batches_for_pp(
-            micro_batches,
-            sample_packing_sequence_len=pad_target,
-            sp_size=ps.cp_size,
-            pad_to_multiple_of=self.train_config.get("pad_to_multiple_of", 1),
-        )
+        if pad_target:
+            pad_micro_batches_for_pp(
+                micro_batches,
+                sample_packing_sequence_len=pad_target,
+                sp_size=ps.cp_size,
+                pad_to_multiple_of=self.train_config.get("pad_to_multiple_of", 1),
+            )
 
         micro_batches = [
             {k: v.to(get_device_type(), non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in mb.items()}
@@ -6859,108 +8000,101 @@ class ModelRunner:
         if r3_enabled:
             set_replay_stage("replay_forward")
         try:
-            pp_schedule = self._get_pp_schedule(
-                len(micro_batches),
-                micro_batches[0]["input_ids"].shape[-1],
-                loss_fn=None,
-                example_input_ids=micro_batches[0]["input_ids"],
-            )
-            hidden_per_mb = forward_only_pp(
-                model_parts=self.model_parts,
-                pp_schedule=pp_schedule,
-                micro_batches=micro_batches,
-                has_first_stage=self.has_first_stage,
-                has_last_stage=self.has_last_stage,
-            )
+            physical_batch_sizes = [int(micro_batch["input_ids"].shape[0]) for micro_batch in micro_batches]
+            if len(set(physical_batch_sizes)) > 1:
+                hidden_per_mb = [] if self.has_last_stage else None
+                for micro_batch in micro_batches:
+                    pp_schedule = self._get_pp_schedule(
+                        1,
+                        micro_batch["input_ids"].shape[-1],
+                        loss_fn=None,
+                        example_input_ids=micro_batch["input_ids"],
+                    )
+                    microbatch_hidden = forward_only_pp(
+                        model_parts=self.model_parts,
+                        pp_schedule=pp_schedule,
+                        micro_batches=[micro_batch],
+                        has_first_stage=self.has_first_stage,
+                        has_last_stage=self.has_last_stage,
+                    )
+                    if hidden_per_mb is not None:
+                        if microbatch_hidden is None or len(microbatch_hidden) != 1:
+                            raise RuntimeError(
+                                "Ragged physical PP forward-only schedule did not return exactly one terminal output"
+                            )
+                        hidden_per_mb.extend(microbatch_hidden)
+            else:
+                pp_schedule = self._get_pp_schedule(
+                    len(micro_batches),
+                    micro_batches[0]["input_ids"].shape[-1],
+                    loss_fn=None,
+                    example_input_ids=micro_batches[0]["input_ids"],
+                )
+                hidden_per_mb = forward_only_pp(
+                    model_parts=self.model_parts,
+                    pp_schedule=pp_schedule,
+                    micro_batches=micro_batches,
+                    has_first_stage=self.has_first_stage,
+                    has_last_stage=self.has_last_stage,
+                )
         finally:
             if r3_enabled:
                 set_replay_stage(None)
         logger.info(f"Rank {self.rank}: PP forward-only schedule step done (last_stage={hidden_per_mb is not None})")
 
         src_rank = self._pp_last_stage_src_rank()
-        total_loss = 0.0
-        accumulators = {"logprobs": [], "losses": [], "position_ids": [], "token_diagnostics": []}
-        raw_per_mb_logprobs = []
-
-        prefer_target_tokens = bool(params.get("_prefer_target_tokens", False))
-
-        def _mb_labels(micro_batch):
-            if prefer_target_tokens:
-                return micro_batch.get("target_tokens", micro_batch.get("labels"))
-            return micro_batch.get("labels", micro_batch.get("target_tokens"))
-
-        # Compute all per-microbatch payloads on the last stage, then ONE
-        # broadcast to pp_group. Errors are broadcast too so every rank raises
-        # together instead of peers hanging in the collective.
+        # Compute every requested objective on the terminal stage, then make
+        # its detached metrics/per-token payload available to the other PP
+        # stages before stage-local DP/CP recomposition.
         if hidden_per_mb is not None:
             try:
-                last_part = self._pp_last_stage_part()
-                lm_head = last_part.lm_head
-                effective_weight = (
-                    lm_head.weight + lm_head.get_delta_weight().to(lm_head.weight.dtype)
-                    if isinstance(lm_head, LoraLinear)
-                    else lm_head.weight
-                )
-                # Under no_grad FSDP2 reshards after the stage forward even with
-                # reshard_after_forward=False, so the weight is a sharded DTensor
-                # here — materialize the full tensor for the loss.
-                if hasattr(effective_weight, "full_tensor"):
-                    effective_weight = effective_weight.full_tensor()
-                payloads = []
+                records = []
                 for batch_idx, micro_batch in enumerate(micro_batches):
-                    _result = causallm_loss_function(
-                        hidden_states=hidden_per_mb[batch_idx],
-                        weight=effective_weight,
-                        labels=_mb_labels(micro_batch),
-                        return_per_token=return_per_token,
-                        ce_mode=self.ce_mode,
-                        lm_head_fp32=self.lm_head_fp32,
-                        loss_reducer=TokenPartial(scale=torch.tensor(1.0, device=hidden_per_mb[batch_idx].device)),
-                        lm_head=self._get_loss_lm_head_module(lm_head),
+                    objective = _PhysicalPPMicrobatchObjective(
+                        microbatch_id=batch_idx,
+                        micro_batch=MappingProxyType(dict(micro_batch)),
+                        loss_fn=loss_fn,
+                        loss_fn_params=MappingProxyType(dict(params)),
+                        model_id="forward_only",
                     )
-                    payloads.append(
-                        [
-                            _result.loss.detach().float().cpu(),
-                            _result.per_token_logprobs.detach().cpu() if return_per_token else None,
-                            _result.per_token_loss.detach().cpu() if return_per_token else None,
-                        ]
+                    local_loss, per_token_outputs, metrics, metric_ops = self._compute_pp_terminal_objective(
+                        hidden_per_mb[batch_idx],
+                        objective,
                     )
-                wire = ["ok", payloads]
+                    records.append(
+                        {
+                            "microbatch_id": batch_idx,
+                            "loss": local_loss.detach().float().cpu(),
+                            "per_token_outputs": self._pp_payload_to_cpu(per_token_outputs),
+                            "metrics": self._pp_payload_to_cpu(metrics),
+                            "metric_ops": dict(metric_ops or {}),
+                        }
+                    )
+                wire = ["ok", tuple(records)]
             except Exception as exc:
                 logger.error(f"Rank {self.rank}: PP forward-only loss failed: {exc}", exc_info=True)
                 wire = ["error", f"{type(exc).__name__}: {exc}"]
         else:
             wire = [None, None]
         dist.broadcast_object_list(wire, src=src_rank, group=ps.pp_group)
-        status, payloads = wire
+        status, records = wire
         if status == "error":
-            raise RuntimeError(f"PP forward-only loss failed on the last stage: {payloads}")
+            raise RuntimeError(f"PP forward-only loss failed on the last stage: {records}")
 
-        for batch_idx, micro_batch in enumerate(micro_batches):
-            local_loss_sum, per_token_logprobs, per_token_loss = payloads[batch_idx]
-
-            if global_valid_tokens.item() > 0:
-                total_loss += local_loss_sum.item() / global_valid_tokens.item()
-            per_token_outputs = {}
-            if return_per_token and per_token_logprobs is not None:
-                device = get_device_type()
-                per_token_outputs["logprobs"] = per_token_logprobs.to(device)
-                if per_token_loss is not None:
-                    per_token_outputs["loss"] = per_token_loss.to(device)
-                raw_per_mb_logprobs.append(per_token_logprobs)
-                self._collect_per_token_outputs(per_token_outputs, micro_batch, accumulators)
-
-        result = {
-            "total_loss": total_loss,
-            "global_valid_tokens": global_valid_tokens.item(),
-        }
-        if accumulators["logprobs"]:
-            result["packed_logprobs"] = [t.tolist() for t in accumulators["logprobs"]]
-            if accumulators["losses"]:
-                result["packed_losses"] = [t.tolist() for t in accumulators["losses"]]
-            if accumulators["position_ids"]:
-                result["packed_position_ids"] = [t.tolist() for t in accumulators["position_ids"]]
-        result["_pp_raw_per_token_logprobs"] = raw_per_mb_logprobs
+        raw_local_loss = sum(float(record["loss"].item()) for record in records)
+        result = self._finalize_pp_objective_records(
+            tuple(records),
+            micro_batches,
+            loss_fn=loss_fn,
+            loss_fn_params=params,
+            global_valid_tokens=global_valid_tokens,
+            raw_local_loss=raw_local_loss,
+        )
+        result["_pp_raw_per_token_logprobs"] = [
+            record["per_token_outputs"]["logprobs"]
+            for record in records
+            if isinstance(record["per_token_outputs"].get("logprobs"), torch.Tensor)
+        ]
         synchronize()
         return result
 
@@ -6985,6 +8119,7 @@ class ModelRunner:
         result rendezvous has completed on every rank.
         """
 
+        routing_requested = routed_experts is not None or routed_expert_logits is not None
         try:
             result = self._forward_backward_impl(
                 micro_batches,
@@ -7004,6 +8139,9 @@ class ModelRunner:
             if self._adapter_manager is not None and self._adapter_manager.has_adapter(model_id):
                 self._adapter_manager.abort_gradient_capture(model_id)
             raise
+        finally:
+            if routing_requested:
+                self._routing_handler.cleanup()
 
     def commit_forward_backward_completion(self, model_id: str = "default") -> None:
         """Commit staged capture and monotonic success at the result boundary."""
@@ -7120,16 +8258,17 @@ class ModelRunner:
         # Get return_per_token flag from loss_fn_params (default True for tinker compatibility)
         use_distsignsgd = getattr(self, "_use_distsignsgd", False)
 
-        if self.pp_enabled and loss_fn == "opd_loss":
-            raise NotImplementedError("opd_loss does not yet support pipeline parallelism")
+        if self.pp_enabled:
+            self._validate_physical_pp_objective(loss_fn, params)
 
         # Reference forward pass: compute Xorl's own logprobs to replace SGLang logprobs
         # This guarantees KL=0 at step 0 since both old and new logprobs come from the same engine
         compute_ref_logprobs = params.get("compute_ref_logprobs", False)
-        ref_logprob_temperature = float(params.get("logprob_temperature", 1.0) or 1.0)
-        if ref_logprob_temperature <= 0.0:
-            raise ValueError(f"logprob_temperature must be > 0, got {ref_logprob_temperature}")
-        if compute_ref_logprobs and loss_fn in ["policy_loss", "importance_sampling"]:
+        raw_ref_temperature = params.get("logprob_temperature", 1.0)
+        ref_logprob_temperature = 1.0 if raw_ref_temperature is None else float(raw_ref_temperature)
+        if not math.isfinite(ref_logprob_temperature) or ref_logprob_temperature <= 0.0:
+            raise ValueError(f"logprob_temperature must be finite and > 0, got {ref_logprob_temperature}")
+        if compute_ref_logprobs and loss_fn in ["policy_loss", "importance_sampling", "cispo"]:
             logger.info("Computing reference logprobs via no-grad forward pass")
 
             # Set up R3 routing for ref pass if needed (separate from main pass)
@@ -7141,7 +8280,16 @@ class ModelRunner:
                 ref_result = self._pp_forward_only_loop(
                     micro_batches,
                     "causallm_loss",
-                    {"return_per_token": True, "_prefer_target_tokens": True},
+                    {
+                        "return_per_token": True,
+                        "_prefer_target_tokens": True,
+                        "logprob_temperature": ref_logprob_temperature,
+                        **{
+                            key: params[key]
+                            for key in ("logprob_top_k", "logprob_top_p", "logprob_min_p")
+                            if key in params
+                        },
+                    },
                     r3_enabled=ref_r3_enabled,
                 )
                 for batch_idx, ref_logprobs in enumerate(ref_result["_pp_raw_per_token_logprobs"]):
@@ -7168,6 +8316,10 @@ class ModelRunner:
                             "advantages",
                             "_original_position_ids",
                             "rollout_logprobs",
+                            "logprob_temperatures",
+                            "logprob_top_ks",
+                            "logprob_top_ps",
+                            "logprob_min_ps",
                         ]
                     }
 
@@ -7184,6 +8336,8 @@ class ModelRunner:
                     loss_lm_head = self._get_loss_lm_head_module(getattr(self.model, "lm_head", None))
 
                     labels = mb.get("target_tokens", mb.get("labels"))
+                    ref_logprob_temperature = self._resolve_logprob_temperature(mb, params)
+                    ref_sampling_transforms = self._resolve_logprob_sampling_transforms(mb, params)
 
                     # Compute per-token logprobs using same CE path as training
                     _ref_result = causallm_loss_function(
@@ -7196,6 +8350,7 @@ class ModelRunner:
                         tp_group=self._get_loss_tp_group(),
                         lm_head=loss_lm_head,
                         logprob_temperature=ref_logprob_temperature,
+                        **ref_sampling_transforms,
                     )
                     ref_logprobs = _ref_result.per_token_logprobs
 
@@ -7250,26 +8405,80 @@ class ModelRunner:
                     sp_size=get_parallel_state().cp_size,
                     pad_to_multiple_of=self.train_config.get("pad_to_multiple_of", 1),
                 )
-            raw_total_loss = self._forward_backward_pp(micro_batches, global_valid_tokens)
-            # raw_total_loss = sum of CE_sum across micro-batches (unnormalized).
-            # Normalize for reporting: divide by global_valid_tokens.
-            gvt = global_valid_tokens.item()
-            reported_loss = raw_total_loss / gvt if gvt > 0 else 0.0
-            result = {
-                "total_loss": reported_loss,
-                "global_valid_tokens": gvt,
-            }
-            # Accumulate valid tokens for deferred normalization at optim_step
-            self._accumulated_valid_tokens[model_id] = self._accumulated_valid_tokens.get(model_id, 0) + gvt
-            if use_distsignsgd:
-                self._accumulated_active_microbatches[model_id] = (
-                    self._accumulated_active_microbatches.get(model_id, 0) + active_microbatches
+            ownership_capture_open = False
+            if self._adapter_manager is not None:
+                ownership_capture_open = self._adapter_manager.begin_gradient_capture(
+                    model_id,
+                    scale_state=GradientScaleState.RAW_NUMERATOR,
                 )
-                self._accumulated_active_voter_total[model_id] = (
-                    self._accumulated_active_voter_total.get(model_id, 0) + active_voter_total
+            try:
+                if r3_enabled or getattr(self, "_use_routing_replay", False):
+                    # _pp_forward temporarily maps this outer stage to record
+                    # (standard checkpointing) or replay_forward (R3), then
+                    # restores replay_backward before scheduled recomputation.
+                    set_replay_stage("replay_backward")
+                raw_total_loss, objective_records = self._forward_backward_pp(
+                    micro_batches,
+                    global_valid_tokens,
+                    loss_fn=loss_fn,
+                    loss_fn_params=params,
+                    model_id=model_id,
                 )
-            # R3 cleanup for PP path (stage management handled by _pp_forward)
-            if r3_enabled:
+                sp_exclusions = (
+                    self._adapter_manager.adapter_sync_exclusions(model_id, ReductionAxis.SEQUENCE_PARALLEL)
+                    if self._adapter_manager is not None
+                    else frozenset()
+                )
+                output_exclusions = (
+                    self._adapter_manager.adapter_sync_exclusions(
+                        model_id,
+                        ReductionAxis.OUTPUT_PROJECTION_REPLICA,
+                    )
+                    if self._adapter_manager is not None
+                    else frozenset()
+                )
+                ps = get_parallel_state()
+                for model_part in self.model_parts:
+                    sync_sp_gradients(
+                        model_part,
+                        ps.sp_grad_sync_group,
+                        skip_dtensor_grads=use_distsignsgd,
+                        excluded_parameter_ids=sp_exclusions,
+                    )
+                    if getattr(ps, "lm_head_tp_size", 1) > 1:
+                        sync_lm_head_tp_gradient(
+                            model_part,
+                            ps.lm_head_tp_replica_group,
+                            excluded_parameter_ids=output_exclusions,
+                        )
+                if ownership_capture_open:
+                    self._adapter_manager.stage_gradient_numerators(
+                        model_id,
+                        denominator=float(global_valid_tokens.item()),
+                        backward_completed=True,
+                    )
+                result = self._finalize_pp_objective_records(
+                    objective_records,
+                    micro_batches,
+                    loss_fn=loss_fn,
+                    loss_fn_params=params,
+                    global_valid_tokens=global_valid_tokens,
+                    raw_local_loss=raw_total_loss,
+                )
+                gvt = global_valid_tokens.item()
+                self._accumulated_valid_tokens[model_id] = self._accumulated_valid_tokens.get(model_id, 0) + gvt
+                if use_distsignsgd:
+                    self._accumulated_active_microbatches[model_id] = (
+                        self._accumulated_active_microbatches.get(model_id, 0) + active_microbatches
+                    )
+                    self._accumulated_active_voter_total[model_id] = (
+                        self._accumulated_active_voter_total.get(model_id, 0) + active_voter_total
+                    )
+            finally:
+                dispatcher = getattr(self, "_pp_objective_dispatcher", None)
+                if dispatcher is not None:
+                    dispatcher.abort_step()
+                self._release_index_share_contexts()
                 self._routing_handler.cleanup()
         else:
             # Standard forward-backward via unified loop
@@ -7287,6 +8496,9 @@ class ModelRunner:
                 if self._adapter_manager is not None:
                     self._adapter_manager.abort_gradient_capture(model_id)
                 raise
+
+        if r3_enabled:
+            result.update(self._routing_handler.last_setup_metrics)
 
         if self._adapter_manager is not None:
             self._adapter_manager.trace_model_gradient_stage(
@@ -7358,6 +8570,20 @@ class ModelRunner:
 
         return result
 
+    def _reshard_exact_forward_only_lm_head(self) -> None:
+        """Restore FP32 masters after the external no-grad vocab projection."""
+
+        if not getattr(self.model.config, "_dsv4_flash_exact_mode", False):
+            return
+        head_owner = self._pp_last_stage_part() if self.pp_enabled else self.model
+        if head_owner is None:
+            return
+        lm_head = getattr(head_owner, "lm_head", None)
+        reshard = getattr(lm_head, "reshard", None)
+        if not callable(reshard):
+            raise RuntimeError("Exact DSV4-Flash forward-only replay requires an FSDP-managed lm_head")
+        reshard()
+
     # FSDP2 unshard hooks require version counters; no_grad keeps this path
     # forward-only without disabling those counters.
     @torch.no_grad()
@@ -7383,33 +8609,46 @@ class ModelRunner:
 
         start_time = time.time()
 
-        if self.pp_enabled and loss_fn == "opd_loss":
-            raise NotImplementedError("opd_loss does not yet support pipeline parallelism")
-
         params = loss_fn_params or {}
-        if bool(params.get("diagnostic_decode_cache", False)):
-            r3_enabled = self._routing_handler.setup_decode_cache(micro_batches, routed_experts, routed_expert_logits)
-        else:
-            r3_enabled = self._routing_handler.setup(micro_batches, routed_experts, routed_expert_logits)
-
         if self.pp_enabled:
-            # Forward-only must run the pipeline schedule — calling self.model(...)
-            # would execute only this rank's first stage.
-            try:
+            self._validate_physical_pp_objective(loss_fn, params)
+        routing_requested = routed_experts is not None or routed_expert_logits is not None
+        try:
+            if bool(params.get("diagnostic_decode_cache", False)):
+                r3_enabled = self._routing_handler.setup_decode_cache(
+                    micro_batches, routed_experts, routed_expert_logits
+                )
+            else:
+                r3_enabled = self._routing_handler.setup(micro_batches, routed_experts, routed_expert_logits)
+
+            if self.pp_enabled:
+                # Forward-only must run the pipeline schedule — calling self.model(...)
+                # would execute only this rank's first stage.
                 result = self._pp_forward_only_loop(micro_batches, loss_fn, loss_fn_params, r3_enabled=r3_enabled)
                 result.pop("_pp_raw_per_token_logprobs", None)
-            finally:
-                if r3_enabled:
-                    self._routing_handler.cleanup()
-        else:
-            result = self._forward_loop(
-                micro_batches,
-                loss_fn,
-                loss_fn_params,
-                compute_backward=False,
-                r3_enabled=r3_enabled,
-                model_id=model_id,
-            )
+            else:
+                result = self._forward_loop(
+                    micro_batches,
+                    loss_fn,
+                    loss_fn_params,
+                    compute_backward=False,
+                    r3_enabled=r3_enabled,
+                    model_id=model_id,
+                )
+        finally:
+            if routing_requested or self.pp_enabled:
+                self._routing_handler.cleanup()
+            if self.pp_enabled:
+                dispatcher = getattr(self, "_pp_objective_dispatcher", None)
+                if dispatcher is not None:
+                    dispatcher.abort_step()
+                self._release_index_share_contexts()
+            # The lm head is called by compute_loss outside the root model. In
+            # a no-grad pass FSDP2 leaves its BF16 compute view materialized,
+            # so restore the sharded FP32 adapter masters even when the
+            # forward/loss path raises. Backward owns this transition in
+            # training passes.
+            self._reshard_exact_forward_only_lm_head()
 
         if self._adapter_manager is not None:
             result["step"] = self._adapter_manager.get_adapter_state(model_id).global_forward_backward_step
@@ -7488,6 +8727,8 @@ class ModelRunner:
         start_time = time.time()
         skip_optim_empty_cache = False
         adapter_mutated = False
+        glm52_fullparam_mutation_started = False
+        glm52_fullparam_publish_receipt = None
         capture_config = dict(sparse_delta_capture or {})
         capture_snapshots: dict[str, torch.Tensor] | None = None
         capture_snapshot_s = 0.0
@@ -7498,8 +8739,9 @@ class ModelRunner:
             capture_snapshots = snapshot_sparse_delta_tensors(self.model, capture_config)
             capture_snapshot_s = time.perf_counter() - t_capture
 
-        # A missing/non-positive threshold means disabled clipping, but the
-        # adapter manager still computes and reports the real logical norm.
+        # A non-positive threshold means disabled clipping. The adapter manager
+        # retains its legacy missing-threshold behavior, while the single-model
+        # path below rejects a missing threshold before optimizer mutation.
         clip_value = gradient_clip if gradient_clip is not None else self.train_config.get("max_grad_norm")
 
         # Pop accumulated valid tokens for this model_id (deferred normalization)
@@ -7595,31 +8837,59 @@ class ModelRunner:
                 pp_group=ps.pp_group if self.pp_enabled else None,
             )
 
-            # Optimizer step
-            self.optimizer.step()
-            # Fused/foreach optimizer kernels can still be reading gradients when
-            # Python reaches zero_grad/empty_cache. Synchronize before releasing
-            # grad storage to avoid allocator reuse while those kernels are live.
-            synchronize()
+            # Once an optimizer kernel has been launched, any exception may
+            # follow a partial mutation.  The exact full-parameter lane must
+            # therefore classify the entire remaining command as fatal, not
+            # only cache refresh/publication failures.
+            glm52_fullparam_mutation_started = bool(self.train_config.get("glm52_fullparam_fp8_training"))
             try:
-                self.optimizer.zero_grad(set_to_none=True)
-            except TypeError:
-                # MultiOptimizer (Muon) doesn't support set_to_none kwarg
-                self.optimizer.zero_grad()
-            for part in self.model_parts if self.pp_enabled else [self.model]:
-                part.zero_grad(set_to_none=True)
-            skip_optim_empty_cache = _skip_empty_cache_after_optim_step(self.train_config)
-            if skip_optim_empty_cache:
-                logger.debug("Skipping torch.cuda.empty_cache() after optimizer step")
-            else:
-                torch.cuda.empty_cache()
+                self.optimizer.step()
+                # Fused/foreach optimizer kernels can still be reading gradients when
+                # Python reaches zero_grad/empty_cache. Synchronize before releasing
+                # grad storage to avoid allocator reuse while those kernels are live.
+                synchronize()
+                try:
+                    self.optimizer.zero_grad(set_to_none=True)
+                except TypeError:
+                    # MultiOptimizer (Muon) doesn't support set_to_none kwarg
+                    self.optimizer.zero_grad()
+                for part in self.model_parts if self.pp_enabled else [self.model]:
+                    part.zero_grad(set_to_none=True)
+                skip_optim_empty_cache = _skip_empty_cache_after_optim_step(self.train_config)
+                if skip_optim_empty_cache:
+                    logger.debug("Skipping torch.cuda.empty_cache() after optimizer step")
+                else:
+                    torch.cuda.empty_cache()
 
-            self.global_step += 1
-            current_step = self.global_step
-            current_lr = self.optimizer.param_groups[0]["lr"]
+                self.global_step += 1
+                current_step = self.global_step
+                current_lr = self.optimizer.param_groups[0]["lr"]
 
-            # Collect mean grad_norm across data parallel group for logging
-            grad_norm = all_reduce(grad_norm, group=ps.fsdp_group)
+                # Collect mean grad_norm across data parallel group for logging
+                grad_norm = all_reduce(grad_norm, group=ps.fsdp_group)
+
+                # GLM-5.2 full-param step boundary: refresh every admitted cache
+                # from post-step masters on every rank and, when configured,
+                # publish one checksummed all-rank payload. Failures propagate;
+                # callers never receive a successful step with partial bytes.
+                if glm52_fullparam_mutation_started:
+                    from xorl.server.weight_sync.glm52_fullparam_step_publish import (  # noqa: PLC0415
+                        glm52_fullparam_step_boundary,
+                    )
+
+                    glm52_fullparam_publish_receipt = glm52_fullparam_step_boundary(
+                        self.model,
+                        step=current_step,
+                        publish_root=self.train_config.get("glm52_fullparam_publish_dir"),
+                        rank=self.rank,
+                        world_size=self.world_size,
+                    )
+            except FullParamOptimizerMutationFailure:
+                raise
+            except BaseException as error:
+                if glm52_fullparam_mutation_started:
+                    self._raise_fullparam_post_mutation_failure(error)
+                raise
 
         try:
             # Periodic merge for the shared-optimizer path still belongs after
@@ -7636,6 +8906,8 @@ class ModelRunner:
                 "model_id": model_id,
                 "optim_empty_cache_skipped": skip_optim_empty_cache,
             }
+            if glm52_fullparam_publish_receipt is not None:
+                result["glm52_fullparam_publish"] = glm52_fullparam_publish_receipt
             if capture_snapshots is not None:
                 capture_result = write_sparse_source_delta_rank(
                     model=self.model,
@@ -7665,12 +8937,27 @@ class ModelRunner:
 
             synchronize()
             return result
-        except (AdapterGradientMutationFailure, KeyboardInterrupt):
+        except (AdapterGradientMutationFailure, FullParamOptimizerMutationFailure):
+            raise
+        except KeyboardInterrupt as error:
+            if glm52_fullparam_mutation_started:
+                self._raise_fullparam_post_mutation_failure(error)
             raise
         except BaseException as error:
+            if glm52_fullparam_mutation_started:
+                self._raise_fullparam_post_mutation_failure(error)
             if adapter_mutated:
                 self._raise_adapter_post_mutation_failure(model_id, error)
             raise
+
+    def _raise_fullparam_post_mutation_failure(self, error: BaseException) -> None:
+        """Poison and classify every failure after a full-param step may mutate."""
+
+        self._glm52_fullparam_poisoned = True
+        raise FullParamOptimizerMutationFailure(
+            "GLM-5.2 full-parameter optimizer handling failed after optimizer mutation may have started; "
+            "publish nothing and restart from the last committed checkpoint"
+        ) from error
 
     def _raise_adapter_post_mutation_failure(self, model_id: str, error: BaseException) -> None:
         """Poison an adapter and classify any post-step tail failure as fatal."""
@@ -7715,6 +9002,17 @@ class ModelRunner:
         """Sync state back from checkpoint manager after load operations."""
         self.global_step = self._checkpoint_mgr.global_step
         self.global_forward_backward_step = self._checkpoint_mgr.global_forward_backward_step
+        if self.train_config.get("glm52_fullparam_fp8_training"):
+            # CheckpointManager.load_state uses the strict full-model DCP
+            # transaction and this hook runs only after it returns.  DCP has
+            # restored coherent master+cache pairs but bumped each master's
+            # tensor version; rebind freshness without requantizing away the
+            # checkpoint's serving bytes.
+            from xorl.models.transformers.glm5.exact_fullparam_admission import (  # noqa: PLC0415
+                restore_glm52_fullparam_master_identities,
+            )
+
+            restore_glm52_fullparam_master_identities(self.model)
         if getattr(get_parallel_state(), "lm_head_tp_size", 1) > 1:
             sync_lm_head_tp_parameters(
                 self.model,

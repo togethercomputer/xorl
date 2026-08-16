@@ -1,5 +1,6 @@
 from unittest.mock import Mock
 
+import pytest
 import torch
 
 from xorl.data.constants import IGNORE_INDEX
@@ -26,6 +27,7 @@ def test_synchronize_micro_batch_padding_extends_cu_seqlens(monkeypatch):
             "labels": torch.ones(1, 176, dtype=torch.long),
             "position_ids": torch.arange(176).unsqueeze(0),
             "attention_mask": torch.ones(1, 176, dtype=torch.long),
+            "logprob_temperatures": torch.full((1, 176), 0.7),
             "cu_seq_lens_q": torch.tensor([0, 83, 167, 176], dtype=torch.int32),
             "cu_seq_lens_k": torch.tensor([0, 83, 167, 176], dtype=torch.int32),
             "max_length_q": torch.tensor(84, dtype=torch.int32),
@@ -46,6 +48,7 @@ def test_synchronize_micro_batch_padding_extends_cu_seqlens(monkeypatch):
                     torch.zeros(336, dtype=torch.long),
                 ]
             ).unsqueeze(0),
+            "logprob_temperatures": torch.full((1, 512), 1.3),
             "cu_seq_lens_q": torch.tensor([0, 83, 167, 176], dtype=torch.int32),
             "cu_seq_lens_k": torch.tensor([0, 83, 167, 176], dtype=torch.int32),
             "max_length_q": torch.tensor(84, dtype=torch.int32),
@@ -60,8 +63,15 @@ def test_synchronize_micro_batch_padding_extends_cu_seqlens(monkeypatch):
         assert mb["labels"].shape[-1] == 512
         assert mb["position_ids"].shape[-1] == 512
         assert mb["attention_mask"].shape[-1] == 512
+        assert mb["logprob_temperatures"].shape[-1] == 512
         assert torch.equal(mb["labels"][0, 176:], torch.full((336,), IGNORE_INDEX))
         assert mb["attention_mask"][0, 176:].sum().item() == 0
+
+        if mb["logprob_temperatures"][0, 0].item() == pytest.approx(0.7):
+            torch.testing.assert_close(
+                mb["logprob_temperatures"][0, 176:],
+                torch.ones(336),
+            )
 
         assert mb["cu_seq_lens_q"].tolist() == [0, 83, 167, 512]
         assert mb["cu_seq_lens_k"].tolist() == [0, 83, 167, 512]

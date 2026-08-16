@@ -258,6 +258,36 @@ def test_packing_disabled_preserves_shifted_target_tokens():
     assert batch["advantages"] == [[1.0, 1.0, 1.0]]
 
 
+def test_packing_disabled_derives_sampler_boundaries_before_advantage_masking():
+    packer = SequentialPacker(enable_packing=False, log_stats=False, pad_to_multiple_of=1)
+    data = [
+        {
+            "model_input": {"input_ids": [11, 12, 13, 21]},
+            "loss_fn_inputs": {
+                "target_tokens": [IGNORE_INDEX, IGNORE_INDEX, 21, 22],
+                "logprobs": [0.0, 0.0, -0.1, -0.2],
+                # A zero-advantage trajectory masks every target downstream,
+                # but must not erase its prompt/decode arithmetic boundary.
+                "advantages": [0.0, 0.0, 0.0, 0.0],
+            },
+        },
+        {
+            "model_input": {"input_ids": [31, 41]},
+            "loss_fn_inputs": {
+                "target_tokens": [41, 42],
+                "logprobs": [-0.3, -0.4],
+                "advantages": [1.0, 1.0],
+            },
+        },
+    ]
+
+    batches = packer.pack(data, max_seq_len=1000, request_id="test-sampler-boundaries")
+
+    assert [batch["sampler_prefill_lengths"] for batch in batches] == [[3], [1]]
+    assert batches[0]["labels"] == [[IGNORE_INDEX] * 4]
+    assert batches[0]["target_tokens"] == [[IGNORE_INDEX] * 4]
+
+
 def test_packing_disabled_warns_on_hf_shift(monkeypatch):
     """HF labels should warn when shifted in the non-packed path."""
     packer = SequentialPacker(enable_packing=False, log_stats=False, pad_to_multiple_of=1)
@@ -343,6 +373,147 @@ def test_packing_pads_target_tokens_as_ignore_index():
     assert batch["labels"] == [[22, 33, 44, 66, 77, IGNORE_INDEX, IGNORE_INDEX, IGNORE_INDEX]]
     assert batch["logprobs"] == [[-0.1, -0.2, -0.3, -0.4, -0.5, 0, 0, 0]]
     assert batch["advantages"] == [[1.0, 1.0, 1.0, -1.0, -1.0, 0, 0, 0]]
+
+
+def test_ragged_request_temperatures_pack_and_pad_with_identity():
+    packer = SequentialPacker(enable_packing=True, log_stats=False, pad_to_multiple_of=8)
+    data = [
+        {
+            "model_input": {"input_ids": [11, 22, 33]},
+            "loss_fn_inputs": {
+                "target_tokens": [22, 33, 44],
+                "logprobs": [-0.1, -0.2, -0.3],
+                "advantages": [1.0, 1.0, 1.0],
+                "logprob_temperatures": [0.7, 0.7, 0.7],
+                "logprob_top_ks": [8, 8, 8],
+                "logprob_top_ps": [0.9, 0.9, 0.9],
+                "logprob_min_ps": [0.1, 0.1, 0.1],
+            },
+        },
+        {
+            "model_input": {"input_ids": [55, 66]},
+            "loss_fn_inputs": {
+                "target_tokens": [66, 77],
+                "logprobs": [-0.4, -0.5],
+                "advantages": [-1.0, -1.0],
+                "logprob_temperatures": [1.3, 1.3],
+                "logprob_top_ks": [4, 4],
+                "logprob_top_ps": [0.8, 0.8],
+                "logprob_min_ps": [0.2, 0.2],
+            },
+        },
+    ]
+
+    batch = packer.pack(data, max_seq_len=1000, request_id="mixed-temperature")[0]
+
+    assert batch["logprob_temperatures"] == [[0.7, 0.7, 0.7, 1.3, 1.3, 1.0, 1.0, 1.0]]
+    assert batch["logprob_top_ks"] == [[8, 8, 8, 4, 4, 1 << 30, 1 << 30, 1 << 30]]
+    assert batch["logprob_top_ps"] == [[0.9, 0.9, 0.9, 0.8, 0.8, 1.0, 1.0, 1.0]]
+    assert batch["logprob_min_ps"] == [[0.1, 0.1, 0.1, 0.2, 0.2, 0, 0, 0]]
+
+
+@pytest.mark.parametrize("enable_packing", [False, True])
+def test_normalized_sampler_metadata_expands_to_each_decision(enable_packing):
+    packer = SequentialPacker(enable_packing=enable_packing, log_stats=False, pad_to_multiple_of=1)
+    datum = {
+        "model_input": {"input_ids": [11, 22, 33]},
+        "loss_fn_inputs": {
+            "target_tokens": [22, 33, 44],
+            "sampling_temperature": [0.7],
+            "sampling_top_k": [8],
+            "sampling_top_p": [0.9],
+            "sampling_min_p": [0.1],
+        },
+    }
+
+    batch = packer.pack([datum], max_seq_len=100, request_id="normalized-sampling")[0]
+
+    assert batch["logprob_temperatures"] == [[0.7, 0.7, 0.7]]
+    assert batch["logprob_top_ks"] == [[8, 8, 8]]
+    assert batch["logprob_top_ps"] == [[0.9, 0.9, 0.9]]
+    assert batch["logprob_min_ps"] == [[0.1, 0.1, 0.1]]
+    assert not any(key.startswith("sampling_") for key in batch)
+
+
+def test_normalized_greedy_sampler_payload_preserves_decision_logprob():
+    packer = SequentialPacker(
+        enable_packing=False,
+        log_stats=False,
+        pad_to_multiple_of=1,
+    )
+    datum = {
+        "model_input": {"input_ids": [11, 22]},
+        "loss_fn_inputs": {
+            "target_tokens": [22, 33],
+            "logprobs": [0.0, 0.0],
+            # SGLang normalizes user temperature=0 to this divide-safe pair.
+            "sampling_temperature": 1.0,
+            "sampling_top_k": 1,
+            "sampling_top_p": 1.0,
+            "sampling_min_p": 0.0,
+        },
+    }
+
+    batch = packer.pack([datum], max_seq_len=100, request_id="greedy")[0]
+
+    assert batch["logprobs"] == [[0.0, 0.0]]
+    assert batch["logprob_temperatures"] == [[1.0, 1.0]]
+    assert batch["logprob_top_ks"] == [[1, 1]]
+    assert batch["logprob_top_ps"] == [[1.0, 1.0]]
+    assert batch["logprob_min_ps"] == [[0.0, 0.0]]
+
+
+def test_normalized_sampler_metadata_follows_hf_causal_shift():
+    packer = SequentialPacker(enable_packing=True, log_stats=False, pad_to_multiple_of=1)
+    batch = packer.pack(
+        [
+            {
+                "input_ids": [1, 2, 3, 4],
+                "labels": [1, 2, 3, 4],
+                "sampling_temperature": 0.7,
+                "sampling_top_k": 8,
+                "sampling_top_p": 0.9,
+                "sampling_min_p": 0.1,
+            }
+        ],
+        max_seq_len=100,
+    )[0]
+
+    assert batch["labels"] == [[2, 3, 4]]
+    assert batch["logprob_temperatures"] == [[0.7, 0.7, 0.7]]
+    assert batch["logprob_top_ks"] == [[8, 8, 8]]
+    assert batch["logprob_top_ps"] == [[0.9, 0.9, 0.9]]
+    assert batch["logprob_min_ps"] == [[0.1, 0.1, 0.1]]
+
+
+def test_normalized_sampler_metadata_rejects_ambiguous_canonical_fields():
+    packer = SequentialPacker(enable_packing=True, log_stats=False, pad_to_multiple_of=1)
+    datum = {
+        "input_ids": [1, 2],
+        "target_tokens": [2, 3],
+        "sampling_top_k": [8],
+        "logprob_top_ks": [8, 8],
+    }
+
+    with pytest.raises(ValueError, match="provide either sampling_top_k or logprob_top_ks"):
+        packer.pack([datum], max_seq_len=100)
+
+
+def test_hf_shift_keeps_temperatures_aligned_with_shifted_labels():
+    packer = SequentialPacker(enable_packing=True, log_stats=False, pad_to_multiple_of=1)
+    batch = packer.pack(
+        [
+            {
+                "input_ids": [1, 2, 3, 4],
+                "labels": [1, 2, 3, 4],
+                "logprob_temperatures": [1.0, 0.7, 0.8, 0.9],
+            }
+        ],
+        max_seq_len=100,
+    )[0]
+
+    assert batch["labels"] == [[2, 3, 4]]
+    assert batch["logprob_temperatures"] == [[0.7, 0.8, 0.9]]
 
 
 def test_position_ids_and_labels():

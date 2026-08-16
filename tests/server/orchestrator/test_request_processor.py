@@ -13,6 +13,7 @@ Test Strategy:
 - Verify RequestProcessor correctly packs data and formats outputs
 """
 
+import json
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -358,6 +359,18 @@ async def test_model_pass_cleans_mooncake_routing_payloads_by_default():
     assert sorted(client.removed) == sorted(seen["keys"])
 
 
+def test_mooncake_chunk_ranges_follow_dispatcher_dp_slices():
+    processor = RequestProcessor(backend=DummyBackend(), dp_size=3)
+    batches = [
+        {"num_samples": 2},
+        {"num_samples": 1},
+        {"num_samples": 3},
+        {"num_samples": 4},
+    ]
+
+    assert processor._routing_payload_chunk_ranges(batches, 10) == [(0, 3), (3, 3), (6, 4)]
+
+
 @pytest.mark.asyncio
 async def test_model_pass_cleans_mooncake_routing_payloads_on_backend_exception():
     backend = DummyBackend()
@@ -469,6 +482,12 @@ async def test_model_pass_cleans_externalized_routing_payloads_by_default(tmp_pa
         expert_ref = kwargs["routed_experts"]
         manifest_path = Path(expert_ref["manifest"])
         assert manifest_path.exists()
+        assert expert_ref["version"] == 3
+        assert expert_ref["format"] == "packed_rows"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        assert manifest["format"] == "xorl-r3-packed"
+        assert len(manifest["routed_experts"]["chunks"]) == 1
+        assert sorted(path.name for path in (manifest_path.parent / "routed_experts").iterdir()) == ["chunk-000000.bin"]
         seen["root"] = manifest_path.parent
         dispatcher = object.__new__(RunnerDispatcher)
         dispatcher.rank = 0
@@ -629,6 +648,11 @@ async def test_optim_and_checkpoint_operations(processor):
             "learning_rate": kwargs["lr"],
             "optim_step_time": 0.125,
             "optim_empty_cache_skipped": True,
+            "glm52_fullparam_publish": {
+                "published": True,
+                "step": 3,
+                "manifest_checksum": "manifest-3",
+            },
         }
 
     processor.backend.optim_step = _optim_step_with_cleanup_metrics
@@ -646,6 +670,11 @@ async def test_optim_and_checkpoint_operations(processor):
     assert output.outputs[0]["learning_rate"] == 0.001
     assert output.outputs[0]["optim_step_time"] == pytest.approx(0.125)
     assert output.outputs[0]["optim_empty_cache_skipped"] is True
+    assert output.outputs[0]["glm52_fullparam_publish"] == {
+        "published": True,
+        "step": 3,
+        "manifest_checksum": "manifest-3",
+    }
 
     processor.backend.optim_step = original_optim_step
 
@@ -1017,3 +1046,79 @@ async def test_packed_row_batching_rejects_routed_replay(processor):
     output = await processor.execute_forward_backward(request)
     assert output.output_type == OutputType.ERROR
     assert "routed_experts replay" in output.error
+
+
+def test_sglang_span_payloads_bypass_repacking_and_cleanup_sources(tmp_path, monkeypatch):
+    source = tmp_path / "routing.bin"
+    source.write_bytes(b"\0" * 32)
+    item = {
+        "schema": "xorl.r3.spans.v1",
+        "rows": 2,
+        "shape": [2, 2, 2],
+        "dtype": "int32",
+        "spans": [
+            {
+                "path": str(source),
+                "error_path": str(tmp_path / ".routing.error.json"),
+                "offset": 0,
+                "source_row": 0,
+                "rows": 2,
+                "row_nbytes": 16,
+                "source_shape": [2, 2, 2],
+                "dtype": "int32",
+            }
+        ],
+    }
+    monkeypatch.setenv("XORL_R3_SHARED_ROOTS", str(tmp_path))
+    processor = RequestProcessor(backend=DummyBackend())
+
+    routed, logits, cleanup = processor._externalize_routing_payloads("request", [item], None)
+
+    assert logits is None
+    assert routed["transport"] == "sglang_files"
+    assert routed["items"][0] is item
+    assert source.exists()
+    processor._cleanup_routing_payloads(cleanup)
+    assert not source.exists()
+
+
+def test_sglang_file_descriptor_is_normalized_to_span_payload(tmp_path, monkeypatch):
+    source = tmp_path / "routing.bin"
+    source.write_bytes(b"\0" * 32)
+    item = {
+        "schema": "sglang.routed_experts.file.v1",
+        "path": str(source),
+        "error_path": str(tmp_path / ".routing.error.json"),
+        "rows": 2,
+        "field": "routed_experts",
+        "fields": {
+            "routed_experts": {
+                "offset": 0,
+                "nbytes": 32,
+                "shape": [2, 2, 2],
+                "dtype": "int32",
+            }
+        },
+    }
+    monkeypatch.setenv("XORL_R3_SHARED_ROOTS", str(tmp_path))
+    processor = RequestProcessor(backend=DummyBackend())
+
+    routed, logits, cleanup = processor._externalize_routing_payloads("request", [item], None)
+
+    assert logits is None
+    normalized = routed["items"][0]
+    assert normalized["schema"] == "xorl.r3.spans.v1"
+    assert normalized["spans"] == [
+        {
+            "path": str(source),
+            "error_path": str(tmp_path / ".routing.error.json"),
+            "offset": 0,
+            "source_row": 0,
+            "rows": 2,
+            "row_nbytes": 16,
+            "source_shape": [2, 2, 2],
+            "dtype": "int32",
+        }
+    ]
+    processor._cleanup_routing_payloads(cleanup)
+    assert not source.exists()

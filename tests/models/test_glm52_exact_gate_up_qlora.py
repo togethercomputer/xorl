@@ -13,7 +13,7 @@ from xorl.models.transformers.glm5.exact_gate_up_qlora import (
 )
 from xorl.models.transformers.glm5.exact_qlora import Glm52ExactTP1BlockFP8QLoRALinear
 from xorl.ops.block_fp8_native import NativeBlockFP8Linear
-from xorl.ops.fused_silu_and_mul import fused_silu_and_mul
+from xorl.ops.fused_silu_and_mul import exact_fp32_silu_and_mul
 
 
 def _module() -> Glm52ExactTP1FusedGateUpBlockFP8QLoRA:
@@ -80,10 +80,9 @@ def test_fused_gate_up_contract_is_one_native_leaf_with_four_logical_fp32_factor
     assert module.packed_weight_f32.requires_grad is False
     assert module.weight_scale_inv.requires_grad is False
 
-    with pytest.raises(ValueError, match="rank=1 and alpha=1"):
-        Glm52ExactTP1FusedGateUpBlockFP8QLoRA(8, 128, r=2)
-    with pytest.raises(ValueError, match="rank=1 and alpha=1"):
-        Glm52ExactTP1FusedGateUpBlockFP8QLoRA(8, 128, lora_alpha=2)
+    rank_three = Glm52ExactTP1FusedGateUpBlockFP8QLoRA(8, 128, r=3, lora_alpha=7)
+    assert rank_three.gate_proj.lora_A.shape == (3, 8)
+    assert rank_three.gate_proj.lora_B.shape == (128, 3)
     with pytest.raises(ValueError, match="bias-free"):
         Glm52ExactTP1FusedGateUpBlockFP8QLoRA(8, 128, bias=True)
     with pytest.raises(ValueError, match="rejects adaptive"):
@@ -95,10 +94,10 @@ def test_fused_gate_up_contract_is_one_native_leaf_with_four_logical_fp32_factor
     with pytest.raises(RuntimeError, match="explicit gate/up pair"):
         Glm52ExactTP1FusedGateUpBlockFP8QLoRA.from_linear(nn.Linear(8, 128, bias=False))
     module.set_runtime_lora_config(1, 1)
-    with pytest.raises(ValueError, match="only lora_rank=1 and lora_alpha=1"):
-        module.set_runtime_lora_config(1, 2)
-    with pytest.raises(ValueError, match="only lora_rank=1 and lora_alpha=1"):
-        module.set_runtime_lora_config(2, 1)
+    with pytest.raises(ValueError, match="positive integer rank"):
+        Glm52ExactTP1FusedGateUpBlockFP8QLoRA(8, 128, r=0)
+    with pytest.raises(ValueError, match="positive integer alpha"):
+        module.set_runtime_lora_config(1, 0)
 
 
 def test_fused_gate_up_loader_makes_gate_then_up_order_explicit_and_strict() -> None:
@@ -320,6 +319,7 @@ def test_official_fused_gate_up_literal_bytes_graph_metadata_zero_and_gradients(
         pytest.skip("the qualified exact GLM-5.2 component requires Hopper")
     from sglang.kernels.ops.gemm.gate_up_lora_b import gate_up_lora_b_fwd
     from sglang.kernels.ops.gemm.sgemm_lora_a import sgemm_lora_a_fwd
+    from sglang.srt.batch_invariant_ops.bi_silu_and_mul import fp32_silu_and_mul
     from sglang.srt.layers.quantization.fp8_utils import triton_w8a8_block_fp8_linear
     from sglang.srt.lora.backend.triton_backend import TritonLoRABackend
     from sglang.srt.lora.utils import LoRABatchInfo
@@ -426,8 +426,11 @@ def test_official_fused_gate_up_literal_bytes_graph_metadata_zero_and_gradients(
     )
     assert torch.equal(cold_actual.view(torch.uint8), expected.view(torch.uint8))
     assert torch.equal(warm_actual.view(torch.uint8), cold_actual.view(torch.uint8))
-    trainer_activation = fused_silu_and_mul(cold_actual)
-    sampler_activation = F.silu(expected[:, :intermediate_size]) * expected[:, intermediate_size:]
+    # Serving's exact mode computes the one-round FP32 SwiGLU
+    # (SiluAndMul.forward_exact, xorl-sglang f10b907d8); the trainer op must
+    # match a one-round sampler oracle bitwise.
+    trainer_activation = exact_fp32_silu_and_mul(cold_actual)
+    sampler_activation = fp32_silu_and_mul(expected)
     assert torch.equal(trainer_activation.view(torch.uint8), sampler_activation.view(torch.uint8))
 
     # Build the exact adapter-merged metadata used after S4's production

@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import types
+from dataclasses import fields
 from pathlib import Path
 from unittest.mock import patch
 
@@ -43,24 +44,32 @@ def _load_server_arguments_fn():
     fake_session_spec_mod.build_default_session_spec = lambda *args, **kwargs: None
 
     module = importlib.util.module_from_spec(spec)
-    with patch.dict(
-        sys.modules,
-        {
-            "xorl.server.api_server": fake_api_server_pkg,
-            "xorl.server.api_server.server": fake_api_server_mod,
-            "xorl.server.orchestrator": fake_orchestrator_pkg,
-            "xorl.server.orchestrator.orchestrator": fake_orchestrator_mod,
-            "xorl.server.session_spec": fake_session_spec_mod,
-            "xorl.server.utils": fake_utils_pkg,
-            "xorl.server.utils.network": fake_network_mod,
-        },
-    ):
+    stubs = {
+        "xorl.server.api_server": fake_api_server_pkg,
+        "xorl.server.api_server.server": fake_api_server_mod,
+        "xorl.server.orchestrator": fake_orchestrator_pkg,
+        "xorl.server.orchestrator.orchestrator": fake_orchestrator_mod,
+        "xorl.server.session_spec": fake_session_spec_mod,
+        "xorl.server.utils": fake_utils_pkg,
+        "xorl.server.utils.network": fake_network_mod,
+    }
+    missing = object()
+    previous = {name: sys.modules.get(name, missing) for name in stubs}
+    sys.modules.update(stubs)
+    try:
         spec.loader.exec_module(module)
+    finally:
+        for name, value in previous.items():
+            if value is missing:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = value
 
     return module.load_server_arguments
 
 
 _load_server_arguments_impl = _load_server_arguments_fn()
+ServerArguments = _load_server_arguments_impl.__globals__["ServerArguments"]
 
 
 def load_server_arguments(config_path, *args, **kwargs):
@@ -125,6 +134,29 @@ def test_nested_yaml_rejects_removed_zorl_section(tmp_path):
         load_server_arguments(str(config_path))
 
 
+@pytest.mark.parametrize(
+    ("field", "value", "error_pattern"),
+    (
+        ("fp8_cfg", {"enabled": True}, "train.fp8_cfg.*native fp8_training"),
+        (
+            "externalize_r3_payloads",
+            True,
+            "train.externalize_r3_payloads.*r3_payload_transport='mooncake'",
+        ),
+        ("keep_r3_payloads", True, "train.keep_r3_payloads.*r3_payload_keep=true"),
+    ),
+)
+def test_nested_yaml_rejects_removed_training_aliases(tmp_path, field, value, error_pattern):
+    config_path = tmp_path / "server_config.yaml"
+    config_path.write_text(
+        yaml.safe_dump({"model": {"model_path": "Qwen/Qwen3-8B"}, "train": {field: value}}),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=error_pattern):
+        load_server_arguments(str(config_path))
+
+
 def test_load_server_arguments_rejects_removed_cli_override(tmp_path):
     config_path = tmp_path / "server_config.yaml"
     config_path.write_text(yaml.safe_dump({"model_path": "Qwen/Qwen3-8B"}), encoding="utf-8")
@@ -135,15 +167,39 @@ def test_load_server_arguments_rejects_removed_cli_override(tmp_path):
             overrides={"adapter_gradient_ownership_shadow_canary": True},
         )
 
+    with pytest.raises(ValueError, match="keep_r3_payloads.*r3_payload_keep=true"):
+        load_server_arguments(str(config_path), overrides={"keep_r3_payloads": True})
+
 
 def test_removed_field_inventory_allows_unrelated_unknown_fields():
     payload = {"shared_config_key_not_owned_by_server": {"future_nested_key": True}}
     assert reject_removed_configuration_fields(payload, context="test config") is payload
 
 
-_SHIPPED_MOE_LORA_CONFIGS = (
-    "examples/server/configs/lora/qwen3_5_35b_a3b_lora.yaml",
-    "examples/server/configs/lora/qwen3_coder_30b_a3b_lora.yaml",
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    (
+        ("fp8_cfg", {"enabled": True}),
+        ("externalize_r3_payloads", True),
+        ("keep_r3_payloads", True),
+    ),
+)
+def test_removed_training_aliases_are_absent_from_server_arguments_schema(field_name, value):
+    assert field_name not in {item.name for item in fields(ServerArguments)}
+    with pytest.raises(TypeError, match=rf"unexpected keyword argument.*{field_name}"):
+        ServerArguments(model_path="Qwen/Qwen3-8B", **{field_name: value})
+
+
+def test_server_arguments_config_does_not_emit_removed_training_aliases():
+    config = ServerArguments(model_path="Qwen/Qwen3-8B").to_config_dict()
+    assert {"fp8_cfg", "externalize_r3_payloads", "keep_r3_payloads"}.isdisjoint(config["train"])
+
+
+_SHIPPED_EXACT_QWEN35_MOE_LORA_CONFIG = "examples/server/configs/lora/qwen3_5_35b_a3b_lora.yaml"
+_SHIPPED_MOE_LORA_CONFIGS = ("examples/server/configs/lora/qwen3_coder_30b_a3b_lora.yaml",)
+_SHIPPED_QWEN35_LORA_CONFIGS = (
+    _SHIPPED_EXACT_QWEN35_MOE_LORA_CONFIG,
+    "examples/server/configs/lora/qwen3_5_397b_a17b_lora.yaml",
 )
 _SHIPPED_QWEN_MOE_QLORA_CONFIGS = (
     "examples/server/configs/qlora/qwen3_235b_a22b_qlora_nf4.yaml",
@@ -159,7 +215,9 @@ def clean_shipped_adapter_arguments():
     """Parse shipped configs in a clean process, outside this module's launcher stubs."""
 
     root = Path(__file__).resolve().parents[2]
-    relative_paths = _SHIPPED_MOE_LORA_CONFIGS + _SHIPPED_QWEN_MOE_QLORA_CONFIGS
+    relative_paths = tuple(
+        dict.fromkeys(_SHIPPED_MOE_LORA_CONFIGS + _SHIPPED_QWEN35_LORA_CONFIGS + _SHIPPED_QWEN_MOE_QLORA_CONFIGS)
+    )
     script = """
 import json
 import sys
@@ -169,7 +227,10 @@ result = {}
 for path in sys.argv[1:]:
     args = load_server_arguments(path)
     result[path] = {
+        "attn_implementation": args.attn_implementation,
         "moe_implementation": args.moe_implementation,
+        "ep_dispatch": args.ep_dispatch,
+        "deepep_async_combine": args.deepep_async_combine,
         "moe_hybrid_shared_lora": args.moe_hybrid_shared_lora,
         "lora_target_modules": args.lora_target_modules,
     }
@@ -202,6 +263,78 @@ def test_shipped_moe_lora_examples_restore_certified_quack(relative_path, clean_
     parsed = clean_shipped_adapter_arguments[relative_path]
     assert config["moe_implementation"] == parsed["moe_implementation"] == "quack"
     assert config.get("moe_hybrid_shared_lora", False) is parsed["moe_hybrid_shared_lora"] is False
+
+
+@pytest.mark.parametrize("relative_path", _SHIPPED_QWEN35_LORA_CONFIGS)
+def test_shipped_qwen35_lora_configs_include_linear_attention_gate(relative_path, clean_shipped_adapter_arguments):
+    assert "g_proj" in clean_shipped_adapter_arguments[relative_path]["lora_target_modules"]
+
+
+def test_unfuse_for_lora_server_round_trip(tmp_path):
+    config_path = tmp_path / "server_lora.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model_path": "openai/gpt-oss-20b",
+                "enable_lora": True,
+                "unfuse_for_lora": True,
+                "lora_target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    args = load_server_arguments(str(config_path))
+    assert args.unfuse_for_lora is True
+    assert args.to_config_dict()["lora"]["unfuse_for_lora"] is True
+
+    config_path.write_text(
+        yaml.safe_dump({"model_path": "openai/gpt-oss-20b", "unfuse_for_lora": True}),
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="requires enable_lora"):
+        load_server_arguments(str(config_path))
+
+
+def test_shipped_exact_qwen35_lora_backends_pass_exact_admission(clean_shipped_adapter_arguments):
+    from xorl.models.auto import (  # noqa: PLC0415
+        _validate_exact_qwen35_moe_program,
+        resolve_model_numerical_program,
+    )
+
+    relative_path = _SHIPPED_EXACT_QWEN35_MOE_LORA_CONFIG
+    config_path = Path(__file__).resolve().parents[2] / relative_path
+    raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    parsed = clean_shipped_adapter_arguments[relative_path]
+    exact_config = types.SimpleNamespace(
+        _qwen35_exact_contract=True,
+        model_type="qwen3_5_moe",
+    )
+
+    _validate_exact_qwen35_moe_program(
+        exact_config,
+        moe_implementation=parsed["moe_implementation"],
+        ep_dispatch=parsed["ep_dispatch"],
+        deepep_async_combine=parsed["deepep_async_combine"],
+    )
+    numerical_program = resolve_model_numerical_program(
+        exact_config,
+        attn_implementation=parsed["attn_implementation"],
+        non_glm_attn_default="flash_attention_4",
+        router_fp32=raw.get("router_fp32"),
+        lm_head_fp32=raw.get("lm_head_fp32"),
+        rmsnorm_mode=raw.get("rmsnorm_mode"),
+        activation_native=raw.get("activation_native", False),
+        rope_native=raw.get("rope_native"),
+        rope_class_b=raw.get("rope_class_b"),
+        attention_cast_bf16=raw.get("attention_cast_bf16", False),
+        sparse_mla_enabled=raw.get("sparse_mla_enabled"),
+        sparse_mla_backend=raw.get("sparse_mla_backend"),
+        qwen35_rmsnorm_family=raw.get("qwen35_rmsnorm_family"),
+    )
+
+    assert parsed["attn_implementation"] == numerical_program.attn_implementation == "flash_attention_4"
+    assert parsed["moe_implementation"] == "triton"
+    assert parsed["ep_dispatch"] == "alltoall"
 
 
 @pytest.mark.parametrize(
@@ -409,7 +542,7 @@ def test_server_arguments_r3_payload_mooncake_transport_is_opt_in(tmp_path):
     assert args.to_config_dict()["train"]["r3_payload_transport"] == "mooncake"
 
 
-def test_server_arguments_legacy_externalize_alias_selects_mooncake(tmp_path):
+def test_server_arguments_rejects_legacy_externalize_aliases(tmp_path):
     config_path = tmp_path / "server_config.yaml"
     config_path.write_text(
         yaml.safe_dump(
@@ -426,10 +559,8 @@ def test_server_arguments_legacy_externalize_alias_selects_mooncake(tmp_path):
         encoding="utf-8",
     )
 
-    args = load_server_arguments(str(config_path))
-
-    assert args.r3_payload_transport == "mooncake"
-    assert args.r3_payload_keep is True
+    with pytest.raises(ValueError, match="externalize_r3_payloads.*r3_payload_transport='mooncake'"):
+        load_server_arguments(str(config_path))
 
 
 def test_server_arguments_r3_payload_dir_requires_filesystem_transport(tmp_path):
@@ -649,13 +780,19 @@ def _exact_glm52_rank1_server_config(tmp_path):
     }
 
 
-def test_load_server_arguments_admits_exact_glm52_rank1_world16_tuple(tmp_path):
+@pytest.mark.parametrize(
+    ("rank", "alpha"),
+    ((1, 1), (2, 3), (3, 7), (7, 11), (16, 32), (31, 47), (64, 128)),
+)
+def test_load_server_arguments_admits_any_positive_exact_glm52_rank(tmp_path, rank, alpha):
+    payload = _exact_glm52_rank1_server_config(tmp_path)
+    payload["lora"].update(lora_rank=rank, max_lora_rank=rank, lora_alpha=alpha)
     config_path = tmp_path / "server_config.yaml"
-    config_path.write_text(yaml.safe_dump(_exact_glm52_rank1_server_config(tmp_path)), encoding="utf-8")
+    config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
 
     args = load_server_arguments(str(config_path))
 
-    assert (args.lora_rank, args.max_lora_rank, args.lora_alpha) == (1, 1, 1)
+    assert (args.lora_rank, args.max_lora_rank, args.lora_alpha) == (rank, rank, alpha)
     assert args.ep_dispatch == "alltoall"
     assert (args.expert_parallel_size, args.ulysses_parallel_size) == (16, 16)
     assert args.lm_head_tensor_parallel_size == 16
@@ -663,14 +800,50 @@ def test_load_server_arguments_admits_exact_glm52_rank1_world16_tuple(tmp_path):
     assert args.get_total_gpus() == 16
 
 
-def test_load_server_arguments_rejects_rank1_exact_lane_with_non_tp16_lm_head(tmp_path):
+def test_load_server_arguments_admits_dp_owned_exact_glm52_row(tmp_path):
+    payload = _exact_glm52_rank1_server_config(tmp_path)
+    payload["train"].update(ulysses_parallel_size=1, data_parallel_shard_size=16)
+    config_path = tmp_path / "server_config.yaml"
+    config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    args = load_server_arguments(str(config_path))
+    assert (args.ulysses_parallel_size, args.data_parallel_shard_size) == (1, 16)
+    assert args.get_total_gpus() == 16
+
+
+@pytest.mark.parametrize(("ulysses", "dp_shard"), ((1, 1), (16, 16), (8, 2), (2, 8)))
+def test_load_server_arguments_admits_glm52_dp_cp_layouts_without_a_family_table(tmp_path, ulysses, dp_shard):
+    payload = _exact_glm52_rank1_server_config(tmp_path)
+    payload["train"].update(
+        ulysses_parallel_size=ulysses,
+        data_parallel_shard_size=dp_shard,
+    )
+    config_path = tmp_path / "server_config.yaml"
+    config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    args = load_server_arguments(str(config_path))
+    assert (args.ulysses_parallel_size, args.data_parallel_shard_size) == (ulysses, dp_shard)
+
+
+def test_load_server_arguments_threads_nonzero_lora_b_initialization(tmp_path):
+    payload = _exact_glm52_rank1_server_config(tmp_path)
+    payload["lora"].update(lora_b_init_std=0.001, lora_b_init_seed=1616)
+    config_path = tmp_path / "server_config.yaml"
+    config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    args = load_server_arguments(str(config_path))
+    assert args.to_config_dict()["lora"]["lora_b_init_std"] == 0.001
+    assert args.to_config_dict()["lora"]["lora_b_init_seed"] == 1616
+
+
+def test_load_server_arguments_defers_lm_head_group_validation_to_the_exact_kernel(tmp_path):
     payload = _exact_glm52_rank1_server_config(tmp_path)
     payload["train"]["lm_head_tensor_parallel_size"] = 1
     config_path = tmp_path / "server_config.yaml"
     config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="lm_head_tensor_parallel_size=1"):
-        load_server_arguments(str(config_path))
+    args = load_server_arguments(str(config_path))
+    assert args.lm_head_tensor_parallel_size == 1
 
 
 def test_load_server_arguments_threads_qarl_into_train_config(tmp_path):
@@ -841,7 +1014,7 @@ def test_load_server_arguments_rejects_qarl_with_mamba_config_json(tmp_path):
         load_server_arguments(str(config_path))
 
 
-def test_load_server_arguments_accepts_fp8_cfg_alias_and_layer_islands(tmp_path):
+def test_load_server_arguments_rejects_fp8_cfg_alias_with_layer_islands(tmp_path):
     config_path = tmp_path / "server_config.yaml"
     config_path.write_text(
         yaml.safe_dump(
@@ -866,18 +1039,11 @@ def test_load_server_arguments_accepts_fp8_cfg_alias_and_layer_islands(tmp_path)
         encoding="utf-8",
     )
 
-    args = load_server_arguments(str(config_path))
-    train_config = args.to_config_dict()["train"]
-
-    assert args.enable_fp8_training is True
-    assert train_config["enable_fp8_training"] is True
-    assert train_config["fp8_training_num_first_layers_bf16"] == 1
-    assert train_config["fp8_training_num_last_layers_bf16"] == 2
-    assert train_config["fp8_training_allow_blackwell"] is True
-    assert train_config["fp8_training_blackwell_validation_artifact"] == "artifact.json"
+    with pytest.raises(ValueError, match="fp8_cfg.*native fp8_training"):
+        load_server_arguments(str(config_path))
 
 
-def test_load_server_arguments_accepts_nemo_policy_fp8_cfg_alias(tmp_path):
+def test_load_server_arguments_rejects_nemo_policy_fp8_cfg_alias(tmp_path):
     config_path = tmp_path / "server_config.yaml"
     config_path.write_text(
         yaml.safe_dump(
@@ -898,10 +1064,8 @@ def test_load_server_arguments_accepts_nemo_policy_fp8_cfg_alias(tmp_path):
         encoding="utf-8",
     )
 
-    args = load_server_arguments(str(config_path))
-
-    assert args.fp8_cfg == {"enabled": True, "fp8": "e4m3", "fp8_recipe": "blockwise", "fp8_param": False}
-    assert args.enable_fp8_training is True
+    with pytest.raises(ValueError, match="fp8_cfg.*native fp8_training"):
+        load_server_arguments(str(config_path))
 
 
 def test_load_server_arguments_rejects_vllm_fp8_runtime_knobs(tmp_path):
@@ -2025,7 +2189,7 @@ def test_load_server_arguments_rejects_merge_lora_interval_for_server_multi_adap
         load_server_arguments(str(config_path))
 
 
-def test_load_server_arguments_rejects_pipeline_parallel_multi_adapter_lora(tmp_path):
+def test_load_server_arguments_admits_pipeline_parallel_multi_adapter_lora(tmp_path):
     config_path = tmp_path / "server_config.yaml"
     config_path.write_text(
         yaml.safe_dump(
@@ -2045,8 +2209,9 @@ def test_load_server_arguments_rejects_pipeline_parallel_multi_adapter_lora(tmp_
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="pipeline_parallel_size > 1 is not supported"):
-        load_server_arguments(str(config_path))
+    args = load_server_arguments(str(config_path))
+    assert args.pipeline_parallel_size == 2
+    assert args.enable_lora is True
 
 
 def test_load_server_arguments_threads_muon_gram_newton_schulz_through_nested_config(tmp_path):

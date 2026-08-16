@@ -73,6 +73,7 @@ import zmq.asyncio
 
 from xorl.data.collators import TextSequenceShardCollator
 from xorl.distributed.parallel_state import get_parallel_state
+from xorl.models.exact_contract import exact_gdn_cp_alignment_required
 from xorl.ops.shared_prefix import shared_prefix_repack_batch
 from xorl.server.protocol.operations import (
     AbortGradientEpochData,
@@ -95,7 +96,7 @@ from xorl.server.runner.adapters.gradient_finalizer import (
     AdapterGradientMutationFailure,
 )
 from xorl.server.runner.adapters.gradient_ownership import AdapterGradientUniformRejection
-from xorl.server.runner.model_runner import ModelRunner
+from xorl.server.runner.model_runner import FullParamOptimizerMutationFailure, ModelRunner
 from xorl.server.runner.utils import (
     Rank0Protocol,
     apply_sequence_sharding,
@@ -206,7 +207,9 @@ class RunnerDispatcher:
         self._sequence_shard_collator: Optional[TextSequenceShardCollator] = None
         parallel_state = get_parallel_state()
         if parallel_state.cp_enabled:
-            self._sequence_shard_collator = TextSequenceShardCollator()
+            self._sequence_shard_collator = TextSequenceShardCollator(
+                gdn_exact_cp_align=exact_gdn_cp_alignment_required(trainer.model_config_obj)
+            )
             logger.info(
                 f"Rank {rank}: Initialized TextSequenceShardCollator for sequence parallelism "
                 f"(cp_size={parallel_state.cp_size}, cp_rank={parallel_state.cp_rank})"
@@ -417,7 +420,11 @@ class RunnerDispatcher:
                     # or the explicit whole-epoch abort command.
                     logger.warning(f"Rank {self.rank}: Uniform command rejection: {uniform_error}")
                     self._worker_error = None
-                except (AdapterGradientCollectiveFailure, AdapterGradientMutationFailure) as fatal_error:
+                except (
+                    AdapterGradientCollectiveFailure,
+                    AdapterGradientMutationFailure,
+                    FullParamOptimizerMutationFailure,
+                ) as fatal_error:
                     self._terminate_after_adapter_gradient_failure(fatal_error)
                 except Exception as cmd_error:
                     # Log gracefully - only include traceback for unexpected errors
@@ -445,7 +452,11 @@ class RunnerDispatcher:
                                 )
                             logger.warning(f"Rank {self.rank}: Cross-rank error detected: {cross_rank_error}")
                         self._worker_error = None
-                    except (AdapterGradientCollectiveFailure, AdapterGradientMutationFailure) as fatal_error:
+                    except (
+                        AdapterGradientCollectiveFailure,
+                        AdapterGradientMutationFailure,
+                        FullParamOptimizerMutationFailure,
+                    ) as fatal_error:
                         self._terminate_after_adapter_gradient_failure(fatal_error)
                     except Exception as sync_error:
                         self._worker_error = None
@@ -618,7 +629,11 @@ class RunnerDispatcher:
                 request_id=request.message_id, success=True, result=result, execution_time=time.time() - start_time
             )
 
-        except (AdapterGradientCollectiveFailure, AdapterGradientMutationFailure) as fatal_error:
+        except (
+            AdapterGradientCollectiveFailure,
+            AdapterGradientMutationFailure,
+            FullParamOptimizerMutationFailure,
+        ) as fatal_error:
             self._terminate_after_adapter_gradient_failure(fatal_error)
         except AdapterGradientUniformRejection as uniform_error:
             return RunnerResponse(
@@ -652,7 +667,7 @@ class RunnerDispatcher:
         """Terminate this worker after a collective or post-mutation failure."""
 
         logger.critical(
-            "Rank %s: fatal adapter-gradient failure; terminating distributed worker: %s",
+            "Rank %s: fatal optimizer/gradient failure; terminating distributed worker: %s",
             self.rank,
             error,
             exc_info=True,
@@ -1293,8 +1308,12 @@ class RunnerDispatcher:
             )
             return items
 
-        if value.get("transport") != "filesystem" or int(value.get("version", 0)) != 2:
-            raise ValueError("Legacy pickle routing payload references are disabled; use filesystem version 2")
+        if value.get("transport") == "sglang_files" and int(value.get("version", 0)) == 1:
+            return self._load_sglang_file_routing_slice(value, start, count)
+
+        version = int(value.get("version", 0))
+        if value.get("transport") != "filesystem" or version not in (2, 3):
+            raise ValueError("Legacy pickle routing payload references are disabled; use filesystem version 2 or 3")
 
         manifest_path = Path(str(value.get("manifest", "")))
         if not manifest_path.is_absolute():
@@ -1314,6 +1333,14 @@ class RunnerDispatcher:
             raise ValueError(f"Invalid R3 filesystem manifest {manifest_path}: {exc}") from exc
         if not isinstance(manifest, Mapping):
             raise ValueError("R3 filesystem manifest must be a JSON object")
+        if version == 3:
+            return self._load_packed_filesystem_routing_slice(
+                value=value,
+                manifest=manifest,
+                manifest_path=manifest_path,
+                start=start,
+                count=count,
+            )
         if manifest.get("format") != "xorl-r3-raw" or int(manifest.get("version", 0)) != 2:
             raise ValueError("R3 filesystem manifest must use xorl-r3-raw version 2")
 
@@ -1374,6 +1401,202 @@ class RunnerDispatcher:
             kind,
             start,
             start + count,
+            item_dir,
+        )
+        return items
+
+    @staticmethod
+    def _r3_shared_roots() -> tuple[Path, ...]:
+        configured = os.getenv("XORL_R3_SHARED_ROOTS", "")
+        roots = tuple(
+            Path(entry).expanduser().resolve(strict=True) for entry in configured.split(os.pathsep) if entry.strip()
+        )
+        if not roots:
+            raise ValueError("XORL_R3_SHARED_ROOTS must name the trusted SGLang side-channel root")
+        return roots
+
+    @classmethod
+    def _wait_for_r3_source(cls, span: Mapping[str, Any]) -> Path:
+        raw_path = Path(str(span.get("path", "")))
+        if not raw_path.is_absolute() or raw_path.name.startswith("."):
+            raise ValueError(f"Invalid SGLang R3 source path: {raw_path}")
+        roots = cls._r3_shared_roots()
+        parent = raw_path.parent.resolve(strict=True)
+        if not any(parent == root or root in parent.parents for root in roots):
+            raise ValueError(f"SGLang R3 source path is outside XORL_R3_SHARED_ROOTS: {raw_path}")
+        error_path = Path(str(span.get("error_path", ""))) if span.get("error_path") else None
+        timeout_s = float(os.getenv("XORL_R3_SOURCE_WAIT_S", "120"))
+        deadline = time.monotonic() + timeout_s
+        while True:
+            if error_path is not None and error_path.is_file():
+                raise RuntimeError(f"SGLang R3 publisher failed: {error_path.read_text(encoding='utf-8')}")
+            if raw_path.is_file():
+                if raw_path.is_symlink():
+                    raise ValueError(f"SGLang R3 source path may not be a symlink: {raw_path}")
+                resolved = raw_path.resolve(strict=True)
+                if resolved.parent != parent:
+                    raise ValueError(f"SGLang R3 source path changed during publication: {raw_path}")
+                return resolved
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"Timed out waiting {timeout_s:.1f}s for SGLang R3 source {raw_path}")
+            time.sleep(0.01)
+
+    def _load_sglang_file_routing_slice(self, value: Mapping[str, Any], start: int, count: int) -> List[torch.Tensor]:
+        if value.get("format") != "spans":
+            raise ValueError("SGLang R3 source reference must use spans format")
+        kind = str(value.get("kind", ""))
+        expected_dtype = torch.int32 if kind == "routed_experts" else torch.float32
+        expected_dtype_name = "int32" if kind == "routed_experts" else "float32"
+        items = value.get("items")
+        total = int(value.get("count", -1))
+        if kind not in {"routed_experts", "routed_expert_logits"} or not isinstance(items, list):
+            raise ValueError(f"Invalid SGLang R3 source reference for {kind!r}")
+        if total != len(items) or start < 0 or count < 0 or start + count > total:
+            raise ValueError(f"SGLang R3 source slice out of range: start={start}, count={count}, total={total}")
+
+        loaded: List[torch.Tensor] = []
+        for datum_idx, item in enumerate(items[start : start + count], start=start):
+            if not isinstance(item, Mapping) or item.get("schema") != "xorl.r3.spans.v1":
+                raise ValueError(f"Invalid R3 span datum {datum_idx}")
+            shape = item.get("shape")
+            spans = item.get("spans")
+            if (
+                item.get("dtype") != expected_dtype_name
+                or not isinstance(shape, list)
+                or len(shape) != 3
+                or not isinstance(spans, list)
+            ):
+                raise ValueError(f"Invalid R3 span metadata for datum {datum_idx}")
+            pieces: List[torch.Tensor] = []
+            for span_idx, span in enumerate(spans):
+                if not isinstance(span, Mapping):
+                    raise ValueError(f"Invalid R3 span {datum_idx}/{span_idx}")
+                rows = int(span.get("rows", -1))
+                source_row = int(span.get("source_row", -1))
+                row_nbytes = int(span.get("row_nbytes", -1))
+                offset = int(span.get("offset", -1)) + source_row * row_nbytes
+                source_shape = span.get("source_shape")
+                expected_row_nbytes = math.prod(shape[1:]) * 4
+                if (
+                    span.get("dtype") != expected_dtype_name
+                    or rows < 0
+                    or source_row < 0
+                    or row_nbytes != expected_row_nbytes
+                    or offset < 0
+                    or not isinstance(source_shape, list)
+                    or len(source_shape) != 3
+                    or source_shape[1:] != shape[1:]
+                    or source_row + rows > int(source_shape[0])
+                ):
+                    raise ValueError(f"Invalid R3 span geometry for datum {datum_idx}/{span_idx}")
+                path = self._wait_for_r3_source(span)
+                required = offset + rows * row_nbytes
+                if path.stat().st_size < required:
+                    raise ValueError(f"R3 source {path} is shorter than span {datum_idx}/{span_idx}")
+                if rows == 0:
+                    pieces.append(torch.empty((0, *shape[1:]), dtype=expected_dtype))
+                    continue
+                storage = torch.from_file(str(path), shared=False, size=path.stat().st_size // 4, dtype=expected_dtype)
+                pieces.append(storage[offset // 4 : required // 4].reshape(rows, *shape[1:]))
+            if sum(piece.shape[0] for piece in pieces) != int(shape[0]):
+                raise ValueError(f"R3 span coverage mismatch for datum {datum_idx}")
+            loaded.append(pieces[0] if len(pieces) == 1 else torch.cat(pieces, dim=0))
+        return loaded
+
+    def _load_packed_filesystem_routing_slice(
+        self,
+        *,
+        value: Mapping[str, Any],
+        manifest: Mapping[str, Any],
+        manifest_path: Path,
+        start: int,
+        count: int,
+    ) -> List[torch.Tensor]:
+        if value.get("format") != "packed_rows":
+            raise ValueError("R3 filesystem version 3 reference must use packed_rows format")
+        if manifest.get("format") != "xorl-r3-packed" or int(manifest.get("version", 0)) != 3:
+            raise ValueError("R3 filesystem manifest must use xorl-r3-packed version 3")
+        kind = str(value.get("kind", ""))
+        if kind not in {"routed_experts", "routed_expert_logits"}:
+            raise ValueError(f"Unsupported R3 filesystem payload kind {kind!r}")
+        kind_meta = manifest.get(kind)
+        if not isinstance(kind_meta, Mapping):
+            raise ValueError(f"R3 filesystem manifest field {kind!r} must be an object")
+        chunks = kind_meta.get("chunks")
+        total = int(kind_meta.get("count", -1))
+        if not isinstance(chunks, list) or int(value.get("count", -1)) != total:
+            raise ValueError(f"R3 packed filesystem manifest has invalid {kind!r} metadata")
+        if start < 0 or count < 0 or start + count > total:
+            raise ValueError(
+                f"R3 filesystem payload slice out of range for {kind}: start={start}, count={count}, total={total}"
+            )
+
+        item_dir = manifest_path.parent / kind
+        if item_dir.is_symlink() or item_dir.resolve(strict=True).parent != manifest_path.parent:
+            raise ValueError(f"Invalid R3 filesystem item directory: {item_dir}")
+        expected_dtype = torch.int32 if kind == "routed_experts" else torch.float32
+        expected_dtype_name = "int32" if kind == "routed_experts" else "float32"
+        stop = start + count
+        expected_chunk_start = 0
+        items: List[torch.Tensor] = []
+        for chunk_idx, metadata in enumerate(chunks):
+            if not isinstance(metadata, Mapping):
+                raise ValueError(f"R3 packed filesystem chunk {kind}[{chunk_idx}] must be an object")
+            shape = metadata.get("shape")
+            datum_start = int(metadata.get("datum_start", -1))
+            datum_count = int(metadata.get("datum_count", -1))
+            offsets = metadata.get("row_offsets")
+            filename = metadata.get("file")
+            if (
+                not isinstance(shape, list)
+                or len(shape) != 3
+                or not all(isinstance(dim, int) and dim >= 0 for dim in shape)
+                or metadata.get("dtype") != expected_dtype_name
+                or datum_start != expected_chunk_start
+                or datum_count < 1
+                or not isinstance(offsets, list)
+                or len(offsets) != datum_count + 1
+                or offsets[0] != 0
+                or any(not isinstance(offset, int) or offset < 0 for offset in offsets)
+                or any(left > right for left, right in zip(offsets, offsets[1:]))
+                or offsets[-1] != shape[0]
+            ):
+                raise ValueError(f"R3 packed filesystem chunk {kind}[{chunk_idx}] has invalid metadata")
+            expected_chunk_start += datum_count
+            expected_nbytes = math.prod(shape) * 4
+            if int(metadata.get("nbytes", -1)) != expected_nbytes:
+                raise ValueError(f"R3 packed filesystem chunk {kind}[{chunk_idx}] has inconsistent byte size")
+            expected_filename = f"chunk-{chunk_idx:06d}.bin"
+            if filename != expected_filename:
+                raise ValueError(f"R3 packed filesystem chunk {kind}[{chunk_idx}] has invalid filename")
+
+            chunk_stop = datum_start + datum_count
+            overlap_start = max(start, datum_start)
+            overlap_stop = min(stop, chunk_stop)
+            if overlap_start >= overlap_stop:
+                continue
+            item_path = item_dir / expected_filename
+            if item_path.is_symlink() or item_path.resolve(strict=True).parent != item_dir:
+                raise ValueError(f"Invalid R3 filesystem item path: {item_path}")
+            if item_path.stat().st_size != expected_nbytes:
+                raise ValueError(f"R3 packed filesystem chunk {kind}[{chunk_idx}] byte size does not match metadata")
+            data = item_path.read_bytes()
+            tensor = torch.frombuffer(bytearray(data), dtype=expected_dtype).reshape(shape)
+            for datum_idx in range(overlap_start, overlap_stop):
+                local_idx = datum_idx - datum_start
+                items.append(tensor[offsets[local_idx] : offsets[local_idx + 1]])
+        if expected_chunk_start != total or len(items) != count:
+            raise ValueError(
+                f"R3 packed filesystem coverage mismatch for {kind}: chunks={expected_chunk_start}/{total}, "
+                f"loaded={len(items)}/{count}"
+            )
+        log_fn = logger.info if _r3_verbose_logging_enabled() else logger.debug
+        log_fn(
+            "Rank %s: Loaded packed R3 %s slice [%s:%s] from %s",
+            self.rank,
+            kind,
+            start,
+            stop,
             item_dir,
         )
         return items
@@ -1887,6 +2110,13 @@ class RunnerDispatcher:
         except (AdapterGradientCollectiveFailure, AdapterGradientMutationFailure):
             raise
         except BaseException as error:
+            train_config = getattr(self.trainer, "train_config", {})
+            if isinstance(train_config, dict) and train_config.get("glm52_fullparam_fp8_training"):
+                self.trainer._glm52_fullparam_poisoned = True
+                raise FullParamOptimizerMutationFailure(
+                    "Full-parameter optimizer handler tail failed after mutation; "
+                    "publish nothing and restart from checkpoint"
+                ) from error
             self._poison_adapter_after_mutation(model_id)
             raise AdapterGradientMutationFailure(
                 "Optimizer handler tail failed after adapter mutation; publish nothing and restart from checkpoint"

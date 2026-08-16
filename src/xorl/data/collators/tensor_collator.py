@@ -177,7 +177,13 @@ class ToTensorCollator(DataCollator):
         ]:
             return torch.long
 
-        if key in ["teacher_weights", "hidden_match_weights"]:
+        if key in [
+            "teacher_weights",
+            "hidden_match_weights",
+            "logprob_temperatures",
+            "logprob_top_ps",
+            "logprob_min_ps",
+        ]:
             return torch.float
 
         # Let PyTorch infer for other fields

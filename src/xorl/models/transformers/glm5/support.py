@@ -57,8 +57,32 @@ def validate_glm5_training_mode(
     moe_implementation: str | None = None,
     ep_dispatch: str = "alltoall",
     moe_hybrid_shared_lora: bool = False,
+    glm52_fullparam_fp8_training: bool = False,
 ) -> None:
     if not is_glm5_config(config):
+        return
+    if glm52_fullparam_fp8_training:
+        if block_fp8_qlora_training or enable_qlora:
+            raise ValueError(
+                "GLM-5.2 full-param block-FP8 training is a full-weight mode and cannot be combined with QLoRA"
+            )
+        requirements = {
+            "moe_implementation": (moe_implementation, "triton"),
+            "ep_dispatch": (ep_dispatch, "alltoall"),
+            # Full-param mode TRAINS the router through its FP32 master;
+            # freeze_router=True would misdescribe the run.
+            "freeze_router": (freeze_router, False),
+            "merge_qkv": (merge_qkv, True),
+        }
+        mismatches = [
+            f"{name}={actual!r} (requires {expected!r})"
+            for name, (actual, expected) in requirements.items()
+            if actual != expected
+        ]
+        if mismatches:
+            raise ValueError(
+                "GLM-5.2 full-param block-FP8 training rejects unsupported configuration: " + ", ".join(mismatches)
+            )
         return
     if block_fp8_qlora_training:
         exact_active_lora = glm52_exact_active_lora_enabled(config)

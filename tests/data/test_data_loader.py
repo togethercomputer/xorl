@@ -5,7 +5,13 @@ import pytest
 import torch
 from torch.utils.data import Dataset
 
-from xorl.data.collators import CollatePipeline, DataCollator, FlattenCollator, PackingConcatCollator
+from xorl.data.collators import (
+    CollatePipeline,
+    DataCollator,
+    FlattenCollator,
+    PackingConcatCollator,
+    TextSequenceShardCollator,
+)
 from xorl.data.data_loader import (
     DataLoaderBuilder,
     DistributedDataloader,
@@ -123,14 +129,20 @@ class TestMicroBatchCollatorAndDistributedDataloader:
         mock_ps.cp_size = 2
         mock_ps.cp_enabled = True
         mock_parallel_state.return_value = mock_ps
-        DataLoaderBuilder(dataset=fake_text_dataset, micro_batch_size=2, gradient_accumulation_steps=2).build(
-            verbose=False
-        )
+        DataLoaderBuilder(
+            dataset=fake_text_dataset,
+            micro_batch_size=2,
+            gradient_accumulation_steps=2,
+            gdn_exact_cp_align=True,
+        ).build(verbose=False)
         collate_fn = mock_dataloader_cls.call_args[1]["collate_fn"]
         assert isinstance(collate_fn, MicroBatchCollator)
 
         assert isinstance(collate_fn.internal_collator, CollatePipeline)
         assert len(collate_fn.internal_collator.data_collators) == 5
+        sequence_collator = collate_fn.internal_collator.data_collators[-1]
+        assert isinstance(sequence_collator, TextSequenceShardCollator)
+        assert sequence_collator.gdn_exact_cp_align is True
 
         # Single custom collator
         mock_ps.cp_size = 1

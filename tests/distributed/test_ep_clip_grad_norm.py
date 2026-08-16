@@ -29,6 +29,7 @@ from xorl.distributed.ep_gradients import (
     synchronize_ep_replicated_gradients,
 )
 from xorl.distributed.fsdp2.clip_grad_norm import (
+    _fsdp2_reduce_group,
     clip_grad_norm,
     ep_fsdp2_clip_grad_norm,
 )
@@ -310,6 +311,31 @@ class TestEPFSDP2ClipGradNorm:
         assert total_norm.item() == pytest.approx(5.0, abs=1e-5)
 
 
+@pytest.mark.parametrize(
+    ("norm_type", "expected"),
+    ((2.0, 25.0), (float("inf"), 4.0)),
+)
+def test_singleton_reduce_group_does_not_launch_collective(norm_type, expected):
+    """A size-one mesh dimension contributes only its local statistic."""
+
+    param = _make_param(2, grad=torch.tensor([3.0, -4.0]))
+    singleton_group = MagicMock()
+
+    with (
+        patch.object(dist, "get_world_size", return_value=1) as get_world_size,
+        patch.object(dist, "all_reduce") as all_reduce,
+    ):
+        total = _fsdp2_reduce_group(
+            params=[param],
+            norm_type=norm_type,
+            reduce_groups=[("ep_fsdp", singleton_group)],
+        )
+
+    assert total.item() == pytest.approx(expected)
+    get_world_size.assert_called_once_with(singleton_group)
+    all_reduce.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # 3. _skip_fsdp end-to-end: classify → clip
 # ---------------------------------------------------------------------------
@@ -531,6 +557,7 @@ def test_real_three_rank_gradient_participation_mask():
 def _run_distributed_ep_clip_worker() -> None:
     dist.init_process_group("gloo")
     rank = dist.get_rank()
+    mesh = init_device_mesh("cpu", (2, 1), mesh_dim_names=("ep", "ep_fsdp"))
     model = nn.Module()
     expert = nn.Parameter(torch.zeros(1))
     expert.grad = torch.tensor([3.0 if rank == 0 else 4.0])
@@ -539,12 +566,25 @@ def _run_distributed_ep_clip_worker() -> None:
     parallel_state = MagicMock()
     parallel_state.ep_enabled = True
     parallel_state.fsdp_group = None
-    parallel_state.ep_group = dist.group.WORLD
+    parallel_state.ep_group = mesh["ep"].get_group()
+    parallel_state.ep_fsdp_device_mesh = mesh
     parallel_state.tp_enabled = False
     parallel_state.tp_group = None
 
-    with patch("xorl.distributed.fsdp2.clip_grad_norm.get_parallel_state", return_value=parallel_state):
+    reduction_group_sizes = []
+    original_all_reduce = dist.all_reduce
+
+    def _recording_all_reduce(*args, **kwargs):
+        reduction_group_sizes.append(dist.get_world_size(kwargs.get("group")))
+        return original_all_reduce(*args, **kwargs)
+
+    with (
+        patch("xorl.distributed.fsdp2.clip_grad_norm.get_parallel_state", return_value=parallel_state),
+        patch.object(dist, "all_reduce", side_effect=_recording_all_reduce),
+    ):
         total_norm = ep_fsdp2_clip_grad_norm(model, max_norm=1.0)
+    assert 1 not in reduction_group_sizes
+    assert 2 in reduction_group_sizes
     assert total_norm.item() == pytest.approx(5.0, abs=1e-6)
     assert expert.grad.item() == pytest.approx(0.6 if rank == 0 else 0.8, abs=1e-6)
 

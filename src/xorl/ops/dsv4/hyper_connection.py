@@ -30,6 +30,160 @@ _HYPER_CONNECTION_MIXER_NO_GRAD = True
 _DEFAULT_HC_CHUNK_TOKENS = 1024
 
 
+def _exact_mhc_pre_norm_forward(
+    residual: Tensor,
+    hc_fn: Tensor,
+    hc_scale: Tensor,
+    hc_base: Tensor,
+    norm_weight: Tensor,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Run the literal SGLang SM90 MHC-pre plus RMSNorm value path."""
+
+    if not residual.is_cuda or residual.dtype != torch.bfloat16:
+        raise RuntimeError("DSV4 exact MHC pre requires CUDA BF16 residuals")
+    if residual.shape[-2:] != (4, 4096):
+        raise RuntimeError(
+            "DSV4 exact MHC pre admits only the official (hc_mult=4, hidden=4096) geometry, "
+            f"got {tuple(residual.shape[-2:])}"
+        )
+    if hc_fn.dtype != torch.float32 or hc_scale.dtype != torch.float32 or hc_base.dtype != torch.float32:
+        raise RuntimeError("DSV4 exact MHC routing parameters must remain FP32")
+
+    from sglang.kernels.ops.layernorm.mhc import (  # noqa: PLC0415
+        _compute_num_split_for_mhc_pre,
+        mhc_pre_big_fuse_with_norm_tilelang,
+    )
+    from sglang.srt.layers.deep_gemm_wrapper.entrypoint import (  # noqa: PLC0415
+        tf32_hc_prenorm_gemm,
+    )
+
+    outer_shape = residual.shape[:-2]
+    residual_flat = residual.contiguous().view(-1, 4, 4096)
+    num_tokens = residual_flat.shape[0]
+    n_splits = _compute_num_split_for_mhc_pre(num_tokens, 4 * 4096)
+    gemm_out_mul = torch.empty(n_splits, num_tokens, 24, dtype=torch.float32, device=residual.device)
+    gemm_out_sqrsum = torch.empty(n_splits, num_tokens, dtype=torch.float32, device=residual.device)
+    tf32_hc_prenorm_gemm(
+        residual_flat.view(num_tokens, 4 * 4096),
+        hc_fn.contiguous(),
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        n_splits,
+    )
+
+    post = torch.empty(num_tokens, 4, dtype=torch.float32, device=residual.device)
+    comb = torch.empty(num_tokens, 16, dtype=torch.float32, device=residual.device)
+    layer_input = torch.empty(num_tokens, 4096, dtype=torch.bfloat16, device=residual.device)
+    norm_weight_bf16 = norm_weight.bfloat16().contiguous()
+    mhc_pre_big_fuse_with_norm_tilelang(
+        gemm_out_mul,
+        gemm_out_sqrsum,
+        hc_scale.contiguous(),
+        hc_base.contiguous(),
+        residual_flat,
+        post,
+        comb,
+        layer_input,
+        norm_weight_bf16,
+        4096,
+        rms_eps,
+        hc_eps,
+        hc_eps,
+        2.0,
+        sinkhorn_iters,
+        rms_eps,
+        n_splits,
+        4,
+        24,
+    )
+    return (
+        layer_input.view(*outer_shape, 4096),
+        post.view(*outer_shape, 4),
+        comb.view(*outer_shape, 4, 4),
+    )
+
+
+def _exact_mhc_post_forward(x: Tensor, residual: Tensor, post: Tensor, comb: Tensor) -> Tensor:
+    """Run the literal SGLang SM90 MHC-post value path."""
+
+    if not residual.is_cuda or residual.dtype != torch.bfloat16:
+        raise RuntimeError("DSV4 exact MHC post requires CUDA BF16 residuals")
+    if residual.shape[-2:] != (4, 4096) or x.shape[-1] != 4096:
+        raise RuntimeError("DSV4 exact MHC post admits only official DSV4-Flash geometry")
+    from sglang.kernels.ops.layernorm.mhc import mhc_post_tilelang  # noqa: PLC0415
+
+    outer_shape = residual.shape[:-2]
+    x_flat = x.contiguous().view(-1, 4096)
+    residual_flat = residual.contiguous().view(-1, 4, 4096)
+    post_flat = post.contiguous().view(-1, 4)
+    comb_flat = comb.contiguous().view(-1, 4, 4)
+    out = torch.empty_like(residual_flat)
+    mhc_post_tilelang(comb_flat, residual_flat, post_flat, x_flat, out, 4, 4096)
+    return out.view(*outer_shape, 4, 4096)
+
+
+class _ExactMhcPreNorm(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, residual, hc_fn, hc_scale, hc_base, norm_weight, rms_eps, hc_eps, sinkhorn_iters):
+        layer_input, post, comb = _exact_mhc_pre_norm_forward(
+            residual,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            norm_weight,
+            rms_eps,
+            hc_eps,
+            sinkhorn_iters,
+        )
+        ctx.save_for_backward(residual, hc_fn, hc_scale, hc_base, norm_weight)
+        ctx.rms_eps = rms_eps
+        ctx.hc_eps = hc_eps
+        return layer_input, post, comb
+
+    @staticmethod
+    def backward(ctx, grad_layer_input, grad_post, grad_comb):
+        residual, hc_fn, hc_scale, hc_base, norm_weight = ctx.saved_tensors
+        with torch.enable_grad():
+            surrogate = residual.detach().requires_grad_(True)
+            flat = surrogate.flatten(-2).float()
+            rsqrt = torch.rsqrt(flat.square().mean(-1, keepdim=True) + ctx.rms_eps)
+            mixes = F.linear(flat, hc_fn) * rsqrt
+            pre = (torch.sigmoid(mixes[..., :4] * hc_scale[0] + hc_base[:4]) + ctx.hc_eps).detach()
+            mixed = (pre.unsqueeze(-1) * surrogate.float()).sum(dim=-2).to(torch.bfloat16)
+            mixed_fp32 = mixed.float()
+            normed = mixed_fp32 * torch.rsqrt(mixed_fp32.square().mean(-1, keepdim=True) + ctx.rms_eps)
+            normed = (normed * norm_weight.float()).to(torch.bfloat16)
+            grad_residual = torch.autograd.grad(
+                normed,
+                surrogate,
+                grad_layer_input,
+                retain_graph=False,
+                create_graph=False,
+            )[0]
+        return grad_residual, None, None, None, None, None, None, None
+
+
+class _ExactMhcPost(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, residual, post, comb):
+        out = _exact_mhc_post_forward(x, residual, post, comb)
+        ctx.save_for_backward(post, comb)
+        ctx.x_dtype = x.dtype
+        ctx.residual_dtype = residual.dtype
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        post, comb = ctx.saved_tensors
+        grad = grad_output.float()
+        grad_x = (grad * post.float().unsqueeze(-1)).sum(dim=-2)
+        grad_residual = torch.einsum("...jh,...ij->...ih", grad, comb.float())
+        return grad_x.to(ctx.x_dtype), grad_residual.to(ctx.residual_dtype), None, None
+
+
 def _hc_chunk_tokens() -> int:
     value = os.environ.get("XORL_DSV4_HC_CHUNK_TOKENS")
     if value is None:
@@ -264,6 +418,25 @@ class DeepSeekV4HyperConnectionUtil:
 
         return self.hc_pre_raw(x=hidden_states, hc_fn=hc_fn, hc_scale=hc_scale, hc_base=hc_base)
 
+    def layer_pre_norm_exact(
+        self,
+        hidden_states: Tensor,
+        hc_fn: Tensor,
+        hc_scale: Tensor,
+        hc_base: Tensor,
+        norm_weight: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        return _ExactMhcPreNorm.apply(
+            hidden_states,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            norm_weight,
+            self.norm_eps,
+            self.hc_eps,
+            self.hc_sinkhorn_iters,
+        )
+
     def layer_post(
         self,
         output_with_bias: Tensor | tuple[Tensor, Tensor | None],
@@ -289,6 +462,21 @@ class DeepSeekV4HyperConnectionUtil:
         assert isinstance(out, torch.Tensor)
 
         return self.hc_post_raw(x=out, residual=residual, post=post, comb=comb)
+
+    def layer_post_exact(
+        self,
+        output_with_bias: Tensor | tuple[Tensor, Tensor | None],
+        residual: Tensor,
+        post: Tensor,
+        comb: Tensor,
+    ) -> Tensor:
+        if isinstance(output_with_bias, tuple):
+            out, bias = output_with_bias
+            if bias is not None:
+                raise RuntimeError("DSV4 exact MHC post does not admit a separate bias")
+        else:
+            out = output_with_bias
+        return _ExactMhcPost.apply(out, residual, post, comb)
 
     def block_expand(self, hidden_states: Tensor) -> Tensor:
         """Expand a 3-D ``[B, S, hidden]`` state into 4-D ``[B, S, hc_mult, hidden]``."""

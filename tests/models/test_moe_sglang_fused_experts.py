@@ -748,7 +748,7 @@ def test_ensure_sglang_runtime_publishes_xorl_deterministic_context(monkeypatch)
             "model_path": "dummy",
             "enable_deterministic_inference": True,
             "enable_fused_moe_sum_all_reduce": False,
-            "rl_on_policy_target": "xorl-batch-invariant",
+            "rl_on_policy_target": "xorl",
         }
     ]
     assert len(published) == 1

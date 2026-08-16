@@ -28,6 +28,7 @@ Stage switching lifecycle::
 """
 
 from typing import ClassVar, List, Optional
+from weakref import WeakSet
 
 import torch
 
@@ -35,7 +36,11 @@ import torch
 class RoutingReplay:
     """Per-MoE-layer routing replay with dual-index for PP + checkpoint."""
 
-    _instances: ClassVar[List["RoutingReplay"]] = []
+    # Model construction can enable checkpointing independently on several
+    # local virtual-pipeline parts.  Weak membership keeps every live part in
+    # global reset/cleanup operations without one part clearing registrations
+    # created by an earlier part, and without retaining destroyed models.
+    _instances: ClassVar[WeakSet["RoutingReplay"]] = WeakSet()
 
     def __init__(self):
         self.forward_index: int = 0
@@ -44,7 +49,7 @@ class RoutingReplay:
         self.top_weights_list: List[torch.Tensor] = []  # CPU routing weight buffers (R3 logits)
         self.top_indices_events: List[Optional[torch.cuda.Event]] = []
         self.top_weights_events: List[Optional[torch.cuda.Event]] = []
-        RoutingReplay._instances.append(self)
+        RoutingReplay._instances.add(self)
 
     @staticmethod
     def _record_copy_event(source: torch.Tensor) -> Optional[torch.cuda.Event]:
@@ -87,6 +92,12 @@ class RoutingReplay:
             return torch.device("cuda", torch.cuda.current_device())
         return torch.device("cpu")
 
+    def _to_target_device(self, tensor: torch.Tensor) -> torch.Tensor:
+        target = self._target_device()
+        if tensor.device == target:
+            return tensor
+        return tensor.to(target, non_blocking=torch.cuda.is_available())
+
     @torch.compiler.disable
     def pop_forward(self) -> torch.Tensor:
         """Read routing for forward replay, advance forward_index."""
@@ -94,7 +105,7 @@ class RoutingReplay:
         idx = self.top_indices_list[index]
         self._wait_for_copy(self.top_indices_events, index)
         self.forward_index += 1
-        return idx.to(self._target_device(), non_blocking=torch.cuda.is_available())
+        return self._to_target_device(idx)
 
     @torch.compiler.disable
     def pop_forward_weights(self) -> Optional[torch.Tensor]:
@@ -104,7 +115,7 @@ class RoutingReplay:
         # forward_index was already incremented by pop_forward, so use -1
         index = self.forward_index - 1
         self._wait_for_copy(self.top_weights_events, index)
-        return self.top_weights_list[index].to(self._target_device(), non_blocking=torch.cuda.is_available())
+        return self._to_target_device(self.top_weights_list[index])
 
     @torch.compiler.disable
     def pop_backward(self) -> torch.Tensor:
@@ -113,7 +124,7 @@ class RoutingReplay:
         idx = self.top_indices_list[index]
         self._wait_for_copy(self.top_indices_events, index)
         self.backward_index += 1
-        return idx.to(self._target_device(), non_blocking=torch.cuda.is_available())
+        return self._to_target_device(idx)
 
     @torch.compiler.disable
     def pop_backward_weights(self) -> Optional[torch.Tensor]:
@@ -122,7 +133,7 @@ class RoutingReplay:
             return None
         index = self.backward_index - 1
         self._wait_for_copy(self.top_weights_events, index)
-        return self.top_weights_list[index].to(self._target_device(), non_blocking=torch.cuda.is_available())
+        return self._to_target_device(self.top_weights_list[index])
 
     @property
     def has_weights(self) -> bool:

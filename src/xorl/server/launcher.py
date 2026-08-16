@@ -40,7 +40,7 @@ import requests
 import uvicorn
 import yaml
 
-from xorl.fp8_training.config_compat import extract_nemo_fp8_cfg, validate_external_fp8_runtime_config
+from xorl.fp8_training.config_compat import validate_external_fp8_runtime_config
 from xorl.server.api_server.server import APIServer
 from xorl.server.orchestrator.orchestrator import Orchestrator
 from xorl.server.removed_config import reject_removed_configuration_fields
@@ -435,7 +435,6 @@ def load_server_arguments(config_path: str, overrides: Optional[Dict[str, any]] 
 
     reject_removed_configuration_fields(config, context=f"server config {config_path!r}")
     validate_external_fp8_runtime_config(config, context=config_path)
-    nemo_fp8_cfg = extract_nemo_fp8_cfg(config)
 
     valid_fields = {f.name for f in fields(ServerArguments)}
 
@@ -453,8 +452,6 @@ def load_server_arguments(config_path: str, overrides: Optional[Dict[str, any]] 
         for section in ("model", "train"):
             for k, v in config.get(section, {}).items():
                 flat_config[k] = v
-        if nemo_fp8_cfg is not None and "fp8_cfg" not in flat_config:
-            flat_config["fp8_cfg"] = nemo_fp8_cfg
 
         # lora.* keys also map 1:1 except exclude_modules → qlora_exclude_modules
         for k, v in config.get("lora", {}).items():
@@ -499,8 +496,6 @@ def load_server_arguments(config_path: str, overrides: Optional[Dict[str, any]] 
     else:
         # Flat config (ServerArguments style)
         flat_config = dict(config)
-        if nemo_fp8_cfg is not None and "fp8_cfg" not in flat_config:
-            flat_config["fp8_cfg"] = nemo_fp8_cfg
         filtered_config = {k: v for k, v in flat_config.items() if k in valid_fields}
 
         # Handle None values for Optional fields
@@ -1621,7 +1616,8 @@ def main():
 Examples:
 
   # Auto-launch mode (world size automatically calculated from config)
-  python -m xorl.server.launcher --mode auto --config examples/qwen3/sft.yaml
+  python -m xorl.server.launcher --mode auto \\
+    --config examples/server/configs/full/qwen3_8b_full.yaml
 
   # Override config values via CLI
   python -m xorl.server.launcher --mode auto --config server.yaml \\
@@ -1632,7 +1628,8 @@ Examples:
   # Connect mode (workers launched separately)
   # Terminal 1: Launch workers manually
   torchrun --nnodes=1 --nproc-per-node=8 -m xorl.server.runner.runner_dispatcher \\
-    examples/qwen3/sft.yaml --worker.bind_address tcp://127.0.0.1:5556
+    examples/server/configs/full/qwen3_8b_full.yaml \\
+    --worker.bind_address tcp://127.0.0.1:5556
 
   # Terminal 2: Launch API server and engine
   python -m xorl.server.launcher --mode connect --worker-address tcp://127.0.0.1:5556

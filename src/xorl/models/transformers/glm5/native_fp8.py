@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import re
 from dataclasses import dataclass
 from typing import Iterable, Mapping
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from xorl.models.layers.moe.experts import MoEExperts
@@ -17,6 +19,11 @@ from xorl.ops.block_fp8_native import (
     pack_fp8_as_float32,
     unpack_float32_as_fp8,
 )
+
+
+logger = logging.getLogger(__name__)
+
+GLM52_NATIVE_EXPERTS_FROZEN_DGRAD_CONTRACT_VERSION = "glm52_native_block_fp8_experts_frozen_dgrad_v1"
 
 
 _LAYER_KEY = re.compile(r"^model\.layers\.(\d+)\.")
@@ -78,11 +85,56 @@ def _set_submodule(root: nn.Module, fqn: str, replacement: nn.Module) -> None:
     setattr(parent, child_name, replacement)
 
 
+class _Glm52NativeFrozenBankDgradFunction(torch.autograd.Function):
+    """Exact-value expert forward with the frozen-bank activation backward.
+
+    Forward: the UNCHANGED fused block-FP8 expert value sequence on the
+    frozen checkpoint bytes.  Backward: activation gradients only — hidden
+    states (upstream trainable parameters) and routing weights (the combine
+    multiply, through which trained routers learn) — through the dequantized
+    frozen bytes in the declared BF16 expert program.  NO expert-weight
+    gradient exists at this boundary and no byte is ever written.
+    """
+
+    @staticmethod
+    def forward(
+        ctx, hidden: torch.Tensor, routing: torch.Tensor, local_ids: torch.Tensor, routed_scaling_factor: float, module
+    ):
+        output = module._sglang_ep_native_routed_value(
+            hidden,
+            routing,
+            local_ids,
+            routed_scaling_factor=float(routed_scaling_factor),
+        )
+        ctx.module = module
+        ctx.routed_scaling_factor = float(routed_scaling_factor)
+        ctx.save_for_backward(hidden.detach(), routing.detach(), local_ids)
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        hidden, routing, local_ids = ctx.saved_tensors
+        grad_hidden, grad_routing = ctx.module._frozen_activation_vjp(
+            hidden,
+            routing,
+            local_ids,
+            grad_output=grad_output,
+            routed_scaling_factor=ctx.routed_scaling_factor,
+            needs_input_grad=ctx.needs_input_grad[:2],
+        )
+        return grad_hidden, grad_routing, None, None, None
+
+
 class Glm52NativeBlockFP8Experts(nn.Module):
     """GLM-5.2 frozen FP8 experts restricted to rank-local routed partials."""
 
     fsdp_requires_full_precision = True
     contract_version = NATIVE_BLOCK_FP8_CONTRACT_VERSION
+    frozen_dgrad_contract_version = GLM52_NATIVE_EXPERTS_FROZEN_DGRAD_CONTRACT_VERSION
+    # Fail-closed default (scoring-only); a trainable-set admission opts in
+    # per bank via :meth:`enable_frozen_activation_dgrad`.
+    _frozen_dgrad_admitted = False
+    _frozen_dgrad_engagement_logged = False
 
     def __init__(
         self,
@@ -238,6 +290,65 @@ class Glm52NativeBlockFP8Experts(nn.Module):
             self.down_packed_weight_f32.copy_(pack_fp8_as_float32(down).to(self.down_packed_weight_f32.device))
             self.down_weight_scale_inv.copy_(down_scale_inv.to(self.down_weight_scale_inv.device))
 
+    def enable_frozen_activation_dgrad(self) -> None:
+        """Admit the validated frozen-bank activation backward.
+
+        Idempotent per bank.  The forward VALUE program is byte-unchanged;
+        only the refusal on grad-requiring hidden/routing inputs is replaced
+        by the checked BF16 dequant-program activation backward (hidden +
+        routing gradients only; expert bytes are immutable).  Only a
+        trainable-set admission that must backpropagate THROUGH an
+        out-of-scope frozen bank may call this.
+        """
+
+        self._frozen_dgrad_admitted = True
+        cls = Glm52NativeBlockFP8Experts
+        if not cls._frozen_dgrad_engagement_logged:
+            cls._frozen_dgrad_engagement_logged = True
+            logger.info(
+                "GLM-5.2 native block-FP8 frozen-bank activation dgrad engaged: contract=%s "
+                "(forward bytes unchanged; hidden+routing grads through dequantized frozen "
+                "bytes in the declared BF16 expert program; no expert-weight grads; frozen "
+                "bytes immutable)",
+                self.frozen_dgrad_contract_version,
+            )
+
+    def _assert_expert_ids_within_stored_rows(self, local_ids: torch.Tensor) -> None:
+        """Mandatory fail-closed stored-rows admission for the expert kernels.
+
+        Expert ids MUST be validated against the ACTUAL stored rows, never a
+        declared expert count: ``num_experts`` is GLOBAL for frozen banks
+        (declare-global / store-EP-local), and on a corrupt construction the
+        storage can hold fewer rows than any declaration implies.  For
+        example, an accidental second EP slice can leave fewer stored rows
+        than the declared global count, so declaration-validated ids could
+        otherwise reach the fused kernel out of bounds.
+        An out-of-range id must RAISE here, never fault in the kernel.
+        """
+
+        names = (
+            "gate_up_packed_weight_f32",
+            "gate_up_weight_scale_inv",
+            "down_packed_weight_f32",
+            "down_weight_scale_inv",
+        )
+        rows = {name: int(getattr(self, name).shape[0]) for name in names}
+        stored_rows = rows["gate_up_packed_weight_f32"]
+        if any(count != stored_rows for count in rows.values()):
+            raise RuntimeError(
+                f"GLM native block-FP8 expert storage is internally inconsistent across fields: {rows}; "
+                "refusing to run the expert kernels on a corrupt bank"
+            )
+        if local_ids.numel() and bool(torch.any((local_ids < -1) | (local_ids >= stored_rows))):
+            raise RuntimeError(
+                "GLM native block-FP8 expert ids exceed the stored bank: ids admit only the -1 sentinel "
+                f"or slots [0, {stored_rows}) of the ACTUAL stored rows, got max id {int(local_ids.max())} "
+                f"with stored_rows={stored_rows} (declared num_experts={int(self.num_experts)}, "
+                f"bank={type(self).__name__}, packed_shape={tuple(self.gate_up_packed_weight_f32.shape)}); "
+                "a bank storing fewer rows than the dispatch derived is a corrupt construction "
+                "(e.g. an EP slice applied twice) and must refuse instead of faulting in the fused kernel"
+            )
+
     def sglang_ep_native_routed_partial(
         self,
         hidden_flat,
@@ -248,10 +359,12 @@ class Glm52NativeBlockFP8Experts(nn.Module):
     ):
         if any(parameter.requires_grad for parameter in self.parameters()):
             raise RuntimeError("GLM native block-FP8 expert weights and scales must remain frozen")
-        if torch.is_grad_enabled() and (hidden_flat.requires_grad or routing_flat.requires_grad):
+        grad_engaged = torch.is_grad_enabled() and (hidden_flat.requires_grad or routing_flat.requires_grad)
+        if grad_engaged and not self._frozen_dgrad_admitted:
             raise RuntimeError("GLM native block-FP8 phase-one expert forward is scoring-only")
         if routing_flat.dtype is not torch.float32:
             raise TypeError(f"GLM native block-FP8 experts require FP32 routing weights, got {routing_flat.dtype}")
+        self._assert_expert_ids_within_stored_rows(local_ids)
         if hidden_flat.device.type != "cuda":
             raise RuntimeError("GLM native block-FP8 expert forward requires CUDA and pinned public SGLang")
         if hidden_flat.dtype is not torch.bfloat16:
@@ -265,6 +378,33 @@ class Glm52NativeBlockFP8Experts(nn.Module):
         routed_scaling_factor = float(routed_scaling_factor)
         if not math.isfinite(routed_scaling_factor) or routed_scaling_factor <= 0:
             raise ValueError("GLM native block-FP8 routed scaling factor must be finite and positive")
+
+        if grad_engaged:
+            # Same kernel invocation inside the autograd boundary; the value
+            # bytes are identical to the scoring-only path below.
+            return _Glm52NativeFrozenBankDgradFunction.apply(
+                hidden_flat,
+                routing_flat,
+                local_ids,
+                routed_scaling_factor,
+                self,
+            )
+        return self._sglang_ep_native_routed_value(
+            hidden_flat,
+            routing_flat,
+            local_ids,
+            routed_scaling_factor=routed_scaling_factor,
+        )
+
+    def _sglang_ep_native_routed_value(
+        self,
+        hidden_flat,
+        routing_flat,
+        local_ids,
+        *,
+        routed_scaling_factor: float,
+    ):
+        """The literal fused block-FP8 expert value sequence (no grad policy)."""
 
         from xorl.ops.moe.sglang_fused_moe_strided import fused_experts_impl_strided  # noqa: PLC0415
 
@@ -285,6 +425,111 @@ class Glm52NativeBlockFP8Experts(nn.Module):
             routed_scaling_factor=routed_scaling_factor,
         )
         return output
+
+    def _dequantized_cached_experts(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """Dequantize the stored bytes into [E, N, K] BF16 banks (LoRA-surrogate treatment)."""
+
+        try:
+            from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant  # noqa: PLC0415
+        except Exception as exc:
+            raise RuntimeError("Pinned public SGLang block-FP8 dequantization is required for the surrogate") from exc
+        gate_up = block_quant_dequant(
+            self.gate_up_proj.transpose(1, 2),
+            self.gate_up_weight_scale_inv.transpose(1, 2),
+            [128, 128],
+            torch.bfloat16,
+        )
+        down = block_quant_dequant(
+            self.down_proj.transpose(1, 2),
+            self.down_weight_scale_inv.transpose(1, 2),
+            [128, 128],
+            torch.bfloat16,
+        )
+        return gate_up, down
+
+    def _surrogate_program(
+        self,
+        hidden: torch.Tensor,
+        routing: torch.Tensor,
+        local_ids: torch.Tensor,
+        gate_up_weight: torch.Tensor,
+        down_weight: torch.Tensor,
+        *,
+        routed_scaling_factor: float,
+    ) -> torch.Tensor:
+        """The LoRA lane's declared expert roundpoints, minus the adapter branch.
+
+        ``gate_up_weight`` / ``down_weight`` are FP32 ``[E, N, K]`` leaves;
+        the base branch keeps its BF16 compute boundaries via explicit casts,
+        exactly as the frozen-base branch of the exact QLoRA surrogate does.
+        """
+
+        local_experts = int(self.gate_up_packed_weight_f32.shape[0])
+        result = hidden.float() * 0.0 + routing.sum() * 0.0
+        # Exact-zero anchors keep unrouted experts participating with a
+        # mathematically zero gradient instead of returning ``None``.
+        result = result + (gate_up_weight.sum() + down_weight.sum()) * 0.0
+        for local_expert in range(local_experts):
+            pair_rows, pair_topk = (local_ids == local_expert).nonzero(as_tuple=True)
+            if pair_rows.numel() == 0:
+                continue
+            expert_input_bf16 = hidden.index_select(0, pair_rows).to(torch.bfloat16)
+            gate_up = F.linear(expert_input_bf16, gate_up_weight[local_expert].to(torch.bfloat16))
+            gate, up = gate_up.split(self.intermediate_size, dim=-1)
+            activated = F.silu(gate.float()).to(torch.bfloat16) * up
+            down = F.linear(activated, down_weight[local_expert].to(torch.bfloat16)).float()
+            scores = routing[pair_rows, pair_topk].unsqueeze(1)
+            result = result.index_add(0, pair_rows, down * scores * routed_scaling_factor)
+        return result
+
+    def _frozen_activation_vjp(
+        self,
+        hidden: torch.Tensor,
+        routing: torch.Tensor,
+        local_ids: torch.Tensor,
+        *,
+        grad_output: torch.Tensor,
+        routed_scaling_factor: float,
+        needs_input_grad: tuple[bool, bool],
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Activation-only backward through the dequantized frozen bytes.
+
+        The same surrogate program the full-param bank differentiates for its
+        masters, evaluated with the expert weights as CONSTANTS: only hidden
+        and routing gradients exist at a frozen bank.  Gradients are returned
+        at the callers' storage dtypes (BF16 hidden, FP32 routing).
+        """
+
+        need_hidden, need_routing = needs_input_grad
+        if not (need_hidden or need_routing):
+            return None, None
+
+        gate_up_deq, down_deq = self._dequantized_cached_experts()
+        with torch.enable_grad(), torch.autocast(device_type=hidden.device.type, enabled=False):
+            hidden_ref = hidden.float().detach().requires_grad_(need_hidden)
+            routing_ref = routing.float().detach().requires_grad_(need_routing)
+            output = self._surrogate_program(
+                hidden_ref,
+                routing_ref,
+                local_ids,
+                gate_up_deq.float().detach(),
+                down_deq.float().detach(),
+                routed_scaling_factor=routed_scaling_factor,
+            )
+            requested = [
+                reference for reference, needed in ((hidden_ref, need_hidden), (routing_ref, need_routing)) if needed
+            ]
+            computed = torch.autograd.grad(
+                output,
+                requested,
+                grad_outputs=grad_output.float(),
+                allow_unused=False,
+            )
+
+        iterator = iter(computed)
+        grad_hidden = next(iterator).to(hidden.dtype) if need_hidden else None
+        grad_routing = next(iterator).to(routing.dtype) if need_routing else None
+        return grad_hidden, grad_routing
 
     def forward(
         self,
@@ -687,8 +932,176 @@ class NativeBlockFP8ExpertPairBuffer:
             )
 
 
+class Glm52NativeBlockFP8DenseMLP(nn.Module):
+    """Serving-form dense MLP receiver for checkpoint-split byte payloads.
+
+    Consumes the checkpoint's unfused ``gate_proj``/``up_proj``/``down_proj``
+    byte pairs exactly the way the serving loader does — gate rows first, up
+    rows second, concatenated into one fused ``[2*intermediate, hidden]``
+    weight with scales fused in the same row order — and serves the frozen
+    exact program (fused gate/up W8A8 GEMM, one-round FP32 SwiGLU, down
+    W8A8 GEMM).
+    """
+
+    fsdp_requires_full_precision = True
+    contract_version = NATIVE_BLOCK_FP8_CONTRACT_VERSION
+
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        *,
+        device: torch.device | str | None = None,
+    ) -> None:
+        super().__init__()
+        if intermediate_size % 128:
+            raise ValueError(
+                "GLM-5.2 native dense MLP requires a 128-aligned intermediate size for the fused "
+                f"gate/up boundary, got {intermediate_size}"
+            )
+        self.hidden_size = int(hidden_size)
+        self.intermediate_size = int(intermediate_size)
+        self.gate_up_proj = NativeBlockFP8Linear(hidden_size, 2 * intermediate_size, device=device)
+        self.down_proj = NativeBlockFP8Linear(intermediate_size, hidden_size, device=device)
+
+    def load_prequantized_split(
+        self,
+        gate_weight: torch.Tensor,
+        gate_scale_inv: torch.Tensor,
+        up_weight: torch.Tensor,
+        up_scale_inv: torch.Tensor,
+        down_weight: torch.Tensor,
+        down_scale_inv: torch.Tensor,
+    ) -> None:
+        """The loader's real consumption: fuse gate rows then up rows, byte-verbatim."""
+
+        for name, tensor in (("gate", gate_weight), ("up", up_weight)):
+            if tuple(tensor.shape) != (self.intermediate_size, self.hidden_size):
+                raise ValueError(
+                    f"GLM-5.2 dense {name}_proj weight must be "
+                    f"({self.intermediate_size}, {self.hidden_size}), got {tuple(tensor.shape)}"
+                )
+        self.gate_up_proj.load_prequantized(
+            torch.cat((gate_weight, up_weight), dim=0),
+            torch.cat((gate_scale_inv, up_scale_inv), dim=0),
+        )
+        self.down_proj.load_prequantized(down_weight, down_scale_inv)
+
+    def checkpoint_split_bytes(self) -> tuple[torch.Tensor, ...]:
+        """Current bytes in the split checkpoint form (clones; snapshot/rollback)."""
+
+        fused_weight = self.gate_up_proj.fp8_weight()
+        fused_scale = self.gate_up_proj.weight_scale_inv.detach()
+        scale_rows = self.intermediate_size // 128
+        return (
+            fused_weight[: self.intermediate_size].clone(),
+            fused_scale[:scale_rows].clone(),
+            fused_weight[self.intermediate_size :].clone(),
+            fused_scale[scale_rows:].clone(),
+            self.down_proj.fp8_weight().clone(),
+            self.down_proj.weight_scale_inv.detach().clone(),
+        )
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        from xorl.ops.fused_silu_and_mul import exact_fp32_silu_and_mul  # noqa: PLC0415
+
+        gate_up = self.gate_up_proj(hidden_states)
+        activated = exact_fp32_silu_and_mul(gate_up)
+        return self.down_proj(activated)
+
+
+class Glm52NativeExpertSlotReceiver:
+    """One expert slot of a serving bank, fed by checkpoint-form byte payloads.
+
+    Applies the production ``NativeBlockFP8ExpertPairBuffer`` fuse for a
+    single expert — ``cat((gate, up), dim=0).T`` for gate/up, ``down.T`` for
+    down, scales identically — writing exactly one slot of the frozen bank's
+    packed GKN state.  All byte movement is a pure permutation.
+    """
+
+    def __init__(self, bank: Glm52NativeBlockFP8Experts, local_slot: int) -> None:
+        if not isinstance(bank, Glm52NativeBlockFP8Experts):
+            raise TypeError(f"Expert slot receiver requires a serving bank, got {type(bank).__name__}")
+        local_slot = int(local_slot)
+        stored_experts = int(bank.gate_up_packed_weight_f32.shape[0])
+        if not 0 <= local_slot < stored_experts:
+            raise ValueError(f"Expert slot {local_slot} outside the stored bank [0, {stored_experts})")
+        self.bank = bank
+        self.local_slot = local_slot
+
+    def load_checkpoint_expert(
+        self,
+        gate_weight: torch.Tensor,
+        gate_scale_inv: torch.Tensor,
+        up_weight: torch.Tensor,
+        up_scale_inv: torch.Tensor,
+        down_weight: torch.Tensor,
+        down_scale_inv: torch.Tensor,
+    ) -> None:
+        bank = self.bank
+        intermediate, hidden = bank.intermediate_size, bank.hidden_size
+        expected = {
+            "gate_proj.weight": (gate_weight, (intermediate, hidden), torch.float8_e4m3fn),
+            "gate_proj.weight_scale_inv": (gate_scale_inv, (intermediate // 128, hidden // 128), torch.float32),
+            "up_proj.weight": (up_weight, (intermediate, hidden), torch.float8_e4m3fn),
+            "up_proj.weight_scale_inv": (up_scale_inv, (intermediate // 128, hidden // 128), torch.float32),
+            "down_proj.weight": (down_weight, (hidden, intermediate), torch.float8_e4m3fn),
+            "down_proj.weight_scale_inv": (down_scale_inv, (hidden // 128, intermediate // 128), torch.float32),
+        }
+        for name, (tensor, shape, dtype) in expected.items():
+            if tensor.dtype is not dtype or tuple(tensor.shape) != shape:
+                raise ValueError(
+                    f"Expert slot {self.local_slot} {name} must be {dtype} {shape}, "
+                    f"got {tensor.dtype} {tuple(tensor.shape)}"
+                )
+        for name in ("gate_proj.weight_scale_inv", "up_proj.weight_scale_inv", "down_proj.weight_scale_inv"):
+            if not bool(torch.all(torch.isfinite(expected[name][0]))):
+                raise ValueError(f"Expert slot {self.local_slot} {name} contains non-finite values")
+
+        fused_weight = torch.cat((gate_weight, up_weight), dim=0).T.contiguous()
+        fused_scale = torch.cat((gate_scale_inv, up_scale_inv), dim=0).T.contiguous().float()
+        down_gkn = down_weight.T.contiguous()
+        down_scale_gkn = down_scale_inv.T.contiguous().float()
+        with torch.no_grad():
+            self.bank.gate_up_packed_weight_f32[self.local_slot].copy_(
+                pack_fp8_as_float32(fused_weight).reshape(self.bank.gate_up_packed_weight_f32.shape[1:])
+            )
+            self.bank.gate_up_weight_scale_inv[self.local_slot].copy_(fused_scale)
+            self.bank.down_packed_weight_f32[self.local_slot].copy_(
+                pack_fp8_as_float32(down_gkn).reshape(self.bank.down_packed_weight_f32.shape[1:])
+            )
+            self.bank.down_weight_scale_inv[self.local_slot].copy_(down_scale_gkn)
+
+    def checkpoint_expert_bytes(self) -> tuple[torch.Tensor, ...]:
+        """Current slot bytes in the split checkpoint form (copies; snapshot/rollback)."""
+
+        def _row_major_copy(tensor: torch.Tensor) -> torch.Tensor:
+            # .contiguous() is a no-op on size-1 dims and can leave
+            # byte-view-hostile strides behind a transpose.
+            output = torch.empty(tensor.shape, dtype=tensor.dtype, device=tensor.device)
+            output.copy_(tensor)
+            return output
+
+        bank, slot = self.bank, self.local_slot
+        intermediate = bank.intermediate_size
+        scale_blocks = intermediate // 128
+        gate_up = bank.gate_up_proj[slot]
+        gate_up_scale = bank.gate_up_weight_scale_inv[slot].detach()
+        return (
+            _row_major_copy(gate_up[:, :intermediate].t()),
+            _row_major_copy(gate_up_scale[:, :scale_blocks].t()),
+            _row_major_copy(gate_up[:, intermediate:].t()),
+            _row_major_copy(gate_up_scale[:, scale_blocks:].t()),
+            _row_major_copy(bank.down_proj[slot].t()),
+            _row_major_copy(bank.down_weight_scale_inv[slot].detach().t()),
+        )
+
+
 __all__ = [
+    "GLM52_NATIVE_EXPERTS_FROZEN_DGRAD_CONTRACT_VERSION",
+    "Glm52NativeBlockFP8DenseMLP",
     "Glm52NativeBlockFP8Experts",
+    "Glm52NativeExpertSlotReceiver",
     "Glm52OfficialFP8Inventory",
     "NativeBlockFP8ExpertPairBuffer",
     "NativeBlockFP8PairBuffer",

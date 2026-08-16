@@ -49,7 +49,15 @@ def _reset_contract_state():
     bi_families_v2._select_nonexact_families()
 
 
-def _build(monkeypatch, captured, *, model=None, server_training=False, freeze_router=False):
+def _build(
+    monkeypatch,
+    captured,
+    *,
+    model=None,
+    server_training=False,
+    freeze_router=False,
+    enable_lora=False,
+):
     def fake_parallelize(model, **_kwargs):
         captured["wrapped_at_parallelize"] = sum(
             1 for _, m in model.named_modules() if getattr(m, "_xorl_bi_trunk_wrapped", False)
@@ -73,6 +81,10 @@ def _build(monkeypatch, captured, *, model=None, server_training=False, freeze_r
         enable_gradient_checkpointing=False,
         server_training=server_training,
         freeze_router=freeze_router,
+        enable_lora=enable_lora,
+        lora_rank=2,
+        lora_alpha=4,
+        lora_target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
     )
 
 
@@ -116,6 +128,30 @@ def test_glm52_selects_v2_family_structurally(monkeypatch):
     _build(monkeypatch, captured, model=model, freeze_router=True)
 
     assert bi_families_v2.families_v2_enabled() is True
+
+
+def test_dense_qwen_exact_program_is_reinstalled_after_lora_replacement(monkeypatch):
+    from xorl.lora.modules.linear import LoraLinear
+    from xorl.ops.batch_invariant_ops import wrap_trunk_linears_batch_invariant
+
+    captured = {}
+    model = TinyTrunkModel()
+    model.config._qwen3_dense_exact_contract = True
+    monkeypatch.setenv("XORL_FAMILIES_V2", "0")
+
+    # Match the foundation-model lifecycle: these monkey patches belong to
+    # the original nn.Linear objects and LoRA injection replaces them.
+    wrap_trunk_linears_batch_invariant(model)
+    result = _build(monkeypatch, captured, model=model, server_training=True, enable_lora=True)
+
+    assert captured["wrapped_at_parallelize"] == 10
+    assert bi_families_v2.families_v2_enabled() is True
+    for layer in result.model.layers:
+        for name in ("q_proj", "o_proj", "gate_proj", "up_proj", "down_proj"):
+            module = layer[name]
+            assert type(module) is LoraLinear
+            assert module.exact_merged_forward is True
+            assert module._xorl_bi_trunk_wrapped is True
 
 
 def test_ordinary_model_restores_nonexact_family_selection(monkeypatch):

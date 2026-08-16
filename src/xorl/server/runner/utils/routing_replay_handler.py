@@ -72,13 +72,23 @@ class RoutingReplayHandler:
     training loss depends on matching the inference-time expert assignments.
 
     Args:
-        model: The nn.Module model containing MoE layers.
+        model: One model or the ordered local virtual-pipeline model parts
+            containing MoE layers.
     """
 
-    def __init__(self, model: nn.Module) -> None:
-        self.model = model
+    def __init__(self, model: Union[nn.Module, List[nn.Module]]) -> None:
+        self.models = tuple(model) if isinstance(model, (list, tuple)) else (model,)
+        if not self.models:
+            raise TypeError("RoutingReplayHandler requires one model or a nonempty list of model parts")
+        # Preserve the historical single-model attribute for callers that use
+        # it for metadata; discovery always walks every ordered local part.
+        self.model = self.models[0]
         self._moe_blocks: Optional[List[nn.Module]] = None
-        self._model_topk: Optional[int] = self._extract_topk(model)
+        self._model_topk: Optional[int] = next(
+            (topk for part in self.models if (topk := self._extract_topk(part)) is not None),
+            None,
+        )
+        self.last_setup_metrics: Dict[str, float] = {}
 
     @staticmethod
     def _extract_topk(model: nn.Module) -> Optional[int]:
@@ -111,7 +121,8 @@ class RoutingReplayHandler:
 
     def get_moe_blocks(self) -> List[nn.Module]:
         """
-        Find all MoE blocks in the model that have routing replay enabled.
+        Find all MoE blocks in the model that have routing replay enabled and
+        whose instantiated route program supports replay.
 
         Uses the same discovery pattern as base.py:enable_routing_replay() —
         looks for decoder layers whose ``mlp`` attribute is a MoEBlock with
@@ -128,10 +139,21 @@ class RoutingReplayHandler:
             return []
 
         moe_blocks = []
-        for _name, module in self.model.named_modules():
-            mlp = getattr(module, "mlp", None)
-            if isinstance(mlp, MoEBlock) and getattr(mlp, "_routing_replay", None) is not None:
-                moe_blocks.append(mlp)
+        seen = set()
+        for model_part in self.models:
+            named_modules = getattr(model_part, "named_modules", None)
+            if not callable(named_modules):
+                continue
+            for _name, module in named_modules():
+                mlp = getattr(module, "mlp", None)
+                if (
+                    isinstance(mlp, MoEBlock)
+                    and id(mlp) not in seen
+                    and mlp.supports_routing_replay()
+                    and getattr(mlp, "_routing_replay", None) is not None
+                ):
+                    seen.add(id(mlp))
+                    moe_blocks.append(mlp)
 
         self._moe_blocks = moe_blocks
         return moe_blocks
@@ -191,6 +213,11 @@ class RoutingReplayHandler:
                 except Exception as e:
                     logger.warning(f"{log_prefix}: Failed to reshape with shape {shape}: {e}")
                     return None
+                rows = item.get("rows", shape[0])
+                if not isinstance(rows, int) or isinstance(rows, bool) or rows < 0 or rows > shape[0]:
+                    logger.warning(f"{log_prefix}: Invalid rows view {rows!r} for shape {shape}")
+                    return None
+                arr = arr[:rows]
             else:
                 arr = self._infer_shape(arr, num_moe_layers)
                 if arr is None:
@@ -230,9 +257,29 @@ class RoutingReplayHandler:
         return self._decode_routing_array(item, num_moe_layers, np.float32, "R3 weights")
 
     @staticmethod
-    def _append_cpu_replay_tensor(replay: RoutingReplay, list_name: str, tensor: torch.Tensor) -> None:
-        """Append a CPU replay buffer without the extra pinned-memory staging copy."""
-        getattr(replay, list_name).append(tensor.detach().cpu().contiguous())
+    def _append_replay_tensor(replay: RoutingReplay, list_name: str, tensor: torch.Tensor) -> None:
+        """Append a view into an already staged replay buffer."""
+        getattr(replay, list_name).append(tensor.detach())
+
+    @staticmethod
+    def _stage_layer_major_replay_tensor(tensor: torch.Tensor) -> torch.Tensor:
+        """Transpose once and stage a whole microbatch in one H2D transfer.
+
+        Layer-major layout makes every per-layer replay entry contiguous while
+        retaining a single backing allocation for the microbatch.
+        """
+        if not torch.cuda.is_available():
+            return tensor.detach().permute(1, 0, 2).contiguous()
+
+        # Keep the host buffer in its existing token-major layout.  Pinning and
+        # transposing the full buffer on the host adds two more full-size CPU
+        # copies before H2D.  Transfer once, then use the GPU's memory bandwidth
+        # to materialize the contiguous layer-major backing allocation.
+        staged = tensor.detach().to(
+            device=torch.device("cuda", torch.cuda.current_device()),
+            non_blocking=True,
+        )
+        return staged.permute(1, 0, 2).contiguous()
 
     @staticmethod
     def _flatten_labels_for_decode_cache(labels: Any) -> List[int]:
@@ -268,18 +315,19 @@ class RoutingReplayHandler:
         segment_count = 0
         num_moe_layers = len(moe_blocks)
         for mb_idx, mb_routing_tensor in enumerate(per_mb_routing):
+            staged = self._stage_layer_major_replay_tensor(mb_routing_tensor)
             micro_batch = micro_batches[mb_idx] if mb_idx < len(micro_batches) else {}
             labels = self._flatten_labels_for_decode_cache(micro_batch.get("target_tokens", micro_batch.get("labels")))
             segments = self._decode_cache_segments(labels)
             if not segments:
                 continue
-            num_layers_to_use = min(num_moe_layers, mb_routing_tensor.shape[1])
+            num_layers_to_use = min(num_moe_layers, staged.shape[0])
             for start, end in segments:
                 for moe_idx in range(num_layers_to_use):
-                    self._append_cpu_replay_tensor(
+                    self._append_replay_tensor(
                         moe_blocks[moe_idx]._routing_replay,
                         list_name,
-                        mb_routing_tensor[start:end, moe_idx, :],
+                        staged[moe_idx, start:end, :],
                     )
                 segment_count += 1
         return segment_count
@@ -343,6 +391,7 @@ class RoutingReplayHandler:
             return False
 
         decode_start = time.perf_counter()
+        self.last_setup_metrics = {}
 
         # Decode each item (may be base64-encoded or nested list)
         decoded_routing = []
@@ -388,13 +437,19 @@ class RoutingReplayHandler:
         # Pre-populate RoutingReplay instances: for each micro-batch, for each
         # MoE block, call record() with the routing tensor for that (mb, layer).
         populate_start = time.perf_counter()
+        routing_stage_s = 0.0
+        staged_bytes = 0
         for mb_idx, mb_routing_tensor in enumerate(per_mb_routing):
-            # mb_routing_tensor: [num_tokens_mb, num_layers, topk]
-            num_layers_to_use = min(num_moe_layers, mb_routing_tensor.shape[1])
+            # One layer-major backing buffer and one H2D transfer per
+            # microbatch, rather than one transfer per layer during each pass.
+            stage_start = time.perf_counter()
+            staged_routing = self._stage_layer_major_replay_tensor(mb_routing_tensor)
+            routing_stage_s += time.perf_counter() - stage_start
+            staged_bytes += staged_routing.numel() * staged_routing.element_size()
+            num_layers_to_use = min(num_moe_layers, staged_routing.shape[0])
             for moe_idx in range(num_layers_to_use):
-                # [num_tokens_mb, topk]
-                layer_routing = mb_routing_tensor[:, moe_idx, :]
-                self._append_cpu_replay_tensor(
+                layer_routing = staged_routing[moe_idx]
+                self._append_replay_tensor(
                     moe_blocks[moe_idx]._routing_replay,
                     "top_indices_list",
                     layer_routing,
@@ -418,11 +473,16 @@ class RoutingReplayHandler:
                     topk,
                     tensor_dtype=torch.float32,
                 )
+                weights_stage_s = 0.0
                 for mb_idx, mb_weights_tensor in enumerate(per_mb_weights):
-                    num_layers_to_use_w = min(num_moe_layers, mb_weights_tensor.shape[1])
+                    stage_start = time.perf_counter()
+                    staged_weights = self._stage_layer_major_replay_tensor(mb_weights_tensor)
+                    weights_stage_s += time.perf_counter() - stage_start
+                    staged_bytes += staged_weights.numel() * staged_weights.element_size()
+                    num_layers_to_use_w = min(num_moe_layers, staged_weights.shape[0])
                     for moe_idx in range(num_layers_to_use_w):
-                        layer_weights = mb_weights_tensor[:, moe_idx, :].float()
-                        self._append_cpu_replay_tensor(
+                        layer_weights = staged_weights[moe_idx]
+                        self._append_replay_tensor(
                             moe_blocks[moe_idx]._routing_replay,
                             "top_weights_list",
                             layer_weights,
@@ -433,7 +493,18 @@ class RoutingReplayHandler:
                     weights_build_start - weights_decode_start,
                     time.perf_counter() - weights_build_start,
                 )
+                self.last_setup_metrics["r3_replay_weights_stage_s"] = weights_stage_s
 
+        setup_total_s = time.perf_counter() - decode_start
+        self.last_setup_metrics.update(
+            {
+                "r3_replay_setup_s": setup_total_s,
+                "r3_replay_routing_decode_s": build_start - decode_start,
+                "r3_replay_routing_build_s": populate_start - build_start,
+                "r3_replay_routing_stage_s": routing_stage_s,
+                "r3_replay_staged_bytes": float(staged_bytes),
+            }
+        )
         _r3_log_info(
             "R3: Pre-populated %s micro-batches x %s MoE layers into RoutingReplay instances "
             "(decode=%.3fs build=%.3fs populate=%.3fs total=%.3fs)",
@@ -442,7 +513,7 @@ class RoutingReplayHandler:
             build_start - decode_start,
             populate_start - build_start,
             time.perf_counter() - populate_start,
-            time.perf_counter() - decode_start,
+            setup_total_s,
         )
         return True
 
@@ -498,6 +569,8 @@ class RoutingReplayHandler:
         def _concat_routing(parts: List[Any]) -> Any:
             if not parts:
                 return np.empty((0, num_layers_in_data, topk), dtype=_numpy_dtype())
+            if len(parts) == 1:
+                return parts[0]
             if all(isinstance(part, np.ndarray) for part in parts):
                 return np.concatenate(parts, axis=0)
             routing = []
@@ -553,6 +626,124 @@ class RoutingReplayHandler:
                     return [int(v) for row in value for v in row]
                 return [int(v) for v in value]
             return None
+
+        def _flatten_cp_metadata(value: Any, key: str) -> List[Any]:
+            if isinstance(value, torch.Tensor):
+                return value.detach().reshape(-1).cpu().tolist()
+            if isinstance(value, np.ndarray):
+                return value.reshape(-1).tolist()
+            if isinstance(value, list):
+                array = np.asarray(value)
+                if array.dtype == object:
+                    raise ValueError(f"R3: CP row metadata {key} is ragged")
+                return array.reshape(-1).tolist()
+            raise ValueError(f"R3: CP row metadata {key} must be a tensor, array, or list")
+
+        def _local_routing_from_cp_source_map(
+            routing: Any,
+            datum_parts: List[Any],
+            micro_batch: Dict[str, Any],
+            expected_tokens: Optional[int],
+            mb_idx: int,
+        ) -> Any | None:
+            metadata_keys = (
+                "_cp_logical_row_indices",
+                "_cp_live_mask",
+                "_cp_request_ids",
+                "_cp_request_positions",
+            )
+            metadata_present = [micro_batch.get(key) is not None for key in metadata_keys]
+            if not any(metadata_present):
+                return None
+            if not all(metadata_present):
+                missing = [key for key, present in zip(metadata_keys, metadata_present) if not present]
+                raise ValueError(f"R3: MB{mb_idx} has incomplete CP row metadata; missing {missing}")
+
+            logical_rows = [
+                int(value) for value in _flatten_cp_metadata(micro_batch[metadata_keys[0]], metadata_keys[0])
+            ]
+            live_mask = [bool(value) for value in _flatten_cp_metadata(micro_batch[metadata_keys[1]], metadata_keys[1])]
+            request_ids = [
+                int(value) for value in _flatten_cp_metadata(micro_batch[metadata_keys[2]], metadata_keys[2])
+            ]
+            request_positions = [
+                int(value) for value in _flatten_cp_metadata(micro_batch[metadata_keys[3]], metadata_keys[3])
+            ]
+            physical_tokens = len(logical_rows)
+            metadata_lengths = {
+                len(live_mask),
+                len(request_ids),
+                len(request_positions),
+                physical_tokens,
+            }
+            if len(metadata_lengths) != 1:
+                raise ValueError(
+                    f"R3: MB{mb_idx} CP row metadata lengths differ: "
+                    f"logical={physical_tokens}, live={len(live_mask)}, "
+                    f"request_ids={len(request_ids)}, request_positions={len(request_positions)}"
+                )
+            if expected_tokens is not None and physical_tokens != expected_tokens:
+                raise ValueError(
+                    f"R3: MB{mb_idx} CP row metadata has {physical_tokens} rows, "
+                    f"but the local micro-batch has {expected_tokens} tokens"
+                )
+
+            datum_lengths = [_routing_len(part) for part in datum_parts]
+            datum_offsets = []
+            source_offset = 0
+            for datum_length in datum_lengths:
+                datum_offsets.append(source_offset)
+                source_offset += datum_length
+            if source_offset != _routing_len(routing):
+                raise RuntimeError(
+                    f"R3: MB{mb_idx} routing parts total {source_offset} rows, "
+                    f"but the concatenated routing has {_routing_len(routing)}"
+                )
+
+            local_routing = (
+                _pad_array(physical_tokens)
+                if isinstance(routing, np.ndarray)
+                else [_pad_entry() for _ in range(physical_tokens)]
+            )
+            seen_live_rows = set()
+            for physical_row, (logical_row, live, request_id, request_position) in enumerate(
+                zip(logical_rows, live_mask, request_ids, request_positions)
+            ):
+                if logical_row < -1:
+                    raise ValueError(
+                        f"R3: MB{mb_idx} CP row {physical_row} has invalid logical source row {logical_row}"
+                    )
+                if not live:
+                    if request_id != -1 or request_position != 0:
+                        raise ValueError(
+                            f"R3: MB{mb_idx} non-live CP row {physical_row} has request identity "
+                            f"({request_id}, {request_position})"
+                        )
+                    if 0 <= logical_row < source_offset:
+                        raise ValueError(f"R3: MB{mb_idx} routed source row {logical_row} is marked non-live")
+                    continue
+                if logical_row < 0:
+                    raise ValueError(f"R3: MB{mb_idx} live CP row {physical_row} is inserted padding")
+                if request_id < 0 or request_id >= len(datum_parts):
+                    raise ValueError(f"R3: MB{mb_idx} live CP row {physical_row} has invalid request id {request_id}")
+                datum_length = datum_lengths[request_id]
+                if request_position < 0 or request_position >= datum_length:
+                    raise ValueError(
+                        f"R3: MB{mb_idx} live CP row {physical_row} has request position "
+                        f"{request_position} outside request {request_id} length {datum_length}"
+                    )
+                expected_source_row = datum_offsets[request_id] + request_position
+                if logical_row != expected_source_row:
+                    raise ValueError(
+                        f"R3: MB{mb_idx} CP row {physical_row} maps logical source row {logical_row}, "
+                        f"but request ({request_id}, {request_position}) maps to {expected_source_row}"
+                    )
+                if logical_row in seen_live_rows:
+                    raise ValueError(f"R3: MB{mb_idx} repeats live source row {logical_row} in its local CP shard")
+                seen_live_rows.add(logical_row)
+                local_routing[physical_row] = routing[logical_row]
+
+            return local_routing
 
         def _resize_position_ids(position_ids: List[int], target_tokens: int) -> List[int]:
             if len(position_ids) < target_tokens:
@@ -662,7 +853,25 @@ class RoutingReplayHandler:
             micro_batch = micro_batches[mb_idx] if mb_idx < len(micro_batches) else {}
             expected_mb_tokens = _num_tokens(micro_batch.get("input_ids"))
 
-            if cp_enabled and mb_total_tokens > 0:
+            source_mapped_routing = None
+            if cp_enabled:
+                source_mapped_routing = _local_routing_from_cp_source_map(
+                    mb_routing,
+                    datum_routing,
+                    micro_batch,
+                    expected_mb_tokens,
+                    mb_idx,
+                )
+
+            if source_mapped_routing is not None:
+                mb_routing = source_mapped_routing
+                logger.debug(
+                    "R3: SP MB%s mapped %s source routing rows onto %s local physical rows",
+                    mb_idx,
+                    mb_total_tokens,
+                    _routing_len(mb_routing),
+                )
+            elif cp_enabled and mb_total_tokens > 0:
                 # Match the actual sharded micro-batch shape. Packed batches may
                 # already be padded to 128-token boundaries by SequentialPacker,
                 # while unpacked/server batches are only padded to the CP size.

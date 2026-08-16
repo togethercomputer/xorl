@@ -65,6 +65,7 @@ class TestToTensorCollator:
                     "labels": [4, 5, 6],
                     "position_ids": [0, 1, 2],
                     "attention_mask": [1, 1, 1],
+                    "logprob_temperatures": [1, 1, 1],
                     "other_field": [1.0, 2.0, 3.0],
                 }
             ]
@@ -73,6 +74,7 @@ class TestToTensorCollator:
         assert result_dtype[0]["labels"].dtype == torch.long
         assert result_dtype[0]["position_ids"].dtype == torch.long
         assert result_dtype[0]["attention_mask"].dtype == torch.long
+        assert result_dtype[0]["logprob_temperatures"].dtype == torch.float32
         assert result_dtype[0]["other_field"].dtype in [torch.float32, torch.float64]
 
         # Numpy dtype preservation

@@ -883,6 +883,10 @@ class InferenceEndpointServerInfo(BaseModel):
         default=None, description="Whether the endpoint reports static FP8 KV-cache scale state"
     )
     cache_epoch: Optional[Any] = Field(default=None, description="Receiver cache epoch/version, if reported")
+    radix_cache_enabled: Optional[bool] = Field(
+        default=None,
+        description="Whether the endpoint serves with the radix prefix cache enabled (derived from disable_radix_cache)",
+    )
     enable_lora: Optional[bool] = Field(default=None, description="Whether LoRA is enabled")
     max_lora_rank: Optional[int] = Field(default=None, description="Maximum LoRA rank supported")
     version: Optional[str] = Field(default=None, description="SGLang version")
@@ -1000,9 +1004,8 @@ class SyncInferenceWeightsRequest(BaseModel):
         default=False,
         description=(
             "Whether to flush inference KV/prefix cache after weight sync. "
-            "Set this for online weight updates when later requests may reuse prefixes scored under older weights; "
-            "token-keyed radix caches are not weight-version aware unless the receiver adds a separate invalidation "
-            "contract."
+            "Set this for every online weight update when later requests may reuse cached state; the pinned receiver "
+            "does not make KV or prefix-cache entries weight-version aware."
         ),
     )
     cache_invalidation_mode: Literal["auto", "flush", "none"] = Field(
@@ -1010,15 +1013,18 @@ class SyncInferenceWeightsRequest(BaseModel):
         description=(
             "How XoRL should handle inference KV/prefix cache invalidation for this sync. "
             "'auto' flushes when registered endpoint metadata reports FP8 KV cache and FP8 weight sync is active; "
-            "'flush' always flushes; 'none' relies on receiver-side versioning and does not add an automatic flush."
+            "'flush' always flushes and is required for online updates against the pinned receiver; 'none' disables "
+            "invalidation and is unsafe when cached state may survive the update. weight_version is metadata, not "
+            "cache namespacing."
         ),
     )
     pause_mode: Literal["retract", "abort", "in_place"] = Field(
-        default="in_place",
+        default="retract",
         description="How to pause inference during weight sync. "
         "'retract' (default): retract running requests to waiting queue, re-execute after resume. "
         "'abort': abort and return all in-flight requests. "
-        "'in_place': keep requests in place with KV cache (flush_cache must be False).",
+        "'in_place': keep requests in place with KV cache (flush_cache must be False); do not use it to "
+        "carry cached state across online weight updates against the pinned receiver.",
     )
     weight_version: Optional[str] = Field(
         default=None,

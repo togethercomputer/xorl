@@ -4,6 +4,8 @@ title: "Password Memorization"
 
 [`examples/server/password_memorization/`](https://github.com/togethercomputer/xorl/tree/main/examples/server/password_memorization) — End-to-end test for the full **training → weight sync → inference** pipeline. Trains a model to memorize 3 secret project codes via SFT, syncs weights to a running xorl-sglang instance, and queries inference to verify recall.
 
+The runner connects to an existing training server; it does not select full-weight, LoRA, or QLoRA mode. Start the server with the matching YAML first. The `--model` argument must agree with that server and primarily selects tokenizer/session metadata.
+
 **Run:**
 
 ```bash
@@ -33,6 +35,9 @@ python examples/server/password_memorization/run_password_test.py \
 | `--sync-quant` | fp8 | Sync quantization: `fp8` or `none` |
 | `--train-url` | `http://localhost:6000` | Training server URL |
 | `--infer-url` | `http://localhost:30000` | Inference endpoint URL |
+| `--run-baseline` | `false` | Run pre-training inference. Restart or clear the inference endpoint afterward before using this example's no-flush sync |
+
+This runner deliberately demonstrates a narrow no-flush update: use a freshly started, dedicated inference endpoint, allow no concurrent traffic, keep `--run-baseline` disabled, and perform the one weight update before the endpoint's first generation. Under those conditions no old-version KV or prefix-cache state exists to cross the version boundary. If any pre-sync generation has occurred, restart or clear the endpoint cache first.
 
 ## Weight sync pipeline
 
@@ -44,7 +49,9 @@ python examples/server/password_memorization/run_password_test.py \
 | QLoRA block_fp8 | fp8 dequant → bf16 merged → fp8 requant → SGLang |
 | QLoRA nf4 | nf4 dequant → bf16 merged → fp8 requant → SGLang |
 
-## Test matrix
+## Historical smoke matrix
+
+The result counts below are historical example outcomes without revision/container/artifact metadata on this page. Re-run a row against the intended checkout before treating it as a current gate.
 
 **Qwen3-8B (4x H100):**
 
@@ -70,4 +77,4 @@ python examples/server/password_memorization/run_password_test.py \
 | QLoRA nvfp4 | EP=8, SP=8 | 128 | 5e-4 | cosine | 3/3 |
 | QLoRA nf4 | EP=8, SP=8 | 128 | 5e-4 | cosine | 3/3 |
 
-See the [example README](https://github.com/togethercomputer/xorl/tree/main/examples/server/password_memorization/README.md) for the full test matrix and detailed setup instructions.
+See the [example README](https://github.com/togethercomputer/xorl/tree/main/examples/server/password_memorization/README.md) for the complete recorded matrix and detailed setup instructions.

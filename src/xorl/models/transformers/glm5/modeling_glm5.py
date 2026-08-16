@@ -12,11 +12,13 @@ from xorl.distributed.canonical_moe import (
     CanonicalMoEGraphMetadata,
     CanonicalMoETransport,
     LocalMoEContribution,
+    LogicalRowOwnership,
     OutputDistribution,
     ParallelPlan,
+    canonical_moe_leaf_fp32_v1,
     canonical_moe_reduce_cp_sharded_v3,
+    canonical_moe_reduce_fp64_v3,
     canonical_moe_reduce_packed_ep16_v2,
-    canonical_moe_reduce_v1,
     resolve_canonical_moe_transport,
 )
 from xorl.distributed.moe.deepep import sync_pending_combine
@@ -68,13 +70,12 @@ from xorl.models.transformers.glm5.rotary import glm5_apply_rotary_pos_emb
 from xorl.models.transformers.glm5.sparse_mla import sparse_mla_dispatch
 from xorl.models.transformers.glm5.support import validate_glm5_sequence_parallel
 from xorl.ops.block_fp8_native import NativeBlockFP8Linear
-from xorl.ops.fused_silu_and_mul import fused_silu_and_mul
+from xorl.ops.fused_silu_and_mul import exact_fp32_silu_and_mul, fused_silu_and_mul
 from xorl.utils import logging
 
 
 logger = logging.get_logger(__name__)
-GLM52_LOCAL_PARTIAL_POLICY = "glm52_routed_final_scaled_then_shared_ep_slice_bf16_v2"
-_GLM52_CANONICAL_TRAINER_TOPOLOGIES = ((16, 1, 1, 1),)
+GLM52_LOCAL_PARTIAL_POLICY = "glm52_routed_final_scaled_then_shared_ep_slice_fp32_then_bf16_v3"
 
 
 def _glm52_serving_grouped_topk(
@@ -126,11 +127,21 @@ class Glm5MLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, config.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
         self._use_fused_silu = config.hidden_act == "silu" and not getattr(config, "_activation_native", False)
+        # One-round FP32 SwiGLU pairs with serving's universal exact-mode
+        # activation (SiluAndMul.forward_exact, xorl-sglang f10b907d8). Model
+        # resolution stamps the family-neutral ``_exact_one_round_swiglu`` key
+        # for contracted families; unstamped configs keep the historical
+        # two-round bytes.
+        self._exact_one_round = bool(getattr(config, "_exact_one_round_swiglu", False))
+        if self._exact_one_round and config.hidden_act != "silu":
+            raise ValueError("GLM exact one-round SwiGLU requires hidden_act='silu'")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         gate = self.gate_proj(x)
         up = self.up_proj(x)
-        if self._use_fused_silu:
+        if self._exact_one_round:
+            hidden_states = exact_fp32_silu_and_mul(torch.cat([gate, up], dim=-1))
+        elif self._use_fused_silu:
             hidden_states = fused_silu_and_mul(torch.cat([gate, up], dim=-1))
         else:
             hidden_states = self.act_fn(gate) * up
@@ -799,8 +810,6 @@ class Glm5MoEBlock(MoEBlock):
         stage = get_replay_stage()
         replay = self._routing_replay
 
-        if self.canonical_contract_version is not None and (stage is not None or replay is not None):
-            raise RuntimeError("GLM-5.2 canonical MoE canonical path forbids routing replay and recomputation")
         if self.canonical_contract_version is not None and not _moe_bi_router_enabled(self.config):
             raise RuntimeError("GLM-5.2 canonical MoE requires its model-level exact router declaration")
         router_logits = self.gate(flat_hidden_states)
@@ -809,12 +818,21 @@ class Glm5MoEBlock(MoEBlock):
             cached_weights = None
             if stage == "record":
                 with torch.no_grad():
-                    _, selected_experts = self._route_tokens_to_experts(
+                    recorded_weights, selected_experts = self._route_tokens_to_experts(
                         router_logits,
                         flat_hidden_states.dtype,
                         hidden_states=flat_hidden_states,
                     )
                 replay.record(selected_experts)
+                if self.canonical_contract_version is not None:
+                    # Canonical grouped-top-k weights are part of the serving
+                    # numerical contract.  They are FP32 and intentionally do
+                    # not include routed_scaling_factor (the canonical expert
+                    # kernel applies that once at output).  Preserve those
+                    # literal values for checkpoint recomputation instead of
+                    # reconstructing a generic trainer approximation.
+                    replay.record_weights(recorded_weights)
+                    cached_weights = recorded_weights
             elif stage == "replay_forward":
                 selected_experts = replay.pop_forward()
                 cached_weights = replay.pop_forward_weights()
@@ -825,8 +843,21 @@ class Glm5MoEBlock(MoEBlock):
                 raise RuntimeError(f"Unsupported routing replay stage: {stage}")
 
             if cached_weights is not None:
-                routing_weights = cached_weights.to(flat_hidden_states.dtype)
+                if self.canonical_contract_version is not None:
+                    if cached_weights.dtype is not torch.float32:
+                        raise TypeError(
+                            "GLM-5.2 canonical routing replay requires literal FP32 serving weights, "
+                            f"got {cached_weights.dtype}"
+                        )
+                    routing_weights = cached_weights
+                else:
+                    routing_weights = cached_weights.to(flat_hidden_states.dtype)
             else:
+                if self.canonical_contract_version is not None:
+                    raise RuntimeError(
+                        "GLM-5.2 canonical routing replay requires cached serving weights; "
+                        "expert ids alone cannot reproduce the serving numerical contract"
+                    )
                 selected_experts, routing_weights = self._regather_routing(
                     router_logits,
                     selected_experts,
@@ -846,7 +877,30 @@ class Glm5MoEBlock(MoEBlock):
                 "DeepEP cannot propagate gradients through routing weights. "
                 "Set train_router=False or switch to ep_dispatch='alltoall'."
             )
-        if not self.train_router:
+        if getattr(self.gate, "_glm52_exact_fullparam_component", False):
+            # Full-param mode trains routers: their only gradient
+            # path is the combine multiply, so the routing weights must carry
+            # a gradient into the router logits.  The serving top-k programs
+            # are gradient-opaque, so the values are kept verbatim and the
+            # gradient is supplied by the trainer-owned regather surrogate.
+            if ep_dispatch == "deepep":
+                raise AssertionError("GLM-5.2 full-param router training is not supported with ep_dispatch='deepep'")
+            from xorl.models.transformers.glm5.exact_fullparam_fp8 import (  # noqa: PLC0415
+                glm52_fullparam_routing_weights_with_grad,
+            )
+
+            canonical = self.canonical_contract_version is not None
+            routing_weights = glm52_fullparam_routing_weights_with_grad(
+                router_logits,
+                routing_weights,
+                selected_experts,
+                # The canonical serving program renormalizes and leaves the
+                # routed scaling to the expert kernel; the generic trainer
+                # route folds both into the weights.
+                renormalize=True if canonical else bool(self.norm_topk_prob),
+                scale=1.0 if canonical else float(self.routed_scaling_factor),
+            )
+        elif not self.train_router:
             routing_weights = routing_weights.detach()
 
         return routing_weights, selected_experts, router_logits
@@ -940,6 +994,62 @@ class Glm5MoEBlock(MoEBlock):
         sync_pending_combine()
         return expert_output + shared_output
 
+    def _canonical_expert_slice(self, ep_rank: int, ep_size: int) -> tuple[int, int]:
+        """Resolve this rank's contiguous expert slice for the canonical dispatch.
+
+        Reconciles the two declared-expert-count conventions: the QLoRA EP16
+        bank and the frozen native banks DECLARE the global expert count and
+        store EP-locally, while the full-param trainable bank declares its
+        EP-LOCAL bank size and carries its admission-assigned GLOBAL range
+        (``assign_global_expert_range``).  For the full-param bank the
+        admission-time ownership and the dispatch-derived ownership must be
+        identical — anything else is a routing corruption, not a fallback.
+        """
+
+        # Resolve the slice from DECLARATIONS only.  Outside an expert-FSDP
+        # unshard window the packed parameters rest as sharded DTensors, so a
+        # shape-derived local_experts reads the resting shard instead of the
+        # compute-time bank.  Declaration-based resolution is safe only with
+        # its two fail-closed companions: the
+        # construction can no longer double-slice (ParallelPlan.apply fails
+        # closed on load-presliced tensors), and the bank's forward now
+        # ACTUALLY validates ids against stored rows at kernel time
+        # (Glm52NativeBlockFP8Experts._assert_expert_ids_within_stored_rows —
+        # the check this comment previously asserted into existence).
+        if isinstance(self.experts, Glm52ExactEP16BlockFP8QLoRARoutedExperts):
+            local_experts = int(self.experts.num_local_experts)
+            declared_global_experts = int(self.experts.num_experts)
+        elif getattr(self.experts, "_glm52_exact_fullparam_component", False):
+            # The full-param bank declares its EP-LOCAL size; its GLOBAL
+            # ownership is assigned at admission (fail-closed properties:
+            # RAISE if the admission never assigned the range).
+            local_experts = int(self.experts.num_experts)
+            declared_global_experts = int(self.experts.num_global_experts)
+            assigned_start = int(self.experts.global_expert_ids[0])
+            if assigned_start != ep_rank * local_experts:
+                raise RuntimeError(
+                    f"GLM-5.2 full-param expert bank owns the global block starting at {assigned_start} "
+                    f"but the canonical dispatch derives {ep_rank * local_experts} for ep_rank {ep_rank}; "
+                    "admission-time and dispatch-time EP ownership must be identical"
+                )
+        else:
+            # Frozen native bank: DECLARE-global / store-EP-local (the
+            # production pair-buffer ownership rule: local = global //
+            # ep_size, expert_start = ep_rank * local).
+            declared_global_experts = int(self.experts.num_experts)
+            local_experts = declared_global_experts // ep_size if ep_size else 0
+        if local_experts <= 0 or local_experts * ep_size != declared_global_experts:
+            packed = getattr(self.experts, "gate_up_packed_weight_f32", None)
+            raise RuntimeError(
+                "GLM-5.2 canonical MoE requires equal contiguous expert slices: "
+                f"bank={type(self.experts).__name__} local_experts={local_experts} "
+                f"ep_size={ep_size} ep_rank={ep_rank} declared_global={declared_global_experts} "
+                f"num_experts_attr={getattr(self.experts, 'num_experts', None)} "
+                f"packed_type={type(packed).__name__} "
+                f"packed_shape={tuple(packed.shape) if packed is not None else None}"
+            )
+        return local_experts, ep_rank * local_experts
+
     def _canonical_routed_local_partial(
         self,
         gathered: torch.Tensor,
@@ -989,7 +1099,13 @@ class Glm5MoEBlock(MoEBlock):
         else:
             gate = F.linear(gathered, self.shared_experts.gate_proj.weight[shard_start:shard_end])
             up = F.linear(gathered, self.shared_experts.up_proj.weight[shard_start:shard_end])
-        activated = F.silu(gate) * up
+        if getattr(self.config, "_exact_one_round_swiglu", False):
+            # Serving computes the exact-mode shared expert with the one-round
+            # FP32 SwiGLU (SiluAndMul.forward_exact since xorl-sglang
+            # f10b907d8); the canonical partial must produce those bytes.
+            activated = exact_fp32_silu_and_mul(torch.cat([gate, up], dim=-1))
+        else:
+            activated = F.silu(gate) * up
         if isinstance(self.shared_experts.down_proj, NativeBlockFP8Linear):
             return self.shared_experts.down_proj(
                 activated,
@@ -1014,28 +1130,34 @@ class Glm5MoEBlock(MoEBlock):
         )
 
         ps = get_parallel_state()
-        if not ps.ep_enabled or ps.ep_size != 16 or ps.cp_size != 16:
-            raise RuntimeError("GLM-5.2 exact trainer path requires aliased EP16/CP16")
-        admitted = _GLM52_CANONICAL_TRAINER_TOPOLOGIES
-        topology = (dist.get_world_size(), ps.pp_size, ps.tp_size, ps.dp_size)
-        if topology not in admitted:
-            raise RuntimeError(
-                f"GLM-5.2 canonical MoE trainer path does not admit WORLD/PP/TP/DP={topology}; "
-                f"admitted topologies are {admitted}"
-            )
-        if ps.ringattn_size != 1 or ps.ulysses_size != 16:
-            raise RuntimeError("GLM-5.2 canonical MoE trainer path requires Ring1 and Ulysses equal to EP")
-        if ps.dp_replicate_size != 1 or ps.dp_shard_size != ps.dp_size or ps.cp_fsdp_mode != "all":
-            raise RuntimeError(
-                "GLM-5.2 canonical trainer path requires DP-replicate1, fully sharded DP, and cp_fsdp_mode=all"
-            )
-        if ps.ep_group is None or ps.ulysses_group is None:
-            raise RuntimeError("GLM-5.2 canonical MoE requires the stage-local CP and EP process groups to alias")
+        if not ps.ep_enabled:
+            raise RuntimeError("GLM-5.2 canonical MoE requires expert-parallel contributors")
+        ownership = LogicalRowOwnership(
+            dp_size=ps.dp_size,
+            cp_size=ps.cp_size,
+            dp_rank=ps.dp_rank,
+            cp_rank=ps.cp_rank if ps.cp_enabled else 0,
+            contributor_count=ps.ep_size,
+        )
+        if ps.tp_size != 1:
+            raise RuntimeError("GLM-5.2 canonical MoE requires stage-local dense TP1")
+        if ps.ep_group is None:
+            raise RuntimeError("GLM-5.2 canonical MoE requires a stage-local EP contributor group")
         get_group_ranks = getattr(dist, "get_process_group_ranks", None)
-        if get_group_ranks is not None and tuple(get_group_ranks(ps.ep_group)) != tuple(
-            get_group_ranks(ps.ulysses_group)
-        ):
-            raise RuntimeError("GLM-5.2 canonical MoE requires identical stage-local CP and EP rank membership")
+        if ps.cp_size > 1:
+            if ps.sp_group is None:
+                raise RuntimeError("GLM-5.2 CP-owned rows require a stage-local sequence-parallel group")
+            if get_group_ranks is not None:
+                ep_ranks = tuple(get_group_ranks(ps.ep_group))
+                cp_ranks = tuple(get_group_ranks(ps.sp_group))
+                expected_cp_ranks = tuple(ep_ranks[index] for index in ownership.context_source_ordinals)
+                if cp_ranks != expected_cp_ranks:
+                    raise RuntimeError(
+                        "GLM-5.2 CP membership does not match the DP-major logical row layout: "
+                        f"expected={expected_cp_ranks}, actual={cp_ranks}"
+                    )
+        elif ps.sp_group is not None:
+            raise RuntimeError("GLM-5.2 CP1 rows must not have a sequence-parallel process group")
         if self.experts.ep_dispatch == "deepep":
             raise RuntimeError("GLM-5.2 canonical MoE canonical path does not support DeepEP")
         if hidden_states.dtype is not torch.bfloat16:
@@ -1058,17 +1180,16 @@ class Glm5MoEBlock(MoEBlock):
         gathered_routing = gather_tokens_for_ep_combine(routing_weights.reshape(local_rows, -1), group, padded_rows)
         gathered_ids = gather_ids_for_ep_combine(selected_experts.reshape(local_rows, -1), group, padded_rows)
         gathered_positions = gather_ids_for_ep_combine(local_positions[:, None], group, padded_rows).squeeze(-1)
-        local_valid = torch.ones((local_rows, 1), dtype=torch.int32, device=flat.device)
-        gathered_valid = gather_ids_for_ep_combine(local_valid, group, padded_rows).squeeze(-1) >= 0
+        local_valid = LogicalRowOwnership.valid_positions(local_positions).to(torch.int32)[:, None]
+        gathered_valid = gather_ids_for_ep_combine(local_valid, group, padded_rows).squeeze(-1) > 0
 
         ep_rank = dist.get_rank(group)
-        if isinstance(self.experts, Glm52ExactEP16BlockFP8QLoRARoutedExperts):
-            local_experts = self.experts.num_local_experts
-        else:
-            local_experts = int(self.experts.gate_up_proj.shape[0])
-        if local_experts * ps.ep_size != self.experts.num_experts:
-            raise RuntimeError("GLM-5.2 canonical MoE requires equal contiguous expert slices")
-        expert_start = ep_rank * local_experts
+        if ep_rank != ownership.source_ordinal:
+            raise RuntimeError(
+                "GLM-5.2 EP rank order does not match the DP-major/CP-minor row layout: "
+                f"ep_rank={ep_rank}, source_ordinal={ownership.source_ordinal}"
+            )
+        local_experts, expert_start = self._canonical_expert_slice(ep_rank, ps.ep_size)
         local_ids = torch.where(
             (gathered_ids >= expert_start) & (gathered_ids < expert_start + local_experts),
             gathered_ids - expert_start,
@@ -1080,7 +1201,7 @@ class Glm5MoEBlock(MoEBlock):
             contributor_ordinal=ep_rank,
             contributor_count=ps.ep_size,
         )
-        local_partial = (routed + shared).to(torch.bfloat16)
+        local_partial = canonical_moe_leaf_fp32_v1(shared, routed)
 
         capacity = int(getattr(self.config, "_glm52_canonical_moe_capacity", local_partial.shape[0]))
         if local_partial.shape[0] > capacity:
@@ -1111,11 +1232,28 @@ class Glm5MoEBlock(MoEBlock):
             valid_rows=int(gathered_valid.sum().item()),
         )
         contribution = LocalMoEContribution(local_partial, metadata, GLM52_LOCAL_PARTIAL_POLICY)
+        ep_mesh = ps.ep_fsdp_device_mesh
+        ep_dim = tuple(ep_mesh.mesh_dim_names).index("ep")
+        combine_groups = tuple(
+            tuple(int(rank) for rank in row.tolist())
+            for row in ep_mesh.mesh.movedim(ep_dim, -1).reshape(-1, ps.ep_size)
+        )
         plan = ParallelPlan.glm52_trainer(
             world_size=dist.get_world_size(),
             pp_size=ps.pp_size,
             dp_size=ps.dp_size,
             contributor_count=ps.ep_size,
+            cp_size=ps.cp_size,
+            combine_groups=combine_groups,
+            pipeline_layer_ranges=tuple(
+                tuple(int(value) for value in stage)
+                for stage in getattr(
+                    self.config,
+                    "_glm52_pipeline_layer_ranges",
+                    ((0, self.config.num_hidden_layers),),
+                )
+            ),
+            model_num_layers=self.config.num_hidden_layers,
         )
         resolved_transport = resolve_canonical_moe_transport(
             self.canonical_moe_transport,
@@ -1151,7 +1289,7 @@ class Glm5MoEBlock(MoEBlock):
             canonical_reduce = (
                 canonical_moe_reduce_packed_ep16_v2
                 if resolved_transport is CanonicalMoETransport.PACKED_EP16_V2
-                else canonical_moe_reduce_v1
+                else canonical_moe_reduce_fp64_v3
             )
             canonical = canonical_reduce(
                 contribution,
@@ -1159,15 +1297,12 @@ class Glm5MoEBlock(MoEBlock):
                 group=group,
                 output_distribution=OutputDistribution.REPLICATED_CANONICAL,
                 physical_global_rank=dist.get_rank(),
-                chunk_rows=int(getattr(self.config, "_glm52_canonical_moe_chunk_rows", capacity)),
                 graph_mode=False,
             )
         if resolved_transport is CanonicalMoETransport.CP_SHARDED_V3:
             local_canonical = canonical.tensor[:local_rows]
         else:
-            source_start = ep_rank * padded_rows
-            source_end = source_start + local_rows
-            local_canonical = canonical.tensor[source_start:source_end]
+            local_canonical = canonical.tensor[ownership.source_slice(padded_rows=padded_rows, local_rows=local_rows)]
         return local_canonical.reshape(batch_size, sequence_length, hidden_dim)
 
     def forward(
@@ -1381,6 +1516,13 @@ class Glm5PreTrainedModel(XorlPreTrainedModel):
             # Keep the base model independent of adapter implementation at
             # import time; exact_qlora may grow model-specific construction
             # helpers without creating a modeling import cycle.
+            from xorl.models.transformers.glm5.exact_fullparam_admission import (  # noqa: PLC0415
+                Glm52FullParamTopkRouter,
+            )
+            from xorl.models.transformers.glm5.exact_fullparam_fp8 import (  # noqa: PLC0415
+                Glm52ExactTP1BlockFP8FullParamLinear,
+                Glm52FullParamDenseMLP,
+            )
             from xorl.models.transformers.glm5.exact_qlora import (  # noqa: PLC0415
                 Glm52ExactTP1BlockFP8QLoRALinear,
             )
@@ -1392,6 +1534,15 @@ class Glm5PreTrainedModel(XorlPreTrainedModel):
                 NativeBlockFP8Linear,
                 Glm52ExactTP1BlockFP8QLoRALinear,
                 Glm52ExactTP16SharedExpertBlockFP8QLoRA,
+                # Full-param training: dense composites and routers own
+                # FP32 masters plus byte-packed caches — the decoder-layer
+                # BF16 param cast would corrupt both; the composites'
+                # engaged-contract check refuses to score in that state. Expert banks
+                # take the dedicated expert-FSDP branch and must not appear
+                # here.
+                Glm52FullParamDenseMLP,
+                Glm52FullParamTopkRouter,
+                Glm52ExactTP1BlockFP8FullParamLinear,
             )
         return None
 
@@ -1487,7 +1638,9 @@ class Glm5Model(Glm5PreTrainedModel):
             return None
         local_layers = tuple(index for index, layer in enumerate(self.layers) if layer is not None)
         if not local_layers:
-            raise RuntimeError("GLM-5.2 model part owns no decoder layers")
+            # Weighted PP layouts may assign embedding/head-only edge stages.
+            # They carry no IndexShare producer/consumer and need no context.
+            return None
         candidates = [
             stage
             for stage in self.layer_plan.pipeline_layer_ranges
@@ -1508,10 +1661,10 @@ class Glm5Model(Glm5PreTrainedModel):
         return manager
 
     def release_index_share_context(self) -> None:
-        """Idempotently release a retained backward-bearing invocation."""
+        """Release every invocation retained by the completed PP schedule."""
 
         for manager in self._index_share_context_managers.values():
-            manager.end_active()
+            manager.end_all()
 
     def forward(
         self,
@@ -1681,13 +1834,22 @@ class Glm5ForCausalLM(Glm5PreTrainedModel):
         self.model.release_index_share_context()
 
     def get_pp_module_config(self):
-        return {
+        pp_config = {
             "input_fqns": ["model.embed_tokens"],
             "layer_prefix": "model.layers",
             "output_fqns": ["model.norm", "lm_head"],
             "always_keep_fqns": ["model.rotary_emb"],
             "num_layers": self.config.num_hidden_layers,
         }
+        ranges = getattr(self.config, "_glm52_pipeline_layer_ranges", None)
+        if ranges is not None:
+            pp_config["pipeline_layer_ranges"] = tuple(
+                tuple(int(value) for value in stage_range) for stage_range in ranges
+            )
+        module_plan = getattr(self.config, "_glm52_pipeline_module_names_per_stage", None)
+        if module_plan is not None:
+            pp_config["module_names_per_stage"] = tuple(tuple(names) for names in module_plan)
+        return pp_config
 
     def forward(
         self,

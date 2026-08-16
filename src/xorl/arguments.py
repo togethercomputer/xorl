@@ -316,7 +316,7 @@ class DataArguments:
     sample_packing_group_size: Optional[int] = field(
         default=100000,
         metadata={
-            "help": "The number of samples packed at a time. Increasing this value helps with packing, but usually only slightly (<%1)."
+            "help": "The number of samples packed at a time. Increasing this value helps with packing, but usually only slightly (<1%%)."
         },
     )
     sample_packing_bin_size: Optional[int] = field(
@@ -610,7 +610,7 @@ class ModelArguments:
         metadata={
             "help": "Backend for sparse-MLA dispatch when `sparse_mla_enabled=True`. "
             "'auto' (default) picks tilelang on CUDA + bf16 when the kernel's shape "
-            "constraints hold (`dim_plus_tail_dim == 576`, `topk % 64 == 0`), else "
+            "constraints hold (`dim_plus_tail_dim == 576`, `topk %% 64 == 0`), else "
             "the torch reference. 'torch' is the dense-gather reference, correct but "
             "slow; useful for CPU/CI and as a fallback. 'tilelang' forces the "
             "vendored kernel. 'flashmla' uses the sampler-exact public "
@@ -1015,8 +1015,9 @@ class TrainingArguments:
         default=False,
         metadata={
             "help": (
-                "Enable experimental dense full-weight QARL fake quantization. Initial support uses dynamic "
-                "E4M3 fake quantization with full-precision master parameters and STE gradients."
+                "Enable experimental full-weight QARL fake quantization with full-precision master parameters "
+                "and STE gradients. E4M3 supports dense nn.Linear modules; NVFP4 also supports MoE expert "
+                "containers."
             )
         },
     )
@@ -1024,8 +1025,9 @@ class TrainingArguments:
         default=None,
         metadata={
             "help": (
-                "QARL quantization config or alias. Initial support accepts null, 'FP8_DEFAULT_CFG', 'fp8', "
-                "or a dict with format/quant_method=e4m3/fp8_e4m3 plus optional weight/activation booleans."
+                "QARL quantization config or alias. Accepts null, 'FP8_DEFAULT_CFG', 'fp8', 'fp8_e4m3', "
+                "'e4m3', or 'nvfp4', plus dictionaries for those formats. NVFP4 defaults to weight-only, "
+                "dynamic group-size-16 fake quantization."
             )
         },
     )
@@ -1047,7 +1049,12 @@ class TrainingArguments:
     )
     qarl_target_modules: Optional[List[str]] = field(
         default=None,
-        metadata={"help": "Optional short nn.Linear module names to wrap with QARL fake quantization."},
+        metadata={
+            "help": (
+                "Optional short names, FQNs, or globs to wrap with QARL fake quantization. NVFP4 targets may "
+                "also match MoE expert containers."
+            )
+        },
     )
     qarl_exclude_modules: Optional[List[str]] = field(
         default=None,
@@ -1204,10 +1211,10 @@ class TrainingArguments:
                 "                                dispatch + combine alltoall. Lowest memory.\n"
                 "                                Required for 128k+ seq. (default)\n"
                 "  'recompute_before_dispatch' — recompute attn + layernorm + router; keep\n"
-                "                                dispatch + expert + combine. +20% speed,\n"
-                "                                more memory than recompute_full_layer.\n"
-                "  'no_recompute'              — no recomputation, max throughput. +34% speed\n"
-                "                                but highest memory, only fits short seq.\n"
+                "                                dispatch + expert + combine. Uses more memory\n"
+                "                                but avoids replaying expert communication.\n"
+                "  'no_recompute'              — no recomputation and highest activation memory;\n"
+                "                                use only after a shape-matched fit check.\n"
             )
         },
     )
@@ -1295,7 +1302,8 @@ class TrainingArguments:
             "(model_runner) applies enable_high_precision_for_bf16() unconditionally — so out of the box "
             "local training does NOT match server/K3 numerics. Local runs must opt in (set True) whenever "
             "trainer-recomputed logprobs need to match the values measured by the K3 harness against the "
-            "server. Kept opt-in for throughput: measured +5.5% step time on a 30B-A3B MoE at 128k."
+            "server. Kept opt-in because the higher-precision matmul settings can reduce throughput; "
+            "benchmark them on the intended model and topology."
         },
     )
     allow_cuda_launch_blocking: bool = field(
@@ -1865,6 +1873,14 @@ class LoRAArguments:
         default=16,
         metadata={"help": "LoRA alpha for scaling"},
     )
+    lora_b_init_std: float = field(
+        default=0.0,
+        metadata={"help": "Optional deterministic normal initialization std for LoRA-B"},
+    )
+    lora_b_init_seed: int = field(
+        default=0,
+        metadata={"help": "Seed for deterministic nonzero LoRA-B initialization"},
+    )
     lora_target_modules: Optional[List[str]] = field(
         default=None,
         metadata={"help": "Modules to apply LoRA to. If None, uses default linear projections."},
@@ -1874,6 +1890,18 @@ class LoRAArguments:
         metadata={
             "help": "Strict LoRA target manifest mapping or JSON path. The manifest supplies target_modules "
             "and validates exact runtime module counts/ranks before training."
+        },
+    )
+    unfuse_for_lora: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Split fused qkv_proj / gate_up_proj before LoRA injection so q/k/v and "
+                "gate/up can be adapted. Without this they are stored fused, match no "
+                "target name, and train unadapted. Costs base-forward throughput: the "
+                "fused GEMMs split, and the MLP loses its fused SiLU-and-mul kernel. "
+                "Requires enable_lora; rejected with enable_qlora."
+            )
         },
     )
     save_lora_only: bool = field(

@@ -6,12 +6,20 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+from xorl.ops.exact_sampling_transforms import TOP_K_ALL
 from xorl.ops.loss.compiled_cross_entropy import (
     compiled_ce_and_lse_sq_function,
     compiled_cross_entropy_function,
 )
 from xorl.ops.loss.loss_output import LossOutput
-from xorl.ops.loss.per_token_ce import compute_per_token_ce
+from xorl.ops.loss.per_token_ce import (
+    LogprobProbability,
+    LogprobTemperature,
+    LogprobTopK,
+    compute_per_token_ce,
+    normalize_logprob_temperature,
+    resolve_bi_fused_lm_head_tp_groups,
+)
 from xorl.ops.loss.reducers import Reducer, TokenPartial
 from xorl.ops.loss.vocab_parallel_cross_entropy import (
     _backward_kernel as _vocab_parallel_ce_backward_kernel,
@@ -448,7 +456,10 @@ def causallm_loss_function(
     loss_reducer: Reducer | None = None,
     z_loss_coef: float = 0.0,
     lm_head: torch.nn.Module | None = None,
-    logprob_temperature: float = 1.0,
+    logprob_temperature: LogprobTemperature = 1.0,
+    logprob_top_k: LogprobTopK = TOP_K_ALL,
+    logprob_top_p: LogprobProbability = 1.0,
+    logprob_min_p: LogprobProbability = 0.0,
 ) -> "LossOutput":
     """
     Compute causal language modeling loss.
@@ -485,7 +496,8 @@ def causallm_loss_function(
         logprob_temperature: Temperature for selected-token logprobs. ``1.0``
                      returns raw model logprobs; a rollout temperature such as
                      ``0.7`` returns behavior-policy logprobs using
-                     ``log_softmax(logits / temperature)``.
+                     ``log_softmax(logits / temperature)``. Exact LM heads also
+                     accept contiguous FP32 temperatures aligned with labels.
 
     Returns:
         LossOutput with loss, and optionally per_token_logprobs/per_token_loss.
@@ -499,18 +511,64 @@ def causallm_loss_function(
     labels_flat = labels.view(-1)
     hidden_states_flat = hidden_states.view(-1, hidden_states.size(-1))
     valid_mask = labels_flat != ignore_index
+    bi_fused_tp_groups = resolve_bi_fused_lm_head_tp_groups(ce_mode, tp_group, lm_head)
+    has_explicit_loss_reducer = loss_reducer is not None
 
     if loss_reducer is None:
-        loss_reducer = TokenPartial(scale=valid_mask.sum().float())
+        scale = valid_mask.sum().float()
+        if bi_fused_tp_groups is not None:
+            dedicated_group, replica_group = bi_fused_tp_groups
+            dist.all_reduce(scale, op=dist.ReduceOp.SUM, group=dedicated_group)
+            if replica_group is not None:
+                dist.all_reduce(scale, op=dist.ReduceOp.SUM, group=replica_group)
+        loss_reducer = TokenPartial(scale=scale)
 
     mask_flat = valid_mask.float()
-    logprob_temperature = float(logprob_temperature)
-    if logprob_temperature <= 0.0:
-        raise ValueError(f"logprob_temperature must be > 0, got {logprob_temperature}")
-    exact_lm_head = bool(lm_head is not None and getattr(lm_head, "_glm52_exact_tp16_lm_head", False))
+    if isinstance(logprob_temperature, torch.Tensor):
+        if not logprob_temperature.is_contiguous():
+            raise ValueError("per-row logprob_temperature must be contiguous")
+        if tuple(logprob_temperature.shape) not in (tuple(labels.shape), (labels_flat.shape[0],)):
+            raise ValueError(
+                "per-row logprob_temperature must match labels or flattened labels, got "
+                f"{tuple(logprob_temperature.shape)} for labels {tuple(labels.shape)}"
+            )
+        logprob_temperature = logprob_temperature.reshape(-1)
+    logprob_temperature = normalize_logprob_temperature(
+        logprob_temperature,
+        rows=labels_flat.shape[0],
+        device=hidden_states.device,
+    )
+
+    def _flatten_sampling_metadata(value, name: str):
+        if not isinstance(value, torch.Tensor):
+            return value
+        if not value.is_contiguous():
+            raise ValueError(f"per-row {name} must be contiguous")
+        if tuple(value.shape) not in (tuple(labels.shape), (labels_flat.shape[0],)):
+            raise ValueError(f"per-row {name} must match labels or flattened labels")
+        return value.reshape(-1)
+
+    logprob_top_k = _flatten_sampling_metadata(logprob_top_k, "logprob_top_ks")
+    logprob_top_p = _flatten_sampling_metadata(logprob_top_p, "logprob_top_ps")
+    logprob_min_p = _flatten_sampling_metadata(logprob_min_p, "logprob_min_ps")
+    has_temperature_transform = isinstance(logprob_temperature, torch.Tensor) or logprob_temperature != 1.0
+    has_sampling_filter = (
+        isinstance(logprob_top_k, torch.Tensor)
+        or isinstance(logprob_top_p, torch.Tensor)
+        or isinstance(logprob_min_p, torch.Tensor)
+        or int(logprob_top_k) < TOP_K_ALL
+        or float(logprob_top_p) != 1.0
+        or float(logprob_min_p) != 0.0
+    )
+    exact_lm_head = bool(
+        lm_head is not None
+        and (getattr(lm_head, "_glm52_exact_tp16_lm_head", False) or getattr(lm_head, "_dsv4_exact_tp8_lm_head", False))
+    )
     if ce_mode == "bi_fused":
-        if tp_group is not None and not exact_lm_head:
-            raise NotImplementedError("ce_mode='bi_fused' does not support tensor parallelism yet")
+        if tp_group is not None and not exact_lm_head and bi_fused_tp_groups is None:
+            raise NotImplementedError(
+                "ce_mode='bi_fused' supports TP only through the dedicated vocabulary-sharded LM-head TP path"
+            )
         if lm_head is not None and not lm_head_fp32 and not exact_lm_head:
             raise NotImplementedError("ce_mode='bi_fused' does not support FP8 lm_head modules")
     if exact_lm_head:
@@ -528,6 +586,9 @@ def causallm_loss_function(
             lm_head_fp32=lm_head_fp32,
             lm_head=lm_head,
             logprob_temperature=logprob_temperature,
+            logprob_top_k=logprob_top_k,
+            logprob_top_p=logprob_top_p,
+            logprob_min_p=logprob_min_p,
         )
         loss = loss_reducer(per_token_ce, mask_flat)
         if return_per_token:
@@ -537,7 +598,52 @@ def causallm_loss_function(
                 per_token_loss=per_token_ce.view(original_shape),
             )
         return LossOutput(loss=loss)
-    if logprob_temperature != 1.0:
+    if bi_fused_tp_groups is not None:
+        if z_loss_coef > 0.0:
+            raise NotImplementedError("ce_mode='bi_fused' does not support softmax_auxiliary_loss")
+        per_token_ce = compute_per_token_ce(
+            hidden_states_flat,
+            weight,
+            labels_flat,
+            ignore_index,
+            ce_mode,
+            num_chunks,
+            tp_group=tp_group,
+            use_compile=use_compile,
+            lm_head_fp32=lm_head_fp32,
+            lm_head=lm_head,
+            logprob_temperature=logprob_temperature,
+            logprob_top_k=logprob_top_k,
+            logprob_top_p=logprob_top_p,
+            logprob_min_p=logprob_min_p,
+        )
+        local_loss = loss_reducer(per_token_ce, mask_flat)
+        if has_explicit_loss_reducer:
+            if return_per_token:
+                return LossOutput(
+                    loss=local_loss,
+                    per_token_logprobs=-per_token_ce.detach().view(original_shape),
+                    per_token_loss=per_token_ce.view(original_shape),
+                )
+            return LossOutput(loss=local_loss)
+
+        # Standalone/default-reducer calls historically return the full scalar
+        # on every rank. Explicit reducers instead promise a local partial, and
+        # their caller owns detached reporting aggregation.
+        global_loss = local_loss.detach().clone()
+        dedicated_group, replica_group = bi_fused_tp_groups
+        dist.all_reduce(global_loss, op=dist.ReduceOp.SUM, group=dedicated_group)
+        if replica_group is not None:
+            dist.all_reduce(global_loss, op=dist.ReduceOp.SUM, group=replica_group)
+        loss = local_loss + (global_loss - local_loss.detach())
+        if return_per_token:
+            return LossOutput(
+                loss=loss,
+                per_token_logprobs=-per_token_ce.detach().view(original_shape),
+                per_token_loss=per_token_ce.view(original_shape),
+            )
+        return LossOutput(loss=loss)
+    if has_temperature_transform or has_sampling_filter:
         if z_loss_coef > 0.0:
             raise NotImplementedError("logprob_temperature is not supported with softmax_auxiliary_loss")
         per_token_ce = compute_per_token_ce(
@@ -552,6 +658,9 @@ def causallm_loss_function(
             lm_head_fp32=lm_head_fp32,
             lm_head=lm_head,
             logprob_temperature=logprob_temperature,
+            logprob_top_k=logprob_top_k,
+            logprob_top_p=logprob_top_p,
+            logprob_min_p=logprob_min_p,
         )
         loss = loss_reducer(per_token_ce, mask_flat)
         if return_per_token:

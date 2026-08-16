@@ -1332,8 +1332,7 @@ def sglang_rms_norm_batch_invariant(
 #
 # Two batch-invariant RMSNorm kernel families coexist, and they disagree at
 # 1 ulp on rare bf16 boundary values (~2/524288 at [4096, 128]), so silently
-# swapping one for the other seeds K3 divergence that amplifies downstream
-# (the 2026-07-04 norm-seed incident: 2.99e-5 K3 from five such seeds).
+# swapping one for the other seeds K3 divergence that amplifies downstream.
 # Each family is pinned to the serving site-class that executes it:
 #   - "serving_no_residual" (family-1): the looped ``tl.sum`` + ``1.0/tl.sqrt``
 #     kernel (``rms_norm_batch_invariant``), what SGLang dispatches when
@@ -1632,6 +1631,77 @@ def bi_lm_head_selected_logprob(
     _lm_head_lse_merge_kernel[(n_tokens,)](chunk_max, chunk_sumexp, lse, n_chunks)
     # In exact math the selected logit never exceeds the LSE; clamp the one-ulp
     # fp boundary case (p~1 tokens) so contract logprobs are provably <= 0.
+    return torch.clamp_max(selected - lse, 0.0), lse, selected
+
+
+def bi_lm_head_full_logits(
+    hidden: torch.Tensor,
+    weight: torch.Tensor,
+    vocab_chunk: int = BI_LM_HEAD_VOCAB_CHUNK,
+) -> torch.Tensor:
+    """Materialize full FP32 logits through the v1 contract GEMM."""
+
+    assert hidden.ndim == 2 and weight.ndim == 2, "hidden and weight must be 2D"
+    assert hidden.shape[1] == weight.shape[1], "hidden dim mismatch"
+    assert hidden.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16, (
+        "the lm-head contract takes bf16 hidden/weight"
+    )
+    assert hidden.is_cuda, "CUDA only"
+
+    hidden = hidden.contiguous()
+    logits = torch.empty(
+        (hidden.shape[0], weight.shape[0]),
+        dtype=torch.float32,
+        device=hidden.device,
+    )
+    if hidden.shape[0] != 0:
+        _bi_lm_head_chunk_gemm_fp32(hidden, weight.t(), logits)
+    return logits
+
+
+def bi_lm_head_selected_logprob_from_logits(
+    logits: torch.Tensor,
+    token_ids: torch.Tensor,
+    temperature: Optional[torch.Tensor] = None,
+    vocab_chunk: int = BI_LM_HEAD_VOCAB_CHUNK,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run the v1 stats and merge tree over materialized FP32 logits."""
+
+    assert logits.ndim == 2 and logits.dtype == torch.float32, "logits must be FP32 [N, V]"
+    assert logits.is_cuda and logits.stride(1) == 1, "logits must be contiguous CUDA rows"
+    n_tokens, vocab = logits.shape
+    token_ids = token_ids.contiguous().to(device=logits.device, dtype=torch.int64)
+    assert token_ids.shape == (n_tokens,), "token_ids must be per-row [N]"
+    n_chunks = (vocab + vocab_chunk - 1) // vocab_chunk
+    if temperature is not None:
+        temperature = temperature.reshape(-1).to(device=logits.device, dtype=torch.float32).contiguous()
+        assert temperature.shape == (n_tokens,), "temperature must be per-row [N]"
+        torch._assert_async((temperature > 0).all(), "temperature must be > 0")
+
+    chunk_max = torch.empty((n_tokens, n_chunks), dtype=torch.float32, device=logits.device)
+    chunk_sumexp = torch.empty_like(chunk_max)
+    selected = torch.zeros(n_tokens, dtype=torch.float32, device=logits.device)
+    lse = torch.empty(n_tokens, dtype=torch.float32, device=logits.device)
+    for chunk_idx, col_start in enumerate(range(0, vocab, vocab_chunk)):
+        col_end = min(col_start + vocab_chunk, vocab)
+        logits_c = logits[:, col_start:col_end]
+        _lm_head_chunk_stats_kernel[(n_tokens,)](
+            logits_c,
+            token_ids,
+            selected,
+            chunk_max,
+            chunk_sumexp,
+            temperature,
+            logits_c.stride(0),
+            col_end - col_start,
+            col_start,
+            chunk_idx,
+            n_chunks,
+            BLOCK_SIZE=_BI_LM_HEAD_STATS_BLOCK,
+            HAS_TEMP=temperature is not None,
+        )
+
+    _lm_head_lse_merge_kernel[(n_tokens,)](chunk_max, chunk_sumexp, lse, n_chunks)
     return torch.clamp_max(selected - lse, 0.0), lse, selected
 
 
@@ -2028,6 +2098,7 @@ def wrap_trunk_linears_batch_invariant(
 
     from xorl.lora.fold import lora_merged_forward_enabled  # noqa: PLC0415
     from xorl.lora.modules.base import LoraModule  # noqa: PLC0415
+    from xorl.lora.modules.delta_linear import LoraDeltaLinear  # noqa: PLC0415
     from xorl.lora.modules.linear import LoraLinear  # noqa: PLC0415
 
     if is_batch_invariant_mode_enabled():
@@ -2053,6 +2124,13 @@ def wrap_trunk_linears_batch_invariant(
         if leaf not in names:
             continue
         if ".experts." in f".{module_name}.":
+            continue
+        if isinstance(module, LoraDeltaLinear) and module_name.endswith(
+            (".mlp.shared_expert.gate_proj", ".mlp.shared_expert.up_proj")
+        ):
+            # These are factor-only children of the fused gate_up_proj.  The
+            # parent base GEMM is wrapped and Qwen3_5MoeMLP folds both logical
+            # projections into that one contracted call.
             continue
         if type(module) is LoraLinear and lora_merged_forward_enabled(module):
             # Merged-forward contract lane: the adapted linear serves and trains

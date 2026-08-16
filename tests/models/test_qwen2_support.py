@@ -78,7 +78,14 @@ def test_qwen2_unfuse_for_tp_matches_hf_parameter_layout():
     assert not hasattr(layer.mlp, "gate_up_proj")
     assert hasattr(layer.mlp, "gate_proj")
     assert hasattr(layer.mlp, "up_proj")
-    assert model.get_checkpoint_handler() is None
+    # Unfused: the handler is returned with both merges disabled; its pre-quantized
+    # loading paths stay active.
+    handler = model.get_checkpoint_handler()
+    assert handler is not None
+    # HF's already-split keys pass straight through to matching parameters.
+    key = "model.layers.0.self_attn.q_proj.weight"
+    passthrough = handler.on_load_weight(key, layer.self_attn.q_proj.weight.detach())
+    assert [name for name, _ in passthrough] == [key]
 
 
 def test_qwen2_checkpoint_handler_exports_hf_compatible_attention_keys():

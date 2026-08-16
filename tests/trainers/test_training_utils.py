@@ -7,11 +7,14 @@ import torch.nn as nn
 import xorl.trainers.training_utils as training_utils_module
 from xorl.data.constants import IGNORE_INDEX
 from xorl.trainers.training_utils import (
+    align_dsv4_pp_storage_rows,
     clip_gradients,
     count_active_microbatches,
     count_valid_tokens,
+    forward_backward_pp,
     get_distsign_grad_scale_factor,
     get_effective_grad_clip_value,
+    pad_micro_batches_for_pp,
     sync_lm_head_tp_gradient,
     sync_lm_head_tp_parameters,
     sync_sp_gradients,
@@ -25,6 +28,64 @@ class TinyModule(nn.Module):
     def __init__(self):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(2, dtype=torch.float32))
+
+
+def test_dsv4_pp_storage_alignment_covers_unequal_owner_planes(monkeypatch):
+    monkeypatch.setattr(training_utils_module, "get_device_type", lambda: "cpu")
+    monkeypatch.setattr(training_utils_module.dist, "is_available", lambda: True)
+    monkeypatch.setattr(training_utils_module.dist, "is_initialized", lambda: True)
+
+    def remote_owner_has_twelve_storage_rows(negotiation, op=None, group=None):
+        assert op is torch.distributed.ReduceOp.MAX
+        assert group is None
+        # [max storage rows, max microbatch count, -min microbatch count]
+        negotiation.copy_(torch.tensor([12, 1, -1]))
+
+    monkeypatch.setattr(training_utils_module.dist, "all_reduce", remote_owner_has_twelve_storage_rows)
+    sample_lengths = [2, 4]
+    micro_batches = [
+        {
+            "input_ids": torch.arange(8).view(1, -1),
+            "labels": torch.arange(8).view(1, -1),
+            "position_ids": torch.arange(16).view(1, -1),
+            "cu_seq_lens_q": torch.tensor([0, 16], dtype=torch.int32),
+            "cu_seq_lens_k": torch.tensor([0, 16], dtype=torch.int32),
+            "max_length_q": 16,
+            "max_length_k": 16,
+            "_cp_logical_row_indices": torch.tensor([[0, 1, 2, 3, 4, 5, -1, -1]]),
+            "_cp_request_ids": torch.tensor([[0, 0, 1, 1, 1, 1, -1, -1]]),
+            "_cp_request_positions": torch.tensor([[0, 1, 0, 1, 2, 3, 0, 0]]),
+            "_cp_live_mask": torch.tensor([[True, True, True, True, True, True, False, False]]),
+            "_r3_sample_lengths": sample_lengths,
+        }
+    ]
+
+    assert align_dsv4_pp_storage_rows(micro_batches, cp_size=2) == 12
+    batch = micro_batches[0]
+    assert batch["input_ids"].shape == (1, 12)
+    assert batch["_cp_live_mask"].shape == (1, 12)
+    assert torch.count_nonzero(batch["_cp_live_mask"]) == 6
+    assert batch["_r3_sample_lengths"] is sample_lengths
+    assert batch["position_ids"].shape == (1, 24)
+    assert int(batch["cu_seq_lens_q"][-1]) == 24
+    assert int(batch["cu_seq_lens_k"][-1]) == 24
+
+
+def test_dsv4_pp_storage_alignment_collectively_rejects_empty_rank(monkeypatch):
+    monkeypatch.setattr(training_utils_module, "get_device_type", lambda: "cpu")
+    monkeypatch.setattr(training_utils_module.dist, "is_available", lambda: True)
+    monkeypatch.setattr(training_utils_module.dist, "is_initialized", lambda: True)
+    participated = False
+
+    def one_rank_is_empty(negotiation, op=None, group=None):
+        nonlocal participated
+        participated = True
+        negotiation.copy_(torch.tensor([8, 1, 0]))
+
+    monkeypatch.setattr(training_utils_module.dist, "all_reduce", one_rank_is_empty)
+    with pytest.raises(ValueError, match="minimum=0, maximum=1"):
+        align_dsv4_pp_storage_rows([], cp_size=2)
+    assert participated
 
 
 def test_get_effective_grad_clip_value_preserves_regular_clipping():
@@ -62,6 +123,18 @@ def test_clip_gradients_disabled_when_nonpositive(max_grad_norm):
     grad_norm = clip_gradients(model, max_grad_norm)
 
     assert grad_norm == 0.0
+    assert torch.equal(model.weight.grad, torch.ones_like(model.weight.grad))
+
+
+def test_missing_clip_threshold_fails_closed():
+    model = TinyModule()
+    model.weight.grad = torch.ones_like(model.weight)
+    with pytest.raises(ValueError, match="max_grad_norm must be configured"):
+        get_effective_grad_clip_value(None, use_distsignsgd=False)
+    with pytest.raises(ValueError, match="max_grad_norm must be configured"):
+        get_effective_grad_clip_value(None, use_distsignsgd=True)
+    with pytest.raises(ValueError, match="max_grad_norm must be configured"):
+        clip_gradients(model, None)
     assert torch.equal(model.weight.grad, torch.ones_like(model.weight.grad))
 
 
@@ -185,6 +258,29 @@ def test_count_active_microbatches_is_empty_input_safe():
     assert count_active_microbatches([]) == (0, 0)
 
 
+def test_pp_padding_uses_exact_sampling_transform_identities():
+    micro_batches = [
+        {
+            "input_ids": torch.tensor([[7, 8]], dtype=torch.int64),
+            "labels": torch.tensor([[8, 9]], dtype=torch.int64),
+            "logprob_temperatures": torch.tensor([[0.7, 1.3]], dtype=torch.float32),
+            "logprob_top_ks": torch.tensor([[4, 9]], dtype=torch.int64),
+            "logprob_top_ps": torch.tensor([[0.8, 0.9]], dtype=torch.float32),
+            "logprob_min_ps": torch.tensor([[0.1, 0.2]], dtype=torch.float32),
+        }
+    ]
+
+    pad_micro_batches_for_pp(micro_batches, sample_packing_sequence_len=4)
+
+    batch = micro_batches[0]
+    assert batch["input_ids"].tolist() == [[7, 8, 0, 0]]
+    assert batch["labels"].tolist() == [[8, 9, IGNORE_INDEX, IGNORE_INDEX]]
+    torch.testing.assert_close(batch["logprob_temperatures"], torch.tensor([[0.7, 1.3, 1.0, 1.0]]))
+    assert batch["logprob_top_ks"].tolist() == [[4, 9, 1 << 30, 1 << 30]]
+    torch.testing.assert_close(batch["logprob_top_ps"], torch.tensor([[0.8, 0.9, 1.0, 1.0]]))
+    torch.testing.assert_close(batch["logprob_min_ps"], torch.tensor([[0.1, 0.2, 0.0, 0.0]]))
+
+
 def test_pp_chunked_ce_matches_eager_loss_and_grad(monkeypatch):
     monkeypatch.setenv("XORL_PP_CE_CHUNK_TOKENS", "2")
     labels = torch.tensor([[1, 2, IGNORE_INDEX], [3, 4, 0]])
@@ -204,6 +300,48 @@ def test_pp_chunked_ce_matches_eager_loss_and_grad(monkeypatch):
 
     torch.testing.assert_close(chunked_loss, ref_loss)
     torch.testing.assert_close(pred.grad, ref_pred.grad)
+
+
+def test_forward_backward_pp_relays_tensor_ids_and_preserves_signed_loss(monkeypatch):
+    observed = {}
+
+    class _Schedule:
+        def step(self, input_ids, *, target, losses, return_outputs):
+            observed["input_ids"] = input_ids.clone()
+            observed["target"] = target.clone()
+            assert return_outputs is False
+            losses.extend((torch.tensor(-1.25), torch.tensor(-2.5)))
+
+    reduced = []
+
+    def fake_all_reduce(tensor, op, group):
+        reduced.append((tensor.clone(), op, group))
+
+    monkeypatch.setattr(training_utils_module, "get_device_type", lambda: "cpu")
+    monkeypatch.setattr(training_utils_module.dist, "all_reduce", fake_all_reduce)
+    model_part = nn.Module()
+    micro_batches = [
+        {"input_ids": torch.tensor([[1, 2]]), "labels": torch.tensor([[2, 3]])},
+        {"input_ids": torch.tensor([[4, 5]]), "labels": torch.tensor([[5, 6]])},
+    ]
+    target_ids = torch.tensor([7, 9], dtype=torch.long)
+
+    raw_loss = forward_backward_pp(
+        model_parts=[model_part],
+        pp_schedule=_Schedule(),
+        micro_batches=micro_batches,
+        has_first_stage=True,
+        has_last_stage=True,
+        pp_group="pp",
+        schedule_targets=target_ids,
+    )
+
+    assert torch.equal(observed["input_ids"], torch.tensor([[1, 2], [4, 5]]))
+    assert torch.equal(observed["target"], target_ids)
+    assert raw_loss == pytest.approx(-3.75)
+    assert len(reduced) == 1
+    assert reduced[0][1] == torch.distributed.ReduceOp.SUM
+    assert reduced[0][2] == "pp"
 
 
 def test_sync_sp_gradients_reduces_every_grad_by_default(monkeypatch):
@@ -341,3 +479,42 @@ def test_sync_lm_head_tp_parameters_broadcasts_marked_module(monkeypatch):
     assert torch.equal(tensor, lm_head.weight)
     assert src == 7
     assert group == "lm-head-replica"
+
+
+def test_pp_padding_and_queues_preserve_exact_row_side_channels():
+    micro_batches = [
+        {
+            "input_ids": torch.tensor([[11, 12, 13]]),
+            "labels": torch.tensor([[12, 13, IGNORE_INDEX]]),
+            "position_ids": torch.tensor([[0, 1, 2]]),
+            "_cp_logical_row_indices": torch.tensor([[7, 8, 9]]),
+            "_cp_request_ids": torch.tensor([[2, 2, 2]]),
+            "_cp_request_positions": torch.tensor([[0, 1, 2]]),
+            "_cp_live_mask": torch.tensor([[True, True, True]]),
+            "_r3_sample_lengths": [3],
+            "sampler_prefill_lengths": torch.tensor([3]),
+            "num_samples": 1,
+        }
+    ]
+    training_utils_module.pad_micro_batches_for_pp(
+        micro_batches,
+        sample_packing_sequence_len=5,
+    )
+    mb = micro_batches[0]
+    assert torch.equal(mb["input_ids"], torch.tensor([[11, 12, 13, 0, 0]]))
+    assert torch.equal(mb["_cp_logical_row_indices"], torch.tensor([[7, 8, 9, -1, -1]]))
+    assert torch.equal(mb["_cp_request_ids"], torch.tensor([[2, 2, 2, -1, -1]]))
+    assert torch.equal(mb["_cp_request_positions"], torch.tensor([[0, 1, 2, 0, 0]]))
+    assert torch.equal(mb["_cp_live_mask"], torch.tensor([[True, True, True, False, False]]))
+
+    parts = [nn.Identity(), nn.Identity()]
+    training_utils_module._set_pp_batch_metadata(parts, micro_batches)
+    first = parts[0]._pp_batch_metadata.popleft()
+    second = parts[1]._pp_batch_metadata.popleft()
+    assert first is not second
+    for metadata in (first, second):
+        assert torch.equal(metadata["_pp_original_input_ids"], mb["input_ids"])
+        assert torch.equal(metadata["_cp_live_mask"], mb["_cp_live_mask"])
+        assert metadata["_r3_sample_lengths"] == [3]
+        assert torch.equal(metadata["sampler_prefill_lengths"], torch.tensor([3]))
+        assert metadata["num_samples"] == 1

@@ -118,7 +118,10 @@ def sync_lm_head_tp_parameters(
         if lm_head_tp_group is not None and dist.get_world_size(lm_head_tp_group) > 1:
             exact_src = _group_root_rank(lm_head_tp_group)
             for module in model.modules():
-                if not getattr(module, "_glm52_exact_tp16_lm_head", False):
+                if not (
+                    getattr(module, "_glm52_exact_tp16_lm_head", False)
+                    or getattr(module, "_dsv4_exact_tp8_lm_head", False)
+                ):
                     continue
                 parameter = getattr(module, "lora_A", None)
                 if parameter is None or (DTensor is not None and isinstance(parameter, DTensor)):
@@ -138,7 +141,7 @@ def sync_lm_head_tp_parameters(
 
 def clip_gradients(
     model: "torch.nn.Module | List[torch.nn.Module]",
-    max_grad_norm: float,
+    max_grad_norm: float | None,
     pp_enabled: bool = False,
     pp_group=None,
 ) -> float:
@@ -154,6 +157,11 @@ def clip_gradients(
     Returns:
         Scalar grad_norm value.
     """
+    if max_grad_norm is None:
+        raise ValueError(
+            "max_grad_norm must be configured for single-model optimizer steps; "
+            "use a finite value <= 0 to disable clipping"
+        )
     if max_grad_norm <= 0:
         return 0.0
 
@@ -177,7 +185,7 @@ def clip_gradients(
     return grad_norm
 
 
-def get_effective_grad_clip_value(max_grad_norm: float, *, use_distsignsgd: bool) -> float:
+def get_effective_grad_clip_value(max_grad_norm: float | None, *, use_distsignsgd: bool) -> float:
     """Return the clipping threshold to use for the current optimizer path.
 
     Non-positive ``max_grad_norm`` disables local-training gradient clipping.
@@ -193,6 +201,11 @@ def get_effective_grad_clip_value(max_grad_norm: float, *, use_distsignsgd: bool
     not a true gradient magnitude — its scale tracks `sqrt(num_params)` and
     voter agreement, not the underlying loss landscape.
     """
+    if max_grad_norm is None:
+        raise ValueError(
+            "max_grad_norm must be configured for single-model optimizer steps; "
+            "use a finite value <= 0 to disable clipping"
+        )
     if use_distsignsgd:
         return float("inf")
     return max_grad_norm
@@ -441,7 +454,51 @@ def _pp_quack_linear_ce_sum(hidden, labels, *, lm_head, num_chunks: int = 8):
     )
 
 
-def make_pp_loss_fn(ce_mode: str = "compiled", lm_head=None):
+def _pp_lm_head_ce_sum(
+    hidden,
+    labels,
+    *,
+    lm_head,
+    ce_mode: str,
+    tp_group=None,
+    lm_head_fp32: bool = False,
+    num_chunks: int = 8,
+    logprob_temperature: float | torch.Tensor = 1.0,
+):
+    """Apply the ordinary per-token CE dispatcher to a PP terminal hidden state."""
+
+    from xorl.models.module_utils import get_lm_head_weight  # noqa: PLC0415
+    from xorl.ops.loss.per_token_ce import compute_per_token_ce  # noqa: PLC0415
+
+    weight = get_lm_head_weight(
+        lm_head,
+        fsdp_sharded_loss=bool(getattr(lm_head, "_xorl_fsdp_sharded_lm_head_loss", False)),
+    )
+    per_token_ce = compute_per_token_ce(
+        hidden.reshape(-1, hidden.shape[-1]),
+        weight,
+        labels.reshape(-1),
+        ignore_index=IGNORE_INDEX,
+        ce_mode=ce_mode,
+        num_chunks=num_chunks,
+        tp_group=tp_group,
+        lm_head_fp32=lm_head_fp32,
+        lm_head=lm_head,
+        logprob_temperature=logprob_temperature,
+    )
+    return per_token_ce.sum()
+
+
+def make_pp_loss_fn(
+    ce_mode: str = "compiled",
+    lm_head=None,
+    *,
+    tp_group=None,
+    lm_head_fp32: bool = False,
+    num_chunks: int = 8,
+    loss_owner=None,
+    logprob_temperature: float = 1.0,
+):
     """Return the PP cross-entropy loss variant selected by ``ce_mode``.
 
     'compiled' (default) returns the torch.compile'd CE sum; 'eager'
@@ -451,6 +508,58 @@ def make_pp_loss_fn(ce_mode: str = "compiled", lm_head=None):
     requires the last-stage ``lm_head`` module — avoiding the full 248k-vocab
     logits materialization (OOM) on the last stage.
     """
+    exact_head = bool(
+        lm_head is not None
+        and (getattr(lm_head, "_glm52_exact_tp16_lm_head", False) or getattr(lm_head, "_dsv4_exact_tp8_lm_head", False))
+    )
+    if ce_mode == "bi_fused" or exact_head:
+        # Every rank constructs the schedule, but only the terminal stage calls
+        # the loss. Defer the missing-head error so headless PP stages remain
+        # independent of the output projection.
+        def _lm_head_loss(hidden, labels):
+            if lm_head is None:
+                raise ValueError(f"ce_mode={ce_mode!r} under PP requires the terminal-stage lm_head module")
+            scalar_temperature = float(getattr(loss_owner, "_pp_loss_scalar_temperature", logprob_temperature))
+            temperature = scalar_temperature
+            temperature_queue = getattr(loss_owner, "_pp_loss_temperatures", None)
+            if temperature_queue is not None:
+                if not temperature_queue:
+                    raise RuntimeError("PP loss-temperature metadata was exhausted before the terminal loss")
+                queued_temperature = temperature_queue.popleft()
+                if queued_temperature is not None:
+                    if not isinstance(queued_temperature, torch.Tensor):
+                        raise TypeError("PP logprob_temperatures entries must be tensors")
+                    if tuple(queued_temperature.shape) != tuple(labels.shape):
+                        raise ValueError(
+                            "PP logprob_temperatures must match terminal labels shape: "
+                            f"temperature={tuple(queued_temperature.shape)}, labels={tuple(labels.shape)}"
+                        )
+                    if scalar_temperature != 1.0:
+                        raise ValueError(
+                            "A per-token logprob_temperatures tensor cannot be combined with a non-unit scalar "
+                            "logprob_temperature"
+                        )
+                    temperature = (
+                        queued_temperature.to(
+                            device=hidden.device,
+                            dtype=torch.float32,
+                            non_blocking=True,
+                        )
+                        .reshape(-1)
+                        .contiguous()
+                    )
+            return _pp_lm_head_ce_sum(
+                hidden,
+                labels,
+                lm_head=lm_head,
+                ce_mode=ce_mode,
+                tp_group=tp_group,
+                lm_head_fp32=lm_head_fp32,
+                num_chunks=num_chunks,
+                logprob_temperature=temperature,
+            )
+
+        return _lm_head_loss
     if ce_mode == "eager":
         if _pp_ce_chunk_tokens() > 0:
             return _pp_ce_sum_chunked
@@ -471,7 +580,7 @@ def make_pp_loss_fn(ce_mode: str = "compiled", lm_head=None):
             return _pp_quack_linear_ce_sum(hidden, labels, lm_head=lm_head)
 
         return _quack_loss
-    raise ValueError(f"Unknown ce_mode: {ce_mode!r} (expected 'eager', 'compiled', or 'quack_linear')")
+    raise ValueError(f"Unknown ce_mode: {ce_mode!r} (expected 'eager', 'compiled', 'quack_linear', or 'bi_fused')")
 
 
 def pad_micro_batches_for_pp(
@@ -501,7 +610,21 @@ def pad_micro_batches_for_pp(
     if pad_to_multiple_of > 1 and target_sharded % pad_to_multiple_of != 0:
         target_sharded = ((target_sharded + pad_to_multiple_of - 1) // pad_to_multiple_of) * pad_to_multiple_of
 
-    _PAD_VALUES = {"input_ids": 0, "labels": IGNORE_INDEX, "attention_mask": 0}
+    _PAD_VALUES = {
+        "input_ids": 0,
+        "labels": IGNORE_INDEX,
+        "attention_mask": 0,
+        # Exact sampling-transform metadata must pad with the mathematical
+        # identity so PP's fixed communication shape cannot change scoring.
+        "logprob_temperatures": 1.0,
+        "logprob_top_ks": 1 << 30,
+        "logprob_top_ps": 1.0,
+        "logprob_min_ps": 0.0,
+        "_cp_logical_row_indices": -1,
+        "_cp_request_ids": -1,
+        "_cp_request_positions": 0,
+        "_cp_live_mask": False,
+    }
     full_target = target_sharded * sp_size if sp_size > 1 else target_sharded
 
     for mb in micro_batches:
@@ -509,9 +632,9 @@ def pad_micro_batches_for_pp(
         if ids_len < target_sharded:
             pad_tokens = target_sharded - ids_len
 
-            for key in ("input_ids", "labels", "attention_mask"):
+            for key, pad_value in _PAD_VALUES.items():
                 if key in mb and isinstance(mb[key], torch.Tensor):
-                    mb[key] = F.pad(mb[key], (0, pad_tokens), value=_PAD_VALUES.get(key, 0))
+                    mb[key] = F.pad(mb[key], (0, pad_tokens), value=pad_value)
 
             if "position_ids" in mb and isinstance(mb["position_ids"], torch.Tensor):
                 scale = mb["position_ids"].shape[-1] // ids_len if ids_len > 0 else 1
@@ -532,27 +655,134 @@ def pad_micro_batches_for_pp(
                     mb[ml_key] = new_max
 
 
+def align_dsv4_pp_storage_rows(
+    micro_batches: List[Dict[str, Any]],
+    *,
+    cp_size: int,
+    bucket_size: int = 1,
+    minimum_storage_rows: int = 0,
+    pad_to_multiple_of: int = 1,
+) -> int:
+    """Align compact-hyperconnection PP storage before stage buffers exist.
+
+    Exact DSV4 compacts live rows for decoder compute, but its physical PP
+    wire has storage-row capacity. ``compute_rows`` spans several owner planes,
+    so PP-only length negotiation can leave a shorter rank unable to carry the
+    compact prefix. One world MAX is the deadlock-free transitive superset of
+    those overlapping PP/FSDP/EP/SP planes. Existing padding then grows local
+    storage side channels and full-domain position/FA metadata together without
+    changing ``_r3_sample_lengths`` or the live-row compute plan.
+    """
+    cp_size = int(cp_size)
+    if cp_size < 1:
+        raise ValueError(f"Exact DSV4 PP storage alignment requires cp_size >= 1, got {cp_size}")
+
+    local_count = len(micro_batches)
+    local_storage_rows = max(
+        max((int(mb["input_ids"].shape[-1]) for mb in micro_batches), default=0),
+        int(minimum_storage_rows),
+    )
+    negotiation = torch.tensor(
+        [local_storage_rows, local_count, -local_count],
+        dtype=torch.int64,
+        device=get_device_type(),
+    )
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(negotiation, op=dist.ReduceOp.MAX)
+    storage_rows, max_count, negative_min_count = (int(value) for value in negotiation.tolist())
+    min_count = -negative_min_count
+    if min_count != max_count:
+        raise ValueError(
+            f"Exact DSV4 PP ranks disagree on the number of microbatches: minimum={min_count}, maximum={max_count}"
+        )
+    if max_count == 0:
+        raise ValueError("Exact DSV4 PP storage alignment requires at least one microbatch on every rank")
+    if bucket_size > 1:
+        storage_rows = ((storage_rows + bucket_size - 1) // bucket_size) * bucket_size
+    if pad_to_multiple_of > 1:
+        storage_rows = ((storage_rows + pad_to_multiple_of - 1) // pad_to_multiple_of) * pad_to_multiple_of
+    pad_micro_batches_for_pp(
+        micro_batches,
+        sample_packing_sequence_len=storage_rows * cp_size,
+        sp_size=cp_size,
+        pad_to_multiple_of=pad_to_multiple_of,
+    )
+    return storage_rows
+
+
 _PP_FA_KEYS = ("cu_seq_lens_q", "cu_seq_lens_k", "max_length_q", "max_length_k")
+_PP_EXACT_ROW_KEYS = (
+    "_cp_logical_row_indices",
+    "_cp_request_ids",
+    "_cp_request_positions",
+    "_cp_live_mask",
+    "_r3_sample_lengths",
+    "sampler_prefill_lengths",
+    "num_samples",
+)
 
 
-def _set_pp_batch_metadata(model_parts: List[torch.nn.Module], micro_batches: List[Dict[str, Any]]) -> None:
+def _set_pp_batch_metadata(
+    model_parts: List[torch.nn.Module],
+    micro_batches: List[Dict[str, Any]],
+    *,
+    logprob_temperature: float = 1.0,
+    index_share_mode: str | None = None,
+) -> None:
     """Queue per-microbatch metadata (position_ids, flash-attn kwargs) on each part.
 
     Each part gets its own dict copies: _pp_forward pops keys from the entry,
     so sharing dicts across virtual stages would corrupt later stages' metadata.
+    Exact DSV4 also needs the original storage-order token IDs on every stage:
+    live hidden states occupy a compact prefix of the storage-capacity PP wire,
+    while hash-routed MoE layers must reproduce token ownership from the
+    original IDs.
     """
     pp_metadata_list = []
     for mb in micro_batches:
         md = {}
+        if "input_ids" in mb:
+            # Some decoder programs use token IDs inside later layers (DSV4
+            # hash routing).  Every PP rank owns the same microbatch metadata,
+            # so carry the original IDs out-of-band rather than putting them
+            # on the differentiable activation wire.
+            md["_pp_input_ids"] = mb["input_ids"]
         if "position_ids" in mb:
             md["position_ids"] = mb["position_ids"]
+        if "input_ids" in mb:
+            md["_pp_original_input_ids"] = mb["input_ids"]
         for key in _PP_FA_KEYS:
+            if key in mb:
+                md[key] = mb[key]
+        for key in _PP_EXACT_ROW_KEYS:
             if key in mb:
                 md[key] = mb[key]
         pp_metadata_list.append(md)
 
     for model_part in model_parts:
-        model_part._pp_batch_metadata = deque(dict(md) for md in pp_metadata_list)
+        requires_index_share = bool(getattr(model_part, "_pp_requires_index_share_mode", False))
+        model_part._pp_batch_metadata = deque(
+            {
+                **md,
+                **(
+                    {"index_share_mode": index_share_mode}
+                    if requires_index_share and index_share_mode is not None
+                    else {}
+                ),
+            }
+            for md in pp_metadata_list
+        )
+        model_part._pp_loss_temperatures = deque(mb.get("logprob_temperatures") for mb in micro_batches)
+        model_part._pp_loss_scalar_temperature = float(logprob_temperature)
+
+
+def _release_pp_index_share_contexts(model_parts: List[torch.nn.Module]) -> None:
+    """Close contexts only after a schedule finishes all of its backwards."""
+
+    for model_part in model_parts:
+        release = getattr(model_part, "release_index_share_context", None)
+        if callable(release):
+            release()
 
 
 def forward_backward_pp(
@@ -562,6 +792,8 @@ def forward_backward_pp(
     has_first_stage: bool,
     has_last_stage: bool,
     pp_group,
+    logprob_temperature: float = 1.0,
+    schedule_targets: torch.Tensor | None = None,
 ) -> float:
     """Pipeline parallel forward-backward step.
 
@@ -569,33 +801,51 @@ def forward_backward_pp(
     callers normalize gradients by global_valid_tokens after this returns.
 
     Returns:
-        raw_total_loss scalar (broadcast from last stage via MAX all-reduce).
+        raw_total_loss scalar (broadcast from the terminal stage via SUM all-reduce).
     """
     device = get_device_type()
 
     input_ids = torch.cat([mb["input_ids"].to(device, non_blocking=True) for mb in micro_batches], dim=0)
-    labels = torch.cat([mb["labels"].to(device, non_blocking=True) for mb in micro_batches], dim=0)
+    labels = None
+    if schedule_targets is None:
+        label_tensors = [mb.get("labels", mb.get("target_tokens")) for mb in micro_batches]
+        if any(label is None for label in label_tensors):
+            raise ValueError("PP cross-entropy schedule requires labels or target_tokens in every microbatch")
+        labels = torch.cat([label.to(device, non_blocking=True) for label in label_tensors], dim=0)
 
-    _set_pp_batch_metadata(model_parts, micro_batches)
+    _set_pp_batch_metadata(
+        model_parts,
+        micro_batches,
+        logprob_temperature=logprob_temperature,
+        index_share_mode="training_with_backward",
+    )
 
-    targets = labels if has_last_stage else None
+    targets = (labels if schedule_targets is None else schedule_targets) if has_last_stage else None
     losses = [] if has_last_stage else None
 
     # return_outputs=False: the merged last-stage output is unused for training and
     # costs an O(n_microbatches x seq x vocab) allocation (37 GiB at m=16/8k/151k).
-    if has_first_stage:
-        pp_schedule.step(input_ids, target=targets, losses=losses, return_outputs=False)
-    else:
-        pp_schedule.step(target=targets, losses=losses, return_outputs=False)
+    try:
+        if has_first_stage:
+            pp_schedule.step(input_ids, target=targets, losses=losses, return_outputs=False)
+        else:
+            pp_schedule.step(target=targets, losses=losses, return_outputs=False)
+    finally:
+        # TRAINING_WITH_BACKWARD contexts must remain open through checkpoint
+        # recomputation.  ``step`` is the first boundary at which every
+        # scheduled backward is known to have completed (or aborted).
+        _release_pp_index_share_contexts(model_parts)
 
-    # Broadcast loss from last stage via MAX
+    # Exactly one physical/virtual stage in each PP group owns the terminal
+    # objective. SUM carries signed RL objectives correctly; the historical
+    # MAX-with--1 sentinel silently corrupted sufficiently negative losses.
     if has_last_stage:
         total_loss = torch.sum(torch.stack(losses)).item()
         loss_tensor = torch.tensor([total_loss], device=device)
     else:
-        loss_tensor = torch.tensor([-1.0], device=device)
+        loss_tensor = torch.tensor([0.0], device=device)
 
-    dist.all_reduce(loss_tensor, op=dist.ReduceOp.MAX, group=pp_group)
+    dist.all_reduce(loss_tensor, op=dist.ReduceOp.SUM, group=pp_group)
 
     del input_ids, labels
     return loss_tensor.item()
@@ -622,7 +872,7 @@ def forward_only_pp(
     device = get_device_type()
     input_ids = torch.cat([mb["input_ids"].to(device, non_blocking=True) for mb in micro_batches], dim=0)
 
-    _set_pp_batch_metadata(model_parts, micro_batches)
+    _set_pp_batch_metadata(model_parts, micro_batches, index_share_mode="forward_only")
     for model_part in model_parts:
         model_part._pp_forward_only = True
     try:
@@ -633,6 +883,9 @@ def forward_only_pp(
     finally:
         for model_part in model_parts:
             model_part._pp_forward_only = False
+        # Successful forward-only GLM invocations close themselves.  This
+        # also owns cleanup if one stage forward raises partway through.
+        _release_pp_index_share_contexts(model_parts)
 
     if not has_last_stage or output is None:
         return None

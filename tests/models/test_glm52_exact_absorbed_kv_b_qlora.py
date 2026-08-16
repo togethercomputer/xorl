@@ -89,17 +89,18 @@ def test_absorbed_kv_b_contract_keeps_one_frozen_native_base_and_two_logical_mas
 
     with pytest.raises(ValueError, match="only official"):
         Glm52ExactTP1AbsorbedKvBBlockFP8QLoRA(num_heads=32)
-    with pytest.raises(ValueError, match="rank=1 and alpha=1"):
-        Glm52ExactTP1AbsorbedKvBBlockFP8QLoRA(r=2)
-    with pytest.raises(ValueError, match="rank=1 and alpha=1"):
-        Glm52ExactTP1AbsorbedKvBBlockFP8QLoRA(lora_alpha=2)
+    rank_three = Glm52ExactTP1AbsorbedKvBBlockFP8QLoRA(r=3, lora_alpha=7, device="meta")
+    assert rank_three.lora_A.shape == (3, 512)
+    assert rank_three.lora_B.shape[-1] == 3
     with pytest.raises(ValueError, match="bias-free"):
         Glm52ExactTP1AbsorbedKvBBlockFP8QLoRA(bias=True)
     with pytest.raises(ValueError, match="only effective TP1"):
         Glm52ExactTP1AbsorbedKvBBlockFP8QLoRA(tp_size=2)
     module.set_runtime_lora_config(1, 1)
-    with pytest.raises(ValueError, match="only rank=1 and alpha=1"):
-        module.set_runtime_lora_config(1, 2)
+    with pytest.raises(ValueError, match="positive integer rank"):
+        Glm52ExactTP1AbsorbedKvBBlockFP8QLoRA(r=0, device="meta")
+    with pytest.raises(ValueError, match="positive integer alpha"):
+        module.set_runtime_lora_config(1, 0)
 
 
 def test_absorbed_kv_b_dtype_move_preserves_native_bytes_master_values_and_identity() -> None:

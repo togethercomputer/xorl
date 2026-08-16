@@ -27,7 +27,7 @@ def unfuse_for_tp(model):
     decoder layer.
 
     After unfusing, checkpoint keys from HuggingFace already match
-    the model's parameter names — no merging handler is needed.
+    the model's parameter names, so the checkpoint handler skips its merges.
     """
     for layer in model.model.layers:
         layer.self_attn.unfuse_for_tp()

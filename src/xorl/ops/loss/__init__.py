@@ -4,6 +4,7 @@ Loss functions for training.
 This module provides various loss functions for language model training:
 - causallm_loss_function: Standard causal language modeling loss
 - importance_sampling_loss_function: Importance sampling loss for GRPO/RL
+- cispo_loss_function: Clipped IS-weight policy optimization
 - policy_loss_function: PPO-style policy loss with TIS correction
 - drgrpo_loss_function: DR-GRPO loss with PPO clipping and KL penalty
 """
@@ -11,6 +12,7 @@ This module provides various loss functions for language model training:
 from typing import Callable, Dict, Literal
 
 from xorl.ops.loss.causallm_loss import causallm_loss_function, fsdp_sharded_causallm_loss_function
+from xorl.ops.loss.cispo_loss import cispo_loss_function
 from xorl.ops.loss.grpo_loss import drgrpo_loss_function
 from xorl.ops.loss.importance_sampling_loss import importance_sampling_loss_function
 from xorl.ops.loss.loss_output import LossOutput
@@ -23,7 +25,7 @@ from xorl.ops.loss.vocab_parallel_cross_entropy import vocab_parallel_cross_entr
 # Cross-entropy computation mode shared by the local-trainer (TrainingArguments)
 # and server-runner (ServerArguments) entry points so the Literal stays in sync.
 # ``bi_fused`` runs the shared batch-invariant projection and fixed-order LSE.
-CrossEntropyMode = Literal["eager", "compiled", "bi_fused"]
+CrossEntropyMode = Literal["eager", "compiled", "bi_fused", "quack_linear", "fused_quack"]
 
 
 # ---------------------------------------------------------------------------
@@ -33,6 +35,7 @@ LOSS_REGISTRY: Dict[str, Callable] = {
     "causallm_loss": causallm_loss_function,
     "cross_entropy": causallm_loss_function,  # alias
     "importance_sampling": importance_sampling_loss_function,
+    "cispo": cispo_loss_function,
     "policy_loss": policy_loss_function,
     "drgrpo": drgrpo_loss_function,
     "opd_loss": opd_loss_function,
@@ -65,6 +68,7 @@ __all__ = [
     "fsdp_sharded_causallm_loss_function",
     "drgrpo_loss_function",
     "importance_sampling_loss_function",
+    "cispo_loss_function",
     "opd_loss_function",
     "opd_vocab_parallel_loss_function",
     "policy_loss_function",

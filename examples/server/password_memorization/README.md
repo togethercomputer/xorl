@@ -10,19 +10,21 @@ All tests use the unified `run_password_test.py` script:
 python run_password_test.py --model <MODEL> --steps <N> --lr <LR> [options]
 ```
 
+`run_password_test.py` does **not** choose the training implementation. It connects to an already-running XoRL server, so full-weight, LoRA, and QLoRA examples require starting that server with the corresponding YAML under `examples/server/configs/{full,lora,qlora}/`. The `--model` flag selects the tokenizer/session model and must agree with the running server; it does not convert a full-weight server into LoRA or QLoRA mode.
+
 ### Examples
 
 ```bash
-# Qwen3-8B full bf16 → FP8 inference
+# Training server: configs/full/qwen3_8b_full.yaml
 python run_password_test.py --model Qwen/Qwen3-8B --steps 16 --lr 1e-5
 
-# Qwen3-8B LoRA → FP8 inference
+# Training server: configs/lora/qwen3_8b_lora.yaml
 python run_password_test.py --model Qwen/Qwen3-8B --steps 32 --lr 1e-4
 
-# Qwen3-8B QLoRA nvfp4 → FP8, cosine LR
+# Training server: configs/qlora/qwen3_8b_qlora_nvfp4.yaml
 python run_password_test.py --model Qwen/Qwen3-8B --steps 64 --lr 5e-5 --lr-schedule cosine
 
-# Qwen3-8B QLoRA block_fp8 → FP8
+# Training server: configs/qlora/qwen3_8b_qlora_block_fp8.yaml
 python run_password_test.py --model Qwen/Qwen3-8B --steps 64 --lr 5e-4
 
 # Qwen3-Coder-30B full bf16 → FP8
@@ -60,12 +62,14 @@ python run_password_test.py --model Qwen/Qwen3-8B --steps 48 --lr 5e-5 --sync-qu
 | `--infer-url` | http://localhost:30000 | Inference endpoint URL(s), space-separated |
 | `--master-address` | localhost | Master address for NCCL weight sync |
 | `--log-interval` | 16 | Print loss every N steps |
-| `--run-baseline` | false | Run a pre-training inference check before weight sync |
+| `--run-baseline` | false | Run a pre-training inference check. This seeds old-version cache state, so restart/clear the isolated inference endpoint before the no-flush sync |
 | `--sync-wait-timeout` | 120 | Seconds to wait for inference endpoints to report the new `weight_version` |
 
 ---
 
-## Test Matrix
+## Historical smoke matrix
+
+The `3/3` results below record prior password-recall smokes. They are not bound here to a source revision, container, checkpoint hash, or terminal artifact, so treat them as example workload shapes rather than current certification. Re-run the selected row and retain its revisions and output before using it as a release gate.
 
 ### Qwen3-8B (4× H100)
 
@@ -151,4 +155,5 @@ FP8 re-quantization uses block-wise e4m3 with `weight_block_size=[128, 128]`, co
 - **30B MoE with EP**: cosine LR schedule is important — constant LR causes loss oscillation around ~1.0.
 - **NF4**: quantizes bf16 weights on-the-fly; no pre-quantized checkpoint needed.
 - **Password e2e validation**: `run_password_test.py` now waits for the async `create_model` future and for each inference endpoint to report the requested `weight_version` before running post-sync recall checks.
-- **Baseline queries**: the script skips baseline inference by default to avoid seeding radix-cache entries for the exact prompts later used in the no-flush post-sync validation. Pass `--run-baseline` if you explicitly want that pre-training check.
+- **No-flush scope**: this example intentionally uses the REST no-flush defaults. That is safe only for a freshly started, dedicated inference endpoint with no concurrent traffic: the default path performs no pre-sync generation, then makes one weight update before its first generation. If the endpoint has served any earlier request, restart or clear its cache before running the sync.
+- **Baseline queries**: the script skips baseline inference by default because those exact prompts could seed old-version radix-cache entries. `--run-baseline` is diagnostic only; restart or clear the isolated inference endpoint after the baseline and before the weight sync.

@@ -173,4 +173,110 @@ class Glm52LayerPlan:
         return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-__all__ = ["Glm52LayerPlan", "Glm52LayerSpec", "IndexerType", "MLPType"]
+def derive_glm52_pipeline_layer_ranges(config, pp_size: int) -> tuple[tuple[int, int], ...]:
+    """Derive contiguous PP ranges whose stages begin on full indexers.
+
+    GLM shares sparse-index state between neighboring layers, so a pipeline
+    stage may begin only where that state is produced locally.  The checkpoint
+    schedule is the source of truth; no PP-degree table is maintained here.
+    """
+
+    pp_size = int(pp_size)
+    if pp_size <= 0:
+        raise ValueError("pipeline_parallel_size must be positive")
+
+    base_plan = Glm52LayerPlan.from_config(config)
+    num_layers = len(base_plan.layers)
+    legal_starts = base_plan.full_indexer_layers
+    if pp_size > len(legal_starts):
+        raise ValueError(
+            f"GLM-5.2 PP{pp_size} requires {pp_size} full-index stage starts, "
+            f"but the checkpoint schedule exposes only {len(legal_starts)}"
+        )
+    if pp_size == 1:
+        return ((0, num_layers),)
+
+    starts = [0]
+    for cut_index in range(1, pp_size):
+        remaining_cuts = pp_size - cut_index - 1
+        candidates = [
+            start
+            for position, start in enumerate(legal_starts)
+            if start > starts[-1] and len(legal_starts) - position - 1 >= remaining_cuts
+        ]
+        if not candidates:
+            raise ValueError(f"GLM-5.2 cannot derive {pp_size} non-empty full-index pipeline stages")
+        target = cut_index * num_layers / pp_size
+        starts.append(min(candidates, key=lambda start: (abs(start - target), start)))
+
+    ranges = tuple(zip(starts, (*starts[1:], num_layers), strict=True))
+    # Re-run the model's state-ownership validator over the resolved cuts.
+    Glm52LayerPlan.from_config(config, pipeline_layer_ranges=ranges)
+    return ranges
+
+
+def install_glm52_pipeline_module_plan(
+    config,
+    *,
+    num_stages: int,
+    input_weight: int = 1,
+    output_weight: int = 1,
+    num_layers_in_first_stage: int | None = None,
+    num_layers_in_last_stage: int | None = None,
+) -> tuple[tuple[str, ...], ...]:
+    """Resolve and install the real GLM pipeline module plan before construction.
+
+    Input/output weighting can produce module-only edge stages.  IndexShare
+    ownership therefore follows the number of stages that actually own decoder
+    layers, not the physical PP degree.  The resolved FQN assignment is stored on
+    the config and reused verbatim by ``build_parallelize_model``; it is not
+    reconstructed after the GLM layers have already captured their layer plan.
+    """
+
+    from xorl.distributed.pipeline_parallel import generate_llm_fqn_per_model_part  # noqa: PLC0415
+
+    layer_prefix = "model.layers"
+    provisional = generate_llm_fqn_per_model_part(
+        num_stages=int(num_stages),
+        num_layers=int(config.num_hidden_layers),
+        input_weight=int(input_weight),
+        output_weight=int(output_weight),
+        input_fqns=["model.embed_tokens"],
+        layer_prefix=layer_prefix,
+        output_fqns=["model.norm", "lm_head"],
+        num_layers_in_first_stage=num_layers_in_first_stage,
+        num_layers_in_last_stage=num_layers_in_last_stage,
+    )
+    decoder_slots = tuple(
+        stage_index
+        for stage_index, modules in enumerate(provisional)
+        if any(name.startswith(f"{layer_prefix}.") for name in modules)
+    )
+    if not decoder_slots:
+        raise ValueError("GLM pipeline module plan must assign at least one stage decoder layers")
+
+    ranges = derive_glm52_pipeline_layer_ranges(config, len(decoder_slots))
+    resolved = [[name for name in modules if not name.startswith(f"{layer_prefix}.")] for modules in provisional]
+    for stage_index, (start, end) in zip(decoder_slots, ranges, strict=True):
+        decoder_names = [f"{layer_prefix}.{layer_index}" for layer_index in range(start, end)]
+        output_offset = next(
+            (index for index, name in enumerate(resolved[stage_index]) if name in {"model.norm", "lm_head"}),
+            len(resolved[stage_index]),
+        )
+        resolved[stage_index][output_offset:output_offset] = decoder_names
+
+    module_plan = tuple(tuple(modules) for modules in resolved)
+    config._glm52_pipeline_layer_ranges = ranges
+    config._glm52_pipeline_decoder_stage_indices = decoder_slots
+    config._glm52_pipeline_module_names_per_stage = module_plan
+    return module_plan
+
+
+__all__ = [
+    "Glm52LayerPlan",
+    "Glm52LayerSpec",
+    "IndexerType",
+    "MLPType",
+    "derive_glm52_pipeline_layer_ranges",
+    "install_glm52_pipeline_module_plan",
+]

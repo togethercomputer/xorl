@@ -101,3 +101,44 @@ def test_mode_owned_success_and_failure_cleanup_is_idempotent():
             manager.end(backward_failure)
     manager.end(backward_failure)
     assert manager.active is None
+
+
+@pytest.mark.cpu
+def test_overlapping_checkpointed_microbatches_keep_invocation_local_payloads_until_schedule_end():
+    """Model a 1F1B stage issuing F0/F1 before the matching B1/B0 recomputes."""
+
+    plan = _producer_shared_plan()
+    manager = IndexShareContextManager(plan, (0, 2))
+    scale = torch.nn.Parameter(torch.tensor(0.5))
+    payload_calls = [0, 0]
+    contexts = []
+    outputs = []
+
+    for microbatch in range(2):
+        context = manager.begin(mode=IndexShareMode.TRAINING_WITH_BACKWARD)
+        contexts.append(context)
+        input_tensor = torch.tensor([float(microbatch + 1)], requires_grad=True)
+
+        def layer(hidden_states, *, _context=context, _microbatch=microbatch):
+            payload = _context.get_or_publish(
+                producer_layer_index=0,
+                layer_plan=plan,
+                produce_payload=lambda: (
+                    payload_calls.__setitem__(_microbatch, payload_calls[_microbatch] + 1)
+                    or torch.tensor([[_microbatch]], dtype=torch.int64)
+                ),
+            )
+            return hidden_states * scale + payload.values.sum().to(hidden_states) * 0.0
+
+        outputs.append(checkpoint(layer, input_tensor, use_reentrant=False))
+        manager.finish_forward(context, succeeded=True)
+
+    assert manager.active_contexts == tuple(contexts)
+    outputs[1].sum().backward(retain_graph=True)
+    outputs[0].sum().backward()
+    assert payload_calls == [1, 1]
+    assert manager.active_contexts == tuple(contexts)
+
+    manager.end_all()
+    assert manager.active_contexts == ()
+    assert all(context.lifecycle is IndexShareLifecycle.CLOSED for context in contexts)

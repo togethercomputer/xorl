@@ -49,7 +49,8 @@ class Qwen3_5MoeCheckpointHandler(CheckpointHandler):
     - When ``skip_qkv_merge=True``, QKV keys pass through unmerged
       (model has separate q_proj/k_proj/v_proj after unfuse_for_tp).
     - When ``skip_gate_up_merge=True``, gate/up keys pass through unmerged
-      (dense MLP layers have separate gate_proj/up_proj after unfuse_for_tp).
+      (dense MLP layers and shared experts have separate gate_proj/up_proj after
+      unfuse_for_tp).
     - Expert merging is always active (stacking per-expert HF weights).
     """
 

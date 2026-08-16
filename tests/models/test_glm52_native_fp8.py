@@ -166,10 +166,24 @@ def test_model_replaces_only_quantized_dense_shared_and_expert_modules():
     assert isinstance(modules["model.layers.1.mlp.experts"], Glm52NativeBlockFP8Experts)
     assert isinstance(modules["model.layers.0.self_attn.indexer.weights_proj"], nn.Linear)
     assert isinstance(model.lm_head, nn.Linear)
+    from xorl.models.transformers.glm5.exact_fullparam_admission import (
+        Glm52FullParamTopkRouter,
+    )
+    from xorl.models.transformers.glm5.exact_fullparam_fp8 import (
+        Glm52ExactTP1BlockFP8FullParamLinear,
+        Glm52FullParamDenseMLP,
+    )
+
+    # Full-param composites and routers own FP32
+    # masters + byte caches that a decoder-layer parameter cast would
+    # corrupt.  Expert banks stay out (dedicated expert-FSDP branch).
     assert model.get_ignore_modules_in_mixed_precision() == (
         NativeBlockFP8Linear,
         Glm52ExactTP1BlockFP8QLoRALinear,
         Glm52ExactTP16SharedExpertBlockFP8QLoRA,
+        Glm52FullParamDenseMLP,
+        Glm52FullParamTopkRouter,
+        Glm52ExactTP1BlockFP8FullParamLinear,
     )
 
 
@@ -402,3 +416,54 @@ def test_grouped_dense_and_expert_handlers_own_disjoint_native_pair_families():
     assert expert_skip is not None
     assert expert_skip("model.layers.1.mlp.experts.2.gate_proj.weight")
     assert not expert_skip("model.layers.1.mlp.experts.1.gate_proj.weight")
+
+
+def test_frozen_bank_refuses_ids_beyond_stored_rows_before_any_kernel():
+    """Stored-rows admission fails before the fused expert kernel.
+
+    Expert-id validation must check the ACTUAL stored rows, never the
+    declared ``num_experts`` (declared-global for frozen banks): on the
+    double-slice construction can leave a bank storing one row while
+    declaring the global expert count.  A ``(1, ...)``-shaped bank must
+    REFUSE out-of-range ids here, never fault.
+    """
+
+    module = Glm52NativeBlockFP8Experts(16, 256, 128)
+    module.load_prequantized(
+        _fp8_values((16, 256, 256)),
+        torch.arange(64, dtype=torch.float32).reshape(16, 2, 2) / 11,
+        _fp8_values((16, 128, 256)),
+        torch.arange(32, dtype=torch.float32).reshape(16, 1, 2) / 19,
+    )
+    # Simulate the corrupt double-slice construction: every stored field
+    # keeps ONE expert row while the bank still declares 16.
+    for name in (
+        "gate_up_packed_weight_f32",
+        "gate_up_weight_scale_inv",
+        "down_packed_weight_f32",
+        "down_weight_scale_inv",
+    ):
+        sliced = getattr(module, name).detach()[:1].clone()
+        setattr(module, name, nn.Parameter(sliced, requires_grad=False))
+    assert tuple(module.gate_up_packed_weight_f32.shape)[0] == 1
+
+    hidden = torch.zeros(16, 256, dtype=torch.bfloat16)
+    routing = torch.ones(16, 1, dtype=torch.float32)
+    declared_local_ids = torch.arange(16, dtype=torch.int32).reshape(16, 1).contiguous()
+
+    # The declared-count-derived ids must RAISE against the stored rows.
+    with pytest.raises(RuntimeError, match="ACTUAL stored rows"):
+        module(hidden, routing, sglang_ep_native_local_ids=declared_local_ids)
+
+    # Ids within the stored rows sail PAST the new admission: on CPU the
+    # next refusal in line is the CUDA requirement, proving the check is
+    # id-driven, not shape-driven.
+    in_range_ids = torch.zeros(16, 1, dtype=torch.int32)
+    in_range_ids[0, 0] = -1  # sentinel stays admitted
+    with pytest.raises(RuntimeError, match="requires CUDA"):
+        module(hidden, routing, sglang_ep_native_local_ids=in_range_ids)
+
+    # Internally inconsistent storage (fields disagree on rows) refuses too.
+    module.down_packed_weight_f32 = nn.Parameter(torch.zeros(3, 128, 64, dtype=torch.float32), requires_grad=False)
+    with pytest.raises(RuntimeError, match="internally inconsistent"):
+        module(hidden, routing, sglang_ep_native_local_ids=in_range_ids)

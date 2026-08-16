@@ -127,13 +127,16 @@ class XorlPreTrainedModel(nn.Module):
 
     def enable_routing_replay(self):
         """Create RoutingReplay instances for each MoE block."""
-        # Clear stale instances from previous calls (e.g. model rebuild).
-        RoutingReplay._instances.clear()
-
         moe_layers = []
         for name, module in self.named_modules():
             mlp = getattr(module, "mlp", None)
             if isinstance(mlp, MoEBlock):
+                if not mlp.supports_routing_replay():
+                    # Unsupported route programs must not retain replay state:
+                    # a global stage is process-wide and would otherwise enter
+                    # a route path that explicitly cannot consume it.
+                    mlp._routing_replay = None
+                    continue
                 replay = RoutingReplay()
                 mlp._routing_replay = replay
                 moe_layers.append((name, replay))

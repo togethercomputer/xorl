@@ -4,9 +4,11 @@ title: Development Guide
 
 ## Workflow
 
+[`CONTRIBUTING.md`](https://github.com/togethercomputer/xorl/blob/main/CONTRIBUTING.md) is the source of truth for contribution policy. This page summarizes it for the website.
+
 1. **Branch** off `main` with a descriptive name: `feature/my-feature`, `fix/bug-description`
 2. **Commit** early and often on your branch — commit messages don't matter much here
-3. **Open a PR** against `main` when ready for review
+3. **Open a PR** against `main` when ready for review. The PR title must follow Conventional Commits because it becomes the squash-merge commit and drives release versioning.
 4. **Squash merge** — all PRs are merged as a single squash commit; write a clean PR title and description since that becomes the commit message
 
 ## PR Guidelines
@@ -14,7 +16,7 @@ title: Development Guide
 - Keep PRs focused — one feature or fix per PR
 - Add tests for new behavior; existing tests must pass
 - Update relevant docs if behavior changes
-- PR title should be imperative and descriptive: `Add chunked cross-entropy loss` not `chunked ce`
+- Use `type: description` or `type(scope): description`, for example `feat: add chunked cross-entropy loss` or `fix(moe): preserve expert ordering`. See the root contribution guide for allowed release and non-release types.
 
 ## Commit Message (Squash Merge)
 
@@ -33,7 +35,7 @@ Add ring attention support for long-context training
 We use [pre-commit](https://pre-commit.com/) to enforce formatting and catch common issues. Set it up once:
 
 ```bash
-pip install pre-commit
+pip install -e ".[lint]"
 pre-commit install
 ```
 

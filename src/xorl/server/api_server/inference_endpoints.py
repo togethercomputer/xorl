@@ -135,6 +135,16 @@ class InferenceEndpointsMixin:
             return None
         return dtype in {"fp8", "fp8_e4m3", "e4m3", "float8_e4m3fn"}
 
+    @classmethod
+    def _server_info_radix_cache_enabled(cls, info_data: Dict[str, Any]) -> bool | None:
+        explicit = cls._server_info_bool(info_data, "radix_cache_enabled")
+        if explicit is not None:
+            return explicit
+        disabled = cls._server_info_bool(info_data, "disable_radix_cache")
+        if disabled is None:
+            return None
+        return not disabled
+
     @staticmethod
     def _normalize_receiver_kv_cache_dtype(value: Any) -> str | None:
         if value is None:
@@ -398,11 +408,16 @@ class InferenceEndpointsMixin:
         fp8_kv_cache_enabled = False
         fp8_kv_cache_requires_postprocess = False
         fp8_kv_cache_static_scales = False
+        radix_cache_enabled = False
         cache_epoch = None
 
         for ep in self.inference_endpoints:
             info = ep.server_info
             if info is None:
+                # SGLang enables the radix cache by default. Older endpoints
+                # may not report the flag, so auto mode must assume enabled
+                # rather than risk replaying KV from the previous weights.
+                radix_cache_enabled = True
                 continue
             if info.fp8_kv_cache_enabled is True or self._is_fp8_kv_cache_dtype(info.kv_cache_dtype):
                 fp8_kv_cache_enabled = True
@@ -410,6 +425,8 @@ class InferenceEndpointsMixin:
                 fp8_kv_cache_requires_postprocess = True
             if info.fp8_kv_cache_static_scales is True:
                 fp8_kv_cache_static_scales = True
+            if info.radix_cache_enabled is not False:
+                radix_cache_enabled = True
             if cache_epoch is None and info.cache_epoch is not None:
                 cache_epoch = info.cache_epoch
 
@@ -419,6 +436,23 @@ class InferenceEndpointsMixin:
             flush_cache = True
         elif mode == "auto" and fp8_weight_sync and fp8_kv_cache_enabled:
             flush_cache = True
+        elif mode == "auto" and radix_cache_enabled:
+            # Token-keyed radix trees are not weight-version aware: a prefix
+            # hit after this sync would replay KV computed by the previous
+            # weights, silently corrupting decision-time logprobs. Exact-RL
+            # engines also force this flush server-side; this client rule is
+            # belt-and-braces for endpoints that predate that guard. An
+            # explicit mode="none" still opts out.
+            logger.info(
+                "cache_invalidation_mode=auto: flushing because at least one "
+                "endpoint serves with, or does not explicitly disable, the radix prefix cache."
+            )
+            flush_cache = True
+
+        pause_mode = request.pause_mode
+        if flush_cache and pause_mode == "in_place":
+            logger.info("Normalizing pause_mode=in_place to retract because this weight sync flushes cache.")
+            pause_mode = "retract"
 
         postprocess_required = bool(
             fp8_weight_sync
@@ -428,6 +462,8 @@ class InferenceEndpointsMixin:
         return {
             "cache_invalidation_mode": mode,
             "flush_cache": flush_cache,
+            "pause_mode": pause_mode,
+            "radix_cache_enabled": radix_cache_enabled,
             "fp8_kv_cache_enabled": fp8_kv_cache_enabled,
             "fp8_kv_cache_postprocess_required": postprocess_required,
             "fp8_kv_cache_static_scales": fp8_kv_cache_static_scales,
@@ -612,6 +648,7 @@ class InferenceEndpointsMixin:
                         "kv_cache_static_scales",
                     ),
                     cache_epoch=self._cache_epoch_from_mapping(info_data),
+                    radix_cache_enabled=self._server_info_radix_cache_enabled(info_data),
                     enable_lora=info_data.get("enable_lora"),
                     max_lora_rank=info_data.get("max_lora_rank"),
                     version=info_data.get("version"),
@@ -938,7 +975,7 @@ class InferenceEndpointsMixin:
                     fp8_kv_cache_enabled=cache_behavior["fp8_kv_cache_enabled"],
                     fp8_kv_cache_postprocess_required=cache_behavior["fp8_kv_cache_postprocess_required"],
                     fp8_kv_cache_static_scales=cache_behavior["fp8_kv_cache_static_scales"],
-                    pause_mode=request.pause_mode,
+                    pause_mode=cache_behavior["pause_mode"],
                     weight_version=request.weight_version,
                     quantization=quantization,
                 ),

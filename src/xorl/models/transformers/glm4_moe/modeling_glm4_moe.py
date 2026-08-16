@@ -35,6 +35,7 @@ from xorl.models.layers.attention import (
     is_flash_attention,
     update_causal_mask,
 )
+from xorl.models.layers.fused_projection_lora import project_fused_linear_with_lora
 from xorl.models.layers.moe import MoEBlock
 from xorl.models.layers.moe.routing_replay import get_replay_stage
 from xorl.models.layers.normalization import compiled_eager_rms_norm
@@ -83,6 +84,8 @@ class Glm4MoeRMSNorm(nn.Module):
 
 
 class Glm4MoeMLP(nn.Module):
+    _supports_fused_gate_up_lora = True
+
     def __init__(self, config, intermediate_size=None):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -103,10 +106,17 @@ class Glm4MoeMLP(nn.Module):
 
     def forward(self, x):
         if hasattr(self, "gate_up_proj"):
+            gate_up = project_fused_linear_with_lora(
+                self,
+                x,
+                base_name="gate_up_proj",
+                projection_names=("gate_proj", "up_proj"),
+                projection_sizes=(self.intermediate_size, self.intermediate_size),
+            )
             if self._use_fused_silu:
-                x = fused_silu_and_mul(self.gate_up_proj(x))
+                x = fused_silu_and_mul(gate_up)
             else:
-                gate, up = self.gate_up_proj(x).chunk(2, dim=-1)
+                gate, up = gate_up.chunk(2, dim=-1)
                 x = self.act_fn(gate) * up
         else:
             x = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
@@ -306,7 +316,13 @@ class Glm4MoeAttention(MultiHeadAttention):
         hidden_shape = (*input_shape, -1, self.head_dim)
 
         if hasattr(self, "qkv_proj"):
-            qkv = self.qkv_proj(hidden_states)
+            qkv = project_fused_linear_with_lora(
+                self,
+                hidden_states,
+                base_name="qkv_proj",
+                projection_names=("q_proj", "k_proj", "v_proj"),
+                projection_sizes=(self.q_dim, self.kv_dim, self.kv_dim),
+            )
             q, k, v = qkv.split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
         else:
             q = self.q_proj(hidden_states)

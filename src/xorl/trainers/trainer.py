@@ -48,6 +48,7 @@ from xorl.models import (
     save_model_weights,
 )
 from xorl.models.checkpoint_handlers.buffers import get_prequantized_exclude_modules
+from xorl.models.exact_contract import exact_gdn_cp_alignment_required
 from xorl.models.layers.moe.aux_loss import LoadBalancingBuffer, global_load_balancing_loss_func
 from xorl.models.layers.moe.routing_replay import RoutingReplay, set_replay_stage
 from xorl.models.module_utils import compute_loss
@@ -68,12 +69,14 @@ from xorl.qlora import (
 )
 from xorl.qlora.utils import _deregister_qlora_weights_from_fsdp
 from xorl.trainers.model_builder import (
+    maybe_unfuse_projections,
     maybe_upcast_trainable_adapter_params,
     resolve_training_model_dtype,
     should_skip_generic_param_upcast,
 )
 from xorl.trainers.per_component_timer import PerComponentTimer
 from xorl.trainers.training_utils import (
+    align_dsv4_pp_storage_rows,
     clip_gradients,
     count_active_microbatches,
     count_valid_tokens,
@@ -661,6 +664,7 @@ class Trainer:
             seed=args.train.seed,
             pad_to_multiple_of=args.data.pad_to_multiple_of,
             fa_max_length_bucket=args.data.fa_max_length_bucket,
+            gdn_exact_cp_align=exact_gdn_cp_alignment_required(self.model_config),
         ).build()
 
         self.train_steps_per_epoch = len(self.train_dataloader)
@@ -717,6 +721,11 @@ class Trainer:
             lora_rank=args.lora.lora_rank,
             lora_alpha=args.lora.lora_alpha,
             init_device=args.train.init_device,
+            pipeline_parallel_virtual_stages=args.train.pipeline_parallel_virtual_stages,
+            pipeline_parallel_input_weight=args.train.pipeline_parallel_input_weight,
+            pipeline_parallel_output_weight=args.train.pipeline_parallel_output_weight,
+            pipeline_parallel_num_layers_in_first_stage=args.train.pipeline_parallel_num_layers_in_first_stage,
+            pipeline_parallel_num_layers_in_last_stage=args.train.pipeline_parallel_num_layers_in_last_stage,
         )
         self.model_config = self.model.config
         numerical_program = self.model_config._resolved_numerical_program
@@ -760,8 +769,16 @@ class Trainer:
         )
         helper.print_device_mem_info("VRAM usage after building model")
 
-        # Unfuse QKV for tensor parallelism
-        if not args.model.merge_qkv:
+        # Unfuse projections — for LoRA coverage, or QKV-only for tensor parallelism.
+        # Both must precede LoRA injection below and the weight load in _parallelize.
+        maybe_unfuse_projections(
+            self.model,
+            unfuse_for_lora=args.lora.unfuse_for_lora,
+            enable_lora=args.lora.enable_lora,
+            enable_qlora=args.lora.enable_qlora,
+        )
+
+        if not args.model.merge_qkv and not args.lora.unfuse_for_lora:
             for layer in self.model.model.layers:
                 if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "unfuse_for_tp"):
                     layer.self_attn.unfuse_for_tp()
@@ -1042,6 +1059,18 @@ class Trainer:
                 self.ps.lm_head_tp_group,
             )
 
+        if args.lora.lora_b_init_std:
+            if not (args.lora.enable_lora or args.lora.enable_qlora):
+                raise ValueError("lora_b_init_std requires LoRA or QLoRA")
+            from xorl.lora.utils import initialize_lora_b_nonzero  # noqa: PLC0415
+
+            for part in self._all_model_parts():
+                initialize_lora_b_nonzero(
+                    part,
+                    std=args.lora.lora_b_init_std,
+                    seed=args.lora.lora_b_init_seed,
+                )
+
     def _all_model_parts(self) -> List[torch.nn.Module]:
         """All local model chunks: PP virtual stages own several, else just self.model."""
         return list(self.model_parts) if self.pp_enabled else [self.model]
@@ -1230,15 +1259,28 @@ class Trainer:
         h = cfg.hidden_size
         v = cfg.vocab_size
         dt = torch.bfloat16
+        boundary_state = None
+        for model_part, init_stage in zip(self.model_parts, self.pp_stages):
+            if init_stage.stage_index == stage_index:
+                boundary_state = getattr(model_part, "_pp_pipeline_boundary_state", None)
+                break
+        if boundary_state is None:
+            boundary_shape = (mbs, s, h)
+        else:
+            boundary_shape = (mbs, s, *tuple(boundary_state["shape_suffix"]))
+            dt = boundary_state["dtype"]
         if stage_index == 0:
             input_args = (torch.empty(mbs, s, dtype=example_input_ids.dtype, device="meta"),)
         else:
-            input_args = (torch.empty(mbs, s, h, dtype=dt, device="meta"),)
+            input_args = (torch.empty(*boundary_shape, dtype=dt, device="meta"),)
         # quack_linear PP loss consumes HIDDEN (lm_head fused into the loss fn),
         # so the last stage outputs hidden [mbs,s,h] instead of logits [mbs,s,v]
         # — this is what avoids the 8GB+ last-stage logits OOM at 248k vocab.
-        if stage_index == self.pp_num_stages - 1 and not lm_head_in_loss:
-            output_args = (torch.empty(mbs, s, v, dtype=dt, device="meta"),)
+        if stage_index == self.pp_num_stages - 1:
+            terminal_shape = (mbs, s, h) if lm_head_in_loss else (mbs, s, v)
+            output_args = (torch.empty(*terminal_shape, dtype=torch.bfloat16, device="meta"),)
+        elif boundary_state is not None:
+            output_args = (torch.empty(*boundary_shape, dtype=dt, device="meta"),)
         else:
             output_args = (torch.empty(mbs, s, h, dtype=dt, device="meta"),)
         return input_args, output_args
@@ -1267,11 +1309,23 @@ class Trainer:
         watchdog hang at the first schedule step).
         """
         if seq_len not in self._pp_schedule_cache:
-            # quack_linear: last stage returns hidden; the loss fn applies lm_head.
             ce_mode = self.args.train.ce_mode
-            lm_head_in_loss = ce_mode == "quack_linear"
-            stages = []
             pp_lm_head = None
+            pp_loss_owner = None
+            for model_part, init_stage in zip(self.model_parts, self.pp_stages):
+                if init_stage.stage_index == self.pp_num_stages - 1:
+                    pp_lm_head = getattr(model_part, "lm_head", None)
+                    pp_loss_owner = model_part
+                    break
+            exact_head = bool(
+                pp_lm_head is not None
+                and (
+                    getattr(pp_lm_head, "_glm52_exact_tp16_lm_head", False)
+                    or getattr(pp_lm_head, "_dsv4_exact_tp8_lm_head", False)
+                )
+            )
+            lm_head_in_loss = ce_mode in {"quack_linear", "bi_fused"} or exact_head
+            stages = []
             for model_part, init_stage in zip(self.model_parts, self.pp_stages):
                 stage_index = init_stage.stage_index
                 model_part._pp_lm_head_in_loss = lm_head_in_loss
@@ -1287,13 +1341,17 @@ class Trainer:
                         output_args=output_args,
                     )
                 )
-                if stage_index == self.pp_num_stages - 1:
-                    # Only the last stage computes the loss; pass its lm_head to the loss fn.
-                    pp_lm_head = getattr(model_part, "lm_head", None)
             schedule = build_pipeline_schedule(
                 stages=stages,
                 n_microbatches=self.args.train.gradient_accumulation_steps,
-                loss_fn=make_pp_loss_fn(ce_mode, lm_head=pp_lm_head),
+                loss_fn=make_pp_loss_fn(
+                    ce_mode,
+                    lm_head=pp_lm_head,
+                    tp_group=getattr(self.ps, "lm_head_tp_group", None),
+                    lm_head_fp32=bool(self.args.model.lm_head_fp32),
+                    num_chunks=self.args.train.fsdp_sharded_lm_head_loss_num_chunks,
+                    loss_owner=pp_loss_owner,
+                ),
                 schedule_name=self.args.train.pipeline_parallel_schedule,
             )
             if os.environ.get("XORL_PP_BUBBLE_PROFILE", "0") == "1":
@@ -2103,7 +2161,27 @@ class Trainer:
         normalizes gradients by global_valid_tokens in-place.  Returns the
         normalized loss for logging.
         """
-        if self.args.train.pp_variable_seq_lengths:
+        carries_compact_hyperconnection = any(
+            bool(getattr(model_part, "_pp_carries_hyperconnection_state", False)) for model_part in self.model_parts
+        )
+        if carries_compact_hyperconnection:
+            seq_len = self._time_step_phase(
+                "dsv4_pp_align_storage_rows",
+                lambda: align_dsv4_pp_storage_rows(
+                    micro_batches,
+                    cp_size=self.ps.cp_size,
+                    bucket_size=(
+                        self.args.train.pp_seq_len_bucket_size if self.args.train.pp_variable_seq_lengths else 1
+                    ),
+                    minimum_storage_rows=(
+                        0
+                        if self.args.train.pp_variable_seq_lengths
+                        else (self.args.data.sample_packing_sequence_len or 0) // self.ps.cp_size
+                    ),
+                    pad_to_multiple_of=self.args.data.pad_to_multiple_of or 1,
+                ),
+            )
+        elif self.args.train.pp_variable_seq_lengths:
             seq_len = self._time_step_phase(
                 "pp_negotiate_seq_len",
                 lambda: self._bucket_pp_seq_len(negotiate_pp_seq_len(micro_batches, self.ps.pp_group)),
@@ -2131,6 +2209,7 @@ class Trainer:
                 has_first_stage=self.has_first_stage,
                 has_last_stage=self.has_last_stage,
                 pp_group=self.ps.pp_group,
+                logprob_temperature=float(self._causallm_loss_params.get("logprob_temperature", 1.0)),
             )
 
         if profiler is not None:

@@ -15,6 +15,7 @@ from typing import Any, Dict, Optional, Tuple
 import torch
 import torch.distributed as dist
 
+from xorl.ops.exact_sampling_transforms import TOP_K_ALL
 from xorl.ops.loss.loss_output import LossOutput
 from xorl.ops.loss.per_token_ce import compute_per_token_ce
 from xorl.ops.loss.reducers import Reducer, TokenPartial
@@ -158,6 +159,9 @@ def policy_loss_function(
     metric_reducer: Optional[Reducer] = None,
     lm_head: Optional[torch.nn.Module] = None,
     logprob_temperature: float = 1.0,
+    logprob_top_k: int | torch.Tensor = TOP_K_ALL,
+    logprob_top_p: float | torch.Tensor = 1.0,
+    logprob_min_p: float | torch.Tensor = 0.0,
 ) -> "LossOutput":
     """
     Policy loss with PPO clipping, optional IcePop masking, and optional TIS correction.
@@ -239,8 +243,12 @@ def policy_loss_function(
         lm_head_fp32=lm_head_fp32,
         lm_head=lm_head,
         logprob_temperature=logprob_temperature,
+        logprob_top_k=logprob_top_k,
+        logprob_top_p=logprob_top_p,
+        logprob_min_p=logprob_min_p,
     )
 
+    current_support = torch.isfinite(per_token_ce)
     new_logprobs_flat = -per_token_ce.detach()
 
     # Compute PPO KL: old_log_probs - new_log_probs
@@ -254,8 +262,13 @@ def policy_loss_function(
     _kl_stats = None
     if compute_kl_stats:
         with torch.no_grad():
-            _log_ratio_full = (new_logprobs_flat - old_logprobs_flat).masked_fill(~valid_mask, 0.0)
-            _ratio_full = torch.exp(_log_ratio_full)
+            _raw_log_ratio = (new_logprobs_flat - old_logprobs_flat).masked_fill(~valid_mask, 0.0)
+            _log_ratio_full = torch.where(
+                current_support,
+                _raw_log_ratio,
+                torch.full_like(_raw_log_ratio, -20.0),
+            )
+            _ratio_full = torch.where(current_support, torch.exp(_raw_log_ratio), torch.zeros_like(_raw_log_ratio))
             _per_token_k3 = _ratio_full - _log_ratio_full - 1.0
             # ±inf identity on empty ranks lets cross-rank MIN/MAX-allreduce ignore empty contributors.
             if valid_mask.any():
@@ -286,6 +299,7 @@ def policy_loss_function(
                 "ratio_mean": metric_reducer(_ratio_full, valid_mask_f),
                 "ratio_min": _ratio_min,
                 "ratio_max": _ratio_max,
+                "current_support_fraction": metric_reducer(current_support.float(), valid_mask_f),
             }
             for suffix, threshold in K3_DEBUG_THRESHOLDS:
                 _kl_stats[f"kl_k3_debug_frac_gt_{suffix}"] = metric_reducer(
@@ -331,13 +345,14 @@ def policy_loss_function(
     true_loss = loss_reducer(pg_losses, valid_mask_f)
 
     # Gradient-active mask: tokens that are not clipped, not IcePop-masked, and valid
-    gradient_active = ~is_clipped & valid_mask
+    gradient_active = ~is_clipped & valid_mask & current_support
     if icepop_mask is not None:
         gradient_active = gradient_active & icepop_mask
 
     # Surrogate: gradient weight = ratio * advantages, zeroed for inactive tokens
     gradient_weight = (ratio.detach() * advantages_flat).masked_fill(~gradient_active, 0.0)
-    surrogate = loss_reducer(gradient_weight * per_token_ce, valid_mask_f)
+    safe_per_token_ce = torch.where(current_support, per_token_ce, torch.zeros_like(per_token_ce))
+    surrogate = loss_reducer(gradient_weight * safe_per_token_ce, valid_mask_f)
 
     # Combine: forward value from true_loss, gradient from surrogate
     loss_with_grad = true_loss.detach() + surrogate - surrogate.detach()

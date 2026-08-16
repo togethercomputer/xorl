@@ -373,7 +373,7 @@ class RemoteBackend(Backend):
         sync_method="nccl_broadcast",
         flush_cache=False,
         cache_invalidation_mode="auto",
-        pause_mode="in_place",
+        pause_mode="retract",
         weight_version=None,
         quantization=None,
         sparse_delta_paths=None,
@@ -381,6 +381,8 @@ class RemoteBackend(Backend):
         model_id=None,
         request_id=None,
     ):
+        if flush_cache and pause_mode == "in_place":
+            pause_mode = "retract"
         return await self._execute(
             "sync_inference_weights",
             SyncWeightsData(

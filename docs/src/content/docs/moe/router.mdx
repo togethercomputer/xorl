@@ -44,7 +44,7 @@ train:
 
 Routing Replay (R3) solves a correctness problem that arises when combining EP with gradient checkpointing.
 
-**The problem:** Flash attention is non-deterministic on recompute — small numerical differences mean the hidden states fed to the router during backward's recompute differ from the original forward. This causes top-K selection to pick different experts, changing the AllToAll shapes and causing tensor mismatches.
+**The problem:** If recomputation changes the values at the routing boundary, top-K selection can pick different experts. That changes dispatch shapes and makes the recomputed execution inconsistent with the recorded forward.
 
 **The solution:** R3 records routing decisions (expert indices, optionally gate weights) during the forward pass and replays them verbatim during backward recompute.
 
@@ -72,7 +72,7 @@ Routing Replay (R3) solves a correctness problem that arises when combining EP w
   <text x="530" y="74" text-anchor="middle" font-size="10" fill="#1e293b">1. Router runs but result is discarded</text>
   <text x="530" y="90" text-anchor="middle" font-size="10" fill="#1e293b">2. Cached indices popped from replay buffer</text>
   <text x="530" y="106" text-anchor="middle" font-size="10" fill="#1e293b">3. AllToAll uses same indices → same shapes</text>
-  <text x="530" y="118" text-anchor="middle" font-size="9" fill="#64748b">Correct gradients despite non-deterministic attn</text>
+  <text x="530" y="118" text-anchor="middle" font-size="9" fill="#64748b">Stable route-conditioned recompute shapes</text>
 
   <path d="M320 80 Q350 80 380 80" stroke="#2563eb" stroke-width="2" fill="none" marker-end="url(#r3-fwd-arr)"/>
   <text x="350" y="73" text-anchor="middle" font-size="9" fill="#2563eb">replay</text>
@@ -81,7 +81,7 @@ Routing Replay (R3) solves a correctness problem that arises when combining EP w
   <text x="170" y="168" text-anchor="middle" font-size="11" fill="#6b21a8" font-weight="700">R3 mode: Pre-loaded Routing (RL use case)</text>
   <text x="170" y="186" text-anchor="middle" font-size="10" fill="#1e293b">Routing decisions loaded from inference engine</text>
   <text x="170" y="202" text-anchor="middle" font-size="10" fill="#1e293b">before training step (SGLang rollout data)</text>
-  <text x="170" y="216" text-anchor="middle" font-size="9" fill="#64748b">Training exactly replicates inference routing</text>
+  <text x="170" y="216" text-anchor="middle" font-size="9" fill="#64748b">Trainer reuses exported expert choices</text>
 
   <rect x="380" y="148" width="300" height="78" rx="6" fill="#fff7ed" stroke="#d97706" stroke-width="1.5"/>
   <text x="530" y="168" text-anchor="middle" font-size="11" fill="#92400e" font-weight="700">RoutingReplay Buffer</text>
@@ -100,9 +100,9 @@ Routing Replay (R3) solves a correctness problem that arises when combining EP w
 
 ### R3 Mode for RL (Pre-loaded Routing from SGLang)
 
-R3 also powers **rollout routing replay** for RL training. When SGLang generates rollouts, it records which experts each token was routed to during inference. xorl loads these pre-computed routing decisions so that training uses *exactly the same expert assignments as inference*, ensuring gradient-level consistency between the policy model's training and rollout steps.
+R3 also powers **rollout routing replay** for RL training. When xorl-sglang exports expert choices, XoRL can load them so the route-conditioned trainer computation uses the same discrete assignments. This does not verify the router computation independently and does not prove equality of expert outputs, selected-token logprobs, gradients, or post-update weights.
 
-R3 is activated automatically when `ep_size > 1` and gradient checkpointing is enabled. No configuration is required.
+The local forward/recompute replay lifecycle is enabled automatically on admitted EP + gradient-checkpointing paths. Rollout replay additionally requires routing data from the inference response and the corresponding server request path.
 
 ---
 

@@ -5,13 +5,14 @@ Functions for injecting LoRA into models and managing LoRA state dicts.
 """
 
 import fnmatch
+import hashlib
 import json
 import logging
 import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Set, Tuple
 
 import torch
 import torch.distributed as dist
@@ -31,7 +32,28 @@ logger = logging.getLogger(__name__)
 # Default target modules for common model architectures
 DEFAULT_TARGET_MODULES = {
     "llama": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-    "qwen": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    "qwen2": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    "qwen3": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    "qwen3_moe": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    # Qwen3.5/3.6 GDN calls its z projection ``g_proj`` in the trainer.
+    "qwen3_5": ["q_proj", "k_proj", "v_proj", "g_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    "qwen3_5_moe": [
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "g_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    ],
+    "olmo2": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    "glm4_moe": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    "gpt_oss": ["q_proj", "k_proj", "v_proj", "o_proj"],
+    "minimax_m3": ["q_proj", "k_proj", "v_proj", "o_proj"],
+    "xorl_minimax_m3": ["q_proj", "k_proj", "v_proj", "o_proj"],
+    "nemotron_h": ["q_proj", "k_proj", "v_proj", "o_proj"],
+    "deepseek_v4": ["wq_a", "wq_b", "wkv", "wo_a", "wo_b"],
     "mistral": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
     "gemma": ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
     "deepseek_v3": [
@@ -99,7 +121,63 @@ _MOE_SGLANG_SHARED_OUTER_PATTERN = re.compile(r"(.*)\.mlp\.experts\.(w1|w2|w3)\.
 _PROJ_TO_SGLANG_W = {"gate_proj": "w1", "down_proj": "w2", "up_proj": "w3"}
 _SGLANG_W_TO_PROJ = {v: k for k, v in _PROJ_TO_SGLANG_W.items()}
 
-LORA_EXPORT_FORMATS = ("peft", "sglang_shared_outer")
+LORA_EXPORT_FORMATS = ("peft", "sglang_shared_outer", "dsv4_expert_banks")
+
+
+def dsv4_expert_bank_export_key_and_tensor(
+    name: str,
+    tensor: torch.Tensor,
+) -> tuple[str, torch.Tensor]:
+    """Map one trainer factor into the exact SGLang DSV4 adapter layout."""
+
+    match = _MOE_LORA_PATTERN.match(name)
+    if match is not None:
+        prefix, projection, factor = match.groups()
+        slot = _PROJ_TO_SGLANG_W[projection]
+        key = f"{_PEFT_BASE_MODEL_PREFIX}{prefix}.mlp.experts.{slot}.lora_{factor}.weight"
+        return key, tensor.transpose(-2, -1).contiguous()
+
+    if "lm_head.lora_A" in name:
+        name = name.replace("lm_head.lora_A", "lm_head.lora_embedding_A")
+    elif "lm_head.lora_B" in name:
+        name = name.replace("lm_head.lora_B", "lm_head.lora_embedding_B")
+    elif name.endswith(".lora_A") or name.endswith(".lora_B"):
+        name += ".weight"
+    return f"{_PEFT_BASE_MODEL_PREFIX}{name}", tensor
+
+
+@torch.no_grad()
+def initialize_lora_b_nonzero(
+    model: nn.Module,
+    *,
+    std: float = 0.0,
+    seed: int = 0,
+) -> int:
+    """Optionally replace zero LoRA-B initialization with deterministic noise.
+
+    ``std=0`` is the default no-op. Each fully-qualified parameter gets its own
+    stable seed, so replicated DTensor parameters receive identical bytes on
+    every rank without depending on Python's randomized hash.
+    """
+    if std < 0.0:
+        raise ValueError(f"lora_b_init_std must be nonnegative, got {std}")
+    if std == 0.0:
+        return 0
+
+    initialized = 0
+    for name, parameter in model.named_parameters():
+        if "lora_B" not in name:
+            continue
+        local = parameter.to_local() if isinstance(parameter, DTensor) else parameter
+        digest = hashlib.sha256(f"{seed}:{name}".encode()).digest()
+        parameter_seed = int.from_bytes(digest[:8], "little") & ((1 << 63) - 1)
+        generator = torch.Generator(device=local.device).manual_seed(parameter_seed)
+        local.normal_(mean=0.0, std=std, generator=generator)
+        initialized += 1
+    if initialized == 0:
+        raise RuntimeError("nonzero LoRA-B initialization requested but no lora_B parameters were found")
+    logger.info("Initialized %d LoRA-B parameters with deterministic normal std=%g seed=%d", initialized, std, seed)
+    return initialized
 
 
 @dataclass(frozen=True)
@@ -117,10 +195,12 @@ def _get_default_target_modules(model: nn.Module) -> List[str]:
     if model_type in DEFAULT_TARGET_MODULES:
         return list(DEFAULT_TARGET_MODULES[model_type])
     if model_type is not None:
-        for family, targets in DEFAULT_TARGET_MODULES.items():
+        for family in sorted(DEFAULT_TARGET_MODULES, key=len, reverse=True):
             if family in model_type:
-                return list(targets)
-    return ["q_proj", "k_proj", "v_proj", "o_proj"]
+                return list(DEFAULT_TARGET_MODULES[family])
+    raise ValueError(
+        f"No audited default LoRA targets for model_type={model_type!r}; set lora_target_modules explicitly"
+    )
 
 
 def _get_submodule(model: nn.Module, target: str) -> Tuple[nn.Module, str]:
@@ -144,6 +224,7 @@ def _get_submodule(model: nn.Module, target: str) -> Tuple[nn.Module, str]:
 def _find_target_modules(
     model: nn.Module,
     target_modules: List[str],
+    satisfied_targets: Optional[Iterable[str]] = None,
 ) -> List[str]:
     """
     Find all module paths matching target module names.
@@ -158,6 +239,12 @@ def _find_target_modules(
     The algorithm processes modules top-down and skips children of replaced
     modules to avoid double-replacement.
 
+    Raises for any requested target that matched no module, since it would otherwise
+    train unadapted. That check is satisfied by a single match anywhere, so a target
+    some modules carry and others lack stays silent: ``MoEExperts`` exposes
+    ``gate_proj``/``up_proj`` as properties, so routed experts satisfy those names
+    for the whole model even when a shared expert beside them is bare.
+
     Args:
         model: Model to search
         target_modules: List of module name patterns to match
@@ -166,7 +253,8 @@ def _find_target_modules(
         List of full module paths that match (in top-down order)
     """
     matched_paths = []
-    replaced_prefixes = set()  # Track replaced module paths to skip their children
+    replaced_prefixes: Set[str] = set()  # Track replaced module paths to skip their children
+    matched_targets: Set[str] = set(satisfied_targets or ())
 
     for name, module in model.named_modules():
         # Skip if this module is under an already-matched parent
@@ -184,18 +272,55 @@ def _find_target_modules(
         if module_name in target_modules:
             matched_paths.append(name)
             replaced_prefixes.add(name)
+            matched_targets.add(module_name)
             continue
 
         # Indirect match: module has attributes/children matching target_modules
         # This handles MoE experts where user specifies "gate_proj" but the
         # actual module to replace is "experts" which contains gate_proj weights
         module_attrs = set(dir(module))
-        if any(target in module_attrs for target in target_modules):
+        indirect_matches = {target for target in target_modules if target in module_attrs}
+        if indirect_matches:
             matched_paths.append(name)
             replaced_prefixes.add(name)
+            matched_targets |= indirect_matches
             continue
 
+    # Partial coverage is never a valid success: a 2-of-7 match otherwise looks like
+    # a healthy injection while five requested projections remain unadapted.
+    unmatched = sorted(set(target_modules) - matched_targets)
+    if unmatched:
+        raise ValueError(
+            f"LoRA targets matched no module: {unmatched} "
+            f"(adapted: {sorted(matched_targets)}). If this architecture stores them fused, "
+            "either enable unfuse_for_lora or target the fused names directly."
+        )
+
     return matched_paths
+
+
+def _restrict_dsv4_flash_exact_target_paths(
+    model: nn.Module,
+    target_paths: List[str],
+) -> List[str]:
+    """Keep only the frozen exact DSV4-Flash physical adapter surface.
+
+    Leaf-name matching is intentionally insufficient for this architecture:
+    both the attention compressor and the DSA indexer contain an internal
+    ``wkv`` projection, but those selector/trunk components are frozen.  The
+    exact inventory is the single source of truth for adapted physical paths.
+    """
+
+    config = getattr(model, "config", None)
+    if not getattr(config, "_dsv4_flash_exact_active_lora", False):
+        return target_paths
+
+    from xorl.models.transformers.deepseek_v4.exact_contract import (  # noqa: PLC0415
+        build_dsv4_flash_adapter_inventory,
+    )
+
+    allowed = build_dsv4_flash_adapter_inventory(config).target_names
+    return [path for path in target_paths if path in allowed]
 
 
 def _manifest_allows_module_path(path: str, manifest: Optional[dict]) -> bool:
@@ -271,6 +396,72 @@ def _inject_fused_gdn_delta_lora(
     return injected
 
 
+def _inject_fused_projection_delta_lora(
+    model: nn.Module,
+    *,
+    r: int,
+    lora_alpha: int,
+    target_modules: List[str],
+    target_manifest: Optional[dict],
+) -> tuple[int, set[str]]:
+    """Attach independent logical factors while retaining fused base GEMMs."""
+
+    from xorl.lora.modules.delta_linear import LoraDeltaLinear  # noqa: PLC0415
+
+    injected = 0
+    satisfied: set[str] = set()
+    for module_path, module in list(model.named_modules()):
+        specs = []
+        qkv_proj = getattr(module, "qkv_proj", None)
+        if getattr(module, "_supports_fused_qkv_lora", False) and isinstance(qkv_proj, nn.Linear):
+            q_dim = int(getattr(module, "q_dim"))
+            kv_dim = int(getattr(module, "kv_dim"))
+            expected_outputs = q_dim + 2 * kv_dim
+            if qkv_proj.out_features != expected_outputs:
+                raise ValueError(
+                    f"{module_path}: qkv_proj has {qkv_proj.out_features} outputs, expected {expected_outputs}"
+                )
+            specs.append((qkv_proj, (("q_proj", q_dim), ("k_proj", kv_dim), ("v_proj", kv_dim))))
+
+        gate_up_proj = getattr(module, "gate_up_proj", None)
+        intermediate_size = getattr(module, "intermediate_size", None)
+        if (
+            getattr(module, "_supports_fused_gate_up_lora", False)
+            and isinstance(gate_up_proj, nn.Linear)
+            and intermediate_size is not None
+        ):
+            intermediate_size = int(intermediate_size)
+            if gate_up_proj.out_features != 2 * intermediate_size:
+                raise ValueError(
+                    f"{module_path}: gate_up_proj has {gate_up_proj.out_features} outputs, "
+                    f"expected {2 * intermediate_size}"
+                )
+            specs.append((gate_up_proj, (("gate_proj", intermediate_size), ("up_proj", intermediate_size))))
+
+        for base, projections in specs:
+            for projection, out_features in projections:
+                if projection not in target_modules:
+                    continue
+                path = f"{module_path}.{projection}"
+                if not _manifest_allows_module_path(path, target_manifest):
+                    continue
+                if hasattr(module, projection):
+                    raise ValueError(f"{path} already exists before fused-projection LoRA injection")
+                module.add_module(
+                    projection,
+                    LoraDeltaLinear(
+                        base.in_features,
+                        out_features,
+                        r=r,
+                        lora_alpha=lora_alpha,
+                        device=base.weight.device,
+                    ),
+                )
+                injected += 1
+                satisfied.add(projection)
+    return injected, satisfied
+
+
 def inject_lora_into_model(
     model: nn.Module,
     r: int = 16,
@@ -331,12 +522,23 @@ def inject_lora_into_model(
         target_modules=target_modules,
         target_manifest=loaded_manifest,
     )
+    fused_projection_count, fused_projection_targets = _inject_fused_projection_delta_lora(
+        model,
+        r=r,
+        lora_alpha=lora_alpha,
+        target_modules=target_modules,
+        target_manifest=loaded_manifest,
+    )
 
     # Find all matching modules
-    target_paths = _find_target_modules(model, target_modules)
+    specially_satisfied = set(fused_projection_targets)
+    if fused_gdn_count:
+        specially_satisfied.update({name for name in ("in_proj_qkvz", "out_proj") if name in target_modules})
+    target_paths = _find_target_modules(model, target_modules, satisfied_targets=specially_satisfied)
+    target_paths = _restrict_dsv4_flash_exact_target_paths(model, target_paths)
     target_paths = [path for path in target_paths if _manifest_allows_module_path(path, loaded_manifest)]
 
-    if not target_paths and fused_gdn_count == 0:
+    if not target_paths and fused_gdn_count == 0 and fused_projection_count == 0:
         raise ValueError(
             f"No modules found matching target_modules={target_modules}. "
             f"Please check that the model has modules with these names. "
@@ -345,7 +547,8 @@ def inject_lora_into_model(
 
     logger.info(
         f"Injecting LoRA into {len(target_paths)} base modules and "
-        f"{fused_gdn_count} fused-GDN delta modules with r={r}, alpha={lora_alpha}"
+        f"{fused_gdn_count} fused-GDN delta modules and {fused_projection_count} "
+        f"fused-projection delta modules with r={r}, alpha={lora_alpha}"
     )
 
     # Replace each target module
@@ -375,7 +578,7 @@ def inject_lora_into_model(
         logger.debug(f"Replaced {target_path} with {lora_cls.__name__}")
 
     # Check if any modules were actually replaced
-    if replaced_count == 0 and fused_gdn_count == 0:
+    if replaced_count == 0 and fused_gdn_count == 0 and fused_projection_count == 0:
         skipped_info = ", ".join([f"{path} ({typ})" for path, typ in skipped_modules[:5]])
         if len(skipped_modules) > 5:
             skipped_info += f"... and {len(skipped_modules) - 5} more"
@@ -393,7 +596,8 @@ def inject_lora_into_model(
         )
 
     logger.info(
-        f"Successfully injected LoRA into {replaced_count} base modules and {fused_gdn_count} fused-GDN delta modules"
+        f"Successfully injected LoRA into {replaced_count} base modules, {fused_gdn_count} "
+        f"fused-GDN delta modules, and {fused_projection_count} fused-projection delta modules"
     )
     if loaded_manifest is not None and not _defer_manifest_validation:
         validated = validate_lora_target_manifest(model, loaded_manifest)
@@ -939,9 +1143,10 @@ def save_lora_checkpoint(
             inference backends. Ignored when
             ``lora_export_format="sglang_shared_outer"``.
         lora_export_format: On-disk layout for MoE expert LoRA. ``"peft"``
-            (default) un-stacks the 3D tensors into per-expert 2D keys. Pass
-            ``"sglang_shared_outer"`` to emit SGLang's stacked 3D shared_outer
-            layout directly (requires ``moe_hybrid_shared_lora=True``).
+            (default) un-stacks the 3D tensors into per-expert 2D keys.
+            ``"sglang_shared_outer"`` emits SGLang's stacked hybrid-shared
+            layout. ``"dsv4_expert_banks"`` emits the exact per-expert bank
+            layout for the official DSV4-Flash contract.
         preserve_lora_dtype: Keep LoRA tensor dtypes in the safetensors file
             instead of exporting bf16 weights. Use this for training-resume
             checkpoints; keep the default bf16 export for inference adapters.
@@ -957,6 +1162,10 @@ def save_lora_checkpoint(
             "lora_export_format='sglang_shared_outer' requires moe_hybrid_shared_lora=True "
             "(shared_outer only makes sense for hybrid-shared MoE LoRA)."
         )
+    if lora_export_format == "dsv4_expert_banks" and moe_hybrid_shared_lora:
+        raise ValueError(
+            "lora_export_format='dsv4_expert_banks' requires per-expert A/B factors (moe_hybrid_shared_lora=False)"
+        )
 
     os.makedirs(save_path, exist_ok=True)
 
@@ -966,10 +1175,38 @@ def save_lora_checkpoint(
     else:
         lora_state_dict = slice_lora_state_dict_to_active_rank(model, lora_state_dict)
 
+    if lora_export_format == "dsv4_expert_banks":
+        from xorl.models.transformers.deepseek_v4.exact_contract import (  # noqa: PLC0415
+            DSV4_FLASH_LOGICAL_FACTOR_COUNT,
+        )
+
+        inventory = getattr(model, "_dsv4_adapter_inventory", None)
+        config = getattr(model, "config", None)
+        if not getattr(config, "_dsv4_flash_exact_active_lora", False) or inventory is None:
+            raise ValueError("dsv4_expert_banks export requires a bound exact DSV4-Flash active-LoRA model")
+        expected = {factor.name: factor for factor in inventory.factors}
+        missing = sorted(set(expected) - set(lora_state_dict))
+        extra = sorted(set(lora_state_dict) - set(expected))
+        if len(expected) != DSV4_FLASH_LOGICAL_FACTOR_COUNT or missing or extra:
+            raise ValueError(
+                "dsv4_expert_banks export requires the complete 948-factor "
+                f"inventory: expected={len(expected)}, missing={missing[:8]}, extra={extra[:8]}"
+            )
+        mismatched = [
+            f"{name}: {tuple(lora_state_dict[name].shape)} != {spec.shape}"
+            for name, spec in expected.items()
+            if tuple(lora_state_dict[name].shape) != spec.shape
+        ]
+        if mismatched:
+            raise ValueError("dsv4_expert_banks factor shape mismatch: " + ", ".join(mismatched[:8]))
+
     def _prepare_lora_tensor(tensor: torch.Tensor) -> torch.Tensor:
         tensor = tensor.detach().cpu().contiguous()
-        if preserve_lora_dtype:
+        if preserve_lora_dtype and lora_export_format != "dsv4_expert_banks":
             return tensor
+        # dsv4_expert_banks is a serving artifact: the sampler's fail-closed
+        # loader admits only BF16 factor views (the FP32 masters remain
+        # trainer/optimizer state and are not part of the export contract).
         return tensor.to(torch.bfloat16)
 
     def _is_moe_lora_param(name: str) -> bool:
@@ -1064,7 +1301,22 @@ def save_lora_checkpoint(
 
     for key, value in lora_state_dict.items():
         # Check if this is a stacked MoE LoRA parameter
-        if _is_moe_lora_param(key):
+        if lora_export_format == "dsv4_expert_banks":
+            peft_key, out_tensor = dsv4_expert_bank_export_key_and_tensor(
+                key,
+                value,
+            )
+            peft_state_dict[peft_key] = _prepare_lora_tensor(out_tensor)
+            if _is_moe_lora_param(key):
+                match = _MOE_LORA_PATTERN.match(key)
+                assert match is not None
+                detected_modules.add(match.group(2))
+                if detected_r is None and match.group(3) == "A":
+                    detected_r = value.shape[2]
+            elif detected_r is None and key.endswith(".lora_A"):
+                detected_r = value.shape[0]
+        # Check if this is a stacked MoE LoRA parameter
+        elif _is_moe_lora_param(key):
             if lora_export_format == "sglang_shared_outer":
                 peft_key, out_tensor = _sglang_shared_outer_moe_weight(key, value)
                 peft_state_dict[peft_key] = out_tensor
@@ -1148,6 +1400,24 @@ def save_lora_checkpoint(
         # on-disk, so mirror the flag here so SGLang doesn't mis-classify it as
         # per_expert (which would reject loading under --lora-moe-format hybrid_shared).
         adapter_config["moe_hybrid_shared_lora"] = True
+    elif lora_export_format == "dsv4_expert_banks":
+        adapter_config["_sglang_lora_format"] = "dsv4_expert_banks"
+        adapter_config["moe_hybrid_shared_lora"] = False
+        adapter_config["target_modules"] = sorted(
+            {
+                "down_proj",
+                "gate_proj",
+                "lm_head",
+                "self_attn.wq_b",
+                "up_proj",
+                "wkv",
+                "wo_a",
+                "wo_b",
+                "wq_a",
+            }
+        )
+        adapter_config["use_dora"] = False
+        adapter_config["use_rslora"] = False
     else:
         adapter_config["moe_hybrid_shared_lora"] = moe_hybrid_shared_lora
 
