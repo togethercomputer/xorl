@@ -299,6 +299,7 @@ class RequestProcessor:
                     chunk_ranges=self._routing_payload_chunk_ranges(
                         batches, len(routed_experts or routed_expert_logits or [])
                     ),
+                    max_chunk_bytes=store.packed_chunk_bytes,
                 )
             except R3PayloadRollbackError as exc:
                 self._r3_cleanup_blocked_error = str(exc)
