@@ -67,7 +67,7 @@ from xorl.lora.expert_adapter_contract import (
     ExpertAdapterGradientContract,
     ZeroTokenGradientBehavior,
 )
-from xorl.lora.fold import lora_merged_forward_enabled
+from xorl.lora.fold import invalidate_lora_merged_weight_caches, lora_merged_forward_enabled
 from xorl.models import resolve_cross_entropy_mode
 from xorl.models.layers.moe.routing_replay import set_replay_stage
 from xorl.models.transformers.deepseek_v3.support import deepseek_v3_default_lora_targets
@@ -8848,6 +8848,8 @@ class ModelRunner:
                 # Python reaches zero_grad/empty_cache. Synchronize before releasing
                 # grad storage to avoid allocator reuse while those kernels are live.
                 synchronize()
+                for part in self.model_parts if self.pp_enabled else [self.model]:
+                    invalidate_lora_merged_weight_caches(part)
                 try:
                     self.optimizer.zero_grad(set_to_none=True)
                 except TypeError:

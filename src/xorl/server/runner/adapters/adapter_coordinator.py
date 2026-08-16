@@ -242,18 +242,15 @@ class AdapterCoordinator:
     ) -> None:
         """Convert a rank0-broadcast checkpoint payload into this rank's local adapter tensors."""
         adapter_manager = self.trainer.adapter_manager
-        state = adapter_manager.get_adapter_state(model_id)
         self._validate_broadcast_checkpoint_session_spec(
             model_id,
             payload.get("session_spec"),
             load_optimizer=load_optimizer,
             lr=lr,
         )
-        packed = adapter_manager._pack_logical_state_dict(state, payload["weights"])
-        for name, tensor in packed.items():
-            target_param = state.local_params[name]
-            target_param.data.copy_(tensor.to(device=target_param.device, dtype=target_param.dtype))
+        adapter_manager.load_logical_state_dict(model_id, payload["weights"])
 
+        state = adapter_manager.get_adapter_state(model_id)
         metadata = payload.get("metadata", {})
         state.global_step = metadata.get("global_step", 0)
         state.global_forward_backward_step = metadata.get("global_forward_backward_step", 0)
