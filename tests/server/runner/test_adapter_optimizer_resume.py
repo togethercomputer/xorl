@@ -24,9 +24,11 @@ from xorl.server.runner.adapters.manager import (
     _adapter_param_structure_fingerprint,
     _descriptor_structure_fingerprint,
     _layout_descriptor_fingerprint,
+    _normalize_dp_replica_resize_restore_contract,
     _optimizer_shard_filename,
     _reshard_adapter_optimizer_state,
     _save_optimizer_state_safetensors,
+    _select_adapter_optimizer_restore_contract,
     load_adapter_optimizer_shards,
 )
 from xorl.server.runner.adapters.optimizer_reshard import (
@@ -42,6 +44,100 @@ from .test_adapter_manager import _build_manager, _session_spec
 
 
 pytestmark = [pytest.mark.cpu, pytest.mark.server]
+
+
+def _restore_contract(*, dp_replicate_size: int = 1, producer: str = "module_managed") -> dict:
+    fqn = "model.layers.0.self_attn.q_proj.lora_A"
+    completed = [["fsdp_shard", "fsdp", "sum", "fsdp_shard"]]
+    fields = {"producer": producer}
+    masks = [{"axis": "fsdp_shard", "authority": "fsdp", "fqns": [fqn]}]
+    if dp_replicate_size > 1:
+        completed.insert(0, list(adapter_manager_module._DP_REPLICA_COMPLETED_DOMAIN))
+        fields["dp_replicate_size"] = dp_replicate_size
+        masks.insert(0, {"axis": "data_parallel_replica", "authority": "fsdp", "fqns": [fqn]})
+    return {
+        "schema": "adapter-gradient-optimizer-restore-v1",
+        "parameters": [
+            {
+                "fqn": fqn,
+                "producer": producer,
+                "completed_domains": completed,
+                "config_guard_fields": fields,
+                "norm_replica_divisor": dp_replicate_size,
+            }
+        ],
+        "authority_masks": masks,
+    }
+
+
+def test_restore_contract_normalizes_only_coherent_hsdp_replica_resize():
+    single = _restore_contract()
+    hsdp = _restore_contract(dp_replicate_size=2)
+
+    assert _normalize_dp_replica_resize_restore_contract(single) == single
+    assert _normalize_dp_replica_resize_restore_contract(hsdp) == single
+
+
+def test_restore_contract_ignores_global_hsdp_size_for_owner_sharded_parameter():
+    single = _restore_contract()
+    owner_sharded = _restore_contract()
+    owner_sharded["parameters"][0]["config_guard_fields"]["dp_replicate_size"] = 2
+
+    assert _normalize_dp_replica_resize_restore_contract(owner_sharded) == single
+
+
+def test_stage_contract_selection_allows_only_equivalent_hsdp_replica_resize():
+    fqn = "model.layers.0.self_attn.q_proj.lora_A"
+    checkpoint_contract = _restore_contract()
+    live_contract = _restore_contract(dp_replicate_size=2)
+    state = SimpleNamespace(
+        tensor_layouts={fqn: SimpleNamespace(fqn=fqn)},
+        local_params={},
+        layout_world_size=16,
+        layout_group_ranks=tuple(range(16)),
+        pipeline_stage_ordinal=0,
+        gradient_ownership_plan=SimpleNamespace(optimizer_restore_contract=lambda: live_contract),
+    )
+    ownership = {
+        "optimizer_restore_contracts_by_stage": [
+            {
+                "schema": "adapter-optimizer-stage-v1",
+                "pipeline_stage_ordinal": 0,
+                "layout_world_size": 8,
+                "layout_group_ranks": list(range(8)),
+                "parameter_fqns": [fqn],
+                "optimizer_restore_contract": checkpoint_contract,
+            }
+        ]
+    }
+
+    assert _select_adapter_optimizer_restore_contract(ownership, state) == checkpoint_contract
+
+    live_contract["parameters"][0]["producer"] = "different"
+    with pytest.raises(ValueError, match="no optimizer restore contract"):
+        _select_adapter_optimizer_restore_contract(ownership, state)
+
+
+@pytest.mark.parametrize("mutation", ["missing_domain", "wrong_divisor", "wrong_mask", "other_semantics"])
+def test_restore_contract_replica_resize_stays_fail_closed(mutation):
+    single = _restore_contract()
+    candidate = _restore_contract(dp_replicate_size=2)
+    if mutation == "missing_domain":
+        candidate["parameters"][0]["completed_domains"].pop(0)
+    elif mutation == "wrong_divisor":
+        candidate["parameters"][0]["norm_replica_divisor"] = 3
+    elif mutation == "wrong_mask":
+        candidate["authority_masks"][0]["fqns"] = ["wrong.fqn"]
+    else:
+        candidate["parameters"][0]["producer"] = "manual"
+
+    normalized = _normalize_dp_replica_resize_restore_contract(candidate)
+    if mutation == "other_semantics":
+        assert normalized["parameters"][0]["producer"] == "manual"
+        assert normalized != single
+    else:
+        assert normalized == candidate
+        assert normalized != single
 
 
 @pytest.fixture(autouse=True)

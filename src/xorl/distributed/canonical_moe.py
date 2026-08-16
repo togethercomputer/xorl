@@ -669,6 +669,20 @@ def _canonical_moe_fp64_fold_chunk_elements(contributor_count: int) -> int:
     )
 
 
+def _canonical_moe_cast_fp64_to_transport(
+    folded_fp64: torch.Tensor,
+    transport_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Apply the declared final cast without a CUDA FP32 double round."""
+    if folded_fp64.dtype is not torch.float64:
+        raise TypeError(f"Canonical MoE final cast requires FP64 input, got {folded_fp64.dtype}")
+    if folded_fp64.is_cuda and transport_dtype in (torch.bfloat16, torch.float16):
+        from xorl.ops.canonical_moe_cast import canonical_moe_fp64_to_lowp_rne  # noqa: PLC0415
+
+        return canonical_moe_fp64_to_lowp_rne(folded_fp64.contiguous(), transport_dtype)
+    return folded_fp64.to(transport_dtype)
+
+
 def canonical_moe_fold_fp64_v3(partials_by_logical_ordinal: torch.Tensor) -> torch.Tensor:
     """Fold source-ordered low-precision contributions under the FP64-v3 contract.
 
@@ -692,7 +706,10 @@ def canonical_moe_fold_fp64_v3(partials_by_logical_ordinal: torch.Tensor) -> tor
     payload_elements = partials[0].numel()
     chunk_elements = _canonical_moe_fp64_fold_chunk_elements(contributor_count)
     if payload_elements <= chunk_elements:
-        return _canonical_moe_fold_fp64_tree(partials).to(partials.dtype)
+        return _canonical_moe_cast_fp64_to_transport(
+            _canonical_moe_fold_fp64_tree(partials),
+            partials.dtype,
+        )
 
     # Each payload element is independent: the only reduction axis is the
     # immutable logical-contributor axis.  Chunking that orthogonal payload
@@ -706,7 +723,7 @@ def canonical_moe_fold_fp64_v3(partials_by_logical_ordinal: torch.Tensor) -> tor
         for start in range(0, payload_elements, chunk_elements):
             end = min(start + chunk_elements, payload_elements)
             folded_fp64 = _canonical_moe_fold_fp64_tree(flat_partials[:, start:end])
-            flat_output[start:end] = folded_fp64.to(partials.dtype)
+            flat_output[start:end] = _canonical_moe_cast_fp64_to_transport(folded_fp64, partials.dtype)
         return output
 
     # A whole-tensor ``reshape`` of a strided arrival silently materializes the
@@ -728,7 +745,7 @@ def canonical_moe_fold_fp64_v3(partials_by_logical_ordinal: torch.Tensor) -> tor
             for start, tile_extent, extent in zip(starts, tile_shape, payload_shape)
         )
         folded_fp64 = _canonical_moe_fold_fp64_tree(partials[(slice(None), *payload_slice)])
-        output[payload_slice] = folded_fp64.to(partials.dtype)
+        output[payload_slice] = _canonical_moe_cast_fp64_to_transport(folded_fp64, partials.dtype)
     return output
 
 

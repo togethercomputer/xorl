@@ -888,6 +888,9 @@ class ModelRunner:
 
         memberships: dict[str, tuple[int, ...]] = {}
         sp_group = parallel_state.sp_grad_sync_group
+        dp_replicate_group = (
+            parallel_state.dp_replicate_group if bool(getattr(parallel_state, "dp_replicate_enabled", False)) else None
+        )
         output_group = getattr(parallel_state, "lm_head_tp_replica_group", None)
         output_tp_group = getattr(parallel_state, "lm_head_tp_group", None)
         ep_group = (
@@ -897,6 +900,8 @@ class ModelRunner:
         )
         if sp_group is not None:
             memberships["sequence_parallel"] = _public_group_members(sp_group)
+        if dp_replicate_group is not None:
+            memberships["data_parallel_replica"] = _public_group_members(dp_replicate_group)
         if output_group is not None:
             memberships["output_projection_replica"] = _public_group_members(output_group)
         if output_tp_group is not None:
@@ -1202,6 +1207,17 @@ class ModelRunner:
                         "fsdp_shard",
                     )
                 )
+                if topology is TopologyFamily.DENSE_REPLICATED and bool(
+                    getattr(parallel_state, "dp_replicate_enabled", False)
+                ):
+                    completed.append(
+                        ReductionDomainPlan(
+                            ReductionAxis.DATA_PARALLEL_REPLICA,
+                            ReductionAuthority.FSDP,
+                            ReductionOperation.SUM,
+                            "data_parallel_replica",
+                        )
+                    )
             exact_lm_head_guard = exact_lm_head_guard_by_parameter_id.get(id(parameter))
             if exact_lm_head_guard is not None and exact_lm_head_guard["exact_lm_head_factor"] == "lora_A":
                 completed.append(
@@ -1260,6 +1276,7 @@ class ModelRunner:
                 "representation": representation.value,
                 "merged_forward": merged_forward_by_parameter_id[id(parameter)],
                 "sp_pending": sp_group is not None,
+                "dp_replicate_size": int(getattr(parallel_state, "dp_replicate_size", 1)),
                 "output_replica_size": output_group_size,
                 "ep_size": int(getattr(parallel_state, "ep_size", 1)),
                 "managed_fsdp_shard": id(parameter) in managed_fsdp_parameter_ids,

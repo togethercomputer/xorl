@@ -242,6 +242,72 @@ def _first_restore_contract_difference(checkpoint: Any, live: Any, path: str = "
     return None
 
 
+_DP_REPLICA_COMPLETED_DOMAIN = ["data_parallel_replica", "fsdp", "sum", "data_parallel_replica"]
+
+
+def _normalize_dp_replica_resize_restore_contract(contract: Any) -> Any:
+    """Erase only a coherent FSDP HSDP-replica-size difference.
+
+    Adapter optimizer tensors are addressed by logical coordinates. Adding or
+    removing an HSDP replicate dimension duplicates those same coordinates; it
+    does not change the Adam state assigned to them. The gradient contract does
+    change mechanically: FSDP adds a completed DP-replica sum and divides the
+    resulting numerator by that replica count. Normalize that exact, internally
+    consistent combination so topology-aware optimizer resharding can proceed.
+
+    All other ownership fields remain fail-closed and are compared verbatim.
+    """
+
+    if not isinstance(contract, dict) or not isinstance(contract.get("parameters"), list):
+        return contract
+    normalized = deepcopy(contract)
+    dp_fqns: list[str] = []
+    for parameter in normalized["parameters"]:
+        if not isinstance(parameter, dict):
+            return contract
+        fields = parameter.get("config_guard_fields")
+        completed = parameter.get("completed_domains")
+        if not isinstance(fields, dict) or not isinstance(completed, list):
+            return contract
+        raw_size = fields.pop("dp_replicate_size", 1)
+        if type(raw_size) is not int or raw_size < 1:
+            return contract
+        matches = [domain for domain in completed if domain == _DP_REPLICA_COMPLETED_DOMAIN]
+        if len(matches) > 1 or (raw_size == 1 and matches):
+            return contract
+        # The global HSDP size is recorded on owner-sharded expert factors too,
+        # even though those coordinates are not replicated across that axis.
+        # In that case there is intentionally no completed DP domain or change
+        # to the parameter's replica divisor.
+        if not matches:
+            continue
+        divisor = parameter.get("norm_replica_divisor")
+        if type(divisor) is not int or divisor < raw_size or divisor % raw_size:
+            return contract
+        parameter["completed_domains"] = [domain for domain in completed if domain != _DP_REPLICA_COMPLETED_DOMAIN]
+        parameter["norm_replica_divisor"] = divisor // raw_size
+        fqn = parameter.get("fqn")
+        if not isinstance(fqn, str):
+            return contract
+        dp_fqns.append(fqn)
+
+    masks = normalized.get("authority_masks")
+    if not isinstance(masks, list):
+        return contract
+    dp_masks = [
+        mask
+        for mask in masks
+        if isinstance(mask, dict) and mask.get("axis") == "data_parallel_replica" and mask.get("authority") == "fsdp"
+    ]
+    if dp_fqns:
+        if len(dp_masks) != 1 or dp_masks[0].get("fqns") != sorted(dp_fqns):
+            return contract
+        normalized["authority_masks"] = [mask for mask in masks if mask is not dp_masks[0]]
+    elif dp_masks:
+        return contract
+    return normalized
+
+
 def _optimizer_shard_rank_world() -> Tuple[int, int]:
     """Current (rank, world_size); uninitialized torch.distributed counts as single-rank."""
     if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -382,9 +448,40 @@ def _select_adapter_optimizer_restore_contract(
     try:
         return records_by_identity[live_identity].get("optimizer_restore_contract")
     except KeyError:
+        pass
+
+    # HSDP replica resizing changes the stage-local layout world even though it
+    # leaves the logical parameter coordinates unchanged.  Select such a
+    # record only when the physical PP stage and complete FQN set are unique and
+    # the checkpoint/live ownership contracts become exactly equal under the
+    # narrow DP-replica normalization above.  This keeps all other topology
+    # changes fail-closed while allowing 1xFSDP <-> HSDP replica cutovers.
+    live_contract = (
+        adapter_state.gradient_ownership_plan.optimizer_restore_contract()
+        if adapter_state.gradient_ownership_plan is not None
+        else None
+    )
+    compatible_records = []
+    for identity, record in records_by_identity.items():
+        stage_ordinal, _layout_world, _layout_ranks, parameter_fqns = identity
+        if stage_ordinal != live_stage_ordinal or parameter_fqns != tuple(live_fqns):
+            continue
+        checkpoint_contract = record.get("optimizer_restore_contract")
+        if (
+            _first_restore_contract_difference(
+                _normalize_dp_replica_resize_restore_contract(checkpoint_contract),
+                _normalize_dp_replica_resize_restore_contract(live_contract),
+            )
+            is None
+        ):
+            compatible_records.append(record)
+    if len(compatible_records) == 1:
+        return compatible_records[0].get("optimizer_restore_contract")
+    if len(compatible_records) > 1:
         raise ValueError(
-            "Checkpoint has no optimizer restore contract for this physical PP stage or layout topology"
-        ) from None
+            "Checkpoint has ambiguous optimizer restore contracts for this physical PP stage after DP-replica normalization"
+        )
+    raise ValueError("Checkpoint has no optimizer restore contract for this physical PP stage or layout topology")
 
 
 def _optimizer_shard_filename(rank: int) -> str:
@@ -1168,7 +1265,9 @@ class LoRAAdapterManager:
                 "load weights-only (load_optimizer=False) and re-save it"
             )
         live_contract = live_plan.optimizer_restore_contract()
-        difference = _first_restore_contract_difference(checkpoint_contract, live_contract)
+        normalized_checkpoint = _normalize_dp_replica_resize_restore_contract(checkpoint_contract)
+        normalized_live = _normalize_dp_replica_resize_restore_contract(live_contract)
+        difference = _first_restore_contract_difference(normalized_checkpoint, normalized_live)
         if difference is not None:
             raise ValueError(f"Checkpoint adapter-gradient topology/producer contract is incompatible: {difference}")
 
@@ -1230,6 +1329,11 @@ class LoRAAdapterManager:
 
             local_group_memberships = {}
             sp_group = parallel_state.sp_grad_sync_group
+            dp_replicate_group = (
+                parallel_state.dp_replicate_group
+                if bool(getattr(parallel_state, "dp_replicate_enabled", False))
+                else None
+            )
             output_group = getattr(parallel_state, "lm_head_tp_replica_group", None)
             output_tp_group = getattr(parallel_state, "lm_head_tp_group", None)
             ep_group = (
@@ -1239,6 +1343,8 @@ class LoRAAdapterManager:
             )
             if sp_group is not None:
                 local_group_memberships["sequence_parallel"] = _public_group_members(sp_group)
+            if dp_replicate_group is not None:
+                local_group_memberships["data_parallel_replica"] = _public_group_members(dp_replicate_group)
             if output_group is not None:
                 local_group_memberships["output_projection_replica"] = _public_group_members(output_group)
             if output_tp_group is not None:

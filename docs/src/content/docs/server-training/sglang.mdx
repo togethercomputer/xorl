@@ -87,11 +87,11 @@ python -m sglang.launch_server \
 
 The resolver rejects incompatible options for an admitted architecture rather than silently selecting a different program. A successful launch is still not a parity certificate; validate the intended revision pair and workload with decision-time logprob artifacts.
 
-### 4. Batch-Invariant Mode
+### 4. Exact XoRL Mode
 
 Modified files: `model_runner.py`, `batch_invariant_ops.py`
 
-When `--rl-on-policy-target xorl-batch-invariant` is set, xorl-sglang selects its batch-invariant numerical path. Admission still requires tests for the intended model, shapes, topology, and batching states; the target name alone is not a parity certificate.
+When `--rl-on-policy-target xorl` is set, xorl-sglang resolves the architecture-owned exact numerical path for the loaded model. Validation for the intended model, shapes, topology, and batching states is still required; the target name alone is not a parity certificate.
 
 ### 5. Bug Fixes
 
@@ -165,7 +165,7 @@ python -m sglang.launch_server \
 
 | Flag | Description |
 |---|---|
-| `--rl-on-policy-target xorl` | Select deterministic inference and the architecture-owned XoRL numerical program when the model has one. Weight-sync endpoints are independent of this flag. Use `xorl-batch-invariant` for the generic batch-invariant target. |
+| `--rl-on-policy-target xorl` | Select deterministic inference and the architecture-owned XoRL numerical program when the model has one. Weight-sync endpoints are independent of this flag. |
 | `--enable-fp32-lm-head` | Request FP32 LM-head logits on generic paths; admitted architecture-owned programs resolve their required head precision automatically. |
 | `--enable-return-routed-experts` | Return expert routing indices in response metadata (for R3) |
 | `--enable-rdma-weight-updates` | Initialize the Mooncake receiver used by XoRL's P2P weight-sync backend. |

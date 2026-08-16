@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -329,6 +330,58 @@ def test_compiler_rejects_unowned_or_unresolved_physical_replicas() -> None:
             domains=(sequence,),
             group_memberships={"group:sequence_parallel": ((0, 2), (1,))},
         )
+
+
+def test_compiler_accepts_fsdp_completed_hsdp_replica_reduction() -> None:
+    name = "adapter.hsdp"
+    parameter = nn.Parameter(torch.zeros(2))
+    replica_domain = _domain(ReductionAxis.DATA_PARALLEL_REPLICA, ReductionAuthority.FSDP)
+
+    plan = compile_adapter_gradient_ownership(
+        layouts={name: _layout(name, replica_count=2)},
+        model_parameters={name: parameter},
+        optimizer_parameters={name: nn.Parameter(torch.zeros(2))},
+        declarations={
+            name: ParameterOwnershipDeclaration(
+                topology=TopologyFamily.DENSE_REPLICATED,
+                producer=ProducerFamily.MODULE_MANAGED,
+                representation=GradientRepresentation.FSDP_COMPLETED_LOCAL_SHARD,
+                completed_domains=(
+                    _domain(ReductionAxis.FSDP_SHARD, ReductionAuthority.FSDP),
+                    replica_domain,
+                ),
+                pending_domains=(),
+                config_guard_fingerprint="guard:hsdp",
+                managed_fsdp_shard=True,
+            )
+        },
+        model_generation="model-generation-1",
+        adapter_generation="adapter-generation-1",
+        group_memberships={replica_domain.group_key: ((0, 1),)},
+    )
+
+    assert plan.parameters[0].completed_domains == (
+        replica_domain,
+        _domain(ReductionAxis.FSDP_SHARD, ReductionAuthority.FSDP),
+    )
+
+
+def test_model_runner_publishes_hsdp_replica_group_for_layout_discovery() -> None:
+    from xorl.server.runner.model_runner import ModelRunner
+
+    memberships = ModelRunner._local_adapter_gradient_group_memberships(
+        SimpleNamespace(
+            sp_grad_sync_group=None,
+            dp_replicate_enabled=True,
+            dp_replicate_group=object(),
+            lm_head_tp_replica_group=None,
+            lm_head_tp_group=None,
+            ep_enabled=False,
+            ep_size=1,
+        )
+    )
+
+    assert memberships == {"data_parallel_replica": (0,)}
 
 
 def test_compiler_rejects_overlapping_or_incomplete_replica_coverage() -> None:

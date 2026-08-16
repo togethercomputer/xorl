@@ -2292,7 +2292,7 @@ class MoEExperts(nn.Module):
                     model_path=os.environ.get("XORL_SGLANG_MOE_MODEL_PATH", "dummy"),
                     enable_deterministic_inference=True,
                     enable_fused_moe_sum_all_reduce=False,
-                    rl_on_policy_target="xorl-batch-invariant",
+                    rl_on_policy_target="xorl",
                 ),
                 role="scheduler",
             )
