@@ -40,6 +40,62 @@ from xorl.server.runner.model_runner import ModelRunner
 pytestmark = pytest.mark.cpu
 
 
+def test_adapter_publication_invalidates_merged_moe_cache_once_per_generation(tmp_path):
+    config = MoELoRAConfig(
+        r=2,
+        lora_alpha=4,
+        target_modules=["gate_proj", "up_proj", "down_proj"],
+        hybrid_shared=False,
+    )
+
+    class _Model(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.experts = MoEExpertsLoRA(
+                num_experts=2,
+                hidden_dim=4,
+                intermediate_size=3,
+                hidden_act="silu",
+                moe_implementation="triton",
+                lora_config=config,
+            ).to(torch.bfloat16)
+            self.experts.exact_merged_forward = True
+
+    model = _Model()
+    manager = LoRAAdapterManager(
+        model,
+        torch.device("cpu"),
+        checkpoint_dir=str(tmp_path),
+        auto_save_on_eviction=False,
+        lora_config={"lora_rank": 2, "lora_alpha": 4},
+        optimizer_type="sgd",
+    )
+    manager.register_adapter("policy", lr=0.1, initialize_fresh=False)
+    state = manager.get_adapter_state("policy")
+    source_b = state.local_params["experts.gate_proj_lora_B"]
+    with torch.no_grad():
+        source_b.fill_(0.125)
+    state.weight_generation += 1
+
+    model_version = model.experts.gate_proj_lora_B._version
+    manager.prepare_forward("policy")
+    first, _ = model.experts._merged_weights()
+    assert model.experts._merged_weights()[0] is first
+    assert model.experts.gate_proj_lora_B._version == model_version
+
+    with torch.no_grad():
+        source_b.add_(0.25)
+    state.weight_generation += 1
+    manager.prepare_forward("policy")
+    second, _ = model.experts._merged_weights()
+
+    assert second is not first
+    assert not torch.equal(second, first)
+    assert model.experts.gate_proj_lora_B._version == model_version
+    manager.prepare_forward("policy")
+    assert model.experts._merged_weights()[0] is second
+
+
 def test_effective_lm_head_uses_canonical_merged_weight_with_adapter_gradients():
     head = LoraLinear(5, 7, r=2, lora_alpha=4, bias=False, dtype=torch.bfloat16)
     head.exact_merged_forward = True

@@ -31,6 +31,7 @@ pytestmark = [pytest.mark.cpu, pytest.mark.server]
 
 class _FakeAdapterState:
     def __init__(self, lr: float = 1e-5):
+        self.weight_generation = 0
         self.global_step = 0
         self.global_forward_backward_step = 0
         self.lr = lr
@@ -77,6 +78,15 @@ class _FakeAdapterManager:
         expected_shapes = {name: layout.logical_shape for name, layout in state.tensor_layouts.items()}
         converted = convert_peft_lora_state_dict(state_dict, expected_shapes=expected_shapes)
         return {name: pack_logical_tensor(state.tensor_layouts[name], converted[name]) for name in state.local_params}
+
+    def load_logical_state_dict(self, model_id: str, state_dict: dict[str, torch.Tensor]) -> None:
+        state = self.get_adapter_state(model_id)
+        packed = self._pack_logical_state_dict(state, state_dict)
+        with torch.no_grad():
+            for name, tensor in packed.items():
+                target = state.local_params[name]
+                target.copy_(tensor.to(device=target.device, dtype=target.dtype))
+        state.weight_generation += 1
 
 
 class _FakeTrainer:
@@ -449,6 +459,7 @@ def test_rank0_broadcast_ep_sharded_restore_slices_full_checkpoint_tensor(monkey
     assert result["success"] is True
     assert result["step"] == 11
     assert torch.equal(state.lora_params[param_name].detach(), full_tensor[2:4])
+    assert state.weight_generation == 1
     assert state.global_forward_backward_step == 13
     assert state.lr == 3e-5
     assert trainer.load_calls == []

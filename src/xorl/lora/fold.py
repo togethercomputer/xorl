@@ -24,6 +24,25 @@ gate should be rerun on every environment change.
 import torch
 
 
+def invalidate_lora_merged_weight_caches(model: torch.nn.Module) -> int:
+    """Invalidate every model-owned canonical merged-LoRA weight cache.
+
+    Adapter-manager publication writes through ``Parameter.data`` (and, under
+    FSDP2, through a DTensor local view).  Those writes do not advance the
+    public parameter's version counter, so cache users cannot infer a weight
+    change from ``Tensor._version``.  Publication boundaries call this helper
+    explicitly; repeated forwards at one published generation still reuse the
+    resulting folds.
+    """
+    count = 0
+    for module in model.modules():
+        invalidate = getattr(module, "invalidate_merged_weight_cache", None)
+        if callable(invalidate):
+            invalidate()
+            count += 1
+    return count
+
+
 def lora_merged_forward_enabled(module: object) -> bool:
     """Whether one model-owned module uses canonical merged LoRA forwards."""
     return bool(getattr(module, "exact_merged_forward", False))
