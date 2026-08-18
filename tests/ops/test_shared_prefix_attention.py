@@ -18,6 +18,9 @@ pytestmark = pytest.mark.gpu
 if not torch.cuda.is_available():
     pytest.skip("shared-prefix attention requires CUDA", allow_module_level=True)
 
+# FA3 is not shipped for the CUDA 13 / FA4 profile this tree pins.
+pytest.importorskip("flash_attn_interface")
+
 from flash_attn_interface import flash_attn_varlen_func  # noqa: E402
 
 from xorl.models.layers.attention.backend.shared_prefix_attention import (  # noqa: E402

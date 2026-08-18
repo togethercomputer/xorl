@@ -11,11 +11,18 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
-from xorl.distributed.parallel_state import init_parallel_state
-from xorl.ops.linear_attention.flashqla_cp import flashqla_chunk_gated_delta_rule_cp
-from xorl.ops.linear_attention.ops.cp import build_linear_attention_cp_context
-from xorl.ops.linear_attention.ops.gated_delta_rule import chunk_gated_delta_rule
-from xorl.utils.device import get_nccl_backend
+
+# The FlashQLA bridge pulls in TileLang, which resolves a CUDA target at import
+# time and raises when no GPU is visible. This is a two-rank GPU parity test, so
+# skip the module outright rather than fail collection on a CPU-only host.
+if not torch.cuda.is_available():
+    pytest.skip("FlashQLA CP parity requires CUDA", allow_module_level=True)
+
+from xorl.distributed.parallel_state import init_parallel_state  # noqa: E402
+from xorl.ops.linear_attention.flashqla_cp import flashqla_chunk_gated_delta_rule_cp  # noqa: E402
+from xorl.ops.linear_attention.ops.cp import build_linear_attention_cp_context  # noqa: E402
+from xorl.ops.linear_attention.ops.gated_delta_rule import chunk_gated_delta_rule  # noqa: E402
+from xorl.utils.device import get_nccl_backend  # noqa: E402
 
 
 THIS_DIR = Path(__file__).resolve().parent

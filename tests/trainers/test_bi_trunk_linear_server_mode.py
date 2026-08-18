@@ -84,7 +84,9 @@ def _build(
         enable_lora=enable_lora,
         lora_rank=2,
         lora_alpha=4,
-        lora_target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        # TinyTrunkModel has no k_proj/v_proj, and injection rejects a target that
+        # matches nothing, so request only the projections the fixture defines.
+        lora_target_modules=["q_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
     )
 
 
