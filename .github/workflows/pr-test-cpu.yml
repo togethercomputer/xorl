@@ -12,9 +12,97 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  cpu-tests:
+  # Sharded by functional area rather than by file name, so a red shard names the
+  # failure domain on sight: "moe-ep is red" means expert parallelism, without
+  # opening a log. Unsharded this job takes ~9.5 minutes, and 84% of that sits in
+  # ~40 multi-process gloo tests under tests/distributed and tests/server; the
+  # other ~2100 tests finish in about 80 seconds. Splitting the expensive
+  # dimensions apart is what buys the wall clock back -- measured per shard:
+  # moe-ep 163s, tp-lm-head 150s, server 147s, misc 60s, fsdp-shard 50s,
+  # context-pipeline 42s.
+  #
+  # tests/test_cpu_test_shards.py enforces that the tests/distributed patterns
+  # below partition that directory exactly. A file claimed by no shard would
+  # otherwise run nowhere, silently -- add one and that test goes red.
+  shard:
+    name: cpu (${{ matrix.shard }})
     if: github.event_name == 'push' || !github.event.pull_request.draft
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # MoE dispatch/combine, expert parallel, DeepEP, all-to-all.
+          - shard: moe-ep
+            paths: >-
+              tests/distributed/test_canonical_moe_contract.py
+              tests/distributed/test_canonical_combine_multirank.py
+              tests/distributed/test_canonical_combine_transports.py
+              tests/distributed/test_deepep_*.py
+              tests/distributed/test_deepseek_v3_ep_checkpoint.py
+              tests/distributed/test_ep_*.py
+              tests/distributed/test_moe_memory_efficient_permutation.py
+              tests/distributed/test_muon_optimizer_ep_reshard.py
+              tests/distributed/test_fp8_deepep_training.py
+              tests/distributed/test_quack_deepep_no_permute_parity.py
+              tests/distributed/test_glm52_fullparam_ep16_combine.py
+              tests/distributed/test_bf16_a2a_*.py
+
+          # Tensor parallel and the LM-head/vocab-parallel interaction.
+          - shard: tp-lm-head
+            paths: >-
+              tests/distributed/test_lm_head_tp_*.py
+              tests/distributed/test_tensor_parallel.py
+              tests/distributed/test_vocab_parallel_ce.py
+              tests/distributed/test_bi_fused_lm_head_tp.py
+              tests/distributed/test_fused_linear_logprob_tp.py
+              tests/distributed/test_olmo2_*.py
+
+          # FSDP2 sharding, materialization and exact-shard lifecycles.
+          - shard: fsdp-shard
+            paths: >-
+              tests/distributed/test_glm52_exact_*.py
+              tests/distributed/test_glm52_fullparam_fsdp2.py
+              tests/distributed/test_glm52_fullparam_construction_gate.py
+              tests/distributed/test_native_fp8_fsdp2_materialization.py
+              tests/distributed/test_bi_trunk_linear_fsdp.py
+              tests/distributed/test_qwen35_lora_projection_fsdp2.py
+              tests/distributed/test_rope_class_b_fsdp_transport.py
+              tests/distributed/test_torch_parallelize_policies.py
+              tests/distributed/test_parallel_plan_meta_slice.py
+              tests/distributed/test_offloading.py
+
+          # Context/sequence parallel, pipeline parallel, and the core
+          # parallel-state plumbing every other dimension builds on.
+          - shard: context-pipeline
+            paths: >-
+              tests/distributed/test_ring_attention.py
+              tests/distributed/test_sequence_parallel.py
+              tests/distributed/test_shared_prefix_sp.py
+              tests/distributed/test_ulysses_*.py
+              tests/distributed/test_qwen3_5_ulysses_cp.py
+              tests/distributed/test_linear_attention_cp_equivalence.py
+              tests/distributed/test_gdn_conv_contract_cp.py
+              tests/distributed/test_flashqla_cp_equivalence.py
+              tests/distributed/test_dsv4_exact_cp_attention_layout.py
+              tests/distributed/test_sync_padding.py
+              tests/distributed/test_pipeline_parallel.py
+              tests/distributed/test_pp_*.py
+              tests/distributed/test_parallel_state.py
+              tests/distributed/test_utils.py
+              tests/distributed/test_gradient_accumulate_loss.py
+              tests/distributed/test_loss_metric_reductions.py
+              tests/distributed/test_muon_full_gradient.py
+
+          # Training server: runner, orchestrator, weight sync, API.
+          - shard: server
+            paths: tests/server
+
+          # Catch-all. Anything outside tests/distributed and tests/server lands
+          # here automatically, so a newly added directory is never skipped.
+          - shard: misc
+            paths: tests --ignore=tests/distributed --ignore=tests/server
+
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
@@ -43,4 +131,18 @@ jobs:
       # re-syncs against the lock first, which would reinstall the CUDA wheel
       # and undo the swap.
       - name: Run CPU tests
-        run: uv run --no-sync pytest -m "cpu" --tb=short --durations=10
+        run: uv run --no-sync pytest ${{ matrix.paths }} -m "cpu" --tb=short --durations=10
+
+  # Single stable check name for branch protection. The matrix jobs are named per
+  # shard, so requiring them individually would break every time a shard is
+  # renamed, added or removed.
+  cpu-tests:
+    name: cpu-tests
+    if: always() && (github.event_name == 'push' || !github.event.pull_request.draft)
+    needs: shard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check shard results
+        run: |
+          echo "shard result: ${{ needs.shard.result }}"
+          test "${{ needs.shard.result }}" = "success"
