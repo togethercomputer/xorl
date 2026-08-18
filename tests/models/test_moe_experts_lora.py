@@ -671,7 +671,7 @@ class TestFromModuleAndInjection:
                 super().__init__()
                 self.layer1 = nn.Linear(64, 64)
 
-        with pytest.raises(ValueError, match="No modules found matching target_modules"):
+        with pytest.raises(ValueError, match="LoRA targets matched no module"):
             inject_lora_into_model(ModelA(), r=8, lora_alpha=16, target_modules=["nonexistent_proj"])
 
         # Matched modules without LoRA support
@@ -688,7 +688,7 @@ class TestFromModuleAndInjection:
                 super().__init__()
                 self.custom_layer = UnsupportedModule()
 
-        with pytest.raises(ValueError, match="No modules found matching target_modules"):
+        with pytest.raises(ValueError, match="LoRA targets matched no module"):
             inject_lora_into_model(ModelB(), r=8, lora_alpha=16, target_modules=["custom_layer"])
 
         # Valid target

@@ -6,7 +6,13 @@ Distributed tests removed -- run with torchrun separately.
 import pytest
 import torch
 
-from xorl.data.collators.sequence_shard_collator import (
+
+# ``sequence_parallel.ring_attention`` imports FA3 at module scope, and FA3 is
+# not shipped for the CUDA 13 / FA4 profile this tree pins. Skip rather than
+# fail collection when it is unavailable.
+pytest.importorskip("flash_attn_interface")
+
+from xorl.data.collators.sequence_shard_collator import (  # noqa: E402
     zigzag_reorder_packed_sequence,
 )
 from xorl.distributed.sequence_parallel.ring_attention import (

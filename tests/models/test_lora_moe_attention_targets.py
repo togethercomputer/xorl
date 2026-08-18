@@ -33,11 +33,25 @@ class _MLALikeBlock(nn.Module):
         self.o_proj = nn.Linear(hidden_size, hidden_size, bias=False)
 
 
+class _MLPLikeBlock(nn.Module):
+    """Dense MLP with the projection names in the deepseek_v3 default targets."""
+
+    def __init__(self, hidden_size: int = 32, intermediate_size: int = 64):
+        super().__init__()
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+
+
 class _DeepSeekLikeModel(nn.Module):
     def __init__(self):
         super().__init__()
         self.config = _StubConfig("deepseek_v3")
         self.self_attn = _MLALikeBlock()
+        # The deepseek_v3 default target list covers the MLP projections too, and
+        # injection rejects a partial match, so a model without an MLP cannot
+        # exercise the attention split on its own.
+        self.mlp = _MLPLikeBlock()
 
 
 def test_default_targets_cover_all_mla_projections_for_deepseek_v3():
