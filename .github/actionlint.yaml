@@ -1,0 +1,6 @@
+# Custom runner labels used by this repository's workflows. Without this,
+# actionlint reports an unknown-label error for any non-GitHub-hosted runner.
+self-hosted-runner:
+  labels:
+    # Actions Runner Controller scale set backing .github/workflows/pr-test-gpu.yml.
+    - self-hosted-h100-2gpu-cu131
