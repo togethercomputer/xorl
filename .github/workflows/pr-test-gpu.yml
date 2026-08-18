@@ -21,32 +21,25 @@ permissions:
 
 jobs:
   gpu-tests:
-    # Three gates, all of which must hold.
+    # Two gates, both of which must hold.
     #
-    # 1. vars.GPU_RUNNER_AVAILABLE must be 'true'. The runner scale sets serving
-    #    this org are registered against the organization and land in the Default
-    #    runner group, which disallows public repositories -- so this repository
-    #    currently has no runner able to claim the job. Without this gate the job
-    #    queues forever rather than failing, which is worse than not running: a
-    #    permanently pending check trains people to ignore CI, and as a required
-    #    check it would block every pull request with no diagnostic. Skipped jobs
-    #    report as skipped, not pending. Set the variable (Settings > Actions >
-    #    Variables) once a repository-scoped scale set exists; no code change.
+    # 1. Not a draft pull request.
     #
-    # 2. Not a draft pull request.
-    #
-    # 3. The ref lives in this repository. This job runs on a self-hosted H100.
+    # 2. The ref lives in this repository. This job runs on a self-hosted H100.
     #    On a public repository a pull request from a fork must never reach that
     #    host: the runner would execute the fork's code, with its checkout, its
     #    workflow-adjacent scripts and its test payloads, on hardware inside our
     #    network. Fork contributions are still covered by the CPU job, which runs
     #    on ephemeral GitHub-hosted runners; a maintainer who wants GPU coverage
     #    for a fork pull request pushes the branch to this repository first.
+    #
+    # Note: until a runner scale set scoped to this repository exists, a job that
+    # passes these gates has nothing to claim it and stays queued rather than
+    # failing. `gh run list --workflow=pr-test-gpu.yml` is how you spot that.
     if: >-
-      vars.GPU_RUNNER_AVAILABLE == 'true' &&
-      (github.event_name != 'pull_request' ||
+      github.event_name != 'pull_request' ||
       (!github.event.pull_request.draft &&
-      github.event.pull_request.head.repo.full_name == github.repository))
+      github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: self-hosted-h100-2gpu-cu131
     timeout-minutes: 30
     container:
