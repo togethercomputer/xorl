@@ -17,7 +17,7 @@ def test_deepep_async_combine_is_synchronous_by_default(monkeypatch):
         captured["async_combine"] = async_combine
         return expert_output
 
-    monkeypatch.setattr(deepep, "_ALLOW_UNSAFE_ASYNC_COMBINE", False)
+    monkeypatch.delenv("XORL_DEEPEP_UNSAFE_ASYNC_COMBINE", raising=False)
     monkeypatch.setattr(deepep._FusedUnpermuteAndCombine, "apply", staticmethod(fake_apply))
 
     expert_output = torch.ones(1, 2)
@@ -40,7 +40,7 @@ def test_deepep_async_combine_can_be_unsafely_opted_in(monkeypatch):
         captured["async_combine"] = async_combine
         return expert_output
 
-    monkeypatch.setattr(deepep, "_ALLOW_UNSAFE_ASYNC_COMBINE", True)
+    monkeypatch.setenv("XORL_DEEPEP_UNSAFE_ASYNC_COMBINE", "1")
     monkeypatch.setattr(deepep._FusedUnpermuteAndCombine, "apply", staticmethod(fake_apply))
 
     expert_output = torch.ones(1, 2)

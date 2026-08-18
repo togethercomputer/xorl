@@ -1,0 +1,155 @@
+name: CPU Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: these jobs only read the checkout. Without this the token
+# inherits the repository default, which may include write scopes.
+permissions:
+  contents: read
+
+jobs:
+  # Sharded by functional area rather than by file name, so a red shard names the
+  # failure domain on sight: "moe-ep is red" means expert parallelism, without
+  # opening a log. Unsharded this job takes ~9.5 minutes, and 84% of that sits in
+  # ~40 multi-process gloo tests under tests/distributed and tests/server; the
+  # other ~2100 tests finish in about 80 seconds. Splitting the expensive
+  # dimensions apart is what buys the wall clock back -- measured per shard:
+  # moe-ep 163s, tp-lm-head 150s, server 147s, misc 60s, fsdp-shard 50s,
+  # context-pipeline 42s.
+  #
+  # tests/test_cpu_test_shards.py enforces that the tests/distributed patterns
+  # below partition that directory exactly. A file claimed by no shard would
+  # otherwise run nowhere, silently -- add one and that test goes red.
+  shard:
+    name: cpu (${{ matrix.shard }})
+    if: github.event_name == 'push' || !github.event.pull_request.draft
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # MoE dispatch/combine, expert parallel, DeepEP, all-to-all.
+          - shard: moe-ep
+            paths: >-
+              tests/distributed/test_canonical_moe_contract.py
+              tests/distributed/test_canonical_combine_multirank.py
+              tests/distributed/test_canonical_combine_transports.py
+              tests/distributed/test_deepep_*.py
+              tests/distributed/test_deepseek_v3_ep_checkpoint.py
+              tests/distributed/test_ep_*.py
+              tests/distributed/test_moe_memory_efficient_permutation.py
+              tests/distributed/test_muon_optimizer_ep_reshard.py
+              tests/distributed/test_fp8_deepep_training.py
+              tests/distributed/test_quack_deepep_no_permute_parity.py
+              tests/distributed/test_glm52_fullparam_ep16_combine.py
+              tests/distributed/test_bf16_a2a_*.py
+
+          # Tensor parallel and the LM-head/vocab-parallel interaction.
+          - shard: tp-lm-head
+            paths: >-
+              tests/distributed/test_lm_head_tp_*.py
+              tests/distributed/test_tensor_parallel.py
+              tests/distributed/test_vocab_parallel_ce.py
+              tests/distributed/test_bi_fused_lm_head_tp.py
+              tests/distributed/test_fused_linear_logprob_tp.py
+              tests/distributed/test_olmo2_*.py
+
+          # FSDP2 sharding, materialization and exact-shard lifecycles.
+          - shard: fsdp-shard
+            paths: >-
+              tests/distributed/test_glm52_exact_*.py
+              tests/distributed/test_glm52_fullparam_fsdp2.py
+              tests/distributed/test_glm52_fullparam_construction_gate.py
+              tests/distributed/test_native_fp8_fsdp2_materialization.py
+              tests/distributed/test_bi_trunk_linear_fsdp.py
+              tests/distributed/test_qwen35_lora_projection_fsdp2.py
+              tests/distributed/test_rope_class_b_fsdp_transport.py
+              tests/distributed/test_torch_parallelize_policies.py
+              tests/distributed/test_parallel_plan_meta_slice.py
+              tests/distributed/test_offloading.py
+
+          # Context/sequence parallel, pipeline parallel, and the core
+          # parallel-state plumbing every other dimension builds on.
+          - shard: context-pipeline
+            paths: >-
+              tests/distributed/test_ring_attention.py
+              tests/distributed/test_sequence_parallel.py
+              tests/distributed/test_shared_prefix_sp.py
+              tests/distributed/test_ulysses_*.py
+              tests/distributed/test_qwen3_5_ulysses_cp.py
+              tests/distributed/test_linear_attention_cp_equivalence.py
+              tests/distributed/test_gdn_conv_contract_cp.py
+              tests/distributed/test_flashqla_cp_equivalence.py
+              tests/distributed/test_dsv4_exact_cp_attention_layout.py
+              tests/distributed/test_sync_padding.py
+              tests/distributed/test_pipeline_parallel.py
+              tests/distributed/test_pp_*.py
+              tests/distributed/test_parallel_state.py
+              tests/distributed/test_utils.py
+              tests/distributed/test_gradient_accumulate_loss.py
+              tests/distributed/test_loss_metric_reductions.py
+              tests/distributed/test_muon_full_gradient.py
+
+          # Training server: runner, orchestrator, weight sync, API.
+          - shard: server
+            paths: tests/server
+
+          # Catch-all. Anything outside tests/distributed and tests/server lands
+          # here automatically, so a newly added directory is never skipped.
+          - shard: misc
+            paths: tests --ignore=tests/distributed --ignore=tests/server
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57 # v8.0.0
+        with:
+          enable-cache: true
+          prune-cache: false
+          cache-dependency-glob: pyproject.toml
+
+      # ``pyproject.toml`` pins torch to a CUDA 13.2 wheel. That wheel runs fine
+      # on a CPU-only host, but it is a multi-gigabyte download, so swap in the
+      # CPU build for this job.
+      #
+      # The versions are pinned to the same release pyproject.toml pins. Left
+      # unpinned, this resolves to the newest CPU build on the index -- which
+      # silently ran the whole CPU suite on torch 2.13.0 against a project that
+      # pins 2.12.1. Keep these two in step with the torch/torchvision URLs in
+      # pyproject.toml; tests/distributed/test_native_fp8_fsdp2_materialization.py
+      # asserts the release and will fail loudly if they drift apart.
+      - name: Install dependencies
+        run: |
+          uv sync --group test
+          uv pip install torch==2.12.1 torchvision==0.27.1 --index-url https://download.pytorch.org/whl/cpu --reinstall
+
+      # ``--no-sync`` keeps the CPU torch installed above. A bare ``uv run``
+      # re-syncs against the lock first, which would reinstall the CUDA wheel
+      # and undo the swap.
+      - name: Run CPU tests
+        run: uv run --no-sync pytest ${{ matrix.paths }} -m "cpu" --tb=short --durations=10
+
+  # Single stable check name for branch protection. The matrix jobs are named per
+  # shard, so requiring them individually would break every time a shard is
+  # renamed, added or removed.
+  cpu-tests:
+    name: cpu-tests
+    if: always() && (github.event_name == 'push' || !github.event.pull_request.draft)
+    needs: shard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check shard results
+        run: |
+          echo "shard result: ${{ needs.shard.result }}"
+          test "${{ needs.shard.result }}" = "success"

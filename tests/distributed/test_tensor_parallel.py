@@ -12,12 +12,13 @@ from xorl.models.transformers.qwen3.configuration_qwen3 import Qwen3Config
 from xorl.models.transformers.qwen3.modeling_qwen3 import Qwen3Attention, Qwen3ForCausalLM, Qwen3MLP
 
 
-pytestmark = [pytest.mark.cpu, pytest.mark.distributed]
+pytestmark = [pytest.mark.distributed]
 
 
 class TestUnfuseForTP:
     """Test that unfuse_for_tp correctly replaces fused projections."""
 
+    @pytest.mark.cpu
     def test_attention_and_mlp_unfuse(self):
         """Attention unfuse creates separate q/k/v; MLP unfuse creates separate gate/up."""
 
@@ -50,8 +51,34 @@ class TestUnfuseForTP:
         assert mlp.gate_proj.out_features == 512
         assert mlp.up_proj.out_features == 512
 
-    def test_unfused_forward_shape_and_model_level(self):
-        """Unfused MLP forward produces same shape; model-level unfuse covers all layers."""
+    # ``Qwen3MLP.forward`` routes through the fused_silu_and_mul Triton kernel, so the
+    # forward comparison cannot run without a GPU. The model-level traversal below is
+    # pure module surgery and stays on CPU.
+    @pytest.mark.gpu
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="fused_silu_and_mul is a Triton kernel")
+    def test_unfused_forward_shape_matches_fused(self):
+        """Unfused MLP forward produces the same shape as the fused projection."""
+
+        config = Qwen3Config(
+            hidden_size=256,
+            intermediate_size=512,
+            num_attention_heads=4,
+            num_key_value_heads=2,
+            head_dim=64,
+        )
+
+        mlp_fused = Qwen3MLP(config).cuda()
+        x = torch.randn(1, 16, 256, device="cuda")
+        out_fused = mlp_fused(x)
+
+        mlp_unfused = Qwen3MLP(config).cuda()
+        mlp_unfused.unfuse_for_tp()
+        out_unfused = mlp_unfused(x)
+        assert out_fused.shape == out_unfused.shape == torch.Size([1, 16, 256])
+
+    @pytest.mark.cpu
+    def test_model_level_unfuse_covers_all_layers(self):
+        """Model-level unfuse replaces the fused projections in every layer."""
 
         config = Qwen3Config(
             hidden_size=256,
@@ -64,17 +91,6 @@ class TestUnfuseForTP:
             pad_token_id=0,
         )
 
-        # Unfused forward shape matches fused
-        mlp_fused = Qwen3MLP(config).cuda()
-        x = torch.randn(1, 16, 256, device="cuda")
-        out_fused = mlp_fused(x)
-
-        mlp_unfused = Qwen3MLP(config).cuda()
-        mlp_unfused.unfuse_for_tp()
-        out_unfused = mlp_unfused(x)
-        assert out_fused.shape == out_unfused.shape == torch.Size([1, 16, 256])
-
-        # Model-level unfuse
         model = Qwen3ForCausalLM(config)
         model.unfuse_for_tp()
         for layer in model.model.layers:

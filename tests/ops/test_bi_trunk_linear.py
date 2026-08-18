@@ -78,7 +78,10 @@ def test_wrap_selection_counts_and_exclusions():
     assert wrapped == dict.fromkeys(("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"), 2)
     assert not getattr(model.lm_head, "_xorl_bi_trunk_wrapped", False)
     assert all(getattr(layer.q_proj, "_xorl_bi_trunk_wrapped", False) for layer in model.layers)
-    assert not is_trunk_linear_contract_enabled(), "wrapping one model must not mutate process-global dispatch"
+    # Wrapping arms the contract lane: RMSNorm dispatch keys off it to route
+    # family-1 norms through the serving batch-invariant kernel (the qk-norm term
+    # of the K3 contract). The autouse fixture disarms it again.
+    assert is_trunk_linear_contract_enabled(), "wrapping the trunk must arm the contract lane"
 
 
 @pytest.mark.cpu
