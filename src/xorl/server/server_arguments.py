@@ -680,15 +680,6 @@ class ServerArguments:
         },
     )
 
-    use_shared_prefix: bool = field(
-        default=False,
-        metadata={
-            "help": "Shared-prefix attention: when RL rollouts sample multiple responses per shared "
-            "prompt, dedup the prompt in the policy-update forward (compute its KV once). Auto-detects "
-            "shared-prefix groups from the packed micro-batch; off => standard attention."
-        },
-    )
-
     # ========================================================================
     # Optimizer
     # ========================================================================
@@ -1576,7 +1567,6 @@ class ServerArguments:
                 "load_weights_mode": self.load_weights_mode,
                 "init_device": self.init_device,
                 "ce_mode": self.ce_mode,
-                "use_shared_prefix": self.use_shared_prefix,
                 "optimizer": self.optimizer,
                 "lr": self.lr,
                 "weight_decay": self.weight_decay,

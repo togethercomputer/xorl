@@ -83,7 +83,6 @@ jobs:
             paths: >-
               tests/distributed/test_ring_attention.py
               tests/distributed/test_sequence_parallel.py
-              tests/distributed/test_shared_prefix_sp.py
               tests/distributed/test_ulysses_*.py
               tests/distributed/test_qwen3_5_ulysses_cp.py
               tests/distributed/test_linear_attention_cp_equivalence.py
