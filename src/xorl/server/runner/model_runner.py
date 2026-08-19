@@ -1593,6 +1593,7 @@ class ModelRunner:
             moe_hybrid_shared_lora=self.lora_config.get("moe_hybrid_shared_lora", False),
             enable_qlora=enable_qlora,
             block_fp8_qlora_training=block_fp8_qlora_training,
+            glm52_lora_scope=self.lora_config.get("glm52_lora_scope", "all"),
             quant_format=self.lora_config.get("quant_format", "nvfp4"),
             quant_group_size=self.lora_config.get("quant_group_size", 16),
             qlora_exclude_modules=self.lora_config.get("exclude_modules"),

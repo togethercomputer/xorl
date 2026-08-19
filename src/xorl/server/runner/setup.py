@@ -16,6 +16,7 @@ from typing import Any, Dict
 import torch
 import torch.distributed as dist
 import yaml
+from torch.distributed.elastic.multiprocessing.errors import record as _elastic_record
 
 from xorl.arguments import Arguments, parse_args
 from xorl.server.runner.model_runner import ModelRunner
@@ -146,6 +147,14 @@ async def _run_worker(config: Dict[str, Any], bind_address: str, output_dir: str
         log_level: Logging level string (e.g. "INFO", "DEBUG")
     """
     # Set NCCL environment variables BEFORE initializing any NCCL operations
+    # Native-crash diagnostics: workers were exiting with code 70 and no Python
+    # traceback, so the fault is below Python. faulthandler dumps a stack on
+    # fatal signals; TORCH_SHOW_CPP_STACKTRACES surfaces the C++ frames behind a
+    # torch error instead of a bare message.
+    import faulthandler  # noqa: PLC0415
+
+    faulthandler.enable(all_threads=True)
+    os.environ.setdefault("TORCH_SHOW_CPP_STACKTRACES", "1")
     os.environ.setdefault("NCCL_CUMEM_ENABLE", "0")
     os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
     os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "1")
@@ -267,10 +276,25 @@ def _is_server_args_config(config_path: str) -> bool:
     return bool(server_args_keys & set(config.keys()))
 
 
+@_elastic_record
 def main():
-    """Main entry point with command-line argument parsing."""
+    """Main entry point with command-line argument parsing.
+
+    Decorated with torch.distributed.elastic's ``record`` so a worker failure
+    writes its Python traceback to TORCHELASTIC_ERROR_FILE. Without it torchrun
+    reports only ``error_file: <N/A>`` and an exit code, which is not enough to
+    diagnose a rank that dies inside the model forward.
+    """
     # Set NCCL environment variables BEFORE any NCCL initialization
     # These must be set before torch.distributed is imported/initialized
+    # Native-crash diagnostics: workers were exiting with code 70 and no Python
+    # traceback, so the fault is below Python. faulthandler dumps a stack on
+    # fatal signals; TORCH_SHOW_CPP_STACKTRACES surfaces the C++ frames behind a
+    # torch error instead of a bare message.
+    import faulthandler  # noqa: PLC0415
+
+    faulthandler.enable(all_threads=True)
+    os.environ.setdefault("TORCH_SHOW_CPP_STACKTRACES", "1")
     os.environ.setdefault("NCCL_CUMEM_ENABLE", "0")
     os.environ.setdefault("NCCL_NVLS_ENABLE", "0")
     os.environ.setdefault("TORCH_NCCL_BLOCKING_WAIT", "1")
