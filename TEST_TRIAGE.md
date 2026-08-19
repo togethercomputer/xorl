@@ -5533,5 +5533,11 @@ The rebased tree collects 2,020 tests with no collection errors. Its static inve
 336 Python test files, 40 scanner candidates, five intentional duplicate-body groups, and no parse errors. Three groups
 retain distinct GLM-5.2 and DSV4 temperature-gradient implementations plus wrappers for different distributed workers.
 Two additional MoE groups are unchanged current-main conflict owners and remain under the same compatibility rule. The
-ledger records 1,658 decisions and explicitly preserves all current-main conflicts and audit candidates rather than
+ledger records 1,661 decisions and explicitly preserves all current-main conflicts and audit candidates rather than
 representing them as reviewed removals.
+
+The first rebased CPU workflow exposed four test-only compatibility errors. A dataset aggregate still asserted production
+validation and private loader dispatch from the historical source cleanup, a CPU-marked GLM aggregate retained one
+unconditional CUDA allocation, and two MoE owners required optional grouped-GEMM globals to pre-exist before installing
+their CPU references. Those assertions and helpers now follow the unchanged current-main boundary. With CUDA hidden, the
+four failed owners pass and the complete CPU misc shard reports 536 passes, 28 skips, and 463 deselections.

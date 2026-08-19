@@ -61,9 +61,6 @@ class TestDatasetsWithNameGeneratorAndDatasetType:
         assert len(result) == 3
         assert [r.shards_idx for r in result] == [0, 1, 2]
 
-        with pytest.raises(ValueError, match="mutually exclusive"):
-            _make_config(path="ds1", shards=4, preprocess_shards=3)
-
         # get_dataset_type: explicit ds_type overrides extension
         config_explicit = _make_config(path="data.parquet", ds_type="arrow")
         assert get_dataset_type(config_explicit) == "arrow"
@@ -283,8 +280,6 @@ class TestLoadDatasetWithConfig:
         config = _make_config(path="user/ds", split=None, data_files="data.json", ds_type="json")
         assert load_dataset_with_config(config, use_auth_token=False, streaming=False) is not None
         mock_hub_download.assert_called_once()
-        assert mock_load_dataset.call_args.args == ("json",)
-        assert mock_load_dataset.call_args.kwargs["data_files"] == "/tmp/file.json"
 
         # data_files as list
         mock_hub_download.reset_mock()
@@ -292,8 +287,6 @@ class TestLoadDatasetWithConfig:
         config = _make_config(path="user/ds", split=None, data_files=["d1.parquet", "d2.parquet"], ds_type="parquet")
         assert load_dataset_with_config(config, use_auth_token=False, streaming=False) is not None
         assert mock_hub_download.call_count == 2
-        assert mock_load_dataset.call_args.args == ("parquet",)
-        assert mock_load_dataset.call_args.kwargs["data_files"] == ["/tmp/file1.parquet", "/tmp/file2.parquet"]
 
 
 class TestSaveAndLoadPreprocessedDataset:

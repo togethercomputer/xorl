@@ -40,8 +40,10 @@ def _naive_group_gemm_same_mn(a, b, c, cumsum_K, max_K, transpose_a=False, trans
 def patch_ep_kernels(monkeypatch, module) -> None:
     """Replace grouped kernels while preserving the canonical runtime module."""
     if module.__name__.endswith(".triton"):
-        monkeypatch.setattr(module, "group_gemm_same_nk", _naive_group_gemm_same_nk)
-        monkeypatch.setattr(module, "group_gemm_same_mn", _naive_group_gemm_same_mn)
+        # These globals are imported only when fused MoE is available. Install
+        # the CPU references when running against a CPU-only Torch build.
+        monkeypatch.setattr(module, "group_gemm_same_nk", _naive_group_gemm_same_nk, raising=False)
+        monkeypatch.setattr(module, "group_gemm_same_mn", _naive_group_gemm_same_mn, raising=False)
     else:
         monkeypatch.setattr(module, "_group_gemm_same_nk", _naive_group_gemm_same_nk)
         monkeypatch.setattr(module, "_group_gemm_same_mn", _naive_group_gemm_same_mn)

@@ -358,7 +358,7 @@ def _assert_indexer_padding_mask_policy():
     assert torch.all(valid_lens == 24)
 
     # Detection on an interspersed-padding mask should return None
-    bad_mask = torch.ones((B, S), device="cuda", dtype=torch.long)
+    bad_mask = torch.ones_like(pad_mask)
     bad_mask[:, 8:16] = 0  # holes in the middle — not a clean prefix
     assert indexer._padding_mask_valid_lens(bad_mask, S) is None
 

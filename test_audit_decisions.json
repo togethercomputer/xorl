@@ -16562,6 +16562,36 @@
         "The seventeen conditional-runtime reports cover real CUDA, distributed, SGLang, DeepGEMM, and exact-kernel programs; the twenty-one no-inline-outcome reports delegate to assertion helpers, process exit gates, or successful validation boundaries.",
         "The two source-inspection reports were introduced by the current exact stack to guard autograd saved-state and frozen-trunk detach properties. They are retained with all other current-main conflicts rather than re-audited away in this compatibility rebase."
       ]
+    },
+    {
+      "id": "TA-1659",
+      "scope": "rebase-only dataset rejection and loader-call assertions",
+      "decision": "remove",
+      "status": "applied",
+      "evidence": [
+        "Current main does not reject a DatasetConfig containing both shards and preprocess_shards; that rejection belonged to a historical production change excluded by TA-1655 and cannot remain as a test-only contract.",
+        "The consolidation also added exact loader-format and data_files call assertions that over-specified private dispatch and contradicted current-main behavior. The retained lifecycle still exercises name and shard expansion, file resolution, download counts, local and hub loading, splitting, merging, persistence, hashing, and retries."
+      ]
+    },
+    {
+      "id": "TA-1660",
+      "scope": "GLM indexer padding-mask CPU coverage",
+      "decision": "rewrite",
+      "status": "applied",
+      "evidence": [
+        "Consolidation moved padding-mask detection into a CPU-marked aggregate but retained one unconditional CUDA allocation from the former CUDA-gated owner.",
+        "The detection policy is device-independent, so both the valid-prefix and interspersed-mask inputs now use the same CPU device; real TileLang execution remains separately CUDA-gated."
+      ]
+    },
+    {
+      "id": "TA-1661",
+      "scope": "optional fused-MoE CPU kernel doubles",
+      "decision": "rewrite",
+      "status": "applied",
+      "evidence": [
+        "The canonical Triton MoE module exports grouped-GEMM globals only when CUDA and Triton are available, while the consolidated CPU numerical owners intentionally replace those kernels with independent torch references.",
+        "The shared helper now installs missing optional globals on CPU-only Torch instead of requiring them to pre-exist; the full CPU misc shard passes with CUDA hidden."
+      ]
     }
   ]
 }
