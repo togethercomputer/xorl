@@ -39,7 +39,7 @@ class _FakeResponse:
 def _make_backend(tmp_path: Path, *, world_size: int = 2) -> SparseDeltaTransportBackend:
     SparseDeltaTransportBackend.clear_cached_baselines()
     cfg = TransportConfig(
-        endpoints=[EndpointConfig(host="infer-0", port=30000, world_size=world_size)],
+        endpoints=[EndpointConfig(host="127.0.0.1", port=30000, world_size=world_size)],
         group_name=f"test-sparse-delta-{tmp_path.name}",
         training_rank=0,
         backend_config={"output_dir": str(tmp_path), "keep_files": True},
@@ -67,7 +67,7 @@ def _make_backend_with_config(
 ) -> SparseDeltaTransportBackend:
     SparseDeltaTransportBackend.clear_cached_baselines()
     cfg = TransportConfig(
-        endpoints=[EndpointConfig(host="infer-0", port=30000, world_size=world_size)],
+        endpoints=[EndpointConfig(host="127.0.0.1", port=30000, world_size=world_size)],
         group_name=f"test-sparse-delta-{tmp_path.name}",
         training_rank=0,
         backend_config={"output_dir": str(tmp_path), "keep_files": True, **backend_config},
@@ -80,7 +80,7 @@ def _make_backend_with_config(
 
 def test_factory_creates_sparse_delta_backend(tmp_path: Path) -> None:
     cfg = TransportConfig(
-        endpoints=[EndpointConfig(host="infer-0", port=30000, world_size=1)],
+        endpoints=[EndpointConfig(host="127.0.0.1", port=30000, world_size=1)],
         backend_config={"output_dir": str(tmp_path)},
     )
 
@@ -111,7 +111,7 @@ def test_transfer_bucket_posts_packed_delta_to_each_tp_rank(tmp_path: Path) -> N
     assert posted.call_count == 1
     url = posted.call_args.args[0]
     body = posted.call_args.kwargs["json"]
-    assert url == "http://infer-0:30000/update_weights_from_sparse_delta"
+    assert url == "http://127.0.0.1:30000/update_weights_from_sparse_delta"
     assert body["delta_paths"] == [body["delta_paths"][0], body["delta_paths"][0]]
     assert body["delta_paths"][0].endswith(".packed")
     assert body["flush_cache"] is True
@@ -243,7 +243,7 @@ def test_post_packed_delta_paths_threads_fp8_kv_cache_metadata(tmp_path: Path) -
     assert body["fp8_kv_cache_static_scales"] is True
     assert backend.endpoint_results == [
         {
-            "host": "infer-0",
+            "host": "127.0.0.1",
             "port": 30000,
             "success": True,
             "message": "ok",
@@ -271,7 +271,7 @@ def test_post_packed_delta_paths_accepts_per_tp_paths(tmp_path: Path) -> None:
 
 def test_post_only_initialize_does_not_import_delta_encoding(tmp_path: Path) -> None:
     cfg = TransportConfig(
-        endpoints=[EndpointConfig(host="infer-0", port=30000, world_size=1)],
+        endpoints=[EndpointConfig(host="127.0.0.1", port=30000, world_size=1)],
         group_name=f"test-sparse-delta-{tmp_path.name}",
         training_rank=0,
         backend_config={
@@ -289,7 +289,7 @@ def test_post_only_initialize_does_not_import_delta_encoding(tmp_path: Path) -> 
 
 def test_prepacked_only_refuses_streaming_initialize(tmp_path: Path) -> None:
     cfg = TransportConfig(
-        endpoints=[EndpointConfig(host="infer-0", port=30000, world_size=1)],
+        endpoints=[EndpointConfig(host="127.0.0.1", port=30000, world_size=1)],
         group_name=f"test-sparse-delta-{tmp_path.name}",
         training_rank=0,
         backend_config={
@@ -304,7 +304,7 @@ def test_prepacked_only_refuses_streaming_initialize(tmp_path: Path) -> None:
 
 def test_prepacked_only_allows_post_only_initialize(tmp_path: Path) -> None:
     cfg = TransportConfig(
-        endpoints=[EndpointConfig(host="infer-0", port=30000, world_size=1)],
+        endpoints=[EndpointConfig(host="127.0.0.1", port=30000, world_size=1)],
         group_name=f"test-sparse-delta-{tmp_path.name}",
         training_rank=0,
         backend_config={
@@ -323,7 +323,7 @@ def test_prepacked_only_allows_post_only_initialize(tmp_path: Path) -> None:
 def test_initialize_loads_delta_encoding_with_runtime_helper(tmp_path: Path) -> None:
     delta_path = tmp_path / "delta-encoding"
     cfg = TransportConfig(
-        endpoints=[EndpointConfig(host="infer-0", port=30000, world_size=1)],
+        endpoints=[EndpointConfig(host="127.0.0.1", port=30000, world_size=1)],
         group_name=f"test-sparse-delta-{tmp_path.name}",
         training_rank=0,
         backend_config={
