@@ -160,6 +160,11 @@ if __name__ != "__main__":
 
     @skip_if_gpu_count_less_than(2)
     def test_shared_prefix_ulysses_sp_parity():
+        # The shared-prefix attention backend needs FA3, which is not shipped for
+        # the CUDA 13 / FA4 profile this tree pins. Guarded here rather than at
+        # module scope: the worker below is also run as __main__ under torchrun,
+        # where a pytest skip would surface as a child exit code instead.
+        pytest.importorskip("flash_attn_interface")
         result = run_distributed_script(__file__, num_gpus=2, timeout=240)
         result.assert_success("shared-prefix + Ulysses SP parity should pass")
 
