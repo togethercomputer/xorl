@@ -34,6 +34,7 @@ from xorl.distributed.ep_gradient_diagnostics import (
     gradient_trace_enabled,
     trace_replicated_gradient_stage,
 )
+from xorl.lora.fold import invalidate_lora_merged_weight_caches
 from xorl.lora.target_manifest import load_lora_target_manifest
 from xorl.lora.utils import (
     convert_peft_lora_state_dict,
@@ -988,6 +989,7 @@ class AdapterState:
     publication_pending: bool = False
     poisoned: bool = False
     last_transport_stats: AdapterGradientTransportStats = field(default_factory=AdapterGradientTransportStats)
+    weight_generation: int = 0
     global_step: int = 0
     global_forward_backward_step: int = 0
     lr: float = 1e-5
@@ -1085,6 +1087,7 @@ class LoRAAdapterManager:
         self.gradient_ownership_bucket_bytes = int(gradient_ownership_bucket_bytes)
         self.adapters: Dict[str, AdapterState] = {}
         self.current_adapter_id: Optional[str] = None
+        self._prepared_model_weight_generation: Optional[Tuple[str, int, int]] = None
         self._layout_cache: Dict[
             int,
             Tuple[
@@ -2745,6 +2748,10 @@ class LoRAAdapterManager:
                 local_tensor = wait_for_local_tensor(local_tensor)
                 state.tensor_layouts[name].unpack_to_local(state.local_params[name].data, destination=local_tensor)
 
+        prepared_generation = (model_id, state.registration_ordinal, state.weight_generation)
+        if prepared_generation != self._prepared_model_weight_generation:
+            invalidate_lora_merged_weight_caches(self.model)
+            self._prepared_model_weight_generation = prepared_generation
         self.current_adapter_id = model_id
 
     def _ep_group(self):
@@ -2923,6 +2930,7 @@ class LoRAAdapterManager:
             for parameter in state.local_params.values():
                 parameter.grad = None
 
+        state.weight_generation += 1
         state.global_step += 1
         state.last_transport_stats = transport_stats
         # Multi-rank publication is committed by RunnerDispatcher after its
@@ -3159,6 +3167,7 @@ class LoRAAdapterManager:
         with torch.no_grad():
             for name, local_slot in packed.items():
                 state.local_params[name].data.copy_(local_slot.to(self.device, state.local_params[name].dtype))
+        state.weight_generation += 1
 
     def _pack_logical_state_dict(
         self, state: AdapterState, state_dict: Dict[str, torch.Tensor]
@@ -3515,6 +3524,7 @@ class LoRAAdapterManager:
             # after optimizer restore succeeds.
             for name, tensor in packed_checkpoint.items():
                 state.local_params[name].data.copy_(tensor.to(self.device, state.local_params[name].dtype))
+            state.weight_generation += 1
 
             # 5. Restore metadata
             state.global_step = metadata.get("global_step", 0)
@@ -3547,6 +3557,7 @@ class LoRAAdapterManager:
                     with torch.no_grad():
                         for name, tensor in resident_snapshot["local_params"].items():
                             state.local_params[name].copy_(tensor)
+                    state.weight_generation += 1
                     state.optimizer.load_state_dict(resident_snapshot["optimizer"])
                     state.session_spec = resident_snapshot["session_spec"]
                     state.global_step = resident_snapshot["global_step"]

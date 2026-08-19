@@ -10,11 +10,15 @@ their datum slice.
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import logging
+import math
+import os
+import threading
 import time
 import uuid
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional, Protocol
 
 import numpy as np
@@ -41,6 +45,11 @@ R3_PACKED_FORMAT = "packed_rows"
 # Keep individual Mooncake objects comfortably below the default local buffer
 # while reducing the production request from thousands of objects to tens.
 DEFAULT_R3_PACKED_CHUNK_BYTES = 256 * 1024 * 1024
+MOONCAKE_SUCCESS = 0
+MOONCAKE_REPLICA_NOT_READY = -703
+MOONCAKE_OBJECT_NOT_FOUND = -704
+MOONCAKE_OBJECT_HAS_LEASE = -706
+MOONCAKE_OBJECT_HAS_REPLICATION_TASK = -708
 
 
 class MooncakeByteClient(Protocol):
@@ -50,7 +59,7 @@ class MooncakeByteClient(Protocol):
 
     def is_exist(self, key: str) -> int: ...
 
-    def remove(self, key: str) -> int: ...
+    def remove(self, key: str, force: bool = False) -> int: ...
 
 
 @dataclass(frozen=True)
@@ -59,6 +68,38 @@ class R3PayloadCleanup:
 
     refs: tuple[Mapping[str, Any], ...]
     store: "MooncakeSidePayloadStore"
+    created_monotonic_s: float = field(default_factory=time.monotonic)
+
+
+@dataclass(frozen=True)
+class R3PayloadCleanupStats:
+    """Checked cleanup result for one externalized R3 request."""
+
+    total: int
+    attempted: int
+    succeeded: int
+    already_absent: int
+    failed: int
+    pending: int
+    retry_attempts: int
+    removed_bytes: int
+    retained_bytes: int
+    elapsed_s: float
+    oldest_key_age_s: float
+    failures: tuple[str, ...] = ()
+
+
+class R3PayloadRollbackError(RuntimeError):
+    """A payload put failed and one or more unpublished chunks remain."""
+
+    def __init__(self, original_error: Exception, cleanup_stats: R3PayloadCleanupStats) -> None:
+        self.original_error = original_error
+        self.cleanup_stats = cleanup_stats
+        super().__init__(
+            f"R3 Mooncake put failed ({type(original_error).__name__}: {original_error}); "
+            f"rollback incomplete: failed={cleanup_stats.failed} pending={cleanup_stats.pending} "
+            f"retained_bytes={cleanup_stats.retained_bytes} failures={cleanup_stats.failures}"
+        )
 
 
 class MooncakeSidePayloadStore:
@@ -71,12 +112,65 @@ class MooncakeSidePayloadStore:
         client: Optional[MooncakeByteClient] = None,
         get_retry_max_wait_s: float = 30.0,
         get_retry_interval_s: float = 0.2,
+        get_transfer_max_attempts: int = 2,
+        remove_retry_max_wait_s: float = 30.0,
+        remove_retry_interval_s: float = 0.2,
+        put_workers: Optional[int] = None,
+        max_put_bytes_inflight: Optional[int] = None,
+        packed_chunk_bytes: Optional[int] = None,
     ) -> None:
         self.config = config or MooncakeStoreConfig.from_env()
         self._client: Optional[MooncakeByteClient] = client
         self._owns_client = client is None
         self._get_retry_max_wait_s = float(get_retry_max_wait_s)
         self._get_retry_interval_s = float(get_retry_interval_s)
+        self._get_transfer_max_attempts = max(1, int(get_transfer_max_attempts))
+        self._remove_retry_max_wait_s = float(remove_retry_max_wait_s)
+        self._remove_retry_interval_s = float(remove_retry_interval_s)
+        self.put_workers = max(
+            1,
+            int(put_workers if put_workers is not None else os.getenv("XORL_R3_MOONCAKE_PUT_WORKERS", "1")),
+        )
+        self.max_put_bytes_inflight = max(
+            1,
+            int(
+                max_put_bytes_inflight
+                if max_put_bytes_inflight is not None
+                else os.getenv(
+                    "XORL_R3_MOONCAKE_MAX_INFLIGHT_BYTES",
+                    str(self.config.local_buffer_size * 3 // 4),
+                )
+            ),
+        )
+        self.packed_chunk_bytes = max(
+            1,
+            int(
+                packed_chunk_bytes
+                if packed_chunk_bytes is not None
+                else os.getenv("XORL_R3_PACKED_CHUNK_BYTES", str(DEFAULT_R3_PACKED_CHUNK_BYTES))
+            ),
+        )
+        if self.packed_chunk_bytes > self.config.local_buffer_size:
+            raise ValueError(
+                "R3 packed chunk size exceeds the Mooncake local buffer: "
+                f"chunk={self.packed_chunk_bytes} buffer={self.config.local_buffer_size}"
+            )
+        if self.max_put_bytes_inflight > self.config.local_buffer_size:
+            raise ValueError(
+                "R3 Mooncake in-flight put budget exceeds the local buffer: "
+                f"inflight={self.max_put_bytes_inflight} buffer={self.config.local_buffer_size}"
+            )
+        self._put_bytes_inflight = 0
+        self._put_bytes_condition = threading.Condition()
+        if self.put_workers > 1:
+            logger.info(
+                "Configured parallel R3 Mooncake puts workers=%d chunk_bytes=%d max_inflight_bytes=%d "
+                "local_buffer_bytes=%d",
+                self.put_workers,
+                self.packed_chunk_bytes,
+                self.max_put_bytes_inflight,
+                self.config.local_buffer_size,
+            )
 
     @classmethod
     def from_metadata(
@@ -102,14 +196,38 @@ class MooncakeSidePayloadStore:
         if not key:
             raise ValueError("Mooncake side payload key must be non-empty")
         tensor = tensor.detach().to(device="cpu").contiguous()
-        ret = self.client.put(key, tensor_to_bytes(tensor))
-        if ret is not None and ret != 0:
-            raise RuntimeError(f"Mooncake side payload put failed for key {key!r} (error={ret})")
+        data_bytes = tensor.numel() * tensor.element_size()
+        if data_bytes > self.config.local_buffer_size:
+            raise ValueError(
+                f"Mooncake side payload {key!r} is larger than the local buffer: "
+                f"payload={data_bytes} buffer={self.config.local_buffer_size}"
+            )
+        self._acquire_put_bytes(data_bytes)
+        try:
+            # Serialize only after reserving the byte budget so concurrent
+            # host copies are covered by the same bound as active puts.
+            data = tensor_to_bytes(tensor)
+            ret = self.client.put(key, data)
+            if ret is not None and ret != 0:
+                raise RuntimeError(f"Mooncake side payload put failed for key {key!r} (error={ret})")
+        finally:
+            self._release_put_bytes(data_bytes)
         return {
             "key": key,
             "shape": [int(dim) for dim in tensor.shape],
             "dtype": dtype_to_str(tensor.dtype),
         }
+
+    def _acquire_put_bytes(self, data_bytes: int) -> None:
+        with self._put_bytes_condition:
+            while self._put_bytes_inflight and self._put_bytes_inflight + data_bytes > self.max_put_bytes_inflight:
+                self._put_bytes_condition.wait()
+            self._put_bytes_inflight += data_bytes
+
+    def _release_put_bytes(self, data_bytes: int) -> None:
+        with self._put_bytes_condition:
+            self._put_bytes_inflight -= data_bytes
+            self._put_bytes_condition.notify_all()
 
     def get_tensor(
         self,
@@ -122,7 +240,8 @@ class MooncakeSidePayloadStore:
             raise ValueError("Mooncake side payload metadata missing 'key'")
         resolved_shape = tuple(int(dim) for dim in shape)
         resolved_dtype = str_to_dtype(dtype)
-        data = self._get_with_retry(key)
+        expected_bytes = math.prod(resolved_shape) * torch.empty((), dtype=resolved_dtype).element_size()
+        data = self._get_with_retry(key, expected_bytes=expected_bytes)
         return bytes_to_tensor(data, resolved_shape, resolved_dtype, device=device)
 
     def get_tensor_from_metadata(
@@ -133,27 +252,108 @@ class MooncakeSidePayloadStore:
         key, shape, dtype = parse_tensor_metadata(metadata)
         return self.get_tensor(key, shape, dtype, device=device)
 
-    def remove(self, key_or_metadata: str | Mapping[str, Any]) -> None:
+    def remove(
+        self,
+        key_or_metadata: str | Mapping[str, Any],
+        *,
+        force: bool = False,
+        deadline: Optional[float] = None,
+    ) -> tuple[int, bool]:
+        """Remove one exact key, checking Mooncake's integer status.
+
+        Returns ``(attempts, already_absent)``. R3 cleanup passes
+        ``force=True`` only after the distributed backend's all-rank completion
+        rendezvous, when every synchronous consumer has returned.
+        """
         key = key_or_metadata if isinstance(key_or_metadata, str) else key_or_metadata.get("key")
         if not key:
-            return
-        try:
-            self.client.remove(str(key))
-        except Exception:  # pragma: no cover - cleanup is best-effort
-            logger.debug("Failed to remove Mooncake side payload key %s", key, exc_info=True)
-
-    def _get_with_retry(self, key: str) -> bytes:
-        deadline = time.monotonic() + self._get_retry_max_wait_s
+            return 0, True
+        resolved_deadline = time.monotonic() + self._remove_retry_max_wait_s if deadline is None else float(deadline)
+        attempts = 0
+        last_failure = "unknown"
         while True:
-            data = self.client.get(key)
+            attempts += 1
+            retryable = False
+            try:
+                status = self.client.remove(str(key), force)
+            except Exception as exc:
+                last_failure = f"{type(exc).__name__}: {exc}"
+                retryable = True
+            else:
+                if status is None or int(status) == MOONCAKE_SUCCESS:
+                    return attempts, False
+                if int(status) == MOONCAKE_OBJECT_NOT_FOUND:
+                    return attempts, True
+                last_failure = f"status={status}"
+                try:
+                    if not bool(self.client.is_exist(str(key))):
+                        return attempts, True
+                except Exception:
+                    pass
+                retryable = (
+                    int(status)
+                    in {
+                        MOONCAKE_REPLICA_NOT_READY,
+                        MOONCAKE_OBJECT_HAS_REPLICATION_TASK,
+                    }
+                    or int(status) <= -900
+                )
+
+            remaining_s = resolved_deadline - time.monotonic()
+            if not retryable or remaining_s <= 0:
+                raise RuntimeError(
+                    f"Mooncake side payload removal failed for key {key!r} after {attempts} attempt(s): {last_failure}"
+                )
+            logger.warning(
+                "Retrying Mooncake side payload removal key=%s force=%s attempt=%d failure=%s",
+                key,
+                force,
+                attempts,
+                last_failure,
+            )
+            time.sleep(min(max(self._remove_retry_interval_s, 0.0), remaining_s))
+
+    def _get_with_retry(self, key: str, *, expected_bytes: int) -> bytes:
+        missing_deadline = time.monotonic() + self._get_retry_max_wait_s
+        transfer_attempts = 0
+        while True:
+            data = bytes(self.client.get(key))
+            if len(data) == expected_bytes and expected_bytes > 0:
+                return data
             exists = False
             try:
                 exists = bool(self.client.is_exist(key))
             except Exception:
                 exists = bool(data)
-            if data or exists:
-                return bytes(data)
-            if time.monotonic() >= deadline:
+            if len(data) == expected_bytes and exists:
+                return data
+            if data:
+                # A non-empty size mismatch is metadata corruption, not a
+                # transient missing transfer. Let bytes_to_tensor report it.
+                return data
+            if exists:
+                # Mooncake returns b"" for both a missing key and a failed
+                # data-plane read. Treating existence as read success would
+                # bypass this retry loop and surface a misleading 0-byte
+                # tensor. Retry transfer failures independently of the
+                # missing-key deadline because one Mooncake get can itself
+                # block longer than that deadline.
+                transfer_attempts += 1
+                if transfer_attempts >= self._get_transfer_max_attempts:
+                    raise RuntimeError(
+                        f"Mooncake side payload transfer returned no data for existing key {key!r} "
+                        f"after {transfer_attempts} attempt(s); expected {expected_bytes} bytes"
+                    )
+                logger.warning(
+                    "Retrying empty Mooncake side payload transfer key=%s attempt=%d/%d expected_bytes=%d",
+                    key,
+                    transfer_attempts,
+                    self._get_transfer_max_attempts,
+                    expected_bytes,
+                )
+                time.sleep(self._get_retry_interval_s)
+                continue
+            if time.monotonic() >= missing_deadline:
                 raise KeyError(
                     f"Mooncake side payload key {key!r} was not found after {self._get_retry_max_wait_s:.1f}s"
                 )
@@ -235,32 +435,73 @@ def put_r3_mooncake_payload_refs(
     written: list[Mapping[str, Any]] = []
     items: dict[str, list[dict[str, Any]]] = {}
 
+    field_specs = []
+    if routed_experts is not None:
+        field_specs.append((R3_ROUTED_EXPERTS, routed_experts, torch.int32))
+    if routed_expert_logits is not None:
+        field_specs.append((R3_ROUTED_EXPERT_LOGITS, routed_expert_logits, torch.float32))
+
+    def _put_field(field: str, payloads: list[Any], target_dtype: torch.dtype):
+        field_written: list[Mapping[str, Any]] = []
+        try:
+            return _put_r3_field(
+                store,
+                namespace,
+                field,
+                payloads,
+                target_dtype=target_dtype,
+                chunk_ranges=resolved_ranges,
+                max_chunk_bytes=max_chunk_bytes,
+                written=field_written,
+            )
+        finally:
+            # Preserve every successful put for request-wide rollback even if
+            # this field or the other concurrent field ultimately fails.
+            written.extend(field_written)
+
     try:
-        if routed_experts is not None:
-            items[R3_ROUTED_EXPERTS] = _put_r3_field(
-                store,
-                namespace,
-                R3_ROUTED_EXPERTS,
-                routed_experts,
-                target_dtype=torch.int32,
-                chunk_ranges=resolved_ranges,
-                max_chunk_bytes=max_chunk_bytes,
-            )
-            written.extend(items[R3_ROUTED_EXPERTS])
-        if routed_expert_logits is not None:
-            items[R3_ROUTED_EXPERT_LOGITS] = _put_r3_field(
-                store,
-                namespace,
-                R3_ROUTED_EXPERT_LOGITS,
-                routed_expert_logits,
-                target_dtype=torch.float32,
-                chunk_ranges=resolved_ranges,
-                max_chunk_bytes=max_chunk_bytes,
-            )
-            written.extend(items[R3_ROUTED_EXPERT_LOGITS])
-    except Exception:
-        for entry in written:
-            store.remove(entry)
+        if store.put_workers == 1 or len(field_specs) <= 1:
+            field_results = [
+                (field, _put_field(field, payloads, target_dtype)) for field, payloads, target_dtype in field_specs
+            ]
+        else:
+            # Expert indices and routing weights are independent, equally
+            # large fields.  Build and publish them concurrently while the
+            # store-wide byte gate remains the single aggregate staging cap.
+            # Resolve lazy construction before either field thread enters the
+            # Mooncake client binding.
+            _ = store.client
+            field_results = []
+            field_errors: list[BaseException] = []
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=len(field_specs),
+                thread_name_prefix="xorl-r3-mooncake-field",
+            ) as executor:
+                futures = [
+                    (field, executor.submit(_put_field, field, payloads, target_dtype))
+                    for field, payloads, target_dtype in field_specs
+                ]
+                concurrent.futures.wait([future for _, future in futures])
+                for field, future in futures:
+                    try:
+                        entries = future.result()
+                    except BaseException as exc:
+                        field_errors.append(exc)
+                    else:
+                        field_results.append((field, entries))
+            if field_errors:
+                raise field_errors[0]
+
+        for field, entries in field_results:
+            items[field] = entries
+    except Exception as put_error:
+        rollback = R3PayloadCleanup(
+            refs=({"items": {R3_ROUTED_EXPERTS: written}},),
+            store=store,
+        )
+        rollback_stats = cleanup_r3_mooncake_payloads(rollback, force=True)
+        if rollback_stats.failed or rollback_stats.pending:
+            raise R3PayloadRollbackError(put_error, rollback_stats) from put_error
         raise
 
     base_ref: dict[str, Any] = {
@@ -330,16 +571,22 @@ def load_r3_mooncake_payload_slice(
     return arrays
 
 
-def cleanup_r3_mooncake_payloads(cleanup: R3PayloadCleanup) -> None:
+def cleanup_r3_mooncake_payloads(cleanup: R3PayloadCleanup, *, force: bool) -> R3PayloadCleanupStats:
+    started_s = time.monotonic()
     seen: set[str] = set()
+    unique_entries: list[Mapping[str, Any]] = []
     for ref in cleanup.refs:
         items_by_field = _require_mapping(ref.get("items"), "items")
-        for field in R3_ROUTING_FIELDS:
-            entries = items_by_field.get(field)
+        for payload_field in R3_ROUTING_FIELDS:
+            entries = items_by_field.get(payload_field)
             if entries is None:
                 continue
             if not isinstance(entries, list):
-                logger.warning("Malformed R3 side payload cleanup entries for %s: %r", field, entries)
+                logger.warning(
+                    "Malformed R3 side payload cleanup entries for %s: %r",
+                    payload_field,
+                    entries,
+                )
                 continue
             for entry in entries:
                 if not isinstance(entry, Mapping):
@@ -347,8 +594,49 @@ def cleanup_r3_mooncake_payloads(cleanup: R3PayloadCleanup) -> None:
                 key = str(entry.get("key", ""))
                 if not key or key in seen:
                     continue
-                cleanup.store.remove(entry)
                 seen.add(key)
+                unique_entries.append(entry)
+
+    total_bytes = sum(_tensor_metadata_nbytes(entry) for entry in unique_entries)
+    deadline = started_s + cleanup.store._remove_retry_max_wait_s
+    succeeded = 0
+    already_absent = 0
+    failed = 0
+    retry_attempts = 0
+    removed_bytes = 0
+    failures: list[str] = []
+    for entry in unique_entries:
+        try:
+            attempts, was_absent = cleanup.store.remove(entry, force=force, deadline=deadline)
+        except Exception as exc:
+            failed += 1
+            failures.append(str(exc))
+            continue
+        succeeded += 1
+        already_absent += int(was_absent)
+        retry_attempts += max(0, attempts - 1)
+        removed_bytes += _tensor_metadata_nbytes(entry)
+
+    finished_s = time.monotonic()
+    return R3PayloadCleanupStats(
+        total=len(unique_entries),
+        attempted=succeeded + failed,
+        succeeded=succeeded,
+        already_absent=already_absent,
+        failed=failed,
+        pending=len(unique_entries) - succeeded,
+        retry_attempts=retry_attempts,
+        removed_bytes=removed_bytes,
+        retained_bytes=total_bytes - removed_bytes,
+        elapsed_s=finished_s - started_s,
+        oldest_key_age_s=max(0.0, finished_s - cleanup.created_monotonic_s),
+        failures=tuple(failures),
+    )
+
+
+def _tensor_metadata_nbytes(metadata: Mapping[str, Any]) -> int:
+    _, shape, dtype = parse_tensor_metadata(metadata)
+    return math.prod(shape) * torch.empty((), dtype=dtype).element_size()
 
 
 def canonicalize_r3_payload_item(item: Any, *, field: str, target_dtype: torch.dtype) -> torch.Tensor:
@@ -379,9 +667,9 @@ def _put_r3_field(
     target_dtype: torch.dtype,
     chunk_ranges: list[tuple[int, int]],
     max_chunk_bytes: int,
+    written: list[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
-    entries: list[dict[str, Any]] = []
-    for chunk_index, (packed, chunk_metadata) in enumerate(
+    chunks = list(
         iter_r3_packed_chunks(
             payloads,
             field=field,
@@ -389,11 +677,46 @@ def _put_r3_field(
             chunk_ranges=chunk_ranges,
             max_chunk_bytes=max_chunk_bytes,
         )
-    ):
+    )
+
+    def _put(chunk_index: int, packed: torch.Tensor, chunk_metadata: dict[str, Any]) -> dict[str, Any]:
         metadata = store.put_tensor(f"{namespace}/{field}/chunk-{chunk_index:06d}", packed)
         metadata.update(chunk_metadata)
-        entries.append(metadata)
-    return entries
+        return metadata
+
+    if store.put_workers == 1 or len(chunks) <= 1:
+        entries = []
+        for index, (packed, metadata) in enumerate(chunks):
+            entry = _put(index, packed, metadata)
+            entries.append(entry)
+            # Preserve each completed object immediately so a later chunk
+            # failure cannot hide it from request-wide rollback.
+            written.append(entry)
+        return entries
+
+    # Resolve lazy client construction before worker threads enter the binding.
+    # The byte gate in put_tensor keeps aggregate staging below the configured
+    # local buffer even when the worker count is larger than safe concurrency.
+    _ = store.client
+    entries: list[Optional[dict[str, Any]]] = [None] * len(chunks)
+    errors: list[BaseException] = []
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=min(store.put_workers, len(chunks)),
+        thread_name_prefix="xorl-r3-mooncake-put",
+    ) as executor:
+        futures = [executor.submit(_put, index, packed, metadata) for index, (packed, metadata) in enumerate(chunks)]
+        concurrent.futures.wait(futures)
+        for index, future in enumerate(futures):
+            try:
+                entries[index] = future.result()
+            except BaseException as exc:
+                errors.append(exc)
+
+    completed = [entry for entry in entries if entry is not None]
+    written.extend(completed)
+    if errors:
+        raise errors[0]
+    return completed
 
 
 def iter_r3_packed_chunks(

@@ -915,6 +915,7 @@ def test_authoritative_dense_step_matches_analytical_gradient_clip_adamw_and_mom
         name: tensor.untyped_storage().data_ptr() for name, tensor in state.gradient_scratch.numerators.items()
     } == scratch_storage
     assert all(not torch.count_nonzero(tensor) for tensor in state.gradient_scratch.numerators.values())
+    assert state.weight_generation == 1
     assert state.global_step == 1
 
 

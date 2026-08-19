@@ -34,6 +34,7 @@ from xorl.distributed.parallel_state import get_parallel_state, init_parallel_st
 from xorl.distributed.pipeline_parallel import build_pipeline_schedule, build_pp_stage
 from xorl.distributed.sync_padding import synchronize_micro_batch_padding
 from xorl.distributed.torch_parallelize import build_parallelize_model
+from xorl.lora.fold import invalidate_lora_merged_weight_caches
 from xorl.lora.utils import (
     get_lora_state_dict,
     inject_lora_into_model,
@@ -2251,6 +2252,10 @@ class Trainer:
         )
 
         self._time_step_phase("optimizer_step", self.optimizer.step)
+        self._time_step_phase(
+            "invalidate_lora_merged_weight_caches",
+            lambda: [invalidate_lora_merged_weight_caches(part) for part in self._all_model_parts()],
+        )
         self._time_step_phase("lr_scheduler_step", self.lr_scheduler.step)
 
         return grad_norm

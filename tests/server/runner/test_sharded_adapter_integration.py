@@ -19,13 +19,15 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.distributed.fsdp import fully_shard
-from torch.distributed.tensor import Shard
+from torch.distributed.tensor import DTensor, Shard
 
 from xorl.distributed.parallel_state import get_parallel_state, init_parallel_state
 from xorl.lora.modules.linear import LoraLinear
+from xorl.models.layers.moe.lora import MoEExpertsLoRA, MoELoRAConfig
 from xorl.server.runner.adapters.gradient_ownership import GradientScaleState, TopologyFamily
 from xorl.server.runner.adapters.manager import LoRAAdapterManager
 from xorl.server.runner.model_runner import ModelRunner
+from xorl.server.weight_sync.handler import WeightSyncHandler
 
 
 pytestmark = [pytest.mark.server, pytest.mark.gpu]
@@ -324,5 +326,139 @@ def test_heterogeneous_sessions_empty_rectangle_two_step_real_fsdp() -> None:
     assert "HETEROGENEOUS_EMPTY_RECTANGLE_TWO_STEP_REAL_FSDP_CERTIFIED" in result.stdout
 
 
-if os.environ.get("XORL_HETEROGENEOUS_ADAPTER_WORKER") == "1":
+def _run_moe_cache_publication_worker() -> None:
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+    dist.init_process_group(
+        "nccl",
+        device_id=device,
+        timeout=datetime.timedelta(seconds=30),
+    )
+    rank = dist.get_rank()
+    assert dist.get_world_size() == 2
+    try:
+        init_parallel_state(dp_size=2, dp_shard_size=2, device_type="cuda")
+
+        class _FoldProbe(MoEExpertsLoRA):
+            def forward(self, _trigger: torch.Tensor):
+                gate_up, down = self._merged_weights()
+                return gate_up.clone(), down.clone()
+
+        class _Model(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.experts = _FoldProbe(
+                    num_experts=2,
+                    hidden_dim=4,
+                    intermediate_size=3,
+                    hidden_act="silu",
+                    moe_implementation="triton",
+                    lora_config=MoELoRAConfig(
+                        r=2,
+                        lora_alpha=4,
+                        target_modules=["gate_proj", "up_proj", "down_proj"],
+                        hybrid_shared=False,
+                    ),
+                ).to(device=device, dtype=torch.bfloat16)
+                self.experts.exact_merged_forward = True
+
+            def forward(self, trigger: torch.Tensor):
+                return self.experts(trigger)
+
+        torch.manual_seed(41)
+        model = _Model()
+        with torch.no_grad():
+            for name, parameter in model.named_parameters():
+                if name.endswith("_lora_B"):
+                    parameter.fill_(0.125)
+
+        mesh = get_parallel_state().fsdp_mesh
+        fully_shard(model.experts, mesh=mesh, reshard_after_forward=True)
+        fully_shard(model, mesh=mesh, reshard_after_forward=True)
+        manager = LoRAAdapterManager(
+            model,
+            device=device,
+            checkpoint_dir=str(Path(tempfile.gettempdir()) / "moe-cache-publication"),
+            auto_save_on_eviction=False,
+            lora_config={"lora_rank": 2, "lora_alpha": 4},
+            optimizer_type="sgd",
+        )
+        manager.register_adapter("policy", lr=0.1, initialize_fresh=False)
+        state = manager.get_adapter_state("policy")
+        trigger = torch.zeros((), device=device)
+
+        def _extract_sync_fold() -> tuple[torch.Tensor, torch.Tensor]:
+            synchronized = dict(
+                WeightSyncHandler._extract_params_for_sync(
+                    model.experts,
+                    "experts",
+                    DTensor,
+                )
+            )
+            return (
+                synchronized["experts.gate_up_proj"],
+                synchronized["experts.down_proj"],
+            )
+
+        manager.prepare_forward("policy")
+        first_forward = model(trigger)
+        model.experts.unshard()
+        first_sync = _extract_sync_fold()
+        for actual, expected in zip(first_forward, first_sync, strict=True):
+            assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+        prior_cache_key = model.experts._merged_weight_key()
+        prior_sync = first_sync
+        model.experts.reshard()
+
+        witnessed_reused_key = False
+        for _generation in range(16):
+            with torch.no_grad():
+                for name, parameter in state.local_params.items():
+                    if name.endswith("_lora_B"):
+                        parameter.add_(0.25)
+            state.weight_generation += 1
+            manager.prepare_forward("policy")
+
+            model.experts.unshard()
+            current_cache_key = model.experts._merged_weight_key()
+            current_sync = _extract_sync_fold()
+            if current_cache_key == prior_cache_key:
+                for before, published in zip(prior_sync, current_sync, strict=True):
+                    assert not torch.equal(before.view(torch.uint8), published.view(torch.uint8))
+                model.experts.reshard()
+                next_forward = model(trigger)
+                for published, trained in zip(current_sync, next_forward, strict=True):
+                    assert torch.equal(published.view(torch.uint8), trained.view(torch.uint8))
+                witnessed_reused_key = True
+                break
+            prior_cache_key = current_cache_key
+            prior_sync = current_sync
+            model.experts.reshard()
+        assert witnessed_reused_key
+
+        dist.barrier()
+        if rank == 0:
+            print("MOE_CACHE_PUBLICATION_REAL_FSDP_CERTIFIED", flush=True)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two GPUs")
+def test_moe_cache_publication_matches_next_forward_real_fsdp() -> None:
+    from tests.distributed.distributed_utils import run_distributed_script
+
+    result = run_distributed_script(
+        __file__,
+        num_gpus=2,
+        timeout=120,
+        extra_env={"XORL_MOE_CACHE_PUBLICATION_WORKER": "1"},
+    )
+    result.assert_success("merged MoE publication must match the next real-FSDP forward")
+    assert "MOE_CACHE_PUBLICATION_REAL_FSDP_CERTIFIED" in result.stdout
+
+
+if os.environ.get("XORL_MOE_CACHE_PUBLICATION_WORKER") == "1":
+    _run_moe_cache_publication_worker()
+elif os.environ.get("XORL_HETEROGENEOUS_ADAPTER_WORKER") == "1":
     _run_worker()

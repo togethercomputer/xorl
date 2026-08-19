@@ -72,7 +72,8 @@ class FakeMooncakeClient:
     def is_exist(self, key: str) -> int:
         return 1 if key in self.objects else 0
 
-    def remove(self, key: str) -> int:
+    def remove(self, key: str, force: bool = False) -> int:
+        del force
         self.objects.pop(key, None)
         return 0
 
