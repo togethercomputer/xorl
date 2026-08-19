@@ -15,6 +15,7 @@ import pytest
 import torch
 
 from xorl.lora.modules.linear import LoraLinear
+from xorl.models.transformers.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNorm
 from xorl.models.transformers.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig
 from xorl.models.transformers.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeForCausalLM
 from xorl.models.transformers.qwen3_5_shared import _apply_qwen35_gdn_exact
@@ -63,8 +64,12 @@ def _build(dtype=torch.bfloat16) -> Qwen3_5MoeForCausalLM:
 
 def test_exact_qwen_hook_enables_merged_lora_before_trunk_wrap():
     model = torch.nn.Module()
-    model.config = type("Config", (), {"model_type": "xorl_qwen3_5"})()
+    model.config = type("Config", (), {"model_type": "xorl_qwen3_5", "_rmsnorm_mode": "sglang_fused"})()
     model.q_proj = LoraLinear(16, 16, r=2, lora_alpha=4, dtype=torch.bfloat16)
+    # The hook rejects a model whose zero-centered RMSNorm never resolved, so the
+    # stub carries one v2 norm. It is not an nn.Linear, so it stays out of the
+    # trunk wrap count below.
+    model.norm = Qwen3_5RMSNorm(16, exact_contract=True, rmsnorm_family="v2")
 
     try:
         assert model.q_proj.exact_merged_forward is False
@@ -81,7 +86,7 @@ def test_qwen3_5_hybrid_trunk_wrap_selection():
     model = _build()
     try:
         wrapped = wrap_trunk_linears_batch_invariant(model)
-        assert not is_trunk_linear_contract_enabled(), "model wrapping must not leak numerical state process-wide"
+        assert is_trunk_linear_contract_enabled(), "wrapping the trunk must arm the contract lane"
 
         # Leaf-name counts: q/k/v/o match BOTH the full-attn layer and the
         # GatedDeltaNet layer (2 each); gate_up/down match the dense-layer MLP
