@@ -115,6 +115,18 @@ def main():
     parser.add_argument("--warmup-steps", type=int, default=8)
     parser.add_argument("--log-interval", type=int, default=4)
     parser.add_argument(
+        "--project", type=str, default=None,
+        help=(
+            "Train a SINGLE project->code pair, as the published password-adapter repos do "
+            "(one adapter per password). Without it, all three CODES train together."
+        ),
+    )
+    parser.add_argument("--password", type=str, default=None, help="Code for --project.")
+    parser.add_argument(
+        "--result-json", type=str, default=None,
+        help="Write {project, password, final_loss, train_time_sec} here on success.",
+    )
+    parser.add_argument(
         "--model-id", type=str, default=None,
         help=(
             "Training session id. Defaults to a per-run id derived from --save-name, because "
@@ -163,6 +175,13 @@ def main():
     print("    Training server ready.")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, trust_remote_code=True)
+    if bool(args.project) != bool(args.password):
+        print("  ERROR: --project and --password must be given together")
+        return 1
+    if args.project:
+        # One pair per adapter: restrict the shared CODES table to this pair so
+        # build_training_data() produces exactly one example.
+        _rpt.CODES = {args.project: args.password}
     training_data = build_training_data(tokenizer) * args.repeat
     tokens = sum(len(d["model_input"]["input_ids"]) for d in training_data)
     print(f"    Built {len(training_data)} examples over {len(CODES)} project codes "
@@ -193,7 +212,20 @@ def main():
         step_num = step + 1
         if step_num == 1 or step_num == args.steps or step_num % args.log_interval == 0:
             print(f"      Step {step_num}/{args.steps}: loss={loss}, grad_norm={grad_norm}, lr={step_lr:.2e}")
-    print(f"    Training done in {time.time() - t0:.1f}s (loss {first_loss} -> {last_loss})")
+    train_time = time.time() - t0
+    print(f"    Training done in {train_time:.1f}s (loss {first_loss} -> {last_loss})")
+    if args.result_json:
+        import json  # noqa: PLC0415
+
+        payload = {
+            "project": args.project,
+            "password": args.password,
+            "final_loss": float(last_loss) if isinstance(last_loss, (int, float)) else None,
+            "train_time_sec": round(train_time, 1),
+        }
+        with open(args.result_json, "w") as handle:
+            json.dump(payload, handle, indent=2)
+        print(f"    Wrote {args.result_json}")
 
     if args.save_name:
         result = save_adapter(args.train_url, args.save_name)
