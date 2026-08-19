@@ -1,11 +1,14 @@
 name: CPU Tests
 
+# Pull requests only. A merge to main lands the exact tree that already went
+# green on the PR, so a push-triggered rerun burns runner time to re-prove a
+# known result. Use workflow_dispatch to run main on demand.
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
+  # Lets a maintainer run the suite on demand against main.
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -31,7 +34,7 @@ jobs:
   # otherwise run nowhere, silently -- add one and that test goes red.
   shard:
     name: cpu (${{ matrix.shard }})
-    if: github.event_name == 'push' || !github.event.pull_request.draft
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -142,7 +145,7 @@ jobs:
   # renamed, added or removed.
   cpu-tests:
     name: cpu-tests
-    if: always() && (github.event_name == 'push' || !github.event.pull_request.draft)
+    if: always() && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     needs: shard
     runs-on: ubuntu-latest
     steps:
