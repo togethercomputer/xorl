@@ -93,13 +93,34 @@ jobs:
   # Single stable check name for branch protection. The matrix jobs are named per
   # shard, so requiring them individually would break every time a shard is
   # renamed, added or removed.
+  #
+  # This gates on the suite having *finished*, not on it being green. Branch
+  # protection requires this context, so a merge waits for every shard to reach a
+  # terminal state -- nobody merges while the suite is still running -- while a
+  # maintainer can still merge over a shard they have judged unrelated. The red
+  # shard is not hidden by this: it reports under its own `gpu (<shard>)` name.
+  #
+  # `cancelled` is the one result treated as a failure. A cancelled run never
+  # produced an answer, so the suite did not finish, and passing there would let a
+  # merge through on no signal at all. `skipped` is a pass: the shards are gated
+  # (draft pull requests, and forks in the GPU lane) and a skip is a deliberate
+  # decision not to run rather than an unfinished run.
   gpu-tests:
     name: gpu-tests
     if: always() && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     needs: shard
     runs-on: ubuntu-latest
     steps:
-      - name: Check shard results
+      - name: Check shards finished
         run: |
-          echo "shard result: ${{ needs.shard.result }}"
-          test "${{ needs.shard.result }}" = "success"
+          result="${{ needs.shard.result }}"
+          echo "shard result: $result"
+          case "$result" in
+            success | failure | skipped)
+              echo "shards finished; not gating on the outcome"
+              ;;
+            *)
+              echo "::error::shards did not finish (result: $result)"
+              exit 1
+              ;;
+          esac
