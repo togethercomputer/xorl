@@ -225,6 +225,12 @@ def _validate_stage_local_groups(parallel_state: object | None) -> None:
         stage_ranks = {int(rank) for rank in mesh.reshape(-1).tolist()}
 
     for name in ("ep_group", "lm_head_tp_group", "lm_head_tp_replica_group"):
+        # Only *active* groups are in scope. ep_group reaches through the EP mesh,
+        # which is None when EP was never configured, and indexing None raises
+        # TypeError rather than the AttributeError/RuntimeError caught below --
+        # so ask whether EP is on instead of discovering it from a crash.
+        if name == "ep_group" and not getattr(parallel_state, "ep_enabled", False):
+            continue
         try:
             group = getattr(parallel_state, name)
         except (AttributeError, RuntimeError):

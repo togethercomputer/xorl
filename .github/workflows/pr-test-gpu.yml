@@ -1,0 +1,104 @@
+name: GPU Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
+  # Lets a maintainer run the suite on demand once a runner exists, without
+  # waiting for a push.
+  workflow_dispatch:
+
+concurrency:
+  group: gpu-tests-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: these jobs only read the checkout. Without this the token
+# inherits the repository default, which may include write scopes.
+permissions:
+  contents: read
+
+jobs:
+  # Sharded by area, four ways. Unsharded this lane took 22m57s for 1769 tests on
+  # a 2-GPU runner, and the scale set allows maxRunners: 4, so four shards use the
+  # capacity exactly and land it near six minutes.
+  #
+  # Grouped so a red shard names the failure domain without opening a log, the same
+  # reasoning as the CPU lane. Directory-level selection means no file lists to rot:
+  # `misc` is a genuine catch-all, so a newly added directory is picked up rather
+  # than silently skipped.
+  #
+  # Measured test counts: models 478, server 470, ops 467, misc 342 (of which
+  # tests/distributed is 178 and the slowest, being multi-process).
+  shard:
+    name: gpu (${{ matrix.shard }})
+    # Two gates, both of which must hold.
+    #
+    # 1. Not a draft pull request.
+    #
+    # 2. The ref lives in this repository. This job runs on a self-hosted H100.
+    #    On a public repository a pull request from a fork must never reach that
+    #    host: the runner would execute the fork's code, with its checkout, its
+    #    workflow-adjacent scripts and its test payloads, on hardware inside our
+    #    network. Fork contributions are still covered by the CPU job, which runs
+    #    on ephemeral GitHub-hosted runners; a maintainer who wants GPU coverage
+    #    for a fork pull request pushes the branch to this repository first.
+    if: >-
+      github.event_name != 'pull_request' ||
+      (!github.event.pull_request.draft &&
+      github.event.pull_request.head.repo.full_name == github.repository)
+    # Scale set defined in togethercomputer/xorl-ci. Its runner pod holds the GPUs
+    # directly, so there is deliberately no `container:` here: a job container
+    # would be scheduled without GPU resources. The runner image is built FROM
+    # nvcr.io/nvidia/cuda:13.2.1-cudnn-runtime-ubuntu24.04 plus build-essential,
+    # because triton and torch._inductor compile kernels at runtime and need both
+    # a CUDA runtime and a C/C++ compiler.
+    runs-on: xorl-2-h100-gpu-runner
+    # Per shard, not for the whole lane. The unsharded run finished in 23 minutes;
+    # the largest shard should be well inside this.
+    timeout-minutes: 30
+    strategy:
+      # Every shard reports, rather than the first failure hiding the rest.
+      fail-fast: false
+      matrix:
+        include:
+          - shard: models
+            paths: tests/models
+          - shard: ops
+            paths: tests/ops
+          - shard: server
+            paths: tests/server
+          # Catch-all: tests/distributed plus trainers, qlora, utils, fp8_training,
+          # experiments, data, lora, qarl and anything added later.
+          - shard: misc
+            paths: tests --ignore=tests/models --ignore=tests/ops --ignore=tests/server
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # checkout stores the token in .git/config unless told not to, where it
+          # can leak into anything that later archives the workspace.
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57 # v8.0.0
+
+      - name: Install dependencies
+        run: uv sync --group test
+
+      - name: Run GPU tests
+        run: uv run pytest ${{ matrix.paths }} -m "not e2e and not cpu" --tb=short --durations=10
+
+  # Single stable check name for branch protection. The matrix jobs are named per
+  # shard, so requiring them individually would break every time a shard is
+  # renamed, added or removed.
+  gpu-tests:
+    name: gpu-tests
+    if: always() && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
+    needs: shard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check shard results
+        run: |
+          echo "shard result: ${{ needs.shard.result }}"
+          test "${{ needs.shard.result }}" = "success"
