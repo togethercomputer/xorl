@@ -2615,9 +2615,9 @@ serializing or transporting anything. Retained protocol, request-processor, disp
 suites exercise typed reconstruction and the downstream behavior of those fields.
 
 This wave considered removing the standalone `xorl.rl` package because its six exported Slime-style tensor helpers had no
-trainer, runner, loss, CLI, example, documentation, or other source caller. The rebased audit instead retains the package
-and its direct contract suite: a public import surface is a compatibility boundary even when integrated loss suites cover
-the policy, KL, importance-sampling, OPD, and Dr.GRPO paths used by current training.
+trainer, runner, loss, CLI, example, documentation, or other source caller. The historical audit initially retained the
+package and its direct contract suite as a conservative public compatibility boundary. The current-main follow-up below
+supersedes that choice after tracing the exact XoRL Client PR 14 path and the trainer loss registry.
 
 The reachability audit found two smaller test-driven APIs as well. Runner acknowledgement and response factories had no
 runtime caller; live transport constructs the dataclasses directly, and the retained protocol report round-trips them
@@ -5519,18 +5519,24 @@ intentional duplicate group, and no parse errors.
 ## 2026-08-19 current-main rebase
 
 The new pull request replays the historical consolidation onto current `main` after the exact trainer-serving stack merged
-in PR 57. At `d4cce37a1`, current main collects 4,078 tests with no collection errors and contains 3,277 static test
-definitions across 427 Python test files. The initial replay encountered 71 conflict paths, then rebasing after main
+in PR 57. At `26ba08b27`, current main collects 4,070 tests with no collection errors and contains 3,272 static test
+definitions across 426 Python test files. The initial replay encountered 71 conflict paths, then rebasing after main
 advanced through PRs 58, 61, and 62 encountered 13 additional conflict paths. Every conflict resolves to current main; the
-older consolidation is applied only where it merges cleanly.
+older consolidation is applied only where it merges cleanly. Later main updates through PRs 64 and 67 merge cleanly.
 
-Production code is explicitly out of scope for this rebase. The entire `src/` tree is restored from current main, making
-`src/xorl/rl` and every newer trainer, serving, distributed, and model API byte-for-byte unchanged. The direct
-`tests/ops/loss/test_rl_primitives.py` owner is retained as well. Earlier ledger decisions that removed production helpers
-describe the historical audit and are superseded for this PR by TA-1655.
+Production code is explicitly out of scope for this rebase. The entire `src/` tree matches current main byte-for-byte.
+PR 67 removed `src/xorl/rl` and its direct self-test upstream after confirming that its six exports had no caller; merging
+main carries that deletion into the branch without adding it to this pull request's diff. Earlier ledger decisions that
+removed other production helpers describe the historical audit and are superseded for this PR by TA-1655.
 
-The rebased tree collects 2,020 tests with no collection errors. Its static inventory contains 1,602 definitions across
-336 Python test files, 40 scanner candidates, five intentional duplicate-body groups, and no parse errors. Three groups
+The downstream trace uses XoRL Client PR 14 at `a10d65a5`. Its Wordle adapter imports `xorl_client.rl`, never `xorl.rl`,
+and submits `importance_sampling`, `cispo`, or `policy_loss` over the service API. The trainer resolves those names directly
+to `xorl.ops.loss`, independently confirming PR 67's conclusion that the standalone Slime-style helpers were not part of
+the client request, server dispatch, or executed training objective. Organization-wide code search finds no other source
+consumer.
+
+The rebased tree collects 2,012 tests with no collection errors. Its static inventory contains 1,597 definitions across
+335 Python test files, 40 scanner candidates, five intentional duplicate-body groups, and no parse errors. Three groups
 retain distinct GLM-5.2 and DSV4 temperature-gradient implementations plus wrappers for different distributed workers.
 Two additional MoE groups are unchanged current-main conflict owners and remain under the same compatibility rule. The
 ledger records 1,661 decisions and explicitly preserves all current-main conflicts and audit candidates rather than
@@ -5540,4 +5546,5 @@ The first rebased CPU workflow exposed four test-only compatibility errors. A da
 validation and private loader dispatch from the historical source cleanup, a CPU-marked GLM aggregate retained one
 unconditional CUDA allocation, and two MoE owners required optional grouped-GEMM globals to pre-exist before installing
 their CPU references. Those assertions and helpers now follow the unchanged current-main boundary. With CUDA hidden, the
-four failed owners pass and the complete CPU misc shard reports 536 passes, 28 skips, and 463 deselections.
+four failed owners pass and, after merging PR 67, the complete CPU misc shard reports 528 passes, 28 skips, and 463
+deselections.

@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "rebase_policy": "The 2026-08-19 current-main PR preserves src/ byte-for-byte. Applied production-surface decisions below describe the original audit; TA-1655 supersedes them for the rebased PR.",
+  "rebase_policy": "The 2026-08-19 current-main PR preserves src/ byte-for-byte against current main. PR 67 removed the unreachable xorl.rl package upstream; TA-887 records that inherited decision. Other applied production-surface decisions describe the original audit and are superseded by TA-1655.",
   "items": [
     {
       "id": "TA-001",
@@ -8840,11 +8840,11 @@
     {
       "id": "TA-887",
       "scope": "public xorl.rl primitive package and direct contract suite",
-      "decision": "keep",
-      "status": "accepted",
+      "decision": "remove",
+      "status": "applied",
       "evidence": [
-        "The six tensor helpers remain a public import surface even though current trainer paths use integrated loss implementations; removing the package would be an API compatibility change rather than test consolidation.",
-        "The current-main src/xorl/rl package and tests/ops/loss/test_rl_primitives.py are retained byte-for-byte in the rebased PR."
+        "Repository and organization-wide code searches find no consumer of the six exports beyond their direct self-test. XoRL Client PR 14 imports xorl_client.rl, not xorl.rl, and sends importance_sampling, cispo, or policy_loss names over the API.",
+        "The trainer dispatches those names directly to the integrated xorl.ops.loss implementations. PR 67 removed the isolated package and self-test from main; this pull request inherits that merge and carries no source or test diff for the removal."
       ]
     },
     {
@@ -16524,12 +16524,12 @@
     },
     {
       "id": "TA-1655",
-      "scope": "all current-main production source including xorl.rl",
+      "scope": "all current-main production source",
       "decision": "keep",
       "status": "accepted",
       "evidence": [
         "Replaying the historical audit onto current main showed that helpers previously classified as test-only are now consumed by the exact trainer-serving stack merged in PR 57.",
-        "The rebased pull request restores the entire src tree from origin/main, so src/xorl/rl and every other production module are byte-for-byte unchanged; earlier production-surface removals remain historical audit evidence rather than changes in this PR."
+        "After merging main through PR 67, the pull request has zero src diff against origin/main. The upstream removal of src/xorl/rl is recorded by TA-887; earlier production-surface removals remain historical audit evidence rather than changes in this PR."
       ]
     },
     {
