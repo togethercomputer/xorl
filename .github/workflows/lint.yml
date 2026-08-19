@@ -1,10 +1,12 @@
 name: Lint
 
+# Pull requests only. A merge to main lands the exact tree that already went
+# green on the PR, so a push-triggered rerun burns runner time to re-prove a
+# known result. Use workflow_dispatch to run main on demand.
 on:
-  push:
-    branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 jobs:
   lint:
