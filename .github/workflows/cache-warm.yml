@@ -1,0 +1,82 @@
+name: Warm caches
+
+# Actions caches are readable from the branch that wrote them and from the
+# default branch, and nothing else. Once the check workflows stopped running on
+# push, main was the one ref no run ever wrote to, so its entries -- a ~3.2 GB
+# uv cache and a ~22 MB pre-commit cache -- would age out and every pull request
+# would start cold. This job exists to keep writing them.
+#
+# It runs no tests and reports no check. It installs what the check workflows
+# install, lets the cache actions save the result, and stops. A restore also
+# refreshes a cache's last-accessed time, so this doubles as the heartbeat that
+# keeps main's entries clear of the 7-day idle eviction.
+#
+# The checkout, setup-uv and install steps below are duplicated from
+# pr-test-cpu.yml, and the pre-commit steps from lint.yml, deliberately: a cache
+# is only reusable if its key matches, and the key is derived from the runner
+# image, the action inputs and the dependency file hash. Change either workflow
+# and this one has to move with it or it warms a key nothing reads.
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Split from the pre-commit job so the saved uv cache holds exactly what a CPU
+  # shard's install produces. Warming both in one job would fold pre-commit's own
+  # dependencies into the same directory.
+  uv:
+    name: uv
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57 # v8.0.0
+        with:
+          enable-cache: true
+          prune-cache: false
+          cache-dependency-glob: pyproject.toml
+
+      # Mirrors the CPU shard's install, CPU torch swap included -- that swap is
+      # most of the cache's size, so warming without it would leave the shards
+      # downloading the part that actually costs them.
+      - name: Install dependencies
+        run: |
+          uv sync --group test
+          uv pip install torch==2.12.1 torchvision==0.27.1 --index-url https://download.pytorch.org/whl/cpu --reinstall
+
+  pre-commit:
+    name: pre-commit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57 # v8.0.0
+
+      - name: Install pre-commit
+        run: uv tool install "pre-commit~=4.5"
+
+      - name: Cache pre-commit envs
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+          restore-keys: |
+            pre-commit-
+
+      # ``install-hooks`` builds every hook environment without running a single
+      # hook, which is the whole point: this workflow warms the cache, it does not
+      # duplicate the lint check.
+      - name: Build hook environments
+        run: pre-commit install-hooks
