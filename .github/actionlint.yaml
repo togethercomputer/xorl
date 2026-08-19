@@ -1,0 +1,7 @@
+# Custom runner labels used by this repository's workflows. Without this,
+# actionlint reports an unknown-label error for any non-GitHub-hosted runner.
+self-hosted-runner:
+  labels:
+    # Actions Runner Controller scale set backing .github/workflows/pr-test-gpu.yml,
+    # defined in togethercomputer/xorl-ci.
+    - xorl-2-h100-gpu-runner

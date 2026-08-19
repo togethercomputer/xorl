@@ -200,15 +200,20 @@ def test_shipped_hidden_sizes_always_take_the_fused_realization(hidden_size, row
 
 @requires_cuda
 def test_dispatch_rule_needs_a_deep_tile_chain_and_few_rows():
-    """Split only when the split-kernel tile chain is deep and rows are few."""
+    """Split only when the split-kernel tile chain is deep and rows are few.
+
+    ``V2_NORM_SPLIT_MIN_TILES`` is the no-residual crossover, so these calls say
+    ``has_residual=False`` — the residual specialization has its own, higher
+    threshold in ``V2_NORM_RESIDUAL_SPLIT_MIN_TILES``.
+    """
     import xorl.ops.bi_families_v2 as module
 
     shallow = V2_NORM_SPLIT_MIN_TILES - 1
-    assert module._v2_norm_use_split(1, shallow) is False
+    assert module._v2_norm_use_split(1, shallow, has_residual=False) is False
 
     deep = V2_NORM_SPLIT_MIN_TILES
-    assert module._v2_norm_use_split(deep, deep) is True
-    assert module._v2_norm_use_split(deep + 1, deep) is False
+    assert module._v2_norm_use_split(deep, deep, has_residual=False) is True
+    assert module._v2_norm_use_split(deep + 1, deep, has_residual=False) is False
 
 
 @requires_cuda
@@ -222,8 +227,8 @@ def test_dispatch_uses_the_split_kernels_tile_basis():
     fused_chunks = -(-hidden_size // 4096)
     assert split_tiles == 10
     assert fused_chunks == 2
-    assert module._v2_norm_use_split(1, split_tiles) is True
-    assert module._v2_norm_use_split(1, fused_chunks) is False
+    assert module._v2_norm_use_split(1, split_tiles, has_residual=False) is True
+    assert module._v2_norm_use_split(1, fused_chunks, has_residual=False) is False
 
 
 # --- qk-norm -----------------------------------------------------------------

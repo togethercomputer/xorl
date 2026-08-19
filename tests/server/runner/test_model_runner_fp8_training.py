@@ -270,6 +270,7 @@ def test_dsv4_forward_only_reshards_external_lm_head_compute_view() -> None:
         config=SimpleNamespace(_dsv4_flash_exact_mode=True),
         lm_head=head,
     )
+    runner.pp_enabled = False
 
     runner._reshard_exact_forward_only_lm_head()
 
@@ -292,6 +293,7 @@ def test_dsv4_forward_only_requires_fsdp_managed_lm_head() -> None:
         config=SimpleNamespace(_dsv4_flash_exact_mode=True),
         lm_head=nn.Module(),
     )
+    runner.pp_enabled = False
 
     with pytest.raises(RuntimeError, match="FSDP-managed lm_head"):
         runner._reshard_exact_forward_only_lm_head()
