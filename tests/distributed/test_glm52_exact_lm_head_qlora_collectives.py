@@ -92,6 +92,7 @@ def _run_collective_case() -> None:
             local_lora_B,
             local_token_ids,
             local_temperature,
+            (None, None, None),
             _FakeDistributedComponent(),
         )
         torch.testing.assert_close(

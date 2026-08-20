@@ -218,6 +218,35 @@ def test_fp8_lm_head_module_transform_requests_fail_loudly_in_one_place():
         )
 
 
+def test_misaligned_transform_metadata_is_rejected_not_truncated():
+    from xorl.ops.loss.sampling_transform_ce import sampling_transform_per_token_ce
+
+    hidden, weight, labels, _, _, _, _ = _case(seed=19, rows=10)
+    over_length = 15
+    with pytest.raises(ValueError, match="logprob_top_ks"):
+        sampling_transform_per_token_ce(
+            hidden,
+            weight,
+            labels,
+            ignore_index=IGNORE,
+            temperature_rows=None,
+            top_ks=torch.full((over_length,), 3, dtype=torch.int64),
+            top_ps=torch.ones(over_length, dtype=torch.float32),
+            min_ps=torch.zeros(over_length, dtype=torch.float32),
+        )
+    with pytest.raises(ValueError, match="all or none"):
+        sampling_transform_per_token_ce(
+            hidden,
+            weight,
+            labels,
+            ignore_index=IGNORE,
+            temperature_rows=None,
+            top_ks=torch.full((10,), 3, dtype=torch.int64),
+            top_ps=None,
+            min_ps=None,
+        )
+
+
 def test_normalize_temperature_rows_contract():
     device = torch.device("cpu")
     assert normalize_temperature_rows(1.0, rows=3, device=device) is None

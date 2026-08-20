@@ -13,6 +13,7 @@ from xorl.distributed.parallel_state import get_parallel_state
 from xorl.ops.exact_sampling_transforms import (
     TOP_K_ALL,
     normalize_exact_sampling_transforms,
+    normalize_temperature_rows,
 )
 from xorl.ops.loss.compiled_cross_entropy import compiled_cross_entropy_function
 from xorl.ops.loss.fused_linear_logprob import fused_selected_logprob_ce
@@ -197,7 +198,11 @@ def compute_per_token_ce(
             logprob/CE calculation. ``1.0`` preserves raw model logprobs; values
             such as a rollout temperature of ``0.7`` compute behavior-policy
             logprobs matching ``log_softmax(logits / temperature)``. Every mode
-            also accepts a contiguous per-row FP32 tensor.
+            also accepts a contiguous per-row FP32 tensor. Convention note: a
+            non-unit scalar keeps each mode's historical pre-GEMM
+            hidden-scaling arithmetic, while a per-row tensor (uniform or not)
+            scales the FP32 logits post-GEMM in the shared scoring core — the
+            two agree mathematically but not bit-for-bit.
         logprob_top_k/logprob_top_p/logprob_min_p: Per-row replay transforms.
             Non-identity values score the selected token on the joint support
             of the pinned sampling-transform program; a replayed token outside
@@ -290,17 +295,11 @@ def compute_per_token_ce(
             sampling_transform_per_token_ce,
         )
 
-        if isinstance(logprob_temperature, torch.Tensor):
-            temperature_rows = logprob_temperature
-        elif logprob_temperature == 1.0:
-            temperature_rows = None
-        else:
-            temperature_rows = torch.full(
-                (rows,),
-                float(logprob_temperature),
-                dtype=torch.float32,
-                device=hidden_states_flat.device,
-            )
+        temperature_rows = normalize_temperature_rows(
+            logprob_temperature,
+            rows=rows,
+            device=hidden_states_flat.device,
+        )
         return sampling_transform_per_token_ce(
             hidden_states_flat,
             weight,

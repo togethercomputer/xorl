@@ -34,6 +34,7 @@ from xorl.ops.exact_sampling_transforms import (
     NativeSelectedScore,
     exact_sampling_support,
     score_with_sampling_transforms,
+    validate_sampling_transform_rows,
     validate_temperature_rows,
 )
 
@@ -53,10 +54,12 @@ class ChunkedScoringPolicy:
     ``selected - logsumexp`` reduction.  ``prepare_weight`` runs once per
     forward/backward pass (e.g. one FP32 master cast) so ``logits_fn`` never
     re-casts per chunk.  ``grad_operand_dtype`` is the dtype of the recomputed
-    ``dlogits`` operand in the two gradient GEMMs.
+    ``dlogits`` operand in the two gradient GEMMs.  ``backward_vocab_chunk``
+    bounds the vocabulary tile of the single-pass unfiltered backward.
     """
 
     __slots__ = (
+        "backward_vocab_chunk",
         "grad_operand_dtype",
         "logits_fn",
         "native_selected_score",
@@ -74,15 +77,17 @@ class ChunkedScoringPolicy:
         prepare_weight: Callable[[torch.Tensor], torch.Tensor] = lambda weight: weight,
         grad_operand_dtype: torch.dtype | None = None,
         row_chunk: int = EXACT_FILTER_ROW_CHUNK,
+        backward_vocab_chunk: int = 8192,
     ) -> None:
-        if row_chunk < 1:
-            raise ValueError("row_chunk must be >= 1")
+        if row_chunk < 1 or backward_vocab_chunk < 1:
+            raise ValueError("row_chunk and backward_vocab_chunk must be >= 1")
         self.logits_fn = logits_fn
         self.temperature_fn = temperature_fn
         self.native_selected_score = native_selected_score
         self.prepare_weight = prepare_weight
         self.grad_operand_dtype = grad_operand_dtype
         self.row_chunk = row_chunk
+        self.backward_vocab_chunk = backward_vocab_chunk
 
 
 class _TpVocabLayout:
@@ -154,13 +159,26 @@ def _mm_accumulate_fp32(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return torch.mm(a.float(), b.float())
 
 
+def _addmm_accumulate_fp32(accumulator: torch.Tensor, a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Accumulate ``a @ b`` into an FP32 buffer without an FP32 temporary."""
+
+    if a.dtype is torch.float32 and b.dtype is torch.float32:
+        return torch.addmm(accumulator, a, b, out=accumulator)
+    if a.is_cuda:
+        return torch.addmm(accumulator, a, b, out_dtype=torch.float32, out=accumulator)
+    accumulator += torch.mm(a.float(), b.float())
+    return accumulator
+
+
 def _plain_selected_score(
     logits: torch.Tensor,
     token_ids: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     lse = torch.logsumexp(logits, dim=-1)
     selected = logits.gather(1, token_ids.unsqueeze(1)).squeeze(1)
-    return selected - lse, lse, selected
+    # Clamp the one-ulp rounding artifact, like every sibling selected-logprob
+    # implementation: a logprob must never be positive.
+    return torch.minimum(selected - lse, torch.zeros_like(selected)), lse, selected
 
 
 def _chunk_transformed_logits(
@@ -282,22 +300,50 @@ class _ChunkedTransformScoredCE(torch.autograd.Function):
         vocab_offset = 0 if tp is None else tp.vocab_offset
         local_vocab = weight.shape[0]
         grad_hidden = torch.zeros(hidden.shape, dtype=torch.float32, device=hidden.device) if compute_hidden else None
-        grad_weight = torch.zeros(weight.shape, dtype=torch.float32, device=weight.device) if need_weight else None
         grad_all = (grad_ce * valid_mask).float()
 
-        for start in range(0, hidden.shape[0], policy.row_chunk):
-            end = min(start + policy.row_chunk, hidden.shape[0])
-            hidden_chunk = hidden[start:end]
-            labels_chunk = labels[start:end]
-            temperature_chunk = None if temperature_rows is None else temperature_rows[start:end]
-            logits = _chunk_transformed_logits(
-                hidden_chunk,
-                prepared_weight,
-                temperature_chunk,
-                policy,
-                tp,
-            )
-            if ctx.has_sampling_filter:
+        if not ctx.has_sampling_filter:
+            # No support is needed, so a single pass over all rows per
+            # vocabulary tile suffices: each weight-gradient slice is written
+            # exactly once, full-row logits never materialize, and (under TP)
+            # no gather is needed — the saved lse and the local shard carry
+            # everything.
+            grad_weight = torch.empty(weight.shape, dtype=torch.float32, device=weight.device) if need_weight else None
+            hidden_op = hidden if hidden.dtype is operand_dtype else hidden.to(operand_dtype)
+            g_col = grad_all.unsqueeze(1)
+            lse_col = lse_all.unsqueeze(1)
+            inv_t = None if temperature_rows is None else (1.0 / temperature_rows).unsqueeze(1)
+            rows = torch.arange(hidden.shape[0], device=hidden.device)
+            for col_start in range(0, local_vocab, policy.backward_vocab_chunk):
+                col_end = min(col_start + policy.backward_vocab_chunk, local_vocab)
+                weight_tile = grad_weight_operand[col_start:col_end]
+                grad_logits = _mm_accumulate_fp32(hidden_op, weight_tile.t())
+                if inv_t is not None:
+                    grad_logits *= inv_t
+                grad_logits = grad_logits.sub_(lse_col).exp_().mul_(g_col)
+                in_tile = (labels >= vocab_offset + col_start) & (labels < vocab_offset + col_end)
+                grad_logits[rows[in_tile], labels[in_tile] - (vocab_offset + col_start)] -= grad_all[in_tile]
+                if inv_t is not None:
+                    grad_logits *= inv_t
+                grad_logits_op = grad_logits.to(operand_dtype)
+                if compute_hidden:
+                    _addmm_accumulate_fp32(grad_hidden, grad_logits_op, weight_tile)
+                if need_weight:
+                    grad_weight[col_start:col_end] = _mm_accumulate_fp32(grad_logits_op.t(), hidden_op)
+        else:
+            grad_weight = torch.zeros(weight.shape, dtype=torch.float32, device=weight.device) if need_weight else None
+            for start in range(0, hidden.shape[0], policy.row_chunk):
+                end = min(start + policy.row_chunk, hidden.shape[0])
+                hidden_chunk = hidden[start:end]
+                labels_chunk = labels[start:end]
+                temperature_chunk = None if temperature_rows is None else temperature_rows[start:end]
+                logits = _chunk_transformed_logits(
+                    hidden_chunk,
+                    prepared_weight,
+                    temperature_chunk,
+                    policy,
+                    tp,
+                )
                 support = exact_sampling_support(
                     logits,
                     stored_top_ks[start:end],
@@ -306,29 +352,25 @@ class _ChunkedTransformScoredCE(torch.autograd.Function):
                 )
                 selected_support = support.gather(1, labels_chunk.unsqueeze(1)).squeeze(1)
                 local_support = support[:, vocab_offset : vocab_offset + local_vocab]
-            else:
-                selected_support = torch.ones_like(labels_chunk, dtype=torch.bool)
-                local_support = None
 
-            g = grad_all[start:end] * selected_support
-            local_logits = logits[:, vocab_offset : vocab_offset + local_vocab]
-            grad_logits = (local_logits - lse_all[start:end].unsqueeze(1)).exp()
-            if local_support is not None:
+                g = grad_all[start:end] * selected_support
+                local_logits = logits[:, vocab_offset : vocab_offset + local_vocab]
+                grad_logits = (local_logits - lse_all[start:end].unsqueeze(1)).exp()
                 grad_logits *= local_support
-            grad_logits *= g.unsqueeze(1)
-            target_in_shard = (
-                selected_support & (labels_chunk >= vocab_offset) & (labels_chunk < vocab_offset + local_vocab)
-            )
-            rows = torch.arange(labels_chunk.shape[0], device=labels_chunk.device)
-            grad_logits[rows[target_in_shard], labels_chunk[target_in_shard] - vocab_offset] -= g[target_in_shard]
-            if temperature_chunk is not None:
-                grad_logits *= (1.0 / temperature_chunk).unsqueeze(1)
-            grad_logits_op = grad_logits.to(operand_dtype)
+                grad_logits *= g.unsqueeze(1)
+                target_in_shard = (
+                    selected_support & (labels_chunk >= vocab_offset) & (labels_chunk < vocab_offset + local_vocab)
+                )
+                rows = torch.arange(labels_chunk.shape[0], device=labels_chunk.device)
+                grad_logits[rows[target_in_shard], labels_chunk[target_in_shard] - vocab_offset] -= g[target_in_shard]
+                if temperature_chunk is not None:
+                    grad_logits *= (1.0 / temperature_chunk).unsqueeze(1)
+                grad_logits_op = grad_logits.to(operand_dtype)
 
-            if compute_hidden:
-                grad_hidden[start:end] += _mm_accumulate_fp32(grad_logits_op, grad_weight_operand)
-            if need_weight:
-                grad_weight += _mm_accumulate_fp32(grad_logits_op.t(), hidden_chunk.to(operand_dtype))
+                if compute_hidden:
+                    grad_hidden[start:end] = _mm_accumulate_fp32(grad_logits_op, grad_weight_operand)
+                if need_weight:
+                    _addmm_accumulate_fp32(grad_weight, grad_logits_op.t(), hidden_chunk.to(operand_dtype))
 
         if tp is not None and compute_hidden and grad_hidden.numel():
             # The hidden rows are replicated across vocabulary ranks, so their
@@ -375,8 +417,13 @@ def chunked_transform_scored_ce(
         rows=rows,
         device=hidden_states_flat.device,
     )
-    if (top_ks is None, top_ps is None, min_ps is None).count(True) not in (0, 3):
-        raise ValueError("transform scoring requires all or none of top-k/top-p/min-p row metadata")
+    top_ks, top_ps, min_ps = validate_sampling_transform_rows(
+        top_ks,
+        top_ps,
+        min_ps,
+        rows=rows,
+        device=hidden_states_flat.device,
+    )
     valid_mask = labels_flat != ignore_index
     labels_safe = torch.where(valid_mask, labels_flat, torch.zeros_like(labels_flat))
     tp = _resolve_tp_layout(tp_group, rows, local_weight.shape[0], hidden_states_flat.device)

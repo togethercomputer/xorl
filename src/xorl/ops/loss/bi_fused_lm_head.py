@@ -40,6 +40,7 @@ from xorl.ops.exact_sampling_transforms import (
     exact_sampling_support,
     normalize_temperature_rows,
     score_with_sampling_transforms,
+    validate_sampling_transform_rows,
 )
 from xorl.ops.loss.sampling_transform_ce import (
     ChunkedScoringPolicy,
@@ -83,6 +84,7 @@ def _bi_scoring_policy(vocab_chunk: int) -> ChunkedScoringPolicy:
         temperature_fn=exact_temperature_scale_fp32_logits,
         native_selected_score=native_selected_score,
         row_chunk=_TEMPERATURE_MATERIALIZE_ROW_CHUNK,
+        backward_vocab_chunk=vocab_chunk,
     )
 
 
@@ -613,8 +615,13 @@ def bi_fused_per_token_ce(
         rows=hidden_states.shape[0],
         device=hidden_states.device,
     )
-    if (top_ks is None, top_ps is None, min_ps is None).count(True) not in (0, 3):
-        raise ValueError("ce_mode='bi_fused' requires all or none of top-k/top-p/min-p row metadata")
+    top_ks, top_ps, min_ps = validate_sampling_transform_rows(
+        top_ks,
+        top_ps,
+        min_ps,
+        rows=hidden_states.shape[0],
+        device=hidden_states.device,
+    )
     if temp_row is not None or top_ks is not None:
         return chunked_transform_scored_ce(
             hidden_states,
@@ -683,15 +690,13 @@ def bi_fused_vocab_parallel_per_token_ce(
         rows=hidden_states.shape[0],
         device=hidden_states.device,
     )
-    if (top_ks is None, top_ps is None, min_ps is None).count(True) not in (0, 3):
-        raise ValueError("ce_mode='bi_fused' requires all or none of top-k/top-p/min-p row metadata")
-    for name, value in (("top_ks", top_ks), ("top_ps", top_ps), ("min_ps", min_ps)):
-        if value is not None and (
-            value.device != hidden_states.device
-            or tuple(value.shape) != (hidden_states.shape[0],)
-            or not value.is_contiguous()
-        ):
-            raise ValueError(f"ce_mode='bi_fused' requires contiguous local-row {name} metadata")
+    top_ks, top_ps, min_ps = validate_sampling_transform_rows(
+        top_ks,
+        top_ps,
+        min_ps,
+        rows=hidden_states.shape[0],
+        device=hidden_states.device,
+    )
 
     return _BiFusedVocabParallelPerTokenCE.apply(
         hidden_states,

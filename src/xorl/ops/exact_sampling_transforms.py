@@ -180,6 +180,33 @@ def normalize_temperature_rows(
     return torch.full((rows,), value, dtype=torch.float32, device=device)
 
 
+def validate_sampling_transform_rows(
+    top_ks: torch.Tensor | None,
+    top_ps: torch.Tensor | None,
+    min_ps: torch.Tensor | None,
+    *,
+    rows: int,
+    device: torch.device,
+) -> SamplingTransformRows:
+    """Validate an all-or-none per-row transform triple; a None triple passes.
+
+    Row metadata that is present must be exactly row-aligned — silently
+    truncating an over-length tensor would score tokens against the wrong
+    row's filter.
+    """
+
+    none_count = (top_ks is None, top_ps is None, min_ps is None).count(True)
+    if none_count == 3:
+        return None, None, None
+    if none_count:
+        raise ValueError("sampling-transform replay requires all or none of top-k/top-p/min-p row metadata")
+    return (
+        _normalize_row_metadata(top_ks, rows=rows, device=device, dtype=torch.int64, name="logprob_top_ks"),
+        _normalize_row_metadata(top_ps, rows=rows, device=device, dtype=torch.float32, name="logprob_top_ps"),
+        _normalize_row_metadata(min_ps, rows=rows, device=device, dtype=torch.float32, name="logprob_min_ps"),
+    )
+
+
 def score_with_sampling_transforms(
     logits: torch.Tensor,
     token_ids: torch.Tensor,
@@ -474,5 +501,6 @@ __all__ = [
     "selected_logprob_reference_grad",
     "selected_logprob_reference_grad_filtered",
     "selected_logprob_reference_grad_partitioned",
+    "validate_sampling_transform_rows",
     "validate_temperature_rows",
 ]
