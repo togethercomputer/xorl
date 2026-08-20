@@ -19,26 +19,12 @@ from xorl.models.layers.moe.backend import ep_lora_gradient_reduction_domain
 pytestmark = [pytest.mark.cpu]
 
 
-@pytest.mark.parametrize(
-    ("backend", "expected"),
-    [
-        ("eager", GradientReductionDomain.EP_SUM),
-        ("native", GradientReductionDomain.EP_SUM),
-        ("triton", GradientReductionDomain.EP_SUM),
-        ("triton_w4a4", GradientReductionDomain.EP_SUM),
-        ("quack", GradientReductionDomain.EP_SUM),
-    ],
-)
-def test_supported_backend_gradient_contract_table(backend, expected):
-    assert ep_lora_gradient_reduction_domain(backend) is expected
-
-
-def test_unknown_backend_fails_closed():
+def test_gradient_reduction_domain_admission_policy():
+    for backend in ("eager", "native", "triton", "triton_w4a4", "quack"):
+        assert ep_lora_gradient_reduction_domain(backend) is GradientReductionDomain.EP_SUM
     with pytest.raises(ValueError, match="Unsupported MoE backend"):
         ep_lora_gradient_reduction_domain("new_backend")
 
-
-def test_unknown_metadata_domain_fails_closed():
     model = nn.Module()
     shared = nn.Module()
     shared._skip_fsdp = True

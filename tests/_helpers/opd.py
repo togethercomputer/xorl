@@ -23,12 +23,17 @@ class FakeMooncakeClient:
 
     def __init__(self) -> None:
         self.objects: dict[str, bytes] = {}
+        self.put_calls: list[str] = []
+        self.get_calls: list[str] = []
+        self.removed: list[str] = []
 
     def put(self, key: str, value: bytes) -> int:
         self.objects[key] = bytes(value)
+        self.put_calls.append(key)
         return 0
 
     def get(self, key: str) -> bytes:
+        self.get_calls.append(key)
         return self.objects.get(key, b"")
 
     def is_exist(self, key: str) -> int:
@@ -36,6 +41,7 @@ class FakeMooncakeClient:
 
     def remove(self, key: str) -> int:
         self.objects.pop(key, None)
+        self.removed.append(key)
         return 0
 
 

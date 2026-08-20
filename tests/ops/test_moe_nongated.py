@@ -9,15 +9,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-
-def _import_experts():
-    """Import MoEExperts or skip (mirrors test_eager_vs_native_moe.py)."""
-    try:
-        from xorl.models.layers.moe.experts import MoEExperts  # noqa: PLC0415
-
-        return MoEExperts
-    except Exception as e:
-        pytest.skip(f"Cannot import MoE layers: {e}")
+from xorl.models.layers.moe.experts import MoEExperts
 
 
 def _make_routing(num_tokens, num_experts, top_k, device, dtype):
@@ -70,7 +62,6 @@ def _reference_forward(hidden_states, routing_weights, selected_experts, up_proj
 @pytest.mark.cpu
 def test_eager_nongated_matches_reference():
     """Eager non-gated forward + gradients match a plain per-expert torch loop."""
-    MoEExperts = _import_experts()
     ne, hd, inter, top_k, num_tokens = 4, 16, 24, 2, 10  # hd is a latent dim, not a model hidden size
 
     experts = _make_nongated_experts(MoEExperts, ne, hd, inter, "eager", "cpu", torch.float32)
@@ -97,37 +88,13 @@ def test_eager_nongated_matches_reference():
     torch.testing.assert_close(experts.gate_up_proj.grad, up_ref.grad)
     torch.testing.assert_close(experts.down_proj.grad, down_ref.grad)
 
-
-@pytest.mark.cpu
-def test_relu2_activation_registry():
-    """relu2 is registered, normalized, and equals relu(x)**2 when gate ≡ up."""
-    from xorl.ops.moe.activations import (  # noqa: PLC0415
-        MOE_ACTIVATIONS,
-        UNGATED_HIDDEN_ACTS,
-        apply_moe_activation,
-        normalize_hidden_act,
-    )
-
-    assert normalize_hidden_act("relu2") == "relu2"
-    assert "relu2" in MOE_ACTIVATIONS
-    assert "relu2" in UNGATED_HIDDEN_ACTS
-
-    x = torch.randn(32)
-    torch.testing.assert_close(apply_moe_activation("relu2", x, x), torch.square(F.relu(x)))
+    _assert_nongated_constructor_rejects_unsupported_policies()
 
 
-@pytest.mark.cpu
-def test_nongated_quack_raises():
-    """quack backend rejects non-gated experts with a clear error."""
-    MoEExperts = _import_experts()
+def _assert_nongated_constructor_rejects_unsupported_policies():
+    """Non-gated experts reject unsupported backends and gated activations."""
     with pytest.raises(NotImplementedError, match="non-gated"):
         MoEExperts(4, 16, 24, hidden_act="relu2", moe_implementation="quack", gated=False)
-
-
-@pytest.mark.cpu
-def test_nongated_rejects_gated_activation():
-    """Non-gated experts require an ungated activation (relu2)."""
-    MoEExperts = _import_experts()
     with pytest.raises(ValueError, match="non-gated"):
         MoEExperts(4, 16, 24, hidden_act="silu", moe_implementation="eager", gated=False)
 
@@ -139,50 +106,52 @@ def test_nongated_rejects_gated_activation():
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("backend", ["triton", "native"])
-def test_nongated_backend_matches_eager(backend):
+def test_nongated_backends_match_eager():
     """Triton/native non-gated forward + gradients match eager."""
-    MoEExperts = _import_experts()
     from xorl.models.layers.moe.backend import MOE_EXPERT_BACKENDS  # noqa: PLC0415
 
-    if backend not in MOE_EXPERT_BACKENDS:
-        pytest.skip(f"{backend} backend not available")
+    backends = ("triton", "native")
+    missing = set(backends) - MOE_EXPERT_BACKENDS.keys()
+    assert not missing, f"shipped non-gated backends failed to register: {sorted(missing)}"
 
-    ne, hd, inter, top_k, num_tokens = 8, 64, 128, 2, 32
-    device, dtype = "cuda", torch.bfloat16
+    for backend in backends:
+        ne, hd, inter, top_k, num_tokens = 8, 64, 128, 2, 32
+        device, dtype = "cuda", torch.bfloat16
 
-    eager = _make_nongated_experts(MoEExperts, ne, hd, inter, "eager", device, dtype)
-    other = MoEExperts(ne, hd, inter, hidden_act="relu2", moe_implementation=backend, gated=False).to(device, dtype)
-    with torch.no_grad():
-        other.gate_up_proj.copy_(eager.gate_up_proj)
-        other.down_proj.copy_(eager.down_proj)
+        eager = _make_nongated_experts(MoEExperts, ne, hd, inter, "eager", device, dtype)
+        other = MoEExperts(ne, hd, inter, hidden_act="relu2", moe_implementation=backend, gated=False).to(device, dtype)
+        with torch.no_grad():
+            other.gate_up_proj.copy_(eager.gate_up_proj)
+            other.down_proj.copy_(eager.down_proj)
 
-    torch.manual_seed(7)
-    x_eager = torch.randn(num_tokens, hd, device=device, dtype=dtype, requires_grad=True)
-    x_other = x_eager.detach().clone().requires_grad_(True)
-    routing_weights, selected_experts = _make_routing(num_tokens, ne, top_k, device, dtype)
+        torch.manual_seed(7)
+        x_eager = torch.randn(num_tokens, hd, device=device, dtype=dtype, requires_grad=True)
+        x_other = x_eager.detach().clone().requires_grad_(True)
+        routing_weights, selected_experts = _make_routing(num_tokens, ne, top_k, device, dtype)
 
-    out_eager = _eager_moe_forward(eager, x_eager, routing_weights, selected_experts)
-    out_other = other(x_other, routing_weights, selected_experts)
-    torch.testing.assert_close(out_other, out_eager, atol=0.05, rtol=0.05, msg=f"{backend} forward mismatch")
+        out_eager = _eager_moe_forward(eager, x_eager, routing_weights, selected_experts)
+        out_other = other(x_other, routing_weights, selected_experts)
+        torch.testing.assert_close(out_other, out_eager, atol=0.05, rtol=0.05, msg=f"{backend} forward mismatch")
 
-    grad_out = torch.randn_like(out_eager)
-    out_eager.backward(grad_out)
-    out_other.backward(grad_out)
+        grad_out = torch.randn_like(out_eager)
+        out_eager.backward(grad_out)
+        out_other.backward(grad_out)
 
-    atol, rtol = 0.05, 0.05
-    torch.testing.assert_close(x_other.grad, x_eager.grad, atol=atol, rtol=rtol, msg=f"{backend} input grad mismatch")
-    torch.testing.assert_close(
-        other.gate_up_proj.grad,
-        eager.gate_up_proj.grad,
-        atol=atol,
-        rtol=rtol,
-        msg=f"{backend} gate_up_proj grad mismatch",
-    )
-    torch.testing.assert_close(
-        other.down_proj.grad, eager.down_proj.grad, atol=atol, rtol=rtol, msg=f"{backend} down_proj grad mismatch"
-    )
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
+        atol, rtol = 0.05, 0.05
+        torch.testing.assert_close(
+            x_other.grad, x_eager.grad, atol=atol, rtol=rtol, msg=f"{backend} input grad mismatch"
+        )
+        torch.testing.assert_close(
+            other.gate_up_proj.grad,
+            eager.gate_up_proj.grad,
+            atol=atol,
+            rtol=rtol,
+            msg=f"{backend} gate_up_proj grad mismatch",
+        )
+        torch.testing.assert_close(
+            other.down_proj.grad,
+            eager.down_proj.grad,
+            atol=atol,
+            rtol=rtol,
+            msg=f"{backend} down_proj grad mismatch",
+        )

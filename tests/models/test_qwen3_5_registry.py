@@ -1,104 +1,113 @@
-from types import SimpleNamespace
+import json
 
+from xorl.models.auto import _load_local_xorl_config
 from xorl.models.registry import get_registry
 from xorl.models.transformers.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
 from xorl.models.transformers.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig
 
 
-def test_qwen3_5_conditional_generation_registered():
-    registry = get_registry()
-    assert "Qwen3_5ForConditionalGeneration" in registry.supported_models
-    assert "Qwen3_5MoeForConditionalGeneration" in registry.supported_models
-
-
-def test_qwen3_5_moe_config_from_hf_config():
-    rope_parameters = {
-        "rope_type": "default",
-        "rope_theta": 10_000_000,
-        "partial_rotary_factor": 0.25,
-        "mrope_interleaved": True,
-    }
+def _moe_config_dict():
     num_hidden_layers = 40
     full_attention_interval = 4
     layer_types = [
         "full_attention" if (i + 1) % full_attention_interval == 0 else "linear_attention"
         for i in range(num_hidden_layers)
     ]
-    text_config = SimpleNamespace(
-        vocab_size=248320,
-        hidden_size=2048,
-        intermediate_size=2048,
-        shared_expert_intermediate_size=512,
-        num_hidden_layers=num_hidden_layers,
-        num_attention_heads=16,
-        num_key_value_heads=2,
-        head_dim=256,
-        hidden_act="silu",
-        max_position_embeddings=262144,
-        initializer_range=0.02,
-        rms_norm_eps=1e-6,
-        use_cache=True,
-        attention_bias=False,
-        attention_dropout=0.0,
-        layer_types=layer_types,
-        full_attention_interval=full_attention_interval,
-        linear_num_key_heads=16,
-        linear_num_value_heads=32,
-        linear_key_head_dim=128,
-        linear_value_head_dim=128,
-        attn_output_gate=True,
-        linear_conv_kernel_dim=4,
-        moe_intermediate_size=512,
-        num_experts_per_tok=8,
-        num_experts=256,
-        router_aux_loss_coef=0.001,
-        mlp_only_layers=[],
-        rope_parameters=rope_parameters,
-    )
-    hf_config = SimpleNamespace(
-        text_config=text_config,
-        tie_word_embeddings=False,
-    )
+    return {
+        "model_type": "qwen3_5_moe",
+        "text_config": {
+            "vocab_size": 248320,
+            "hidden_size": 2048,
+            "intermediate_size": 2048,
+            "shared_expert_intermediate_size": 512,
+            "num_hidden_layers": num_hidden_layers,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 2,
+            "head_dim": 256,
+            "hidden_act": "silu",
+            "max_position_embeddings": 262144,
+            "initializer_range": 0.02,
+            "rms_norm_eps": 1e-6,
+            "use_cache": True,
+            "attention_bias": False,
+            "attention_dropout": 0.0,
+            "layer_types": layer_types,
+            "full_attention_interval": full_attention_interval,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 32,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128,
+            "attn_output_gate": True,
+            "linear_conv_kernel_dim": 4,
+            "moe_intermediate_size": 512,
+            "num_experts_per_tok": 8,
+            "num_experts": 256,
+            "router_aux_loss_coef": 0.001,
+            "mlp_only_layers": [],
+            "rope_parameters": {
+                "rope_type": "default",
+                "rope_theta": 10_000_000,
+                "partial_rotary_factor": 0.25,
+                "mrope_interleaved": True,
+            },
+        },
+        "tie_word_embeddings": False,
+    }
 
-    config = Qwen3_5MoeConfig.from_hf_config(hf_config)
 
-    assert config.layer_types == layer_types
+def _dense_config_dict():
+    return {
+        "model_type": "qwen3_5",
+        "text_config": {
+            "vocab_size": 248320,
+            "hidden_size": 4096,
+            "intermediate_size": 12288,
+            "num_hidden_layers": 32,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 4,
+            "head_dim": 256,
+            "hidden_act": "silu",
+            "max_position_embeddings": 262144,
+            "initializer_range": 0.02,
+            "rms_norm_eps": 1e-6,
+            "use_cache": True,
+            "attention_bias": False,
+            "attention_dropout": 0.0,
+            "layer_types": ["linear_attention", "full_attention"],
+            "full_attention_interval": 4,
+            "rope_parameters": {"rope_type": "default", "rope_theta": 10_000_000},
+        },
+        "tie_word_embeddings": False,
+    }
+
+
+def test_local_auto_config_builds_qwen3_5_family_configs(tmp_path):
+    """Exercise dense and MoE conversion through the real local-config loader."""
+    registry = get_registry()
+    assert "Qwen3_5ForConditionalGeneration" in registry.supported_models
+    assert "Qwen3_5MoeForConditionalGeneration" in registry.supported_models
+
+    for name, raw_config, expected_type in (
+        ("dense", _dense_config_dict(), Qwen3_5Config),
+        ("moe", _moe_config_dict(), Qwen3_5MoeConfig),
+    ):
+        config_dir = tmp_path / name
+        config_dir.mkdir()
+        (config_dir / "config.json").write_text(json.dumps(raw_config))
+        config = _load_local_xorl_config(str(config_dir), {})
+
+        assert isinstance(config, expected_type)
+        assert config.layer_types == [
+            "full_attention"
+            if (layer_idx + 1) % raw_config["text_config"]["full_attention_interval"] == 0
+            else "linear_attention"
+            for layer_idx in range(raw_config["text_config"]["num_hidden_layers"])
+        ]
+        assert config.head_dim == 256
+
     assert config.linear_num_key_heads == 16
     assert config.linear_num_value_heads == 32
     assert config.linear_key_head_dim == 128
     assert config.linear_value_head_dim == 128
     assert config.mrope_interleaved is True
     assert config.num_experts == 256
-
-
-def test_qwen3_5_config_from_hf_config():
-    text_config = SimpleNamespace(
-        vocab_size=248320,
-        hidden_size=4096,
-        intermediate_size=12288,
-        num_hidden_layers=32,
-        num_attention_heads=16,
-        num_key_value_heads=4,
-        head_dim=256,
-        hidden_act="silu",
-        max_position_embeddings=262144,
-        initializer_range=0.02,
-        rms_norm_eps=1e-6,
-        use_cache=True,
-        attention_bias=False,
-        attention_dropout=0.0,
-        layer_types=["linear_attention", "full_attention"],
-        full_attention_interval=4,
-        rope_parameters={"rope_type": "default", "rope_theta": 10_000_000},
-    )
-    hf_config = SimpleNamespace(text_config=text_config, tie_word_embeddings=False)
-
-    config = Qwen3_5Config.from_hf_config(hf_config)
-
-    assert config.vocab_size == 248320
-    assert config.hidden_size == 4096
-    assert config.head_dim == 256
-    assert config.layer_types == [
-        "full_attention" if (layer_idx + 1) % text_config.full_attention_interval == 0 else "linear_attention"
-        for layer_idx in range(text_config.num_hidden_layers)
-    ]

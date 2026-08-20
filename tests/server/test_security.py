@@ -19,42 +19,29 @@ from xorl.server.security import (
 pytestmark = [pytest.mark.cpu, pytest.mark.server]
 
 
-def test_api_endpoint_requires_explicit_allowlist(monkeypatch):
+def test_outbound_endpoint_policy_requires_allowlist_pins_dns_and_rejects_malformed(monkeypatch):
     monkeypatch.delenv("XORL_OUTBOUND_ENDPOINT_ALLOWLIST", raising=False)
     with pytest.raises(ValueError, match="not allowed"):
         validate_outbound_endpoint("inference.example", 30000, require_allowlist=True)
 
     monkeypatch.setenv("XORL_OUTBOUND_ENDPOINT_ALLOWLIST", "inference.example")
-    monkeypatch.setattr(
-        "xorl.server.security.socket.getaddrinfo",
-        lambda *_args, **_kwargs: [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 30000))],
+    resolutions = iter(
+        [
+            [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 30000))],
+            [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.4.4", 30000))],
+            [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("169.254.169.254", 30000))],
+        ]
     )
+    monkeypatch.setattr("xorl.server.security.socket.getaddrinfo", lambda *_args, **_kwargs: next(resolutions))
     assert validate_outbound_endpoint("inference.example", 30000, require_allowlist=True) == (
         "8.8.8.8",
         30000,
     )
-
-
-def test_endpoint_url_pins_validated_dns_address(monkeypatch):
-    monkeypatch.setenv("XORL_OUTBOUND_ENDPOINT_ALLOWLIST", "inference.example")
-    resolutions = iter(
-        [
-            [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("8.8.8.8", 30000))],
-            [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("169.254.169.254", 30000))],
-        ]
-    )
-    monkeypatch.setattr(
-        "xorl.server.security.socket.getaddrinfo",
-        lambda *_args, **_kwargs: next(resolutions),
-    )
-
     assert (
         build_http_endpoint_url("inference.example", 30000, "/health", require_allowlist=True)
-        == "http://8.8.8.8:30000/health"
+        == "http://8.8.4.4:30000/health"
     )
 
-
-def test_endpoint_rejects_metadata_and_malformed_targets(monkeypatch):
     monkeypatch.delenv("XORL_OUTBOUND_ENDPOINT_ALLOWLIST", raising=False)
     with pytest.raises(ValueError, match="Unsafe endpoint"):
         validate_outbound_endpoint("169.254.169.254", 80)
@@ -62,7 +49,7 @@ def test_endpoint_rejects_metadata_and_malformed_targets(monkeypatch):
         validate_outbound_endpoint("localhost@169.254.169.254", 80)
 
 
-def test_resolve_path_within_rejects_escape_and_symlink(tmp_path):
+def test_server_artifact_and_diagnostic_path_policy(tmp_path, monkeypatch):
     root = tmp_path / "root"
     root.mkdir()
     outside = tmp_path / "outside"
@@ -76,34 +63,30 @@ def test_resolve_path_within_rejects_escape_and_symlink(tmp_path):
     with pytest.raises(ValueError, match="Symlinked paths"):
         resolve_path_within(root, link, must_exist=True, reject_symlinks=True)
 
-
-def test_server_artifact_path_is_confined_to_configured_root(tmp_path, monkeypatch):
-    root = tmp_path / "artifacts"
-    root.mkdir()
-    checkpoint = root / "checkpoint"
+    artifact_root = tmp_path / "artifacts"
+    artifact_root.mkdir()
+    checkpoint = artifact_root / "checkpoint"
     checkpoint.mkdir()
-    monkeypatch.setenv("XORL_SERVER_ARTIFACT_ROOT", str(root))
+    monkeypatch.setenv("XORL_SERVER_ARTIFACT_ROOT", str(artifact_root))
 
     assert resolve_server_artifact("checkpoint", must_exist=True) == checkpoint
     with pytest.raises(ValueError, match="escapes configured root"):
         resolve_server_artifact(tmp_path / "outside")
 
-
-def test_explicit_server_artifact_root_is_authoritative(tmp_path, monkeypatch):
     output_dir = tmp_path / "server-output"
     output_dir.mkdir()
     checkpoint = output_dir / "weights" / "adapter"
     checkpoint.mkdir(parents=True)
-    environment_root = tmp_path / "environment-root"
-    environment_root.mkdir()
-    monkeypatch.setenv("XORL_SERVER_ARTIFACT_ROOT", str(environment_root))
-
     assert resolve_server_artifact(checkpoint, must_exist=True, root=output_dir) == checkpoint
     with pytest.raises(ValueError, match="escapes configured root"):
-        resolve_server_artifact(environment_root, root=output_dir)
+        resolve_server_artifact(artifact_root, root=output_dir)
+
+    diagnostic_root = tmp_path / "diagnostic-input"
+    diagnostic_root.mkdir()
+    _assert_diagnostic_input_requires_configured_root_and_regular_private_file(diagnostic_root, monkeypatch)
 
 
-def test_diagnostic_input_requires_configured_root_and_regular_private_file(tmp_path, monkeypatch):
+def _assert_diagnostic_input_requires_configured_root_and_regular_private_file(tmp_path, monkeypatch):
     root = tmp_path / "diagnostics"
     root.mkdir()
     payload = root / "reference.pt"
@@ -123,7 +106,7 @@ def test_diagnostic_input_requires_configured_root_and_regular_private_file(tmp_
         resolve_diagnostic_input(outside)
 
 
-def test_compile_worker_rejects_targets_outside_quack():
+def test_compile_worker_security_and_protocol_policy():
     from xorl.ops.quack._compile_worker import _resolve_compile_function
 
     with pytest.raises(ValueError, match="Quack module"):
@@ -131,8 +114,10 @@ def test_compile_worker_rejects_targets_outside_quack():
     with pytest.raises(ValueError, match="safe qualified name"):
         _resolve_compile_function("xorl.ops.quack.autotuner", "__builtins__.eval")
 
+    _assert_compile_worker_protocol_roundtrips_safe_types_and_rejects_oversized_header()
 
-def test_compile_worker_protocol_roundtrips_safe_types_and_rejects_oversized_header():
+
+def _assert_compile_worker_protocol_roundtrips_safe_types_and_rejects_oversized_header():
     stream = BytesIO()
     message = {
         "dtype": torch.bfloat16,

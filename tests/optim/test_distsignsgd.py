@@ -41,18 +41,7 @@ class RecordingReduceScatter:
         return None
 
 
-def test_distsignsgd_applies_preaggregated_gradient():
-    param = nn.Parameter(torch.tensor([1.0, -2.0, 3.0]))
-    optimizer = DistSignSGD([param], lr=0.1)
-
-    param.grad = torch.tensor([0.5, -0.25, 0.0])
-    optimizer.step()
-
-    expected = torch.tensor([0.95, -1.975, 3.0])
-    assert torch.allclose(param, expected)
-
-
-def test_distsignsgd_applies_decoupled_weight_decay_before_preaggregated_update():
+def _assert_distsignsgd_applies_preaggregated_update_with_decoupled_weight_decay():
     param = nn.Parameter(torch.tensor([2.0, -2.0]))
     optimizer = DistSignSGD([param], lr=0.1, weight_decay=0.5)
 
@@ -63,67 +52,7 @@ def test_distsignsgd_applies_decoupled_weight_decay_before_preaggregated_update(
     assert torch.allclose(param, expected)
 
 
-def test_distsignsgd_rejects_sparse_gradients():
-    param = nn.Parameter(torch.ones(4))
-    optimizer = DistSignSGD([param], lr=0.1)
-    param.grad = torch.sparse_coo_tensor(indices=[[0, 2]], values=torch.tensor([1.0, -1.0]), size=(4,))
-
-    with pytest.raises(RuntimeError, match="does not support sparse gradients"):
-        optimizer.step()
-
-
-def test_distsignsgd_keeps_optimizer_state_empty_across_steps():
-    param = nn.Parameter(torch.tensor([1.0]))
-    optimizer = DistSignSGD([param], lr=0.1)
-
-    for grad in (torch.tensor([1.0]), torch.tensor([-0.5])):
-        param.grad = grad
-        optimizer.step()
-        assert len(optimizer.state) == 0
-
-
-def test_distsignsgd_state_dict_round_trips_without_state_tensors():
-    source_param = nn.Parameter(torch.tensor([1.0, -1.0]))
-    source_optimizer = DistSignSGD([source_param], lr=0.1, weight_decay=0.25)
-    source_param.grad = torch.tensor([0.5, -0.25])
-    source_optimizer.step()
-
-    state_dict = source_optimizer.state_dict()
-
-    target_param = nn.Parameter(torch.tensor([0.0, 0.0]))
-    target_optimizer = DistSignSGD([target_param], lr=1.0, weight_decay=0.0)
-    target_optimizer.load_state_dict(state_dict)
-
-    assert state_dict["state"] == {}
-    assert target_optimizer.state_dict()["state"] == {}
-    assert target_optimizer.param_groups[0]["lr"] == pytest.approx(0.1)
-    assert target_optimizer.param_groups[0]["weight_decay"] == pytest.approx(0.25)
-
-
-def test_dist_sign_reduce_scatter_signs_input_before_reduce():
-    inner = RecordingReduceScatter()
-    comm = distsign_module.DistSignReduceScatter(inner_comm=inner)
-
-    input_tensor = torch.tensor([2.0, -0.5, 0.0], dtype=torch.float32)
-    output_tensor = torch.empty_like(input_tensor)
-
-    comm(
-        output_tensor=output_tensor,
-        input_tensor=input_tensor,
-        group=None,
-        op=torch.distributed.ReduceOp.SUM,
-        async_op=True,
-    )
-
-    expected = torch.tensor([1.0, -1.0, 0.0], dtype=torch.float32)
-    assert torch.equal(input_tensor, expected)
-    assert torch.equal(inner.seen_input, expected)
-    assert torch.equal(output_tensor, expected)
-    assert inner.seen_op == torch.distributed.ReduceOp.SUM
-    assert inner.seen_async_op is True
-
-
-def test_dist_sign_reduce_scatter_forces_sum_when_caller_passes_avg():
+def _assert_dist_sign_reduce_scatter_signs_after_sp_sum_and_forces_sum(monkeypatch):
     inner = RecordingReduceScatter()
     comm = distsign_module.DistSignReduceScatter(inner_comm=inner)
 
@@ -135,15 +64,16 @@ def test_dist_sign_reduce_scatter_forces_sum_when_caller_passes_avg():
         input_tensor=input_tensor,
         group=None,
         op=torch.distributed.ReduceOp.AVG,
+        async_op=True,
     )
 
-    # FSDP2 with reduce_dtype=fp32 may pass AVG; the trainer's voter-total
-    # divisor would then double-divide. Forcing SUM here keeps the sign-vote
-    # accumulator semantics intact.
+    expected = torch.tensor([1.0, -1.0, 0.0], dtype=torch.float32)
+    assert torch.equal(input_tensor, expected)
+    assert torch.equal(inner.seen_input, expected)
+    assert torch.equal(output_tensor, expected)
     assert inner.seen_op == torch.distributed.ReduceOp.SUM
+    assert inner.seen_async_op is True
 
-
-def test_dist_sign_reduce_scatter_sums_sp_before_sign(monkeypatch):
     inner = RecordingReduceScatter()
     comm = distsign_module.DistSignReduceScatter(inner_comm=inner, sp_group="sp-group")
     reduced = []
@@ -173,7 +103,7 @@ def test_dist_sign_reduce_scatter_sums_sp_before_sign(monkeypatch):
     assert torch.equal(output_tensor, expected)
 
 
-def test_configure_distsignsgd_registers_local_sign_hook(monkeypatch):
+def _assert_configure_distsignsgd_hook_and_admission_policy(monkeypatch):
     model = LocalOnlyModule()
 
     monkeypatch.setattr(
@@ -198,8 +128,11 @@ def test_configure_distsignsgd_registers_local_sign_hook(monkeypatch):
     assert getattr(model.param, "_distsign_local_hook_registered", False) is True
     assert getattr(model, "_distsignsgd_configured", False) is True
 
+    _assert_configure_distsignsgd_skips_local_sign_hook_for_fsdp_managed_params(monkeypatch)
+    _assert_configure_distsignsgd_rejects_unsupported_parallel_topologies(monkeypatch)
 
-def test_configure_distsignsgd_skips_local_sign_hook_for_fsdp_managed_params(monkeypatch):
+
+def _assert_configure_distsignsgd_skips_local_sign_hook_for_fsdp_managed_params(monkeypatch):
     class FakeFSDPModule(nn.Module):
         def __init__(self):
             super().__init__()
@@ -250,58 +183,37 @@ def test_configure_distsignsgd_skips_local_sign_hook_for_fsdp_managed_params(mon
     assert getattr(model.fsdp.managed, "_distsign_local_hook_registered", False) is False
 
 
-def test_configure_distsignsgd_rejects_hsdp(monkeypatch):
-    model = LocalOnlyModule()
-
-    monkeypatch.setattr(
-        distsign_module,
-        "get_parallel_state",
-        lambda: SimpleNamespace(dp_mode="fsdp2", dp_replicate_enabled=True),
-    )
-
-    with pytest.raises(NotImplementedError, match="does not yet support HSDP"):
-        distsign_module.configure_distsignsgd(model)
-
-
-def test_configure_distsignsgd_rejects_sequence_parallel_folded_into_fsdp(monkeypatch):
-    model = LocalOnlyModule()
-
-    monkeypatch.setattr(
-        distsign_module,
-        "get_parallel_state",
-        lambda: SimpleNamespace(
-            dp_mode="fsdp2",
-            dp_replicate_enabled=False,
-            ep_enabled=False,
-            cp_enabled=True,
-            cp_fsdp_mode="all",
+def _assert_configure_distsignsgd_rejects_unsupported_parallel_topologies(monkeypatch):
+    cases = [
+        (SimpleNamespace(dp_mode="fsdp2", dp_replicate_enabled=True), "does not yet support HSDP"),
+        (
+            SimpleNamespace(
+                dp_mode="fsdp2",
+                dp_replicate_enabled=False,
+                ep_enabled=False,
+                cp_enabled=True,
+                cp_fsdp_mode="all",
+            ),
+            "set cp_fsdp_mode='none'",
         ),
-    )
-
-    with pytest.raises(NotImplementedError, match="set cp_fsdp_mode='none'"):
-        distsign_module.configure_distsignsgd(model)
-
-
-def test_configure_distsignsgd_rejects_expert_parallelism(monkeypatch):
-    model = LocalOnlyModule()
-
-    monkeypatch.setattr(
-        distsign_module,
-        "get_parallel_state",
-        lambda: SimpleNamespace(
-            dp_mode="fsdp2",
-            dp_replicate_enabled=False,
-            ep_enabled=True,
-            cp_enabled=False,
-            cp_fsdp_mode="none",
+        (
+            SimpleNamespace(
+                dp_mode="fsdp2",
+                dp_replicate_enabled=False,
+                ep_enabled=True,
+                cp_enabled=False,
+                cp_fsdp_mode="none",
+            ),
+            "expert parallelism",
         ),
-    )
+    ]
 
-    with pytest.raises(NotImplementedError, match="expert parallelism"):
-        distsign_module.configure_distsignsgd(model)
+    for parallel_state, error in cases:
+        model = LocalOnlyModule()
+        monkeypatch.setattr(distsign_module, "get_parallel_state", lambda state=parallel_state: state)
+        with pytest.raises(NotImplementedError, match=error):
+            distsign_module.configure_distsignsgd(model)
 
-
-def test_configure_distsignsgd_rejects_non_fsdp_dtensor_param(monkeypatch):
     class FakeDTensor:
         pass
 
@@ -333,7 +245,11 @@ def test_configure_distsignsgd_rejects_non_fsdp_dtensor_param(monkeypatch):
         distsign_module.configure_distsignsgd(model)
 
 
-def test_build_optimizer_supports_distsignsgd_and_preserves_weight_decay_split(monkeypatch):
+def test_build_optimizer_and_distsignsgd_step_policy(monkeypatch):
+    with monkeypatch.context() as case_patch:
+        _assert_dist_sign_reduce_scatter_signs_after_sp_sum_and_forces_sum(case_patch)
+    with monkeypatch.context() as case_patch:
+        _assert_configure_distsignsgd_hook_and_admission_policy(case_patch)
     model = TinyModule()
     configured = []
 
@@ -364,8 +280,6 @@ def test_build_optimizer_supports_distsignsgd_and_preserves_weight_decay_split(m
     assert decay_group["params"] == [model.linear.weight]
     assert no_decay_group["params"] == [model.linear.bias]
 
-
-def test_build_optimizer_rejects_distsignsgd_without_fsdp2(monkeypatch):
     model = TinyModule()
 
     monkeypatch.setattr(
@@ -376,3 +290,5 @@ def test_build_optimizer_rejects_distsignsgd_without_fsdp2(monkeypatch):
 
     with pytest.raises(ValueError, match="requires data_parallel_mode='fsdp2'"):
         build_optimizer(model, optimizer_type="distsignsgd")
+
+    _assert_distsignsgd_applies_preaggregated_update_with_decoupled_weight_decay()

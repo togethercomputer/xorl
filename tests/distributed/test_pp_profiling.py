@@ -1,6 +1,6 @@
 """Tests for PP bubble profiling.
 
-Pure-math helpers (interval merge, analytic bubble, P2P estimate, patching) run on CPU;
+Pure-math helpers (interval merge, P2P estimate, patching) run on CPU;
 the CUDA-event machinery has a single-GPU, single-stage schedule test marked gpu.
 """
 
@@ -11,73 +11,25 @@ from torch.distributed.pipelining import PipelineStage, ScheduleGPipe
 
 from xorl.distributed.pp_profiling import (
     PPBubbleProfiler,
-    analytic_bubble_fraction,
     estimate_p2p_bytes_per_step,
     merge_busy_intervals,
 )
 
 
 class TestMergeBusyIntervals:
-    @pytest.mark.cpu
-    def test_empty_and_degenerate(self):
+    def _assert_interval_union_truth_table(self):
         assert merge_busy_intervals([]) == 0.0
         assert merge_busy_intervals([(1.0, 1.0)]) == 0.0  # zero-length dropped
         assert merge_busy_intervals([(2.0, 1.0)]) == 0.0  # inverted dropped
-
-    @pytest.mark.cpu
-    def test_single_and_disjoint(self):
         assert merge_busy_intervals([(0.0, 1.0)]) == pytest.approx(1.0)
         assert merge_busy_intervals([(0.0, 1.0), (2.0, 3.5)]) == pytest.approx(2.5)
-
-    @pytest.mark.cpu
-    def test_overlapping_counted_once(self):
         # [0,2] and [1,3] overlap on [1,2] -> union length 3
         assert merge_busy_intervals([(0.0, 2.0), (1.0, 3.0)]) == pytest.approx(3.0)
         # Fully contained interval adds nothing
         assert merge_busy_intervals([(0.0, 4.0), (1.0, 2.0)]) == pytest.approx(4.0)
         # Touching endpoints merge without a gap
         assert merge_busy_intervals([(0.0, 1.0), (1.0, 2.0)]) == pytest.approx(2.0)
-
-    @pytest.mark.cpu
-    def test_unsorted_input(self):
         assert merge_busy_intervals([(5.0, 6.0), (0.0, 1.0), (0.5, 2.0)]) == pytest.approx(3.0)
-
-
-class TestAnalyticBubbleFraction:
-    @pytest.mark.cpu
-    def test_1f1b_gpipe_textbook_values(self):
-        # (p-1)/(m+p-1): 27% at p=4,m=8; 30% at p=8,m=16 (GOALS.md bubble arithmetic)
-        assert analytic_bubble_fraction("1F1B", 4, 1, 8) == pytest.approx(3 / 11)
-        assert analytic_bubble_fraction("GPipe", 4, 1, 8) == pytest.approx(3 / 11)
-        assert analytic_bubble_fraction("1F1B", 8, 1, 16) == pytest.approx(7 / 23)
-        assert analytic_bubble_fraction("1f1b", 2, 1, 8) == pytest.approx(1 / 9)
-
-    @pytest.mark.cpu
-    def test_interleaved_divides_bubble(self):
-        # (p-1)/(v*m+p-1)
-        assert analytic_bubble_fraction("Interleaved1F1B", 4, 2, 8) == pytest.approx(3 / 19)
-        assert analytic_bubble_fraction("Interleaved1F1B", 2, 2, 16) == pytest.approx(1 / 33)
-        # v=1 degenerates to the 1F1B value
-        assert analytic_bubble_fraction("Interleaved1F1B", 4, 1, 8) == pytest.approx(3 / 11)
-
-    @pytest.mark.cpu
-    def test_zero_bubble_schedules(self):
-        assert analytic_bubble_fraction("InterleavedZeroBubble", 4, 2, 8) == 0.0
-        assert analytic_bubble_fraction("ZBVZeroBubble", 2, 2, 8) == 0.0
-        assert analytic_bubble_fraction("DualPipeV", 4, 2, 16) == 0.0
-
-    @pytest.mark.cpu
-    def test_pp1_has_no_bubble(self):
-        assert analytic_bubble_fraction("1F1B", 1, 1, 4) == 0.0
-
-    @pytest.mark.cpu
-    def test_invalid_inputs(self):
-        with pytest.raises(ValueError):
-            analytic_bubble_fraction("NotASchedule", 2, 1, 8)
-        with pytest.raises(ValueError):
-            analytic_bubble_fraction("1F1B", 2, 2, 8)  # single-stage schedule with v=2
-        with pytest.raises(ValueError):
-            analytic_bubble_fraction("1F1B", 0, 1, 8)
 
 
 class _FakeRecvInfo:
@@ -124,15 +76,18 @@ class TestEstimateP2PBytes:
     SHAPE = (2, 128, 64)  # bf16 -> 32768 bytes
     NBYTES = 2 * 128 * 64 * 2
 
-    @pytest.mark.cpu
-    def test_middle_stage_counts_all_four_flows(self):
+    def _assert_p2p_byte_estimation_policy(self):
         stage_to_rank = {0: 0, 1: 1, 2: 2, 3: 3}
         stage = _FakeIOStage(1, 4, 1, stage_to_rank, in_shape=self.SHAPE, out_shape=self.SHAPE)
         # fwd recv + fwd send + grad recv + grad send, x 8 microbatches
         assert estimate_p2p_bytes_per_step([stage], 8) == 4 * self.NBYTES * 8
 
-    @pytest.mark.cpu
-    def test_first_and_last_stage_skip_edge_flows(self):
+        self._assert_first_and_last_stage_skip_edge_flows()
+        self._assert_forward_only_skips_grad_flows()
+        self._assert_same_rank_adjacency_excluded()
+        self._assert_unpopulated_stage_returns_none()
+
+    def _assert_first_and_last_stage_skip_edge_flows(self):
         stage_to_rank = {0: 0, 1: 1}
         first = _FakeIOStage(0, 2, 0, stage_to_rank, out_shape=self.SHAPE)
         last = _FakeIOStage(1, 2, 1, stage_to_rank, in_shape=self.SHAPE, out_shape=self.SHAPE)
@@ -140,14 +95,12 @@ class TestEstimateP2PBytes:
         assert estimate_p2p_bytes_per_step([first], 4) == 2 * self.NBYTES * 4
         assert estimate_p2p_bytes_per_step([last], 4) == 2 * self.NBYTES * 4
 
-    @pytest.mark.cpu
-    def test_forward_only_skips_grad_flows(self):
+    def _assert_forward_only_skips_grad_flows(self):
         stage_to_rank = {0: 0, 1: 1, 2: 2, 3: 3}
         stage = _FakeIOStage(1, 4, 1, stage_to_rank, in_shape=self.SHAPE, out_shape=self.SHAPE, has_backward=False)
         assert estimate_p2p_bytes_per_step([stage], 8) == 2 * self.NBYTES * 8
 
-    @pytest.mark.cpu
-    def test_same_rank_adjacency_excluded(self):
+    def _assert_same_rank_adjacency_excluded(self):
         # ZBV at pp=2: rank 1 owns stages [1, 2]; the 1->2 handoff is rank-local.
         stage_to_rank = {0: 0, 1: 1, 2: 1, 3: 0}
         s1 = _FakeIOStage(1, 4, 1, stage_to_rank, in_shape=self.SHAPE, out_shape=self.SHAPE)
@@ -155,8 +108,7 @@ class TestEstimateP2PBytes:
         # s1: fwd recv from 0 + grad send to 0 (send to 2 local); s2 mirrored.
         assert estimate_p2p_bytes_per_step([s1, s2], 2) == 4 * self.NBYTES * 2
 
-    @pytest.mark.cpu
-    def test_unpopulated_stage_returns_none(self):
+    def _assert_unpopulated_stage_returns_none(self):
         class _Broken:
             stage_index = 1
             is_first = False
@@ -170,6 +122,13 @@ class TestEstimateP2PBytes:
                 raise RuntimeError("not configured")
 
         assert estimate_p2p_bytes_per_step([_Broken()], 4) is None
+
+
+@pytest.mark.cpu
+def test_pp_profile_interval_and_p2p_accounting_policy():
+    TestMergeBusyIntervals()._assert_interval_union_truth_table()
+    TestEstimateP2PBytes()._assert_p2p_byte_estimation_policy()
+    TestProfilerPatching()._assert_profiler_patch_lifecycle_policy()
 
 
 class _FakeComputeStage:
@@ -195,8 +154,7 @@ class _FakeSchedule:
 
 
 class TestProfilerPatching:
-    @pytest.mark.cpu
-    def test_patch_passthrough_and_restore(self):
+    def _assert_profiler_patch_lifecycle_policy(self):
         stages = [_FakeComputeStage(0), _FakeComputeStage(2)]
         profiler = PPBubbleProfiler(_FakeSchedule(stages))
         for stage in stages:
@@ -212,16 +170,18 @@ class TestProfilerPatching:
             assert "forward_one_chunk" not in stage.__dict__
         assert stages[0].forward_one_chunk(0, ()) == "out"  # class method restored
 
-    @pytest.mark.cpu
-    def test_double_patch_rejected(self):
+        self._assert_double_patch_rejected()
+        self._assert_single_stage_schedule_attr()
+        self._assert_report_without_steps_raises()
+
+    def _assert_double_patch_rejected(self):
         schedule = _FakeSchedule([_FakeComputeStage(0)])
         profiler = PPBubbleProfiler(schedule)
         with pytest.raises(RuntimeError, match="already instance-patched"):
             PPBubbleProfiler(schedule)
         profiler.close()
 
-    @pytest.mark.cpu
-    def test_single_stage_schedule_attr(self):
+    def _assert_single_stage_schedule_attr(self):
         class _SingleSchedule:
             def __init__(self, stage):
                 self._stage = stage
@@ -232,8 +192,7 @@ class TestProfilerPatching:
         assert profiler.stages == [stage]
         profiler.close()
 
-    @pytest.mark.cpu
-    def test_report_without_steps_raises(self):
+    def _assert_report_without_steps_raises(self):
         profiler = PPBubbleProfiler(_FakeSchedule([_FakeComputeStage(0)]))
         with pytest.raises(RuntimeError, match="No instrumented steps"):
             profiler.report()

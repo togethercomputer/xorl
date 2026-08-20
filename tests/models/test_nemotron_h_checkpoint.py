@@ -108,18 +108,22 @@ def _run_handler(handler: NemotronHCheckpointHandler, checkpoint: dict[str, torc
     return loaded
 
 
-@pytest.mark.parametrize(
-    ("num_experts", "ep_rank", "ep_size"),
-    [(7, 0, 2), (8, 2, 2), (8, 0, 0)],
-)
-def test_checkpoint_handler_rejects_invalid_expert_parallelism(num_experts, ep_rank, ep_size):
-    with pytest.raises(ValueError):
-        NemotronHCheckpointHandler(num_experts=num_experts, ep_rank=ep_rank, ep_size=ep_size)
+def _assert_nemotron_h_ep_checkpoint_ownership_policy():
+    for num_experts, ep_rank, ep_size in ((7, 0, 2), (8, 2, 2), (8, 0, 0)):
+        with pytest.raises(ValueError):
+            NemotronHCheckpointHandler(num_experts=num_experts, ep_rank=ep_rank, ep_size=ep_size)
+
+    _assert_ep_skip_key_policy()
+    _assert_ep_aware_loading_slices_and_counts_skips()
+    _assert_ep_plan_targets_expert_params()
 
 
-def test_nemotron_h_hf_parity_and_strict_load_accounting():
+def test_nemotron_h_published_layout_load_save_and_hf_parity_contract():
+    _assert_nemotron_h_ep_checkpoint_ownership_policy()
+
     hf_model = _build_hf_model()
-    checkpoint = _published_checkpoint_layout(hf_model)
+    published_checkpoint = _published_checkpoint_layout(hf_model)
+    checkpoint = dict(published_checkpoint)
     checkpoint["mtp.layers.0.mixer.q_proj.weight"] = torch.zeros(2, 2)  # must be ignored
 
     model = _build_xorl_model(hf_model.config)
@@ -147,26 +151,19 @@ def test_nemotron_h_hf_parity_and_strict_load_accounting():
     torch.testing.assert_close(outputs.last_hidden_state.float(), hf_hidden.float(), atol=1e-4, rtol=1e-4)
     torch.testing.assert_close(logits.float(), hf_logits.float(), atol=1e-4, rtol=1e-4)
 
-
-def test_nemotron_h_save_round_trips_to_published_layout():
-    hf_model = _build_hf_model()
-    checkpoint = _published_checkpoint_layout(hf_model)
-
-    model = _build_xorl_model(hf_model.config)
-    handler = model.get_checkpoint_handler(checkpoint_keys=set(checkpoint))
-    model.load_state_dict(_run_handler(handler, checkpoint), strict=True)
-
     saved = {}
     for name, tensor in model.state_dict().items():
         for key, out_tensor in handler.on_save_weight(name, tensor):
             saved[key] = out_tensor
 
-    assert set(saved) == set(checkpoint)
-    for key in checkpoint:
-        torch.testing.assert_close(saved[key], checkpoint[key], atol=0.0, rtol=0.0)
+    assert set(saved) == set(published_checkpoint)
+    for key in published_checkpoint:
+        torch.testing.assert_close(saved[key], published_checkpoint[key], atol=0.0, rtol=0.0)
+
+    _assert_nemotron_h_handler_accepts_hf_stacked_expert_layout()
 
 
-def test_nemotron_h_handler_accepts_hf_stacked_expert_layout():
+def _assert_nemotron_h_handler_accepts_hf_stacked_expert_layout():
     """The transformers 5.x in-memory format stores experts as stacked 3D [E, out, in]."""
     hf_model = _build_hf_model()
 
@@ -184,7 +181,7 @@ def test_nemotron_h_handler_accepts_hf_stacked_expert_layout():
     )
 
 
-def test_nemotron_h_ep_skip_key_fn():
+def _assert_ep_skip_key_policy():
     handler = NemotronHCheckpointHandler(num_experts=NUM_EXPERTS, ep_rank=0, ep_size=2)
     skip_fn = handler.get_skip_key_fn()
     assert skip_fn is not None
@@ -200,7 +197,7 @@ def test_nemotron_h_ep_skip_key_fn():
     assert NemotronHCheckpointHandler(num_experts=NUM_EXPERTS).get_skip_key_fn() is None
 
 
-def test_nemotron_h_ep_aware_loading_slices_and_counts_skips():
+def _assert_ep_aware_loading_slices_and_counts_skips():
     hf_model = _build_hf_model()
     checkpoint = _published_checkpoint_layout(hf_model)
 
@@ -224,7 +221,7 @@ def test_nemotron_h_ep_aware_loading_slices_and_counts_skips():
     assert torch.equal(gate_up, stacked_up[local:].transpose(1, 2).contiguous())
 
 
-def test_nemotron_h_ep_plan_targets_expert_params():
+def _assert_ep_plan_targets_expert_params():
     plan = get_ep_plan()
     assert isinstance(plan, ParallelPlan)
     assert plan._is_expert_parameter("model.layers.2.mixer.experts.gate_up_proj")

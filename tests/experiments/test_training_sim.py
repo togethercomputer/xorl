@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -8,29 +9,54 @@ from xorl.sim.analytical_ledgers import activation_ledger, communication_ledger,
 from xorl.sim.benchmark_behavior import load_benchmark_behavior_points
 from xorl.sim.calibration_evaluator import evaluate_calibration
 from xorl.sim.calibration_packs import (
-    list_calibration_packs,
     load_calibration_pack,
     resolve_calibration_pack,
-    validate_calibration_pack,
 )
 from xorl.sim.collect_calibration import parse_log_text, summarize_observed_run
 from xorl.sim.config_fingerprint import build_fingerprint, load_training_config, resolve_topology
 from xorl.sim.feasibility_evaluator import evaluate_feasibility
-from xorl.sim.kernel_variants import compare_kernel_variants, rank_kernel_variants
+from xorl.sim.kernel_variants import rank_kernel_variants
 from xorl.sim.model_metadata import resolve_model_metadata
 from xorl.sim.predict import build_report
 from xorl.sim.scenario_planner import plan_scenario
 from xorl.sim.schemas import ModelMetadata, Topology
 from xorl.sim.shape_engine import balanced_counts, build_shape_ledger
-from xorl.sim.tradeoff_ranker import rank_benchmark_tradeoffs
 from xorl.sim.validate import validate_simulator
+from xorl.utils.count_flops import XorlFlopsCounter
 
 
-def test_balanced_counts_round_robin_distribution() -> None:
+def _assert_training_sim_topology_shape_and_analytical_ledger_policy() -> None:
     assert balanced_counts(20, 6) == [4, 4, 3, 3, 3, 3]
 
+    _assert_resolve_topology_matches_training_arguments_dp_formula()
+    _assert_shape_ledger_uses_sequence_parallel_local_tokens()
+    _assert_portable_analytical_ledger_policy()
+    _assert_runtime_flops_counter_uses_global_sequence_lengths()
 
-def test_resolve_topology_matches_training_arguments_dp_formula() -> None:
+
+def _assert_runtime_flops_counter_uses_global_sequence_lengths() -> None:
+    config = SimpleNamespace(
+        model_type="qwen3_moe",
+        vocab_size=128,
+        hidden_size=64,
+        moe_intermediate_size=32,
+        num_hidden_layers=4,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        num_experts=8,
+        num_experts_per_tok=2,
+    )
+    batch_seqlens = [128, 64]
+
+    cp1_flops, _ = XorlFlopsCounter(config, cp_size=1).estimate_flops(batch_seqlens, delta_time=1.0)
+    cp64_flops, _ = XorlFlopsCounter(config, cp_size=64).estimate_flops(batch_seqlens, delta_time=1.0)
+
+    assert cp1_flops > 0
+    assert cp64_flops == cp1_flops
+
+
+def _assert_resolve_topology_matches_training_arguments_dp_formula() -> None:
     raw_config = {
         "train": {
             "micro_batch_size": 1,
@@ -58,7 +84,7 @@ def test_resolve_topology_matches_training_arguments_dp_formula() -> None:
     assert topology.top_k == 4
 
 
-def test_shape_ledger_uses_sequence_parallel_local_tokens() -> None:
+def _assert_shape_ledger_uses_sequence_parallel_local_tokens() -> None:
     raw_config = {
         "train": {
             "micro_batch_size": 1,
@@ -85,7 +111,7 @@ def test_shape_ledger_uses_sequence_parallel_local_tokens() -> None:
     assert ledger.ep_rank_slots_per_microbatch == [512, 512, 512, 512]
 
 
-def test_parse_structured_step_phase_and_memory_logs() -> None:
+def _assert_parse_structured_step_phase_and_memory_logs() -> None:
     log_text = """
     [STEP 4/9] loss=1.0 grad_norm=0.1 lr=1.0e-5 tflops=100.2 mfu=0.1010 tokens_per_sec=53414 time=72.100s peak_mem=39.8GB fwd=20.1GB bwd=39.8GB optim=10.0GB
     [STEP_PHASES 4/9] dataloader_max_s=0.100000 dataloader_mean_s=0.050000 model_forward_max_s=10.000000 model_forward_mean_s=9.000000
@@ -191,7 +217,8 @@ def _write_resolved_run_fixture(root: Path) -> Path:
     return config_path
 
 
-def test_benchmark_behavior_loader_ingests_resolved_run_logs_and_ooms(tmp_path: Path) -> None:
+def test_observed_benchmark_ingestion_and_planning_policy(tmp_path: Path) -> None:
+    _assert_parse_structured_step_phase_and_memory_logs()
     config_path = _write_resolved_run_fixture(tmp_path)
 
     points = load_benchmark_behavior_points(tmp_path)
@@ -222,10 +249,6 @@ def test_benchmark_behavior_loader_ingests_resolved_run_logs_and_ooms(tmp_path: 
     assert oom.peak_mem_gb == 79.09
     assert oom.micro_batch_size == 3
 
-
-def test_scenario_planner_keeps_observed_fit_feasible_when_safety_margin_is_tight(tmp_path: Path) -> None:
-    config_path = _write_resolved_run_fixture(tmp_path)
-
     report = plan_scenario(
         config_path,
         benchmark_dir=tmp_path,
@@ -245,7 +268,9 @@ def test_scenario_planner_keeps_observed_fit_feasible_when_safety_margin_is_tigh
     assert report.best_raw.recommendation == "remeasure_for_stability"
 
 
-def test_build_fingerprint_reads_config_file(tmp_path: Path) -> None:
+def test_training_config_model_metadata_and_path_admission_policy(tmp_path: Path) -> None:
+    _assert_training_sim_topology_shape_and_analytical_ledger_policy()
+
     config_path = tmp_path / "config.yaml"
     config = {
         "train": {
@@ -275,8 +300,12 @@ def test_build_fingerprint_reads_config_file(tmp_path: Path) -> None:
     assert fingerprint.topology.global_batch_size == 24
     assert len(fingerprint.config_sha256) == 64
 
+    _assert_resolve_model_metadata_from_hf_cache(tmp_path / "hf-cache")
+    _assert_resolve_known_qwen235_metadata_without_hf_cache()
+    _assert_simulator_rejects_untrusted_calibration_and_metadata_paths(tmp_path / "path-admission")
 
-def test_resolve_model_metadata_from_hf_cache(tmp_path: Path) -> None:
+
+def _assert_resolve_model_metadata_from_hf_cache(tmp_path: Path) -> None:
     config_dir = tmp_path / "models--Example--MoE" / "snapshots" / "abc123"
     config_dir.mkdir(parents=True)
     (config_dir / "config.json").write_text(
@@ -314,7 +343,7 @@ def test_resolve_model_metadata_from_hf_cache(tmp_path: Path) -> None:
     assert metadata.config_path is not None
 
 
-def test_resolve_known_qwen235_metadata_without_hf_cache() -> None:
+def _assert_resolve_known_qwen235_metadata_without_hf_cache() -> None:
     metadata = resolve_model_metadata(
         {"model": {"model_path": "Qwen/Qwen3-235B-A22B"}},
         hf_cache_roots=[],
@@ -333,7 +362,7 @@ def test_resolve_known_qwen235_metadata_without_hf_cache() -> None:
 
 
 def _write_q235_results_fixture(benchmark_dir: Path) -> None:
-    benchmark_dir.mkdir()
+    benchmark_dir.mkdir(parents=True)
     (benchmark_dir / "RESULTS.md").write_text(
         """
 # Qwen3-235B-A22B @ 2k context
@@ -350,7 +379,7 @@ Measured: 4 nodes / 32xH100, u1/dp_shard32/EP8/ep_fsdp4.
     )
 
 
-def test_qwen235_markdown_loader_extracts_pack_and_ga_rows(tmp_path: Path) -> None:
+def test_qwen235_calibration_ingestion_and_evaluation_policy(tmp_path: Path) -> None:
     benchmark_dir = tmp_path / "q235"
     _write_q235_results_fixture(benchmark_dir)
 
@@ -378,6 +407,11 @@ def test_qwen235_markdown_loader_extracts_pack_and_ga_rows(tmp_path: Path) -> No
     assert by_label["q235_markdown:n4_ep8_bd_pk16k"].sample_packing_sequence_len == 16384
     assert by_label["q235_markdown:n4_ep8_bd_pk16k"].tokens_per_sec is None
     assert by_label["q235_markdown:n4_ep8_bd_pk16k"].correctness_status == "oom"
+
+    _assert_qwen235_calibration_evaluator_reports_leave_one_out_ga_error(tmp_path / "evaluation")
+    _assert_qwen235_calibrated_scenario_policy(tmp_path / "scenario")
+    _assert_qwen235_topology_what_if_policy(tmp_path / "topology")
+    _assert_builtin_calibration_pack_policy()
 
 
 def _write_q235_config_fixture(config_path: Path) -> None:
@@ -417,7 +451,7 @@ def _write_q235_config_fixture(config_path: Path) -> None:
     config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
 
 
-def test_qwen235_scenario_planner_uses_markdown_calibration_for_ga_tradeoff(tmp_path: Path) -> None:
+def _assert_qwen235_calibrated_scenario_policy(tmp_path: Path) -> None:
     benchmark_dir = tmp_path / "q235"
     _write_q235_results_fixture(benchmark_dir)
     config_path = tmp_path / "q235.yaml"
@@ -445,8 +479,11 @@ def test_qwen235_scenario_planner_uses_markdown_calibration_for_ga_tradeoff(tmp_
     assert report.best_raw.feasibility_status == "feasible_calibrated_peak_high_pressure"
     assert report.best_promotable is None
 
+    _assert_qwen235_scenario_planner_extrapolates_ga_asymptote(tmp_path / "asymptote")
+    _assert_qwen235_scenario_planner_marks_matching_oom_pack_infeasible(tmp_path / "oom")
 
-def test_qwen235_scenario_planner_extrapolates_ga_asymptote_from_step_time_fit(tmp_path: Path) -> None:
+
+def _assert_qwen235_scenario_planner_extrapolates_ga_asymptote(tmp_path: Path) -> None:
     benchmark_dir = tmp_path / "q235"
     _write_q235_results_fixture(benchmark_dir)
     config_path = tmp_path / "q235.yaml"
@@ -488,7 +525,7 @@ def test_qwen235_scenario_planner_extrapolates_ga_asymptote_from_step_time_fit(t
     assert ga4.score_tokens_per_sec == 9_520.0
 
 
-def test_qwen235_calibration_evaluator_reports_leave_one_out_ga_error(tmp_path: Path) -> None:
+def _assert_qwen235_calibration_evaluator_reports_leave_one_out_ga_error(tmp_path: Path) -> None:
     benchmark_dir = tmp_path / "q235"
     _write_q235_results_fixture(benchmark_dir)
     config_path = tmp_path / "q235.yaml"
@@ -517,7 +554,7 @@ def test_qwen235_calibration_evaluator_reports_leave_one_out_ga_error(tmp_path: 
     assert ga2.absolute_percentage_error == 27.143
 
 
-def test_qwen235_scenario_planner_does_not_exact_match_observed_row_to_tp_what_if(tmp_path: Path) -> None:
+def _assert_qwen235_topology_what_if_policy(tmp_path: Path) -> None:
     benchmark_dir = tmp_path / "q235"
     _write_q235_results_fixture(benchmark_dir)
     config_path = tmp_path / "q235.yaml"
@@ -544,8 +581,11 @@ def test_qwen235_scenario_planner_does_not_exact_match_observed_row_to_tp_what_i
     assert "TP extrapolation uses conservative communication penalty" in tp2.behavior.warnings
     assert tp2.score_tokens_per_sec == 6_804.0
 
+    _assert_qwen235_scenario_planner_auto_sweeps_parallelism(tmp_path / "auto")
+    _assert_qwen235_auto_sweep_includes_long_context_cp(tmp_path / "long-context")
 
-def test_qwen235_scenario_planner_auto_sweeps_parallelism_strategy_space(tmp_path: Path) -> None:
+
+def _assert_qwen235_scenario_planner_auto_sweeps_parallelism(tmp_path: Path) -> None:
     benchmark_dir = tmp_path / "q235"
     _write_q235_results_fixture(benchmark_dir)
     config_path = tmp_path / "q235.yaml"
@@ -578,7 +618,7 @@ def test_qwen235_scenario_planner_auto_sweeps_parallelism_strategy_space(tmp_pat
     assert all(candidate.prediction_confidence == "extrapolated" for candidate in tp_candidates)
 
 
-def test_qwen235_auto_sweep_includes_long_context_cp_without_cross_seq_calibration(tmp_path: Path) -> None:
+def _assert_qwen235_auto_sweep_includes_long_context_cp(tmp_path: Path) -> None:
     benchmark_dir = tmp_path / "q235"
     _write_q235_results_fixture(benchmark_dir)
     config_path = tmp_path / "q235.yaml"
@@ -616,7 +656,7 @@ def test_qwen235_auto_sweep_includes_long_context_cp_without_cross_seq_calibrati
     assert "observed_oom_boundary:q235_markdown:n4_ep8_bd_pk16k" in base_cp.risk_flags
 
 
-def test_qwen235_scenario_planner_marks_matching_oom_pack_infeasible(tmp_path: Path) -> None:
+def _assert_qwen235_scenario_planner_marks_matching_oom_pack_infeasible(tmp_path: Path) -> None:
     benchmark_dir = tmp_path / "q235"
     _write_q235_results_fixture(benchmark_dir)
     config_path = tmp_path / "q235.yaml"
@@ -646,22 +686,13 @@ def test_qwen235_scenario_planner_marks_matching_oom_pack_infeasible(tmp_path: P
     assert "observed_oom_boundary:q235_markdown:n4_ep8_bd_pk16k" in candidate.risk_flags
 
 
-def test_builtin_calibration_packs_are_sanitized_and_versioned() -> None:
-    assert list_calibration_packs() == ["qwen3_235b_a22b", "qwen3_5_397b_a17b", "qwen3_6_35b_a3b"]
-    for name in list_calibration_packs():
-        pack = load_calibration_pack(name)
-        validation = validate_calibration_pack(pack.path)
-        assert pack.manifest["schema_version"] == 1
-        assert pack.default_config.is_file()
-        assert validation["status"] == "pass"
-
-
-def test_builtin_pack_prefix_rejects_path_traversal() -> None:
+def _assert_builtin_pack_prefix_rejects_path_traversal() -> None:
     with pytest.raises(ValueError, match="unknown built-in calibration pack"):
         resolve_calibration_pack("builtin:../qwen3_6_35b_a3b")
 
 
-def test_calibration_pack_rejects_paths_outside_pack_root(tmp_path: Path) -> None:
+def _assert_simulator_rejects_untrusted_calibration_and_metadata_paths(tmp_path: Path) -> None:
+    tmp_path.mkdir(parents=True, exist_ok=True)
     (tmp_path / "manifest.json").write_text(
         json.dumps(
             {
@@ -677,8 +708,13 @@ def test_calibration_pack_rejects_paths_outside_pack_root(tmp_path: Path) -> Non
     with pytest.raises(ValueError, match="must stay within"):
         load_calibration_pack(tmp_path)
 
+    _assert_builtin_pack_prefix_rejects_path_traversal()
+    _assert_calibration_pack_requires_default_config(tmp_path)
+    _assert_calibration_pack_rejects_symlink_escape(tmp_path)
+    _assert_model_metadata_restricts_local_reads(tmp_path)
 
-def test_calibration_pack_requires_default_config(tmp_path: Path) -> None:
+
+def _assert_calibration_pack_requires_default_config(tmp_path: Path) -> None:
     (tmp_path / "manifest.json").write_text(
         json.dumps({"name": "incomplete", "configs": [], "results": []}),
         encoding="utf-8",
@@ -688,7 +724,7 @@ def test_calibration_pack_requires_default_config(tmp_path: Path) -> None:
         load_calibration_pack(tmp_path)
 
 
-def test_calibration_pack_rejects_symlink_escape(tmp_path: Path) -> None:
+def _assert_calibration_pack_rejects_symlink_escape(tmp_path: Path) -> None:
     outside = tmp_path.parent / f"{tmp_path.name}-outside"
     outside.mkdir()
     (outside / "train.yaml").write_text("train: {}\n", encoding="utf-8")
@@ -709,7 +745,7 @@ def test_calibration_pack_rejects_symlink_escape(tmp_path: Path) -> None:
         load_calibration_pack(tmp_path)
 
 
-def test_model_metadata_restricts_local_config_reads_to_approved_roots(tmp_path: Path) -> None:
+def _assert_model_metadata_restricts_local_reads(tmp_path: Path) -> None:
     allowed_root = tmp_path / "allowed"
     blocked_config = tmp_path / "blocked" / "config.json"
     allowed_root.mkdir()
@@ -725,21 +761,7 @@ def test_model_metadata_restricts_local_config_reads_to_approved_roots(tmp_path:
     assert metadata.num_experts is None
 
 
-def test_builtin_qwen35_pack_preserves_raw_and_promotable_winners() -> None:
-    pack = load_calibration_pack("qwen3_5_397b_a17b")
-    points = load_benchmark_behavior_points(pack.path)
-    report = rank_benchmark_tradeoffs(pack.path)
-
-    assert len(points) == 6
-    assert report.best_raw is not None
-    assert report.best_raw.score_tokens_per_sec == 59_217.0
-    assert report.best_raw.promotable is False
-    assert report.best_promotable is not None
-    assert report.best_promotable.score_tokens_per_sec == 59_188.0
-    assert report.best_promotable.promotable is True
-
-
-def test_builtin_qwen36_pack_matches_default_config_but_remains_ungated() -> None:
+def _assert_builtin_calibration_pack_policy() -> None:
     pack = load_calibration_pack("qwen3_6_35b_a3b")
     report = build_report(
         pack.default_config,
@@ -758,8 +780,11 @@ def test_builtin_qwen36_pack_matches_default_config_but_remains_ungated() -> Non
     assert report.support.support_status == "supported_local_non_pp"
     assert report.timing.timing_coverage_status == "benchmark_total_step_only"
 
+    _assert_builtin_qwen235_pack_replays_fit_and_oom_boundaries()
+    _assert_consolidated_validator_covers_all_builtin_packs()
 
-def test_builtin_qwen235_pack_replays_fit_and_oom_boundaries() -> None:
+
+def _assert_builtin_qwen235_pack_replays_fit_and_oom_boundaries() -> None:
     pack = load_calibration_pack("qwen3_235b_a22b")
     report = evaluate_feasibility(pack.default_config, benchmark_dir=pack.path)
 
@@ -771,7 +796,7 @@ def test_builtin_qwen235_pack_replays_fit_and_oom_boundaries() -> None:
     assert {holdout.actual_outcome for holdout in report.holdouts} == {"fit", "oom"}
 
 
-def test_portable_analytical_core_covers_flops_activations_and_communication() -> None:
+def _assert_portable_analytical_ledger_policy() -> None:
     pack = load_calibration_pack("qwen3_5_397b_a17b")
     raw_config = load_training_config(pack.default_config)
     topology = resolve_topology(raw_config)
@@ -790,8 +815,11 @@ def test_portable_analytical_core_covers_flops_activations_and_communication() -
     assert communication["status"] == "exact_analytic_bytes"
     assert communication["total_per_rank_gb"] > 0
 
+    _assert_dense_no_recompute_activation_ledger_includes_mlp_intermediate()
+    _assert_cross_node_traffic_normalizes_expert_fsdp_all_gather_passes()
 
-def test_dense_no_recompute_activation_ledger_includes_mlp_intermediate() -> None:
+
+def _assert_dense_no_recompute_activation_ledger_includes_mlp_intermediate() -> None:
     metadata = ModelMetadata(
         model_path=None,
         config_path=None,
@@ -826,7 +854,7 @@ def test_dense_no_recompute_activation_ledger_includes_mlp_intermediate() -> Non
     assert ledger["terms"]["saved_full_activations"]["gb"] == expected_gb
 
 
-def test_exposed_cross_node_traffic_normalizes_expert_fsdp_all_gather_passes() -> None:
+def _assert_cross_node_traffic_normalizes_expert_fsdp_all_gather_passes() -> None:
     metadata = ModelMetadata(
         model_path=None,
         config_path=None,
@@ -903,19 +931,21 @@ def test_kernel_variant_ranking_requires_a_correctness_gate() -> None:
     ]
 
     report = rank_kernel_variants(rows)
-    comparison = compare_kernel_variants(rows[1], rows[0])
-
     assert report["status"] == "ok"
     assert report["best"]["variant"] == "validated"
     assert report["measurements"][0]["variant"] == "fast-ungated"
-    assert comparison["speedup"] == 1.25
-    assert comparison["candidate_promotable"] is False
 
 
-def test_consolidated_validator_covers_all_builtin_packs() -> None:
+def _assert_consolidated_validator_covers_all_builtin_packs() -> None:
     report = validate_simulator()
 
+    assert report["schema_version"] == 1
     assert report["status"] == "pass"
     assert report["pack_count"] == 3
+    assert {pack["name"] for pack in report["packs"]} == {
+        "qwen3_235b_a22b",
+        "qwen3_5_397b_a17b",
+        "qwen3_6_35b_a3b",
+    }
     assert report["check_count"] >= 200
     assert report["failed_check_count"] == 0

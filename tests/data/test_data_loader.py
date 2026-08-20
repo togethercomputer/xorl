@@ -35,7 +35,7 @@ class SimpleCollator(DataCollator):
 class TestMicroBatchCollatorAndDistributedDataloader:
     """Tests for MicroBatchCollator splitting, DistributedDataloader.set_epoch, and DataLoaderBuilder."""
 
-    def test_micro_batch_splitting_set_epoch_and_builder(self):
+    def _assert_micro_batch_splitting_and_set_epoch(self):
         """Covers micro-batch splitting, edge cases, set_epoch delegation, batch size, sampler, SP collator, and custom collators."""
         internal_collator = SimpleCollator()
 
@@ -94,10 +94,12 @@ class TestMicroBatchCollatorAndDistributedDataloader:
     @patch("xorl.data.data_loader.get_parallel_state")
     @patch("xorl.data.data_loader.StatefulDistributedSampler")
     @patch("xorl.data.data_loader.DistributedDataloader")
-    def test_builder_batch_size_sampler_sp_and_custom_collators(
+    def test_micro_batch_and_builder_configuration_policy(
         self, mock_dataloader_cls, mock_sampler_cls, mock_parallel_state, fake_text_dataset
     ):
         """Covers batch size, sampler params, SP collator, single/multiple custom collators."""
+        self._assert_micro_batch_splitting_and_set_epoch()
+
         mock_ps = Mock()
         mock_ps.dp_size = 2
         mock_ps.dp_rank = 0
@@ -253,7 +255,9 @@ class TestDataLoaderBuilderPipelineAndIntegration:
                     "position_ids": torch.arange(self.seq_len, dtype=torch.long),
                 }
 
-        dataset = SimpleTokenizedDataset(num_samples=16, seq_len=5)
+        # Ten samples form two complete four-sample loader batches; the incomplete
+        # remainder is dropped by the production dataloader.
+        dataset = SimpleTokenizedDataset(num_samples=10, seq_len=5)
         int_builder = DataLoaderBuilder(
             dataset=dataset,
             micro_batch_size=2,
@@ -263,6 +267,7 @@ class TestDataLoaderBuilderPipelineAndIntegration:
             pad_to_multiple_of=1,
         )
         dataloader = int_builder.build(verbose=False)
+        assert len(dataloader) == 2
 
         for step, micro_batches in enumerate(dataloader):
             assert isinstance(micro_batches, list)

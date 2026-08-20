@@ -15,55 +15,10 @@ from tests.e2e.e2e_utils import (
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.slow]
 
 
-class TestLoRA1GPU:
-    @skip_if_gpu_count_less_than(1)
-    def test_lora_loss_converges(self, tmp_workspace):
-        """Qwen3-8B LoRA training shows strong loss convergence over 20 steps."""
-        output_dir = os.path.join(tmp_workspace, "output_lora_converge")
-        config_path = generate_training_config(
-            model_dir=QWEN3_8B_ID,
-            model_path=QWEN3_8B_ID,
-            output_dir=output_dir,
-            num_gpus=1,
-            max_steps=20,
-            lr=1e-3,
-            enable_lora=True,
-            lora_rank=32,
-            lora_alpha=32,
-            merge_qkv=False,
-        )
-        result = run_training(config_path, num_gpus=1, timeout=600)
-
-        result.assert_success()
-        result.assert_loss_converged(max_final_loss=8.0, min_drop_ratio=0.30)
-
-
 class TestLoRA2GPU:
     @skip_if_gpu_count_less_than(2)
-    def test_lora_fsdp2(self, tmp_workspace):
-        """Qwen3-8B LoRA + FSDP2 on 2 GPUs converges."""
-        output_dir = os.path.join(tmp_workspace, "output_lora_fsdp2")
-        config_path = generate_training_config(
-            model_dir=QWEN3_8B_ID,
-            model_path=QWEN3_8B_ID,
-            output_dir=output_dir,
-            num_gpus=2,
-            dp_shard_size=2,
-            max_steps=20,
-            lr=1e-3,
-            enable_lora=True,
-            lora_rank=32,
-            lora_alpha=32,
-            merge_qkv=False,
-        )
-        result = run_training(config_path, num_gpus=2, timeout=600)
-
-        result.assert_success()
-        result.assert_loss_converged(max_final_loss=8.0, min_drop_ratio=0.30)
-
-    @skip_if_gpu_count_less_than(2)
     def test_lora_checkpoint_save_and_resume(self, tmp_workspace):
-        """Qwen3-8B LoRA checkpoint save and resume round-trip."""
+        """Qwen3-8B LoRA FSDP2 converges through checkpoint save and resume."""
         # Phase 1: Train 5 steps, save at step 3
         output_dir_1 = os.path.join(tmp_workspace, "output_lora_ckpt_p1")
         config_path_1 = generate_training_config(
@@ -86,7 +41,8 @@ class TestLoRA2GPU:
         ckpt_path = os.path.join(output_dir_1, "checkpoints", "global_step_3")
         assert os.path.isdir(ckpt_path), f"Phase 1 checkpoint missing: {ckpt_path}"
 
-        # Phase 2: Resume from step 3, train to step 10
+        # Phase 2: resume from step 3 and retain the former standalone FSDP2
+        # convergence horizon without launching a third training process.
         output_dir_2 = os.path.join(tmp_workspace, "output_lora_ckpt_p2")
         config_path_2 = generate_training_config(
             model_dir=QWEN3_8B_ID,
@@ -94,7 +50,7 @@ class TestLoRA2GPU:
             output_dir=output_dir_2,
             num_gpus=2,
             dp_shard_size=2,
-            max_steps=10,
+            max_steps=20,
             lr=1e-3,
             enable_lora=True,
             lora_rank=32,
@@ -105,4 +61,6 @@ class TestLoRA2GPU:
         result_2 = run_training(config_path_2, num_gpus=2, timeout=600)
 
         result_2.assert_success()
-        assert result_2.global_step == 10
+        assert f"Loaded checkpoint from {ckpt_path}" in result_2.stdout
+        assert result_2.global_step == 20
+        result_2.assert_loss_converged(max_final_loss=8.0, min_drop_ratio=0.30)

@@ -1,21 +1,12 @@
 """Tests for load_state delegation in RunnerDispatcher."""
 
 import asyncio
-import importlib.util
-from pathlib import Path
 
 import pytest
 
 from xorl.server.protocol.operations import AdapterStateData, LoadStateData
 from xorl.server.protocol.orchestrator_runner import RunnerDispatchCommand
-
-
-_MODULE_PATH = Path(__file__).resolve().parents[3] / "src" / "xorl" / "server" / "runner" / "runner_dispatcher.py"
-_SPEC = importlib.util.spec_from_file_location("xorl_test_runner_dispatcher_load_state", _MODULE_PATH)
-assert _SPEC is not None and _SPEC.loader is not None
-_MODULE = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(_MODULE)
-RunnerDispatcher = _MODULE.RunnerDispatcher
+from xorl.server.runner.runner_dispatcher import RunnerDispatcher
 
 
 pytestmark = [pytest.mark.cpu, pytest.mark.server]
@@ -52,7 +43,7 @@ class _FakeTrainerSingleTenant:
         return {"success": True, "model_id": model_id}
 
 
-def test_handle_request_rank0_preserves_prepare_error():
+def _assert_load_state_preparation_preserves_errors_and_enforces_output_root(tmp_path, monkeypatch):
     dispatcher = object.__new__(RunnerDispatcher)
     dispatcher.rank = 0
 
@@ -75,8 +66,6 @@ def test_handle_request_rank0_preserves_prepare_error():
     assert response.success is False
     assert response.error == "checkpoint path rejected"
 
-
-def test_prepare_load_state_uses_server_output_dir_as_artifact_root(tmp_path, monkeypatch):
     output_dir = tmp_path / "server-output"
     checkpoint_path = output_dir / "weights" / "policy-a"
     checkpoint_path.mkdir(parents=True)
@@ -115,9 +104,11 @@ def test_prepare_load_state_uses_server_output_dir_as_artifact_root(tmp_path, mo
         )
 
 
-def test_handle_load_state_uses_adapter_coordinator_for_multi_adapter(tmp_path, monkeypatch):
+def test_load_state_validation_and_routing_lifecycle(tmp_path, monkeypatch):
+    _assert_load_state_preparation_preserves_errors_and_enforces_output_root(tmp_path, monkeypatch)
+
     checkpoint_path = tmp_path / "checkpoint"
-    checkpoint_path.mkdir()
+    checkpoint_path.mkdir(exist_ok=True)
     monkeypatch.setenv("XORL_SERVER_ARTIFACT_ROOT", str(tmp_path))
 
     dispatcher = object.__new__(RunnerDispatcher)
@@ -147,10 +138,8 @@ def test_handle_load_state_uses_adapter_coordinator_for_multi_adapter(tmp_path, 
     assert payload.path == str(checkpoint_path)
     assert payload.load_optimizer is False
 
-
-def test_handle_load_state_uses_trainer_load_state_without_adapter_manager(tmp_path, monkeypatch):
     checkpoint_path = tmp_path / "checkpoint"
-    checkpoint_path.mkdir()
+    checkpoint_path.mkdir(exist_ok=True)
     monkeypatch.setenv("XORL_SERVER_ARTIFACT_ROOT", str(tmp_path))
 
     dispatcher = object.__new__(RunnerDispatcher)

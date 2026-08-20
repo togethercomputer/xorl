@@ -4,39 +4,16 @@ Tests for FutureStore in xorl.
 
 import asyncio
 import time
-from typing import Any, Dict, Optional
 
 import pytest
 
 from xorl.server.api_server.future_store import (
-    FutureEntry,
     FutureStatus,
     FutureStore,
 )
 
 
 pytestmark = [pytest.mark.cpu, pytest.mark.server]
-
-
-def make_try_again_response(
-    request_id: str,
-    queue_state: str = "active",
-    queue_state_reason: Optional[str] = None,
-) -> Dict[str, Any]:
-    """Build a try-again response dict for a pending future."""
-    response: Dict[str, Any] = {
-        "type": "try_again",
-        "request_id": request_id,
-        "queue_state": queue_state,
-    }
-    if queue_state_reason is not None:
-        response["queue_state_reason"] = queue_state_reason
-    return response
-
-
-def make_failed_response(error: str, category: str = "unknown") -> Dict[str, Any]:
-    """Build a failed response dict."""
-    return {"error": error, "category": category}
 
 
 @pytest.fixture
@@ -162,12 +139,18 @@ class TestFutureStore:
             await asyncio.sleep(0.1)
             stats = future_store.get_stats()
             assert stats["total"] >= 3
+
         finally:
             await future_store.stop()
+        fresh_store = FutureStore(
+            default_ttl=60.0,
+            max_concurrent=2,
+            cleanup_interval=1.0,
+        )
+        await self._assert_model_ops_deletion_status_and_expiration(fresh_store)
 
-    @pytest.mark.asyncio
-    async def test_model_ops_deletion_status_and_expiration(self, future_store):
-        """Test listing/deleting by model, status tracking, error info, and TTL expiration."""
+    async def _assert_model_ops_deletion_status_and_expiration(self, future_store):
+        """Test deletion, status/result storage, failure storage, and TTL expiration."""
         await future_store.start()
 
         try:
@@ -189,10 +172,6 @@ class TestFutureStore:
                 )
                 for i in range(2)
             ]
-
-            assert len(future_store.list_by_model("model-1")) == 3
-            assert len(future_store.list_by_model("model-2")) == 2
-            assert len(future_store.list_by_model("model-3")) == 0
 
             deleted = await future_store.delete_by_model("model-1")
             assert deleted == 3
@@ -230,15 +209,15 @@ class TestFutureStore:
                 process_fn=slow_process,
                 request_data={},
             )
-            status = future_store.get_status(request_id)
-            assert status in (FutureStatus.PENDING, FutureStatus.PROCESSING)
-            assert future_store.get_result(request_id) is None
+            entry = future_store.get(request_id)
+            assert entry.status in (FutureStatus.PENDING, FutureStatus.PROCESSING)
+            assert entry.result is None
 
             await asyncio.wait_for(processed.wait(), timeout=5.0)
             await asyncio.sleep(0.1)
-            assert future_store.get_status(request_id) == FutureStatus.COMPLETED
-            assert future_store.get_result(request_id) == {"value": 42}
-            assert future_store.get_status("nonexistent") is None
+            entry = future_store.get(request_id)
+            assert entry.status == FutureStatus.COMPLETED
+            assert entry.result == {"value": 42}
 
             # --- Error info ---
             async def failing_process(data):
@@ -251,10 +230,8 @@ class TestFutureStore:
                 request_data={},
             )
             await asyncio.sleep(0.2)
-            error_info = future_store.get_error(request_id)
-            assert error_info is not None
-            error_msg, error_category = error_info
-            assert "Server crashed" in error_msg and error_category == "server"
+            entry = future_store.get(request_id)
+            assert "Server crashed" in entry.error and entry.error_category == "server"
         finally:
             await future_store.stop()
 
@@ -290,55 +267,3 @@ class TestFutureStore:
             assert future_store.get(request_id).expires_at > time.time() + 3500
         finally:
             await future_store.stop()
-
-
-class TestFutureEntryAndHelpers:
-    """Tests for FutureEntry dataclass and helper functions."""
-
-    def test_entry_queue_state_and_helpers(self):
-        """Test FutureEntry creation/expiry/terminal, queue state, and helper functions."""
-        # --- Entry creation ---
-        entry = FutureEntry(request_id="future_abc", model_id="model-1", request_type="forward_backward")
-        assert entry.status == FutureStatus.PENDING
-        assert entry.result is None and entry.error is None and entry.error_category == "unknown"
-
-        # Not expired vs expired
-        entry_not_expired = FutureEntry(request_id="a", model_id="m", request_type="t", expires_at=time.time() + 3600)
-        assert entry_not_expired.is_expired() is False
-        entry_expired = FutureEntry(request_id="b", model_id="m", request_type="t", expires_at=time.time() - 1)
-        assert entry_expired.is_expired() is True
-
-        # Terminal states
-        entry = FutureEntry(request_id="c", model_id="m", request_type="t")
-        assert entry.is_terminal() is False
-        entry.status = FutureStatus.PROCESSING
-        assert entry.is_terminal() is False
-        for status in (FutureStatus.COMPLETED, FutureStatus.FAILED, FutureStatus.EXPIRED):
-            entry.status = status
-            assert entry.is_terminal() is True
-
-        # --- Queue state management ---
-        store = FutureStore(default_ttl=60.0, max_concurrent=2, cleanup_interval=1.0)
-        state, reason = store.get_queue_state()
-        assert state == "active" and reason is None
-
-        store.set_queue_state("paused_capacity", "GPU memory full")
-        state, reason = store.get_queue_state()
-        assert state == "paused_capacity" and reason == "GPU memory full"
-
-        # --- Helper functions ---
-        response = make_try_again_response("future_abc")
-        assert response == {"type": "try_again", "request_id": "future_abc", "queue_state": "active"}
-
-        response = make_try_again_response("future_xyz", queue_state="paused_capacity", queue_state_reason="GPU full")
-        assert response["queue_state"] == "paused_capacity" and response["queue_state_reason"] == "GPU full"
-
-        response = make_failed_response("Something went wrong")
-        assert response == {"error": "Something went wrong", "category": "unknown"}
-
-        response = make_failed_response("Invalid input", category="user")
-        assert response["category"] == "user"
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])

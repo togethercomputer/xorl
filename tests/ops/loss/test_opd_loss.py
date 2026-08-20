@@ -27,8 +27,7 @@ def inputs():
     return hidden_states, weight, labels, teacher_hidden_states, teacher_weight, teacher_weights
 
 
-@pytest.mark.parametrize("num_chunks_case", [1, 2, 7, "n_valid_plus_one", 0])
-def test_opd_loss_matches_reference(inputs, num_chunks_case):
+def _assert_opd_loss_matches_reference(inputs, num_chunks_case):
     hidden_states, weight, labels, teacher_hidden_states, teacher_weight, teacher_weights = inputs
     n_valid = int((labels != -100).sum().item())
     num_chunks = n_valid + 1 if num_chunks_case == "n_valid_plus_one" else int(num_chunks_case)
@@ -55,8 +54,12 @@ def test_opd_loss_matches_reference(inputs, num_chunks_case):
     assert out.metrics["valid_tokens"] == int((labels != -100).sum().item())
 
 
-@pytest.mark.parametrize("backend", ["streaming", "tilelang"])
-def test_opd_streaming_backends_match_reference(inputs, backend):
+def _assert_opd_loss_reference_chunking(inputs):
+    for num_chunks_case in (0, 1, "n_valid_plus_one"):
+        _assert_opd_loss_matches_reference(inputs, num_chunks_case)
+
+
+def _assert_opd_streaming_backend_matches_reference(inputs, backend):
     hidden_states, weight, labels, teacher_hidden_states, teacher_weight, teacher_weights = inputs
     hidden_states = hidden_states.detach().requires_grad_(True)
     weight = weight.detach().requires_grad_(True)
@@ -90,7 +93,12 @@ def test_opd_streaming_backends_match_reference(inputs, backend):
     assert teacher_weight.grad is None
 
 
-def test_opd_streaming_lowmem_matches_streaming(inputs):
+def _assert_opd_streaming_backends_match_reference(inputs):
+    for backend in ("streaming", "tilelang"):
+        _assert_opd_streaming_backend_matches_reference(inputs, backend)
+
+
+def _assert_opd_streaming_lowmem_matches_streaming(inputs):
     """streaming_lowmem must be loss- and gradient-identical to plain streaming.
 
     The lowmem path keeps lm-head weights in native dtype and upcasts each vocab
@@ -133,7 +141,7 @@ def test_opd_streaming_lowmem_matches_streaming(inputs):
     assert_close(gh_b, gh_a)
 
 
-def test_opd_streaming_backend_reads_sharded_teacher_store(inputs, tmp_path):
+def _assert_opd_streaming_backend_reads_sharded_teacher_store(inputs, tmp_path):
     hidden_states, weight, labels, teacher_hidden_states, teacher_weight, teacher_weights = inputs
     model_dir = tmp_path / "teacher_model"
     model_dir.mkdir()
@@ -161,7 +169,7 @@ def test_opd_streaming_backend_reads_sharded_teacher_store(inputs, tmp_path):
     assert_close(out.loss, expected)
 
 
-def test_opd_loss_backward(inputs):
+def _assert_opd_loss_backward(inputs):
     hidden_states, weight, labels, teacher_hidden_states, teacher_weight, _ = inputs
     hidden_states = hidden_states.detach().requires_grad_(True)
     weight = weight.detach().requires_grad_(True)
@@ -184,7 +192,7 @@ def test_opd_loss_backward(inputs):
     assert teacher_weight.grad is None
 
 
-def test_opd_loss_respects_token_partial_reducer(inputs):
+def _assert_opd_loss_respects_token_partial_reducer(inputs):
     hidden_states, weight, labels, teacher_hidden_states, teacher_weight, teacher_weights = inputs
     out = opd_loss_function(
         hidden_states=hidden_states,
@@ -202,7 +210,7 @@ def test_opd_loss_respects_token_partial_reducer(inputs):
     assert_close(out.loss, expected * n_valid)
 
 
-def test_opd_loss_all_ignored_is_finite(inputs):
+def _assert_opd_loss_all_ignored_is_finite(inputs):
     hidden_states, weight, labels, teacher_hidden_states, teacher_weight, _ = inputs
     labels = torch.full_like(labels, -100)
     hidden_states = hidden_states.to(torch.bfloat16).detach().requires_grad_(True)
@@ -228,7 +236,7 @@ def test_opd_loss_all_ignored_is_finite(inputs):
     assert torch.count_nonzero(weight.grad) == 0
 
 
-def test_opd_loss_bf16_inputs_return_fp32_loss(inputs):
+def _assert_opd_loss_bf16_inputs_return_fp32_loss(inputs):
     hidden_states, weight, labels, teacher_hidden_states, teacher_weight, teacher_weights = inputs
     hidden_states = hidden_states.to(torch.bfloat16).detach().requires_grad_(True)
     weight = weight.to(torch.bfloat16).detach().requires_grad_(True)
@@ -253,7 +261,7 @@ def test_opd_loss_bf16_inputs_return_fp32_loss(inputs):
     assert weight.grad is not None and weight.grad.isfinite().all()
 
 
-def test_opd_loss_return_per_token(inputs):
+def _assert_opd_loss_return_per_token(inputs):
     hidden_states, weight, labels, teacher_hidden_states, teacher_weight, teacher_weights = inputs
     out = opd_loss_function(
         hidden_states=hidden_states,
@@ -275,7 +283,7 @@ def test_opd_loss_return_per_token(inputs):
     assert_close(out.per_token_loss.sum() / denom, expected)
 
 
-def test_opd_loss_hidden_only_mse_with_zero_kl_weight_returns_hidden_term():
+def _assert_opd_loss_hidden_only_mse_with_zero_kl_weight_returns_hidden_term():
     hidden_states = torch.tensor(
         [[[1.0, 2.0], [3.0, 5.0], [7.0, 11.0]]],
         requires_grad=True,
@@ -325,7 +333,7 @@ def test_opd_loss_hidden_only_mse_with_zero_kl_weight_returns_hidden_term():
     assert "opd_kl" in out.metrics
 
 
-def test_oprd_hidden_distance_matches_full_materialization_and_detaches_teacher():
+def _assert_oprd_hidden_distance_matches_full_materialization_and_detaches_teacher():
     torch.manual_seed(23)
     student = torch.randn(3, 5, 7, dtype=torch.bfloat16).requires_grad_(True)
     teacher = torch.randn(3, 5, 7, dtype=torch.bfloat16).requires_grad_(True)
@@ -341,7 +349,7 @@ def test_oprd_hidden_distance_matches_full_materialization_and_detaches_teacher(
     assert teacher.grad is None
 
 
-def test_oprd_hidden_distance_from_fetcher_matches_full_materialization():
+def _assert_oprd_hidden_distance_from_fetcher_matches_full_materialization():
     torch.manual_seed(24)
     student = torch.randn(3, 5, 7, dtype=torch.bfloat16).requires_grad_(True)
     teacher = torch.randn(3, 5, 7, dtype=torch.bfloat16).requires_grad_(True)
@@ -367,3 +375,29 @@ def test_oprd_hidden_distance_from_fetcher_matches_full_materialization():
     distance.sum().backward()
     assert student.grad is not None and student.grad.isfinite().all()
     assert teacher.grad is None
+
+
+def test_opd_numerical_backend_contract(inputs, tmp_path):
+    _assert_opd_loss_reference_chunking(inputs)
+    _assert_opd_streaming_backends_match_reference(inputs)
+    _assert_opd_streaming_lowmem_matches_streaming(inputs)
+    _assert_opd_streaming_backend_reads_sharded_teacher_store(inputs, tmp_path)
+    _assert_opd_gradient_and_reduction_contract(inputs)
+
+
+def _assert_opd_gradient_and_reduction_contract(inputs):
+    _assert_opd_loss_backward(inputs)
+    _assert_opd_loss_respects_token_partial_reducer(inputs)
+    _assert_opd_loss_bf16_inputs_return_fp32_loss(inputs)
+
+
+def test_opd_output_and_hidden_only_edge_contract(inputs):
+    _assert_opd_loss_all_ignored_is_finite(inputs)
+    _assert_opd_loss_return_per_token(inputs)
+    _assert_opd_loss_hidden_only_mse_with_zero_kl_weight_returns_hidden_term()
+    _assert_oprd_hidden_distance_contract()
+
+
+def _assert_oprd_hidden_distance_contract():
+    _assert_oprd_hidden_distance_matches_full_materialization_and_detaches_teacher()
+    _assert_oprd_hidden_distance_from_fetcher_matches_full_materialization()

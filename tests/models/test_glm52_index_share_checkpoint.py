@@ -1,4 +1,4 @@
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 
 import pytest
 import torch
@@ -11,6 +11,16 @@ from xorl.models.transformers.glm5.index_share import (
     IndexShareMode,
 )
 from xorl.models.transformers.glm5.layer_plan import Glm52LayerPlan
+from xorl.server.runner.model_runner import ModelRunner
+from xorl.trainers.trainer import Trainer
+
+
+class _RetainingModel:
+    def __init__(self) -> None:
+        self.release_count = 0
+
+    def release_index_share_context(self) -> None:
+        self.release_count += 1
 
 
 def _producer_shared_plan() -> Glm52LayerPlan:
@@ -27,8 +37,48 @@ def _producer_shared_plan() -> Glm52LayerPlan:
 
 
 @pytest.mark.cpu
-@pytest.mark.parametrize("use_reentrant", [False, True])
-def test_checkpointed_producer_shared_backward_reuses_detached_payload(use_reentrant):
+def test_checkpointed_index_share_lifecycle_policy():
+    for use_reentrant in (False, True):
+        _assert_checkpointed_producer_shared_backward_reuses_detached_payload(use_reentrant)
+    _assert_mode_owned_success_and_failure_cleanup_is_idempotent()
+    _assert_forward_failures_release_offline_and_server_caller_contexts()
+
+
+def _assert_forward_failures_release_offline_and_server_caller_contexts():
+    trainer = Trainer.__new__(Trainer)
+    model = _RetainingModel()
+    trainer.model = model
+    trainer._all_model_parts = MethodType(lambda _self: [model], trainer)
+    trainer._forward_backward_impl = MethodType(
+        lambda _self, _micro_batches, _global_valid_tokens: (_ for _ in ()).throw(RuntimeError("loss failed")),
+        trainer,
+    )
+
+    assert trainer._index_share_forward_kwargs(model, IndexShareMode.TRAINING_WITH_BACKWARD) == {
+        "index_share_mode": IndexShareMode.TRAINING_WITH_BACKWARD
+    }
+    with pytest.raises(RuntimeError, match="loss failed"):
+        trainer._forward_backward([], None)
+    assert model.release_count == 1
+
+    runner = ModelRunner.__new__(ModelRunner)
+    server_model = _RetainingModel()
+    runner.model = server_model
+    runner.model_parts = []
+    runner._forward_loop_impl = MethodType(
+        lambda _self, *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("backward failed")),
+        runner,
+    )
+
+    assert runner._index_share_forward_kwargs(IndexShareMode.FORWARD_ONLY) == {
+        "index_share_mode": IndexShareMode.FORWARD_ONLY
+    }
+    with pytest.raises(RuntimeError, match="backward failed"):
+        runner._forward_loop([], "causallm_loss", {}, compute_backward=True)
+    assert server_model.release_count == 1
+
+
+def _assert_checkpointed_producer_shared_backward_reuses_detached_payload(use_reentrant):
     plan = _producer_shared_plan()
     manager = IndexShareContextManager(plan, (0, 2))
     context = manager.begin(mode=IndexShareMode.TRAINING_WITH_BACKWARD)
@@ -71,8 +121,7 @@ def test_checkpointed_producer_shared_backward_reuses_detached_payload(use_reent
     assert context.lifecycle is IndexShareLifecycle.CLOSED
 
 
-@pytest.mark.cpu
-def test_mode_owned_success_and_failure_cleanup_is_idempotent():
+def _assert_mode_owned_success_and_failure_cleanup_is_idempotent():
     plan = _producer_shared_plan()
     manager = IndexShareContextManager(plan, (0, 2))
 
