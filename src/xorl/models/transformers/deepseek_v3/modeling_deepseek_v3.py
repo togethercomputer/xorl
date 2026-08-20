@@ -414,12 +414,6 @@ class DeepseekV3PreTrainedModel(XorlPreTrainedModel):
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
         elif isinstance(module, MoEExperts):
-            # Grouped expert weights are raw nn.Parameters allocated with
-            # torch.empty, so nothing else in this chain reaches them: without
-            # this branch they keep whatever the allocator returned. That reads
-            # as "works" because recycled pages are usually zeroed -- the model
-            # runs with dead experts -- and as an all-NaN forward whenever the
-            # recycled bytes happen to decode to NaN/Inf.
             module.gate_up_proj.data.normal_(mean=0.0, std=std)
             module.down_proj.data.normal_(mean=0.0, std=std)
         elif isinstance(module, RMSNorm):
