@@ -69,7 +69,7 @@ def _make_sync(master_port: int = 0) -> NCCLWeightSynchronizer:
     )
 
 
-def test_init_nccl_group_fails_before_starting_inference_when_store_bind_fails(monkeypatch):
+def _assert_init_nccl_group_fails_before_starting_inference_when_store_bind_fails(monkeypatch):
     sync = _make_sync()
     inference_started = False
 
@@ -89,7 +89,10 @@ def test_init_nccl_group_fails_before_starting_inference_when_store_bind_fails(m
     assert _JoinDrivenThread.instances == []
 
 
-def test_destroy_nccl_group_reinit_uses_fresh_ephemeral_rendezvous_port_when_old_one_is_sticky(monkeypatch):
+def test_training_rendezvous_port_lifecycle(monkeypatch):
+    """Reinitialization rotates ephemeral ports while an explicit port remains pinned."""
+    _assert_init_nccl_group_fails_before_starting_inference_when_store_bind_fails(monkeypatch)
+
     sync = _make_sync()
     destroyed_groups = []
 
@@ -127,27 +130,7 @@ def test_destroy_nccl_group_reinit_uses_fresh_ephemeral_rendezvous_port_when_old
     assert first_port == 31000
     assert sync._active_master_port == 31001
 
-
-def test_explicit_master_port_is_honored(monkeypatch):
-    sync = _make_sync(master_port=29600)
-
-    _StickyTCPStore.open_ports.clear()
-
-    def fake_new_process_group_helper(world_size, rank, group_ranks, backend, store, **kwargs):
-        del world_size, rank, group_ranks, backend, kwargs
-        return _FakeProcessGroup(store.store), None
-
-    monkeypatch.setattr(nccl_broadcast_module, "TCPStore", _StickyTCPStore)
-    monkeypatch.setattr(nccl_broadcast_module, "PrefixStore", _FakePrefixStore)
-    monkeypatch.setattr(dist, "is_initialized", lambda: False)
-    monkeypatch.setattr(torch.cuda, "set_device", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
-    monkeypatch.setattr(nccl_broadcast_module, "Backend", lambda name: name)
-    monkeypatch.setattr(nccl_broadcast_module, "_new_process_group_helper", fake_new_process_group_helper)
-    monkeypatch.setattr(nccl_broadcast_module, "_world", SimpleNamespace(pg_group_ranks={}))
-    monkeypatch.setattr(nccl_broadcast_module, "default_pg_timeout", object())
-
-    process_group = sync._init_training_process_group()
-
+    explicit_sync = _make_sync(master_port=29600)
+    process_group = explicit_sync._init_training_process_group()
     assert process_group.store.port == 29600
-    assert sync._active_master_port == 29600
+    assert explicit_sync._active_master_port == 29600

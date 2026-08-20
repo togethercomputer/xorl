@@ -1,5 +1,7 @@
 """Structural gates for generic expert QLoRA ownership and target selection."""
 
+import subprocess
+import sys
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -18,18 +20,35 @@ from xorl.qlora.utils import inject_qlora_into_model
 pytestmark = pytest.mark.cpu
 
 
-@pytest.mark.parametrize("backend", ("eager", "triton", "native", "quack"))
-def test_registered_backends_declare_local_ep_and_zero_token_execution(backend):
-    contract = expert_adapter_backend_contract(backend)
-    assert contract.supports_local
-    assert contract.supports_ep
-    assert "alltoall" in contract.supported_dispatch_methods
-    assert ("deepep" in contract.supported_dispatch_methods) is DEEPEP_AVAILABLE
-    assert contract.gradient_reduction_domain.value == "ep_sum"
-    assert contract.zero_token_gradient_behavior.value == "structural_zero"
+def test_expert_backend_capability_ownership_and_checkpoint_policy():
+    _assert_qlora_expert_modules_import_without_loading_models()
+    for backend in ("eager", "triton", "native", "quack"):
+        contract = expert_adapter_backend_contract(backend)
+        assert contract.supports_local, backend
+        assert contract.supports_ep, backend
+        assert "alltoall" in contract.supported_dispatch_methods, backend
+        assert ("deepep" in contract.supported_dispatch_methods) is DEEPEP_AVAILABLE, backend
+        assert contract.gradient_reduction_domain.value == "ep_sum", backend
+        assert contract.zero_token_gradient_behavior.value == "structural_zero", backend
+
+    _assert_inactive_capabilities_do_not_change_plan_identity()
+    _assert_expert_factor_ownership_and_checkpoint_policy()
+    _assert_generic_expert_semantics_preservation_policy()
 
 
-def test_inactive_optional_backend_capabilities_do_not_change_plan_identity():
+def _assert_qlora_expert_modules_import_without_loading_models():
+    script = """
+import sys
+import xorl.qlora.utils
+import xorl.qlora.modules.moe_experts
+assert "xorl.models" not in sys.modules
+assert not any(name.startswith("xorl.models.") for name in sys.modules)
+"""
+    result = subprocess.run([sys.executable, "-c", script], check=False, capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+
+
+def _assert_inactive_capabilities_do_not_change_plan_identity():
     module = NF4QLoRAMoeExperts(
         num_local_experts=2,
         num_experts=2,
@@ -49,7 +68,7 @@ def test_inactive_optional_backend_capabilities_do_not_change_plan_identity():
     assert replace(contract, backend=expanded_backend).config_guard_fields() == contract.config_guard_fields()
 
 
-def test_quantized_expert_contract_preserves_requested_projection_subset():
+def _assert_expert_factor_ownership_and_checkpoint_policy():
     module = NF4QLoRAMoeExperts(
         num_local_experts=2,
         num_experts=4,
@@ -87,8 +106,11 @@ def test_quantized_expert_contract_preserves_requested_projection_subset():
         "down_proj_lora_B": "ep_sum",
     }
 
+    _assert_unquantized_contract_omits_structural_zeros()
+    _assert_quantized_eager_contract_is_local_only()
 
-def test_unquantized_expert_contract_omits_structural_zero_factors_from_checkpoints():
+
+def _assert_unquantized_contract_omits_structural_zeros():
     module = MoEExpertsLoRA(
         num_experts=4,
         hidden_dim=8,
@@ -102,7 +124,7 @@ def test_unquantized_expert_contract_omits_structural_zero_factors_from_checkpoi
     )
 
 
-def test_quantized_eager_contract_is_local_only_until_ep_is_certified():
+def _assert_quantized_eager_contract_is_local_only():
     module = NF4QLoRAMoeExperts(
         num_local_experts=2,
         num_experts=2,
@@ -120,7 +142,7 @@ def test_quantized_eager_contract_is_local_only_until_ep_is_certified():
     assert contract.backend.supported_dispatch_methods == ()
 
 
-def test_generic_quantized_contract_rejects_non_silu_semantics():
+def _assert_generic_expert_semantics_preservation_policy():
     module = NF4QLoRAMoeExperts(
         num_local_experts=2,
         num_experts=2,
@@ -136,8 +158,13 @@ def test_generic_quantized_contract_rejects_non_silu_semantics():
     with pytest.raises(ValueError, match="cannot preserve"):
         _ = module.expert_adapter_gradient_contract
 
+    _assert_quantized_contract_accepts_standard_silu()
+    _assert_unquantized_wrapper_rejects_unpreserved_semantics()
+    _assert_unquantized_wrapper_preserves_standard_silu()
+    _assert_expert_adapter_fail_closed_policy()
 
-def test_quantized_contract_accepts_xorl_standard_silu_source_module():
+
+def _assert_quantized_contract_accepts_standard_silu():
     source = MoEExperts(
         num_experts=2,
         hidden_dim=8,
@@ -157,8 +184,7 @@ def test_quantized_contract_accepts_xorl_standard_silu_source_module():
     assert wrapped.expert_adapter_gradient_contract.projection_roles == ("gate_proj", "down_proj")
 
 
-@pytest.mark.parametrize("unsupported_semantics", ("non_gated", "clamped", "bias", "non_silu"))
-def test_generic_unquantized_wrapper_rejects_unpreserved_expert_semantics(unsupported_semantics):
+def _assert_generic_unquantized_wrapper_rejects(unsupported_semantics):
     if unsupported_semantics == "non_gated":
         source = MoEExperts(
             num_experts=2,
@@ -187,7 +213,12 @@ def test_generic_unquantized_wrapper_rejects_unpreserved_expert_semantics(unsupp
         MoEExpertsLoRA.from_module(source, r=2, lora_alpha=2)
 
 
-def test_generic_unquantized_wrapper_preserves_standard_silu_with_native_activation_flag():
+def _assert_unquantized_wrapper_rejects_unpreserved_semantics():
+    for unsupported_semantics in ("non_gated", "clamped", "bias", "non_silu"):
+        _assert_generic_unquantized_wrapper_rejects(unsupported_semantics)
+
+
+def _assert_unquantized_wrapper_preserves_standard_silu():
     source = MoEExperts(
         num_experts=2,
         hidden_dim=8,
@@ -202,7 +233,14 @@ def test_generic_unquantized_wrapper_preserves_standard_silu_with_native_activat
     assert wrapped.moe_implementation == "native"
 
 
-def test_injection_passes_exact_expert_target_subset(monkeypatch):
+def test_expert_adapter_injection_and_model_family_construction_policy(monkeypatch):
+    with monkeypatch.context() as case_patch:
+        _assert_injection_passes_exact_expert_target_subset(case_patch)
+    with monkeypatch.context() as case_patch:
+        _assert_model_family_expert_adapter_construction_policy(case_patch)
+
+
+def _assert_injection_passes_exact_expert_target_subset(monkeypatch):
     class _Experts(nn.Module):
         def __init__(self):
             super().__init__()
@@ -246,7 +284,7 @@ def test_injection_passes_exact_expert_target_subset(monkeypatch):
     assert set(dict(model.block.experts.named_parameters())) == {"down_proj_lora_A", "down_proj_lora_B"}
 
 
-def test_glm4_generic_qlora_construction_and_checkpoint_buffer_are_model_independent(monkeypatch):
+def _assert_model_family_expert_adapter_construction_policy(monkeypatch):
     from xorl.models.transformers.glm4_moe import modeling_glm4_moe  # noqa: PLC0415
     from xorl.models.transformers.glm4_moe.configuration_glm4_moe import Glm4MoeConfig  # noqa: PLC0415
     from xorl.models.transformers.glm4_moe.modeling_glm4_moe import Glm4MoeForCausalLM  # noqa: PLC0415
@@ -272,6 +310,7 @@ def test_glm4_generic_qlora_construction_and_checkpoint_buffer_are_model_indepen
     config._attn_implementation = "eager"
     config._ep_dispatch = "alltoall"
     model = Glm4MoeForCausalLM(config)
+    _assert_glm4_mtp_tail_checkpoint_policy(model.get_checkpoint_handler())
 
     inject_qlora_into_model(
         model,
@@ -295,8 +334,29 @@ def test_glm4_generic_qlora_construction_and_checkpoint_buffer_are_model_indepen
     )
     assert handler._qlora_expert_buffer is not None
 
+    _assert_qwen3_quack_nf4_construction(monkeypatch)
+    _assert_qwen35_quack_lora_construction()
 
-def test_qwen3_moe_quack_nf4_construction_restores_exact_expert_targets(monkeypatch):
+
+def _assert_glm4_mtp_tail_checkpoint_policy(handler):
+    tensor = torch.randn(2, 3)
+    mtp_layer = handler._mtp_layer_prefix.removesuffix(".")
+    for source_suffix, target in (
+        ("embed_tokens.weight", "model.embed_tokens.weight"),
+        ("shared_head.norm.weight", "model.norm.weight"),
+        ("shared_head.head.weight", "lm_head.weight"),
+    ):
+        remapped = handler.on_load_weight(f"{mtp_layer}.{source_suffix}", tensor)
+        assert len(remapped) == 1
+        assert remapped[0][0] == target
+        torch.testing.assert_close(remapped[0][1], tensor)
+
+    assert handler.on_load_weight(f"{mtp_layer}.eh_proj.weight", tensor) == []
+    assert handler.on_load_weight(f"{mtp_layer}.enorm.weight", tensor) == []
+    assert handler.on_load_weight(f"{mtp_layer}.transformer_layer.self_attn.q_proj.weight", tensor) == []
+
+
+def _assert_qwen3_quack_nf4_construction(monkeypatch):
     from xorl.models.transformers.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig  # noqa: PLC0415
     from xorl.models.transformers.qwen3_moe.modeling_qwen3_moe import Qwen3MoeForCausalLM  # noqa: PLC0415
 
@@ -344,7 +404,7 @@ def test_qwen3_moe_quack_nf4_construction_restores_exact_expert_targets(monkeypa
     assert experts._source_fqn == "model.layers.0.mlp.experts"
 
 
-def test_qwen35_moe_quack_lora_construction_preserves_expert_semantics():
+def _assert_qwen35_quack_lora_construction():
     from xorl.models.transformers.qwen3_5_moe.configuration_qwen3_5_moe import (  # noqa: PLC0415
         Qwen3_5MoeConfig,
     )
@@ -387,7 +447,7 @@ def test_qwen35_moe_quack_lora_construction_preserves_expert_semantics():
     )
 
 
-def test_quantized_expert_construction_rejects_ignored_group_size():
+def _assert_expert_adapter_fail_closed_policy():
     source = MoEExperts(
         num_experts=2,
         hidden_dim=64,
@@ -404,9 +464,12 @@ def test_quantized_expert_construction_rejects_ignored_group_size():
             quant_group_size=32,
         )
 
+    _assert_model_specific_semantics_fail_closed()
+    _assert_quantized_targets_fail_closed()
+    _assert_unquantized_targets_fail_closed()
 
-@pytest.mark.parametrize("family", ("minimax", "gpt_oss", "nemotron"))
-def test_model_specific_expert_semantics_remain_explicitly_fail_closed(family):
+
+def _assert_model_specific_expert_semantics_fail_closed(family):
     if family == "minimax":
         from xorl.models.transformers.minimax_m3.configuration_minimax_m3 import (  # noqa: PLC0415
             MiniMaxM3Config,
@@ -484,30 +547,32 @@ def test_model_specific_expert_semantics_remain_explicitly_fail_closed(family):
         )
 
 
-@pytest.mark.parametrize(
-    "targets",
-    ([], ["router"], ["gate_proj", "router"], ["gate_proj", "gate_proj"]),
-)
-def test_quantized_expert_targets_fail_closed(targets):
-    with pytest.raises(ValueError, match="target_modules"):
-        NF4QLoRAMoeExperts(
-            num_local_experts=2,
-            num_experts=4,
-            intermediate_size=8,
-            hidden_size=8,
-            r=2,
-            lora_alpha=2,
-            device=torch.device("cpu"),
-            target_modules=targets,
-        )
+def _assert_model_specific_semantics_fail_closed():
+    for family in ("minimax", "gpt_oss", "nemotron"):
+        _assert_model_specific_expert_semantics_fail_closed(family)
 
 
-@pytest.mark.parametrize("targets", ([], ["router"], ["gate_proj", "gate_proj"]))
-def test_unquantized_expert_targets_fail_closed(targets):
-    with pytest.raises(ValueError, match="target_modules"):
-        MoEExpertsLoRA(
-            num_experts=4,
-            hidden_dim=8,
-            intermediate_size=8,
-            lora_config=MoELoRAConfig(target_modules=targets),
-        )
+def _assert_quantized_targets_fail_closed():
+    for targets in ([], ["router"], ["gate_proj", "router"], ["gate_proj", "gate_proj"]):
+        with pytest.raises(ValueError, match="target_modules"):
+            NF4QLoRAMoeExperts(
+                num_local_experts=2,
+                num_experts=4,
+                intermediate_size=8,
+                hidden_size=8,
+                r=2,
+                lora_alpha=2,
+                device=torch.device("cpu"),
+                target_modules=targets,
+            )
+
+
+def _assert_unquantized_targets_fail_closed():
+    for targets in ([], ["router"], ["gate_proj", "gate_proj"]):
+        with pytest.raises(ValueError, match="target_modules"):
+            MoEExpertsLoRA(
+                num_experts=4,
+                hidden_dim=8,
+                intermediate_size=8,
+                lora_config=MoELoRAConfig(target_modules=targets),
+            )

@@ -15,7 +15,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from tests._helpers.opd import save_tensor_file
+from tests._helpers.opd import FakeMooncakeClient, save_tensor_file
 from xorl.distillation import (
     MooncakeHiddenStore,
     MooncakeStoreConfig,
@@ -34,47 +34,22 @@ from xorl.distillation.mooncake_hidden_store import (
 pytestmark = [pytest.mark.cpu]
 
 
-class FakeMooncakeClient:
-    """In-memory stand-in for ``mooncake.store.MooncakeDistributedStore``."""
-
-    def __init__(self) -> None:
-        self.objects: dict[str, bytes] = {}
-        self.put_calls: list[str] = []
-        self.get_calls: list[str] = []
-        self.removed: list[str] = []
-
-    def put(self, key: str, value: bytes) -> int:
-        self.objects[key] = bytes(value)
-        self.put_calls.append(key)
-        return 0
-
-    def get(self, key: str) -> bytes:
-        self.get_calls.append(key)
-        return self.objects.get(key, b"")
-
-    def is_exist(self, key: str) -> int:
-        return 1 if key in self.objects else 0
-
-    def remove(self, key: str) -> int:
-        self.objects.pop(key, None)
-        self.removed.append(key)
-        return 0
-
-
 def _store() -> tuple[MooncakeHiddenStore, FakeMooncakeClient]:
     client = FakeMooncakeClient()
     return MooncakeHiddenStore(client=client, get_retry_max_wait_s=0.0), client
 
 
-def test_byte_roundtrip_preserves_bfloat16_and_int64():
+def _assert_mooncake_tensor_codec_policy():
     for dtype in (torch.bfloat16, torch.float16, torch.float32, torch.int64):
         tensor = (torch.arange(12).reshape(3, 4) % 5).to(dtype)
         restored = bytes_to_tensor(tensor_to_bytes(tensor), (3, 4), dtype)
         assert torch.equal(restored, tensor)
         assert restored.dtype == dtype
 
+    _assert_dtype_string_mapping_is_canonical()
 
-def test_dtype_string_mapping_is_canonical():
+
+def _assert_dtype_string_mapping_is_canonical():
     assert dtype_to_str(torch.bfloat16) == "bfloat16"
     assert str_to_dtype("bf16") is torch.bfloat16
     assert str_to_dtype("torch.float32") is torch.float32
@@ -82,7 +57,9 @@ def test_dtype_string_mapping_is_canonical():
         str_to_dtype("complex128")
 
 
-def test_put_hidden_returns_metadata_contract():
+def test_mooncake_hidden_transport_policy():
+    _assert_mooncake_tensor_codec_policy()
+
     store, client = _store()
     tensor = torch.randn(7, 5, dtype=torch.bfloat16)
 
@@ -100,8 +77,12 @@ def test_put_hidden_returns_metadata_contract():
     assert client.put_calls == ["opd/req-1/teacher/0/hidden/hidden_states"]
     assert is_mooncake_entry(meta)
 
+    _assert_put_get_roundtrip_via_metadata()
+    _assert_rank3_layer_cache_roundtrip_and_token_count()
+    _assert_mooncake_teacher_activation_consumer_policy()
 
-def test_put_get_roundtrip_via_metadata():
+
+def _assert_put_get_roundtrip_via_metadata():
     store, _ = _store()
     tensor = torch.randn(9, 6, dtype=torch.bfloat16)
     meta = store.put_hidden("k", tensor)
@@ -112,7 +93,7 @@ def test_put_get_roundtrip_via_metadata():
     assert torch.equal(fetched, tensor)
 
 
-def test_rank3_layer_cache_roundtrip_and_token_count():
+def _assert_rank3_layer_cache_roundtrip_and_token_count():
     store, _ = _store()
     # [layers, tokens, hidden]
     tensor = torch.randn(3, 8, 4, dtype=torch.bfloat16)
@@ -124,7 +105,7 @@ def test_rank3_layer_cache_roundtrip_and_token_count():
     assert torch.equal(fetched, tensor)
 
 
-def test_teacher_activation_cache_indexes_mooncake_entry():
+def _assert_mooncake_teacher_activation_consumer_policy():
     store, _ = _store()
     cache_tensor = torch.arange(12, dtype=torch.float32).reshape(6, 2)
     meta = store.put_hidden("opd/req/teacher/0/hidden", cache_tensor)
@@ -139,8 +120,11 @@ def test_teacher_activation_cache_indexes_mooncake_entry():
     finally:
         tac.close()
 
+    _assert_teacher_activation_cache_rank3_mooncake_entry()
+    _assert_multi_teacher_mooncake_caches()
 
-def test_teacher_activation_cache_rank3_mooncake_entry():
+
+def _assert_teacher_activation_cache_rank3_mooncake_entry():
     store, _ = _store()
     layer_cache = torch.randn(4, 6, 3, dtype=torch.float32)  # [L, tokens, d]
     meta = store.put_hidden("layer", layer_cache)
@@ -157,7 +141,7 @@ def test_teacher_activation_cache_rank3_mooncake_entry():
         tac.close()
 
 
-def test_multi_teacher_mooncake_caches(tmp_path):
+def _assert_multi_teacher_mooncake_caches():
     store, _ = _store()
     cache_a = torch.arange(8, dtype=torch.float32).reshape(4, 2)
     cache_b = torch.arange(100, 110, dtype=torch.float32).reshape(5, 2)
@@ -174,7 +158,7 @@ def test_multi_teacher_mooncake_caches(tmp_path):
         tac.close()
 
 
-def test_non_mooncake_entry_is_rejected(tmp_path):
+def test_mooncake_metadata_admission_and_store_lifecycle_policy(tmp_path, monkeypatch):
     # The file-backed safetensors cache path was removed; a path/str entry must
     # now fail loudly rather than silently load a file.
     store, _ = _store()
@@ -186,8 +170,13 @@ def test_non_mooncake_entry_is_rejected(tmp_path):
     finally:
         tac.close()
 
+    _assert_get_missing_key_raises()
+    _assert_size_mismatch_raises()
+    _assert_parse_mooncake_metadata_rejects_malformed()
+    _assert_mooncake_store_lifecycle_and_configuration_policy(monkeypatch)
 
-def test_get_missing_key_raises():
+
+def _assert_get_missing_key_raises():
     store, _ = _store()
     meta = {
         "backend": "mooncake",
@@ -200,7 +189,7 @@ def test_get_missing_key_raises():
         store.get_hidden_from_metadata(meta)
 
 
-def test_size_mismatch_raises():
+def _assert_size_mismatch_raises():
     store, client = _store()
     tensor = torch.randn(4, 2, dtype=torch.float32)
     meta = store.put_hidden("k", tensor)
@@ -210,37 +199,37 @@ def test_size_mismatch_raises():
         store.get_hidden_from_metadata(meta)
 
 
-@pytest.mark.parametrize(
-    "mutate",
-    [
+def _assert_parse_mooncake_metadata_rejects_malformed():
+    mutations = (
         lambda m: m.pop("key"),
         lambda m: m.pop("tensor_shapes"),
         lambda m: m.pop("tensor_dtypes"),
         lambda m: m["tensor_shapes"].__setitem__("hidden_states", [1, 2, 3, 4]),
-    ],
-)
-def test_parse_mooncake_metadata_rejects_malformed(mutate):
-    meta = {
-        "backend": "mooncake",
-        "key": "k",
-        "tensor_key": "hidden_states",
-        "tensor_shapes": {"hidden_states": [3, 2]},
-        "tensor_dtypes": {"hidden_states": "float32"},
-    }
-    mutate(meta)
-    with pytest.raises(ValueError):
-        parse_mooncake_metadata(meta)
+    )
+    for mutate in mutations:
+        meta = {
+            "backend": "mooncake",
+            "key": "k",
+            "tensor_key": "hidden_states",
+            "tensor_shapes": {"hidden_states": [3, 2]},
+            "tensor_dtypes": {"hidden_states": "float32"},
+        }
+        mutate(meta)
+        with pytest.raises(ValueError):
+            parse_mooncake_metadata(meta)
 
 
-def test_remove_hidden_is_best_effort():
+def _assert_mooncake_store_lifecycle_and_configuration_policy(monkeypatch):
     store, client = _store()
     tensor = torch.randn(2, 2)
     meta = store.put_hidden("k", tensor)
     store.remove_hidden(meta["key"])
     assert client.removed == ["k/hidden_states"]
 
+    _assert_store_config_overrides_win_over_env(monkeypatch)
 
-def test_store_config_overrides_win_over_env(monkeypatch):
+
+def _assert_store_config_overrides_win_over_env(monkeypatch):
     monkeypatch.setenv("MOONCAKE_MASTER_SERVER", "envhost:50051")
     cfg = MooncakeStoreConfig.from_env(overrides={"master_server_address": "pinned:9999"})
     assert cfg.master_server_address == "pinned:9999"

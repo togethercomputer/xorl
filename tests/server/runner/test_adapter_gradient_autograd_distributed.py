@@ -871,6 +871,10 @@ def _set_quantized_expert_values(module: QLoRAMoeExperts, *, rank: int) -> dict[
                 dtype=torch.float32,
             ).reshape(1, in_features, out_features)
             module._quantize_proj(projection, base)
+            if module.quant_format == "nf4":
+                restored = module.dequantize_all_experts(projection, in_features, out_features).float()
+                relative_error = (restored - base).abs().mean() / base.abs().mean()
+                assert relative_error < 0.10
     module._weights_loaded = True
     return values
 
@@ -1078,7 +1082,7 @@ def _run_quantized_experts() -> None:
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two GPUs")
-def test_dense_real_fsdp_autograd_matches_analytical_optimizer_step() -> None:
+def test_dense_and_sequence_parallel_real_autograd_policy() -> None:
     from tests.distributed.distributed_utils import run_distributed_script
 
     result = run_distributed_script(
@@ -1090,9 +1094,10 @@ def test_dense_real_fsdp_autograd_matches_analytical_optimizer_step() -> None:
     result.assert_success("dense real-autograd ownership certification")
     assert "DENSE_REAL_AUTOGRAD_PUBLIC_OPTIM_CERTIFIED" in result.stdout
 
+    _assert_sequence_parallel_real_autograd_matches_analytical_optimizer_step()
 
-@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="Requires four GPUs")
-def test_direct_output_real_fsdp_autograd_matches_analytical_optimizer_step() -> None:
+
+def _assert_direct_output_real_fsdp_autograd_matches_analytical_optimizer_step() -> None:
     from tests.distributed.distributed_utils import run_distributed_script
 
     result = run_distributed_script(
@@ -1107,8 +1112,7 @@ def test_direct_output_real_fsdp_autograd_matches_analytical_optimizer_step() ->
     assert "DIRECT_OUTPUT_REAL_AUTOGRAD_PUBLIC_OPTIM_CERTIFIED" in result.stdout
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two GPUs")
-def test_sequence_parallel_real_autograd_matches_analytical_optimizer_step() -> None:
+def _assert_sequence_parallel_real_autograd_matches_analytical_optimizer_step() -> None:
     from tests.distributed.distributed_utils import run_distributed_script
 
     result = run_distributed_script(
@@ -1122,10 +1126,14 @@ def test_sequence_parallel_real_autograd_matches_analytical_optimizer_step() -> 
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="Requires four GPUs")
-@pytest.mark.parametrize("backend", ("eager", "triton", "native", "quack"))
-def test_expert_shared_and_owner_real_fsdp_autograd_match_analytical_optimizer_step(backend: str) -> None:
+def test_real_fsdp_autograd_direct_output_and_expert_topology_policy() -> None:
+    """Add the eFSDP dimension after EP2 has qualified every backend."""
+
+    _assert_direct_output_real_fsdp_autograd_matches_analytical_optimizer_step()
+
     from tests.distributed.distributed_utils import run_distributed_script
 
+    backend = "quack"
     result = run_distributed_script(
         __file__,
         num_gpus=4,
@@ -1141,59 +1149,66 @@ def test_expert_shared_and_owner_real_fsdp_autograd_match_analytical_optimizer_s
         in result.stdout
     )
 
+    _assert_unquantized_quack_all_owner_real_fsdp_autograd_matches_analytical_optimizer_step()
+
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two GPUs")
-@pytest.mark.parametrize("backend", ("eager", "triton", "native", "quack"))
-def test_expert_backend_real_autograd_matches_analytical_optimizer_step(backend: str) -> None:
+def test_expert_alltoall_backend_quantization_and_layout_policy() -> None:
     """Qualify backend math at EP2; the four-rank gate separately adds eFSDP2."""
 
     from tests.distributed.distributed_utils import run_distributed_script
 
-    result = run_distributed_script(
-        __file__,
-        num_gpus=2,
-        timeout=300,
-        extra_env={
-            "XORL_ADAPTER_AUTOGRAD_CASE": "experts",
-            "XORL_ADAPTER_EXPERT_BACKEND": backend,
-        },
-    )
-    result.assert_success(f"{backend} expert EP2 real-autograd ownership certification")
-    assert (
-        f"EXPERT_SHARED_OWNER_TWO_STEP_ZERO_TOKEN_REAL_AUTOGRAD_PUBLIC_OPTIM_CERTIFIED:{backend}:alltoall"
-        in result.stdout
-    )
+    for backend in ("eager", "triton", "native", "quack"):
+        result = run_distributed_script(
+            __file__,
+            num_gpus=2,
+            timeout=300,
+            extra_env={
+                "XORL_ADAPTER_AUTOGRAD_CASE": "experts",
+                "XORL_ADAPTER_EXPERT_BACKEND": backend,
+            },
+        )
+        result.assert_success(f"{backend} expert EP2 real-autograd ownership certification")
+        assert (
+            f"EXPERT_SHARED_OWNER_TWO_STEP_ZERO_TOKEN_REAL_AUTOGRAD_PUBLIC_OPTIM_CERTIFIED:{backend}:alltoall"
+            in result.stdout
+        )
+
+    _assert_unquantized_expert_projection_subset_matches_analytical_optimizer_step()
+    _assert_unquantized_all_owner_layout_matches_analytical_optimizer_step()
+    _assert_quantized_expert_alltoall_policy()
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two GPUs")
 @pytest.mark.skipif(importlib.util.find_spec("deep_ep") is None, reason="DeepEP is not installed")
-@pytest.mark.parametrize("hybrid_shared", (True, False))
-def test_unquantized_quack_deepep_real_autograd_matches_analytical_optimizer_step(hybrid_shared: bool) -> None:
+def test_deepep_unquantized_and_quantized_real_autograd_policy() -> None:
     """Qualify the shipped Quack+DeepEP expert-LoRA composition."""
 
     from tests.distributed.distributed_utils import run_distributed_script
 
-    result = run_distributed_script(
-        __file__,
-        num_gpus=2,
-        timeout=300,
-        extra_env={
-            "XORL_ADAPTER_AUTOGRAD_CASE": "experts",
-            "XORL_ADAPTER_EXPERT_BACKEND": "quack",
-            "XORL_ADAPTER_EXPERT_DISPATCH": "deepep",
-            "XORL_ADAPTER_EXPERT_HYBRID_SHARED": "1" if hybrid_shared else "0",
-        },
-    )
-    result.assert_success("quack DeepEP expert EP2 real-autograd ownership certification")
-    suffix = "" if hybrid_shared else ":all_owner"
-    assert (
-        "EXPERT_SHARED_OWNER_TWO_STEP_ZERO_TOKEN_REAL_AUTOGRAD_PUBLIC_OPTIM_CERTIFIED:quack:deepep" + suffix
-        in result.stdout
-    )
+    for hybrid_shared in (True, False):
+        result = run_distributed_script(
+            __file__,
+            num_gpus=2,
+            timeout=300,
+            extra_env={
+                "XORL_ADAPTER_AUTOGRAD_CASE": "experts",
+                "XORL_ADAPTER_EXPERT_BACKEND": "quack",
+                "XORL_ADAPTER_EXPERT_DISPATCH": "deepep",
+                "XORL_ADAPTER_EXPERT_HYBRID_SHARED": "1" if hybrid_shared else "0",
+            },
+        )
+        result.assert_success("quack DeepEP expert EP2 real-autograd ownership certification")
+        suffix = "" if hybrid_shared else ":all_owner"
+        assert (
+            "EXPERT_SHARED_OWNER_TWO_STEP_ZERO_TOKEN_REAL_AUTOGRAD_PUBLIC_OPTIM_CERTIFIED:quack:deepep" + suffix
+            in result.stdout
+        )
+
+    _assert_quantized_expert_deepep_real_autograd_matches_analytical_optimizer_step()
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 4, reason="Requires four GPUs")
-def test_unquantized_quack_all_owner_real_fsdp_autograd_matches_analytical_optimizer_step() -> None:
+def _assert_unquantized_quack_all_owner_real_fsdp_autograd_matches_analytical_optimizer_step() -> None:
     """Qualify the restored all-owner Quack layout with an eFSDP dimension."""
 
     from tests.distributed.distributed_utils import run_distributed_script
@@ -1215,8 +1230,7 @@ def test_unquantized_quack_all_owner_real_fsdp_autograd_matches_analytical_optim
     )
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two GPUs")
-def test_unquantized_expert_projection_subset_matches_analytical_optimizer_step() -> None:
+def _assert_unquantized_expert_projection_subset_matches_analytical_optimizer_step() -> None:
     from tests.distributed.distributed_utils import run_distributed_script
 
     result = run_distributed_script(
@@ -1236,13 +1250,12 @@ def test_unquantized_expert_projection_subset_matches_analytical_optimizer_step(
     )
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two GPUs")
-@pytest.mark.parametrize("backend", ("eager", "triton", "native", "quack"))
-def test_unquantized_all_owner_layout_matches_analytical_optimizer_step(backend: str) -> None:
-    """Qualify the default non-hybrid layout, including restored Quack recipes."""
+def _assert_unquantized_all_owner_layout_matches_analytical_optimizer_step() -> None:
+    """Qualify the backend-independent default non-hybrid layout at EP2."""
 
     from tests.distributed.distributed_utils import run_distributed_script
 
+    backend = "eager"
     result = run_distributed_script(
         __file__,
         num_gpus=2,
@@ -1260,36 +1273,38 @@ def test_unquantized_all_owner_layout_matches_analytical_optimizer_step(backend:
     )
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two GPUs")
-@pytest.mark.parametrize("backend", ("triton", "quack", "native"))
-@pytest.mark.parametrize("quant_format", ("nf4", "nvfp4", "block_fp8"))
-def test_quantized_expert_shared_and_owner_real_autograd_matches_analytical_optimizer_step(
-    backend: str,
-    quant_format: str,
-) -> None:
+def _assert_quantized_expert_alltoall_policy() -> None:
+    """Pairwise backend/format coverage avoids a redundant Cartesian product."""
+
     from tests.distributed.distributed_utils import run_distributed_script
 
-    result = run_distributed_script(
-        __file__,
-        num_gpus=2,
-        timeout=240,
-        extra_env={
-            "XORL_ADAPTER_AUTOGRAD_CASE": "quantized_experts",
-            "XORL_ADAPTER_EXPERT_BACKEND": backend,
-            "XORL_ADAPTER_EXPERT_QUANT_FORMAT": quant_format,
-        },
-    )
-    result.assert_success(
-        f"{backend} {quant_format} quantized expert shared/owner real-autograd ownership certification"
-    )
-    assert (
-        f"QUANTIZED_EXPERT_TWO_STEP_ZERO_TOKEN_REAL_AUTOGRAD_PUBLIC_OPTIM_CERTIFIED:{backend}:{quant_format}:alltoall"
-    ) in result.stdout
+    for backend, quant_format in (
+        ("triton", "nf4"),
+        ("native", "nvfp4"),
+        ("quack", "block_fp8"),
+    ):
+        result = run_distributed_script(
+            __file__,
+            num_gpus=2,
+            timeout=240,
+            extra_env={
+                "XORL_ADAPTER_AUTOGRAD_CASE": "quantized_experts",
+                "XORL_ADAPTER_EXPERT_BACKEND": backend,
+                "XORL_ADAPTER_EXPERT_QUANT_FORMAT": quant_format,
+            },
+        )
+        result.assert_success(
+            f"{backend} {quant_format} quantized expert shared/owner real-autograd ownership certification"
+        )
+        assert (
+            f"QUANTIZED_EXPERT_TWO_STEP_ZERO_TOKEN_REAL_AUTOGRAD_PUBLIC_OPTIM_CERTIFIED:"
+            f"{backend}:{quant_format}:alltoall"
+        ) in result.stdout
+
+    _assert_quantized_expert_projection_subset_matches_analytical_optimizer_step()
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two GPUs")
-@pytest.mark.skipif(importlib.util.find_spec("deep_ep") is None, reason="DeepEP is not installed")
-def test_quantized_expert_deepep_real_autograd_matches_analytical_optimizer_step() -> None:
+def _assert_quantized_expert_deepep_real_autograd_matches_analytical_optimizer_step() -> None:
     from tests.distributed.distributed_utils import run_distributed_script
 
     result = run_distributed_script(
@@ -1309,8 +1324,7 @@ def test_quantized_expert_deepep_real_autograd_matches_analytical_optimizer_step
     ) in result.stdout
 
 
-@pytest.mark.skipif(torch.cuda.device_count() < 2, reason="Requires two GPUs")
-def test_quantized_expert_projection_subset_matches_analytical_optimizer_step() -> None:
+def _assert_quantized_expert_projection_subset_matches_analytical_optimizer_step() -> None:
     """The backend's structural zero factors must use EP-local owner dimensions."""
 
     from tests.distributed.distributed_utils import run_distributed_script

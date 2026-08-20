@@ -40,12 +40,6 @@ def tiny_moe_model_dir_with_weights(tmp_workspace):
 
 
 @pytest.fixture
-def small_dense_model_dir_with_weights(tmp_workspace):
-    """Small Qwen3 dense model (hidden=256) with saved weights."""
-    return create_tiny_model_dir(tmp_workspace, model_type="dense_large", save_weights=True)
-
-
-@pytest.fixture
 def small_moe_model_dir_with_weights(tmp_workspace):
     """Small Qwen3-MoE model (moe_intermediate=64) with saved weights.
 

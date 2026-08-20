@@ -33,7 +33,7 @@ from xorl.trainers.training_utils import sync_lm_head_tp_gradient, sync_lm_head_
 pytestmark = [pytest.mark.cpu, pytest.mark.distributed]
 
 
-def _run_case(dp_replicate: int, dp_shard: int, ulysses: int, lm_head_tp: int) -> None:
+def _run_case(dp_replicate: int, dp_shard: int, ulysses: int, lm_head_tp: int, ep_size: int = 1) -> None:
     dist.init_process_group(backend="gloo")
     try:
         dp_size = dp_replicate * dp_shard
@@ -42,11 +42,20 @@ def _run_case(dp_replicate: int, dp_shard: int, ulysses: int, lm_head_tp: int) -
             dp_replicate_size=dp_replicate,
             dp_shard_size=dp_shard,
             ulysses_size=ulysses,
+            ep_size=ep_size,
             lm_head_tp_size=lm_head_tp,
             device_type="cpu",
         )
         ps = get_parallel_state()
         rank = dist.get_rank()
+        if ep_size > 1:
+            assert ps.ep_size == ep_size
+            assert ps.ep_enabled
+            assert ps.ep_fsdp_device_mesh is not None
+            expected_tp = {0: [0, 1], 1: [0, 1], 2: [2, 3], 3: [2, 3]}[rank]
+            expected_replica = {0: [0, 2], 1: [1, 3], 2: [0, 2], 3: [1, 3]}[rank]
+            assert dist.get_process_group_ranks(ps.lm_head_tp_group) == expected_tp
+            assert dist.get_process_group_ranks(ps.lm_head_tp_replica_group) == expected_replica
         # rank layout with pp=dp_replicate=ringattn=tp=1:
         # - CP-sourced lm-head TP: rank = dp_idx * ulysses + cp_idx.
         # - no-CP DP-sourced lm-head TP: ulysses=1, so dp_idx=rank and cp_idx=0.
@@ -153,7 +162,7 @@ def _run_case(dp_replicate: int, dp_shard: int, ulysses: int, lm_head_tp: int) -
         # local hidden grad matches the reference slice for this (dp, seq) shard.
         ref_hidden_grad = ref_hiddens[dp_idx].grad[:, cp_idx * local_seq : (cp_idx + 1) * local_seq, :]
         torch.testing.assert_close(local_hidden.grad, ref_hidden_grad, rtol=1e-4, atol=1e-5)
-        print(f"rank{rank} dp_replicate={dp_replicate} dp_shard={dp_shard} OK loss={loss.item():.6f}")
+        print(f"rank{rank} dp_replicate={dp_replicate} dp_shard={dp_shard} ep={ep_size} OK loss={loss.item():.6f}")
     finally:
         dist.destroy_process_group()
 
@@ -281,71 +290,44 @@ if __name__ != "__main__":
 
     SCRIPT_PATH = os.path.abspath(__file__)
 
-    def test_lm_head_tp_fsdp_e2e_dp1_cpu():
-        # dp=1, cp=4, lm_head_tp=2 -> cp_replica=2 (replica dim is purely sequence).
-        result = run_distributed_script(
-            SCRIPT_PATH, num_gpus=4, timeout=180, extra_env={"XORL_LMHEAD_E2E_CFG": "1,1,4,2"}
+    def test_lm_head_tp_fsdp_topology_and_loss_mode_policy():
+        cases = (
+            ("cp-replica-dp1", "1,1,4,2", None),
+            ("cp-dp2-ep2", "1,2,2,2,2", None),
+            ("no-cp-dp", "1,4,1,2", None),
+            ("no-cp-hsdp", "2,2,1,2", None),
+            ("opd-no-cp-dp", "1,4,1,2", "opd"),
+            ("opd-no-cp-hsdp", "2,2,1,2", "opd"),
         )
-        result.assert_success()
-
-    def test_lm_head_tp_fsdp_e2e_dp2_cpu():
-        # dp=2, cp=2, lm_head_tp=2 -> cp_replica=1; the replica dim is the DP dim, so
-        # this validates that distinct-batch DP gradients are summed for lm-head TP.
-        result = run_distributed_script(
-            SCRIPT_PATH, num_gpus=4, timeout=180, extra_env={"XORL_LMHEAD_E2E_CFG": "1,2,2,2"}
-        )
-        result.assert_success()
-
-    def test_lm_head_tp_fsdp_e2e_nocp_dp_cpu():
-        # dp=4, no CP, lm_head_tp=2 -> lm-head TP groups are carved from DP ranks.
-        # The loss gathers hidden states across the TP group, so distinct DP batches
-        # can share a vocab-parallel CE while replica groups sum the same vocab shard.
-        result = run_distributed_script(
-            SCRIPT_PATH, num_gpus=4, timeout=180, extra_env={"XORL_LMHEAD_E2E_CFG": "1,4,1,2"}
-        )
-        result.assert_success()
-
-    def test_lm_head_tp_fsdp_e2e_nocp_hsdp_cpu():
-        # HSDP no-CP case: dp_replicate=2, dp_shard=2, lm_head_tp=2. The
-        # lm-head TP group is carved inside each shard row; the replica group
-        # spans both HSDP replicas for the same vocab shard.
-        result = run_distributed_script(
-            SCRIPT_PATH, num_gpus=4, timeout=180, extra_env={"XORL_LMHEAD_E2E_CFG": "2,2,1,2"}
-        )
-        result.assert_success()
-
-    def test_lm_head_tp_opd_fsdp_e2e_nocp_dp_cpu():
-        # Production OPD path: DTensor lm_head.weight row range + matching teacher
-        # rows, with no-CP DP-sourced lm-head TP and replica grad sync.
-        result = run_distributed_script(
-            SCRIPT_PATH,
-            num_gpus=4,
-            timeout=180,
-            extra_env={"XORL_LMHEAD_E2E_CFG": "1,4,1,2", "XORL_LMHEAD_E2E_MODE": "opd"},
-        )
-        result.assert_success()
-
-    def test_lm_head_tp_opd_fsdp_e2e_nocp_hsdp_cpu():
-        # Production OPD path under HSDP composition.
-        result = run_distributed_script(
-            SCRIPT_PATH,
-            num_gpus=4,
-            timeout=180,
-            extra_env={"XORL_LMHEAD_E2E_CFG": "2,2,1,2", "XORL_LMHEAD_E2E_MODE": "opd"},
-        )
-        result.assert_success()
+        for case_id, config, mode in cases:
+            extra_env = {"XORL_LMHEAD_E2E_CFG": config}
+            if mode is not None:
+                extra_env["XORL_LMHEAD_E2E_MODE"] = mode
+            result = run_distributed_script(
+                SCRIPT_PATH,
+                num_gpus=4,
+                timeout=180,
+                extra_env=extra_env,
+            )
+            try:
+                result.assert_success()
+            except AssertionError as error:
+                raise AssertionError(f"{case_id}: {error}") from error
 
 
 if __name__ == "__main__":
     cfg = os.environ.get("XORL_LMHEAD_E2E_CFG", "1,1,4,2")
     parts = [int(x) for x in cfg.split(",")]
     if len(parts) == 3:
-        _rep, _dp, _u, _tp = 1, *parts
+        _rep, _dp, _u, _tp, _ep = 1, *parts, 1
     elif len(parts) == 4:
         _rep, _dp, _u, _tp = parts
+        _ep = 1
+    elif len(parts) == 5:
+        _rep, _dp, _u, _tp, _ep = parts
     else:
-        raise ValueError(f"XORL_LMHEAD_E2E_CFG must have 3 or 4 comma-separated ints, got {cfg!r}")
+        raise ValueError(f"XORL_LMHEAD_E2E_CFG must have 3, 4, or 5 comma-separated ints, got {cfg!r}")
     if os.environ.get("XORL_LMHEAD_E2E_MODE") == "opd":
         _run_opd_case(_rep, _dp, _u, _tp)
     else:
-        _run_case(_rep, _dp, _u, _tp)
+        _run_case(_rep, _dp, _u, _tp, _ep)

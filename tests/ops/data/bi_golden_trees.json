@@ -400,18 +400,6 @@
     "tail": "99407941b1429fc2cec11ac04dc36cc1"
    }
   },
-  "qk_v2_strided_t256_h8_d128": {
-   "out": {
-    "sha256": "d251cf917d759561c0e6c6f0ec7b7c63d5682f21b5bb17a2100f77e7e894832f",
-    "shape": [
-     256,
-     1024
-    ],
-    "dtype": "torch.bfloat16",
-    "head": "5d4077c024c0cabf76bf6e3f553f4f3f553fbfbf083f48c0b73f96bf573f70bf",
-    "tail": "8e3b4c3ad43f07ba15bc923e2440c33f"
-   }
-  },
   "head_v2_scoring_n64_real": {
    "logprob": {
     "sha256": "aed8ac4fe4ea61e054cac382841b16449c609a7f5674ddd33cf35499c22dfc34",

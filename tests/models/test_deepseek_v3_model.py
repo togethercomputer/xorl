@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from xorl.lora.modules import LoraLinear
-from xorl.lora.utils import inject_lora_into_model
+from xorl.lora.utils import inject_lora_into_model_with_moe
 from xorl.models.layers.moe import MoEExpertsLoRA
 from xorl.models.layers.moe.routing_replay import RoutingReplay, set_replay_stage
 from xorl.models.transformers.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
@@ -73,11 +73,14 @@ def test_deepseek_v3_tiny_forward_backward_and_freeze_router():
         if ".gate.weight" in name:
             assert param.requires_grad is False
 
+    _assert_deepseek_v3_default_lora_targets_cover_mla_and_moe()
+    _assert_deepseek_v3_router_observability_and_replay_policy()
 
-def test_deepseek_v3_default_lora_targets_cover_mla_and_moe():
+
+def _assert_deepseek_v3_default_lora_targets_cover_mla_and_moe():
     model = DeepseekV3ForCausalLM(_tiny_config())
 
-    inject_lora_into_model(model, r=4, lora_alpha=8, target_modules=None)
+    inject_lora_into_model_with_moe(model, r=4, lora_alpha=8, target_modules=None)
 
     attn = model.model.layers[0].self_attn
     mlp = model.model.layers[0].mlp
@@ -92,8 +95,20 @@ def test_deepseek_v3_default_lora_targets_cover_mla_and_moe():
     assert isinstance(mlp.shared_experts.down_proj, LoraLinear)
     assert isinstance(mlp.experts, MoEExpertsLoRA)
 
+    explicit_model = DeepseekV3ForCausalLM(_tiny_config())
+    inject_lora_into_model_with_moe(
+        explicit_model,
+        r=4,
+        lora_alpha=8,
+        target_modules=["q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj"],
+    )
+    explicit_attention = explicit_model.model.layers[0].self_attn
+    for projection in ("q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj"):
+        assert isinstance(getattr(explicit_attention, projection), LoraLinear)
+    assert not isinstance(explicit_attention.o_proj, LoraLinear)
 
-def test_deepseek_v3_forward_emits_router_logits_when_aux_loss_is_enabled_by_config():
+
+def _assert_deepseek_v3_router_observability_and_replay_policy():
     config = _tiny_config()
     config.output_router_logits = False
     config.router_aux_loss_coef = 0.001
@@ -107,8 +122,6 @@ def test_deepseek_v3_forward_emits_router_logits_when_aux_loss_is_enabled_by_con
     assert outputs.router_logits is not None
     assert len(outputs.router_logits) == model.config.num_hidden_layers
 
-
-def test_deepseek_v3_router_logits_skip_dense_layers_for_aux_loss():
     config = _tiny_config()
     config.first_k_dense_replace = 1
     config.output_router_logits = False
@@ -124,8 +137,10 @@ def test_deepseek_v3_router_logits_skip_dense_layers_for_aux_loss():
     assert len(outputs.router_logits) == model.config.num_hidden_layers - config.first_k_dense_replace
     assert all(router_logits is not None for router_logits in outputs.router_logits)
 
+    _assert_deepseek_v3_routing_replay_records_weights()
 
-def test_deepseek_v3_routing_replay_records_weights():
+
+def _assert_deepseek_v3_routing_replay_records_weights():
     model = DeepseekV3ForCausalLM(_tiny_config())
     block = model.model.layers[0].mlp
     replay = RoutingReplay()

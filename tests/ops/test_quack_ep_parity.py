@@ -12,8 +12,6 @@ Registration alone is NOT correctness: any backend swap must pass this kind of
 output-and-gradient parity before being trusted in a training config.
 """
 
-from types import SimpleNamespace
-
 import pytest
 import torch
 import torch.nn.functional as F
@@ -25,29 +23,11 @@ E, H, I = 4, 256, 512
 requires_gpu = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 
-@pytest.mark.cpu
-def test_deepep_none_gradient_paths_match_forward_arity():
-    try:
-        from xorl.ops.moe.quack import (  # noqa: PLC0415
-            QuackEPDeepEPCombine,
-            QuackEPDeepEPNoPermute,
-        )
-    except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"cannot import DeepEP Quack ops: {exc}")
-
-    ctx = SimpleNamespace(needs_input_grad=(False,) * 16)
-    assert QuackEPDeepEPCombine.backward(ctx, None) == (None,) * 16
-    assert QuackEPDeepEPNoPermute.backward(ctx, None) == (None,) * 16
-
-
 def _imports():
-    try:
-        from xorl.ops.moe.quack import QuackEPGroupGemm  # noqa: PLC0415
-        from xorl.ops.moe.triton import TritonEPGroupGemm  # noqa: PLC0415
+    from xorl.ops.moe.quack import QuackEPGroupGemm  # noqa: PLC0415
+    from xorl.ops.moe.triton import TritonEPGroupGemm  # noqa: PLC0415
 
-        return QuackEPGroupGemm, TritonEPGroupGemm
-    except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"cannot import EP group GEMM ops: {exc}")
+    return QuackEPGroupGemm, TritonEPGroupGemm
 
 
 def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
@@ -56,46 +36,46 @@ def _cos(a: torch.Tensor, b: torch.Tensor) -> float:
 
 @requires_gpu
 @pytest.mark.gpu
-@pytest.mark.parametrize(
-    "tokens_per_expert",
-    [
-        [13, 0, 7, 21],  # uneven with an empty expert
-        [64, 64, 64, 64],  # balanced
-        [1, 127, 0, 32],  # extreme skew + empty expert
-    ],
-)
-@pytest.mark.parametrize("with_scores", [False, True])
-def test_quack_ep_group_gemm_matches_triton(tokens_per_expert, with_scores):
+def test_quack_ep_group_gemm_and_halfconcat_forward_policy():
     QuackEPGroupGemm, TritonEPGroupGemm = _imports()
-    torch.manual_seed(0)
-    cumsum = torch.tensor(tokens_per_expert, device="cuda").cumsum(0)
-    M = int(cumsum[-1])
-    x = torch.randn(M, H, device="cuda", dtype=DTYPE)
-    gate_up = torch.randn(E, H, 2 * I, device="cuda", dtype=DTYPE) * 0.02
-    down = torch.randn(E, I, H, device="cuda", dtype=DTYPE) * 0.02
-    scores = torch.rand(M, device="cuda", dtype=torch.float32) if with_scores else None
+    cases = (
+        ([13, 0, 7, 21], False),  # uneven with an empty expert
+        ([64, 64, 64, 64], True),  # balanced with score scaling
+        ([1, 127, 0, 32], True),  # extreme skew + empty expert with score scaling
+    )
+    for tokens_per_expert, with_scores in cases:
+        torch.manual_seed(0)
+        cumsum = torch.tensor(tokens_per_expert, device="cuda").cumsum(0)
+        M = int(cumsum[-1])
+        x = torch.randn(M, H, device="cuda", dtype=DTYPE)
+        gate_up = torch.randn(E, H, 2 * I, device="cuda", dtype=DTYPE) * 0.02
+        down = torch.randn(E, I, H, device="cuda", dtype=DTYPE) * 0.02
+        scores = torch.rand(M, device="cuda", dtype=torch.float32) if with_scores else None
 
-    def run(cls):
-        x_ = x.clone().requires_grad_(True)
-        g = gate_up.clone().requires_grad_(True)
-        d = down.clone().requires_grad_(True)
-        out = cls.apply(x_, cumsum, g, d, I, scores)
-        # Non-trivial upstream gradient; also exercises the backward grad-arity
-        # contract (a missing grad raises "returned an incorrect number of
-        # gradients" here).
-        out.float().pow(2).sum().backward()
-        return out.detach(), x_.grad, g.grad, d.grad
+        def run(cls):
+            x_ = x.clone().requires_grad_(True)
+            g = gate_up.clone().requires_grad_(True)
+            d = down.clone().requires_grad_(True)
+            out = cls.apply(x_, cumsum, g, d, I, scores)
+            # Non-trivial upstream gradient; also exercises the backward grad-arity
+            # contract (a missing grad raises "returned an incorrect number of
+            # gradients" here).
+            out.float().pow(2).sum().backward()
+            return out.detach(), x_.grad, g.grad, d.grad
 
-    quack_tensors = run(QuackEPGroupGemm)
-    triton_tensors = run(TritonEPGroupGemm)
-    for name, q, t in zip(("out", "grad_x", "grad_gate_up", "grad_down"), quack_tensors, triton_tensors):
-        cos = _cos(q, t)
-        assert cos > 0.999, f"{name}: quack/triton cosine {cos:.6f} (tokens_per_expert={tokens_per_expert})"
+        quack_tensors = run(QuackEPGroupGemm)
+        triton_tensors = run(TritonEPGroupGemm)
+        for name, q, t in zip(("out", "grad_x", "grad_gate_up", "grad_down"), quack_tensors, triton_tensors):
+            cos = _cos(q, t)
+            assert cos > 0.999, (
+                f"{name}: quack/triton cosine {cos:.6f} "
+                f"(tokens_per_expert={tokens_per_expert}, with_scores={with_scores})"
+            )
+
+    _assert_quack_ep_forward_matches_halfconcat_reference()
 
 
-@requires_gpu
-@pytest.mark.gpu
-def test_quack_ep_forward_matches_halfconcat_reference():
+def _assert_quack_ep_forward_matches_halfconcat_reference():
     """Pin the gate/up convention itself: silu(h[:, :I]) * h[:, I:] (half-concat)."""
     QuackEPGroupGemm, _ = _imports()
     torch.manual_seed(1)

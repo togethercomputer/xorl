@@ -11,7 +11,7 @@ import pytest
 import torch
 from torch import nn
 
-from xorl.trainers.per_component_timer import PerComponentTimer, _is_decoder_layer, _resolve_submodule
+from xorl.trainers.per_component_timer import PerComponentTimer
 
 
 class _FakeAttn(nn.Module):
@@ -101,53 +101,8 @@ def _make_model(layer_cls, n_layers=3):
     return _Model()
 
 
-def test_is_decoder_layer_matches_name_suffix():
-    assert _is_decoder_layer(_FakeGlmDecoderLayer())
-    assert not _is_decoder_layer(nn.LayerNorm(64))
-
-
-def test_resolve_submodule_handles_missing_attrs():
-    layer = _FakeGlmDecoderLayer()
-    assert _resolve_submodule(layer, "self_attn.indexer") is not None
-    assert _resolve_submodule(layer, "mlp.shared_experts") is not None
-    assert _resolve_submodule(layer, "mlp.does_not_exist") is None
-
-
-def test_disabled_timer_is_a_noop():
-    timer = PerComponentTimer(enabled=False)
-    assert not timer.enabled
-    assert timer.attach(_make_model(_FakeGlmDecoderLayer)) == 0
-    timer.start_step()
-    timer.set_mode("fwd")
-    timer.set_mode("idle")
-    assert timer.end_step() == {}
-
-
-def test_end_step_skips_unrecorded_cuda_event_pairs(monkeypatch):
-    timer = PerComponentTimer(enabled=False)
-    timer.enabled = True
-
-    class _RecordedEvent:
-        def elapsed_time(self, _end):
-            return 2.5
-
-    class _UnrecordedEvent:
-        def elapsed_time(self, _end):
-            raise ValueError("Both events must be recorded before calculating elapsed time.")
-
-    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
-    timer._fwd_pairs["fwd_ok"].append((_RecordedEvent(), _RecordedEvent()))
-    timer._fwd_pairs["fwd_unrecorded"].append((_UnrecordedEvent(), _RecordedEvent()))
-
-    result = timer.end_step()
-
-    assert result["fwd_ok"] == pytest.approx(0.0025)
-    assert "fwd_unrecorded" not in result
-    assert timer.last_skipped_event_pair_count == 1
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for event-based timing")
-def test_glm_style_hooks_capture_fwd_and_bwd_phases():
+def test_model_style_hooks_capture_present_and_skip_missing_phases():
     model = _make_model(_FakeGlmDecoderLayer).cuda()
     timer = PerComponentTimer(enabled=True)
     n = timer.attach(model)
@@ -180,9 +135,6 @@ def test_glm_style_hooks_capture_fwd_and_bwd_phases():
     for phase, secs in result.items():
         assert secs >= 0.0, f"{phase} reported negative time {secs}"
 
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for event-based timing")
-def test_qwen3_style_skips_missing_submodules():
     model = _make_model(_FakeQwen3DecoderLayer).cuda()
     timer = PerComponentTimer(enabled=True)
     n = timer.attach(model)

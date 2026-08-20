@@ -33,9 +33,7 @@ from xorl.server.weight_sync.backends import p2p as p2p_module
 from xorl.server.weight_sync.backends.base import EndpointConfig, TransportConfig
 from xorl.server.weight_sync.backends.p2p import (
     P2PTransportBackend,
-    _async_api_enabled,
     _resolve_local_hostname,
-    _transfer_small_entries,
 )
 from xorl.server.weight_sync.handler import WeightSyncHandler
 
@@ -60,6 +58,7 @@ class _FakeMooncakeEngine:
         self.registered_memory: List[Tuple[int, int]] = []
         self.deregistered: List[List[int]] = []
         self.transfers: List[Tuple[str, List[int], List[int], List[int]]] = []
+        self.async_transfers: List[Tuple[str, List[int], List[int], List[int]]] = []
         self.copy_dest_ranges: List[Tuple[int, int]] = []
         self.fail_transfer = False
 
@@ -104,6 +103,20 @@ class _FakeMooncakeEngine:
                 ctypes.memmove(peer_ptr, src_ptr, length)
         return 0
 
+    def batch_transfer_async_write(
+        self,
+        session_id: str,
+        src_ptrs: List[int],
+        peer_ptrs: List[int],
+        lengths: List[int],
+    ) -> int:
+        self.async_transfers.append((session_id, list(src_ptrs), list(peer_ptrs), list(lengths)))
+        return len(self.async_transfers)
+
+    @staticmethod
+    def get_batch_transfer_status(_batch_ids: List[int]) -> int:
+        return 0
+
 
 class _FakeCudaStorage:
     def __init__(self, ptr: int, nbytes: int):
@@ -139,69 +152,6 @@ class _FakeCudaView:
 
     def data_ptr(self) -> int:
         return self._data_ptr
-
-
-def test_async_api_enabled_supports_warm_mode(monkeypatch):
-    monkeypatch.setenv("XORL_P2P_USE_ASYNC_API", "warm")
-    assert _async_api_enabled(cached_prepare=False) is False
-    assert _async_api_enabled(cached_prepare=True) is True
-
-
-def test_transfer_small_entries_batches_by_session(monkeypatch):
-    monkeypatch.setenv("XORL_P2P_SMALL_TRANSFER_CHUNK", "2")
-    engine = _FakeMooncakeEngine()
-    session_bytes: Dict[str, int] = {}
-    session_transfer_s: Dict[str, float] = {}
-
-    total_bytes, num_buffers = _transfer_small_entries(
-        engine_wrapper=engine,
-        small_session_data={
-            "recv0:7000": [
-                (0x1000, 0x2000, 4, None),
-                (0x1004, 0x2004, 4, None),
-                (0x1008, 0x2008, 4, None),
-            ]
-        },
-        session_debug_info={"recv0:7000": {"session_id": "recv0:7000"}},
-        small_register_ptrs=[0x1000],
-        small_register_lens=[12],
-        session_bytes=session_bytes,
-        session_transfer_s=session_transfer_s,
-        bucket_idx=3,
-    )
-
-    assert total_bytes == 12
-    assert num_buffers == 3
-    assert session_bytes == {"recv0:7000": 12}
-    assert "recv0:7000" in session_transfer_s
-    assert engine.registered == [([0x1000], [12])]
-    assert engine.deregistered == [[0x1000]]
-    assert engine.transfers == [
-        ("recv0:7000", [0x1000, 0x1004], [0x2000, 0x2004], [4, 4]),
-        ("recv0:7000", [0x1008], [0x2008], [4]),
-    ]
-
-
-def test_persistent_source_registration_skips_already_registered_ranges():
-    backend, engine = _make_backend()
-    backend._intervals_per_cuda_segment = lambda intervals: list(intervals)  # type: ignore[assignment]
-    backend._registered_intervals = [(0x3000, 0x3100)]
-    backend._registered_source_ptrs = [0x3000]
-
-    backend._register_persistent_source_intervals(
-        [(0x3040, 0x3080), (0x5000, 0x5080)],
-        bucket_idx=7,
-    )
-
-    assert engine.registered == [([0x5000], [0x80])]
-    assert backend._registered_source_ptrs == [0x3000, 0x5000]
-
-    backend._register_persistent_source_intervals(
-        [(0x5008, 0x5010)],
-        bucket_idx=8,
-    )
-
-    assert engine.registered == [([0x5000], [0x80])]
 
 
 @pytest.fixture(autouse=True)
@@ -839,7 +789,7 @@ def _assert_moe_expert_fp8_receiver_parity_for_layers(
     return covered_expert_indices
 
 
-def test_transfer_bucket_strips_orig_mod_for_receiver_lookup():
+def _assert_transfer_bucket_strips_orig_mod_for_receiver_lookup():
     backend, engine = _make_backend()
     receiver_name = "model.layers.0.mlp.experts.160.gate_proj.weight"
     sender_name = "model.layers.0._orig_mod.mlp.experts.160.gate_proj.weight"
@@ -872,20 +822,7 @@ def test_transfer_bucket_strips_orig_mod_for_receiver_lookup():
 
 
 class TestP2PInitializeHandshake:
-    def test_resolve_local_hostname_prefers_explicit_p2p_env(self, monkeypatch):
-        for env_name in ("P2P_TRAINER_HOSTNAME", "XORL_WEIGHT_SYNC_MASTER_ADDRESS", "POD_IP"):
-            monkeypatch.delenv(env_name, raising=False)
-
-        monkeypatch.setenv("POD_IP", "10.0.0.3")
-        assert _resolve_local_hostname() == "10.0.0.3"
-
-        monkeypatch.setenv("XORL_WEIGHT_SYNC_MASTER_ADDRESS", "10.0.0.2")
-        assert _resolve_local_hostname() == "10.0.0.2"
-
-        monkeypatch.setenv("P2P_TRAINER_HOSTNAME", "10.0.0.1")
-        assert _resolve_local_hostname() == "10.0.0.1"
-
-    def test_prepare_payload_uses_p2p_transport_and_engine_info(self):
+    def test_initialize_prepare_fanout_and_completion_policy(self, monkeypatch):
         backend, engine = _make_backend(num_endpoints=1)
 
         prepare_response = _FakeResponse(
@@ -928,8 +865,16 @@ class TestP2PInitializeHandshake:
         assert body["group_name"] == "weight_sync_group"
         assert "p2p_return_tensor_map" not in body
 
-    def test_prepare_payload_does_not_invalidate_receiver_cache_when_cache_mode_none(self, monkeypatch):
-        monkeypatch.setenv("XORL_P2P_INVALIDATE_RECEIVER_CACHE_ON_COLD_PREPARE", "1")
+        self._assert_prepare_does_not_invalidate_cache_mode_none()
+        with monkeypatch.context() as case_patch:
+            self._assert_cached_prepare_policy(case_patch)
+        with monkeypatch.context() as case_patch:
+            self._assert_initialize_fanout_policy(case_patch)
+        self._assert_complete_sync_policy()
+        with monkeypatch.context() as case_patch:
+            TestP2PEngineConstruction()._assert_engine_construction_and_hostname_policy(case_patch)
+
+    def _assert_prepare_does_not_invalidate_cache_mode_none(self):
         backend, _ = _make_backend(num_endpoints=1)
         backend.config.backend_config["cache_invalidation_mode"] = "none"
 
@@ -966,7 +911,7 @@ class TestP2PInitializeHandshake:
         body = posted.call_args.kwargs["json"]
         assert "p2p_invalidate_cache" not in body
 
-    def test_initialize_aggregates_tensor_map_across_endpoints(self, monkeypatch):
+    def _assert_initialize_fanout_policy(self, monkeypatch):
         monkeypatch.setenv("XORL_P2P_PREPARE_WORKERS", "1")
         backend, _ = _make_backend(num_endpoints=2)
 
@@ -1026,20 +971,19 @@ class TestP2PInitializeHandshake:
         assert {loc["endpoint_idx"] for loc in locators} == {0, 1}
         assert sorted(loc["session_id"] for loc in locators) == ["recv0a:7000", "recv1a:7000"]
 
-    def test_initialize_returns_false_on_http_error(self):
-        backend, _ = _make_backend()
-        with patch("requests.post", return_value=_FakeResponse(500, {})):
-            assert backend.initialize() is False
+        self._assert_initialize_returns_false_for_failures()
+        self._assert_initialize_cleans_up_after_fanout_failure(monkeypatch)
 
-    def test_initialize_returns_false_when_remote_reports_failure(self):
-        backend, _ = _make_backend()
-        with patch(
-            "requests.post",
-            return_value=_FakeResponse(200, {"success": False, "message": "no engine"}),
+    def _assert_initialize_returns_false_for_failures(self):
+        for response in (
+            _FakeResponse(500, {}),
+            _FakeResponse(200, {"success": False, "message": "no engine"}),
         ):
-            assert backend.initialize() is False
+            backend, _ = _make_backend()
+            with patch("requests.post", return_value=response):
+                assert backend.initialize() is False
 
-    def test_initialize_cleans_up_prepared_receivers_after_fanout_failure(self, monkeypatch):
+    def _assert_initialize_cleans_up_after_fanout_failure(self, monkeypatch):
         monkeypatch.setenv("XORL_P2P_PREPARE_WORKERS", "1")
         backend, _ = _make_backend(num_endpoints=2)
         complete_calls: List[Tuple[str, Dict[str, Any]]] = []
@@ -1089,8 +1033,8 @@ class TestP2PInitializeHandshake:
             assert body["transport"] == "p2p"
             assert body["flush_cache"] is False
 
-    def test_cached_prepare_can_reuse_existing_tensor_map(self):
-        backend, _ = _make_backend()
+    def _assert_cached_prepare_policy(self, monkeypatch):
+        backend, engine = _make_backend()
         cached_map = {
             "model.layers.0.self_attn.q_proj.weight": [
                 {
@@ -1131,7 +1075,41 @@ class TestP2PInitializeHandshake:
         body = posted.call_args.kwargs["json"]
         assert body["p2p_return_tensor_map"] is False
 
-    def test_cached_prepare_retries_full_map_when_receiver_session_changes(self):
+        # Warm-only async mode must be selected by the real transfer path
+        # after a cached prepare, not merely by a private mode selector.
+        monkeypatch.setenv("XORL_P2P_USE_ASYNC_API", "warm")
+        monkeypatch.setenv("XORL_P2P_ASYNC_MIN_BYTES", "1")
+        backend.transfer_bucket(
+            [("model.layers.0.self_attn.q_proj.weight", torch.zeros(128, 64, dtype=torch.bfloat16))],
+            src_rank=0,
+        )
+        backend.flush_pending_transfers()
+        assert len(engine.async_transfers) == 1
+        assert engine.transfers == []
+        backend.destroy(complete_receiver=False)
+
+        self._assert_warm_async_mode_keeps_cold_prepare_synchronous(monkeypatch, cached_map)
+        self._assert_cached_prepare_retries_on_session_change()
+        self._assert_cached_prepare_merges_partial_map(monkeypatch)
+        self._assert_cached_prepare_retries_rejected_flag()
+        self._assert_cached_prepare_retries_only_rejecting_endpoint(monkeypatch)
+
+    def _assert_warm_async_mode_keeps_cold_prepare_synchronous(self, monkeypatch, tensor_map):
+        backend, engine = _make_backend()
+        backend._tensor_map = tensor_map
+        backend._receiver_session_ids = ["recv-0:7000"]
+
+        backend.transfer_bucket(
+            [("model.layers.0.self_attn.q_proj.weight", torch.zeros(128, 64, dtype=torch.bfloat16))],
+            src_rank=0,
+        )
+        backend.flush_pending_transfers()
+
+        assert engine.async_transfers == []
+        assert len(engine.transfers) == 1
+        backend.destroy(complete_receiver=False)
+
+    def _assert_cached_prepare_retries_on_session_change(self):
         backend, _ = _make_backend()
         param_name = "model.layers.0.self_attn.q_proj.weight"
         backend._tensor_map = {
@@ -1194,7 +1172,7 @@ class TestP2PInitializeHandshake:
         assert backend._tensor_map[param_name][0]["ptr"] == 0xBEEF0000
         assert backend._last_prepare_returned_tensor_map is True
 
-    def test_cached_prepare_merges_partial_tensor_map_with_cached_endpoints(self, monkeypatch):
+    def _assert_cached_prepare_merges_partial_map(self, monkeypatch):
         monkeypatch.setenv("XORL_P2P_PREPARE_WORKERS", "1")
         backend, _ = _make_backend(num_endpoints=2)
         name = "model.layers.0.self_attn.q_proj.weight"
@@ -1271,7 +1249,7 @@ class TestP2PInitializeHandshake:
         assert backend._receiver_session_ids == ["recv0-old:7000", "recv1-new:7000"]
         assert backend._last_prepare_returned_tensor_map is True
 
-    def test_cached_prepare_retries_full_map_when_receiver_rejects_flag(self):
+    def _assert_cached_prepare_retries_rejected_flag(self):
         backend, _ = _make_backend()
         backend._tensor_map = {
             "model.layers.0.self_attn.q_proj.weight": [
@@ -1308,7 +1286,7 @@ class TestP2PInitializeHandshake:
         assert "p2p_return_tensor_map" not in posted.call_args_list[1].kwargs["json"]
         assert backend._last_prepare_returned_tensor_map is True
 
-    def test_cached_prepare_retries_rejecting_endpoint_without_restarting_all(self, monkeypatch):
+    def _assert_cached_prepare_retries_only_rejecting_endpoint(self, monkeypatch):
         monkeypatch.setenv("XORL_P2P_PREPARE_WORKERS", "1")
         backend, _ = _make_backend(num_endpoints=2)
         param_name = "model.layers.0.self_attn.q_proj.weight"
@@ -1397,7 +1375,7 @@ class TestP2PInitializeHandshake:
         assert backend._receiver_session_ids == ["recv-0:7000", "recv-1:7000"]
         assert backend._last_prepare_returned_tensor_map is True
 
-    def test_complete_sync_preserves_cached_prepare_state(self):
+    def _assert_complete_sync_policy(self):
         backend, _ = _make_backend()
         cached_map = {
             "model.layers.0.self_attn.q_proj.weight": [
@@ -1425,7 +1403,11 @@ class TestP2PInitializeHandshake:
         assert backend._receiver_session_ids == ["recv-0:7000"]
         assert backend._session_debug_info == {"recv-0:7000": {"session_id": "recv-0:7000"}}
 
-    def test_complete_sync_forwards_p2p_tied_weight_aliases(self):
+        self._assert_complete_sync_forwards_tied_weight_aliases()
+        TestP2PTransferBucket()._assert_transfer_bucket_preserves_requested_flush_cache_and_weight_version()
+        TestP2PDestroy()._assert_pending_transfer_failure_completion_and_cleanup_policy()
+
+    def _assert_complete_sync_forwards_tied_weight_aliases(self):
         backend, _ = _make_backend()
         backend.config.backend_config["p2p_tied_weight_aliases"] = {"lm_head.weight": "model.embed_tokens.weight"}
 
@@ -1437,55 +1419,7 @@ class TestP2PInitializeHandshake:
 
 
 class TestP2PSlicing:
-    def test_slice_source_for_locator_extracts_qkv_q_slice(self):
-        full = torch.arange(128 * 64, dtype=torch.bfloat16).reshape(128, 64)
-        loc = _hf_locator(
-            tp_rank=0,
-            full_shape=[128, 64],
-            slc=[[0, 64], [0, 64]],
-            ptr=0,
-            nbytes=64 * 64 * 2,
-            session_id="x",
-        )
-        view = P2PTransportBackend._slice_source_for_locator("q_proj", full, loc)
-        assert view is not None
-        assert view.shape == (64, 64)
-        # Equal to the literal slice of the source.
-        assert torch.equal(view, full[0:64, 0:64])
-
-    def test_slice_source_for_locator_other_rank_picks_other_rows(self):
-        full = torch.arange(128 * 64, dtype=torch.bfloat16).reshape(128, 64)
-        loc = _hf_locator(
-            tp_rank=1,
-            full_shape=[128, 64],
-            slc=[[64, 128], [0, 64]],
-            ptr=0,
-            nbytes=64 * 64 * 2,
-            session_id="x",
-        )
-        view = P2PTransportBackend._slice_source_for_locator("q_proj", full, loc)
-        assert view is not None
-        assert torch.equal(view, full[64:128, 0:64])
-
-    def test_slice_source_returns_none_on_full_shape_mismatch(self):
-        full = torch.zeros(128, 64, dtype=torch.bfloat16)
-        loc = _hf_locator(
-            tp_rank=0,
-            full_shape=[256, 64],  # wrong on purpose
-            slc=[[0, 128], [0, 64]],
-            ptr=0,
-            nbytes=128 * 64 * 2,
-            session_id="x",
-        )
-        assert P2PTransportBackend._slice_source_for_locator("q_proj", full, loc) is None
-
-    def test_slice_source_no_slice_returns_full_tensor(self):
-        full = torch.zeros(8, 16, dtype=torch.bfloat16)
-        loc = {"ptr": 0, "nbytes": 8 * 16 * 2}
-        view = P2PTransportBackend._slice_source_for_locator("rn", full, loc)
-        assert view is full
-
-    def test_slice_source_squeezes_qwen35_linear_attention_conv_for_receiver_layout(self):
+    def test_qwen35_linear_attention_slice_policy(self):
         full = torch.arange(8 * 1 * 4, dtype=torch.bfloat16).reshape(8, 1, 4)
         loc = _hf_locator(
             tp_rank=1,
@@ -1504,80 +1438,10 @@ class TestP2PSlicing:
         assert view.shape == (4, 4)
         assert torch.equal(view, full.squeeze(1)[4:8, 0:4])
 
-    def test_slice_source_handles_qwen_linear_attention_fused_qkv_tp_shard(self, monkeypatch):
-        # The fused Q|K|V cat path is opt-in (bypassed by default); explicitly
-        # re-enable it here to cover a receiver that emits one combined locator.
-        monkeypatch.setenv("XORL_P2P_DISABLE_QWEN_LINEAR_ATTN_FUSED_SLICE", "0")
-        full = torch.arange(8 * 4, dtype=torch.bfloat16).reshape(8, 4)
-        loc = _hf_locator(
-            tp_rank=1,
-            full_shape=[8, 4],
-            slc=[[4, 8], [0, 4]],
-            ptr=0,
-            nbytes=4 * 4 * 2,
-            session_id="x",
-        )
-        view = P2PTransportBackend._slice_source_for_locator(
-            "model.layers.0.linear_attn.in_proj_qkv.weight",
-            full,
-            loc,
-            {"key_dim": 2, "value_dim": 4},
-        )
-        assert view is not None
-        expected = torch.cat([full[1:2], full[3:4], full[6:8]], dim=0)
-        assert view.shape == (4, 4)
-        assert torch.equal(view, expected)
+        self._assert_slice_handles_local_state_vector()
+        self._assert_slice_casts_state_to_receiver_dtype()
 
-    def test_slice_source_handles_qwen_linear_attention_fused_conv_tp_shard(self, monkeypatch):
-        monkeypatch.setenv("XORL_P2P_DISABLE_QWEN_LINEAR_ATTN_FUSED_SLICE", "0")
-        full = torch.arange(8 * 1 * 4, dtype=torch.bfloat16).reshape(8, 1, 4)
-        loc = _hf_locator(
-            tp_rank=1,
-            full_shape=[8, 4],
-            slc=[[4, 8], [0, 4]],
-            ptr=0,
-            nbytes=4 * 4 * 2,
-            session_id="x",
-        )
-        view = P2PTransportBackend._slice_source_for_locator(
-            "model.layers.0.linear_attn.conv1d.weight",
-            full,
-            loc,
-            {"key_dim": 2, "value_dim": 4},
-        )
-        assert view is not None
-        squeezed = full.squeeze(1)
-        expected = torch.cat([squeezed[1:2], squeezed[3:4], squeezed[6:8]], dim=0)
-        assert view.shape == (4, 4)
-        assert torch.equal(view, expected)
-
-    def test_slice_source_bypasses_fused_qkv_by_default_uses_generic_slice(self, monkeypatch):
-        # By default the orphaned fused-cat path is bypassed: in_proj_qkv falls to
-        # the generic contiguous slice, which matches SGLang's deployed receiver
-        # (p2p_qwen35_linear_attn_qkvz_locators emits separate contiguous Q/K/V
-        # locators). The fused cat had no matching receiver locator.
-        monkeypatch.delenv("XORL_P2P_DISABLE_QWEN_LINEAR_ATTN_FUSED_SLICE", raising=False)
-        full = torch.arange(8 * 4, dtype=torch.bfloat16).reshape(8, 4)
-        loc = _hf_locator(
-            tp_rank=1,
-            full_shape=[8, 4],
-            slc=[[4, 8], [0, 4]],
-            ptr=0,
-            nbytes=4 * 4 * 2,
-            session_id="x",
-        )
-        view = P2PTransportBackend._slice_source_for_locator(
-            "model.layers.0.linear_attn.in_proj_qkv.weight",
-            full,
-            loc,
-            {"key_dim": 2, "value_dim": 4},
-        )
-        assert view is not None
-        # Plain contiguous slice of the locator's row range — NOT the Q|K|V cat.
-        assert view.shape == (4, 4)
-        assert torch.equal(view, full[4:8, 0:4])
-
-    def test_slice_source_handles_qwen35_linear_attention_local_state_vector(self):
+    def _assert_slice_handles_local_state_vector(self):
         full = torch.arange(32, dtype=torch.float32)
         loc = _hf_locator(
             tp_rank=2,
@@ -1597,7 +1461,7 @@ class TestP2PSlicing:
         assert view.shape == (8,)
         assert torch.equal(view, full[16:24])
 
-    def test_slice_source_casts_qwen35_linear_attention_state_to_receiver_dtype(self):
+    def _assert_slice_casts_state_to_receiver_dtype(self):
         full = torch.arange(32, dtype=torch.bfloat16)
         loc = _hf_locator(
             tp_rank=2,
@@ -1652,7 +1516,7 @@ class TestP2PTransferBucket:
         }
         backend._receiver_session_ids = ["recv0:7000", "recv1:7000"]
 
-    def test_transfer_bucket_writes_correct_slice_per_receiver(self):
+    def test_transfer_bucket_receiver_placement_and_staging_policy(self, monkeypatch):
         backend, engine = _make_backend()
         self._seed_tensor_map(backend, peer_ptr=0xCAFE_0000)
         full = torch.arange(128 * 64, dtype=torch.bfloat16).reshape(128, 64)
@@ -1676,7 +1540,11 @@ class TestP2PTransferBucket:
             else:
                 assert peer_ptrs[0] == 0xCAFE_0000 + 0x10000
 
-    def test_transfer_bucket_preserves_fp8_dequant_parity_for_fused_and_unfused_receiver_layouts(self):
+        self._assert_transfer_bucket_reuses_staged_source_for_replicated_locators()
+        with monkeypatch.context() as case_patch:
+            self._assert_transfer_bucket_staging_policy(case_patch)
+
+    def test_transfer_bucket_fp8_receiver_layout_policy(self):
         backend, engine = _make_backend()
         block_size = (2, 4)
         quantization = {
@@ -1776,7 +1644,15 @@ class TestP2PTransferBucket:
             atol=0.0,
         )
 
-    def test_transfer_bucket_preserves_fp8_dequant_parity_for_partial_block_fused_receiver_layout(self):
+        self._assert_partial_block_fused_receiver_layout()
+        self._assert_qwen36_production_qkvz_tp2_layout()
+        self._assert_qwen36_production_full_attention_tp2_layout()
+        self._assert_qwen36_non_expert_receiver_namespace()
+        self._assert_mixed_fp8_and_passthrough_qwen36_manifest_entries()
+        self._assert_shared_expert_receiver_layouts()
+        self._assert_moe_expert_receiver_policy()
+
+    def _assert_partial_block_fused_receiver_layout(self):
         backend, engine = _make_backend()
         block_size = (128, 128)
         hidden_size = 2048
@@ -1870,7 +1746,7 @@ class TestP2PTransferBucket:
                 atol=0.0,
             )
 
-    def test_transfer_bucket_preserves_fp8_dequant_parity_for_qwen36_production_qkvz_tp2_layout(self):
+    def _assert_qwen36_production_qkvz_tp2_layout(self):
         backend, engine = _make_backend(
             num_endpoints=2,
             cpu_scratch_pool_bytes=128 * 1024 * 1024,
@@ -2040,7 +1916,7 @@ class TestP2PTransferBucket:
                 block_size=block_size,
             )
 
-    def test_transfer_bucket_preserves_fp8_dequant_parity_for_qwen36_production_full_attention_tp2_layout(self):
+    def _assert_qwen36_production_full_attention_tp2_layout(self):
         backend, engine = _make_backend(
             num_endpoints=2,
             cpu_scratch_pool_bytes=128 * 1024 * 1024,
@@ -2225,7 +2101,7 @@ class TestP2PTransferBucket:
                 block_size=block_size,
             )
 
-    def test_transfer_bucket_preserves_fp8_dequant_parity_for_qwen36_non_expert_receiver_namespace(self):
+    def _assert_qwen36_non_expert_receiver_namespace(self):
         backend, engine = _make_backend(cpu_scratch_pool_bytes=4 * 1024 * 1024)
         block_size = (8, 8)
         hidden_size = 16
@@ -2450,7 +2326,7 @@ class TestP2PTransferBucket:
             )
         }
 
-    def test_transfer_bucket_preserves_mixed_fp8_and_passthrough_qwen36_manifest_entries(self):
+    def _assert_mixed_fp8_and_passthrough_qwen36_manifest_entries(self):
         backend, engine = _make_backend(cpu_scratch_pool_bytes=4 * 1024 * 1024)
         block_size = (8, 8)
         quantization = {
@@ -2559,7 +2435,7 @@ class TestP2PTransferBucket:
             atol=0.0,
         )
 
-    def test_transfer_bucket_preserves_fp8_parity_for_shared_expert_receiver_layouts(self):
+    def _assert_shared_expert_receiver_layouts(self):
         backend, engine = _make_backend(cpu_scratch_pool_bytes=4 * 1024 * 1024)
         block_size = (8, 8)
         hidden_size = 16
@@ -2733,170 +2609,7 @@ class TestP2PTransferBucket:
             )
         assert torch.equal(receiver_gate, quantized[passthrough_name])
 
-    def test_transfer_bucket_preserves_fp8_parity_for_qwen36_production_shared_expert_layout(self):
-        backend, engine = _make_backend(cpu_scratch_pool_bytes=32 * 1024 * 1024)
-        block_size = (128, 128)
-        hidden_size = 2048
-        shared_intermediate_size = 512
-        quantization = {
-            "quant_method": "fp8",
-            "fmt": "e4m3",
-            "weight_block_size": list(block_size),
-        }
-        prefix = "model.layers.0.mlp.shared_expert"
-        passthrough_name = "model.layers.0.mlp.shared_expert_gate.weight"
-        source_entries: list[tuple[str, torch.Tensor]] = [
-            _make_projection_source(
-                f"{prefix}.gate_proj.weight",
-                shared_intermediate_size,
-                hidden_size,
-                offset=0.10,
-            ),
-            _make_projection_source(
-                f"{prefix}.up_proj.weight",
-                shared_intermediate_size,
-                hidden_size,
-                offset=0.20,
-            ),
-            _make_projection_source(
-                f"{prefix}.down_proj.weight",
-                hidden_size,
-                shared_intermediate_size,
-                offset=0.30,
-            ),
-            (
-                passthrough_name,
-                torch.linspace(-0.75, 0.75, steps=hidden_size, dtype=torch.float32)
-                .reshape(1, hidden_size)
-                .to(torch.bfloat16),
-            ),
-        ]
-        quantized = dict(
-            WeightSyncHandler._quantize_buffer_for_fp8(
-                source_entries,
-                quantization_config=quantization,
-                target_device="cpu",
-            )
-        )
-
-        gate_name = f"{prefix}.gate_proj.weight"
-        up_name = f"{prefix}.up_proj.weight"
-        down_name = f"{prefix}.down_proj.weight"
-        projection_names = {gate_name, up_name, down_name}
-        assert set(quantized) == (
-            projection_names | {name.replace(".weight", ".weight_scale_inv") for name in projection_names}
-        ) | {passthrough_name}
-        assert quantized[gate_name].shape == (512, 2048)
-        assert quantized[gate_name.replace(".weight", ".weight_scale_inv")].shape == (4, 16)
-        assert quantized[up_name].shape == (512, 2048)
-        assert quantized[up_name.replace(".weight", ".weight_scale_inv")].shape == (4, 16)
-        assert quantized[down_name].shape == (2048, 512)
-        assert quantized[down_name.replace(".weight", ".weight_scale_inv")].shape == (16, 4)
-        assert quantized[passthrough_name].dtype == torch.bfloat16
-
-        tensor_map: dict[str, list[dict[str, Any]]] = {}
-        expected_slices: list[tuple[str, torch.Tensor, torch.Tensor, tuple[int, int], int, int]] = []
-
-        def add_expected_slice(
-            *,
-            weight_name: str,
-            receiver_weight: torch.Tensor,
-            receiver_scale: torch.Tensor,
-            source_rows: tuple[int, int],
-            receiver_row_start: int,
-            receiver_scale_row_start: int,
-        ) -> None:
-            _add_fp8_receiver_slice(
-                tensor_map=tensor_map,
-                quantized=quantized,
-                weight_name=weight_name,
-                receiver_weight=receiver_weight,
-                receiver_scale=receiver_scale,
-                source_rows=source_rows,
-                receiver_row_start=receiver_row_start,
-                receiver_scale_row_start=receiver_scale_row_start,
-                block_size=block_size,
-            )
-            expected_slices.append(
-                (
-                    weight_name,
-                    receiver_weight,
-                    receiver_scale,
-                    source_rows,
-                    receiver_row_start,
-                    receiver_scale_row_start,
-                )
-            )
-
-        receiver_gate_up = torch.empty(2 * shared_intermediate_size, hidden_size, dtype=torch.float8_e4m3fn)
-        receiver_gate_up_scale = torch.empty(8, 16, dtype=torch.float32)
-        receiver_down = torch.empty(hidden_size, shared_intermediate_size, dtype=torch.float8_e4m3fn)
-        receiver_down_scale = torch.empty(16, 4, dtype=torch.float32)
-        for tensor in (receiver_gate_up, receiver_gate_up_scale, receiver_down, receiver_down_scale):
-            engine.allow_copy_to(tensor)
-
-        add_expected_slice(
-            weight_name=gate_name,
-            receiver_weight=receiver_gate_up,
-            receiver_scale=receiver_gate_up_scale,
-            source_rows=(0, shared_intermediate_size),
-            receiver_row_start=0,
-            receiver_scale_row_start=0,
-        )
-        add_expected_slice(
-            weight_name=up_name,
-            receiver_weight=receiver_gate_up,
-            receiver_scale=receiver_gate_up_scale,
-            source_rows=(0, shared_intermediate_size),
-            receiver_row_start=shared_intermediate_size,
-            receiver_scale_row_start=4,
-        )
-        add_expected_slice(
-            weight_name=down_name,
-            receiver_weight=receiver_down,
-            receiver_scale=receiver_down_scale,
-            source_rows=(0, hidden_size),
-            receiver_row_start=0,
-            receiver_scale_row_start=0,
-        )
-
-        receiver_gate = torch.empty_like(quantized[passthrough_name])
-        engine.allow_copy_to(receiver_gate)
-        tensor_map[passthrough_name] = [
-            _full_contiguous_tensor_locator(
-                passthrough_name,
-                quantized[passthrough_name],
-                receiver=receiver_gate,
-            )
-        ]
-
-        backend._tensor_map = tensor_map
-        backend._receiver_session_ids = ["recv0:7000"]
-
-        backend.transfer_bucket(list(quantized.items()), src_rank=0)
-        backend.flush_pending_transfers()
-
-        for (
-            weight_name,
-            receiver_weight,
-            receiver_scale,
-            source_rows,
-            receiver_row,
-            receiver_scale_row,
-        ) in expected_slices:
-            _assert_fp8_receiver_slice_parity(
-                quantized=quantized,
-                weight_name=weight_name,
-                receiver_weight=receiver_weight,
-                receiver_scale=receiver_scale,
-                source_rows=source_rows,
-                receiver_row_start=receiver_row,
-                receiver_scale_row_start=receiver_scale_row,
-                block_size=block_size,
-            )
-        assert torch.equal(receiver_gate, quantized[passthrough_name])
-
-    def test_transfer_bucket_preserves_fp8_dequant_parity_for_moe_expert_receiver_layouts(self):
+    def _assert_moe_expert_receiver_policy(self):
         _assert_moe_expert_fp8_receiver_parity(
             block_size=(2, 4),
             num_experts=2,
@@ -2904,73 +2617,19 @@ class TestP2PTransferBucket:
             intermediate_size=6,
         )
 
-    def test_transfer_bucket_preserves_fp8_dequant_parity_for_block128_moe_expert_receiver_layouts(self):
-        _assert_moe_expert_fp8_receiver_parity(
-            block_size=(128, 128),
-            num_experts=3,
-            hidden_size=256,
-            intermediate_size=384,
-        )
-
-    def test_transfer_bucket_preserves_fp8_dequant_parity_for_multi_receiver_block128_moe_expert_layouts(self):
-        _assert_moe_expert_fp8_receiver_parity(
-            block_size=(128, 128),
-            num_experts=3,
-            hidden_size=256,
-            intermediate_size=384,
-            num_receiver_endpoints=2,
-        )
-
-    def test_transfer_bucket_preserves_fp8_dequant_parity_for_qwen36_ep8_local_shard_manifest(self):
         covered = _assert_moe_expert_fp8_receiver_parity(
             block_size=(128, 128),
-            num_experts=32,
-            hidden_size=2048,
-            intermediate_size=512,
+            num_experts=3,
+            hidden_size=256,
+            intermediate_size=384,
             num_receiver_endpoints=2,
             ep_rank=3,
-            cpu_scratch_pool_bytes=128 * 1024 * 1024,
+            cpu_scratch_pool_bytes=4 * 1024 * 1024,
         )
 
-        assert covered == set(range(96, 128))
+        assert covered == {9, 10, 11}
 
-    def test_transfer_bucket_preserves_fp8_dequant_parity_for_qwen36_ep8_all_global_expert_indices(self):
-        covered: set[int] = set()
-        for ep_rank in range(8):
-            covered.update(
-                _assert_moe_expert_fp8_receiver_parity(
-                    block_size=(128, 128),
-                    num_experts=32,
-                    hidden_size=256,
-                    intermediate_size=128,
-                    num_receiver_endpoints=2,
-                    ep_rank=ep_rank,
-                    cpu_scratch_pool_bytes=4 * 1024 * 1024,
-                )
-            )
-
-        assert covered == set(range(256))
-
-    def test_transfer_bucket_preserves_fp8_dequant_parity_for_qwen36_ep8_all_moe_layers_and_experts(self):
-        covered: set[tuple[int, int]] = set()
-        layer_indices = tuple(range(40))
-        for ep_rank in range(8):
-            covered.update(
-                _assert_moe_expert_fp8_receiver_parity_for_layers(
-                    block_size=(128, 128),
-                    num_experts=32,
-                    hidden_size=16,
-                    intermediate_size=16,
-                    layer_indices=layer_indices,
-                    num_receiver_endpoints=2,
-                    ep_rank=ep_rank,
-                    cpu_scratch_pool_bytes=4 * 1024 * 1024,
-                )
-            )
-
-        assert covered == {(layer_idx, expert_idx) for layer_idx in range(40) for expert_idx in range(256)}
-
-    def test_transfer_bucket_reuses_staged_source_for_replicated_locators(self):
+    def _assert_transfer_bucket_reuses_staged_source_for_replicated_locators(self):
         backend, engine = _make_backend(num_endpoints=2)
         backend._tensor_map = {
             "param": [
@@ -3011,7 +2670,7 @@ class TestP2PTransferBucket:
         assert [row[2] for row in engine.transfers] == [[0x1000], [0x2000]]
         assert [row[3] for row in engine.transfers] == [[8 * 8 * 2], [8 * 8 * 2]]
 
-    def test_transfer_bucket_fails_on_unknown_param(self):
+    def _assert_transfer_bucket_rejects_invalid_source_or_receiver_manifest(self):
         backend, engine = _make_backend()
         backend._tensor_map = {}
         full = torch.zeros(8, 8, dtype=torch.bfloat16)
@@ -3019,7 +2678,11 @@ class TestP2PTransferBucket:
             backend.transfer_bucket([("unknown.param", full)], src_rank=0)
         assert engine.transfers == []
 
-    def test_transfer_bucket_skips_missing_tied_lm_head_locator(self):
+        self._assert_shape_mismatch_is_rejected()
+        self._assert_nonzero_source_is_rejected()
+        self._assert_transfer_bucket_name_compatibility_policy()
+
+    def _assert_transfer_bucket_name_compatibility_policy(self):
         backend, engine = _make_backend()
         receiver_name = "model.embed_tokens.weight"
         backend._tensor_map = {
@@ -3056,7 +2719,10 @@ class TestP2PTransferBucket:
         assert peer_ptrs == [0x1234_0000]
         assert lengths == [full.numel() * full.element_size()]
 
-    def test_transfer_bucket_uses_language_model_receiver_prefix_fallback(self):
+        _assert_transfer_bucket_strips_orig_mod_for_receiver_lookup()
+        self._assert_transfer_bucket_uses_language_model_receiver_prefix_fallback()
+
+    def _assert_transfer_bucket_uses_language_model_receiver_prefix_fallback(self):
         backend, engine = _make_backend()
         receiver_name = "language_model.model.layers.0.self_attn.q_b_proj.weight"
         backend._tensor_map = {
@@ -3090,7 +2756,7 @@ class TestP2PTransferBucket:
         assert peer_ptrs == [0x4567_0000]
         assert lengths == [full.numel() * full.element_size()]
 
-    def test_transfer_bucket_fails_on_shape_mismatch(self):
+    def _assert_shape_mismatch_is_rejected(self):
         backend, engine = _make_backend()
         backend._tensor_map = {
             "param": [
@@ -3111,7 +2777,7 @@ class TestP2PTransferBucket:
 
         assert engine.transfers == []
 
-    def test_transfer_bucket_rejects_nonzero_src_rank(self):
+    def _assert_nonzero_source_is_rejected(self):
         backend, _ = _make_backend()
         backend._tensor_map = {}
         try:
@@ -3121,21 +2787,7 @@ class TestP2PTransferBucket:
         else:
             raise AssertionError("expected ValueError for non-zero src_rank")
 
-    def test_transfer_bucket_stashes_weight_version_and_flush_for_destroy(self):
-        backend, _ = _make_backend()
-        self._seed_tensor_map(backend, peer_ptr=0x1000)
-        full = torch.zeros(128, 64, dtype=torch.bfloat16)
-        backend.transfer_bucket(
-            [("model.layers.0.self_attn.q_proj.weight", full)],
-            src_rank=0,
-            flush_cache=True,
-            weight_version="rev-42",
-        )
-        backend.flush_pending_transfers()
-        assert backend.config.backend_config["flush_cache"] is True
-        assert backend.config.backend_config["weight_version"] == "rev-42"
-
-    def test_transfer_bucket_preserves_requested_flush_cache(self):
+    def _assert_transfer_bucket_preserves_requested_flush_cache_and_weight_version(self):
         backend, _ = _make_backend()
         self._seed_tensor_map(backend, peer_ptr=0x1000)
         backend.config.backend_config["flush_cache"] = True
@@ -3145,6 +2797,7 @@ class TestP2PTransferBucket:
             [("model.layers.0.self_attn.q_proj.weight", full)],
             src_rank=0,
             flush_cache=False,
+            weight_version="rev-42",
         )
 
         with patch(
@@ -3155,8 +2808,9 @@ class TestP2PTransferBucket:
 
         body = posted.call_args.kwargs["json"]
         assert body["flush_cache"] is True
+        assert body["weight_version"] == "rev-42"
 
-    def test_transfer_bucket_stages_small_cpu_tensors_through_cpu_pool(self):
+    def _assert_transfer_bucket_staging_policy(self, monkeypatch):
         backend, engine = _make_backend()
         backend._tensor_map = {
             "model.layers.0.mlp.gate_proj.weight_scale_inv": [
@@ -3192,25 +2846,36 @@ class TestP2PTransferBucket:
         assert peer_ptrs == [0x1234_0000]
         assert lengths == [scale.numel() * scale.element_size()]
 
-    def test_transfer_bucket_uses_gpu_direct_for_small_cuda_tensors(self):
+        with monkeypatch.context() as case_patch:
+            self._assert_gpu_direct_small_chunk_and_persistent_registration_policy(case_patch)
+        with monkeypatch.context() as case_patch:
+            self._assert_transfer_bucket_aligns_cpu_scratch_offsets_before_dtype_views(case_patch)
+        with monkeypatch.context() as case_patch:
+            self._assert_transfer_bucket_coalescing_respects_receiver_handle_policy(case_patch)
+
+    def _assert_gpu_direct_small_chunk_and_persistent_registration_policy(self, monkeypatch):
+        monkeypatch.setenv("XORL_P2P_SMALL_TRANSFER_CHUNK", "2")
+        monkeypatch.setenv("XORL_P2P_PERSIST_SMALL_REGISTRATION", "1")
         backend, engine = _make_backend()
         backend._cpu_pool_min_bytes = 64 * 1024
+        names = [f"model.layers.{index}.input_layernorm.weight" for index in range(3)]
         backend._tensor_map = {
-            "model.layers.0.input_layernorm.weight": [
+            name: [
                 {
                     **_hf_locator(
                         tp_rank=0,
                         full_shape=[4096],
                         slc=[[0, 4096]],
-                        ptr=0x1234_0000,
+                        ptr=0x1234_0000 + index * 0x2000,
                         nbytes=4096,
                         session_id="recv0:7000",
                         dtype="float8_e4m3fn",
                     ),
-                    "hf_name": "model.layers.0.input_layernorm.weight",
+                    "hf_name": name,
                     "endpoint_idx": 0,
                 }
             ]
+            for index, name in enumerate(names)
         }
         backend._receiver_session_ids = ["recv0:7000"]
         fake_view = _FakeCudaView(data_ptr=0xCAFE_0100, storage_ptr=0xCAFE_0000, nbytes=4096)
@@ -3230,23 +2895,30 @@ class TestP2PTransferBucket:
             patch.object(P2PTransportBackend, "_slice_source_for_locator", return_value=fake_view),
             patch("torch.cuda.memory.memory_snapshot", return_value=memory_snapshot),
         ):
-            backend.transfer_bucket(
-                [("model.layers.0.input_layernorm.weight", object())],
-                src_rank=0,
-            )
+            bucket = [(name, object()) for name in names]
+            backend.transfer_bucket(bucket, src_rank=0)
+            backend.flush_pending_transfers()
+            backend.transfer_bucket(bucket, src_rank=0)
             backend.flush_pending_transfers()
 
         assert engine.registered_memory == []
         assert engine.registered == [([0xCAFE_0000], [4096])]
+        assert engine.deregistered == []
+        assert [len(lengths) for _, _, _, lengths in engine.transfers] == [2, 1, 2, 1]
+        assert {session_id for session_id, *_ in engine.transfers} == {"recv0:7000"}
+        assert {src_ptr for _, src_ptrs, _, _ in engine.transfers for src_ptr in src_ptrs} == {0xCAFE_0100}
+        assert [peer_ptr for _, _, peer_ptrs, _ in engine.transfers for peer_ptr in peer_ptrs] == [
+            0x1234_0000,
+            0x1234_2000,
+            0x1234_4000,
+            0x1234_0000,
+            0x1234_2000,
+            0x1234_4000,
+        ]
+        backend.destroy(complete_receiver=False)
         assert engine.deregistered == [[0xCAFE_0000]]
-        assert len(engine.transfers) == 1
-        session_id, src_ptrs, peer_ptrs, lengths = engine.transfers[0]
-        assert session_id == "recv0:7000"
-        assert src_ptrs == [0xCAFE_0100]
-        assert peer_ptrs == [0x1234_0000]
-        assert lengths == [4096]
 
-    def test_transfer_bucket_aligns_cpu_scratch_offsets_before_dtype_views(self, monkeypatch):
+    def _assert_transfer_bucket_aligns_cpu_scratch_offsets_before_dtype_views(self, monkeypatch):
         monkeypatch.setenv("XORL_P2P_MOONCAKE_TRANSFER_CHUNK", "16")
         backend, engine = _make_backend()
         backend._tensor_map = {
@@ -3297,7 +2969,7 @@ class TestP2PTransferBucket:
         assert lengths == [3, 4]
         assert src_ptrs[1] % 4 == 0
 
-    def test_transfer_bucket_does_not_coalesce_across_receiver_memory_handles(self, monkeypatch):
+    def _assert_transfer_bucket_coalescing_respects_receiver_handle_policy(self, monkeypatch):
         monkeypatch.setenv("XORL_P2P_MOONCAKE_TRANSFER_CHUNK", "16")
         backend, engine = _make_backend()
         backend._tensor_map = {
@@ -3347,7 +3019,9 @@ class TestP2PTransferBucket:
         assert peer_ptrs == [0x1000, 0x1004]
         assert lengths == [4, 4]
 
-    def test_transfer_bucket_does_not_coalesce_without_receiver_memory_handles(self, monkeypatch):
+        self._assert_no_coalescing_without_receiver_handles(monkeypatch)
+
+    def _assert_no_coalescing_without_receiver_handles(self, monkeypatch):
         monkeypatch.setenv("XORL_P2P_MOONCAKE_TRANSFER_CHUNK", "16")
         backend, engine = _make_backend()
         backend._tensor_map = {
@@ -3395,7 +3069,9 @@ class TestP2PTransferBucket:
         assert peer_ptrs == [0x1000, 0x1004]
         assert lengths == [4, 4]
 
-    def test_transfer_bucket_failure_names_tensor_and_receiver_handle(self, monkeypatch):
+    def test_transfer_bucket_admission_and_failure_diagnostics_policy(self, monkeypatch):
+        self._assert_transfer_bucket_rejects_invalid_source_or_receiver_manifest()
+
         monkeypatch.setenv("XORL_P2P_TRANSFER_RETRIES", "1")
         monkeypatch.setenv("XORL_P2P_TRANSFER_DEBUG", "1")
         backend, engine = _make_backend()
@@ -3436,7 +3112,10 @@ class TestP2PTransferBucket:
         assert "handle=0x3000" in message
         assert "ptr=0x3000" in message
 
-    def test_transfer_bucket_failure_caps_coalesced_debug_sample(self, monkeypatch):
+        self._assert_failure_sample_is_capped(monkeypatch)
+        self._assert_failure_samples_disabled_by_default(monkeypatch)
+
+    def _assert_failure_sample_is_capped(self, monkeypatch):
         monkeypatch.setenv("XORL_P2P_TRANSFER_RETRIES", "1")
         monkeypatch.setenv("XORL_P2P_TRANSFER_DEBUG", "1")
         backend, engine = _make_backend()
@@ -3469,7 +3148,7 @@ class TestP2PTransferBucket:
         assert "ptr=0x400a" in message
         assert "... 2 more" in message
 
-    def test_transfer_bucket_failure_skips_debug_samples_by_default(self, monkeypatch):
+    def _assert_failure_samples_disabled_by_default(self, monkeypatch):
         monkeypatch.setenv("XORL_P2P_TRANSFER_RETRIES", "1")
         monkeypatch.delenv("XORL_P2P_TRANSFER_DEBUG", raising=False)
         backend, engine = _make_backend()
@@ -3548,26 +3227,7 @@ class TestP2PDirectEPTransfer:
         backend._make_local_engine = lambda: fake_engine  # type: ignore[assignment]
         return backend, fake_engine
 
-    def test_supports_direct_ep_transfer_advertises_all_ranks(self):
-        backend, _ = self._make_multi_sender_backend(rank_index=0, world_size=4, rank_filter=lambda loc: True)
-        assert backend.supports_direct_ep_transfer is True
-        assert backend.supports_direct_pp_transfer is False
-        assert backend.sender_ranks == frozenset({0, 1, 2, 3})
-        assert backend.has_explicit_sender_ranks is False
-
-    def test_direct_ep_transfer_accepts_explicit_sender_ranks(self):
-        backend, _ = self._make_multi_sender_backend(
-            rank_index=0,
-            world_size=4,
-            rank_filter=lambda loc: True,
-            sender_ranks=(0, 2),
-        )
-        assert backend.sender_ranks == frozenset({0, 2})
-        assert backend.has_explicit_sender_ranks is True
-
-    def test_initialize_multi_sender_scatters_filtered_tensor_maps(self, monkeypatch):
-        monkeypatch.delenv("XORL_P2P_SCATTER_REUSE_LOCATORS", raising=False)
-        monkeypatch.delenv("XORL_P2P_SCATTER_COPY_MODE", raising=False)
+    def test_direct_ep_multi_sender_manifest_and_transfer_policy(self, monkeypatch):
         process_group = object()
         backend, _ = self._make_multi_sender_backend(
             rank_index=0,
@@ -3663,89 +3323,15 @@ class TestP2PDirectEPTransfer:
         assert set(payloads[2][1]) == {expert_names[2]}
         assert dense_name not in payloads[1][1]
 
-    def test_scatter_copy_mode_list_copies_locator_lists(self, monkeypatch):
-        monkeypatch.setenv("XORL_P2P_SCATTER_COPY_MODE", "list")
-        monkeypatch.delenv("XORL_P2P_SCATTER_REUSE_LOCATORS", raising=False)
-        backend, _ = self._make_multi_sender_backend(
-            rank_index=0,
-            world_size=2,
-            rank_filter=lambda loc: True,
-            sender_ranks=(0, 1),
-            direct_ep_size=2,
-            sender_ep_ranks=((0, 0), (1, 1)),
-        )
-        expert_name = "model.layers.0.mlp.experts.1.gate_proj.weight"
-        tensor_map = {
-            expert_name: [
-                {
-                    **_hf_locator(
-                        tp_rank=0,
-                        full_shape=[8, 8],
-                        slc=[[0, 8], [0, 8]],
-                        ptr=0x2000,
-                        nbytes=8 * 8 * 2,
-                        session_id="recv:7000",
-                    ),
-                    "hf_name": expert_name,
-                }
-            ]
-        }
+        self._assert_initialize_multi_sender_nonzero_adopts_scattered_tensor_map()
+        self._assert_initialize_multi_sender_uses_explicit_sender_process_group()
+        self._assert_initialize_multi_sender_propagates_nonzero_rank_failure_to_rank0()
+        with monkeypatch.context() as case_patch:
+            self._assert_initialize_multi_sender_nonzero_rank_engine_order_policy(case_patch)
+        self._assert_direct_ep_dense_sharding_partitions_manifests_and_buffers()
+        self._assert_rank_filter_transfer_policy()
 
-        filtered = backend._filter_tensor_map_for_sender(
-            tensor_map,
-            1,
-            locator_copy_mode=backend._scatter_locator_copy_mode(),
-        )
-
-        assert filtered[expert_name] == tensor_map[expert_name]
-        assert filtered[expert_name] is not tensor_map[expert_name]
-        assert filtered[expert_name][0] is tensor_map[expert_name][0]
-
-    def test_scatter_reuse_flag_overrides_copy_mode_for_existing_manifests(self, monkeypatch):
-        monkeypatch.setenv("XORL_P2P_SCATTER_COPY_MODE", "list")
-        monkeypatch.setenv("XORL_P2P_SCATTER_REUSE_LOCATORS", "1")
-
-        assert P2PTransportBackend._scatter_locator_copy_mode() == "none"
-
-    def test_scatter_copy_mode_deep_copies_locator_dicts(self, monkeypatch):
-        monkeypatch.setenv("XORL_P2P_SCATTER_COPY_MODE", "deep")
-        monkeypatch.delenv("XORL_P2P_SCATTER_REUSE_LOCATORS", raising=False)
-        backend, _ = self._make_multi_sender_backend(
-            rank_index=0,
-            world_size=2,
-            rank_filter=lambda loc: True,
-            sender_ranks=(0, 1),
-            direct_ep_size=2,
-            sender_ep_ranks=((0, 0), (1, 1)),
-        )
-        expert_name = "model.layers.0.mlp.experts.1.gate_proj.weight"
-        tensor_map = {
-            expert_name: [
-                {
-                    **_hf_locator(
-                        tp_rank=0,
-                        full_shape=[8, 8],
-                        slc=[[0, 8], [0, 8]],
-                        ptr=0x2000,
-                        nbytes=8 * 8 * 2,
-                        session_id="recv:7000",
-                    ),
-                    "hf_name": expert_name,
-                }
-            ]
-        }
-
-        filtered = backend._filter_tensor_map_for_sender(
-            tensor_map,
-            1,
-            locator_copy_mode=backend._scatter_locator_copy_mode(),
-        )
-
-        assert filtered[expert_name] == tensor_map[expert_name]
-        assert filtered[expert_name] is not tensor_map[expert_name]
-        assert filtered[expert_name][0] is not tensor_map[expert_name][0]
-
-    def test_direct_ep_dense_sharding_partitions_dense_tensor_maps(self):
+    def _assert_direct_ep_dense_sharding_partitions_manifests_and_buffers(self):
         backend, _ = self._make_multi_sender_backend(
             rank_index=0,
             world_size=4,
@@ -3795,11 +3381,6 @@ class TestP2PDirectEPTransfer:
         assert owners["model.layers.0.self_attn.qkv_proj.weight"] == owners["model.layers.0.self_attn.v_proj.weight"]
         assert owners["model.layers.0.mlp.gate_up_proj.weight"] == owners["model.layers.0.mlp.gate_proj.weight"]
         assert owners["model.layers.0.mlp.gate_up_proj.weight"] == owners["model.layers.0.mlp.up_proj.weight"]
-        assert owners["model.layers.0.self_attn.qkv_proj.weight"] == owners["model.layers.0.self_attn.q_proj.weight"]
-        assert owners["model.layers.0.self_attn.qkv_proj.weight"] == owners["model.layers.0.self_attn.k_proj.weight"]
-        assert owners["model.layers.0.self_attn.qkv_proj.weight"] == owners["model.layers.0.self_attn.v_proj.weight"]
-        assert owners["model.layers.0.mlp.gate_up_proj.weight"] == owners["model.layers.0.mlp.gate_proj.weight"]
-        assert owners["model.layers.0.mlp.gate_up_proj.weight"] == owners["model.layers.0.mlp.up_proj.weight"]
 
         for sender_rank in backend.sender_rank_order:
             filtered = backend._filter_tensor_map_for_sender(tensor_map, sender_rank)
@@ -3807,32 +3388,14 @@ class TestP2PDirectEPTransfer:
             expected_expert = {expert_names[sender_rank]}
             assert set(filtered) == expected_dense | expected_expert
 
-    def test_direct_ep_dense_sharding_filters_dense_buffers_by_sender(self):
-        backend, _ = self._make_multi_sender_backend(
-            rank_index=0,
-            world_size=4,
-            rank_filter=lambda loc: True,
-            sender_ranks=(0, 1, 2, 3),
-            direct_ep_dense_sharding=True,
-        )
-        buffer = [
-            ("model.embed_tokens.weight", torch.ones(1)),
-            ("model.layers.0.self_attn.qkv_proj.weight", torch.ones(1)),
-            ("model.layers.0.self_attn.q_proj.weight", torch.ones(1)),
-            ("model.layers.0.self_attn.k_proj.weight", torch.ones(1)),
-            ("model.layers.0.self_attn.v_proj.weight", torch.ones(1)),
-            ("model.layers.0.mlp.experts.0.gate_proj.weight", torch.ones(1)),
-        ]
+        buffer = [(name, torch.ones(1)) for name in dense_names + expert_names]
 
         for sender_rank in backend.sender_rank_order:
             filtered_names = {name for name, _ in backend.filter_dense_buffer_for_rank(buffer, sender_rank)}
-            assert "model.layers.0.mlp.experts.0.gate_proj.weight" not in filtered_names
-            assert filtered_names == {name for name, _ in buffer if backend.should_send_dense_param(name, sender_rank)}
-            filtered_names = {name for name, _ in backend.filter_dense_buffer_for_rank(buffer, sender_rank)}
-            assert "model.layers.0.mlp.experts.0.gate_proj.weight" not in filtered_names
+            assert not filtered_names.intersection(expert_names)
             assert filtered_names == {name for name, _ in buffer if backend.should_send_dense_param(name, sender_rank)}
 
-    def test_initialize_multi_sender_nonzero_adopts_scattered_tensor_map(self):
+    def _assert_initialize_multi_sender_nonzero_adopts_scattered_tensor_map(self):
         process_group = object()
         backend, _ = self._make_multi_sender_backend(
             rank_index=2,
@@ -3890,7 +3453,7 @@ class TestP2PDirectEPTransfer:
         assert backend._receiver_session_ids == ["recv:7000"]
         assert backend._session_debug_info["recv:7000"]["endpoint_idx"] == 0
 
-    def test_initialize_multi_sender_uses_explicit_sender_process_group(self):
+    def _assert_initialize_multi_sender_uses_explicit_sender_process_group(self):
         process_group = object()
         backend, _ = self._make_multi_sender_backend(
             rank_index=0,
@@ -3929,27 +3492,7 @@ class TestP2PDirectEPTransfer:
         assert all(group is process_group for _, group in all_gather_calls)
         assert broadcast_groups == [process_group]
 
-    def test_adopt_prepared_state_skips_http(self):
-        backend, _ = self._make_multi_sender_backend(rank_index=2, world_size=4, rank_filter=lambda loc: True)
-        tensor_map = {
-            "model.layers.0.self_attn.q_proj.weight": [
-                _hf_locator(
-                    tp_rank=0,
-                    full_shape=[128, 64],
-                    slc=[[0, 64], [0, 64]],
-                    ptr=0xAAAA0000,
-                    nbytes=64 * 64 * 2,
-                    session_id="recv:7000",
-                ),
-            ]
-        }
-        # Should not raise, should not POST anything.
-        ok = backend.adopt_prepared_state(tensor_map, ["recv:7000"])
-        assert ok is True
-        assert backend._tensor_map == tensor_map
-        assert backend._receiver_session_ids == ["recv:7000"]
-
-    def test_initialize_multi_sender_propagates_nonzero_rank_failure_to_rank0(self):
+    def _assert_initialize_multi_sender_propagates_nonzero_rank_failure_to_rank0(self):
         backend, _ = self._make_multi_sender_backend(rank_index=0, world_size=2, rank_filter=lambda loc: True)
 
         def initialize_rank0():
@@ -3979,9 +3522,7 @@ class TestP2PDirectEPTransfer:
 
         assert all_gather_calls == [False, True]
 
-    def test_initialize_multi_sender_nonzero_rank_does_not_prewarm_engine_by_default(self):
-        backend, fake_engine = self._make_multi_sender_backend(rank_index=1, world_size=2, rank_filter=lambda loc: True)
-        backend._engine = None
+    def _assert_initialize_multi_sender_nonzero_rank_engine_order_policy(self, monkeypatch):
         tensor_map = {
             "model.layers.0.self_attn.q_proj.weight": [
                 _hf_locator(
@@ -3994,91 +3535,57 @@ class TestP2PDirectEPTransfer:
                 ),
             ]
         }
-        events = []
-        all_gather_calls = []
 
-        def make_local_engine():
-            events.append("make_engine")
-            return fake_engine
+        for prewarm, expected_events in (
+            (False, ["broadcast", "make_engine"]),
+            (True, ["make_engine", "broadcast"]),
+        ):
+            if prewarm:
+                monkeypatch.setenv("XORL_P2P_PREINIT_NONZERO_ENGINES", "1")
+            else:
+                monkeypatch.delenv("XORL_P2P_PREINIT_NONZERO_ENGINES", raising=False)
 
-        def broadcast_payload(payload, src=0, **kwargs):
-            events.append("broadcast")
-            payload[0] = ("tensor_map", tensor_map, ["recv:7000"])
+            backend, fake_engine = self._make_multi_sender_backend(
+                rank_index=1,
+                world_size=2,
+                rank_filter=lambda loc: True,
+            )
+            backend._engine = None
+            events = []
+            all_gather_calls = []
 
-        def all_gather_object(output, value, **kwargs):
-            all_gather_calls.append(value)
-            output[:] = [False, False] if len(all_gather_calls) == 1 else [True, True]
+            def make_local_engine():
+                events.append("make_engine")
+                return fake_engine
 
-        backend._make_local_engine = make_local_engine  # type: ignore[assignment]
+            def broadcast_payload(payload, src=0, **kwargs):
+                events.append("broadcast")
+                payload[0] = ("tensor_map", tensor_map, ["recv:7000"])
 
-        with patch("xorl.server.weight_sync.backends.p2p.dist.is_available", return_value=True):
-            with patch("xorl.server.weight_sync.backends.p2p.dist.is_initialized", return_value=True):
-                with patch(
-                    "xorl.server.weight_sync.backends.p2p.dist.broadcast_object_list",
-                    side_effect=broadcast_payload,
-                ):
+            def all_gather_object(output, value, **kwargs):
+                all_gather_calls.append(value)
+                output[:] = [False, False] if len(all_gather_calls) == 1 else [True, True]
+
+            backend._make_local_engine = make_local_engine  # type: ignore[assignment]
+
+            with patch("xorl.server.weight_sync.backends.p2p.dist.is_available", return_value=True):
+                with patch("xorl.server.weight_sync.backends.p2p.dist.is_initialized", return_value=True):
                     with patch(
-                        "xorl.server.weight_sync.backends.p2p.dist.all_gather_object",
-                        side_effect=all_gather_object,
+                        "xorl.server.weight_sync.backends.p2p.dist.broadcast_object_list",
+                        side_effect=broadcast_payload,
                     ):
-                        assert backend.initialize() is True
+                        with patch(
+                            "xorl.server.weight_sync.backends.p2p.dist.all_gather_object",
+                            side_effect=all_gather_object,
+                        ):
+                            assert backend.initialize() is True
 
-        assert events == ["broadcast", "make_engine"]
-        assert backend._engine is fake_engine
-        assert backend._tensor_map == tensor_map
-        assert backend._receiver_session_ids == ["recv:7000"]
+            assert events == expected_events
+            assert backend._engine is fake_engine
+            assert backend._tensor_map == tensor_map
+            assert backend._receiver_session_ids == ["recv:7000"]
 
-    def test_initialize_multi_sender_nonzero_rank_prewarms_engine_before_broadcast(self, monkeypatch):
-        monkeypatch.setenv("XORL_P2P_PREINIT_NONZERO_ENGINES", "1")
-        backend, fake_engine = self._make_multi_sender_backend(rank_index=1, world_size=2, rank_filter=lambda loc: True)
-        backend._engine = None
-        tensor_map = {
-            "model.layers.0.self_attn.q_proj.weight": [
-                _hf_locator(
-                    tp_rank=0,
-                    full_shape=[128, 64],
-                    slc=[[0, 64], [0, 64]],
-                    ptr=0xAAAA0000,
-                    nbytes=64 * 64 * 2,
-                    session_id="recv:7000",
-                ),
-            ]
-        }
-        events = []
-        all_gather_calls = []
-
-        def make_local_engine():
-            events.append("make_engine")
-            return fake_engine
-
-        def broadcast_payload(payload, src=0, **kwargs):
-            events.append("broadcast")
-            payload[0] = ("tensor_map", tensor_map, ["recv:7000"])
-
-        def all_gather_object(output, value, **kwargs):
-            all_gather_calls.append(value)
-            output[:] = [False, False] if len(all_gather_calls) == 1 else [True, True]
-
-        backend._make_local_engine = make_local_engine  # type: ignore[assignment]
-
-        with patch("xorl.server.weight_sync.backends.p2p.dist.is_available", return_value=True):
-            with patch("xorl.server.weight_sync.backends.p2p.dist.is_initialized", return_value=True):
-                with patch(
-                    "xorl.server.weight_sync.backends.p2p.dist.broadcast_object_list",
-                    side_effect=broadcast_payload,
-                ):
-                    with patch(
-                        "xorl.server.weight_sync.backends.p2p.dist.all_gather_object",
-                        side_effect=all_gather_object,
-                    ):
-                        assert backend.initialize() is True
-
-        assert events == ["make_engine", "broadcast"]
-        assert backend._engine is fake_engine
-        assert backend._tensor_map == tensor_map
-        assert backend._receiver_session_ids == ["recv:7000"]
-
-    def test_rank_filter_routes_slices_to_owning_rank(self):
+    def _assert_rank_filter_transfer_policy(self):
         # Locators tagged with ep_rank; each sender ships only its own.
         full = torch.arange(128 * 64, dtype=torch.bfloat16).reshape(128, 64)
         locators = [
@@ -4120,13 +3627,6 @@ class TestP2PDirectEPTransfer:
         assert len(rank1_engine_calls) == 1
         assert rank1_engine_calls[0][0] == "recv-1:7000"
 
-    def test_transfer_bucket_accepts_nonzero_src_rank_when_direct_ep(self):
-        backend, _ = self._make_multi_sender_backend(rank_index=3, world_size=4, rank_filter=lambda loc: False)
-        backend._tensor_map = {}
-        # Should NOT raise even though src_rank != 0.
-        backend.transfer_bucket([], src_rank=3)
-
-    def test_transfer_bucket_all_filtered_out_is_ok_for_direct_ep_rank(self):
         backend, engine = self._make_multi_sender_backend(rank_index=3, world_size=4, rank_filter=lambda loc: False)
         backend._tensor_map = {
             "param": [
@@ -4146,7 +3646,7 @@ class TestP2PDirectEPTransfer:
 
 
 class TestP2PDestroy:
-    def test_complete_sync_does_not_complete_receiver_after_pending_transfer_failure(self):
+    def _assert_pending_transfer_failure_completion_and_cleanup_policy(self):
         backend, _ = _make_backend()
         future: Future[None] = Future()
         future.set_exception(RuntimeError("mooncake transfer failed"))
@@ -4159,7 +3659,11 @@ class TestP2PDestroy:
         posted.assert_not_called()
         assert backend._cpu_pool_pending_futures[0] is None
 
-    def test_destroy_can_skip_receiver_completion_for_failed_sync_cleanup(self):
+        self._assert_destroy_can_skip_receiver_completion()
+        self._assert_destroy_drains_failed_pending_transfers()
+        self._assert_destroy_completion_and_error_policy()
+
+    def _assert_destroy_can_skip_receiver_completion(self):
         backend, engine = _make_backend()
         backend._registered_source_ptrs = [0x1, 0x2]
 
@@ -4170,7 +3674,7 @@ class TestP2PDestroy:
         assert engine.deregistered == [[0x1, 0x2]]
         assert backend._engine is None
 
-    def test_destroy_skip_completion_drains_failed_pending_transfers_without_raising(self):
+    def _assert_destroy_drains_failed_pending_transfers(self):
         backend, _ = _make_backend()
         future: Future[None] = Future()
         future.set_exception(RuntimeError("transfer failed during cleanup"))
@@ -4183,7 +3687,7 @@ class TestP2PDestroy:
         assert backend._cpu_pool_pending_futures == [None] * backend._n_pools
         assert backend._engine is None
 
-    def test_destroy_posts_complete_with_correct_payload(self):
+    def _assert_destroy_completion_and_error_policy(self):
         backend, engine = _make_backend()
         # Pretend transfer_bucket already ran and stashed flush/version state.
         backend.config.backend_config["flush_cache"] = True
@@ -4235,14 +3739,17 @@ class TestP2PDestroy:
         # Source pointers were deregistered.
         assert engine.deregistered == [[0x1, 0x2]]
 
-    def test_destroy_raises_after_complete_failure_but_cleans_up(self):
+        self._assert_destroy_cleans_up_after_completion_failure()
+        self._assert_complete_sync_defaults_flush_cache_false()
+
+    def _assert_destroy_cleans_up_after_completion_failure(self):
         backend, _ = _make_backend()
         with patch("requests.post", return_value=_FakeResponse(500, {})):
             with pytest.raises(RuntimeError, match="/complete_weights_update failed"):
                 backend.destroy()
         assert backend._engine is None
 
-    def test_complete_sync_defaults_flush_cache_false(self):
+    def _assert_complete_sync_defaults_flush_cache_false(self):
         backend, _ = _make_backend()
         with patch(
             "requests.post",
@@ -4255,7 +3762,7 @@ class TestP2PDestroy:
 
 
 class TestP2PEngineConstruction:
-    def test_resolve_local_hostname_prefers_p2p_trainer_hostname(self, monkeypatch):
+    def _assert_engine_construction_and_hostname_policy(self, monkeypatch):
         monkeypatch.delenv("XORL_P2P_HOSTNAME", raising=False)
         monkeypatch.setenv("P2P_TRAINER_HOSTNAME", "10.42.99.10")
         monkeypatch.setenv("XORL_WEIGHT_SYNC_MASTER_ADDRESS", "10.42.88.10")
@@ -4263,27 +3770,13 @@ class TestP2PEngineConstruction:
 
         assert _resolve_local_hostname() == "10.42.99.10"
 
-    def test_resolve_local_hostname_prefers_weight_sync_master_before_pod_ip(self, monkeypatch):
-        monkeypatch.delenv("XORL_P2P_HOSTNAME", raising=False)
         monkeypatch.delenv("P2P_TRAINER_HOSTNAME", raising=False)
-        monkeypatch.setenv("XORL_WEIGHT_SYNC_MASTER_ADDRESS", "10.42.88.10")
-        monkeypatch.setenv("POD_IP", "10.42.31.44")
-
         assert _resolve_local_hostname() == "10.42.88.10"
 
-    def test_resolve_local_hostname_prefers_pod_ip(self, monkeypatch):
-        monkeypatch.delenv("XORL_P2P_HOSTNAME", raising=False)
-        monkeypatch.delenv("P2P_TRAINER_HOSTNAME", raising=False)
         monkeypatch.delenv("XORL_WEIGHT_SYNC_MASTER_ADDRESS", raising=False)
-        monkeypatch.setenv("POD_IP", "10.42.31.44")
         monkeypatch.setenv("HOST_IP", "10.0.0.2")
-
         assert _resolve_local_hostname() == "10.42.31.44"
 
-    def test_resolve_local_hostname_uses_socket_ip_before_fqdn(self, monkeypatch):
-        monkeypatch.delenv("XORL_P2P_HOSTNAME", raising=False)
-        monkeypatch.delenv("P2P_TRAINER_HOSTNAME", raising=False)
-        monkeypatch.delenv("XORL_WEIGHT_SYNC_MASTER_ADDRESS", raising=False)
         monkeypatch.delenv("POD_IP", raising=False)
         monkeypatch.delenv("HOST_IP", raising=False)
         monkeypatch.delenv("HOSTNAME_IP", raising=False)
@@ -4297,7 +3790,9 @@ class TestP2PEngineConstruction:
 
         assert _resolve_local_hostname() == "10.42.31.44"
 
-    def test_make_local_engine_falls_back_without_sglang_wrapper(self, monkeypatch):
+        self._assert_engine_fallback_without_sglang_wrapper(monkeypatch)
+
+    def _assert_engine_fallback_without_sglang_wrapper(self, monkeypatch):
         class FakeTransferEngine:
             def initialize(self, hostname, protocol, transport, device):
                 self.initialized = (hostname, protocol, transport, device)

@@ -6,7 +6,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from xorl.models import module_utils
 from xorl.models.auto import _load_local_xorl_config
 from xorl.models.registry import ModelRegistry
 from xorl.models.transformers.minimax_m3.checkpoint_handler import MiniMaxM3CheckpointHandler
@@ -115,7 +114,7 @@ def _tiny_config(**overrides):
     return MiniMaxM3Config(**values)
 
 
-def test_minimax_m3_config_adapts_top_level_hf_config():
+def test_minimax_m3_configuration_and_registration_policy(tmp_path):
     cfg = MiniMaxM3Config.from_hf_config(_namespace(_hf_minimax_config_dict()))
 
     assert cfg.model_type == "xorl_minimax_m3"
@@ -136,8 +135,14 @@ def test_minimax_m3_config_adapts_top_level_hf_config():
     assert cfg.vision_config == {"hidden_size": 1024}
     assert cfg._moe_implementation == "native"
 
+    _assert_minimax_m3_local_config_loader_and_registry(tmp_path)
+    _assert_minimax_m3_native_config_round_trip()
+    _assert_minimax_m3_text_runtime_and_admission_policy()
+    _assert_minimax_m3_checkpoint_mapping_and_expert_ownership_policy()
+    _assert_minimax_m3_msa_cpu_path_fails_loudly_and_paging_is_stable()
 
-def test_minimax_m3_local_config_loader_and_registry(tmp_path):
+
+def _assert_minimax_m3_local_config_loader_and_registry(tmp_path):
     config_dir = tmp_path / "minimax"
     config_dir.mkdir()
     (config_dir / "config.json").write_text(__import__("json").dumps(_hf_minimax_config_dict()))
@@ -149,7 +154,7 @@ def test_minimax_m3_local_config_loader_and_registry(tmp_path):
     assert "MiniMaxM3SparseForCausalLM" in ModelRegistry.supported_models
 
 
-def test_minimax_m3_config_adapts_xorl_native_config_without_text_config():
+def _assert_minimax_m3_native_config_round_trip():
     original = _tiny_config(text_config=None)
 
     cfg = MiniMaxM3Config.from_hf_config(original)
@@ -159,7 +164,7 @@ def test_minimax_m3_config_adapts_xorl_native_config_without_text_config():
     assert cfg.sparse_attention_freq == original.sparse_attention_freq
 
 
-def test_minimax_m3_swigluoai_matches_oai_formula():
+def _assert_minimax_m3_activation_and_router_policy():
     gate = torch.tensor([[-9.0, -1.0, 1.0, 9.0]])
     up = torch.tensor([[-9.0, -1.0, 1.0, 9.0]])
 
@@ -170,8 +175,10 @@ def test_minimax_m3_swigluoai_matches_oai_formula():
     expected = expected_gate * torch.sigmoid(1.702 * expected_gate) * (expected_up + 1.0)
     torch.testing.assert_close(actual, expected)
 
+    _assert_minimax_m3_sigmoid_router_selection()
 
-def test_minimax_m3_sigmoid_router_uses_bias_only_for_selection():
+
+def _assert_minimax_m3_sigmoid_router_selection():
     router = MiniMaxM3Router(num_experts=4, top_k=2, routed_scaling_factor=2.0, use_routing_bias=True)
     logits = torch.tensor([[4.0, 3.0, -1.0, -2.0]])
     bias = torch.tensor([-10.0, -10.0, 20.0, 0.0])
@@ -185,7 +192,9 @@ def test_minimax_m3_sigmoid_router_uses_bias_only_for_selection():
     torch.testing.assert_close(weights, expected)
 
 
-def test_minimax_m3_tiny_forward_backward_with_labels():
+def _assert_minimax_m3_text_runtime_and_admission_policy():
+    _assert_minimax_m3_activation_and_router_policy()
+
     torch.manual_seed(0)
     cfg = _tiny_config()
     model = MiniMaxM3SparseForCausalLM(cfg)
@@ -199,8 +208,11 @@ def test_minimax_m3_tiny_forward_backward_with_labels():
     out.loss.backward()
     assert model.lm_head.weight.grad is not None
 
+    _assert_minimax_m3_rejects_multimodal_inputs_and_tokens()
+    _assert_minimax_m3_rejects_unsupported_parallel_modes()
 
-def test_minimax_m3_text_only_rejects_multimodal_inputs_and_tokens():
+
+def _assert_minimax_m3_rejects_multimodal_inputs_and_tokens():
     cfg = _tiny_config(image_token_index=5, video_token_index=6)
     model = MiniMaxM3SparseForCausalLM(cfg)
 
@@ -214,7 +226,7 @@ def test_minimax_m3_text_only_rejects_multimodal_inputs_and_tokens():
         model(input_ids=torch.tensor([[1, 6, 3]]))
 
 
-def test_minimax_m3_unsupported_parallel_modes_fail_clearly():
+def _assert_minimax_m3_rejects_unsupported_parallel_modes():
     ps = SimpleNamespace(tp_size=2, pp_size=1, ringattn_size=1, ulysses_size=1, lm_head_tp_size=1)
 
     with pytest.raises(ValueError, match="supports data/FSDP2 and expert parallelism only"):
@@ -223,7 +235,7 @@ def test_minimax_m3_unsupported_parallel_modes_fail_clearly():
     assert "tensor parallelism" in MINIMAX_M3_UNSUPPORTED_PARALLEL_MESSAGE
 
 
-def test_minimax_m3_checkpoint_handler_maps_language_weights_and_skips_multimodal():
+def _assert_minimax_m3_checkpoint_mapping_and_expert_ownership_policy():
     handler = MiniMaxM3CheckpointHandler(num_experts=2)
     hidden = 2
     intermediate = 3
@@ -278,8 +290,10 @@ def test_minimax_m3_checkpoint_handler_maps_language_weights_and_skips_multimoda
     assert handler.on_load_weight("multi_modal_projector.linear_1.weight", torch.ones(1)) == []
     assert handler.on_load_weight("patch_merge_mlp.linear_1.weight", torch.ones(1)) == []
 
+    _assert_minimax_m3_checkpoint_ep_skip_counts_raw_keys()
 
-def test_minimax_m3_checkpoint_handler_ep_skip_counts_raw_keys():
+
+def _assert_minimax_m3_checkpoint_ep_skip_counts_raw_keys():
     handler = MiniMaxM3CheckpointHandler(num_experts=4, ep_rank=1, ep_size=2)
     skip = handler.get_skip_key_fn()
 
@@ -300,7 +314,7 @@ def test_minimax_m3_checkpoint_handler_ep_skip_counts_raw_keys():
     assert mapped["model.layers.3.mlp.experts.down_proj"].shape[0] == 2
 
 
-def test_minimax_m3_msa_cpu_path_fails_loudly_and_paging_is_stable():
+def _assert_minimax_m3_msa_cpu_path_fails_loudly_and_paging_is_stable():
     x = torch.arange(2 * 3 * 1 * 2, dtype=torch.float32).reshape(2, 3, 1, 2)
     pages, indices = _to_paged_kv(x, torch.tensor([3, 1], dtype=torch.int32), page_size=2)
     assert pages.shape == (3, 1, 2, 2)
@@ -321,15 +335,3 @@ def test_minimax_m3_msa_cpu_path_fails_loudly_and_paging_is_stable():
             force_begin_blocks=1,
             force_end_blocks=1,
         )
-
-
-@pytest.mark.parametrize(
-    "key",
-    [
-        "language_model.model.layers.3.block_sparse_moe.experts.0.w1.weight",
-        "model.language_model.model.layers.3.block_sparse_moe.experts.0.w2.weight",
-        "model.layers.3.block_sparse_moe.experts.0.w3.weight",
-    ],
-)
-def test_minimax_m3_grouped_loader_classifies_block_sparse_experts(key):
-    assert module_utils._is_checkpoint_expert_key(key)

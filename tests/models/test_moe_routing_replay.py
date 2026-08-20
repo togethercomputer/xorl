@@ -33,6 +33,10 @@ pytestmark = [pytest.mark.gpu]
 def _clean_routing_replay_state():
     """Reset all RoutingReplay state between tests."""
     yield
+    _reset_routing_replay_state()
+
+
+def _reset_routing_replay_state():
     set_replay_stage(None)
     RoutingReplay.clear_all()
     RoutingReplay._instances.clear()
@@ -81,7 +85,6 @@ def _run_with_replay(layer, x):
     out = checkpoint(layer, x, use_reentrant=False)
     set_replay_stage("replay_backward")
     out.sum().backward()
-    RoutingReplay.reset_all_backward()
     return out
 
 
@@ -93,9 +96,7 @@ def _run_with_replay(layer, x):
 class TestRoutingReplayUnit:
     """Unit tests for RoutingReplay class, stage management, clear, and registry."""
 
-    @pytest.mark.gpu
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-    def test_async_cpu_record_is_ordered_before_replay(self):
+    def _assert_async_cpu_record_is_ordered_before_replay(self):
         replay = RoutingReplay()
         source = torch.arange(16, device="cuda", dtype=torch.int64)
         record_stream = torch.cuda.Stream()
@@ -110,7 +111,7 @@ class TestRoutingReplayUnit:
 
     def test_record_pop_dual_index_clear_stage_and_registry(self):
         """Test record, forward/backward pop, dual-index, CPU pinned storage,
-        clear, clear_all, reset_all_forward/backward, registry, and stage management."""
+        clear, clear_all, registry, and stage management."""
         # --- Record and pop ---
         replay = RoutingReplay()
         t1 = torch.tensor([[0, 1], [2, 3]])
@@ -183,24 +184,6 @@ class TestRoutingReplayUnit:
         assert len(r1.top_indices_list) == 0
         assert len(r2.top_indices_list) == 0
 
-        # reset_all_forward
-        r1.forward_index = 5
-        r2.forward_index = 3
-        r1.backward_index = 2
-        RoutingReplay.reset_all_forward()
-        assert r1.forward_index == 0
-        assert r2.forward_index == 0
-        assert r1.backward_index == 2  # backward not touched
-
-        # reset_all_backward
-        r1.backward_index = 5
-        r2.backward_index = 3
-        r1.forward_index = 2
-        RoutingReplay.reset_all_backward()
-        assert r1.backward_index == 0
-        assert r2.backward_index == 0
-        assert r1.forward_index == 2  # forward not touched
-
         # --- Stage management ---
         assert get_replay_stage() is None
         set_replay_stage("record")
@@ -257,6 +240,8 @@ class TestMoEBlockReplay:
     def test_record_replay_no_replay_and_router_training(self):
         """Test record on forward, replay on backward, no-recording conditions,
         router training/detach, and regather correctness."""
+        TestRoutingReplayUnit()._assert_async_cpu_record_is_ordered_before_replay()
+        _reset_routing_replay_state()
         # --- Record stores expert indices correctly ---
         moe = MoEBlock(
             hidden_size=64,
@@ -287,7 +272,7 @@ class TestMoEBlockReplay:
         x2 = torch.randn(1, 8, 64, device="cuda", requires_grad=True)
         _run_with_replay(layer, x2)
         assert len(replay2.top_indices_list) == 1
-        assert replay2.backward_index == 0
+        assert replay2.backward_index == 1
 
         # Checkpoint determinism with noisy attention
         layer3 = _SimpleDecoderLayer().cuda()
@@ -394,6 +379,10 @@ class TestMoEBlockReplay:
         out, _ = moe6(x7)
         out.sum().backward()
         assert moe6.gate.weight.grad is None or moe6.gate.weight.grad.abs().sum() == 0
+        _reset_routing_replay_state()
+        TestMultiLayerReplay()._assert_multi_layer_and_pp_schedule()
+        _reset_routing_replay_state()
+        TestBaseModelIntegrationAndR3Preload()._assert_enable_routing_replay_checkpoint_e2e_and_r3_preload()
 
 
 # ===========================================================================
@@ -426,7 +415,7 @@ class TestMultiLayerReplay:
             replays.append(replay)
         return model, replays
 
-    def test_multi_layer_and_pp_schedule(self):
+    def _assert_multi_layer_and_pp_schedule(self):
         """Test 3-layer 2-microbatch replay and 4-microbatch 1F1B PP schedule."""
         # 3 layers, 2 micro-batches
         model, replays = self._make_model(num_layers=3)
@@ -501,7 +490,7 @@ class TestMultiLayerReplay:
 class TestBaseModelIntegrationAndR3Preload:
     """XorlPreTrainedModel integration and R3 preload (replay_forward)."""
 
-    def test_enable_routing_replay_checkpoint_e2e_and_r3_preload(self):
+    def _assert_enable_routing_replay_checkpoint_e2e_and_r3_preload(self):
         """Test enable_routing_replay, gradient_checkpointing_enable, full e2e, and R3 preload."""
 
         class _FakeConfig:

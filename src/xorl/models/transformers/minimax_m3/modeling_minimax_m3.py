@@ -21,7 +21,7 @@ from xorl.models.layers import RotaryEmbedding
 from xorl.models.layers.attention import AttentionKwargs, update_causal_mask
 from xorl.models.layers.attention.backend import ATTENTION_FUNCTIONS
 from xorl.models.layers.attention.backend.eager import eager_attention_forward
-from xorl.models.layers.moe import MoEBlock
+from xorl.models.layers.moe import MoEBlock, MoEExperts
 from xorl.models.layers.moe.router import _balanced_selected_experts, balanced_synthetic_routing
 from xorl.models.module_utils import MoEGradientCheckpointingLayer
 from xorl.models.outputs import MoeCausalLMOutput, MoeModelOutput
@@ -564,6 +564,9 @@ class MiniMaxM3PreTrainedModel(XorlPreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
+        elif isinstance(module, MoEExperts):
+            module.gate_up_proj.data.normal_(mean=0.0, std=std)
+            module.down_proj.data.normal_(mean=0.0, std=std)
         elif isinstance(module, (MiniMaxM3RMSNorm, MiniMaxM3PerHeadRMSNorm)):
             if module.use_gemma_norm:
                 module.weight.data.zero_()

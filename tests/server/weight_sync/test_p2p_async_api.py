@@ -80,7 +80,7 @@ def _session_entries(src_ptrs, peer_ptrs, lengths):
     return (src_ptrs, peer_ptrs, lengths, [])
 
 
-def test_async_api_success_status_zero_completes(monkeypatch):
+def _run_transfer(monkeypatch, length):
     monkeypatch.setenv("XORL_P2P_USE_ASYNC_API", "1")
     wrapper = FakeEngineWrapper([0])
     timing = _BucketTiming()
@@ -88,7 +88,7 @@ def test_async_api_success_status_zero_completes(monkeypatch):
     _do_async_transfer(
         engine_wrapper=wrapper,
         copy_done_event=DoneEvent(),
-        by_session={"session-a": _session_entries([1], [2], [128 * 1024 * 1024])},
+        by_session={"session-a": _session_entries([1], [2], [length])},
         small_session_data={},
         session_debug_info={"session-a": {"world_rank": 0}},
         small_register_ptrs=[],
@@ -101,68 +101,36 @@ def test_async_api_success_status_zero_completes(monkeypatch):
         src_view_holds=[],
         log_bucket_details=False,
     )
+    return wrapper, timing
 
-    assert wrapper.engine.submitted == [("session-a", [1], [2], [128 * 1024 * 1024])]
+
+def test_async_api_dispatches_by_size_and_configured_cutoff(monkeypatch):
+    large = 128 * 1024 * 1024
+    wrapper, timing = _run_transfer(monkeypatch, large)
+
+    assert wrapper.engine.submitted == [("session-a", [1], [2], [large])]
     assert wrapper.sync_submitted == []
     assert timing.transfer_s >= 0
 
-
-def test_async_api_uses_sync_fallback_for_medium_chunks(monkeypatch):
-    monkeypatch.setenv("XORL_P2P_USE_ASYNC_API", "1")
-    wrapper = FakeEngineWrapper([0])
-    timing = _BucketTiming()
-
-    _do_async_transfer(
-        engine_wrapper=wrapper,
-        copy_done_event=DoneEvent(),
-        by_session={"session-a": _session_entries([1], [2], [12 * 1024 * 1024])},
-        small_session_data={},
-        session_debug_info={"session-a": {"world_rank": 0}},
-        small_register_ptrs=[],
-        small_register_lens=[],
-        chunk=1,
-        use_async_api=True,
-        timing=timing,
-        bucket_idx=1,
-        slice_holds=[],
-        src_view_holds=[],
-        log_bucket_details=False,
-    )
+    medium = 12 * 1024 * 1024
+    wrapper, timing = _run_transfer(monkeypatch, medium)
 
     assert wrapper.engine.submitted == []
-    assert wrapper.sync_submitted == [("session-a", [1], [2], [12 * 1024 * 1024])]
+    assert wrapper.sync_submitted == [("session-a", [1], [2], [medium])]
     assert timing.transfer_s >= 0
 
-
-def test_async_api_min_bytes_env_controls_cutoff(monkeypatch):
-    monkeypatch.setenv("XORL_P2P_USE_ASYNC_API", "1")
     monkeypatch.setenv("XORL_P2P_ASYNC_MIN_BYTES", str(8 * 1024 * 1024))
-    wrapper = FakeEngineWrapper([0])
-    timing = _BucketTiming()
+    wrapper, timing = _run_transfer(monkeypatch, medium)
 
-    _do_async_transfer(
-        engine_wrapper=wrapper,
-        copy_done_event=DoneEvent(),
-        by_session={"session-a": _session_entries([1], [2], [12 * 1024 * 1024])},
-        small_session_data={},
-        session_debug_info={"session-a": {"world_rank": 0}},
-        small_register_ptrs=[],
-        small_register_lens=[],
-        chunk=1,
-        use_async_api=True,
-        timing=timing,
-        bucket_idx=1,
-        slice_holds=[],
-        src_view_holds=[],
-        log_bucket_details=False,
-    )
-
-    assert wrapper.engine.submitted == [("session-a", [1], [2], [12 * 1024 * 1024])]
+    assert wrapper.engine.submitted == [("session-a", [1], [2], [medium])]
     assert wrapper.sync_submitted == []
     assert timing.transfer_s >= 0
 
+    _assert_async_api_status_poll_timeout(monkeypatch)
+    _assert_prepare_uses_prepare_timeout_env(monkeypatch)
 
-def test_async_api_status_poll_timeout(monkeypatch):
+
+def _assert_async_api_status_poll_timeout(monkeypatch):
     monkeypatch.setenv("XORL_P2P_USE_ASYNC_API", "1")
     monkeypatch.setenv("XORL_P2P_ASYNC_STATUS_TIMEOUT_S", "0.001")
     wrapper = FakeEngineWrapper([1])
@@ -186,7 +154,7 @@ def test_async_api_status_poll_timeout(monkeypatch):
         )
 
 
-def test_prepare_uses_prepare_timeout_env(monkeypatch):
+def _assert_prepare_uses_prepare_timeout_env(monkeypatch):
     monkeypatch.setenv("XORL_P2P_PREPARE_TIMEOUT_S", "12.5")
     seen = {}
 
