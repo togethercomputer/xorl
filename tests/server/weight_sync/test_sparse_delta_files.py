@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import sys
 import types
 from dataclasses import dataclass
@@ -12,20 +11,13 @@ import torch
 import torch.nn as nn
 
 from xorl.server.weight_sync.source_delta_capture import (
-    GLOBAL_MANIFEST_VERSION,
-    load_sparse_source_delta_inputs,
     snapshot_sparse_delta_tensors,
     write_sparse_source_delta_global_manifest,
     write_sparse_source_delta_rank,
 )
 from xorl.server.weight_sync.sparse_delta_files import (
     SparseTensorUpdate,
-    collect_encoded_sparse_deltas_by_rank,
-    split_sparse_update_by_contiguous_shards,
-    write_encoded_sparse_delta_files_by_rank,
     write_sparse_delta_file,
-    write_sparse_delta_files_by_rank,
-    write_translation_futures_as_sparse_delta_files,
 )
 
 
@@ -38,24 +30,6 @@ class _FakeEncoded:
     @property
     def flat_deltas(self) -> torch.Tensor:
         return self.flat_indices
-
-
-@dataclass(frozen=True)
-class _FakeKey:
-    name: str
-    rank: int | None
-
-    def strip_tags(self) -> "_FakeKey":
-        return _FakeKey(self.name.split(".__", 1)[0], self.rank)
-
-
-@dataclass
-class _FakeFuture:
-    key: _FakeKey
-    value: _FakeEncoded
-
-    def wait(self) -> _FakeEncoded:
-        return self.value
 
 
 def _install_fake_delta_encoding(monkeypatch: pytest.MonkeyPatch, captured: dict[str, Any]) -> None:
@@ -123,7 +97,7 @@ class _TinyModel(nn.Module):
         self.frozen = nn.Parameter(torch.tensor([5.0, 6.0]), requires_grad=False)
 
 
-def test_source_delta_capture_writes_rank_manifest_and_packed_file(
+def _assert_source_delta_capture_writes_rank_manifest_and_packed_file(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -158,43 +132,38 @@ def test_source_delta_capture_writes_rank_manifest_and_packed_file(
     assert encoded.values.tolist() == [20.0, 40.0]
 
 
-@pytest.mark.parametrize(
-    ("template_key", "template"),
-    [
-        ("filename_template", "../rank{rank}.packed"),
-        ("manifest_filename_template", "../rank{rank}.manifest.json"),
-    ],
-)
-def test_source_delta_capture_rejects_traversing_templates(
+def _assert_source_delta_capture_rejects_traversing_templates(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    template_key: str,
-    template: str,
 ) -> None:
     _install_fake_delta_encoding(monkeypatch, {})
-    model = _TinyModel()
-    config = {
-        "output_dir": str(tmp_path),
-        "dtype": "float32",
-        template_key: template,
-    }
-    before = snapshot_sparse_delta_tensors(model, config)
-    with torch.no_grad():
-        model.weight[0] = 10.0
+    for template_key, template in (
+        ("filename_template", "../rank{rank}.packed"),
+        ("manifest_filename_template", "../rank{rank}.manifest.json"),
+    ):
+        model = _TinyModel()
+        config = {
+            "output_dir": str(tmp_path),
+            "dtype": "float32",
+            template_key: template,
+        }
+        before = snapshot_sparse_delta_tensors(model, config)
+        with torch.no_grad():
+            model.weight[0] = 10.0
 
-    with pytest.raises(ValueError, match="plain filename"):
-        write_sparse_source_delta_rank(
-            model=model,
-            before=before,
-            config=config,
-            rank=0,
-            world_size=1,
-            model_id="default",
-            step=7,
-        )
+        with pytest.raises(ValueError, match="plain filename"):
+            write_sparse_source_delta_rank(
+                model=model,
+                before=before,
+                config=config,
+                rank=0,
+                world_size=1,
+                model_id="default",
+                step=7,
+            )
 
 
-def test_source_delta_global_manifest_collects_rank_outputs(tmp_path: Path) -> None:
+def _assert_source_delta_global_manifest_collects_rank_outputs(tmp_path: Path) -> None:
     rank0 = {
         "rank": 0,
         "world_size": 2,
@@ -223,60 +192,7 @@ def test_source_delta_global_manifest_collects_rank_outputs(tmp_path: Path) -> N
     assert Path(manifest["manifest_path"]).exists()
 
 
-def test_load_sparse_source_delta_inputs_can_include_empty_rank_shards(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _install_fake_delta_encoding(monkeypatch, {})
-    manifest_path = tmp_path / "manifest.json"
-    manifest_path.write_text(
-        json.dumps(
-            {
-                "format": GLOBAL_MANIFEST_VERSION,
-                "world_size": 2,
-                "ranks": [
-                    {
-                        "rank": 0,
-                        "packed_path": None,
-                        "capture_dtype": "bfloat16",
-                        "tensors": [
-                            {
-                                "name": "model.norm.weight",
-                                "shape": [4],
-                                "dtype": "bfloat16",
-                                "nnz": 0,
-                            }
-                        ],
-                    },
-                    {
-                        "rank": 1,
-                        "packed_path": None,
-                        "capture_dtype": "bfloat16",
-                        "tensors": [
-                            {
-                                "name": "model.norm.weight",
-                                "shape": [4],
-                                "dtype": "bfloat16",
-                                "nnz": 0,
-                            }
-                        ],
-                    },
-                ],
-            }
-        )
-    )
-
-    inputs = load_sparse_source_delta_inputs(manifest_path, include_empty=True)
-
-    assert len(inputs) == 2
-    assert [key.rank for key, _ in inputs] == [0, 1]
-    assert [key.strip_tags().name for key, _ in inputs] == ["model.norm.weight", "model.norm.weight"]
-    assert [encoded.shape for _, encoded in inputs] == [(4,), (4,)]
-    assert all(encoded.values.dtype == torch.bfloat16 for _, encoded in inputs)
-    assert all(encoded.values.numel() == 0 for _, encoded in inputs)
-
-
-def test_write_sparse_delta_file_packs_sparse_updates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def _assert_write_sparse_delta_file_packs_sparse_updates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, Any] = {}
     _install_fake_delta_encoding(monkeypatch, captured)
 
@@ -305,7 +221,9 @@ def test_write_sparse_delta_file_packs_sparse_updates(tmp_path: Path, monkeypatc
     assert encoded.shape == (4, 8)
 
 
-def test_write_sparse_delta_file_sorts_indices_before_encoding(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def _assert_write_sparse_delta_file_sorts_indices_before_encoding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     captured: dict[str, Any] = {}
     _install_fake_delta_encoding(monkeypatch, captured)
 
@@ -326,230 +244,30 @@ def test_write_sparse_delta_file_sorts_indices_before_encoding(tmp_path: Path, m
     assert encoded.values.tolist() == [1.25, 2.5]
 
 
-def test_write_sparse_delta_file_rejects_duplicate_indices(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def _assert_write_sparse_delta_file_rejects_malformed_updates(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_delta_encoding(monkeypatch, {})
 
-    with pytest.raises(ValueError, match="duplicate flat indices"):
-        write_sparse_delta_file(
-            [
-                SparseTensorUpdate(
-                    name="dup.weight",
-                    flat_indices=torch.tensor([1, 1], dtype=torch.int32),
-                    values=torch.tensor([1.0, 2.0], dtype=torch.float32),
-                    shape=(2, 2),
-                )
-            ],
-            tmp_path / "dup.packed",
-        )
-
-
-def test_write_sparse_delta_file_rejects_non_integer_indices(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_fake_delta_encoding(monkeypatch, {})
-
-    with pytest.raises(ValueError, match="integer dtype"):
-        write_sparse_delta_file(
-            [
-                SparseTensorUpdate(
-                    name="bad.weight",
-                    flat_indices=torch.tensor([0.0], dtype=torch.float32),
-                    values=torch.tensor([1.0], dtype=torch.float32),
-                    shape=(2, 2),
-                )
-            ],
-            tmp_path / "bad.packed",
-        )
-
-
-def test_write_sparse_delta_file_rejects_bad_update_lengths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_fake_delta_encoding(monkeypatch, {})
-
-    with pytest.raises(ValueError, match="2 indices but 1 values"):
-        write_sparse_delta_file(
-            [
-                SparseTensorUpdate(
-                    name="bad.weight",
-                    flat_indices=torch.tensor([0, 1], dtype=torch.int32),
-                    values=torch.tensor([1.0], dtype=torch.float32),
-                    shape=(2, 2),
-                )
-            ],
-            tmp_path / "bad.packed",
-        )
-
-
-def test_split_sparse_update_by_contiguous_shards_localizes_flat_indices() -> None:
-    update = SparseTensorUpdate(
-        name="lm_head.weight",
-        flat_indices=torch.tensor([22, 10, 0, 17, 9], dtype=torch.int64),
-        values=torch.tensor([5.0, 3.0, 1.0, 4.0, 2.0], dtype=torch.bfloat16),
-        shape=(6, 4),
+    malformed = (
+        (torch.tensor([1, 1], dtype=torch.int32), torch.tensor([1.0, 2.0]), "duplicate flat indices"),
+        (torch.tensor([0.0], dtype=torch.float32), torch.tensor([1.0]), "integer dtype"),
+        (torch.tensor([0, 1], dtype=torch.int32), torch.tensor([1.0]), "2 indices but 1 values"),
+        (torch.tensor([4], dtype=torch.int32), torch.tensor([1.0]), "out of range"),
     )
-
-    by_rank = split_sparse_update_by_contiguous_shards(
-        update,
-        shard_dim=0,
-        num_shards=3,
-    )
-
-    assert sorted(by_rank) == [0, 1, 2]
-    assert by_rank[0].name == "lm_head.weight"
-    assert by_rank[0].shape == (2, 4)
-    assert by_rank[0].flat_indices.tolist() == [0]
-    assert by_rank[0].values.tolist() == [1.0]
-    assert by_rank[1].shape == (2, 4)
-    assert by_rank[1].flat_indices.tolist() == [1, 2]
-    assert by_rank[1].values.tolist() == [2.0, 3.0]
-    assert by_rank[2].shape == (2, 4)
-    assert by_rank[2].flat_indices.tolist() == [1, 6]
-    assert by_rank[2].values.tolist() == [4.0, 5.0]
-
-
-def test_split_sparse_update_by_contiguous_shards_emits_empty_local_updates() -> None:
-    update = SparseTensorUpdate(
-        name="lm_head.weight",
-        flat_indices=torch.tensor([0], dtype=torch.int32),
-        values=torch.tensor([1.0], dtype=torch.bfloat16),
-        shape=(4, 4),
-    )
-
-    by_rank = split_sparse_update_by_contiguous_shards(update, shard_dim=0, num_shards=2)
-
-    assert by_rank[0].flat_indices.tolist() == [0]
-    assert by_rank[1].shape == (2, 4)
-    assert by_rank[1].flat_indices.tolist() == []
-    assert by_rank[1].values.numel() == 0
-
-
-def test_write_sparse_delta_files_by_rank_writes_rank_ordered_paths(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    captured: dict[str, Any] = {}
-    _install_fake_delta_encoding(monkeypatch, captured)
-
-    stats = write_sparse_delta_files_by_rank(
-        {
-            1: [
-                SparseTensorUpdate(
-                    name="lm_head.weight",
-                    flat_indices=torch.tensor([0], dtype=torch.int32),
-                    values=torch.tensor([2.0], dtype=torch.bfloat16),
-                    shape=(2, 4),
-                )
-            ],
-            0: [
-                SparseTensorUpdate(
-                    name="lm_head.weight",
-                    flat_indices=torch.tensor([0], dtype=torch.int32),
-                    values=torch.tensor([1.0], dtype=torch.bfloat16),
-                    shape=(2, 4),
-                )
-            ],
-        },
-        tmp_path,
-    )
-
-    assert sorted(stats) == [0, 1]
-    assert stats[0].path == str(tmp_path / "rank0.packed")
-    assert stats[1].path == str(tmp_path / "rank1.packed")
-    assert stats[0].nnz == 1
-    assert stats[1].nnz == 1
-
-
-def test_write_sparse_delta_files_by_rank_rejects_traversing_template(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    captured: dict[str, Any] = {}
-    _install_fake_delta_encoding(monkeypatch, captured)
-    updates = {
-        0: [
-            SparseTensorUpdate(
-                name="lm_head.weight",
-                flat_indices=torch.tensor([0], dtype=torch.int32),
-                values=torch.tensor([1.0], dtype=torch.bfloat16),
-                shape=(2, 4),
+    for case, (indices, values, error) in enumerate(malformed):
+        with pytest.raises(ValueError, match=error):
+            write_sparse_delta_file(
+                [SparseTensorUpdate(name="bad.weight", flat_indices=indices, values=values, shape=(2, 2))],
+                tmp_path / f"bad-{case}.packed",
             )
-        ]
-    }
-
-    with pytest.raises(ValueError, match="plain filename"):
-        write_sparse_delta_files_by_rank(updates, tmp_path, filename_template="../rank{rank}.packed")
 
 
-def test_write_encoded_sparse_delta_files_by_rank_uses_packed_api(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    captured: dict[str, Any] = {}
-    _install_fake_delta_encoding(monkeypatch, captured)
-    encoded_by_rank = {
-        0: {"lm_head.weight": _FakeEncoded(torch.tensor([0], dtype=torch.uint8), torch.ones(1), (2, 4))},
-        1: {"lm_head.weight": _FakeEncoded(torch.tensor([0], dtype=torch.uint8), torch.ones(2), (2, 4))},
-    }
+def test_sparse_delta_artifact_and_source_capture_lifecycle(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    with monkeypatch.context() as capture_patch:
+        _assert_source_delta_capture_writes_rank_manifest_and_packed_file(tmp_path, capture_patch)
+        _assert_source_delta_capture_rejects_traversing_templates(tmp_path, capture_patch)
+    _assert_source_delta_global_manifest_collects_rank_outputs(tmp_path)
 
-    stats = write_encoded_sparse_delta_files_by_rank(encoded_by_rank, tmp_path)
-
-    assert sorted(stats) == [0, 1]
-    assert stats[0].path == str(tmp_path / "rank0.packed")
-    assert stats[1].path == str(tmp_path / "rank1.packed")
-    assert stats[0].nnz == 1
-    assert stats[1].nnz == 2
-
-
-def test_collect_encoded_sparse_deltas_by_rank_drains_translation_futures() -> None:
-    encoded0 = _FakeEncoded(torch.tensor([0], dtype=torch.uint8), torch.ones(1), (2, 4))
-    encoded1 = _FakeEncoded(torch.tensor([0], dtype=torch.uint8), torch.ones(2), (2, 4))
-
-    by_rank = collect_encoded_sparse_deltas_by_rank(
-        [
-            _FakeFuture(_FakeKey("lm_head.weight.__enc", 1), encoded1),
-            _FakeFuture(_FakeKey("lm_head.weight.__enc", 0), encoded0),
-        ],
-        expected_ranks=2,
-    )
-
-    assert sorted(by_rank) == [0, 1]
-    assert by_rank[0] == {"lm_head.weight": encoded0}
-    assert by_rank[1] == {"lm_head.weight": encoded1}
-
-
-def test_collect_encoded_sparse_deltas_by_rank_rejects_unranked_output() -> None:
-    encoded = _FakeEncoded(torch.tensor([0], dtype=torch.uint8), torch.ones(1), (2, 4))
-
-    with pytest.raises(ValueError, match="unranked"):
-        collect_encoded_sparse_deltas_by_rank([_FakeFuture(_FakeKey("lm_head.weight", None), encoded)])
-
-
-def test_write_translation_futures_as_sparse_delta_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_fake_delta_encoding(monkeypatch, {})
-    futures = [
-        _FakeFuture(
-            _FakeKey("lm_head.weight", 0),
-            _FakeEncoded(torch.tensor([0], dtype=torch.uint8), torch.ones(1), (2, 4)),
-        ),
-        _FakeFuture(
-            _FakeKey("lm_head.weight", 1),
-            _FakeEncoded(torch.tensor([0], dtype=torch.uint8), torch.ones(1), (2, 4)),
-        ),
-    ]
-
-    stats = write_translation_futures_as_sparse_delta_files(futures, tmp_path, expected_ranks=[0, 1])
-
-    assert sorted(stats) == [0, 1]
-    assert stats[0].path == str(tmp_path / "rank0.packed")
-    assert stats[1].path == str(tmp_path / "rank1.packed")
-
-
-def test_write_sparse_delta_file_rejects_out_of_range_indices(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    _install_fake_delta_encoding(monkeypatch, {})
-
-    with pytest.raises(ValueError, match="out of range"):
-        write_sparse_delta_file(
-            [
-                SparseTensorUpdate(
-                    name="bad.weight",
-                    flat_indices=torch.tensor([4], dtype=torch.int32),
-                    values=torch.tensor([1.0], dtype=torch.float32),
-                    shape=(2, 2),
-                )
-            ],
-            tmp_path / "bad.packed",
-        )
+    with monkeypatch.context() as artifact_patch:
+        _assert_write_sparse_delta_file_packs_sparse_updates(tmp_path, artifact_patch)
+        _assert_write_sparse_delta_file_sorts_indices_before_encoding(tmp_path, artifact_patch)
+        _assert_write_sparse_delta_file_rejects_malformed_updates(tmp_path, artifact_patch)

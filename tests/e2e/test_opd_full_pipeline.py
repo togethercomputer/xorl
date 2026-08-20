@@ -348,8 +348,6 @@ def test_opd_full_pipeline_with_weight_sync(tmp_path):
     visible_devices = (
         [int(x) for x in visible.split(",") if x.strip() != ""] if visible else list(range(torch.cuda.device_count()))
     )
-    if len(visible_devices) < 3:
-        pytest.skip("Need at least 3 visible CUDA devices")
     trainer_gpu, student_gpu, teacher_gpu = visible_devices[0], visible_devices[1], visible_devices[2]
 
     teacher_log = tmp_path / "teacher_sglang.log"

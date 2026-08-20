@@ -12,29 +12,15 @@ Three lanes:
 """
 
 import asyncio
-import importlib.util
-from pathlib import Path
 
 import pytest
 import torch
 
+import xorl.server.runner.model_runner as model_runner_module
 from xorl.server.protocol.operations import OptimStepData
+from xorl.server.runner.model_runner import ModelRunner
+from xorl.server.runner.runner_dispatcher import RunnerDispatcher
 from xorl.server.server_arguments import ServerArguments
-
-
-_RUNNER_PATH = Path(__file__).resolve().parents[3] / "src" / "xorl" / "server" / "runner" / "model_runner.py"
-_RUNNER_SPEC = importlib.util.spec_from_file_location("xorl_test_model_runner_optim_hparams", _RUNNER_PATH)
-assert _RUNNER_SPEC is not None and _RUNNER_SPEC.loader is not None
-_RUNNER_MODULE = importlib.util.module_from_spec(_RUNNER_SPEC)
-_RUNNER_SPEC.loader.exec_module(_RUNNER_MODULE)
-ModelRunner = _RUNNER_MODULE.ModelRunner
-
-_DISPATCHER_PATH = Path(__file__).resolve().parents[3] / "src" / "xorl" / "server" / "runner" / "runner_dispatcher.py"
-_DISPATCHER_SPEC = importlib.util.spec_from_file_location("xorl_test_runner_dispatcher_optim_hparams", _DISPATCHER_PATH)
-assert _DISPATCHER_SPEC is not None and _DISPATCHER_SPEC.loader is not None
-_DISPATCHER_MODULE = importlib.util.module_from_spec(_DISPATCHER_SPEC)
-_DISPATCHER_SPEC.loader.exec_module(_DISPATCHER_MODULE)
-RunnerDispatcher = _DISPATCHER_MODULE.RunnerDispatcher
 
 
 pytestmark = [pytest.mark.cpu, pytest.mark.server]
@@ -51,17 +37,46 @@ class _TinyModule(torch.nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def test_server_arguments_thread_adam_betas_and_eps_into_train_config():
-    server_args = ServerArguments(model_path="x", adam_betas=[0.9, 0.999], adam_eps=1e-8)
+def test_optimizer_hyperparameter_lifecycle(monkeypatch):
+    """Server arguments feed the initializer without losing Adam policy fields."""
+    server_args = ServerArguments(model_path="x", adam_betas=[0.9, 0.999], adam_eps=1e-6)
     train_config = server_args.to_config_dict()["train"]
     assert train_config["adam_betas"] == [0.9, 0.999]
-    assert train_config["adam_eps"] == pytest.approx(1e-8)
+    assert train_config["adam_eps"] == pytest.approx(1e-6)
 
+    defaults = ServerArguments(model_path="x").to_config_dict()["train"]
+    assert defaults["adam_betas"] is None
+    assert defaults["adam_eps"] is None
 
-def test_server_arguments_default_adam_betas_and_eps_are_none():
-    train_config = ServerArguments(model_path="x").to_config_dict()["train"]
-    assert train_config["adam_betas"] is None
-    assert train_config["adam_eps"] is None
+    explicit = _init_runner(
+        {
+            "optimizer": "adamw",
+            "lr": 2e-5,
+            "weight_decay": 0.01,
+            "adam_betas": train_config["adam_betas"],
+            "adam_eps": train_config["adam_eps"],
+        }
+    )
+    ModelRunner._initialize_optimizer(explicit)
+    groups_with_betas = [g for g in explicit.optimizer.param_groups if "betas" in g]
+    assert groups_with_betas, "adamw param groups must carry betas"
+    for group in groups_with_betas:
+        assert group["betas"] == (0.9, 0.999)
+        assert group["eps"] == pytest.approx(1e-6)
+
+    default_runner = _init_runner({"optimizer": "adamw", "lr": 2e-5, "weight_decay": 0.01})
+    ModelRunner._initialize_optimizer(default_runner)
+    for group in default_runner.optimizer.param_groups:
+        assert group["betas"] == (0.9, 0.95)
+        assert group["eps"] == pytest.approx(1e-8)
+
+    malformed = _init_runner({"optimizer": "adamw", "lr": 2e-5, "adam_betas": [0.9]})
+    with pytest.raises(ValueError, match="adam_betas"):
+        ModelRunner._initialize_optimizer(malformed)
+
+    with monkeypatch.context() as step_patch:
+        _assert_optim_step_applies_full_partial_and_omitted_adam_overrides(step_patch)
+    _assert_handle_optim_step_forwards_explicit_and_omitted_adam_hparams()
 
 
 def _init_runner(train_config: dict) -> ModelRunner:
@@ -72,43 +87,6 @@ def _init_runner(train_config: dict) -> ModelRunner:
     runner.model = _TinyModule()
     runner.get_optimizer_pre_hook = None
     return runner
-
-
-def test_initialize_optimizer_passes_yaml_adam_betas_and_eps_to_build_optimizer():
-    runner = _init_runner(
-        {
-            "optimizer": "adamw",
-            "lr": 2e-5,
-            "weight_decay": 0.01,
-            "adam_betas": [0.9, 0.999],
-            "adam_eps": 1e-6,
-        }
-    )
-
-    ModelRunner._initialize_optimizer(runner)
-
-    groups_with_betas = [g for g in runner.optimizer.param_groups if "betas" in g]
-    assert groups_with_betas, "adamw param groups must carry betas"
-    for group in groups_with_betas:
-        assert group["betas"] == (0.9, 0.999)
-        assert group["eps"] == pytest.approx(1e-6)
-
-
-def test_initialize_optimizer_defaults_unchanged_without_yaml_keys():
-    runner = _init_runner({"optimizer": "adamw", "lr": 2e-5, "weight_decay": 0.01})
-
-    ModelRunner._initialize_optimizer(runner)
-
-    for group in runner.optimizer.param_groups:
-        assert group["betas"] == (0.9, 0.95)
-        assert group["eps"] == pytest.approx(1e-8)
-
-
-def test_initialize_optimizer_rejects_malformed_adam_betas():
-    runner = _init_runner({"optimizer": "adamw", "lr": 2e-5, "adam_betas": [0.9]})
-
-    with pytest.raises(ValueError, match="adam_betas"):
-        ModelRunner._initialize_optimizer(runner)
 
 
 # ---------------------------------------------------------------------------
@@ -131,21 +109,21 @@ def _step_runner(monkeypatch, optimizer: torch.optim.Optimizer) -> ModelRunner:
     runner.global_step = 0
 
     monkeypatch.setattr(
-        _RUNNER_MODULE,
+        model_runner_module,
         "get_parallel_state",
         lambda: type("ParallelState", (), {"fsdp_group": None, "pp_group": None})(),
     )
     monkeypatch.setattr(
-        _RUNNER_MODULE, "clip_gradients", lambda model, clip_value, pp_enabled=False, pp_group=None: 0.5
+        model_runner_module, "clip_gradients", lambda model, clip_value, pp_enabled=False, pp_group=None: 0.5
     )
-    monkeypatch.setattr(_RUNNER_MODULE, "all_reduce", lambda value, group=None: value)
-    monkeypatch.setattr(_RUNNER_MODULE, "synchronize", lambda: None)
-    monkeypatch.setattr(_RUNNER_MODULE, "_maybe_merge_lora_util", lambda *args, **kwargs: None)
-    monkeypatch.setattr(_RUNNER_MODULE.torch.cuda, "empty_cache", lambda: None)
+    monkeypatch.setattr(model_runner_module, "all_reduce", lambda value, group=None: value)
+    monkeypatch.setattr(model_runner_module, "synchronize", lambda: None)
+    monkeypatch.setattr(model_runner_module, "_maybe_merge_lora_util", lambda *args, **kwargs: None)
+    monkeypatch.setattr(model_runner_module.torch.cuda, "empty_cache", lambda: None)
     return runner
 
 
-def test_optim_step_payload_betas_and_eps_reach_param_groups(monkeypatch):
+def _assert_optim_step_applies_full_partial_and_omitted_adam_overrides(monkeypatch):
     model = _TinyModule()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5, betas=(0.9, 0.95), eps=1e-8)
     runner = _step_runner(monkeypatch, optimizer)
@@ -160,41 +138,31 @@ def test_optim_step_payload_betas_and_eps_reach_param_groups(monkeypatch):
         assert group["betas"] == (0.9, 0.999)
         assert group["eps"] == pytest.approx(1e-6)
 
-
-def test_optim_step_omitted_betas_leave_defaults_intact(monkeypatch):
-    model = _TinyModule()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5, betas=(0.9, 0.95), eps=1e-8)
-    runner = _step_runner(monkeypatch, optimizer)
-
-    ModelRunner.optim_step(runner, gradient_clip=1.0, lr=3e-5, model_id="default")
-
-    for group in optimizer.param_groups:
+    default_model = _TinyModule()
+    default_optimizer = torch.optim.AdamW(default_model.parameters(), lr=1e-5, betas=(0.9, 0.95), eps=1e-8)
+    default_runner = _step_runner(monkeypatch, default_optimizer)
+    ModelRunner.optim_step(default_runner, gradient_clip=1.0, lr=3e-5, model_id="default")
+    for group in default_optimizer.param_groups:
         assert group["betas"] == (0.9, 0.95)
         assert group["eps"] == pytest.approx(1e-8)
 
-
-def test_optim_step_partial_beta_override_keeps_other_beta(monkeypatch):
-    model = _TinyModule()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5, betas=(0.9, 0.95), eps=1e-8)
-    runner = _step_runner(monkeypatch, optimizer)
-
-    ModelRunner.optim_step(runner, gradient_clip=1.0, lr=3e-5, beta2=0.999, model_id="default")
-
-    for group in optimizer.param_groups:
+    partial_model = _TinyModule()
+    partial_optimizer = torch.optim.AdamW(partial_model.parameters(), lr=1e-5, betas=(0.9, 0.95), eps=1e-8)
+    partial_runner = _step_runner(monkeypatch, partial_optimizer)
+    ModelRunner.optim_step(partial_runner, gradient_clip=1.0, lr=3e-5, beta2=0.999, model_id="default")
+    for group in partial_optimizer.param_groups:
         assert group["betas"] == (0.9, 0.999)
 
-
-def test_optim_step_betas_skip_groups_without_adam_semantics(monkeypatch):
-    model = _TinyModule()
-    optimizer = torch.optim.SGD(model.parameters(), lr=1e-5, momentum=0.9)
-    runner = _step_runner(monkeypatch, optimizer)
-
-    ModelRunner.optim_step(runner, gradient_clip=1.0, lr=3e-5, beta1=0.9, beta2=0.999, eps=1e-6, model_id="default")
-
-    for group in optimizer.param_groups:
+    sgd_model = _TinyModule()
+    sgd_optimizer = torch.optim.SGD(sgd_model.parameters(), lr=1e-5, momentum=0.9)
+    sgd_runner = _step_runner(monkeypatch, sgd_optimizer)
+    ModelRunner.optim_step(sgd_runner, gradient_clip=1.0, lr=3e-5, beta1=0.9, beta2=0.999, eps=1e-6, model_id="default")
+    for group in sgd_optimizer.param_groups:
         assert "betas" not in group
         assert group["momentum"] == pytest.approx(0.9)
         assert group["lr"] == pytest.approx(3e-5)
+
+    _assert_optim_step_multi_adapter_payload_betas_reach_adapter_optimizer(monkeypatch)
 
 
 class _FakeAdapterState:
@@ -224,7 +192,7 @@ class _FakeAdapterManager:
         return 1
 
 
-def test_optim_step_multi_adapter_payload_betas_reach_adapter_optimizer(monkeypatch):
+def _assert_optim_step_multi_adapter_payload_betas_reach_adapter_optimizer(monkeypatch):
     model = _TinyModule()
     adapter_optimizer = torch.optim.AdamW(model.parameters(), lr=1e-5, betas=(0.9, 0.95), eps=1e-8)
     runner = _step_runner(monkeypatch, optimizer=None)
@@ -267,7 +235,7 @@ def _optim_dispatcher() -> RunnerDispatcher:
     return dispatcher
 
 
-def test_handle_optim_step_forwards_payload_betas_and_eps_to_trainer():
+def _assert_handle_optim_step_forwards_explicit_and_omitted_adam_hparams():
     dispatcher = _optim_dispatcher()
     payload = OptimStepData(lr=2e-5, gradient_clip=1.0, beta1=0.9, beta2=0.999, eps=1e-8, model_id="default")
 
@@ -285,8 +253,6 @@ def test_handle_optim_step_forwards_payload_betas_and_eps_to_trainer():
         }
     ]
 
-
-def test_handle_optim_step_forwards_none_betas_when_payload_omits_them():
     dispatcher = _optim_dispatcher()
     payload = OptimStepData(lr=2e-5, gradient_clip=1.0, model_id="default")
 

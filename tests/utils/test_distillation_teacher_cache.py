@@ -23,7 +23,7 @@ def _mooncake_cache(hidden, teacher_id="3", *, enable_async=False):
     return cache
 
 
-def test_load_lm_head_weight_from_safetensors_file(tmp_path):
+def test_teacher_head_loading_and_storage_policy(tmp_path):
     weight = torch.randn(11, 7)
     path = tmp_path / "teacher_head.safetensors"
     save_tensor_file(path, "lm_head.weight", weight)
@@ -32,8 +32,13 @@ def test_load_lm_head_weight_from_safetensors_file(tmp_path):
 
     torch.testing.assert_close(loaded, weight)
 
+    _assert_teacher_store_round_trips_lm_head_shards(tmp_path / "store")
+    _assert_load_lm_head_weight_uses_tied_embedding(tmp_path / "tied")
+    _assert_teacher_head_shard_view_loads_cross_shard_range(tmp_path / "view")
+    _assert_teacher_head_manager_residency_policy(tmp_path)
 
-def test_teacher_head_manager_keeps_one_device_head(tmp_path):
+
+def _assert_teacher_head_manager_residency_policy(tmp_path):
     weight0 = torch.randn(5, 3)
     weight1 = torch.randn(5, 3)
     path0 = tmp_path / "teacher0.safetensors"
@@ -50,8 +55,12 @@ def test_teacher_head_manager_keeps_one_device_head(tmp_path):
     torch.testing.assert_close(loaded1, weight1)
     assert manager._device_teacher_id == "1"
 
+    _assert_teacher_head_manager_reloads_for_dtype_change(tmp_path / "dtype")
+    _assert_teacher_head_manager_prefetches_teacher_store(tmp_path / "prefetch")
 
-def test_teacher_head_manager_reloads_for_dtype_change(tmp_path):
+
+def _assert_teacher_head_manager_reloads_for_dtype_change(tmp_path):
+    tmp_path.mkdir(parents=True)
     weight = torch.randn(5, 3)
     path = tmp_path / "teacher.safetensors"
     save_tensor_file(path, "lm_head.weight", weight)
@@ -66,10 +75,10 @@ def test_teacher_head_manager_reloads_for_dtype_change(tmp_path):
     torch.testing.assert_close(loaded_bf16.float(), weight, rtol=1e-2, atol=1e-2)
 
 
-def test_teacher_store_round_trips_lm_head_shards(tmp_path):
+def _assert_teacher_store_round_trips_lm_head_shards(tmp_path):
     weight = torch.randn(11, 7)
     model_dir = tmp_path / "teacher_model"
-    model_dir.mkdir()
+    model_dir.mkdir(parents=True)
     save_tensor_file(model_dir / "model.safetensors", "lm_head.weight", weight)
 
     store_dir = tmp_path / "teacher_store"
@@ -84,10 +93,10 @@ def test_teacher_store_round_trips_lm_head_shards(tmp_path):
     assert [shard.rows for shard in store.head_spec(3).shards] == [4, 4, 3]
 
 
-def test_load_lm_head_weight_uses_tied_embedding_from_indexed_model_dir(tmp_path):
+def _assert_load_lm_head_weight_uses_tied_embedding(tmp_path):
     weight = torch.randn(11, 7)
     model_dir = tmp_path / "teacher_model"
-    model_dir.mkdir()
+    model_dir.mkdir(parents=True)
     save_file(
         {
             "model.embed_tokens.weight": weight,
@@ -114,10 +123,10 @@ def test_load_lm_head_weight_uses_tied_embedding_from_indexed_model_dir(tmp_path
     torch.testing.assert_close(loaded, weight)
 
 
-def test_teacher_head_manager_prefetches_teacher_store(tmp_path):
+def _assert_teacher_head_manager_prefetches_teacher_store(tmp_path):
     weight = torch.randn(5, 3)
     model_dir = tmp_path / "teacher_model"
-    model_dir.mkdir()
+    model_dir.mkdir(parents=True)
     save_tensor_file(model_dir / "model.safetensors", "lm_head.weight", weight)
     store_dir = tmp_path / "teacher_store"
     prepare_lm_head_teacher_store(model_dir, store_dir, teacher_id=0, shard_rows=2)
@@ -129,28 +138,7 @@ def test_teacher_head_manager_prefetches_teacher_store(tmp_path):
     torch.testing.assert_close(loaded, weight)
 
 
-def test_teacher_activation_cache_gathers_indices():
-    hidden = torch.randn(6, 4)
-    cache = _mooncake_cache(hidden)
-    indices = torch.tensor([[0, 2, 5], [1, 4, 3]])
-
-    gathered = cache.get(3, indices, device="cpu")
-
-    torch.testing.assert_close(gathered, hidden[indices])
-
-
-def test_teacher_activation_cache_gathers_rank3_token_axis():
-    hidden = torch.arange(2 * 6 * 4, dtype=torch.float32).reshape(2, 6, 4)
-    cache = _mooncake_cache(hidden)
-    indices = torch.tensor([[0, 2], [5, 1]])
-
-    gathered = cache.get(3, indices, device="cpu")
-
-    expected = hidden.index_select(1, indices.reshape(-1)).permute(1, 0, 2).reshape(2, 2, 2, 4)
-    torch.testing.assert_close(gathered, expected)
-
-
-def test_teacher_activation_cache_prefetches():
+def test_teacher_activation_cache_lifecycle_and_admission_policy():
     hidden = torch.randn(6, 4)
     cache = _mooncake_cache(hidden, enable_async=True)
     cache.prefetch(3)
@@ -158,30 +146,26 @@ def test_teacher_activation_cache_prefetches():
 
     torch.testing.assert_close(gathered, hidden[[0, 5]])
 
+    _assert_teacher_activation_cache_rejects_out_of_bounds_indices()
+    _assert_teacher_activation_cache_reuses_device_cache()
+    _assert_teacher_activation_cache_reloads_device_dtype()
+    _assert_teacher_activation_cache_gathers_rank3_layer_slices()
 
-def test_teacher_activation_cache_rejects_negative_indices():
-    """Negative indices used to be silently clamped to 0, masking producer bugs."""
+
+def _assert_teacher_activation_cache_rejects_out_of_bounds_indices():
     hidden = torch.randn(6, 4)
     cache = _mooncake_cache(hidden)
-    bad_indices = torch.tensor([[0, 2, -1], [1, 4, 3]])
 
     with pytest.raises(IndexError, match="negative"):
-        cache.get(3, bad_indices, device="cpu")
-
-
-def test_teacher_activation_cache_rejects_out_of_range_indices():
-    hidden = torch.randn(6, 4)
-    cache = _mooncake_cache(hidden)
-    bad_indices = torch.tensor([0, 2, 6])
-
+        cache.get(3, torch.tensor([[0, 2, -1], [1, 4, 3]]), device="cpu")
     with pytest.raises(IndexError, match="cache only has 6 rows"):
-        cache.get(3, bad_indices, device="cpu")
+        cache.get(3, torch.tensor([0, 2, 6]), device="cpu")
 
 
-def test_teacher_head_shard_view_loads_row_range_across_shards(tmp_path):
+def _assert_teacher_head_shard_view_loads_cross_shard_range(tmp_path):
     weight = torch.arange(11 * 7, dtype=torch.float32).reshape(11, 7)
     model_dir = tmp_path / "teacher_model"
-    model_dir.mkdir()
+    model_dir.mkdir(parents=True)
     save_tensor_file(model_dir / "model.safetensors", "lm_head.weight", weight)
 
     manifest = prepare_lm_head_teacher_store(model_dir, tmp_path / "teacher_store", teacher_id=3, shard_rows=4)
@@ -192,7 +176,7 @@ def test_teacher_head_shard_view_loads_row_range_across_shards(tmp_path):
     torch.testing.assert_close(loaded, weight[3:9])
 
 
-def test_teacher_activation_cache_can_gather_from_device_cache():
+def _assert_teacher_activation_cache_reuses_device_cache():
     hidden = torch.randn(6, 4)
     cache = _mooncake_cache(hidden)
 
@@ -205,7 +189,7 @@ def test_teacher_activation_cache_can_gather_from_device_cache():
     assert cache._device_tensor is device_cache
 
 
-def test_teacher_activation_cache_device_cache_reloads_for_dtype_none():
+def _assert_teacher_activation_cache_reloads_device_dtype():
     hidden = torch.randn(6, 4, dtype=torch.float32)
     cache = _mooncake_cache(hidden)
 
@@ -217,35 +201,19 @@ def test_teacher_activation_cache_device_cache_reloads_for_dtype_none():
     torch.testing.assert_close(default_dtype, hidden[[0, 1]])
 
 
-def test_teacher_activation_cache_device_cache_gathers_rank3_token_axis():
-    hidden = torch.arange(2 * 6 * 4, dtype=torch.float32).reshape(2, 6, 4)
-    cache = _mooncake_cache(hidden)
-    indices = torch.tensor([[0, 2], [5, 1]])
-
-    gathered = cache.get(3, indices, device="cpu", cache_device=True)
-
-    expected = hidden.index_select(1, indices.reshape(-1)).permute(1, 0, 2).reshape(2, 2, 2, 4)
-    torch.testing.assert_close(gathered, expected)
-
-
-def test_teacher_activation_cache_gathers_rank3_layer_slice():
+def _assert_teacher_activation_cache_gathers_rank3_layer_slices():
     hidden = torch.arange(5 * 6 * 4, dtype=torch.float32).reshape(5, 6, 4)
     cache = _mooncake_cache(hidden)
     indices = torch.tensor([[0, 2], [5, 1]])
 
     gathered = cache.get_layer_slice(3, indices, 1, 4, device="cpu")
-
     expected = hidden[1:4].index_select(1, indices.reshape(-1)).permute(1, 0, 2).reshape(2, 2, 3, 4)
     torch.testing.assert_close(gathered, expected)
 
-
-def test_teacher_activation_cache_device_cache_gathers_rank3_layer_slice():
-    hidden = torch.arange(5 * 6 * 4, dtype=torch.float32).reshape(5, 6, 4)
-    cache = _mooncake_cache(hidden)
-    indices = torch.tensor([0, 5])
-
-    gathered = cache.get_layer_slice(3, indices, 2, 5, device="cpu", dtype=torch.bfloat16, cache_device=True)
-
-    expected = hidden[2:5].index_select(1, indices).permute(1, 0, 2).to(dtype=torch.bfloat16)
-    torch.testing.assert_close(gathered, expected)
+    device_indices = torch.tensor([0, 5])
+    device_gathered = cache.get_layer_slice(
+        3, device_indices, 2, 5, device="cpu", dtype=torch.bfloat16, cache_device=True
+    )
+    device_expected = hidden[2:5].index_select(1, device_indices).permute(1, 0, 2).to(dtype=torch.bfloat16)
+    torch.testing.assert_close(device_gathered, device_expected)
     assert cache.shape(3) == (5, 6, 4)

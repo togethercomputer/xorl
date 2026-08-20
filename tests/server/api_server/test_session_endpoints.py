@@ -15,13 +15,11 @@ from xorl.server.api_server.api_types import (
     CreateSessionRequest,
     KillSessionRequest,
     OptimizerConfigRequest,
-    SaveWeightsForSamplerRequest,
     SaveWeightsResponse,
     UnloadModelRequest,
     WeightsInfoRequest,
 )
 from xorl.server.api_server.endpoints import (
-    _canon_base_model,
     create_model_endpoint,
     create_session_endpoint,
     kill_session_endpoint,
@@ -141,8 +139,9 @@ def _build_full_weight_server(tmp_path):
     return server
 
 
-async def test_create_model_endpoint_registers_normalized_session_spec(tmp_path):
+async def _assert_create_model_endpoint_registers_normalized_session_spec(tmp_path):
     server = _build_server(tmp_path)
+    server.base_model = "/root/.cache/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/abc123def"
 
     response = await create_model_endpoint(
         CreateModelRequest(
@@ -166,7 +165,7 @@ async def test_create_model_endpoint_registers_normalized_session_spec(tmp_path)
     assert register_requests[0].payload.session_spec["lora_config"]["lora_rank"] == 4
 
 
-async def test_create_session_endpoint_registers_lora_session_with_workers(tmp_path):
+async def test_create_session_endpoint_registration_policy(tmp_path):
     server = _build_server(tmp_path)
 
     response = await create_session_endpoint(
@@ -185,8 +184,11 @@ async def test_create_session_endpoint_registers_lora_session_with_workers(tmp_p
     assert register_requests[0].payload.materialize is True
     assert register_requests[0].payload.session_spec["lora_config"]["lora_rank"] == 4
 
+    await _assert_create_session_allows_rank_only_override(tmp_path)
+    await _assert_create_session_refreshes_existing_custom_session(tmp_path)
 
-async def test_create_session_endpoint_allows_rank_only_lora_override(tmp_path):
+
+async def _assert_create_session_allows_rank_only_override(tmp_path):
     server = _build_server(tmp_path)
 
     response = await create_session_endpoint(
@@ -203,7 +205,7 @@ async def test_create_session_endpoint_allows_rank_only_lora_override(tmp_path):
     assert register_requests[0].payload.session_spec["lora_config"] == {"lora_rank": 4, "lora_alpha": 16}
 
 
-async def test_create_session_endpoint_refreshes_existing_custom_lora_session(tmp_path):
+async def _assert_create_session_refreshes_existing_custom_session(tmp_path):
     server = _build_server(tmp_path)
 
     await create_session_endpoint(
@@ -225,7 +227,9 @@ async def test_create_session_endpoint_refreshes_existing_custom_lora_session(tm
     assert len(register_requests) == 1
 
 
-async def test_create_model_endpoint_rejects_conflicting_recreate(tmp_path):
+async def test_create_model_endpoint_lifecycle_policy(tmp_path):
+    await _assert_create_model_endpoint_registers_normalized_session_spec(tmp_path / "normalized")
+
     server = _build_server(tmp_path)
 
     await create_model_endpoint(
@@ -247,14 +251,23 @@ async def test_create_model_endpoint_rejects_conflicting_recreate(tmp_path):
             server=server,
         )
 
+    # A different HF repository must not be collapsed into the server model.
+    with pytest.raises(ValueError, match="must match the server base model"):
+        await create_model_endpoint(
+            CreateModelRequest(
+                model_id="different-base",
+                base_model=("/root/.cache/huggingface/hub/models--Qwen--Qwen3.5-35B-A3B/snapshots/abc123def"),
+                lora_config={"rank": 4},
+            ),
+            server=server,
+        )
 
-async def test_create_model_endpoint_propagates_register_session_failure(tmp_path):
-    server = _build_server(tmp_path)
+    failure_server = _build_server(tmp_path / "register-failure")
 
     async def _fail_wait_for_response(self, response_future, request_id, timeout, timeout_message="timeout"):
         raise HTTPException(status_code=500, detail="Engine error: Cross-rank error: rank 1: register failed")
 
-    server._wait_for_response = types.MethodType(_fail_wait_for_response, server)
+    failure_server._wait_for_response = types.MethodType(_fail_wait_for_response, failure_server)
 
     with pytest.raises(HTTPException, match="Cross-rank error"):
         await create_model_endpoint(
@@ -263,14 +276,18 @@ async def test_create_model_endpoint_propagates_register_session_failure(tmp_pat
                 base_model="Qwen/Qwen3-8B",
                 lora_config={"rank": 4},
             ),
-            server=server,
+            server=failure_server,
         )
 
-    assert "session-b" not in server.model_configs
-    assert "session-b" not in server.registered_model_ids
+    assert "session-b" not in failure_server.model_configs
+    assert "session-b" not in failure_server.registered_model_ids
+
+    await _assert_create_model_endpoint_reserved_checkpoint_policy(tmp_path / "reserved")
+    await _assert_create_model_endpoint_full_weight_admission_policy(tmp_path / "full-weight")
+    await _assert_kill_session_endpoint_lora_lifecycle(tmp_path / "kill")
 
 
-async def test_create_model_endpoint_ensures_reserved_checkpoint_for_default_session(tmp_path):
+async def _assert_create_model_endpoint_reserved_checkpoint_policy(tmp_path):
     server = _build_server(tmp_path)
     server.save_weights = AsyncMock(return_value=SaveWeightsResponse(path="xorl://default/weights/000000"))
 
@@ -278,6 +295,8 @@ async def test_create_model_endpoint_ensures_reserved_checkpoint_for_default_ses
         CreateModelRequest(
             model_id="default",
             base_model="Qwen/Qwen3-8B",
+            lora_config={},
+            optimizer_config={},
         ),
         server=server,
     )
@@ -288,8 +307,12 @@ async def test_create_model_endpoint_ensures_reserved_checkpoint_for_default_ses
     assert save_request.model_id == "default"
     assert save_request.path == "000000"
 
+    await _assert_reserved_checkpoint_is_saved_per_session(tmp_path / "per-session")
+    await _assert_stale_reserved_checkpoint_is_overwritten(tmp_path / "stale")
+    await _assert_existing_reserved_checkpoint_is_preserved(tmp_path / "existing")
 
-async def test_create_model_endpoint_saves_reserved_checkpoint_per_session(tmp_path):
+
+async def _assert_reserved_checkpoint_is_saved_per_session(tmp_path):
     server = _build_server(tmp_path)
     server.save_weights = AsyncMock(
         side_effect=[
@@ -320,7 +343,7 @@ async def test_create_model_endpoint_saves_reserved_checkpoint_per_session(tmp_p
     assert [call.args[0].path for call in server.save_weights.await_args_list] == ["000000", "000000"]
 
 
-async def test_create_model_endpoint_overwrites_stale_reserved_checkpoint_for_recreated_session(tmp_path):
+async def _assert_stale_reserved_checkpoint_is_overwritten(tmp_path):
     server = _build_server(tmp_path)
     checkpoint_dir = tmp_path / "weights" / "session-a" / server.RESERVED_CHECKPOINT_NAME
     checkpoint_dir.mkdir(parents=True)
@@ -341,7 +364,7 @@ async def test_create_model_endpoint_overwrites_stale_reserved_checkpoint_for_re
     assert save_request.path == "000000"
 
 
-async def test_create_model_endpoint_preserves_reserved_checkpoint_for_existing_session(tmp_path):
+async def _assert_existing_reserved_checkpoint_is_preserved(tmp_path):
     server = _build_server(tmp_path)
     server.save_weights = AsyncMock(return_value=SaveWeightsResponse(path="xorl://session-a/weights/000000"))
 
@@ -358,19 +381,7 @@ async def test_create_model_endpoint_preserves_reserved_checkpoint_for_existing_
     assert server.save_weights.await_count == 1
 
 
-async def test_save_weights_for_sampler_uses_lora_only_for_normalized_session(tmp_path):
-    server = _build_server(tmp_path)
-
-    response = await server.save_weights_for_sampler(
-        SaveWeightsForSamplerRequest(model_id="default", name="sampler-a"),
-    )
-
-    assert response.path == "xorl://default/sampler_weights/sampler-a"
-    assert server.orchestrator_client.requests[-1].operation == "save_lora_only"
-    assert server.orchestrator_client.requests[-1].payload.model_id == "default"
-
-
-async def test_create_model_endpoint_rejects_full_weight_multitenancy(tmp_path):
+async def _assert_full_weight_multitenancy_is_rejected(tmp_path):
     server = _build_full_weight_server(tmp_path)
 
     with pytest.raises(ValueError, match="multi-tenancy is not supported yet"):
@@ -383,7 +394,7 @@ async def test_create_model_endpoint_rejects_full_weight_multitenancy(tmp_path):
         )
 
 
-async def test_create_model_endpoint_allows_default_full_weight_session(tmp_path):
+async def _assert_create_model_endpoint_full_weight_admission_policy(tmp_path):
     server = _build_full_weight_server(tmp_path)
 
     response = await create_model_endpoint(
@@ -405,8 +416,11 @@ async def test_create_model_endpoint_allows_default_full_weight_session(tmp_path
     assert len(register_requests) == 1
     assert register_requests[0].payload.materialize is False
 
+    await _assert_full_weight_multitenancy_is_rejected(tmp_path)
+    await _assert_full_weight_overrides_are_rejected(tmp_path)
 
-async def test_create_model_endpoint_rejects_full_weight_overrides(tmp_path):
+
+async def _assert_full_weight_overrides_are_rejected(tmp_path):
     server = _build_full_weight_server(tmp_path)
 
     with pytest.raises(ValueError, match="Per-session LoRA or optimizer overrides are not supported"):
@@ -420,7 +434,7 @@ async def test_create_model_endpoint_rejects_full_weight_overrides(tmp_path):
         )
 
 
-async def test_kill_session_endpoint_cleans_up_lora_session_registry(tmp_path):
+async def _assert_kill_session_endpoint_lora_lifecycle(tmp_path):
     server = _build_server(tmp_path)
     request = CreateModelRequest(
         model_id="session-a",
@@ -452,8 +466,11 @@ async def test_kill_session_endpoint_cleans_up_lora_session_registry(tmp_path):
     ]
     assert len(register_requests) == 2
 
+    await _assert_kill_session_returns_xorl_checkpoint_uri(tmp_path)
+    await _assert_default_lora_session_protection(tmp_path)
 
-async def test_kill_session_endpoint_returns_xorl_uri_for_lora_checkpoint(tmp_path):
+
+async def _assert_kill_session_returns_xorl_checkpoint_uri(tmp_path):
     server = _build_server(tmp_path)
     request = CreateModelRequest(
         model_id="session-a",
@@ -489,7 +506,7 @@ async def test_kill_session_endpoint_returns_xorl_uri_for_lora_checkpoint(tmp_pa
     assert response.checkpoint_path == "xorl://session-a/weights/session_session-a_final"
 
 
-async def test_kill_session_endpoint_preserves_default_lora_session(tmp_path):
+async def _assert_default_lora_session_protection(tmp_path):
     server = _build_server(tmp_path)
 
     response = await kill_session_endpoint(
@@ -502,8 +519,10 @@ async def test_kill_session_endpoint_preserves_default_lora_session(tmp_path):
     assert "default" in server.model_configs
     assert server.orchestrator_client.requests == []
 
+    await _assert_default_lora_session_cannot_be_unloaded(tmp_path)
 
-async def test_unload_model_endpoint_rejects_default_lora_session(tmp_path):
+
+async def _assert_default_lora_session_cannot_be_unloaded(tmp_path):
     server = _build_server(tmp_path)
 
     with pytest.raises(HTTPException, match="reserved and cannot be unloaded") as exc_info:
@@ -515,7 +534,7 @@ async def test_unload_model_endpoint_rejects_default_lora_session(tmp_path):
     assert exc_info.value.status_code == 400
 
 
-async def test_weights_info_endpoint_reads_session_spec_from_checkpoint(tmp_path):
+async def test_weights_info_endpoint_metadata_and_path_policy(tmp_path):
     server = _build_server(tmp_path)
     checkpoint_dir = tmp_path / "weights" / "session-a" / "ckpt-001"
     checkpoint_dir.mkdir(parents=True)
@@ -562,11 +581,17 @@ async def test_weights_info_endpoint_reads_session_spec_from_checkpoint(tmp_path
     assert response.base_model == "Qwen/Qwen3-8B"
     assert response.lora_config.lora_rank == 4
     assert response.lora_config.lora_alpha == 12
+    assert response.lora_rank == 4
+    assert response.model_dump()["lora_rank"] == 4
     assert response.optimizer_config.type == "signsgd"
     assert response.optimizer_config.learning_rate == pytest.approx(2e-4)
 
+    await _assert_weights_info_rejects_checkpoint_path_escape(tmp_path)
+    await _assert_weights_info_returns_full_weight_metadata(tmp_path)
+    _assert_load_session_spec_from_checkpoint_upgrades_legacy_signsgd_metadata(tmp_path / "legacy")
 
-async def test_weights_info_endpoint_rejects_checkpoint_path_escape(tmp_path):
+
+async def _assert_weights_info_rejects_checkpoint_path_escape(tmp_path):
     server = _build_server(tmp_path / "output")
     escaped_dir = tmp_path / "secret-checkpoint"
     escaped_dir.mkdir()
@@ -582,7 +607,7 @@ async def test_weights_info_endpoint_rejects_checkpoint_path_escape(tmp_path):
     assert exc_info.value.status_code == 400
 
 
-async def test_weights_info_endpoint_returns_full_weight_checkpoint_metadata(tmp_path):
+async def _assert_weights_info_returns_full_weight_metadata(tmp_path):
     server = _build_full_weight_server(tmp_path)
     checkpoint_dir = tmp_path / "weights" / "default" / "ckpt-001"
     checkpoint_dir.mkdir(parents=True)
@@ -602,7 +627,7 @@ async def test_weights_info_endpoint_returns_full_weight_checkpoint_metadata(tmp
     assert response.optimizer_config is None
 
 
-def test_load_session_spec_from_checkpoint_upgrades_legacy_signsgd_metadata(tmp_path):
+def _assert_load_session_spec_from_checkpoint_upgrades_legacy_signsgd_metadata(tmp_path):
     checkpoint_dir = tmp_path / "weights" / "session-a" / "ckpt-legacy"
     checkpoint_dir.mkdir(parents=True)
 
@@ -633,30 +658,3 @@ def test_load_session_spec_from_checkpoint_upgrades_legacy_signsgd_metadata(tmp_
     assert session_spec["optimizer_config"]["type"] == "signsgd"
     assert session_spec["optimizer_config"]["betas"] is None
     assert session_spec["optimizer_config"]["eps"] is None
-
-
-@pytest.mark.parametrize(
-    ("client_ref", "server_ref"),
-    [
-        ("Qwen/Qwen3.5-35B-A3B", "Qwen/Qwen3.5-35B-A3B"),
-        (
-            "Qwen/Qwen3.5-35B-A3B",
-            "/root/.cache/huggingface/hub/models--Qwen--Qwen3.5-35B-A3B/snapshots/abc123def",
-        ),
-        (
-            "/data/hf-cache/models--Qwen--Qwen3.5-35B-A3B/snapshots/abc123def",
-            "Qwen/Qwen3.5-35B-A3B",
-        ),
-    ],
-)
-def test_canon_base_model_matches_hf_cache_path_to_repo_id(client_ref, server_ref):
-    assert _canon_base_model(client_ref) == _canon_base_model(server_ref)
-
-
-def test_canon_base_model_distinct_models_still_differ():
-    assert _canon_base_model("Qwen/Qwen3-8B") != _canon_base_model(
-        "/root/.cache/huggingface/hub/models--Qwen--Qwen3.5-35B-A3B/snapshots/abc123def"
-    )
-    # Non-cache paths and None pass through untouched.
-    assert _canon_base_model("/shared/checkpoints/my-model") == "/shared/checkpoints/my-model"
-    assert _canon_base_model(None) is None

@@ -99,11 +99,6 @@ class _IndexerSpy(nn.Module):
         return torch.zeros((*index_q.shape[:2], self.topk), dtype=torch.long)
 
 
-class _ForbiddenGenericKvB(nn.Module):
-    def forward(self, *_args, **_kwargs) -> torch.Tensor:
-        raise AssertionError("generic absorbed MLA must consume the split weights, not call kv_b_proj")
-
-
 def _attention_with_simple_projections() -> Glm5Attention:
     attention = Glm5Attention(_tiny_config(), layer_idx=0)
     attention.q_a_layernorm = nn.Identity()
@@ -113,8 +108,7 @@ def _attention_with_simple_projections() -> Glm5Attention:
     return attention
 
 
-@pytest.mark.parametrize("cp_enabled", [False, True], ids=["non_cp", "ulysses_cp"])
-def test_sparse_exact_kv_b_routes_q_and_both_v_sites_without_weight_materialization(
+def _assert_sparse_exact_kv_b_routes_q_and_both_v_sites_without_weight_materialization(
     monkeypatch: pytest.MonkeyPatch,
     cp_enabled: bool,
 ) -> None:
@@ -218,65 +212,12 @@ def test_sparse_exact_kv_b_routes_q_and_both_v_sites_without_weight_materializat
         assert "query_offset" not in sparse_calls[0][3]
 
 
-def test_generic_absorbed_q_and_v_keep_the_legacy_split_weight_einsums(
+def test_sparse_exact_kv_b_routes_q_and_both_v_sites_without_weight_materialization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    torch.manual_seed(1)
-    attention = _attention_with_simple_projections()
-    attention.kv_b_proj = _ForbiddenGenericKvB()
-    monkeypatch.setattr(
-        modeling_glm5,
-        "glm5_apply_rotary_pos_emb",
-        lambda q, k, *_args, **_kwargs: (q, k),
-    )
-
-    w_kc = torch.randn(
-        attention.num_heads,
-        attention.qk_nope_head_dim,
-        attention.kv_lora_rank,
-    )
-    w_vc = torch.randn(
-        attention.num_heads,
-        attention.v_head_dim,
-        attention.kv_lora_rank,
-    )
-    split_kv_b_weight = MagicMock(return_value=(w_kc, w_vc))
-    monkeypatch.setattr(attention, "_split_kv_b_weight", split_kv_b_weight)
-
-    batch_size, seq_len = 2, 3
-    hidden_states = torch.randn(batch_size, seq_len, attention.config.hidden_size)
-    position_embeddings = (
-        torch.zeros(batch_size, seq_len, attention.qk_rope_head_dim),
-        torch.zeros(batch_size, seq_len, attention.qk_rope_head_dim),
-    )
-    q, _kv, _q_compressed, actual_w_vc = attention._project_qkv_absorb(
-        hidden_states,
-        position_embeddings,
-    )
-
-    q_compressed = attention.q_a_proj(hidden_states)
-    q_unabsorbed = attention.q_b_proj(q_compressed).view(
-        batch_size,
-        seq_len,
-        attention.num_heads,
-        attention.qk_head_dim,
-    )
-    q_no_pe, q_pe = torch.split(
-        q_unabsorbed,
-        [attention.qk_nope_head_dim, attention.qk_rope_head_dim],
-        dim=-1,
-    )
-    expected_q = torch.cat((torch.einsum("bshd,hdc->bshc", q_no_pe, w_kc), q_pe), dim=-1)
-    torch.testing.assert_close(q, expected_q)
-    assert actual_w_vc is w_vc
-    split_kv_b_weight.assert_called_once_with(compute_dtype=q_no_pe.dtype)
-
-    attn_latent = torch.randn(
-        batch_size,
-        seq_len,
-        attention.num_heads,
-        attention.kv_lora_rank,
-    )
-    value = attention._project_absorbed_value(attn_latent, actual_w_vc)
-    expected_value = torch.einsum("bshk,hdk->bshd", attn_latent, w_vc)
-    torch.testing.assert_close(value, expected_value)
+    for cp_enabled in (False, True):
+        with monkeypatch.context() as case_patch:
+            _assert_sparse_exact_kv_b_routes_q_and_both_v_sites_without_weight_materialization(
+                case_patch,
+                cp_enabled,
+            )

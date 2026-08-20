@@ -9,7 +9,7 @@ from xorl.distributed.moe.utils import permute, permuted_weights, sort_chunks_by
 pytestmark = [pytest.mark.cpu]
 
 
-def test_permuted_weights_follow_expert_sorted_token_order():
+def test_moe_permutation_dispatch_policy(monkeypatch):
     tokens = torch.arange(12, dtype=torch.float32).view(4, 3)
     selected_experts = torch.tensor(
         [
@@ -39,8 +39,14 @@ def test_permuted_weights_follow_expert_sorted_token_order():
     torch.testing.assert_close(permuted_weights(routing_weights, selected_experts, 3), expected)
     torch.testing.assert_close(permutation_mapping, torch.tensor([0, 2, 1, 2, 3, 0, 1, 3]))
 
+    _assert_unpermute_only_scatter_adds_preweighted_outputs()
+    with monkeypatch.context() as pre_patch:
+        _assert_alltoall_pre_dispatch_routes_scores_with_received_token_order(pre_patch)
+    with monkeypatch.context() as post_patch:
+        _assert_tokens_post_all2all_hidden_chunking_matches_unchunked(post_patch)
 
-def test_unpermute_only_scatter_adds_preweighted_outputs():
+
+def _assert_unpermute_only_scatter_adds_preweighted_outputs():
     expert_outputs = torch.tensor(
         [
             [1.0, 1.0],
@@ -65,7 +71,7 @@ def test_unpermute_only_scatter_adds_preweighted_outputs():
     torch.testing.assert_close(output, expected)
 
 
-def test_alltoall_pre_dispatch_routes_scores_with_received_token_order(monkeypatch):
+def _assert_alltoall_pre_dispatch_routes_scores_with_received_token_order(monkeypatch):
     class FakeGroup:
         def size(self):
             return 2
@@ -149,7 +155,7 @@ def test_alltoall_pre_dispatch_routes_scores_with_received_token_order(monkeypat
     torch.testing.assert_close(routing_weights.grad, expected_grad)
 
 
-def test_tokens_post_all2all_hidden_chunking_matches_unchunked(monkeypatch):
+def _assert_tokens_post_all2all_hidden_chunking_matches_unchunked(monkeypatch):
     class FakeGroup:
         def size(self):
             return 2

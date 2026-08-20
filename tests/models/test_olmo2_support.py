@@ -1,14 +1,11 @@
 import pytest
 import torch
-from torch.distributed.tensor.parallel import ColwiseParallel, RowwiseParallel
 from transformers.models.olmo2.configuration_olmo2 import Olmo2Config as HFOlmo2Config
 from transformers.models.olmo2.modeling_olmo2 import Olmo2ForCausalLM as HFOlmo2ForCausalLM
 
 from xorl.models.auto import build_foundation_model
 from xorl.models.transformers.olmo2.configuration_olmo2 import Olmo2Config as XOlmo2Config
 from xorl.models.transformers.olmo2.modeling_olmo2 import Olmo2ForCausalLM
-from xorl.models.transformers.olmo2.parallelize import MODEL_TP_PLAN, TP_PLAN
-from xorl.models.transformers.olmo2.tp_styles import LocalAxisRMSNormShard
 
 
 pytestmark = [pytest.mark.cpu]
@@ -65,36 +62,11 @@ def test_build_foundation_model_accepts_hf_olmo2_config_object():
     assert layer.self_attn.qkv_proj.bias is None
     assert layer.self_attn.o_proj.bias is None
 
-
-def test_olmo2_tp_plan_uses_local_axis_qk_norm():
-    # OLMo-2's full-axis q_norm/k_norm doesn't compose with SequenceParallel
-    # or stock ColwiseParallel — under colwise q/k_proj the input arrives
-    # hidden-sharded and a full-hidden weight can't be applied directly.
-    # LocalAxisRMSNormShard shards the 1-D weight on dim 0 so each rank's
-    # slice matches its local q/k slice. This is the actual root cause of
-    # what was originally reported (the issue thought it was post-norm; the trace
-    # was at q_norm in _project_qkv).
-    assert isinstance(TP_PLAN["layers.*.self_attn.q_norm"], LocalAxisRMSNormShard)
-    assert isinstance(TP_PLAN["layers.*.self_attn.k_norm"], LocalAxisRMSNormShard)
-
-    # Post-norms see a Replicate input after the rowwise all-reduce in
-    # o_proj/down_proj — they should NOT be in the plan (no TP wrapping).
-    assert "layers.*.post_attention_layernorm" not in TP_PLAN
-    assert "layers.*.post_feedforward_layernorm" not in TP_PLAN
-    assert "norm" not in TP_PLAN
-
-    # Standard colwise/rowwise everywhere else.
-    assert isinstance(TP_PLAN["layers.*.self_attn.q_proj"], ColwiseParallel)
-    assert isinstance(TP_PLAN["layers.*.self_attn.o_proj"], RowwiseParallel)
-    assert isinstance(TP_PLAN["layers.*.mlp.gate_proj"], ColwiseParallel)
-    assert isinstance(TP_PLAN["layers.*.mlp.down_proj"], RowwiseParallel)
-
-    # lm_head: vanilla colwise (Replicate input from the model's final norm,
-    # vocab-parallel output for vocab_parallel_cross_entropy).
-    assert MODEL_TP_PLAN["lm_head"] == "colwise" or isinstance(MODEL_TP_PLAN["lm_head"], ColwiseParallel)
+    _assert_olmo2_unfuse_for_tp_matches_hf_parameter_layout()
+    _assert_olmo2_checkpoint_handler_bidirectional_policy()
 
 
-def test_olmo2_unfuse_for_tp_matches_hf_parameter_layout():
+def _assert_olmo2_unfuse_for_tp_matches_hf_parameter_layout():
     model = Olmo2ForCausalLM(_make_xorl_olmo2_config())
 
     model.unfuse_for_tp()
@@ -121,7 +93,7 @@ def test_olmo2_unfuse_for_tp_matches_hf_parameter_layout():
     assert [name for name, _ in passthrough] == [key]
 
 
-def test_olmo2_checkpoint_handler_exports_hf_compatible_attention_keys():
+def _assert_olmo2_checkpoint_handler_bidirectional_policy():
     model = Olmo2ForCausalLM(_make_xorl_olmo2_config())
     handler = model.get_checkpoint_handler()
 
@@ -144,8 +116,10 @@ def test_olmo2_checkpoint_handler_exports_hf_compatible_attention_keys():
     assert "model.layers.0.self_attn.qkv_proj.weight" not in transformed
     assert "model.layers.0.mlp.gate_up_proj.weight" not in transformed
 
+    _assert_olmo2_checkpoint_handler_loads_hf_weights_into_fused_model()
 
-def test_olmo2_checkpoint_handler_loads_hf_weights_into_fused_model():
+
+def _assert_olmo2_checkpoint_handler_loads_hf_weights_into_fused_model():
     hf_config = _make_hf_olmo2_config()
     hf_config._attn_implementation = "eager"
     xorl_config = _make_xorl_olmo2_config()

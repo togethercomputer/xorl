@@ -1,11 +1,10 @@
 """Tests for save/session operation handling in RunnerDispatcher."""
 
 import asyncio
-import importlib.util
-from pathlib import Path
 
 import pytest
 
+import xorl.server.runner.runner_dispatcher as runner_dispatcher_module
 from xorl.server.protocol.operations import (
     AbortGradientEpochData,
     OptimStepData,
@@ -14,14 +13,7 @@ from xorl.server.protocol.operations import (
     SaveStateData,
 )
 from xorl.server.protocol.orchestrator_runner import RunnerDispatchCommand
-
-
-_MODULE_PATH = Path(__file__).resolve().parents[3] / "src" / "xorl" / "server" / "runner" / "runner_dispatcher.py"
-_SPEC = importlib.util.spec_from_file_location("xorl_test_runner_dispatcher_session_ops", _MODULE_PATH)
-assert _SPEC is not None and _SPEC.loader is not None
-_MODULE = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(_MODULE)
-RunnerDispatcher = _MODULE.RunnerDispatcher
+from xorl.server.runner.runner_dispatcher import RunnerDispatcher
 
 
 pytestmark = [pytest.mark.cpu, pytest.mark.server]
@@ -96,7 +88,7 @@ class _FailingPublicationManager(_FakePublicationManager):
         raise RuntimeError("injected publication tail failure")
 
 
-def test_handle_save_state_requires_real_checkpoint_for_nonresident_adapter(tmp_path, monkeypatch):
+def test_save_handlers_require_real_checkpoint_for_nonresident_adapter(tmp_path, monkeypatch):
     monkeypatch.setenv("XORL_SERVER_ARTIFACT_ROOT", str(tmp_path))
     dispatcher = object.__new__(RunnerDispatcher)
     dispatcher.rank = 0
@@ -124,14 +116,6 @@ def test_handle_save_state_requires_real_checkpoint_for_nonresident_adapter(tmp_
     ]
     assert dispatcher.trainer.save_state_calls == [(str(tmp_path / "checkpoint"), True, "policy-a")]
 
-
-def test_handle_save_lora_only_requires_real_checkpoint_for_nonresident_adapter(tmp_path, monkeypatch):
-    monkeypatch.setenv("XORL_SERVER_ARTIFACT_ROOT", str(tmp_path))
-    dispatcher = object.__new__(RunnerDispatcher)
-    dispatcher.rank = 0
-    dispatcher.trainer = _FakeTrainer()
-    dispatcher._adapter_coordinator = _FakeAdapterCoordinator()
-
     result = asyncio.run(
         dispatcher._handle_save_lora_only(
             {
@@ -146,14 +130,20 @@ def test_handle_save_lora_only_requires_real_checkpoint_for_nonresident_adapter(
     assert result["lora_path"] == str(tmp_path / "adapter")
     assert dispatcher._adapter_coordinator.auto_load_calls == [
         {
+            "model_id": "policy-a",
+            "allow_fresh_materialization": False,
+        },
+        {
             "model_id": "policy-b",
             "allow_fresh_materialization": False,
-        }
+        },
     ]
     assert dispatcher.trainer.save_lora_only_calls == [(str(tmp_path / "adapter"), "policy-b")]
+    with monkeypatch.context() as case_patch:
+        _assert_session_registration_policy(case_patch)
 
 
-def test_handle_register_session_delegates_to_adapter_coordinator():
+def _assert_session_registration_policy(monkeypatch):
     dispatcher = object.__new__(RunnerDispatcher)
     dispatcher.rank = 0
     dispatcher._adapter_coordinator = _FakeAdapterCoordinator()
@@ -173,8 +163,10 @@ def test_handle_register_session_delegates_to_adapter_coordinator():
     assert result == {"registered": True, "model_id": "policy-c"}
     assert dispatcher._adapter_coordinator.register_session_calls == [{"payload": payload}]
 
+    _assert_rank0_fails_on_cross_rank_registration_error(monkeypatch)
 
-def test_handle_request_rank0_fails_register_session_on_cross_rank_worker_error(monkeypatch):
+
+def _assert_rank0_fails_on_cross_rank_registration_error(monkeypatch):
     dispatcher = object.__new__(RunnerDispatcher)
     dispatcher.rank = 0
     dispatcher.world_size = 2
@@ -187,7 +179,7 @@ def test_handle_request_rank0_fails_register_session_on_cross_rank_worker_error(
     dispatcher._handle_register_session = _handle_register_session
     dispatcher._sync_error_state = lambda: "rank 1: Session registration failed: boom"
 
-    monkeypatch.setattr(_MODULE.dist, "broadcast_object_list", lambda *args, **kwargs: None)
+    monkeypatch.setattr(runner_dispatcher_module.dist, "broadcast_object_list", lambda *args, **kwargs: None)
 
     request = RunnerDispatchCommand.create(
         "register_session",
@@ -205,7 +197,7 @@ def test_handle_request_rank0_fails_register_session_on_cross_rank_worker_error(
     assert response.error == "Cross-rank error: rank 1: Session registration failed: boom"
 
 
-def test_handle_request_rank0_terminates_process_after_optimizer_mutation_failure(monkeypatch):
+def _assert_handle_request_rank0_terminates_process_after_optimizer_mutation_failure(monkeypatch):
     dispatcher = object.__new__(RunnerDispatcher)
     dispatcher.rank = 0
     dispatcher.world_size = 1
@@ -213,13 +205,13 @@ def test_handle_request_rank0_terminates_process_after_optimizer_mutation_failur
     dispatcher._worker_error = None
 
     async def _handle_optim_step(_command_dict):
-        raise _MODULE.AdapterGradientMutationFailure("injected asymmetric optimizer failure")
+        raise runner_dispatcher_module.AdapterGradientMutationFailure("injected asymmetric optimizer failure")
 
     def _exit(exit_code):
         raise SystemExit(exit_code)
 
     dispatcher._handle_optim_step = _handle_optim_step
-    monkeypatch.setattr(_MODULE.os, "_exit", _exit)
+    monkeypatch.setattr(runner_dispatcher_module.os, "_exit", _exit)
     request = RunnerDispatchCommand.create(
         "optim_step",
         OptimStepData(lr=1e-4, model_id="policy"),
@@ -229,10 +221,10 @@ def test_handle_request_rank0_terminates_process_after_optimizer_mutation_failur
     with pytest.raises(SystemExit) as exited:
         asyncio.run(dispatcher._handle_request_rank0(request))
 
-    assert exited.value.code == _MODULE._ADAPTER_GRADIENT_FATAL_EXIT_CODE
+    assert exited.value.code == runner_dispatcher_module._ADAPTER_GRADIENT_FATAL_EXIT_CODE
 
 
-def test_existing_command_completion_commits_adapter_publication_without_another_collective():
+def test_optimizer_publication_and_fatal_failure_policy(monkeypatch):
     dispatcher = object.__new__(RunnerDispatcher)
     manager = _FakePublicationManager()
     dispatcher.trainer = type("Trainer", (), {"adapter_manager": manager})()
@@ -242,14 +234,22 @@ def test_existing_command_completion_commits_adapter_publication_without_another
 
     assert manager.commits == ["policy"]
 
+    _assert_publication_commit_failure_is_fatal_and_poisons_adapter()
+    _assert_optimizer_handler_tail_failure_is_fatal_and_poisons_adapter()
+    with monkeypatch.context() as case_patch:
+        _assert_handle_request_rank0_terminates_process_after_optimizer_mutation_failure(case_patch)
+    _assert_gradient_epoch_completion_abort_and_failure_policy()
 
-def test_publication_commit_failure_after_mutation_is_fatal_and_poisons_adapter():
+
+def _assert_publication_commit_failure_is_fatal_and_poisons_adapter():
     dispatcher = object.__new__(RunnerDispatcher)
     manager = _FailingPublicationManager()
     dispatcher.trainer = type("Trainer", (), {"adapter_manager": manager})()
     payload = OptimStepData(lr=1e-4, model_id="policy")
 
-    with pytest.raises(_MODULE.AdapterGradientMutationFailure, match="publication commit failed") as raised:
+    with pytest.raises(
+        runner_dispatcher_module.AdapterGradientMutationFailure, match="publication commit failed"
+    ) as raised:
         dispatcher._commit_adapter_optimizer_publication({"payload": payload})
 
     assert str(raised.value.__cause__) == "injected publication tail failure"
@@ -258,7 +258,7 @@ def test_publication_commit_failure_after_mutation_is_fatal_and_poisons_adapter(
     assert manager.state.publication_eligible is False
 
 
-def test_optimizer_handler_tail_failure_after_mutation_is_fatal_and_poisons_adapter():
+def _assert_optimizer_handler_tail_failure_is_fatal_and_poisons_adapter():
     dispatcher = object.__new__(RunnerDispatcher)
     dispatcher.rank = 0
     dispatcher.world_size = 1
@@ -282,7 +282,7 @@ def test_optimizer_handler_tail_failure_after_mutation_is_fatal_and_poisons_adap
         sparse_delta_capture={"enabled": True},
     )
 
-    with pytest.raises(_MODULE.AdapterGradientMutationFailure, match="handler tail failed") as raised:
+    with pytest.raises(runner_dispatcher_module.AdapterGradientMutationFailure, match="handler tail failed") as raised:
         asyncio.run(dispatcher._handle_optim_step({"payload": payload}))
 
     assert str(raised.value.__cause__) == "injected handler tail failure"
@@ -290,7 +290,7 @@ def test_optimizer_handler_tail_failure_after_mutation_is_fatal_and_poisons_adap
     assert manager.state.publication_eligible is False
 
 
-def test_abort_gradient_epoch_uses_the_normal_distributed_handler():
+def _assert_abort_gradient_epoch_uses_the_normal_distributed_handler():
     dispatcher = object.__new__(RunnerDispatcher)
     dispatcher.trainer = _FakeTrainer()
 
@@ -308,7 +308,7 @@ def test_abort_gradient_epoch_uses_the_normal_distributed_handler():
     assert "abort_gradient_epoch" in RunnerDispatcher._ERROR_SYNC_OPS
 
 
-def test_forward_backward_commits_after_completion_rendezvous_before_rank0_merge():
+def _assert_gradient_epoch_completion_abort_and_failure_policy():
     dispatcher = object.__new__(RunnerDispatcher)
     dispatcher.rank = 0
     events = []
@@ -351,23 +351,28 @@ def test_forward_backward_commits_after_completion_rendezvous_before_rank0_merge
     ]
     assert "forward_backward" not in RunnerDispatcher._ERROR_SYNC_OPS
 
+    _assert_abort_gradient_epoch_uses_the_normal_distributed_handler()
+    _assert_forward_backward_failure_policy()
 
-@pytest.mark.parametrize("rank", (0, 1))
-def test_forward_backward_preserves_uniform_rejection_and_promotes_other_failures_to_fatal(rank):
-    dispatcher = object.__new__(RunnerDispatcher)
-    dispatcher.rank = rank
 
-    async def _uniform(*_args, **_kwargs):
-        raise _MODULE.AdapterGradientUniformRejection("ADAPTER_GRADIENT_ZERO_DENOMINATOR: injected")
+def _assert_forward_backward_failure_policy():
+    for rank in (0, 1):
+        dispatcher = object.__new__(RunnerDispatcher)
+        dispatcher.rank = rank
 
-    target = "_handle_compute_rank0_scatter" if rank == 0 else "_handle_compute_worker_receive"
-    setattr(dispatcher, target, _uniform)
-    with pytest.raises(_MODULE.AdapterGradientUniformRejection, match="ZERO_DENOMINATOR"):
-        asyncio.run(dispatcher._handle_forward_backward({}))
+        async def _uniform(*_args, **_kwargs):
+            raise runner_dispatcher_module.AdapterGradientUniformRejection(
+                "ADAPTER_GRADIENT_ZERO_DENOMINATOR: injected"
+            )
 
-    async def _asymmetric(*_args, **_kwargs):
-        raise RuntimeError("injected rank-local failure")
+        target = "_handle_compute_rank0_scatter" if rank == 0 else "_handle_compute_worker_receive"
+        setattr(dispatcher, target, _uniform)
+        with pytest.raises(runner_dispatcher_module.AdapterGradientUniformRejection, match="ZERO_DENOMINATOR"):
+            asyncio.run(dispatcher._handle_forward_backward({}))
 
-    setattr(dispatcher, target, _asymmetric)
-    with pytest.raises(_MODULE.AdapterGradientCollectiveFailure, match="Rank-asymmetric"):
-        asyncio.run(dispatcher._handle_forward_backward({}))
+        async def _asymmetric(*_args, **_kwargs):
+            raise RuntimeError("injected rank-local failure")
+
+        setattr(dispatcher, target, _asymmetric)
+        with pytest.raises(runner_dispatcher_module.AdapterGradientCollectiveFailure, match="Rank-asymmetric"):
+            asyncio.run(dispatcher._handle_forward_backward({}))

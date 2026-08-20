@@ -73,7 +73,7 @@ def make_async_client(responses: dict[str, FakeResponse], calls: list[str]):
 class TestInferenceEndpointRegistration:
     """Test inference endpoint registration behavior."""
 
-    def test_add_inference_endpoint_uses_single_endpoint_port(self, monkeypatch):
+    def test_add_inference_endpoint_registration_policy(self, monkeypatch):
         calls: list[str] = []
         responses = {
             "http://8.8.8.8:30000/health": FakeResponse(),
@@ -101,12 +101,25 @@ class TestInferenceEndpointRegistration:
         assert response.endpoint.worker_port == 30000
         assert "http://8.8.8.8:29999/health" not in calls
 
-    def test_add_inference_endpoint_checks_explicit_worker_port(self, monkeypatch):
+        self._assert_explicit_worker_port_is_checked(monkeypatch)
+        self._assert_add_inference_endpoint_auto_sync_policy(monkeypatch)
+        self._assert_add_inference_endpoint_fp8_kv_cache_admission_policy(monkeypatch)
+        self._assert_list_inference_endpoints_accepts_v1_models_health_fallback(monkeypatch)
+
+    def _assert_explicit_worker_port_is_checked(self, monkeypatch):
         calls: list[str] = []
         responses = {
             "http://8.8.8.8:30000/health": FakeResponse(),
             "http://8.8.8.8:31000/health": FakeResponse(),
             "http://8.8.8.8:30000/server_info": FakeResponse(json_data={"model_path": None, "tp_size": 1}),
+            "http://8.8.8.8:31000/v1/models": FakeResponse(
+                json_data={
+                    "data": [
+                        {"id": "base-model"},
+                        {"id": "adapter-001", "parent": "base-model"},
+                    ]
+                }
+            ),
         }
         monkeypatch.setattr(
             "xorl.server.api_server.inference_endpoints.httpx.AsyncClient",
@@ -129,8 +142,25 @@ class TestInferenceEndpointRegistration:
         assert response.endpoint.worker_port == 31000
         assert "http://8.8.8.8:30000/health" in calls
         assert "http://8.8.8.8:31000/health" in calls
+        post_calls: list[str] = []
 
-    def test_add_inference_endpoint_auto_sync_uses_detected_tp_size(self, monkeypatch):
+        def fake_post(url: str, **_kwargs):
+            post_calls.append(url)
+            return FakeResponse(json_data={"success": True})
+
+        monkeypatch.setattr("xorl.server.api_server.inference_endpoints.requests.post", fake_post)
+        asyncio.run(server._load_lora_on_inference_endpoints("adapter-001", "/tmp/adapter-001"))
+        asyncio.run(server._unload_lora_on_inference_endpoints("adapter-001"))
+        adapters = asyncio.run(server._get_loaded_adapters_from_endpoint(response.endpoint))
+
+        assert post_calls == [
+            "http://8.8.8.8:31000/load_lora_adapter",
+            "http://8.8.8.8:31000/unload_lora_adapter",
+        ]
+        assert adapters == ["adapter-001"]
+        assert calls[-1] == "http://8.8.8.8:31000/v1/models"
+
+    def _assert_add_inference_endpoint_auto_sync_policy(self, monkeypatch):
         calls: list[str] = []
         responses = {
             "http://8.8.8.8:30000/health": FakeResponse(),
@@ -173,7 +203,9 @@ class TestInferenceEndpointRegistration:
         assert response.endpoint.world_size == 4
         assert captured_endpoints == [{"host": "8.8.8.8", "port": 30000, "world_size": 4}]
 
-    def test_add_inference_endpoint_records_fp8_kv_cache_server_info(self, monkeypatch):
+        self._assert_auto_sync_uses_configured_sync_method(monkeypatch)
+
+    def _assert_add_inference_endpoint_fp8_kv_cache_admission_policy(self, monkeypatch):
         calls: list[str] = []
         responses = {
             "http://8.8.8.8:30000/health": FakeResponse(),
@@ -217,7 +249,10 @@ class TestInferenceEndpointRegistration:
         assert response.endpoint.server_info.fp8_kv_cache_static_scales is True
         assert response.endpoint.server_info.cache_epoch == 0
 
-    def test_add_inference_endpoint_accepts_cache_version_alias_and_infers_fp8_kv_cache(self, monkeypatch):
+        self._assert_cache_version_alias_and_dtype_inference(monkeypatch)
+        self._assert_required_fp8_kv_cache_rejects_bf16_receiver(monkeypatch)
+
+    def _assert_cache_version_alias_and_dtype_inference(self, monkeypatch):
         calls: list[str] = []
         responses = {
             "http://8.8.8.8:30000/health": FakeResponse(),
@@ -256,7 +291,7 @@ class TestInferenceEndpointRegistration:
         assert response.endpoint.server_info.fp8_kv_cache_enabled is True
         assert response.endpoint.server_info.cache_epoch == "version-1"
 
-    def test_add_inference_endpoint_rejects_non_fp8_kv_cache_when_config_requires_fp8(self, monkeypatch):
+    def _assert_required_fp8_kv_cache_rejects_bf16_receiver(self, monkeypatch):
         calls: list[str] = []
         responses = {
             "http://8.8.8.8:30000/health": FakeResponse(),
@@ -291,7 +326,7 @@ class TestInferenceEndpointRegistration:
         assert "receiver_kv_cache_dtype='fp8'" in response.message
         assert "kv_cache_dtype='bfloat16'" in response.message
 
-    def test_list_inference_endpoints_accepts_v1_models_health_fallback(self, monkeypatch):
+    def _assert_list_inference_endpoints_accepts_v1_models_health_fallback(self, monkeypatch):
         calls: list[str] = []
         responses = {
             "http://8.8.8.8:30000/health": FakeResponse(status_code=404),
@@ -317,60 +352,7 @@ class TestInferenceEndpointRegistration:
         assert "http://8.8.8.8:30000/health" in calls
         assert "http://8.8.8.8:30000/v1/models" in calls
 
-    def test_lora_adapter_management_uses_worker_port(self, monkeypatch):
-        calls: list[str] = []
-
-        def fake_post(url: str, **kwargs):
-            calls.append(url)
-            return FakeResponse(json_data={"success": True})
-
-        monkeypatch.setattr("xorl.server.api_server.inference_endpoints.requests.post", fake_post)
-
-        server = APIServer(
-            engine_input_addr="tcp://127.0.0.1:17002",
-            engine_output_addr="tcp://127.0.0.1:17003",
-        )
-        server.inference_endpoints = [
-            InferenceEndpoint(host="8.8.8.8", port=30000, worker_port=31000, world_size=1),
-        ]
-
-        asyncio.run(server._load_lora_on_inference_endpoints("adapter-001", "/tmp/adapter-001"))
-        asyncio.run(server._unload_lora_on_inference_endpoints("adapter-001"))
-
-        assert calls == [
-            "http://8.8.8.8:31000/load_lora_adapter",
-            "http://8.8.8.8:31000/unload_lora_adapter",
-        ]
-
-    def test_loaded_adapter_query_uses_worker_port(self, monkeypatch):
-        calls: list[str] = []
-        responses = {
-            "http://8.8.8.8:31000/v1/models": FakeResponse(
-                json_data={
-                    "data": [
-                        {"id": "base-model"},
-                        {"id": "adapter-001", "parent": "base-model"},
-                    ]
-                }
-            ),
-        }
-        monkeypatch.setattr(
-            "xorl.server.api_server.inference_endpoints.httpx.AsyncClient",
-            make_async_client(responses, calls),
-        )
-
-        server = APIServer(
-            engine_input_addr="tcp://127.0.0.1:17002",
-            engine_output_addr="tcp://127.0.0.1:17003",
-        )
-        endpoint = InferenceEndpoint(host="8.8.8.8", port=30000, worker_port=31000, world_size=1)
-
-        adapters = asyncio.run(server._get_loaded_adapters_from_endpoint(endpoint))
-
-        assert adapters == ["adapter-001"]
-        assert calls == ["http://8.8.8.8:31000/v1/models"]
-
-    def test_sync_inference_weights_forwards_single_endpoint(self):
+    def test_sync_inference_weights_request_and_admission_policy(self):
         server = APIServer(
             engine_input_addr="tcp://127.0.0.1:17002",
             engine_output_addr="tcp://127.0.0.1:17003",
@@ -429,7 +411,10 @@ class TestInferenceEndpointRegistration:
         assert response.timing_breakdown == {"transfer_s": 0.1, "total_handler_s": 0.2}
         assert response.p2p_rank_summaries == [{"rank": 0, "is_sender": True, "transfer_wall_s": 0.1}]
 
-    def test_sync_inference_weights_pools_filter_selects_matching_endpoints(self):
+        self._assert_sync_inference_weights_pool_selection_policy()
+        self._assert_sync_inference_weights_quantization_admission_policy()
+
+    def _assert_sync_inference_weights_pool_selection_policy(self):
         server = APIServer(
             engine_input_addr="tcp://127.0.0.1:17002",
             engine_output_addr="tcp://127.0.0.1:17003",
@@ -480,7 +465,9 @@ class TestInferenceEndpointRegistration:
             "eval-0.example",
         ]
 
-    def test_sync_inference_weights_pools_filter_no_match_fails_cleanly(self):
+        self._assert_pool_filter_without_match_fails_cleanly()
+
+    def _assert_pool_filter_without_match_fails_cleanly(self):
         server = APIServer(
             engine_input_addr="tcp://127.0.0.1:17002",
             engine_output_addr="tcp://127.0.0.1:17003",
@@ -498,7 +485,7 @@ class TestInferenceEndpointRegistration:
         assert "pools" in response.message
         server.orchestrator_client.send_request.assert_not_called()
 
-    def test_sync_inference_weights_explicit_null_quantization_disables_default(self):
+    def _assert_sync_inference_weights_quantization_admission_policy(self):
         server = APIServer(
             engine_input_addr="tcp://127.0.0.1:17002",
             engine_output_addr="tcp://127.0.0.1:17003",
@@ -528,7 +515,10 @@ class TestInferenceEndpointRegistration:
         assert response.success is True
         assert captured_request["request"].payload.quantization is None
 
-    def test_sync_inference_weights_auto_flushes_for_fp8_weights_and_fp8_kv_cache(self):
+        self._assert_empty_quantization_config_is_rejected()
+        self._assert_sync_inference_weights_cache_invalidation_policy()
+
+    def _assert_sync_inference_weights_cache_invalidation_policy(self):
         server = APIServer(
             engine_input_addr="tcp://127.0.0.1:17002",
             engine_output_addr="tcp://127.0.0.1:17003",
@@ -603,7 +593,11 @@ class TestInferenceEndpointRegistration:
         assert response.endpoints_synced[0].fp8_kv_cache_postprocess_ran is True
         assert response.endpoints_synced[0].fp8_kv_cache_static_scales_updated is True
 
-    def test_sync_inference_weights_accepts_cache_version_alias_and_dtype_only_fp8_kv_cache(self):
+        self._assert_cache_version_alias_with_dtype_only_fp8_kv_cache()
+        self._assert_bf16_weight_sync_does_not_auto_flush_fp8_kv_cache()
+        self._assert_cache_mode_none_disables_auto_flush_only()
+
+    def _assert_cache_version_alias_with_dtype_only_fp8_kv_cache(self):
         server = APIServer(
             engine_input_addr="tcp://127.0.0.1:17002",
             engine_output_addr="tcp://127.0.0.1:17003",
@@ -670,7 +664,7 @@ class TestInferenceEndpointRegistration:
         assert response.endpoints_synced[0].fp8_kv_cache_postprocess_ran is True
         assert response.endpoints_synced[0].fp8_kv_cache_static_scales_updated is True
 
-    def test_sync_inference_weights_does_not_auto_flush_fp8_kv_cache_for_bf16_weight_sync(self):
+    def _assert_bf16_weight_sync_does_not_auto_flush_fp8_kv_cache(self):
         server = APIServer(
             engine_input_addr="tcp://127.0.0.1:17002",
             engine_output_addr="tcp://127.0.0.1:17003",
@@ -716,7 +710,7 @@ class TestInferenceEndpointRegistration:
         assert response.flush_cache is False
         assert response.fp8_kv_cache_postprocess_requested is False
 
-    def test_sync_inference_weights_cache_mode_none_disables_auto_flush_only(self):
+    def _assert_cache_mode_none_disables_auto_flush_only(self):
         server = APIServer(
             engine_input_addr="tcp://127.0.0.1:17002",
             engine_output_addr="tcp://127.0.0.1:17003",
@@ -761,7 +755,7 @@ class TestInferenceEndpointRegistration:
         assert response.flush_cache is False
         assert response.fp8_kv_cache_postprocess_requested is True
 
-    def test_sync_inference_weights_rejects_empty_quantization_config(self):
+    def _assert_empty_quantization_config_is_rejected(self):
         server = APIServer(
             engine_input_addr="tcp://127.0.0.1:17002",
             engine_output_addr="tcp://127.0.0.1:17003",
@@ -784,7 +778,7 @@ class TestInferenceEndpointRegistration:
         assert "must contain 'quant_method'" in exc_info.value.detail
         server.orchestrator_client.send_request.assert_not_called()
 
-    def test_add_inference_endpoint_auto_sync_uses_configured_sync_method(self, monkeypatch):
+    def _assert_auto_sync_uses_configured_sync_method(self, monkeypatch):
         calls: list[str] = []
         responses = {
             "http://8.8.8.8:30000/health": FakeResponse(),
@@ -936,40 +930,7 @@ class TestSyncCacheInvalidationPolicy:
 class TestQuantizationConfigNormalization:
     """Test FP8 quantization-config auto-detection + name normalization."""
 
-    def test_strips_language_model_infix(self):
-        # Multimodal FP8 checkpoint paths use `model.language_model.layers.*`;
-        # the trainer's text-only model exposes `model.layers.*`.
-        entries = [
-            "lm_head",
-            "model.embed_tokens",
-            "model.language_model.layers.0.linear_attn.in_proj_a",
-            "model.language_model.layers.0.mlp.gate",
-            "model.language_model.layers.39.linear_attn.norm",
-        ]
-        out = InferenceEndpointsMixin._normalize_modules_to_not_convert(entries)
-        assert out == [
-            "lm_head",
-            "model.embed_tokens",
-            "model.layers.0.linear_attn.in_proj_a",
-            "model.layers.0.mlp.gate",
-            "model.layers.39.linear_attn.norm",
-        ]
-
-    def test_drops_vision_entries(self):
-        entries = [
-            "lm_head",
-            "model.visual.blocks.0.attn.proj",
-            "model.visual.blocks.0.attn.qkv",
-            "visual.blocks.0.attn.proj",
-            "model.language_model.layers.0.linear_attn.in_proj_a",
-        ]
-        out = InferenceEndpointsMixin._normalize_modules_to_not_convert(entries)
-        assert "model.visual.blocks.0.attn.proj" not in out
-        assert "visual.blocks.0.attn.proj" not in out
-        assert "lm_head" in out
-        assert "model.layers.0.linear_attn.in_proj_a" in out
-
-    def test_detect_quantization_normalizes_skip_list(self, tmp_path):
+    def test_receiver_quantization_detection_enrichment_and_admission_policy(self, tmp_path):
         cfg = {
             "architectures": ["Qwen3MoeForCausalLM"],
             "quantization_config": {
@@ -997,23 +958,88 @@ class TestQuantizationConfigNormalization:
             "model.layers.0.linear_attn.in_proj_b",
         ]
 
-    def test_detect_quantization_normalizes_minimal_fp8_config(self, tmp_path):
-        cfg = {
-            "architectures": ["Qwen3MoeForCausalLM"],
-            "quantization_config": {"quant_method": "fp8"},
+        self._assert_enrich_quantization_from_receiver_policy(detected)
+        self._assert_unsupported_receiver_configs_are_marked(tmp_path)
+        self._assert_supported_sync_quantization_normalization_policy()
+
+    def _assert_supported_sync_quantization_normalization_policy(self):
+        for config in (
+            None,
+            {"quant_method": "bf16"},
+            {"quant_method": "bfloat16"},
+            {"quant_method": "none"},
+            {"quant_method": "null"},
+        ):
+            assert normalize_sync_quantization_config(config) is None, config
+
+        config = normalize_sync_quantization_config(
+            {
+                "quant_method": "FP8",
+                "fmt": "E4M3",
+                "activation_scheme": "Dynamic",
+                "weight_block_size": [64],
+                "modules_to_not_convert": ["lm_head"],
+            }
+        )
+        assert config == {
+            "quant_method": "fp8",
+            "fmt": "e4m3",
+            "activation_scheme": "dynamic",
+            "weight_block_size": [64, 64],
+            "modules_to_not_convert": ["lm_head"],
         }
-        (tmp_path / "config.json").write_text(json.dumps(cfg))
 
-        detected = InferenceEndpointsMixin._detect_quantization_from_hf_config(str(tmp_path))
-
-        assert detected == {
+        assert normalize_sync_quantization_config({"quant_method": "fp8"}) == {
             "quant_method": "fp8",
             "fmt": "e4m3",
             "activation_scheme": "dynamic",
             "weight_block_size": [128, 128],
         }
 
-    def test_detect_quantization_marks_mtp_fp8_config_unsupported(self, tmp_path):
+        config = normalize_sync_quantization_config(
+            {
+                "quant_method": "fp8",
+                "modules_to_not_convert": [
+                    " lm_head.weight ",
+                    "lm_head",
+                    "model.layers.0.linear_attn.in_proj_a.weight",
+                    "",
+                ],
+            }
+        )
+        assert config is not None
+        assert config["modules_to_not_convert"] == ["lm_head", "model.layers.0.linear_attn.in_proj_a"]
+
+        for method in ("int4", "compressed-tensors", "awq", "qat"):
+            with pytest.raises(UnsupportedSyncQuantizationError, match="Online weight sync currently supports only"):
+                normalize_sync_quantization_config({"quant_method": method})
+
+        for fmt, message in (("ue8m0", "Unsupported .*fmt"), ("e5m2", "E4M3")):
+            with pytest.raises(UnsupportedSyncQuantizationError, match=message):
+                normalize_sync_quantization_config({"quant_method": "fp8", "fmt": fmt})
+
+        for activation_scheme in ("static", None):
+            with pytest.raises(UnsupportedSyncQuantizationError, match="activation_scheme"):
+                normalize_sync_quantization_config({"quant_method": "fp8", "activation_scheme": activation_scheme})
+
+        with pytest.raises(UnsupportedSyncQuantizationError, match="UE8M0 scale storage"):
+            normalize_sync_quantization_config({"quant_method": "fp8", "scale_fmt": "ue8m0"})
+
+        with pytest.raises(UnsupportedSyncQuantizationError, match="modules_to_not_convert"):
+            normalize_sync_quantization_config({"quant_method": "fp8", "modules_to_not_convert": "lm_head"})
+
+        with pytest.raises(UnsupportedSyncQuantizationError, match="MTP/speculative low-precision sync"):
+            normalize_sync_quantization_config(
+                {
+                    "quant_method": "fp8",
+                    SYNC_QUANTIZATION_UNSUPPORTED_REASON_KEY: (
+                        "MTP/speculative low-precision sync is not implemented."
+                    ),
+                },
+                context="sync_inference_weights.quantization",
+            )
+
+    def _assert_unsupported_receiver_configs_are_marked(self, tmp_path):
         cfg = {
             "architectures": ["Qwen3MoeForCausalLM"],
             "text_config": {"mtp_num_hidden_layers": 1},
@@ -1045,43 +1071,23 @@ class TestQuantizationConfigNormalization:
         with pytest.raises(UnsupportedSyncQuantizationError, match="MTP/speculative"):
             normalize_sync_quantization_config(detected)
 
-    def test_detect_quantization_marks_unsupported_fp8_receiver_config(self, tmp_path):
-        cfg = {
-            "architectures": ["Qwen3MoeForCausalLM"],
-            "quantization_config": {
-                "quant_method": "fp8",
-                "activation_scheme": "static",
-            },
-        }
-        (tmp_path / "config.json").write_text(json.dumps(cfg))
+        for activation_scheme in ("static", None):
+            cfg = {
+                "architectures": ["Qwen3MoeForCausalLM"],
+                "quantization_config": {
+                    "quant_method": "fp8",
+                    "activation_scheme": activation_scheme,
+                },
+            }
+            (tmp_path / "config.json").write_text(json.dumps(cfg))
+            detected = InferenceEndpointsMixin._detect_quantization_from_hf_config(str(tmp_path))
 
-        detected = InferenceEndpointsMixin._detect_quantization_from_hf_config(str(tmp_path))
+            assert detected is not None
+            assert detected["quant_method"] == "fp8"
+            assert "activation_scheme" in detected[SYNC_QUANTIZATION_UNSUPPORTED_REASON_KEY]
+            with pytest.raises(UnsupportedSyncQuantizationError, match="activation_scheme"):
+                normalize_sync_quantization_config(detected)
 
-        assert detected is not None
-        assert detected["quant_method"] == "fp8"
-        assert "activation_scheme" in detected[SYNC_QUANTIZATION_UNSUPPORTED_REASON_KEY]
-        with pytest.raises(UnsupportedSyncQuantizationError, match="activation_scheme"):
-            normalize_sync_quantization_config(detected)
-
-    def test_detect_quantization_marks_null_activation_fp8_receiver_config_unsupported(self, tmp_path):
-        cfg = {
-            "architectures": ["Qwen3MoeForCausalLM"],
-            "quantization_config": {
-                "quant_method": "fp8",
-                "activation_scheme": None,
-            },
-        }
-        (tmp_path / "config.json").write_text(json.dumps(cfg))
-
-        detected = InferenceEndpointsMixin._detect_quantization_from_hf_config(str(tmp_path))
-
-        assert detected is not None
-        assert detected["quant_method"] == "fp8"
-        assert "activation_scheme" in detected[SYNC_QUANTIZATION_UNSUPPORTED_REASON_KEY]
-        with pytest.raises(UnsupportedSyncQuantizationError, match="activation_scheme"):
-            normalize_sync_quantization_config(detected)
-
-    def test_detect_quantization_marks_ue8m0_scale_receiver_config_unsupported(self, tmp_path):
         cfg = {
             "architectures": ["Qwen3MoeForCausalLM"],
             "quantization_config": {
@@ -1103,7 +1109,6 @@ class TestQuantizationConfigNormalization:
         with pytest.raises(UnsupportedSyncQuantizationError, match="UE8M0 scale storage"):
             normalize_sync_quantization_config(detected)
 
-    def test_detect_quantization_leaves_bf16_mtp_config_unmarked(self, tmp_path):
         cfg = {
             "architectures": ["Qwen3MoeForCausalLM"],
             "text_config": {"mtp_num_hidden_layers": 1},
@@ -1112,21 +1117,14 @@ class TestQuantizationConfigNormalization:
 
         assert InferenceEndpointsMixin._detect_quantization_from_hf_config(str(tmp_path)) is None
 
-    def test_enrich_fills_modules_to_not_convert_from_endpoint(self):
+    def _assert_enrich_quantization_from_receiver_policy(self, detected):
         """User passes {quant_method, fmt, block_size} without skip list →
         handler should fill it in from the receiver's auto-detected config."""
-        receiver_skip = ["lm_head", "model.layers.0.linear_attn.in_proj_a"]
+        receiver_skip = detected["modules_to_not_convert"]
         endpoint = InferenceEndpoint(
             host="inf",
             port=30000,
-            server_info=InferenceEndpointServerInfo(
-                quantization_config={
-                    "quant_method": "fp8",
-                    "fmt": "e4m3",
-                    "weight_block_size": [128, 128],
-                    "modules_to_not_convert": receiver_skip,
-                },
-            ),
+            server_info=InferenceEndpointServerInfo(quantization_config=detected),
         )
         mixin = InferenceEndpointsMixin()
         mixin.inference_endpoints = [endpoint]  # type: ignore[attr-defined]
@@ -1146,7 +1144,10 @@ class TestQuantizationConfigNormalization:
         # None passes through.
         assert mixin._enrich_quantization_with_receiver_skip_list(None) is None
 
-    def test_enrich_propagates_unsupported_receiver_reason(self):
+        self._assert_unsupported_receiver_reason_is_propagated()
+        self._assert_set_sync_quantization_enforces_method_policy(mixin, enriched)
+
+    def _assert_unsupported_receiver_reason_is_propagated(self):
         """A per-call user FP8 config must not bypass an unsupported receiver marker."""
         endpoint = InferenceEndpoint(
             host="inf",
@@ -1184,17 +1185,16 @@ class TestQuantizationConfigNormalization:
         with pytest.raises(UnsupportedSyncQuantizationError, match="MTP/speculative"):
             normalize_sync_quantization_config(enriched)
 
-    def test_set_sync_quantization_rejects_unsupported_methods(self):
-        mixin = InferenceEndpointsMixin()
+    def _assert_set_sync_quantization_enforces_method_policy(self, mixin, enriched):
+        response = mixin.set_sync_quantization(SetSyncQuantizationRequest(quantization=enriched))
+        assert response.quantization is not None
+        assert response.quantization["modules_to_not_convert"] == enriched["modules_to_not_convert"]
 
         with pytest.raises(HTTPException) as exc_info:
             mixin.set_sync_quantization(SetSyncQuantizationRequest(quantization={"quant_method": "compressed-tensors"}))
 
         assert exc_info.value.status_code == 400
         assert "INT4/compressed-tensors updates" in exc_info.value.detail
-
-    def test_set_sync_quantization_normalizes_explicit_bf16_to_noop(self):
-        mixin = InferenceEndpointsMixin()
 
         response = mixin.set_sync_quantization(SetSyncQuantizationRequest(quantization={"quant_method": "bf16"}))
 

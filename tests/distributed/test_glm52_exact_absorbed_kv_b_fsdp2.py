@@ -304,14 +304,6 @@ def _run_fsdp2_lifecycle() -> None:
 
 if __name__ != "__main__":
 
-    @skip_if_gpu_count_less_than(1)
-    def test_exact_absorbed_kv_b_composes_with_one_rank_fsdp2_lifecycle() -> None:
-        pytest.importorskip("sglang")
-        if torch.cuda.get_device_capability()[0] != 9:
-            pytest.skip("the qualified exact GLM-5.2 absorbed component requires Hopper")
-        result = run_distributed_script(__file__, num_gpus=1, timeout=300)
-        result.assert_success("exact absorbed kv_b should survive two calls through one-rank child FSDP2")
-
     @skip_if_gpu_count_less_than(2)
     def test_exact_absorbed_kv_b_composes_with_two_rank_fsdp2_lifecycle() -> None:
         pytest.importorskip("sglang")

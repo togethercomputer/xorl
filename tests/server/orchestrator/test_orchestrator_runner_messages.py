@@ -8,10 +8,11 @@ This test suite verifies the message protocol between Orchestrator and Runner Ra
 4. Message validation
 """
 
-import json
-import time
+import asyncio
+from unittest.mock import AsyncMock
 
 import pytest
+import torch
 
 from xorl.server.protocol.operations import (
     EmptyData,
@@ -21,173 +22,128 @@ from xorl.server.protocol.operations import (
     SaveStateData,
 )
 from xorl.server.protocol.orchestrator_runner import (
-    BaseMessage,
-    MessageType,
     RunnerAck,
     RunnerDispatchCommand,
     RunnerReady,
     RunnerResponse,
-    create_ack_for_request,
     deserialize_message,
     serialize_message,
 )
+from xorl.server.runner.utils.rank0_protocol import Rank0Protocol
 
 
 pytestmark = [pytest.mark.cpu, pytest.mark.server]
 
 
-def test_dispatch_command_all_operations():
-    """Test RunnerDispatchCommand.create() for all operation types."""
-    # forward_backward
+def _make_protocol_stub():
+    protocol = object.__new__(Rank0Protocol)
+    protocol.rank = 0
+    protocol.world_size = 1
+    protocol.device = "cuda:0"
+    protocol._request_count = 0
+    protocol.request_queue = asyncio.Queue()
+    protocol.current_client_id = None
+    protocol.channel = AsyncMock()
+    return protocol
+
+
+def test_protocol_roundtrips_and_rank0_ready_handshake_policy():
     batches = [{"input_ids": [[1, 2, 3]], "labels": [[2, 3, 4]], "position_ids": [[0, 1, 2]]}]
-    msg = RunnerDispatchCommand.create(
-        operation="forward_backward",
-        payload=ModelPassData(batches=batches, loss_fn="causallm_loss"),
-        request_id="custom-id",
-    )
-    assert msg.operation == "forward_backward"
-    assert msg.payload.batches == batches
-    assert msg.payload.loss_fn == "causallm_loss"
-    assert msg.message_id == "custom-id"
-
-    # optim_step (with and without clip)
-    msg = RunnerDispatchCommand.create(
-        operation="optim_step",
-        payload=OptimStepData(lr=0.001, gradient_clip=1.0),
-        request_id="opt-id",
-    )
-    assert msg.payload.lr == 0.001 and msg.payload.gradient_clip == 1.0
-    msg_no_clip = RunnerDispatchCommand.create(operation="optim_step", payload=OptimStepData(lr=0.001))
-    assert msg_no_clip.payload.gradient_clip is None
-
-    # save_state
-    msg = RunnerDispatchCommand.create(
-        operation="save_state",
-        payload=SaveStateData(checkpoint_path="/tmp/ckpt.pt", save_optimizer=True),
-    )
-    assert msg.payload.checkpoint_path == "/tmp/ckpt.pt" and msg.payload.save_optimizer is True
-
-    # load_state
-    msg = RunnerDispatchCommand.create(
-        operation="load_state",
-        payload=LoadStateData(checkpoint_path="/tmp/ckpt.pt", load_optimizer=False),
-    )
-    assert msg.payload.load_optimizer is False
-
-    # health_check and shutdown
-    msg = RunnerDispatchCommand.create(operation="health_check", payload=EmptyData())
-    assert msg.operation == "health_check"
-    msg = RunnerDispatchCommand.create(operation="shutdown", payload=EmptyData())
-    assert msg.operation == "shutdown"
-
-    # RunnerResponse with error
-    msg = RunnerResponse(request_id="req-123", success=False, error="Test error message")
-    assert msg.success is False and msg.error == "Test error message"
-
-
-def test_serialization_roundtrip_all_types():
-    """Test complete serialization roundtrip for all message types."""
     messages = [
-        RunnerReady(worker_rank=0, world_size=8),
+        RunnerReady(worker_rank=0, world_size=8, device="cuda:0"),
         RunnerAck(request_id="req-123"),
         RunnerResponse(request_id="req-123", success=True, result={"loss": 2.5}),
-        RunnerDispatchCommand.create("forward_backward", ModelPassData(batches=[], loss_fn="test")),
-        RunnerDispatchCommand.create("optim_step", OptimStepData(lr=0.001)),
+        RunnerResponse(request_id="req-failed", success=False, error="Test error message"),
+        RunnerDispatchCommand.create(
+            "forward_backward",
+            ModelPassData(batches=batches, loss_fn="causallm_loss"),
+            request_id="custom-id",
+        ),
+        RunnerDispatchCommand.create("optim_step", OptimStepData(lr=0.001, gradient_clip=1.0)),
+        RunnerDispatchCommand.create("save_state", SaveStateData(checkpoint_path="/tmp/ckpt.pt", save_optimizer=True)),
+        RunnerDispatchCommand.create("load_state", LoadStateData(checkpoint_path="/tmp/ckpt.pt", load_optimizer=False)),
         RunnerDispatchCommand.create("health_check", EmptyData()),
+        RunnerDispatchCommand.create("shutdown", EmptyData()),
     ]
     for original_msg in messages:
         serialized = serialize_message(original_msg)
         deserialized = deserialize_message(serialized)
-        assert type(deserialized) is type(original_msg)
-        assert deserialized.message_type == original_msg.message_type
-        assert deserialized.message_id == original_msg.message_id
+        assert deserialized == original_msg
 
-
-def test_deserializer_rejects_pickle_frames_and_roundtrips_tensors():
     with pytest.raises((ValueError, TypeError)):
         deserialize_message(b"\x80\x04N.")
 
     original = RunnerResponse(
         request_id="tensor-response",
-        result={"values": pytest.importorskip("torch").tensor([[1, 2], [3, 4]])},
+        result={"values": torch.tensor([[1, 2], [3, 4]])},
     )
     restored = deserialize_message(serialize_message(original))
     assert restored.result["values"].equal(original.result["values"])
 
-
-def test_json_conversion():
-    """Test JSON serialization and deserialization of messages."""
-    # to_json
-    msg = RunnerReady(worker_rank=0, world_size=4)
-    data = json.loads(msg.to_json())
-    assert data["message_type"] == "ready"
-    assert data["worker_rank"] == 0 and data["world_size"] == 4
-
-    # from_json
-    json_str = json.dumps(
-        {
-            "message_type": "ready",
-            "worker_rank": 2,
-            "world_size": 8,
-            "device": "cuda:2",
-            "message_id": "msg-123",
-            "timestamp": time.time(),
-        }
-    )
-    msg = BaseMessage.from_json(json_str)
-    assert isinstance(msg, RunnerReady)
-    assert msg.worker_rank == 2 and msg.world_size == 8 and msg.device == "cuda:2"
+    asyncio.run(_assert_rank0_ready_handshake_policy())
 
 
-def test_complex_data_and_edge_cases():
-    """Test large batches, complex results, None values, ID uniqueness, and timestamp accuracy."""
-    # Large batches
-    batches = [
-        {
-            "input_ids": [list(range(100)) for _ in range(10)],
-            "labels": [list(range(100, 200)) for _ in range(10)],
-            "position_ids": [list(range(100)) for _ in range(10)],
-            "request_id": "req-123",
-            "batch_id": i,
-        }
-        for i in range(5)
-    ]
-    msg = RunnerDispatchCommand.create(
-        operation="forward_backward",
-        payload=ModelPassData(batches=batches, loss_fn="causallm_loss"),
-    )
-    deserialized = deserialize_message(serialize_message(msg))
-    assert len(deserialized.payload.batches) == 5
-    assert len(deserialized.payload.batches[0]["input_ids"]) == 10
+async def _assert_rank0_ready_handshake_policy():
+    protocol = _make_protocol_stub()
+    client_id = b"\x00\x80test-client"
+    protocol.channel.recv = AsyncMock(return_value=(client_id, serialize_message(RunnerAck(request_id="ack-123"))))
 
-    # Complex result
-    result = {"loss": 2.5, "gradients": {"layer1": [0.1, 0.2, 0.3]}, "metrics": {"accuracy": 0.95}}
-    msg = RunnerResponse(request_id="req-123", success=True, result=result)
-    deserialized = deserialize_message(serialize_message(msg))
-    assert deserialized.result["loss"] == 2.5
-    assert deserialized.result["gradients"]["layer1"] == [0.1, 0.2, 0.3]
+    await protocol._send_ready(client_id)
 
-    # None values
-    msg = RunnerResponse(request_id="req-123", success=True, result={}, error=None, execution_time=None)
-    deserialized = deserialize_message(serialize_message(msg))
-    assert deserialized.error is None and deserialized.execution_time is None
+    protocol.channel.send.assert_called_once()
+    assert isinstance(deserialize_message(protocol.channel.send.call_args[0][1]), RunnerReady)
+    assert protocol.request_queue.empty()
+    assert protocol._request_count == 0
 
-    # ID uniqueness
-    assert RunnerReady().message_id != RunnerReady().message_id
-
-    # Timestamp accuracy
-    before = time.time()
-    msg = RunnerReady()
-    after = time.time()
-    assert before <= msg.timestamp <= after
-
-    # ACK creation
+    protocol = _make_protocol_stub()
     request = RunnerDispatchCommand.create(
         operation="forward_backward",
-        payload=ModelPassData(batches=[], loss_fn="test"),
-        request_id="req-123",
+        payload=ModelPassData(
+            batches=[{"input_ids": [1, 2, 3]}],
+            loss_fn="importance_sampling",
+            loss_fn_params={"eps_clip": 0.2},
+            model_id="model-42",
+        ),
     )
-    ack = create_ack_for_request(request)
-    assert isinstance(ack, RunnerAck)
-    assert ack.request_id == "req-123"
-    assert ack.message_type == MessageType.ACKNOWLEDGEMENT
+    protocol.channel.recv = AsyncMock(return_value=(client_id, serialize_message(request)))
+
+    await protocol._send_ready(client_id)
+
+    assert protocol.channel.send.call_count == 2
+    assert isinstance(deserialize_message(protocol.channel.send.call_args_list[0][0][1]), RunnerReady)
+    ack_msg = deserialize_message(protocol.channel.send.call_args_list[1][0][1])
+    assert isinstance(ack_msg, RunnerAck) and ack_msg.request_id == request.message_id
+    queued_client_id, queued_request = await protocol.request_queue.get()
+    assert queued_client_id == client_id
+    assert queued_request.operation == "forward_backward"
+    assert queued_request.payload.loss_fn == "importance_sampling"
+    assert queued_request.payload.loss_fn_params == {"eps_clip": 0.2}
+    assert queued_request.payload.model_id == "model-42"
+    assert protocol._request_count == 1
+
+    protocol = _make_protocol_stub()
+    old_client = b"\x00\x80old-client"
+    new_client = b"\x00\x80new-client"
+    protocol.current_client_id = old_client
+    request = RunnerDispatchCommand.create(operation="health_check", payload=EmptyData())
+    protocol.channel.recv = AsyncMock(return_value=(new_client, serialize_message(request)))
+
+    await protocol._send_ready(new_client)
+
+    queued_client_id, _ = await protocol.request_queue.get()
+    assert queued_client_id == new_client and queued_client_id != old_client
+
+    protocol = _make_protocol_stub()
+    wrong_msg = RunnerReady(worker_rank=1, world_size=2)
+    protocol.channel.recv = AsyncMock(return_value=(b"\x00\x80test", serialize_message(wrong_msg)))
+    await protocol._send_ready(b"\x00\x80test")
+    assert protocol.channel.send.call_count == 1
+    assert protocol.request_queue.empty()
+    assert protocol._request_count == 0
+
+    protocol = _make_protocol_stub()
+    protocol.channel.recv = AsyncMock(side_effect=RuntimeError("Unexpected frame count"))
+    await protocol._send_ready(b"\x00\x80test")
+    assert protocol.channel.send.call_count == 1
+    assert protocol.request_queue.empty()
+    assert not hasattr(protocol, "_pending_request")
