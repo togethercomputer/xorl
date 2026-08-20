@@ -156,6 +156,50 @@ def test_parallel_plan_stamps_explicit_replicated_gradient_reduction():
     assert model.experts.shared_lora.spec_info.gradient_reduction == "ep_sum"
 
 
+def test_singleton_axis_without_ep_sum_declaration_fails_closed():
+    """A [1, ...] expert param without EP_SUM is ambiguous (shared replica vs
+    the local slice of ``ep_size == num_experts``) — the plan refuses to guess."""
+    model = _FakeSharedLoRAModel()
+    del model.experts._ep_gradient_reduction_domain
+    plan = ParallelPlan(ep_plan={"experts.shared_lora": Shard(0)})
+
+    with pytest.raises(ValueError, match="refusing to guess"):
+        plan.apply(model, _fake_ep_fsdp_mesh(ep_size=4), already_local=False)
+
+
+def test_singleton_axis_already_local_annotates_per_expert_shard():
+    """With ``already_local=True`` an undeclared singleton is a per-expert
+    local slice: annotated as Shard, never averaged as a replica."""
+    model = _FakeSharedLoRAModel()
+    del model.experts._ep_gradient_reduction_domain
+    plan = ParallelPlan(ep_plan={"experts.shared_lora": Shard(0)})
+
+    fqn2spec = plan.apply(model, _fake_ep_fsdp_mesh(ep_size=4), already_local=True)
+
+    info = fqn2spec["experts.shared_lora"]
+    assert isinstance(info.placement, Shard)
+    assert info.gradient_reduction is GradientReductionDomain.NONE
+    assert tuple(model.experts.shared_lora.shape) == (1, 8, 4)
+
+
+def test_fallback_spec_info_carries_declared_reduction_domain():
+    """Plan-gap params keep their owner's declared EP_SUM contract, so the
+    optimizer-boundary sync and the norm averaging stay coherent."""
+    model = _FakeSharedLoRAModel()
+    model.other = nn.Module()
+    model.other.weight = nn.Parameter(torch.empty(3, 3))
+    plan = ParallelPlan(ep_plan={"experts.nonexistent_pattern": Shard(0)})
+
+    fqn2spec = plan.apply(model, _fake_ep_fsdp_mesh(ep_size=4), already_local=False)
+
+    shared_info = fqn2spec["experts.shared_lora"]
+    assert isinstance(shared_info.placement, Replicate)
+    assert shared_info.gradient_reduction == "ep_sum"
+    other_info = fqn2spec["other.weight"]
+    assert isinstance(other_info.placement, Replicate)
+    assert other_info.gradient_reduction is GradientReductionDomain.NONE
+
+
 def test_glm52_exact_meta_ep_plan_preserves_local_base_and_shards_only_expert_factors():
     model = _ExactRoutedModel(device="meta")
 

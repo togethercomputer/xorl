@@ -93,6 +93,63 @@ class TestBuildEPParamGroups:
         assert model._ep_replicated_gradient_sync_enabled is True
         assert getattr(shared.weight, "_xorl_ep_replicated_gradient_hook", None) is None
 
+    def test_replicated_classification_follows_declared_reduction_not_shape(self):
+        """A singleton expert axis is NOT evidence of replication.
+
+        With ``ep_size == num_experts`` a rank-unique per-expert slice is
+        ``[1, ...]``-shaped and stamped ``Replicate()``; only the declared
+        ``EP_SUM`` reduction marks a genuine replica whose norm may be
+        averaged across EP.
+        """
+        model = nn.Module()
+        per_expert = nn.Module()
+        per_expert._skip_fsdp = True
+        per_expert.weight = nn.Parameter(torch.randn(1, 4))
+        shared = nn.Module()
+        shared._skip_fsdp = True
+        shared.weight = nn.Parameter(torch.randn(2, 4))
+        model.add_module("per_expert", per_expert)
+        model.add_module("shared", shared)
+        model._fqn2spec_info = {
+            "per_expert.weight": SimpleNamespace(placement=Replicate(), gradient_reduction="none"),
+            "shared.weight": SimpleNamespace(placement=Replicate(), gradient_reduction="ep_sum"),
+        }
+
+        _build_ep_param_groups(model)
+
+        assert {id(p) for p in model._ep_param_groups["ep"]} == {id(per_expert.weight), id(shared.weight)}
+        assert {id(p) for p in model._ep_param_groups["ep_replicated"]} == {id(shared.weight)}
+        assert {id(p) for p in model._ep_param_groups["ep_replicated_gradient_sync"]} == {id(shared.weight)}
+
+    def test_frozen_replicas_are_not_queued_for_gradient_sync(self):
+        model = nn.Module()
+        shared = nn.Module()
+        shared._skip_fsdp = True
+        shared.weight = nn.Parameter(torch.randn(1, 4), requires_grad=False)
+        model.add_module("shared", shared)
+        model._fqn2spec_info = {
+            "shared.weight": SimpleNamespace(placement=Replicate(), gradient_reduction="ep_sum"),
+        }
+
+        _build_ep_param_groups(model)
+
+        assert {id(p) for p in model._ep_param_groups["ep_replicated"]} == {id(shared.weight)}
+        assert model._ep_param_groups["ep_replicated_gradient_sync"] == []
+        assert model._ep_replicated_gradient_sync_enabled is False
+
+    def test_ep_sum_replica_off_the_ep_mesh_fails_closed(self):
+        """An EP_SUM replica that would miss the optimizer-boundary sync raises."""
+        model = nn.Module()
+        shared = nn.Module()  # neither _skip_fsdp nor an ep_fsdp DTensor
+        shared.weight = nn.Parameter(torch.randn(1, 4))
+        model.add_module("shared", shared)
+        model._fqn2spec_info = {
+            "shared.weight": SimpleNamespace(placement=Replicate(), gradient_reduction="ep_sum"),
+        }
+
+        with pytest.raises(RuntimeError, match="would silently diverge"):
+            _build_ep_param_groups(model)
+
 
 # ---------------------------------------------------------------------------
 # 2. ep_fsdp2_clip_grad_norm: norm computation and clipping

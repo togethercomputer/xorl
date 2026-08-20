@@ -826,11 +826,27 @@ def _build_ep_param_groups(model: "nn.Module") -> None:
     non_ep_params = []
     for name, p in model.named_parameters():
         spec_info = fqn2spec_info.get(name) or getattr(p, "spec_info", None)
-        is_ep_replicated = Replicate is not None and isinstance(getattr(spec_info, "placement", None), Replicate)
         gradient_reduction = validate_gradient_reduction_domain(
             getattr(spec_info, "gradient_reduction", GradientReductionDomain.NONE)
         )
-        needs_ep_gradient_sync = is_ep_replicated and gradient_reduction is GradientReductionDomain.EP_SUM
+        # ``ParallelPlan.apply`` stamps ``Replicate()`` for several reasons:
+        # a genuine shared factor, the fallback for every parameter no
+        # ``ep_plan`` pattern matched, and (historically) rank-unique
+        # per-expert slices whose expert axis happened to be singleton
+        # (``ep_size == num_experts``).  Placement alone is therefore not
+        # evidence of EP replication.  The authoritative signal is the owner's
+        # declared reduction domain: a replica is only coherent across EP —
+        # and its norm may only be averaged across EP — when its gradient is
+        # EP-summed at the optimizer boundary.  Everything else (plan gaps,
+        # per-expert slices) is counted per rank, which is correct for
+        # rank-unique gradients and merely conservative for an undeclared
+        # replica.
+        is_ep_replicated = (
+            Replicate is not None
+            and isinstance(getattr(spec_info, "placement", None), Replicate)
+            and gradient_reduction is GradientReductionDomain.EP_SUM
+        )
+        needs_ep_gradient_sync = is_ep_replicated and p.requires_grad
         if id(p) in skip_fsdp_param_ids:
             ep_params.append(p)
             if is_ep_replicated:
@@ -848,6 +864,15 @@ def _build_ep_param_groups(model: "nn.Module") -> None:
                     if needs_ep_gradient_sync:
                         ep_replicated_gradient_sync_params.append(p)
                 continue
+        if needs_ep_gradient_sync:
+            # Fail closed: an EP_SUM replica that is neither a _skip_fsdp
+            # expert tensor nor an ep_fsdp DTensor would silently miss the
+            # optimizer-boundary reduction and diverge across EP ranks.
+            raise RuntimeError(
+                f"Parameter {name} declares EP_SUM replicated-gradient reduction but was not classified "
+                "onto the EP mesh (neither _skip_fsdp nor an ep_fsdp DTensor); its replicas would silently "
+                "diverge without the EP gradient sync — fix the module wrapping or the EP plan"
+            )
         non_ep_params.append(p)
 
     model._ep_param_groups = {
