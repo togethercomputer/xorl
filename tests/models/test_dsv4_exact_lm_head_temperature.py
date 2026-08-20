@@ -7,12 +7,19 @@ from torch import nn
 
 import xorl.models.transformers.deepseek_v4.exact_lm_head as exact_head
 from xorl.models.transformers.deepseek_v4.exact_lm_head import (
-    _Dsv4ExactDistributedHeadFunction,
+    _distributed_row_plan,
     _rank_order_variable_row_all_gather,
-    _selected_logprob_reference_grad,
-    _selected_logprob_reference_grad_filtered,
-    _selected_logprob_reference_grad_partitioned,
     _temperature_scale_bf16_logits,
+)
+from xorl.models.transformers.exact_lm_head_shared import ExactLmHeadFunction
+from xorl.ops.exact_sampling_transforms import (
+    selected_logprob_reference_grad as _selected_logprob_reference_grad,
+)
+from xorl.ops.exact_sampling_transforms import (
+    selected_logprob_reference_grad_filtered as _selected_logprob_reference_grad_filtered,
+)
+from xorl.ops.exact_sampling_transforms import (
+    selected_logprob_reference_grad_partitioned as _selected_logprob_reference_grad_partitioned,
 )
 from xorl.ops.loss.per_token_ce import compute_per_token_ce
 
@@ -126,6 +133,9 @@ def test_dsv4_custom_boundary_carries_temperature_through_adapter_backward(
 
     class FakeComponent:
         source_ordinal = 0
+        # Pin the REAL DSV4 output contract: the value program is BF16
+        # end-to-end, and the shared autograd boundary must accept it.
+        logprob_dtype = torch.bfloat16
 
         @staticmethod
         def _validate_tp_group():
@@ -136,7 +146,8 @@ def test_dsv4_custom_boundary_carries_temperature_through_adapter_backward(
             captures["a"] = effective_a.clone()
             captures["b"] = effective_b.clone()
             captures["forward_temperature"] = temperature.clone()
-            return hidden.float().sum(dim=-1) + weight.float().sum() * 0 + token_ids.float() * 0
+            value = hidden.float().sum(dim=-1) + weight.float().sum() * 0 + token_ids.float() * 0
+            return value.to(torch.bfloat16)
 
         @staticmethod
         def _surrogate_vjp(
@@ -160,7 +171,6 @@ def test_dsv4_custom_boundary_carries_temperature_through_adapter_backward(
 
     monkeypatch.setattr(exact_head, "_rank_order_row_counts", lambda *_args: (2, 0, 0, 0, 0, 0, 0, 0))
     monkeypatch.setattr(exact_head, "_rank_order_variable_row_all_gather", lambda value, *_args, **_kwargs: value)
-    monkeypatch.setattr(exact_head.dist, "get_rank", lambda _group: 0)
 
     hidden = torch.arange(6, dtype=torch.float32).reshape(2, 3).to(torch.bfloat16).requires_grad_(True)
     weight = torch.zeros(5, 3, dtype=torch.bfloat16)
@@ -169,13 +179,15 @@ def test_dsv4_custom_boundary_carries_temperature_through_adapter_backward(
     token_ids = torch.tensor([0, 4], dtype=torch.int64)
     temperature = torch.tensor([0.7, 1.3], dtype=torch.float32)
 
-    logprob = _Dsv4ExactDistributedHeadFunction.apply(
+    logprob = ExactLmHeadFunction.apply(
         hidden,
         weight,
         lora_a,
         lora_b,
         token_ids,
         temperature,
+        (None, None, None),
+        _distributed_row_plan(hidden, group, FakeComponent.source_ordinal),
         FakeComponent(),
     )
     logprob.sum().backward()
@@ -214,3 +226,47 @@ def test_dsv4_loss_route_preserves_per_row_temperature(monkeypatch: pytest.Monke
     )
 
     assert captures["logprob_temperature"] is temperature
+
+
+def test_dsv4_component_pins_the_bf16_logprob_contract() -> None:
+    """The shared autograd boundary checks the family's declared output dtype;
+    DSV4's pinned value program is BF16 end-to-end."""
+    assert exact_head.Dsv4ExactTP8LmHeadSelectedLogprob.logprob_dtype is torch.bfloat16
+
+
+def test_shared_boundary_rejects_an_undeclared_logprob_dtype(monkeypatch: pytest.MonkeyPatch) -> None:
+    group = object()
+
+    class Bf16WithoutDeclaration:
+        source_ordinal = 0
+
+        @staticmethod
+        def _validate_tp_group():
+            return group
+
+        @staticmethod
+        def _exact_forward_value(hidden, weight, effective_a, effective_b, token_ids, temperature):
+            del weight, effective_a, effective_b, temperature
+            return token_ids.to(torch.bfloat16)
+
+    monkeypatch.setattr(exact_head, "_rank_order_row_counts", lambda *_args: (2, 0, 0, 0, 0, 0, 0, 0))
+    monkeypatch.setattr(exact_head, "_rank_order_variable_row_all_gather", lambda value, *_a, **_kw: value)
+
+    hidden = torch.zeros(2, 3, dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.zeros(5, 3, dtype=torch.bfloat16)
+    lora_a = torch.zeros(1, 3, requires_grad=True)
+    lora_b = torch.zeros(5, 1, requires_grad=True)
+    token_ids = torch.tensor([0, 4], dtype=torch.int64)
+
+    with pytest.raises(RuntimeError, match="invalid selected-logprob"):
+        ExactLmHeadFunction.apply(
+            hidden,
+            weight,
+            lora_a,
+            lora_b,
+            token_ids,
+            None,
+            (None, None, None),
+            _distributed_row_plan(hidden, group, Bf16WithoutDeclaration.source_ordinal),
+            Bf16WithoutDeclaration(),
+        )
