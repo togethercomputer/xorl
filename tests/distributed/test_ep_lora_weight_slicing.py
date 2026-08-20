@@ -193,3 +193,82 @@ class TestEPLoRAForwardAndGradients:
         loss.backward()
         assert gate_A2.grad is not None
         assert hidden_states.grad is not None
+
+
+class TestPostEPConstructionAndInjection:
+    """Post-EP LoRA construction must never be re-sliced or misread as shared."""
+
+    def test_post_ep_construction_declares_per_expert_factors_already_local(self):
+        experts = MoEExpertsLoRA(
+            num_experts=8,
+            hidden_dim=32,
+            intermediate_size=64,
+            moe_implementation="triton",
+            lora_config=MoELoRAConfig(r=4, lora_alpha=8),
+            num_local_experts=1,
+        )
+        assert experts.num_local_experts == 1
+        assert set(experts._ep_already_local_parameter_names) == {
+            "gate_proj_lora_A",
+            "gate_proj_lora_B",
+            "up_proj_lora_A",
+            "up_proj_lora_B",
+            "down_proj_lora_A",
+            "down_proj_lora_B",
+        }
+
+    def test_hybrid_shared_factors_stay_out_of_the_already_local_declaration(self):
+        experts = MoEExpertsLoRA(
+            num_experts=8,
+            hidden_dim=32,
+            intermediate_size=64,
+            moe_implementation="triton",
+            lora_config=MoELoRAConfig(
+                r=4,
+                lora_alpha=8,
+                target_modules=["gate_proj", "up_proj", "down_proj"],
+                hybrid_shared=True,
+            ),
+            num_local_experts=2,
+        )
+        from xorl.distributed.gradient_reduction import GradientReductionDomain
+
+        declared = set(experts._ep_already_local_parameter_names)
+        assert declared == {"gate_proj_lora_B", "up_proj_lora_B", "down_proj_lora_A"}
+        # The shared factors keep their EP_SUM declaration instead.
+        for shared_name in ("gate_proj_lora_A", "up_proj_lora_A", "down_proj_lora_B"):
+            assert experts._ep_gradient_reduction_by_parameter[shared_name] is GradientReductionDomain.EP_SUM
+
+    def test_pre_ep_construction_declares_nothing(self):
+        experts = MoEExpertsLoRA(
+            num_experts=8,
+            hidden_dim=32,
+            intermediate_size=64,
+            moe_implementation="triton",
+            lora_config=MoELoRAConfig(r=4, lora_alpha=8),
+        )
+        assert not hasattr(experts, "_ep_already_local_parameter_names")
+        assert not hasattr(experts, "num_local_experts")
+
+    def test_inject_lora_preserves_ep_preslice_record(self):
+        import torch.nn as nn
+
+        from xorl.models.layers.moe.experts import MoEExperts
+        from xorl.models.layers.moe.lora import inject_lora_into_experts
+
+        block = nn.Module()
+        block.experts = MoEExperts(num_experts=8, hidden_dim=16, intermediate_size=32)
+        # Simulate the checkpoint load's EP pre-shrink: params resized to the
+        # EP-local shape with the slicing recorded on the owner module.
+        block.experts.gate_up_proj = nn.Parameter(torch.zeros(2, 16, 64), requires_grad=False)
+        block.experts.down_proj = nn.Parameter(torch.zeros(2, 32, 16), requires_grad=False)
+        block.experts._xorl_ep_load_presliced = {"gate_up_proj": (8, 4), "down_proj": (8, 4)}
+
+        inject_lora_into_experts(block, r=2, lora_alpha=4)
+
+        assert block.experts._xorl_ep_load_presliced == {"gate_up_proj": (8, 4), "down_proj": (8, 4)}
+        # Factors were sized from the pre-sliced base (2 local experts), so the
+        # per-expert factors are declared already-local for EP application.
+        assert block.experts.num_local_experts == 2
+        assert "gate_proj_lora_A" in set(block.experts._ep_already_local_parameter_names)
+        assert block.experts.gate_proj_lora_A.shape[0] == 2

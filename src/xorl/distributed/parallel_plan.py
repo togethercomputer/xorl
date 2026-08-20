@@ -215,20 +215,36 @@ class ParallelPlan:
                             )
                             break
 
-                        # An undeclared singleton expert axis is a shared LoRA
-                        # factor. Explicit owner dispositions are validated
-                        # above so malformed local or force-sharded tensors
-                        # cannot silently fall through to replication.
+                        # A singleton expert axis is ambiguous: it is a shared
+                        # LoRA factor, but with ``ep_size == num_experts`` it
+                        # is also the shape of a rank-unique per-expert slice.
+                        # Only the owner's declared EP_SUM reduction resolves
+                        # the ambiguity — replicating a rank-unique slice would
+                        # average its gradient norm across EP and (worse) let
+                        # checkpointing treat distinct experts as one tensor.
                         if param.size(shard.dim) == 1:
-                            param.spec_info = SpecInfo(
-                                ep_fsdp_mesh=ep_fsdp_mesh,
-                                placement=Replicate(),
-                                fqn=fqn,
-                                gradient_reduction=gradient_reduction,
-                            )
-                            fqn2spec_info[fqn] = param.spec_info
-                            logger.debug_rank0(f"EP replicated (shared): {fqn} {list(param.shape)}")
-                            break
+                            if gradient_reduction is GradientReductionDomain.EP_SUM:
+                                param.spec_info = SpecInfo(
+                                    ep_fsdp_mesh=ep_fsdp_mesh,
+                                    placement=Replicate(),
+                                    fqn=fqn,
+                                    gradient_reduction=gradient_reduction,
+                                )
+                                fqn2spec_info[fqn] = param.spec_info
+                                logger.debug_rank0(f"EP replicated (shared): {fqn} {list(param.shape)}")
+                                break
+                            if not already_local or force_shard:
+                                raise ValueError(
+                                    f"EP parameter {fqn} has a singleton dim-{shard.dim} expert axis but no "
+                                    "EP_SUM gradient-reduction declaration. A shared factor must declare "
+                                    "EP_SUM (owner._ep_gradient_reduction_by_parameter or "
+                                    "owner._ep_gradient_reduction_domain); a rank-unique per-expert slice "
+                                    "must arrive already-local (owner._ep_already_local_parameter_names or "
+                                    "already_local=True) — refusing to guess between a replica and a local "
+                                    "expert slice"
+                                )
+                            # already_local: fall through to the annotate-only
+                            # Shard branch below — a per-expert local slice.
 
                         # Meta-tensor path: slice the SHAPE (no data), swap the
                         # param, stamp spec_info. Dispatched first so the
@@ -299,8 +315,19 @@ class ParallelPlan:
                         )
                         break
                 if fqn not in fqn2spec_info:  # not sharded
-                    param.spec_info = SpecInfo(ep_fsdp_mesh=ep_fsdp_mesh, placement=Replicate(), fqn=fqn)
-                    fqn2spec_info[fqn] = SpecInfo(ep_fsdp_mesh=ep_fsdp_mesh, placement=Replicate(), fqn=fqn)
+                    # The fallback must still carry the owner's declared
+                    # reduction domain: a shared factor on a model whose
+                    # ep_plan lacks LoRA patterns would otherwise lose its
+                    # EP_SUM contract and silently skip the optimizer-boundary
+                    # sync while its norm is averaged as if synchronized.
+                    fallback_reduction = _gradient_reduction_domain(model, fqn)
+                    param.spec_info = SpecInfo(
+                        ep_fsdp_mesh=ep_fsdp_mesh,
+                        placement=Replicate(),
+                        fqn=fqn,
+                        gradient_reduction=fallback_reduction,
+                    )
+                    fqn2spec_info[fqn] = param.spec_info
 
         for param in model.parameters():
             assert hasattr(param, "spec_info"), f"Internal Error: {param} is omitted"
