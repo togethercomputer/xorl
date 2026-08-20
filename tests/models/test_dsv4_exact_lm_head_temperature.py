@@ -7,10 +7,11 @@ from torch import nn
 
 import xorl.models.transformers.deepseek_v4.exact_lm_head as exact_head
 from xorl.models.transformers.deepseek_v4.exact_lm_head import (
-    _Dsv4ExactDistributedHeadFunction,
+    _distributed_row_plan,
     _rank_order_variable_row_all_gather,
     _temperature_scale_bf16_logits,
 )
+from xorl.models.transformers.exact_lm_head_shared import ExactLmHeadFunction
 from xorl.ops.exact_sampling_transforms import (
     selected_logprob_reference_grad as _selected_logprob_reference_grad,
 )
@@ -166,7 +167,6 @@ def test_dsv4_custom_boundary_carries_temperature_through_adapter_backward(
 
     monkeypatch.setattr(exact_head, "_rank_order_row_counts", lambda *_args: (2, 0, 0, 0, 0, 0, 0, 0))
     monkeypatch.setattr(exact_head, "_rank_order_variable_row_all_gather", lambda value, *_args, **_kwargs: value)
-    monkeypatch.setattr(exact_head.dist, "get_rank", lambda _group: 0)
 
     hidden = torch.arange(6, dtype=torch.float32).reshape(2, 3).to(torch.bfloat16).requires_grad_(True)
     weight = torch.zeros(5, 3, dtype=torch.bfloat16)
@@ -175,7 +175,7 @@ def test_dsv4_custom_boundary_carries_temperature_through_adapter_backward(
     token_ids = torch.tensor([0, 4], dtype=torch.int64)
     temperature = torch.tensor([0.7, 1.3], dtype=torch.float32)
 
-    logprob = _Dsv4ExactDistributedHeadFunction.apply(
+    logprob = ExactLmHeadFunction.apply(
         hidden,
         weight,
         lora_a,
@@ -183,6 +183,7 @@ def test_dsv4_custom_boundary_carries_temperature_through_adapter_backward(
         token_ids,
         temperature,
         (None, None, None),
+        _distributed_row_plan(hidden, group, FakeComponent.source_ordinal),
         FakeComponent(),
     )
     logprob.sum().backward()

@@ -37,6 +37,7 @@ from xorl.ops.exact_sampling_transforms import (
     validate_sampling_transform_rows,
     validate_temperature_rows,
 )
+from xorl.utils.dist_utils import gather_vocab_shards
 
 
 LogitsFn = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
@@ -126,27 +127,6 @@ def _resolve_tp_layout(
     if any(size <= 0 for size in vocab_sizes):
         raise ValueError(f"vocabulary-parallel transform scoring requires non-empty shards, got {vocab_sizes}")
     return _TpVocabLayout(tp_group, vocab_sizes, dist.get_rank(tp_group))
-
-
-def gather_vocab_shards(
-    local_logits: torch.Tensor,
-    *,
-    vocab_sizes: tuple[int, ...],
-    group: dist.ProcessGroup,
-) -> torch.Tensor:
-    """Gather possibly ragged vocabulary shards in process-group rank order."""
-
-    max_vocab = max(vocab_sizes)
-    padded = local_logits.new_zeros((local_logits.shape[0], max_vocab))
-    padded[:, : local_logits.shape[1]].copy_(local_logits)
-    world_size = dist.get_world_size(group)
-    gathered = local_logits.new_empty((world_size * local_logits.shape[0], max_vocab))
-    dist.all_gather_into_tensor(gathered, padded.contiguous(), group=group)
-    rank_major = gathered.view(world_size, local_logits.shape[0], max_vocab)
-    return torch.cat(
-        [rank_major[rank, :, :vocab_size] for rank, vocab_size in enumerate(vocab_sizes)],
-        dim=1,
-    ).contiguous()
 
 
 def _mm_accumulate_fp32(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
@@ -506,6 +486,5 @@ def sampling_transform_per_token_ce(
 __all__ = [
     "ChunkedScoringPolicy",
     "chunked_transform_scored_ce",
-    "gather_vocab_shards",
     "sampling_transform_per_token_ce",
 ]

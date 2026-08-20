@@ -45,8 +45,8 @@ from xorl.ops.exact_sampling_transforms import (
 from xorl.ops.loss.sampling_transform_ce import (
     ChunkedScoringPolicy,
     chunked_transform_scored_ce,
-    gather_vocab_shards,
 )
+from xorl.utils.dist_utils import gather_vocab_shards
 
 
 _TEMPERATURE_MATERIALIZE_ROW_CHUNK = EXACT_FILTER_ROW_CHUNK

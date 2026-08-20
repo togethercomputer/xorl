@@ -198,6 +198,7 @@ def test_filtered_exact_heads_do_not_save_dense_support_on_autograd_contexts():
     modules = [
         importlib.import_module("xorl.ops.loss.bi_fused_lm_head"),
         importlib.import_module("xorl.ops.loss.sampling_transform_ce"),
+        importlib.import_module("xorl.models.transformers.exact_lm_head_shared"),
         importlib.import_module("xorl.models.transformers.glm5.exact_lm_head_qlora"),
         importlib.import_module("xorl.models.transformers.deepseek_v4.exact_lm_head"),
     ]

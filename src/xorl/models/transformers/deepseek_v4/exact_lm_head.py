@@ -10,8 +10,6 @@ straight-through VJP for training.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import lru_cache
-from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -20,19 +18,21 @@ from torch import Tensor, nn
 
 from xorl.distributed.canonical_moe import LogicalRowOwnership
 from xorl.lora.modules.linear import LoraLinear
+from xorl.models.transformers.exact_lm_head_shared import (
+    ExactHeadRowPlan,
+    ExactLmHeadFunction,
+    check_exact_head_tp_group,
+    exact_lora_local_logits,
+    filtered_surrogate_local_grad_logits,
+    rank_order_row_counts,
+    rank_order_variable_row_all_gather,
+    rank_order_vocab_all_gather,
+    surrogate_local_grad_logits,
+)
 from xorl.ops.bi_families_v2 import exact_temperature_scale_bf16_logits
 from xorl.ops.exact_sampling_transforms import (
-    EXACT_FILTER_ROW_CHUNK,
-    exact_sampling_identity_rows,
-    exact_sampling_support,
-    exact_selected_logprob_partitioned_from_support,
     normalize_temperature_rows,
-)
-from xorl.ops.exact_sampling_transforms import (
-    selected_logprob_reference_grad as _selected_logprob_reference_grad,
-)
-from xorl.ops.exact_sampling_transforms import (
-    selected_logprob_reference_grad_partitioned as _selected_logprob_reference_grad_partitioned,
+    score_with_sampling_transforms,
 )
 from xorl.ops.exact_sampling_transforms import (
     validate_temperature_rows as _validate_temperature_rows,
@@ -69,35 +69,14 @@ def dsv4_lm_head_shard(tp_rank: int) -> Dsv4LmHeadShard:
     return Dsv4LmHeadShard(tp_rank, start, start + DSV4_LM_HEAD_LOCAL_VOCAB_SIZE)
 
 
-@lru_cache(maxsize=64)
-def _single_adapter_batch_info(device_index: int, rows: int) -> Any:
-    from sglang.srt.lora.utils import LoRABatchInfo  # noqa: PLC0415
-
-    device = torch.device("cuda", device_index)
-    return LoRABatchInfo(
-        use_cuda_graph=False,
-        bs=1,
-        num_segments=1,
-        seg_indptr=torch.tensor([0, rows], dtype=torch.int32, device=device),
-        weight_indices=torch.zeros(1, dtype=torch.int32, device=device),
-        lora_ranks=torch.ones(1, dtype=torch.int32, device=device),
-        scalings=torch.ones(1, dtype=torch.float32, device=device),
-        max_len=rows,
-        seg_lens=torch.tensor([rows], dtype=torch.int32, device=device),
-        permutation=None,
-        expected_tokens=rows,
-        has_active_lora=True,
-    )
-
-
 def _rank_order_row_counts(local_rows: int, device: torch.device, group: dist.ProcessGroup) -> tuple[int, ...]:
-    local = torch.tensor([local_rows], dtype=torch.int64, device=device)
-    gathered = torch.empty(DSV4_LM_HEAD_TP_SIZE, dtype=torch.int64, device=device)
-    dist.all_gather_into_tensor(gathered, local, group=group)
-    counts = tuple(int(value) for value in gathered.cpu().tolist())
-    if any(value < 0 for value in counts):
-        raise RuntimeError(f"DSV4 exact lm head received negative row counts: {counts}")
-    return counts
+    return rank_order_row_counts(
+        local_rows,
+        device,
+        group,
+        world_size=DSV4_LM_HEAD_TP_SIZE,
+        program="DSV4 exact lm head",
+    )
 
 
 def _rank_order_variable_row_all_gather(
@@ -107,39 +86,42 @@ def _rank_order_variable_row_all_gather(
     row_counts: tuple[int, ...],
     padded_rows: int,
 ) -> Tensor:
-    if value.ndim == 0 or not value.is_contiguous():
-        raise ValueError("DSV4 row all-gather requires a contiguous non-scalar tensor")
-    if value.shape[0] > padded_rows or len(row_counts) != DSV4_LM_HEAD_TP_SIZE:
-        raise ValueError(f"Invalid DSV4 variable-row geometry: local={value.shape[0]}, counts={row_counts}")
-    if value.shape[0] < padded_rows:
-        padding = value.new_zeros((padded_rows - value.shape[0], *value.shape[1:]))
-        value = torch.cat((value, padding), dim=0)
-    gathered = torch.empty(
-        (DSV4_LM_HEAD_TP_SIZE * padded_rows, *value.shape[1:]),
-        dtype=value.dtype,
-        device=value.device,
+    return rank_order_variable_row_all_gather(
+        value,
+        group,
+        world_size=DSV4_LM_HEAD_TP_SIZE,
+        row_counts=row_counts,
+        padded_rows=padded_rows,
     )
-    dist.all_gather_into_tensor(gathered, value, group=group)
-    pieces = [
-        gathered[rank * padded_rows : rank * padded_rows + count] for rank, count in enumerate(row_counts) if count
-    ]
-    return torch.cat(pieces, dim=0) if pieces else gathered[:0]
 
 
 def _rank_order_vocab_all_gather(local_logits: Tensor, group: dist.ProcessGroup) -> Tensor:
-    if local_logits.dtype is not torch.bfloat16 or not local_logits.is_contiguous():
-        raise ValueError("DSV4 local logits must be contiguous BF16")
-    rows = local_logits.shape[0]
-    gathered = torch.empty(
-        (DSV4_LM_HEAD_TP_SIZE * rows, DSV4_LM_HEAD_LOCAL_VOCAB_SIZE),
-        dtype=local_logits.dtype,
-        device=local_logits.device,
+    return rank_order_vocab_all_gather(
+        local_logits,
+        group,
+        expected_world_size=DSV4_LM_HEAD_TP_SIZE,
+        expected_local_vocab_size=DSV4_LM_HEAD_LOCAL_VOCAB_SIZE,
+        expected_dtype=torch.bfloat16,
     )
-    dist.all_gather_into_tensor(gathered, local_logits, group=group)
-    return (
-        gathered.view(DSV4_LM_HEAD_TP_SIZE, rows, DSV4_LM_HEAD_LOCAL_VOCAB_SIZE)
-        .permute(1, 0, 2)
-        .reshape(rows, DSV4_LM_HEAD_VOCAB_SIZE)
+
+
+def _distributed_row_plan(local_hidden: Tensor, group: dist.ProcessGroup, source_ordinal: int) -> ExactHeadRowPlan:
+    """Ragged rank-order row blocks: TP8 ranks may own different row counts."""
+
+    row_counts = _rank_order_row_counts(local_hidden.shape[0], local_hidden.device, group)
+    if sum(row_counts) <= 0:
+        raise ValueError("DSV4 exact lm head requires at least one live row across TP8")
+    padded_rows = max(row_counts)
+    source_offset = sum(row_counts[:source_ordinal])
+    source_rows = row_counts[source_ordinal]
+    return ExactHeadRowPlan(
+        lambda value: _rank_order_variable_row_all_gather(
+            value,
+            group,
+            row_counts=row_counts,
+            padded_rows=padded_rows,
+        ),
+        lambda value: value.narrow(0, source_offset, source_rows),
     )
 
 
@@ -200,153 +182,6 @@ def _local_surrogate_vjp(
     return by_label.get("hidden"), by_label.get("a"), by_label.get("b")
 
 
-class _Dsv4ExactDistributedHeadFunction(torch.autograd.Function):
-    @staticmethod
-    def forward(
-        ctx,
-        local_hidden: Tensor,
-        local_weight: Tensor,
-        lora_a: Tensor,
-        local_lora_b: Tensor,
-        local_token_ids: Tensor,
-        local_temperature: Tensor | None,
-        local_sampling_transforms: tuple[Tensor | None, Tensor | None, Tensor | None],
-        component: "Dsv4ExactTP8LmHeadSelectedLogprob",
-    ) -> Tensor:
-        group = component._validate_tp_group()
-        row_counts = _rank_order_row_counts(local_hidden.shape[0], local_hidden.device, group)
-        if sum(row_counts) <= 0:
-            raise ValueError("DSV4 exact lm head requires at least one live row across TP8")
-        padded_rows = max(row_counts)
-
-        effective_a = lora_a.to(torch.bfloat16).contiguous()
-        effective_b = local_lora_b.to(torch.bfloat16).contiguous()
-        gathered_hidden = _rank_order_variable_row_all_gather(
-            local_hidden,
-            group,
-            row_counts=row_counts,
-            padded_rows=padded_rows,
-        )
-        gathered_ids = _rank_order_variable_row_all_gather(
-            local_token_ids,
-            group,
-            row_counts=row_counts,
-            padded_rows=padded_rows,
-        )
-        gathered_temperature = (
-            None
-            if local_temperature is None
-            else _rank_order_variable_row_all_gather(
-                local_temperature,
-                group,
-                row_counts=row_counts,
-                padded_rows=padded_rows,
-            )
-        )
-        gathered_sampling_transforms = tuple(
-            None
-            if value is None
-            else _rank_order_variable_row_all_gather(
-                value,
-                group,
-                row_counts=row_counts,
-                padded_rows=padded_rows,
-            )
-            for value in local_sampling_transforms
-        )
-        has_sampling_filter = gathered_sampling_transforms[0] is not None
-        if not has_sampling_filter:
-            gathered_logprob = component._exact_forward_value(
-                gathered_hidden,
-                local_weight,
-                effective_a,
-                effective_b,
-                gathered_ids,
-                gathered_temperature,
-            )
-        else:
-            gathered_logprob = component._exact_forward_value_filtered(
-                gathered_hidden,
-                local_weight,
-                effective_a,
-                effective_b,
-                gathered_ids,
-                gathered_temperature,
-                gathered_sampling_transforms,
-            )
-        source_ordinal = component.source_ordinal
-        rows = row_counts[source_ordinal]
-        source_offset = sum(row_counts[:source_ordinal])
-        local_logprob = gathered_logprob.narrow(0, source_offset, rows).contiguous()
-        ctx.set_materialize_grads(False)
-        ctx.component = component
-        ctx.local_rows = rows
-        ctx.source_ordinal = source_ordinal
-        ctx.source_offset = source_offset
-        ctx.row_counts = row_counts
-        ctx.padded_rows = padded_rows
-        ctx.has_sampling_filter = has_sampling_filter
-        ctx.save_for_backward(
-            gathered_hidden,
-            local_weight,
-            effective_a,
-            effective_b,
-            gathered_ids,
-            gathered_temperature
-            if gathered_temperature is not None
-            else torch.empty((0,), dtype=torch.float32, device=local_hidden.device),
-            lora_a,
-            local_lora_b,
-            *gathered_sampling_transforms,
-        )
-        return local_logprob
-
-    @staticmethod
-    def backward(ctx, grad_local_logprob: Tensor | None):
-        if grad_local_logprob is None:
-            return (None, None, None, None, None, None, None, None)
-        (
-            gathered_hidden,
-            local_weight,
-            effective_a,
-            effective_b,
-            gathered_ids,
-            stored_temperature,
-            _a_master,
-            _b_master,
-            top_ks,
-            top_ps,
-            min_ps,
-        ) = ctx.saved_tensors
-        temperature = None if stored_temperature.numel() == 0 else stored_temperature
-        group = ctx.component._validate_tp_group()
-        gathered_grad = _rank_order_variable_row_all_gather(
-            grad_local_logprob.contiguous(),
-            group,
-            row_counts=ctx.row_counts,
-            padded_rows=ctx.padded_rows,
-        )
-        vjp = ctx.component._surrogate_vjp_filtered if ctx.has_sampling_filter else ctx.component._surrogate_vjp
-        args = (
-            gathered_hidden,
-            local_weight,
-            effective_a,
-            effective_b,
-            gathered_ids,
-            gathered_grad,
-            temperature,
-        )
-        if ctx.has_sampling_filter:
-            args = (*args, (top_ks, top_ps, min_ps))
-        grad_hidden, grad_a, grad_b = vjp(
-            *args,
-            needs_input_grad=(ctx.needs_input_grad[0], ctx.needs_input_grad[2], ctx.needs_input_grad[3]),
-        )
-        if grad_hidden is not None:
-            grad_hidden = grad_hidden.narrow(0, ctx.source_offset, ctx.local_rows).contiguous()
-        return (grad_hidden, None, grad_a, grad_b, None, None, None, None)
-
-
 class Dsv4ExactTP8LmHeadLoraLinear(LoraLinear):
     _dsv4_exact_tp8_lm_head = True
 
@@ -390,17 +225,18 @@ class Dsv4ExactTP8LmHeadSelectedLogprob(nn.Module):
         if group is None or not dist.is_initialized():
             raise RuntimeError("DSV4 exact lm head requires an initialized TP8 group")
         ranks = tuple(dist.get_process_group_ranks(group))
-        expected_ranks = ranks if self.physical_ranks is None else self.physical_ranks
-        if (
-            dist.get_world_size(group) != DSV4_LM_HEAD_TP_SIZE
-            or ranks != expected_ranks
-            or dist.get_rank(group) != self.shard.tp_rank
-            or dist.get_rank(group) != self.source_ordinal
-            or dist.get_rank() != ranks[self.shard.tp_rank]
-        ):
-            raise RuntimeError("DSV4 exact lm-head TP8 rank/order mismatch")
-        if str(dist.get_backend(group)).lower() != "nccl":
-            raise RuntimeError("DSV4 exact lm head requires NCCL")
+        check_exact_head_tp_group(
+            program="DSV4 exact lm-head",
+            world_size=dist.get_world_size(group),
+            group_rank=dist.get_rank(group),
+            global_rank=dist.get_rank(),
+            group_ranks=ranks,
+            backend=str(dist.get_backend(group)).lower(),
+            expected_world_size=DSV4_LM_HEAD_TP_SIZE,
+            expected_ranks=ranks if self.physical_ranks is None else self.physical_ranks,
+            shard_rank=self.shard.tp_rank,
+            source_ordinal=self.source_ordinal,
+        )
         return group
 
     def _validate_operands(
@@ -438,23 +274,16 @@ class Dsv4ExactTP8LmHeadSelectedLogprob(nn.Module):
 
     @staticmethod
     def _exact_local_logits(hidden: Tensor, weight: Tensor, effective_a: Tensor, effective_b: Tensor) -> Tensor:
-        from sglang.kernels.ops.gemm.sgemm_lora_a import sgemm_lora_a_fwd  # noqa: PLC0415
-        from sglang.kernels.ops.gemm.sgemm_lora_b import sgemm_lora_b_fwd  # noqa: PLC0415
-
         base_logits = F.linear(hidden, weight)
         if base_logits.dtype is not torch.bfloat16:
             raise RuntimeError("DSV4 sampler-aligned base head must store BF16 logits")
-        batch_info = _single_adapter_batch_info(hidden.device.index, hidden.shape[0])
-        lora_a_output = sgemm_lora_a_fwd(hidden, effective_a.unsqueeze(0), batch_info)
-        output = sgemm_lora_b_fwd(
-            lora_a_output,
-            effective_b.unsqueeze(0),
-            batch_info,
-            base_output=base_logits,
-        )
-        if output.data_ptr() != base_logits.data_ptr() or output.dtype is not torch.bfloat16:
-            raise RuntimeError("DSV4 sampler-aligned LoRA B must update the BF16 base-logit buffer in place")
-        return output.contiguous()
+        return exact_lora_local_logits(
+            hidden,
+            effective_a,
+            effective_b,
+            base_logits=base_logits,
+            rank=1,
+        ).contiguous()
 
     def _exact_forward_value(
         self,
@@ -497,18 +326,6 @@ class Dsv4ExactTP8LmHeadSelectedLogprob(nn.Module):
         top_ks, top_ps, min_ps = sampling_transforms
         if top_ks is None or top_ps is None or min_ps is None:
             raise ValueError("filtered DSV4 exact scoring requires complete row metadata")
-        support = exact_sampling_support(
-            score_logits,
-            top_ks,
-            top_ps,
-            min_ps,
-        )
-        identity_rows = exact_sampling_identity_rows(
-            top_ks,
-            top_ps,
-            min_ps,
-            vocab_size=score_logits.shape[1],
-        )
         from sglang.srt.batch_invariant_ops.batch_invariant_ops import (  # noqa: PLC0415
             log_softmax as _bi_log_softmax,
         )
@@ -519,14 +336,34 @@ class Dsv4ExactTP8LmHeadSelectedLogprob(nn.Module):
             native_logprob = native_logprobs.gather(1, native_ids.unsqueeze(1)).squeeze(1)
             return native_logprob, native_selected - native_logprob, native_selected
 
-        logprob, _, _ = exact_selected_logprob_partitioned_from_support(
+        logprob, _, _ = score_with_sampling_transforms(
             score_logits,
             token_ids,
-            support,
-            identity_rows,
+            top_ks,
+            top_ps,
+            min_ps,
             _native_score,
         )
         return logprob.contiguous()
+
+    def _reference_full_logits_fn(self, local_weight, effective_a, effective_b, group):
+        """The differentiable rank-1 reference, gathered in serving byte order."""
+
+        def reference_full_logits(hidden_chunk: Tensor) -> Tensor:
+            local_reference = (
+                (
+                    F.linear(hidden_chunk, local_weight)
+                    + F.linear(
+                        F.linear(hidden_chunk.float(), effective_a.float()),
+                        effective_b.float(),
+                    ).to(torch.bfloat16)
+                )
+                .float()
+                .contiguous()
+            )
+            return _rank_order_vocab_all_gather(local_reference.to(torch.bfloat16), group).float()
+
+        return reference_full_logits
 
     def _surrogate_vjp(
         self,
@@ -546,23 +383,14 @@ class Dsv4ExactTP8LmHeadSelectedLogprob(nn.Module):
             rows=hidden.shape[0],
             device=hidden.device,
         )
-        with torch.no_grad():
-            local_reference = (
-                (
-                    F.linear(hidden, local_weight)
-                    + F.linear(F.linear(hidden.float(), effective_a.float()), effective_b.float()).to(torch.bfloat16)
-                )
-                .float()
-                .contiguous()
-            )
-            full_reference = _rank_order_vocab_all_gather(local_reference.to(torch.bfloat16), group).float()
-        full_grad = _selected_logprob_reference_grad(
-            full_reference,
+        local_grad = surrogate_local_grad_logits(
+            hidden,
             token_ids,
             grad_logprob,
             temperature,
+            reference_full_logits_fn=self._reference_full_logits_fn(local_weight, effective_a, effective_b, group),
+            local_vocab_slice=slice(self.shard.vocab_start, self.shard.vocab_end),
         )
-        local_grad = full_grad[:, self.shard.vocab_start : self.shard.vocab_end].contiguous()
         grad_hidden, grad_a, grad_b = _local_surrogate_vjp(
             hidden,
             local_weight,
@@ -592,68 +420,31 @@ class Dsv4ExactTP8LmHeadSelectedLogprob(nn.Module):
     ) -> tuple[Tensor | None, Tensor | None, Tensor | None]:
         group = self._validate_tp_group()
         temperature = _validate_temperature_rows(temperature, rows=hidden.shape[0], device=hidden.device)
-        top_ks, top_ps, min_ps = sampling_transforms
-        if top_ks is None or top_ps is None or min_ps is None:
-            raise ValueError("filtered DSV4 exact scoring requires complete row metadata")
-        local_grad = torch.empty(
-            (hidden.shape[0], DSV4_LM_HEAD_LOCAL_VOCAB_SIZE),
-            dtype=torch.float32,
-            device=hidden.device,
+
+        def _exact_score_logits(hidden_chunk: Tensor, temperature_chunk: Tensor | None) -> Tensor:
+            exact_local = self._exact_local_logits(
+                hidden_chunk.contiguous(),
+                local_weight,
+                effective_a,
+                effective_b,
+            )
+            exact_full = _rank_order_vocab_all_gather(exact_local, group)
+            return _temperature_scale_bf16_logits(
+                exact_full,
+                None if temperature_chunk is None else temperature_chunk.contiguous(),
+            )
+
+        local_grad = filtered_surrogate_local_grad_logits(
+            hidden,
+            token_ids,
+            grad_logprob,
+            temperature,
+            sampling_transforms,
+            exact_score_logits_fn=_exact_score_logits,
+            reference_full_logits_fn=self._reference_full_logits_fn(local_weight, effective_a, effective_b, group),
+            local_vocab_slice=slice(self.shard.vocab_start, self.shard.vocab_end),
+            local_vocab_size=DSV4_LM_HEAD_LOCAL_VOCAB_SIZE,
         )
-        with torch.no_grad():
-            for row_start in range(0, hidden.shape[0], EXACT_FILTER_ROW_CHUNK):
-                row_end = min(row_start + EXACT_FILTER_ROW_CHUNK, hidden.shape[0])
-                row_slice = slice(row_start, row_end)
-                hidden_chunk = hidden[row_slice].contiguous()
-
-                # Recreate the literal value path only for this bounded row
-                # chunk.  The dense support mask is transient and never saved
-                # on the autograd context.
-                exact_local = self._exact_local_logits(
-                    hidden_chunk,
-                    local_weight,
-                    effective_a,
-                    effective_b,
-                )
-                exact_full = _rank_order_vocab_all_gather(exact_local, group)
-                score_logits = _temperature_scale_bf16_logits(
-                    exact_full,
-                    None if temperature is None else temperature[row_slice].contiguous(),
-                )
-                support = exact_sampling_support(
-                    score_logits,
-                    top_ks[row_slice],
-                    top_ps[row_slice],
-                    min_ps[row_slice],
-                )
-                identity_rows = exact_sampling_identity_rows(
-                    top_ks[row_slice],
-                    top_ps[row_slice],
-                    min_ps[row_slice],
-                    vocab_size=score_logits.shape[1],
-                )
-
-                local_reference = (
-                    (
-                        F.linear(hidden_chunk, local_weight)
-                        + F.linear(
-                            F.linear(hidden_chunk.float(), effective_a.float()),
-                            effective_b.float(),
-                        ).to(torch.bfloat16)
-                    )
-                    .float()
-                    .contiguous()
-                )
-                full_reference = _rank_order_vocab_all_gather(local_reference.to(torch.bfloat16), group).float()
-                full_grad = _selected_logprob_reference_grad_partitioned(
-                    full_reference,
-                    token_ids[row_slice],
-                    grad_logprob[row_slice],
-                    None if temperature is None else temperature[row_slice],
-                    support,
-                    identity_rows,
-                )
-                local_grad[row_slice] = full_grad[:, self.shard.vocab_start : self.shard.vocab_end]
         grad_hidden, grad_a, grad_b = _local_surrogate_vjp(
             hidden,
             local_weight,
@@ -686,8 +477,8 @@ class Dsv4ExactTP8LmHeadSelectedLogprob(nn.Module):
             local_token_ids,
             local_temperature,
         )
-        self._validate_tp_group()
-        return _Dsv4ExactDistributedHeadFunction.apply(
+        row_plan = _distributed_row_plan(local_hidden, self._validate_tp_group(), self.source_ordinal)
+        return ExactLmHeadFunction.apply(
             local_hidden,
             local_weight,
             lora_a,
@@ -695,6 +486,7 @@ class Dsv4ExactTP8LmHeadSelectedLogprob(nn.Module):
             local_token_ids,
             local_temperature,
             local_sampling_transforms,
+            row_plan,
             self,
         )
 

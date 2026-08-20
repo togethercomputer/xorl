@@ -7,6 +7,14 @@ import torch
 import torch.nn.functional as F
 
 import xorl.models.transformers.glm5.exact_lm_head_qlora as lm_head_impl
+from xorl.models.transformers.exact_lm_head_shared import (
+    REPLICATED_ROW_PLAN,
+    ExactLmHeadFunction,
+    single_adapter_lora_batch_info,
+)
+from xorl.models.transformers.exact_lm_head_shared import (
+    rank_order_vocab_from_stacked as _rank_order_vocab_from_stacked,
+)
 from xorl.models.transformers.glm5.exact_lm_head_qlora import (
     GLM52_EXACT_TP16_LM_HEAD_CONTRACT_VERSION,
     GLM52_LM_HEAD_HIDDEN_SIZE,
@@ -15,9 +23,7 @@ from xorl.models.transformers.glm5.exact_lm_head_qlora import (
     GLM52_LM_HEAD_TP_SIZE,
     GLM52_LM_HEAD_VOCAB_SIZE,
     Glm52ExactTP16LmHeadSelectedLogprob,
-    _Glm52ExactTP16LmHeadFunction,
     _local_qlora_surrogate_vjp,
-    _rank_order_vocab_from_stacked,
     glm52_lm_head_shard,
 )
 from xorl.ops.bi_families_v2 import exact_temperature_scale_fp32_logits
@@ -280,7 +286,7 @@ def _assert_custom_boundary_is_grad_enabled_and_saves_effective_factor_bytes() -
     token_ids = torch.tensor([0, 4], dtype=torch.int64)
     temperature = torch.tensor([0.7, 1.3], dtype=torch.float32)
 
-    logprob = _Glm52ExactTP16LmHeadFunction.apply(
+    logprob = ExactLmHeadFunction.apply(
         hidden,
         weight,
         lora_A,
@@ -288,6 +294,7 @@ def _assert_custom_boundary_is_grad_enabled_and_saves_effective_factor_bytes() -
         token_ids,
         temperature,
         (None, None, None),
+        REPLICATED_ROW_PLAN,
         FakeComponent(),
     )
     assert logprob.requires_grad
@@ -457,7 +464,7 @@ def test_official_local_shard_literal_v2_bytes_tail_and_surrogate_gradients() ->
     effective_A = lora_A.detach().to(torch.bfloat16).contiguous()
     effective_B = lora_B.detach().to(torch.bfloat16).contiguous()
 
-    batch_info = lm_head_impl._single_adapter_lm_head_batch_info(device.index, rows)
+    batch_info = single_adapter_lora_batch_info(device.index, rows)
     direct_base, _direct_lse = head_v2_full_logits_with_lse(hidden, local_weight)
     direct_a = sgemm_lora_a_fwd(hidden, effective_A.unsqueeze(0), batch_info)
     direct_delta = sgemm_lora_b_fwd(direct_a, effective_B.unsqueeze(0), batch_info)
