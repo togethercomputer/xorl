@@ -37,8 +37,6 @@ class AttentionKwargs(TypedDict, total=False):
     cu_seq_lens_k: torch.LongTensor | None
     max_length_q: int | None
     max_length_k: int | None
-    # Context produced when a packed RL batch deduplicates shared prompts.
-    shared_prefix_context: object | None
 
 
 # Backwards compatibility alias

@@ -88,7 +88,6 @@ from xorl.ops.loss import (
     opd_vocab_parallel_loss_function,
     policy_loss_function,
 )
-from xorl.ops.shared_prefix import shared_prefix_remap_to_original
 from xorl.optim import build_optimizer
 from xorl.server.runner.adapters import LoRAAdapterManager
 from xorl.server.runner.adapters.gradient_finalizer import AdapterGradientMutationFailure
@@ -618,9 +617,6 @@ class ModelRunner:
 
         # LM head fp32 flag for loss functions
         self.lm_head_fp32 = self.model_config.get("lm_head_fp32", True)
-
-        # Deduplicate common prompts in packed RL policy-update batches.
-        self.use_shared_prefix = self.train_config.get("use_shared_prefix", False)
 
         # Training state
         self.global_step = 0
@@ -2231,13 +2227,6 @@ class ModelRunner:
         else:
             gathered = per_token_tensors
             position_ids = micro_batch.get("position_ids")
-
-        shared_prefix_context = micro_batch.get("shared_prefix_context")
-        if shared_prefix_context is not None:
-            gathered = {
-                key: shared_prefix_remap_to_original(value, shared_prefix_context) for key, value in gathered.items()
-            }
-            position_ids = shared_prefix_context.orig_position_ids
 
         if position_ids is not None:
             accumulators["position_ids"].append(position_ids.cpu())
@@ -6154,16 +6143,6 @@ class ModelRunner:
                 sampler_prefill_lengths,
                 dtype=torch.long,
                 device=model_inputs["input_ids"].device,
-            )
-
-        # Shared-prefix: the dispatcher already repacked input_ids / loss fields and
-        # attached a SharedPrefixContext. Move its index tensors to the model device
-        # so it flows (via model_inputs) down to the attention backend. Loss runs on
-        # the repacked labels (already in micro_batch); outputs are remapped to the
-        # original layout in _collect_per_token_outputs.
-        if model_inputs.get("shared_prefix_context") is not None:
-            model_inputs["shared_prefix_context"] = model_inputs["shared_prefix_context"].to(
-                model_inputs["input_ids"].device
             )
 
         # Multi-layer OPRD (all-layer hidden matching): when enabled for an opd_loss

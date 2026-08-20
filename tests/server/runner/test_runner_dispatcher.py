@@ -27,7 +27,6 @@ def _dispatcher(rank: int, world_size: int) -> RunnerDispatcher:
     dispatcher = object.__new__(RunnerDispatcher)
     dispatcher.rank = rank
     dispatcher.world_size = world_size
-    dispatcher.trainer = SimpleNamespace(use_shared_prefix=False)
     return dispatcher
 
 
