@@ -24,9 +24,7 @@ requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requir
 D = 2048
 
 
-@requires_cuda
-@pytest.mark.gpu
-def test_ops_are_batch_composition_invariant():
+def _assert_ops_are_batch_composition_invariant():
     """Row 0's output is bit-identical alone (M=1) vs in a batch (M=N), under BI."""
     torch.manual_seed(0)
     dev = "cuda"
@@ -50,9 +48,11 @@ def test_ops_are_batch_composition_invariant():
 
 @requires_cuda
 @pytest.mark.gpu
-def test_dense_model_logits_invariant_to_batching():
+def test_dense_batch_composition_invariance_policy():
     """A sequence's per-position logits are identical whether it is forwarded
     alone or as the first row of a padded batch, under batch-invariant mode."""
+    _assert_ops_are_batch_composition_invariant()
+
     torch.manual_seed(1)
     dev = "cuda"
     cfg = Qwen3Config(

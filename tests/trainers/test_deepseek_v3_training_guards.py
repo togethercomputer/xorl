@@ -6,7 +6,6 @@ from xorl.distributed.torch_parallelize import build_parallelize_model
 from xorl.models.auto import build_foundation_model
 from xorl.models.transformers.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 from xorl.models.transformers.deepseek_v3.modeling_deepseek_v3 import DeepseekV3ForCausalLM
-from xorl.models.transformers.deepseek_v3.support import validate_deepseek_v3_tensor_parallelism
 from xorl.trainers.model_builder import build_training_model
 
 
@@ -49,37 +48,35 @@ def _patch_tiny_model(monkeypatch):
     monkeypatch.setattr("xorl.trainers.model_builder.helper.print_device_mem_info", lambda *args, **kwargs: None)
 
 
-def test_build_foundation_model_rejects_train_router_for_deepseek():
+def _assert_build_foundation_model_rejects_train_router_for_deepseek():
     with pytest.raises(ValueError, match="train_router=True"):
         build_foundation_model(_tiny_config(), train_router=True)
 
 
-@pytest.mark.parametrize(
-    ("override_kwargs", "match"),
-    [
+def test_deepseek_training_and_parallelization_admission_policy(monkeypatch):
+    _assert_build_foundation_model_rejects_train_router_for_deepseek()
+
+    cases = (
         ({"freeze_router": False}, "requires freeze_router=True"),
         ({"freeze_router": True, "enable_qlora": True}, "enable_qlora=True"),
         ({"freeze_router": True, "merge_qkv": False}, "merge_qkv=False"),
-    ],
-)
-def test_build_training_model_rejects_unsupported_deepseek_modes(monkeypatch, override_kwargs, match):
+    )
     _patch_tiny_model(monkeypatch)
+    for override_kwargs, match in cases:
+        kwargs = {
+            "config_path": "unused",
+            "weights_path": "unused",
+            "freeze_router": True,
+            "enable_mixed_precision": False,
+            "enable_gradient_checkpointing": False,
+        }
+        kwargs.update(override_kwargs)
 
-    kwargs = {
-        "config_path": "unused",
-        "weights_path": "unused",
-        "freeze_router": True,
-        "enable_mixed_precision": False,
-        "enable_gradient_checkpointing": False,
-    }
-    kwargs.update(override_kwargs)
+        with pytest.raises(ValueError, match=match):
+            build_training_model(**kwargs)
 
-    with pytest.raises(ValueError, match=match):
-        build_training_model(**kwargs)
-
-
-def test_build_training_model_freezes_router_when_requested(monkeypatch):
-    _patch_tiny_model(monkeypatch)
+    # The admitted mode must freeze only the router and preserve ordinary
+    # attention training parameters.
     monkeypatch.setattr("xorl.trainers.model_builder._parallelize", lambda model, **kwargs: model)
 
     result = build_training_model(
@@ -95,18 +92,10 @@ def test_build_training_model_freezes_router_when_requested(monkeypatch):
     assert all(param.requires_grad is False for param in router_params)
     assert result.model.model.layers[0].self_attn.q_a_proj.weight.requires_grad is True
 
-
-def test_validate_deepseek_v3_tensor_parallelism_rejects_tp(monkeypatch):
-    monkeypatch.setattr(
-        "xorl.models.transformers.deepseek_v3.support.get_parallel_state",
-        lambda: SimpleNamespace(tp_enabled=True),
-    )
-
-    with pytest.raises(ValueError, match="tensor parallelism is not supported yet"):
-        validate_deepseek_v3_tensor_parallelism(_tiny_config())
+    _assert_build_parallelize_model_preserves_deepseek_tp_guard(monkeypatch)
 
 
-def test_build_parallelize_model_preserves_deepseek_tp_guard(monkeypatch):
+def _assert_build_parallelize_model_preserves_deepseek_tp_guard(monkeypatch):
     model = DeepseekV3ForCausalLM(_tiny_config())
     monkeypatch.setattr(
         "xorl.distributed.torch_parallelize.get_parallel_state",

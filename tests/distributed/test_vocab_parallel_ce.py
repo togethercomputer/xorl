@@ -6,7 +6,6 @@ Can be run two ways:
 """
 
 import os
-import time
 
 import torch
 import torch.distributed as dist
@@ -113,98 +112,6 @@ def check_backward(rank, world_size, tp_group):
         assert grad_w_err < 1e-2, f"grad_w error too large ({mode}): {grad_w_err}"
 
 
-def _bench_one(hidden_states, local_weight, labels, tp_group, use_compile, n_warmup=5, n_iter=20, fwd_only=False):
-    """Run warmup + timed iterations, return (ms/iter, peak_memory_MB)."""
-    for _ in range(n_warmup):
-        ce = vocab_parallel_cross_entropy(hidden_states, local_weight, labels, tp_group, use_compile=use_compile)
-        if not fwd_only:
-            ce.sum().backward()
-            hidden_states.grad = None
-            local_weight.grad = None
-    torch.cuda.synchronize()
-
-    # Reset peak memory stats before timed run
-    torch.cuda.reset_peak_memory_stats()
-    mem_before = torch.cuda.memory_allocated()
-
-    start = time.perf_counter()
-    for _ in range(n_iter):
-        ce = vocab_parallel_cross_entropy(hidden_states, local_weight, labels, tp_group, use_compile=use_compile)
-        if not fwd_only:
-            ce.sum().backward()
-            hidden_states.grad = None
-            local_weight.grad = None
-    torch.cuda.synchronize()
-    ms = (time.perf_counter() - start) / n_iter * 1000
-
-    peak_mem = torch.cuda.max_memory_allocated()
-    # Peak activation memory = peak total - memory before (which includes weights + NCCL buffers)
-    peak_activation_mb = (peak_mem - mem_before) / 1024 / 1024
-
-    return ms, peak_activation_mb, peak_mem / 1024 / 1024
-
-
-def bench_perf(rank, world_size, tp_group):
-    """Benchmark eager vs compiled vocab-parallel CE with memory tracking."""
-    torch.manual_seed(42)
-    BT = 4096
-    H = 4096
-    V = 152064  # Qwen3 vocab
-    local_V = V // world_size
-
-    hidden_states = torch.randn(BT, H, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    local_weight = torch.randn(local_V, H, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    labels = torch.randint(0, V, (BT,), device="cuda")
-
-    if rank == 0:
-        print(f"[perf] BT={BT}, H={H}, V={V}, tp={world_size}")
-        print(f"[perf] local_V={local_V}, num_chunks=8")
-        weight_mb = local_weight.nelement() * local_weight.element_size() / 1024 / 1024
-        hidden_mb = hidden_states.nelement() * hidden_states.element_size() / 1024 / 1024
-        print(f"[perf] weight: {weight_mb:.1f} MB, hidden: {hidden_mb:.1f} MB")
-        print()
-
-    # --- Forward-only benchmark ---
-    if rank == 0:
-        print("--- Forward only ---")
-        print(f"{'Mode':<12} {'Time (ms)':<12} {'Peak Act (MB)':<16} {'Peak Total (MB)'}")
-    for use_compile in [False, True]:
-        mode = "compiled" if use_compile else "eager"
-        ms, peak_act_mb, peak_total_mb = _bench_one(
-            hidden_states,
-            local_weight,
-            labels,
-            tp_group,
-            use_compile=use_compile,
-            fwd_only=True,
-        )
-        if rank == 0:
-            print(f"{mode:<12} {ms:<12.2f} {peak_act_mb:<16.1f} {peak_total_mb:.1f}")
-
-    if rank == 0:
-        print()
-
-    # --- Forward + Backward benchmark ---
-    if rank == 0:
-        print("--- Forward + Backward ---")
-        print(f"{'Mode':<12} {'Time (ms)':<12} {'Peak Act (MB)':<16} {'Peak Total (MB)'}")
-    for use_compile in [False, True]:
-        mode = "compiled" if use_compile else "eager"
-        ms, peak_act_mb, peak_total_mb = _bench_one(
-            hidden_states,
-            local_weight,
-            labels,
-            tp_group,
-            use_compile=use_compile,
-            fwd_only=False,
-        )
-        if rank == 0:
-            print(f"{mode:<12} {ms:<12.2f} {peak_act_mb:<16.1f} {peak_total_mb:.1f}")
-
-    if rank == 0:
-        print()
-
-
 def main():
     rank, world_size = setup()
     tp_group = dist.group.WORLD
@@ -221,9 +128,6 @@ def main():
     dist.barrier()
     if rank == 0:
         print()
-
-    bench_perf(rank, world_size, tp_group)
-    dist.barrier()
 
     if rank == 0:
         print("\nAll tests passed!")

@@ -1,4 +1,4 @@
-"""P5 GDN contract-pin regression tests for the FlashQLA backend.
+"""P5 GDN backend selection and contract-pin regression tests for FlashQLA.
 
 Ports the FlashQLA certification gates 2 (M/batch-invariance) and 4
 (chunk-chaining exactness through the fp32 pool-layout handoff) as regression
@@ -13,9 +13,13 @@ All GPU tests run at the Qwen3.5/3.6-35B-A3B GDN contract shape: HK16/GVA32
 fp32 g/beta, ``use_qk_l2norm_in_kernel=True``.
 """
 
+import warnings
+
 import pytest
 import torch
 
+import xorl.ops.linear_attention.layers.gated_deltanet as gated_deltanet
+from xorl.ops.linear_attention import GatedDeltaNet
 from xorl.ops.linear_attention.backend import FLASHQLA_AUTOCP_ENV, resolve_flashqla_auto_cp
 from xorl.ops.linear_attention.modules.bi_contract import gdn_contract
 
@@ -32,16 +36,12 @@ def _flashqla_chunk_or_skip():
 
     if torch.cuda.get_device_capability() != (9, 0):
         pytest.skip("FlashQLA requires a Hopper (SM90) GPU")
-    try:
-        import tilelang.language as _tl  # noqa: PLC0415
+    import tilelang.language as _tl  # noqa: PLC0415
 
-        if "prefer_instruction" not in inspect.signature(_tl.copy).parameters:
-            pytest.skip("tilelang lacks prefer_instruction (PR #2303); FlashQLA TMA path unavailable")
-        from xorl.ops.linear_attention.flashqla import chunk_gated_delta_rule as flashqla_chunk  # noqa: PLC0415
-    except pytest.skip.Exception:
-        raise
-    except Exception as exc:  # tilelang missing / SM90 import-time check / build failure
-        pytest.skip(f"FlashQLA backend unavailable: {exc}")
+    if "prefer_instruction" not in inspect.signature(_tl.copy).parameters:
+        pytest.skip("tilelang lacks prefer_instruction (PR #2303); FlashQLA TMA path unavailable")
+    from xorl.ops.linear_attention.flashqla import chunk_gated_delta_rule as flashqla_chunk  # noqa: PLC0415
+
     return flashqla_chunk
 
 
@@ -111,6 +111,39 @@ def test_resolve_auto_cp_precedence(monkeypatch):
         assert resolve_flashqla_auto_cp(None) is False
         assert resolve_flashqla_auto_cp(False) is False
 
+    _assert_gdn_backend_env_dispatches_to_flashqla(monkeypatch)
+
+
+def _assert_gdn_backend_env_dispatches_to_flashqla(monkeypatch):
+    calls = []
+
+    def fake_flashqla_chunk(**kwargs):
+        calls.append(kwargs)
+        assert "cp_context" not in kwargs
+        return kwargs["v"], None
+
+    monkeypatch.setenv("XORL_GDN_BACKEND", "flashqla")
+    monkeypatch.setattr(gated_deltanet, "flashqla_chunk_gated_delta_rule", fake_flashqla_chunk)
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        layer = GatedDeltaNet(
+            hidden_size=128,
+            expand_v=1.0,
+            head_dim=128,
+            num_heads=1,
+            num_v_heads=1,
+            mode="chunk",
+            use_gate=False,
+            use_short_conv=False,
+        )
+    layer.train()
+    out, _, _ = layer(torch.randn(1, 8, 128))
+
+    assert len(calls) == 1
+    assert calls[0]["q"].shape == (1, 8, 1, 128)
+    assert out.shape == (1, 8, 128)
+
 
 @requires_cuda
 @pytest.mark.gpu
@@ -150,7 +183,7 @@ def test_contract_lane_pins_autocp_off(monkeypatch):
 
 @requires_cuda
 @pytest.mark.gpu
-def test_gate2_packed_varlen_matches_individual_calls(armed_contract_lane):
+def test_gate2_shape_invariance_policy(armed_contract_lane):
     """Gate 2a: packed varlen rows with fp32 initial states == per-request calls, bitwise."""
     fn = _flashqla_chunk_or_skip()
     partial_lens = [1, 17, 64, 33]
@@ -169,27 +202,26 @@ def test_gate2_packed_varlen_matches_individual_calls(armed_contract_lane):
         _assert_bitwise(o_pack[:, lo:hi], o_i, f"row {i} (len {L}) out")
         _assert_bitwise(s_pack[i : i + 1], s_i, f"row {i} (len {L}) state")
 
+    _assert_gate2_same_row_bits_invariant_to_total_m()
+    _assert_gate2_block_dv_tile_heuristic_bit_invariant()
 
-@requires_cuda
-@pytest.mark.gpu
-@pytest.mark.parametrize("T", [2048, 4096])
-def test_gate2_same_row_bits_invariant_to_total_M(armed_contract_lane, T):
+
+def _assert_gate2_same_row_bits_invariant_to_total_m():
     """Gate 2b: the same row alone (CP-eligible bs1) vs packed 4xT — bitwise under the pin."""
     fn = _flashqla_chunk_or_skip()
-    q, k, v, g, beta = _make_inputs(4 * T, seed=22)
+    for T in (2048, 4096):
+        q, k, v, g, beta = _make_inputs(4 * T, seed=22)
 
-    o_alone, s_alone = _run(fn, q[:, :T], k[:, :T], v[:, :T], g[:, :T], beta[:, :T])
+        o_alone, s_alone = _run(fn, q[:, :T], k[:, :T], v[:, :T], g[:, :T], beta[:, :T])
 
-    cu = torch.arange(0, 4 * T + 1, T, device="cuda", dtype=torch.long)
-    o_pack, s_pack = _run(fn, q, k, v, g, beta, cu_seqlens=cu)
+        cu = torch.arange(0, 4 * T + 1, T, device="cuda", dtype=torch.long)
+        o_pack, s_pack = _run(fn, q, k, v, g, beta, cu_seqlens=cu)
 
-    _assert_bitwise(o_pack[:, :T], o_alone, f"T={T} out")
-    _assert_bitwise(s_pack[0:1], s_alone, f"T={T} state")
+        _assert_bitwise(o_pack[:, :T], o_alone, f"T={T} out")
+        _assert_bitwise(s_pack[0:1], s_alone, f"T={T} state")
 
 
-@requires_cuda
-@pytest.mark.gpu
-def test_gate2_block_dv_tile_heuristic_bit_invariant(armed_contract_lane):
+def _assert_gate2_block_dv_tile_heuristic_bit_invariant():
     """Gate 2c: identical row 0 at B=1/2/3 (block_DV tile heuristic 32/64/128) — bitwise."""
     fn = _flashqla_chunk_or_skip()
     q, k, v, g, beta = _make_inputs(1024, seed=24, batch=3)
@@ -204,24 +236,24 @@ def test_gate2_block_dv_tile_heuristic_bit_invariant(armed_contract_lane):
 
 @requires_cuda
 @pytest.mark.gpu
-@pytest.mark.parametrize("T,step", [(256, CHUNK), (4096, CHUNK), (4096, 256)])
-def test_gate4_chunk_chaining_bitwise_through_pool_layout(armed_contract_lane, T, step):
+def test_gate4_chunk_chaining_bitwise_through_pool_layout(armed_contract_lane):
     """Gate 4: one call == chained calls with fp32 state handoff through the sglang
     pool layout ([N, HV, V, K] transpose round-trip) — the recompute-decode prerequisite."""
     fn = _flashqla_chunk_or_skip()
-    q, k, v, g, beta = _make_inputs(T, seed=42)
+    for T, step in ((256, CHUNK), (4096, CHUNK), (4096, 256)):
+        q, k, v, g, beta = _make_inputs(T, seed=42)
 
-    o_ref, s_ref = _run(fn, q, k, v, g, beta)
+        o_ref, s_ref = _run(fn, q, k, v, g, beta)
 
-    pool = None
-    outs = []
-    for t0 in range(0, T, step):
-        sl = slice(t0, min(t0 + step, T))
-        init = pool.transpose(-1, -2).contiguous() if pool is not None else None
-        o, s = _run(fn, q[:, sl], k[:, sl], v[:, sl], g[:, sl], beta[:, sl], initial_state=init)
-        pool = s.transpose(-1, -2).contiguous()
-        outs.append(o)
-    o_chain = torch.cat(outs, dim=1)
+        pool = None
+        outs = []
+        for t0 in range(0, T, step):
+            sl = slice(t0, min(t0 + step, T))
+            init = pool.transpose(-1, -2).contiguous() if pool is not None else None
+            o, s = _run(fn, q[:, sl], k[:, sl], v[:, sl], g[:, sl], beta[:, sl], initial_state=init)
+            pool = s.transpose(-1, -2).contiguous()
+            outs.append(o)
+        o_chain = torch.cat(outs, dim=1)
 
-    _assert_bitwise(o_ref, o_chain, f"T={T} step={step} out")
-    _assert_bitwise(s_ref.transpose(-1, -2).contiguous(), pool, f"T={T} step={step} state")
+        _assert_bitwise(o_ref, o_chain, f"T={T} step={step} out")
+        _assert_bitwise(s_ref.transpose(-1, -2).contiguous(), pool, f"T={T} step={step} state")

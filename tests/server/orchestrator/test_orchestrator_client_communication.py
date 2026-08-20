@@ -204,8 +204,8 @@ def _optim_step_request(lr, gradient_clip=None):
 
 
 @pytest.mark.asyncio
-async def test_basic_communication_and_roundtrip(mock_engine, orchestrator_client):
-    """Test connection, send, receive, and full roundtrip."""
+async def test_communication_roundtrip_and_interleaving(mock_engine, orchestrator_client):
+    """Test connection, roundtrip, sequential requests, and interleaved request types."""
     await asyncio.sleep(0.4)
     assert mock_engine._running and orchestrator_client._running
 
@@ -221,51 +221,14 @@ async def test_basic_communication_and_roundtrip(mock_engine, orchestrator_clien
     assert len(mock_engine.requests_received) >= 1
     assert len(mock_engine.outputs_sent) >= 1
 
-
-@pytest.mark.asyncio
-async def test_forward_backward_and_optim_step(mock_engine, orchestrator_client):
-    """Test forward_backward and optim_step operations through communication."""
-    await asyncio.sleep(0.2)
-
-    # Forward backward
-    fb_request = _forward_backward_request(
-        data=[
-            {"model_input": {"input_ids": [1, 2, 3]}, "loss_fn_inputs": {"labels": [2, 3, 4]}},
-            {"model_input": {"input_ids": [5, 6, 7]}, "loss_fn_inputs": {"labels": [6, 7, 8]}},
-        ]
-    )
-    future = await orchestrator_client.send_request(fb_request)
-    output = await asyncio.wait_for(future, timeout=2.0)
-    assert output.output_type == OutputType.FORWARD_BACKWARD
-    assert output.outputs[0]["num_samples"] == 2
-
-    # Empty samples
-    empty_request = _forward_backward_request(data=[])
-    future = await orchestrator_client.send_request(empty_request)
-    output = await asyncio.wait_for(future, timeout=2.0)
-    assert output.outputs[0]["num_samples"] == 0
-
-    # Optim step
-    opt_request = _optim_step_request(lr=0.001, gradient_clip=1.0)
-    future = await orchestrator_client.send_request(opt_request)
-    output = await asyncio.wait_for(future, timeout=2.0)
-    assert output.output_type == OutputType.OPTIM_STEP
-    assert output.outputs[0]["learning_rate"] == 0.001
-
-
-@pytest.mark.asyncio
-async def test_multiple_and_interleaved_requests(mock_engine, orchestrator_client):
-    """Test multiple sequential requests and interleaved request types."""
-    await asyncio.sleep(0.2)
-
-    # Multiple sequential
+    # Multiple sequential requests preserve request identity.
     requests = [_health_check_request() for _ in range(5)]
     futures = [await orchestrator_client.send_request(req) for req in requests]
     outputs = [await asyncio.wait_for(f, timeout=2.0) for f in futures]
     assert len(outputs) == 5
     assert {req.request_id for req in requests} == {out.request_id for out in outputs}
 
-    # Interleaved types
+    # Interleaved request types preserve response types.
     mixed_requests = [
         _health_check_request(),
         _forward_backward_request(data=[{"model_input": {"input_ids": [1, 2, 3]}, "loss_fn_inputs": {}}]),
@@ -279,9 +242,10 @@ async def test_multiple_and_interleaved_requests(mock_engine, orchestrator_clien
     assert outputs[2].output_type == OutputType.OPTIM_STEP
     assert outputs[3].output_type == OutputType.HEALTH_CHECK
 
+    await _assert_edge_cases_and_lifecycle(mock_engine, orchestrator_client)
 
-@pytest.mark.asyncio
-async def test_edge_cases_and_lifecycle(zmq_addresses, mock_engine, orchestrator_client):
+
+async def _assert_edge_cases_and_lifecycle(mock_engine, orchestrator_client):
     """Test timeout, delayed response, stats, serialization, errors, and lifecycle."""
     await asyncio.sleep(0.2)
 
@@ -300,11 +264,22 @@ async def test_edge_cases_and_lifecycle(zmq_addresses, mock_engine, orchestrator
             "loss_fn_inputs": {"labels": list(range(100, 200))},
         }
     ]
-    request = _forward_backward_request(data=data)
-    await orchestrator_client.send_request(request)
-    await asyncio.sleep(0.2)
+    request = OrchestratorRequest(
+        operation="forward_backward",
+        payload=ModelPassData(data=data),
+        seq_id=7,
+        timestamp=9999.0,
+    )
+    future = await orchestrator_client.send_request(request)
+    output = await asyncio.wait_for(future, timeout=2.0)
     received = mock_engine.requests_received[-1]
     assert received.payload.data == data
+    assert received.seq_id == 7
+    assert received.timestamp == 9999.0
+    assert output.request_id == request.request_id
+    assert output.output_type == OutputType.FORWARD_BACKWARD
+    assert output.outputs == [{"loss": 2.5, "num_samples": 1, "status": "success"}]
+    assert output.finished is True
 
     # Error before start
     client = OrchestratorClient(input_addr="tcp://127.0.0.1:50000", output_addr="tcp://127.0.0.1:50001")

@@ -6,8 +6,8 @@ and metadata queue guard during no_grad shape inference.
 Tests both the direct trainer path and the server (ModelRunner) path.
 
 GPU layouts:
-    TestPP2GPU:        PP=2, FSDP=1  (2 GPUs) — minimal PP correctness
     TestPP8GPU:        PP=2, FSDP=4  (8 GPUs) — PP + FSDP combination
+    TestPPSchedules2GPU: PP=2, FSDP=1 (2 GPUs) — baseline and schedule parity
     TestPP2GPUServer:  PP=2, FSDP=1  (2 GPUs) — server PP path
     TestPP8GPUServer:  PP=2, FSDP=4  (8 GPUs) — server PP + FSDP
 """
@@ -37,55 +37,10 @@ from tests.e2e.server_utils import (
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.slow]
 
 
-# ---------------------------------------------------------------------------
-# Trainer tests
-# ---------------------------------------------------------------------------
-
-
-class TestPP2GPU:
-    @skip_if_gpu_count_less_than(2)
-    def test_pp2_loss_converges(self, tiny_dense_model_dir):
-        """Trainer: PP=2 on 2 GPUs — loss must be finite and decreasing."""
-        output_dir = os.path.join(tiny_dense_model_dir, "output_pp2")
-        config_path = generate_training_config(
-            model_dir=tiny_dense_model_dir,
-            output_dir=output_dir,
-            num_gpus=2,
-            pp_size=2,
-            dp_shard_size=1,
-            gradient_accumulation_steps=2,
-            packing_seq_len=256,
-            max_steps=5,
-            lr=1e-3,
-        )
-        result = run_training(config_path, num_gpus=2, timeout=600)
-        result.assert_success()
-        result.assert_loss_converged(max_final_loss=12.0, min_drop_ratio=0.001)
-
-
 class TestPP8GPU:
     @skip_if_gpu_count_less_than(8)
-    def test_pp2_fsdp4_loss_converges(self, tiny_dense_model_dir):
-        """Trainer: PP=2 + FSDP=4 on 8 GPUs — validates fsdp_size=1 fix."""
-        output_dir = os.path.join(tiny_dense_model_dir, "output_pp2_fsdp4")
-        config_path = generate_training_config(
-            model_dir=tiny_dense_model_dir,
-            output_dir=output_dir,
-            num_gpus=8,
-            pp_size=2,
-            dp_shard_size=4,
-            gradient_accumulation_steps=2,
-            packing_seq_len=256,
-            max_steps=5,
-            lr=1e-3,
-        )
-        result = run_training(config_path, num_gpus=8, timeout=600)
-        result.assert_success()
-        result.assert_loss_converged(max_final_loss=12.0, min_drop_ratio=0.001)
-
-    @skip_if_gpu_count_less_than(8)
     def test_pp2_fsdp4_muon_loss_converges(self, tiny_dense_model_dir):
-        """Trainer: PP=2 + FSDP=4 + Muon on 8 GPUs."""
+        """Trainer: PP=2 + FSDP=4 + Muon validates the combined topology."""
         output_dir = os.path.join(tiny_dense_model_dir, "output_pp2_fsdp4_muon")
         config_path = generate_training_config(
             model_dir=tiny_dense_model_dir,
@@ -145,19 +100,21 @@ class TestPPSchedules2GPU:
         return result
 
     @skip_if_gpu_count_less_than(2)
-    @pytest.mark.parametrize("schedule,virtual_stages", SCHEDULES)
-    def test_schedule_loss_parity_vs_1f1b(self, tiny_dense_model_dir, schedule, virtual_stages):
+    def test_schedule_loss_parity_vs_1f1b(self, tiny_dense_model_dir):
         baseline = self._run(tiny_dense_model_dir, "1F1B", 1, "sched_baseline_1f1b")
-        candidate = self._run(tiny_dense_model_dir, schedule, virtual_stages, f"sched_{schedule.lower()}")
-        candidate.assert_loss_converged(max_final_loss=12.0, min_drop_ratio=0.001)
-        base_hist, cand_hist = baseline.loss_history, candidate.loss_history
-        assert base_hist is not None and cand_hist is not None
-        assert len(base_hist) == len(cand_hist)
-        for step, (b, c) in enumerate(zip(base_hist, cand_hist)):
-            # ZB dX/dW split reorders reductions; allow small numeric drift.
-            assert abs(b - c) <= max(0.02, 0.01 * abs(b)), (
-                f"{schedule} loss diverged from 1F1B at step {step}: {c:.4f} vs {b:.4f}"
-            )
+        baseline.assert_loss_converged(max_final_loss=12.0, min_drop_ratio=0.001)
+        assert baseline.loss_history is not None
+        for schedule, virtual_stages in self.SCHEDULES:
+            candidate = self._run(tiny_dense_model_dir, schedule, virtual_stages, f"sched_{schedule.lower()}")
+            candidate.assert_loss_converged(max_final_loss=12.0, min_drop_ratio=0.001)
+            cand_hist = candidate.loss_history
+            assert cand_hist is not None
+            assert len(baseline.loss_history) == len(cand_hist)
+            for step, (baseline_loss, candidate_loss) in enumerate(zip(baseline.loss_history, cand_hist)):
+                # ZB dX/dW split reorders reductions; allow small numeric drift.
+                assert abs(baseline_loss - candidate_loss) <= max(0.02, 0.01 * abs(baseline_loss)), (
+                    f"{schedule} loss diverged from 1F1B at step {step}: {candidate_loss:.4f} vs {baseline_loss:.4f}"
+                )
 
 
 # ---------------------------------------------------------------------------

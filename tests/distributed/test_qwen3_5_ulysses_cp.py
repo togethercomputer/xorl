@@ -155,24 +155,18 @@ def _main() -> None:
 if __name__ != "__main__":
 
     @skip_if_gpu_count_less_than(2)
-    def test_qwen35_ulysses_positive_smoke():
-        result = run_distributed_script(
-            __file__,
-            num_gpus=2,
-            timeout=180,
-            extra_env={"QWEN35_CP_MODE": "positive"},
-        )
-        result.assert_success("Qwen3.5 positive Ulysses smoke should pass")
-
-    @skip_if_gpu_count_less_than(2)
-    def test_qwen35_ring_fla_negative_smoke():
-        result = run_distributed_script(
-            __file__,
-            num_gpus=2,
-            timeout=180,
-            extra_env={"QWEN35_CP_MODE": "negative"},
-        )
-        result.assert_success("Qwen3.5 ring+FLA negative smoke should fail fast")
+    def test_qwen35_context_parallel_execution_and_admission_contract():
+        for mode, description in (
+            ("positive", "Qwen3.5 positive Ulysses smoke should pass"),
+            ("negative", "Qwen3.5 ring+FLA negative smoke should fail fast"),
+        ):
+            result = run_distributed_script(
+                __file__,
+                num_gpus=2,
+                timeout=180,
+                extra_env={"QWEN35_CP_MODE": mode},
+            )
+            result.assert_success(description)
 
 
 if __name__ == "__main__":

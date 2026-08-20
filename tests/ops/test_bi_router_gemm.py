@@ -19,7 +19,7 @@ def _inputs(n, seed=0):
 
 @requires_cuda
 @pytest.mark.gpu
-def test_router_gemm_matches_fp32_upcast_reference():
+def test_router_gemm_linear_topk_and_moe_dispatch_policy():
     # bf16xbf16 products are exact in fp32, so the contract kernel must equal an
     # fp32 GEMM over the (exact) fp32 upcasts up to fp32 reduction-order noise.
     hidden, weight = _inputs(256)
@@ -28,30 +28,20 @@ def test_router_gemm_matches_fp32_upcast_reference():
     ref = torch.nn.functional.linear(hidden.float(), weight.float())
     assert torch.allclose(out, ref, rtol=1e-5, atol=1e-4)
 
+    empty = bi_router_gemm(torch.empty(0, H, device="cuda", dtype=torch.bfloat16), weight)
+    assert empty.shape == (0, E) and empty.dtype == torch.float32
+    with pytest.raises(AssertionError):
+        bi_router_gemm(hidden.float(), weight)
+    with pytest.raises(AssertionError):
+        bi_router_gemm(hidden, weight.float())
 
-@requires_cuda
-@pytest.mark.gpu
-def test_router_gemm_batch_invariant_to_padding():
-    # A row's logits must not depend on how many other rows share the batch
-    # (batch invariance): rows of a small batch equal the same rows of a big one.
-    hidden, weight = _inputs(300)
-    full = bi_router_gemm(hidden, weight)
-    sub = bi_router_gemm(hidden[:7].contiguous(), weight)
-    assert torch.equal(full[:7], sub)
-
-
-@requires_cuda
-@pytest.mark.gpu
-def test_router_gemm_empty_tokens():
-    _, weight = _inputs(1)
-    empty = torch.empty(0, H, device="cuda", dtype=torch.bfloat16)
-    out = bi_router_gemm(empty, weight)
-    assert out.shape == (0, E) and out.dtype == torch.float32
+    _assert_router_gemm_autograd_backward_matches_linear()
+    _assert_bf16_fp32_linear_preserves_leading_dims_and_backward()
+    _assert_topk_weights_renormalize_or_cast_and_require_fp32()
+    _assert_moe_block_route_selects_exact_contract_or_default_path()
 
 
-@requires_cuda
-@pytest.mark.gpu
-def test_router_gemm_autograd_backward_matches_linear():
+def _assert_router_gemm_autograd_backward_matches_linear():
     hidden, weight = _inputs(64, seed=1)
 
     h1 = hidden.clone().requires_grad_(True)
@@ -67,9 +57,7 @@ def test_router_gemm_autograd_backward_matches_linear():
     assert torch.allclose(w1.grad.float(), w2.grad.float(), rtol=2e-2, atol=2e-2)
 
 
-@requires_cuda
-@pytest.mark.gpu
-def test_bf16_fp32_linear_preserves_leading_dims_and_backward():
+def _assert_bf16_fp32_linear_preserves_leading_dims_and_backward():
     hidden, weight = _inputs(6, seed=2)
     hidden = hidden.reshape(2, 3, H).requires_grad_(True)
     weight = weight.requires_grad_(True)
@@ -84,19 +72,7 @@ def test_bf16_fp32_linear_preserves_leading_dims_and_backward():
     assert weight.grad is not None and weight.grad.dtype is torch.bfloat16
 
 
-@requires_cuda
-@pytest.mark.gpu
-def test_router_gemm_rejects_non_bf16():
-    hidden, weight = _inputs(8)
-    with pytest.raises(AssertionError):
-        bi_router_gemm(hidden.float(), weight)
-    with pytest.raises(AssertionError):
-        bi_router_gemm(hidden, weight.float())
-
-
-@requires_cuda
-@pytest.mark.gpu
-def test_topk_weights_fixed_order_renorm():
+def _assert_topk_weights_renormalize_or_cast_and_require_fp32():
     torch.manual_seed(0)
     vals = torch.rand(128, TOP_K, device="cuda", dtype=torch.float32) + 0.1
     w = bi_router_topk_weights(vals, norm_topk_prob=True, out_dtype=torch.bfloat16)
@@ -106,19 +82,11 @@ def test_topk_weights_fixed_order_renorm():
     # no-renorm path is a pure cast
     w2 = bi_router_topk_weights(vals, norm_topk_prob=False, out_dtype=torch.bfloat16)
     assert torch.equal(w2, vals.to(torch.bfloat16))
-
-
-@requires_cuda
-@pytest.mark.gpu
-def test_topk_weights_requires_fp32():
-    vals = torch.rand(4, TOP_K, device="cuda", dtype=torch.bfloat16)
     with pytest.raises(AssertionError):
-        bi_router_topk_weights(vals)
+        bi_router_topk_weights(vals.to(torch.bfloat16))
 
 
-@requires_cuda
-@pytest.mark.gpu
-def test_moe_block_route_uses_structural_exact_contract():
+def _assert_moe_block_route_selects_exact_contract_or_default_path():
     # Exact MoEBlock routing must produce
     # router logits equal to the standalone contract kernel, and selection/
     # weights equal to the contract post-processing on those logits.
@@ -137,21 +105,27 @@ def test_moe_block_route_uses_structural_exact_contract():
     )
     hidden = (torch.randn(140, H, device="cuda") * 0.5).to(torch.bfloat16)
 
-    rw, sel, logits = block.route(hidden)
+    with torch.no_grad():
+        rw, sel, logits = block.route(hidden)
 
-    ref_logits = bi_router_gemm(hidden, block.gate.weight)
-    assert torch.equal(logits, ref_logits)
+        ref_logits = bi_router_gemm(hidden, block.gate.weight)
+        assert torch.equal(logits, ref_logits)
 
-    probs = torch.softmax(ref_logits, dim=1, dtype=torch.float)
-    ref_vals, ref_sel = torch.topk(probs, TOP_K, dim=-1)
-    ref_w = bi_router_topk_weights(ref_vals, True, torch.bfloat16)
-    assert torch.equal(sel, ref_sel)
-    assert torch.equal(rw, ref_w)
+        probs = torch.softmax(ref_logits, dim=1, dtype=torch.float)
+        ref_vals, ref_sel = torch.topk(probs, TOP_K, dim=-1)
+        ref_w = bi_router_topk_weights(ref_vals, True, torch.bfloat16)
+        assert torch.equal(sel, ref_sel)
+        assert torch.equal(rw, ref_w)
 
+        # Prove batch composition through the production router, not only the
+        # standalone GEMM helper.
+        sub_rw, sub_sel, sub_logits = block.route(hidden[:7].contiguous())
+        assert torch.equal(sub_logits, logits[:7])
+        assert torch.equal(sub_sel, sel[:7])
+        assert torch.equal(sub_rw, rw[:7])
 
-@requires_cuda
-@pytest.mark.gpu
-def test_moe_block_route_default_path_unchanged():
+    del block, rw, sel, logits, ref_logits, probs, ref_vals, ref_sel, ref_w
+
     # Ordinary models retain the stock gate GEMM; logits are bf16, not fp32.
     block = (
         MoEBlock(
@@ -165,5 +139,6 @@ def test_moe_block_route_default_path_unchanged():
         .to(torch.bfloat16)
     )
     hidden = (torch.randn(16, H, device="cuda") * 0.5).to(torch.bfloat16)
-    _, _, logits = block.route(hidden)
+    with torch.no_grad():
+        _, _, logits = block.route(hidden)
     assert logits.dtype == torch.bfloat16

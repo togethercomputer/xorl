@@ -134,115 +134,112 @@ def test_exact_attention_checkpoint_inventory_routes_only_absorbed_kv_b_through_
     assert len(trainable) == 10
     assert all(parameter.dtype is torch.float32 for parameter in trainable.values())
 
+    _assert_exact_absorbed_kv_b_checkpoint_pair_is_order_independent_and_byte_exact(checkpoint_case)
 
-@pytest.mark.parametrize("arrival_order", (("weight", "scale"), ("scale", "weight")))
-def test_exact_absorbed_kv_b_checkpoint_pair_is_order_independent_and_byte_exact(
+
+def _assert_exact_absorbed_kv_b_checkpoint_pair_is_order_independent_and_byte_exact(
     checkpoint_case: _CheckpointCase,
-    arrival_order: tuple[str, str],
 ) -> None:
     case = checkpoint_case
-    handler = _handler(case)
     values = {
         "weight": (f"{case.source}.weight", case.weight),
         "scale": (f"{case.source}.weight_scale_inv", case.scale),
     }
+    for arrival_order in (("weight", "scale"), ("scale", "weight")):
+        handler = _handler(case)
+        first_key, first_tensor = values[arrival_order[0]]
+        second_key, second_tensor = values[arrival_order[1]]
+        assert handler.on_load_weight(first_key, first_tensor) == []
+        emitted = handler.on_load_weight(second_key, second_tensor)
+        assert handler.on_load_complete() == []
 
-    first_key, first_tensor = values[arrival_order[0]]
-    second_key, second_tensor = values[arrival_order[1]]
-    assert handler.on_load_weight(first_key, first_tensor) == []
-    emitted = handler.on_load_weight(second_key, second_tensor)
-    assert handler.on_load_complete() == []
+        assert [name for name, _ in emitted] == [
+            f"{case.target}.packed_weight_f32",
+            f"{case.target}.weight_scale_inv",
+        ]
+        packed = emitted[0][1]
+        loaded_scale = emitted[1][1]
+        assert packed.dtype is torch.float32
+        assert torch.equal(packed.view(torch.uint8), case.weight.view(torch.uint8))
+        assert loaded_scale.dtype is torch.float32
+        assert torch.equal(loaded_scale, case.scale)
 
-    assert [name for name, _ in emitted] == [
-        f"{case.target}.packed_weight_f32",
-        f"{case.target}.weight_scale_inv",
-    ]
-    packed = emitted[0][1]
-    loaded_scale = emitted[1][1]
-    assert packed.dtype is torch.float32
-    assert torch.equal(packed.view(torch.uint8), case.weight.view(torch.uint8))
-    assert loaded_scale.dtype is torch.float32
-    assert torch.equal(loaded_scale, case.scale)
+    _assert_exact_absorbed_kv_b_checkpoint_pair_rejects_duplicate_members(checkpoint_case)
+    _assert_exact_absorbed_kv_b_checkpoint_pair_rejects_missing_members_at_completion(checkpoint_case)
+    _assert_exact_absorbed_kv_b_checkpoint_pair_rejects_dtype_mismatches(checkpoint_case)
+    _assert_exact_absorbed_kv_b_checkpoint_pair_rejects_shape_mismatches(checkpoint_case)
 
 
-@pytest.mark.parametrize("member", ("weight", "scale"))
-def test_exact_absorbed_kv_b_checkpoint_pair_rejects_duplicate_members(
+def _assert_exact_absorbed_kv_b_checkpoint_pair_rejects_duplicate_members(
     checkpoint_case: _CheckpointCase,
-    member: str,
 ) -> None:
     case = checkpoint_case
-    handler = _handler(case)
-    key, tensor = (
-        (f"{case.source}.weight", case.weight)
-        if member == "weight"
-        else (f"{case.source}.weight_scale_inv", case.scale)
-    )
+    for member in ("weight", "scale"):
+        handler = _handler(case)
+        key, tensor = (
+            (f"{case.source}.weight", case.weight)
+            if member == "weight"
+            else (f"{case.source}.weight_scale_inv", case.scale)
+        )
 
-    assert handler.on_load_weight(key, tensor) == []
-    with pytest.raises(ValueError, match="Duplicate native FP8 pair member"):
-        handler.on_load_weight(key, tensor)
+        assert handler.on_load_weight(key, tensor) == []
+        with pytest.raises(ValueError, match="Duplicate native FP8 pair member"):
+            handler.on_load_weight(key, tensor)
 
 
-@pytest.mark.parametrize("member", ("weight", "scale"))
-def test_exact_absorbed_kv_b_checkpoint_pair_rejects_missing_members_at_completion(
+def _assert_exact_absorbed_kv_b_checkpoint_pair_rejects_missing_members_at_completion(
     checkpoint_case: _CheckpointCase,
-    member: str,
 ) -> None:
     case = checkpoint_case
-    handler = _handler(case)
-    key, tensor = (
-        (f"{case.source}.weight", case.weight)
-        if member == "weight"
-        else (f"{case.source}.weight_scale_inv", case.scale)
-    )
+    for member in ("weight", "scale"):
+        handler = _handler(case)
+        key, tensor = (
+            (f"{case.source}.weight", case.weight)
+            if member == "weight"
+            else (f"{case.source}.weight_scale_inv", case.scale)
+        )
 
-    assert handler.on_load_weight(key, tensor) == []
-    with pytest.raises(ValueError, match="Incomplete native FP8 pairs"):
-        handler.on_load_complete()
+        assert handler.on_load_weight(key, tensor) == []
+        with pytest.raises(ValueError, match="Incomplete native FP8 pairs"):
+            handler.on_load_complete()
 
 
-@pytest.mark.parametrize(
-    ("bad_member", "bad_tensor", "message"),
-    (
+def _assert_exact_absorbed_kv_b_checkpoint_pair_rejects_dtype_mismatches(
+    checkpoint_case: _CheckpointCase,
+) -> None:
+    cases = (
         ("weight", torch.zeros(1, dtype=torch.bfloat16), "weight must be float8_e4m3fn"),
         ("scale", torch.zeros(1, dtype=torch.bfloat16), "weight_scale_inv must be FP32"),
-    ),
-)
-def test_exact_absorbed_kv_b_checkpoint_pair_rejects_dtype_mismatches(
-    checkpoint_case: _CheckpointCase,
-    bad_member: str,
-    bad_tensor: torch.Tensor,
-    message: str,
-) -> None:
-    case = checkpoint_case
-    handler = _handler(case)
-    good_member = "scale" if bad_member == "weight" else "weight"
-    good_key, good_tensor = (
-        (f"{case.source}.weight_scale_inv", case.scale)
-        if good_member == "scale"
-        else (f"{case.source}.weight", case.weight)
     )
-    bad_key = f"{case.source}.{'weight' if bad_member == 'weight' else 'weight_scale_inv'}"
+    case = checkpoint_case
+    for bad_member, bad_tensor, message in cases:
+        handler = _handler(case)
+        good_member = "scale" if bad_member == "weight" else "weight"
+        good_key, good_tensor = (
+            (f"{case.source}.weight_scale_inv", case.scale)
+            if good_member == "scale"
+            else (f"{case.source}.weight", case.weight)
+        )
+        bad_key = f"{case.source}.{'weight' if bad_member == 'weight' else 'weight_scale_inv'}"
 
-    assert handler.on_load_weight(good_key, good_tensor) == []
-    with pytest.raises((TypeError, ValueError), match=message):
-        handler.on_load_weight(bad_key, bad_tensor)
+        assert handler.on_load_weight(good_key, good_tensor) == []
+        with pytest.raises((TypeError, ValueError), match=message):
+            handler.on_load_weight(bad_key, bad_tensor)
 
 
-@pytest.mark.parametrize("bad_member", ("weight", "scale"))
-def test_exact_absorbed_kv_b_checkpoint_pair_rejects_shape_mismatches(
+def _assert_exact_absorbed_kv_b_checkpoint_pair_rejects_shape_mismatches(
     checkpoint_case: _CheckpointCase,
-    bad_member: str,
 ) -> None:
     case = checkpoint_case
-    handler = _handler(case)
-    if bad_member == "weight":
-        good_key, good_tensor = f"{case.source}.weight_scale_inv", case.scale
-        bad_key, bad_tensor = f"{case.source}.weight", case.weight[:-1]
-    else:
-        good_key, good_tensor = f"{case.source}.weight", case.weight
-        bad_key, bad_tensor = f"{case.source}.weight_scale_inv", case.scale[:-1]
+    for bad_member in ("weight", "scale"):
+        handler = _handler(case)
+        if bad_member == "weight":
+            good_key, good_tensor = f"{case.source}.weight_scale_inv", case.scale
+            bad_key, bad_tensor = f"{case.source}.weight", case.weight[:-1]
+        else:
+            good_key, good_tensor = f"{case.source}.weight", case.weight
+            bad_key, bad_tensor = f"{case.source}.weight_scale_inv", case.scale[:-1]
 
-    assert handler.on_load_weight(good_key, good_tensor) == []
-    with pytest.raises(ValueError, match="unexpected shape|must be FP32"):
-        handler.on_load_weight(bad_key, bad_tensor)
+        assert handler.on_load_weight(good_key, good_tensor) == []
+        with pytest.raises(ValueError, match="unexpected shape|must be FP32"):
+            handler.on_load_weight(bad_key, bad_tensor)

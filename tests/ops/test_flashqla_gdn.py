@@ -18,18 +18,14 @@ pytestmark = [
 def _flashqla_chunk_or_skip():
     if torch.cuda.get_device_capability() != (9, 0):
         pytest.skip("FlashQLA requires a Hopper (SM90) GPU")
-    try:
-        import tilelang.language as tl  # noqa: PLC0415
+    import tilelang.language as tl  # noqa: PLC0415
 
-        if "prefer_instruction" not in inspect.signature(tl.copy).parameters:
-            pytest.skip("tilelang lacks the required prefer_instruction support")
-        from xorl.ops.linear_attention.flashqla import (  # noqa: PLC0415
-            chunk_gated_delta_rule,
-        )
-    except pytest.skip.Exception:
-        raise
-    except Exception as exc:
-        pytest.skip(f"FlashQLA backend unavailable: {exc}")
+    if "prefer_instruction" not in inspect.signature(tl.copy).parameters:
+        pytest.skip("tilelang lacks the required prefer_instruction support")
+    from xorl.ops.linear_attention.flashqla import (  # noqa: PLC0415
+        chunk_gated_delta_rule,
+    )
+
     return chunk_gated_delta_rule
 
 
@@ -51,8 +47,7 @@ def _inputs(num_heads: int, *, requires_grad: bool):
     return q, k, v, g, beta
 
 
-@pytest.mark.parametrize("num_heads", [4, 32])
-def test_flashqla_matches_fla_forward(num_heads):
+def _assert_flashqla_matches_fla_forward(num_heads):
     flashqla_chunk = _flashqla_chunk_or_skip()
     q, k, v, g, beta = _inputs(num_heads, requires_grad=False)
     kwargs = {
@@ -73,24 +68,26 @@ def test_flashqla_matches_fla_forward(num_heads):
     assert _cosine(fla_state, flashqla_state) > 0.99
 
 
-@pytest.mark.parametrize("num_heads", [4, 32])
-def test_flashqla_matches_fla_backward(num_heads):
-    flashqla_chunk = _flashqla_chunk_or_skip()
-    gradients = {}
-    for name, implementation in (("fla", fla_chunk), ("flashqla", flashqla_chunk)):
-        q, k, v, g, beta = _inputs(num_heads, requires_grad=True)
-        output, _ = implementation(
-            q=q,
-            k=k,
-            v=v,
-            g=g,
-            beta=beta,
-            output_final_state=False,
-            use_qk_l2norm_in_kernel=True,
-        )
-        output.float().square().mean().backward()
-        gradients[name] = (q.grad, k.grad, v.grad, g.grad, beta.grad)
+def test_flashqla_forward_and_backward_match_fla():
+    for num_heads in (4, 32):
+        _assert_flashqla_matches_fla_forward(num_heads)
 
-    for reference, actual in zip(gradients["fla"], gradients["flashqla"]):
-        assert actual is not None and torch.isfinite(actual).all()
-        assert _cosine(reference, actual) > 0.97
+        flashqla_chunk = _flashqla_chunk_or_skip()
+        gradients = {}
+        for name, implementation in (("fla", fla_chunk), ("flashqla", flashqla_chunk)):
+            q, k, v, g, beta = _inputs(num_heads, requires_grad=True)
+            output, _ = implementation(
+                q=q,
+                k=k,
+                v=v,
+                g=g,
+                beta=beta,
+                output_final_state=False,
+                use_qk_l2norm_in_kernel=True,
+            )
+            output.float().square().mean().backward()
+            gradients[name] = (q.grad, k.grad, v.grad, g.grad, beta.grad)
+
+        for reference, actual in zip(gradients["fla"], gradients["flashqla"]):
+            assert actual is not None and torch.isfinite(actual).all(), num_heads
+            assert _cosine(reference, actual) > 0.97, num_heads

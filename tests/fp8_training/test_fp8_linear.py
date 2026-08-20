@@ -1,5 +1,6 @@
 import json
 import warnings
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -11,6 +12,8 @@ from xorl.fp8_training import (
     clear_linear_error_profile,
     get_linear_error_profile,
     inject_fp8_training_into_model,
+    resolve_fp8_bf16_layer_islands,
+    summarize_fp8_training_model,
 )
 
 
@@ -61,8 +64,9 @@ class TinyModel(nn.Module):
 
 
 class TinyTransformerBlock(nn.Module):
-    def __init__(self):
+    def __init__(self, num_layers: int = 1):
         super().__init__()
+        self.config = SimpleNamespace(num_hidden_layers=num_layers)
         self.model = nn.Module()
         self.model.layers = nn.ModuleList(
             [
@@ -82,12 +86,19 @@ class TinyTransformerBlock(nn.Module):
                         ),
                     }
                 )
+                for _ in range(num_layers)
             ]
         )
         self.lm_head = nn.Linear(16, 8, bias=False)
 
+    def get_pp_module_config(self):
+        return {
+            "layer_prefix": "model.layers",
+            "num_layers": self.config.num_hidden_layers,
+        }
 
-def test_inject_fp8_training_replaces_all_linears_by_default_and_preserves_parameters():
+
+def test_inject_fp8_training_policy():
     model = TinyModel()
     original_weight = model.proj.weight
     replaced = inject_fp8_training_into_model(model)
@@ -101,8 +112,47 @@ def test_inject_fp8_training_replaces_all_linears_by_default_and_preserves_param
     assert model.lm_head.fp8_output_dtype == "float32"
     assert "proj.weight" in model.state_dict()
 
+    _assert_injected_modules_are_tagged_with_fqns()
+    _assert_inject_fp8_training_recipe_policy()
+    _assert_inject_fp8_training_exclusion_policy()
+    _assert_fp8_bf16_layer_island_policy()
+    _assert_fp8_linear_cpu_fallback_policy()
 
-def test_inject_fp8_training_tags_replaced_modules_with_fqns():
+
+def _assert_fp8_bf16_layer_island_policy():
+    model = TinyTransformerBlock(num_layers=4)
+
+    assert resolve_fp8_bf16_layer_islands(
+        model,
+        num_first_layers_bf16=1,
+        num_last_layers_bf16=2,
+    ) == [
+        "model.layers.0.*",
+        "model.layers.2.*",
+        "model.layers.3.*",
+    ]
+    with pytest.raises(ValueError, match="exceeds model layer count"):
+        resolve_fp8_bf16_layer_islands(model, num_first_layers_bf16=5)
+
+    replaced = inject_fp8_training_into_model(
+        model,
+        num_first_layers_bf16=1,
+        num_last_layers_bf16=1,
+    )
+
+    assert replaced == 9
+    assert not isinstance(model.model.layers[0]["self_attn"]["qkv_proj"], FP8Linear)
+    assert isinstance(model.model.layers[1]["self_attn"]["qkv_proj"], FP8Linear)
+    assert isinstance(model.model.layers[2]["mlp"]["down_proj"], FP8Linear)
+    assert not isinstance(model.model.layers[3]["mlp"]["down_proj"], FP8Linear)
+    assert isinstance(model.lm_head, FP8Linear)
+
+    summary = summarize_fp8_training_model(model)
+    assert summary["bf16_layer_island_patterns"] == ["model.layers.0.*", "model.layers.3.*"]
+    assert summary["bf16_layer_island_count"] == 2
+
+
+def _assert_injected_modules_are_tagged_with_fqns():
     model = TinyTransformerBlock()
 
     inject_fp8_training_into_model(model)
@@ -112,7 +162,7 @@ def test_inject_fp8_training_tags_replaced_modules_with_fqns():
     assert model.lm_head.fp8_module_name == "lm_head"
 
 
-def test_inject_fp8_training_threads_amax_scale_recipe():
+def _assert_inject_fp8_training_recipe_policy():
     model = TinyModel()
 
     inject_fp8_training_into_model(model, activation_amax_scale=0.875, weight_amax_scale=1.125)
@@ -122,8 +172,11 @@ def test_inject_fp8_training_threads_amax_scale_recipe():
     assert model.lm_head.fp8_activation_amax_scale == 0.875
     assert model.lm_head.fp8_weight_amax_scale == 1.125
 
+    _assert_fqn_module_recipe_overrides_are_applied()
+    _assert_unknown_module_recipe_override_key_is_rejected()
 
-def test_inject_fp8_training_applies_fqn_module_recipe_overrides():
+
+def _assert_fqn_module_recipe_overrides_are_applied():
     model = TinyTransformerBlock()
 
     inject_fp8_training_into_model(
@@ -157,7 +210,7 @@ def test_inject_fp8_training_applies_fqn_module_recipe_overrides():
     assert model.lm_head.fp8_output_dtype == "float32"
 
 
-def test_inject_fp8_training_rejects_unknown_module_recipe_override_key():
+def _assert_unknown_module_recipe_override_key_is_rejected():
     model = TinyModel()
 
     with pytest.raises(ValueError, match="Unsupported FP8 module override key"):
@@ -167,7 +220,7 @@ def test_inject_fp8_training_rejects_unknown_module_recipe_override_key():
         )
 
 
-def test_inject_fp8_training_can_keep_explicit_exclusions_in_bf16():
+def _assert_inject_fp8_training_exclusion_policy():
     model = TinyModel()
 
     replaced = inject_fp8_training_into_model(model, exclude_modules=["gate", "lm_head"])
@@ -179,8 +232,10 @@ def test_inject_fp8_training_can_keep_explicit_exclusions_in_bf16():
     assert isinstance(model.lm_head, nn.Linear)
     assert not isinstance(model.lm_head, FP8Linear)
 
+    _assert_fqn_glob_exclusions_are_honored()
 
-def test_inject_fp8_training_honors_fqn_glob_exclusions():
+
+def _assert_fqn_glob_exclusions_are_honored():
     model = TinyTransformerBlock()
 
     replaced = inject_fp8_training_into_model(model, exclude_modules=["model.layers.*.self_attn.*"])
@@ -195,7 +250,7 @@ def test_inject_fp8_training_honors_fqn_glob_exclusions():
     assert isinstance(model.lm_head, FP8Linear)
 
 
-def test_fp8_linear_cpu_fallback_matches_linear():
+def _assert_fp8_linear_cpu_fallback_policy():
     torch.manual_seed(0)
     linear = nn.Linear(16, 32, dtype=torch.float32)
     fp8 = FP8Linear.from_linear(linear)
@@ -207,8 +262,11 @@ def test_fp8_linear_cpu_fallback_matches_linear():
     assert fp8.last_forward_used_fp8 is False
     assert torch.allclose(got, expected)
 
+    _assert_cpu_fallback_honors_float32_output_dtype()
+    _assert_fp8_linear_can_fail_fast_without_fallback()
 
-def test_fp8_linear_cpu_fallback_honors_float32_output_dtype():
+
+def _assert_cpu_fallback_honors_float32_output_dtype():
     linear = nn.Linear(16, 32, dtype=torch.bfloat16)
     fp8 = FP8Linear.from_linear(linear, output_dtype="float32")
     x = torch.randn(4, 16, dtype=torch.bfloat16)
@@ -219,7 +277,7 @@ def test_fp8_linear_cpu_fallback_honors_float32_output_dtype():
     assert got.dtype == torch.float32
 
 
-def test_fp8_linear_can_fail_fast_without_fallback():
+def _assert_fp8_linear_can_fail_fast_without_fallback():
     linear = nn.Linear(16, 32)
     fp8 = FP8Linear.from_linear(linear, allow_bf16_fallback=False)
 
@@ -227,7 +285,7 @@ def test_fp8_linear_can_fail_fast_without_fallback():
         fp8(torch.randn(2, 16))
 
 
-def test_fp8_linear_error_profiler_records_sampled_module_stats(monkeypatch, tmp_path):
+def test_fp8_linear_error_profiler_sampling_policy(monkeypatch, tmp_path):
     from xorl.fp8_training.profiler import record_linear_error, write_linear_error_profile  # noqa: PLC0415
 
     clear_linear_error_profile()
@@ -279,8 +337,13 @@ def test_fp8_linear_error_profiler_records_sampled_module_stats(monkeypatch, tmp
     assert json.loads(output_path.read_text())["tiny.proj"]["calls"] == 2
     clear_linear_error_profile()
 
+    monkeypatch.delenv("XORL_FP8_LINEAR_ERROR_PROFILE_MAX_CALLS_PER_MODULE")
+    monkeypatch.delenv("XORL_FP8_LINEAR_ERROR_PROFILE_OUTPUT")
+    _assert_error_profiler_samples_explicit_flattened_rows(monkeypatch)
+    _assert_error_profiler_samples_module_specific_call_rows(monkeypatch)
 
-def test_fp8_linear_error_profiler_samples_explicit_flattened_rows(monkeypatch):
+
+def _assert_error_profiler_samples_explicit_flattened_rows(monkeypatch):
     from xorl.fp8_training.profiler import record_linear_error  # noqa: PLC0415
 
     clear_linear_error_profile()
@@ -312,7 +375,7 @@ def test_fp8_linear_error_profiler_samples_explicit_flattened_rows(monkeypatch):
     clear_linear_error_profile()
 
 
-def test_fp8_linear_error_profiler_samples_module_specific_call_rows(monkeypatch):
+def _assert_error_profiler_samples_module_specific_call_rows(monkeypatch):
     from xorl.fp8_training.profiler import record_linear_error  # noqa: PLC0415
 
     clear_linear_error_profile()
@@ -347,9 +410,7 @@ def test_fp8_linear_error_profiler_samples_module_specific_call_rows(monkeypatch
     clear_linear_error_profile()
 
 
-@pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_fp8_linear_error_profiler_records_cuda_operand_breakdown(monkeypatch):
+def _assert_fp8_linear_error_profiler_records_cuda_operand_breakdown(monkeypatch):
     clear_linear_error_profile()
     monkeypatch.setenv("XORL_FP8_LINEAR_ERROR_PROFILE", "1")
     monkeypatch.setenv("XORL_FP8_LINEAR_ERROR_PROFILE_MAX_CALLS_PER_MODULE", "1")
@@ -393,10 +454,7 @@ def test_fp8_linear_error_profiler_records_cuda_operand_breakdown(monkeypatch):
     clear_linear_error_profile()
 
 
-@pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("block_size", [64, 128])
-def test_block_fp8_gemm_matches_explicit_dequantized_reference(block_size):
+def _assert_block_fp8_gemm_matches_explicit_dequantized_reference(block_size):
     from xorl.ops.quantize import (  # noqa: PLC0415
         block_fp8_dequantize,
         block_fp8_dequantize_gkn,
@@ -417,13 +475,23 @@ def test_block_fp8_gemm_matches_explicit_dequantized_reference(block_size):
     b_dequant = block_fp8_dequantize_gkn(b_fp8, b_scales, block_size=block_size)
     expected = a_dequant @ b_dequant.T
 
+    assert (a - a_dequant).abs().mean() / a.abs().mean() < 0.03
+    assert (b - b_dequant).abs().mean() / b.abs().mean() < 0.03
     torch.testing.assert_close(got, expected, rtol=2e-3, atol=2e-3)
 
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize("block_size", [64, 128])
-def test_block_fp8_gemm_rowwise_weight_scales_match_explicit_dequantized_reference(block_size):
+def test_block_fp8_gemm_backend_and_scale_layout_policy(monkeypatch):
+    for block_size in (64, 128):
+        _assert_block_fp8_gemm_matches_explicit_dequantized_reference(block_size)
+
+    _assert_block_fp8_gemm_rowwise_weight_scales_match_reference_policy()
+    _assert_block_fp8_gemm_torch_scaled_mm_backend_matches_reference()
+    _assert_block_fp8_gemm_auto_fallback_warns_once(monkeypatch)
+
+
+def _assert_block_fp8_gemm_rowwise_weight_scales_match_reference(block_size):
     from xorl.ops.quantize import (  # noqa: PLC0415
         block_fp8_dequantize,
         block_fp8_dequantize_gkn_rowwise,
@@ -454,9 +522,12 @@ def test_block_fp8_gemm_rowwise_weight_scales_match_explicit_dequantized_referen
     torch.testing.assert_close(got, expected, rtol=2e-3, atol=2e-3)
 
 
-@pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_block_fp8_gemm_torch_scaled_mm_backend_matches_explicit_dequantized_reference():
+def _assert_block_fp8_gemm_rowwise_weight_scales_match_reference_policy():
+    for block_size in (64, 128):
+        _assert_block_fp8_gemm_rowwise_weight_scales_match_reference(block_size)
+
+
+def _assert_block_fp8_gemm_torch_scaled_mm_backend_matches_reference():
     from xorl.ops.quantize import (  # noqa: PLC0415
         block_fp8_dequantize,
         block_fp8_dequantize_gkn_rowwise,
@@ -488,9 +559,7 @@ def test_block_fp8_gemm_torch_scaled_mm_backend_matches_explicit_dequantized_ref
     torch.testing.assert_close(got, expected, rtol=2e-3, atol=2e-3)
 
 
-@pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_block_fp8_gemm_auto_fallback_warns_once(monkeypatch):
+def _assert_block_fp8_gemm_auto_fallback_warns_once(monkeypatch):
     import importlib  # noqa: PLC0415
 
     from xorl.ops.quantize import (  # noqa: PLC0415
@@ -534,19 +603,7 @@ def test_block_fp8_gemm_auto_fallback_warns_once(monkeypatch):
     torch.testing.assert_close(first, second)
 
 
-@pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-@pytest.mark.parametrize(
-    ("block_size", "smoothquant_alpha", "activation_amax_scale", "weight_amax_scale"),
-    [
-        (64, None, 1.0, 1.0),
-        (128, None, 1.0, 1.0),
-        (128, 0.5, 1.0, 1.0),
-        (64, 0.4, 0.875, 1.0),
-        (64, 0.4, 1.0, 1.125),
-    ],
-)
-def test_fp8_linear_matmul_padding_matches_explicit_dequantized_reference(
+def _assert_fp8_linear_matmul_padding_matches_reference(
     block_size,
     smoothquant_alpha,
     activation_amax_scale,
@@ -584,7 +641,24 @@ def test_fp8_linear_matmul_padding_matches_explicit_dequantized_reference(
 
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_fp8_linear_full_residual_correction_reduces_forward_error():
+def test_fp8_linear_matmul_and_train_step_policy(monkeypatch):
+    for recipe in (
+        (64, None, 1.0, 1.0),
+        (128, None, 1.0, 1.0),
+        (128, 0.5, 1.0, 1.0),
+        (64, 0.4, 0.875, 1.0),
+        (64, 0.4, 1.0, 1.125),
+    ):
+        _assert_fp8_linear_matmul_padding_matches_reference(*recipe)
+
+    _assert_fp8_linear_full_residual_correction_reduces_forward_error()
+    _assert_fp8_linear_activation2_reduces_activation_quantization_error()
+    _assert_fp8_linear_cuda_train_step_updates_master_weight()
+    with monkeypatch.context() as case_patch:
+        _assert_fp8_linear_error_profiler_records_cuda_operand_breakdown(case_patch)
+
+
+def _assert_fp8_linear_full_residual_correction_reduces_forward_error():
     from xorl.fp8_training.linear import _fp8_matmul  # noqa: PLC0415
 
     torch.manual_seed(11)
@@ -613,9 +687,7 @@ def test_fp8_linear_full_residual_correction_reduces_forward_error():
     assert corrected_error < base_error * 0.25
 
 
-@pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_fp8_linear_activation2_reduces_activation_quantization_error():
+def _assert_fp8_linear_activation2_reduces_activation_quantization_error():
     from xorl.fp8_training.linear import _apply_smoothquant, _fp8_matmul, _pad_last_dim  # noqa: PLC0415
     from xorl.ops.quantize import block_fp8_dequantize_gkn_rowwise, block_fp8_quantize_gkn_rowwise  # noqa: PLC0415
 
@@ -651,9 +723,7 @@ def test_fp8_linear_activation2_reduces_activation_quantization_error():
     assert activation2_error < activation_error * 0.5
 
 
-@pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_fp8_linear_cuda_train_step_updates_master_weight():
+def _assert_fp8_linear_cuda_train_step_updates_master_weight():
     torch.manual_seed(0)
     linear = nn.Linear(128, 128, device="cuda", dtype=torch.bfloat16)
     fp8 = FP8Linear.from_linear(linear, backward_mode="fp8", allow_bf16_fallback=False)
@@ -672,10 +742,10 @@ def test_fp8_linear_cuda_train_step_updates_master_weight():
     assert torch.isfinite(fp8.weight.grad.float()).all()
     assert not torch.equal(fp8.weight.detach(), before)
 
+    _assert_cuda_float32_output_dtype_still_uses_fp8()
 
-@pytest.mark.gpu
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
-def test_fp8_linear_cuda_float32_output_dtype_still_uses_fp8():
+
+def _assert_cuda_float32_output_dtype_still_uses_fp8():
     linear = nn.Linear(128, 128, device="cuda", dtype=torch.bfloat16)
     fp8 = FP8Linear.from_linear(linear, output_dtype="float32", allow_bf16_fallback=False)
     x = torch.randn(8, 128, device="cuda", dtype=torch.bfloat16)

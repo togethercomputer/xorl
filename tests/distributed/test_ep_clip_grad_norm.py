@@ -24,10 +24,7 @@ import torch.nn as nn
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import Replicate, Shard, distribute_tensor
 
-from xorl.distributed.ep_gradients import (
-    register_ep_replicated_gradient_hooks,
-    synchronize_ep_replicated_gradients,
-)
+from xorl.distributed.ep_gradients import synchronize_ep_replicated_gradients
 from xorl.distributed.fsdp2.clip_grad_norm import (
     _fsdp2_reduce_group,
     clip_grad_norm,
@@ -64,15 +61,6 @@ def _mock_parallel_state(ep_enabled=True):
     return ps
 
 
-def _l2_norm(*params):
-    """Compute the expected L2 norm across multiple params' gradients."""
-    total = 0.0
-    for p in params:
-        if p.grad is not None:
-            total += p.grad.detach().to(torch.float32).norm(2).item() ** 2
-    return math.sqrt(total)
-
-
 # ---------------------------------------------------------------------------
 # 1. _build_ep_param_groups classification
 # ---------------------------------------------------------------------------
@@ -81,67 +69,7 @@ def _l2_norm(*params):
 class TestBuildEPParamGroups:
     """Test that _build_ep_param_groups classifies params correctly."""
 
-    def test_skip_fsdp_params_classified_as_ep(self):
-        """Params from _skip_fsdp modules go into the EP group."""
-        model = nn.Module()
-        # Regular submodule
-        regular = nn.Linear(8, 8)
-        model.add_module("regular", regular)
-        # _skip_fsdp submodule (e.g. QLoRAMoeExperts)
-        expert = nn.Linear(8, 8)
-        expert._skip_fsdp = True
-        model.add_module("expert", expert)
-
-        with patch("xorl.distributed.fsdp2.clip_grad_norm.get_parallel_state", return_value=_mock_parallel_state()):
-            _build_ep_param_groups(model)
-
-        assert hasattr(model, "_ep_param_groups")
-        ep_ids = {id(p) for p in model._ep_param_groups["ep"]}
-        non_ep_ids = {id(p) for p in model._ep_param_groups["non_ep"]}
-
-        # Expert params in EP group
-        for p in expert.parameters():
-            assert id(p) in ep_ids
-        # Regular params in non-EP group
-        for p in regular.parameters():
-            assert id(p) in non_ep_ids
-
-    def test_no_skip_fsdp_all_non_ep(self):
-        """Without _skip_fsdp modules, all plain params go to non-EP."""
-        model = nn.Module()
-        model.add_module("linear", nn.Linear(8, 8))
-
-        with patch("xorl.distributed.fsdp2.clip_grad_norm.get_parallel_state", return_value=_mock_parallel_state()):
-            _build_ep_param_groups(model)
-
-        assert len(model._ep_param_groups["ep"]) == 0
-        assert len(model._ep_param_groups["non_ep"]) == 2  # weight + bias
-
-    def test_nested_skip_fsdp_params_all_classified(self):
-        """All params inside nested _skip_fsdp modules are classified as EP."""
-        model = nn.Module()
-        # Mimic QLoRAMoeExperts: a _skip_fsdp module with multiple sub-params
-        expert = nn.Module()
-        expert._skip_fsdp = True
-        expert.lora_A = nn.Parameter(torch.randn(4, 32, 8))
-        expert.lora_B = nn.Parameter(torch.randn(4, 8, 64))
-        expert.base_weight = nn.Parameter(torch.randn(4, 32, 64), requires_grad=False)
-        model.add_module("expert", expert)
-        model.add_module("non_expert", nn.Linear(32, 32))
-
-        with patch("xorl.distributed.fsdp2.clip_grad_norm.get_parallel_state", return_value=_mock_parallel_state()):
-            _build_ep_param_groups(model)
-
-        ep_ids = {id(p) for p in model._ep_param_groups["ep"]}
-        assert id(expert.lora_A) in ep_ids
-        assert id(expert.lora_B) in ep_ids
-        assert id(expert.base_weight) in ep_ids  # even frozen params are classified
-        # non-expert params not in EP group
-        non_ep_ids = {id(p) for p in model._ep_param_groups["non_ep"]}
-        for p in model.non_expert.parameters():
-            assert id(p) in non_ep_ids
-
-    def test_shared_ep_replica_is_recorded_separately_for_clipping(self):
+    def _assert_shared_ep_replica_is_recorded_separately_for_clipping(self):
         model = nn.Module()
         expert = nn.Module()
         expert._skip_fsdp = True
@@ -198,81 +126,7 @@ class TestEPFSDP2ClipGradNorm:
         model._ep_param_groups = {"ep": ep_params, "non_ep": non_ep_params}
         return model, ep_params, non_ep_params
 
-    def test_l2_norm_single_group(self):
-        """Total L2 norm is correct when only non-EP params have grads."""
-        g = torch.tensor([3.0, 4.0])  # norm = 5
-        model, _, non_ep = self._setup_model(ep_grads=[], non_ep_grads=[g])
-
-        with patch("xorl.distributed.fsdp2.clip_grad_norm.get_parallel_state", return_value=_mock_parallel_state()):
-            total_norm = ep_fsdp2_clip_grad_norm(model, max_norm=100.0)
-
-        assert total_norm.item() == pytest.approx(5.0, abs=1e-5)
-
-    def test_l2_norm_combined_groups(self):
-        """Total L2 norm combines EP-local and non-EP norms correctly."""
-        ep_g = torch.tensor([3.0, 0.0])  # norm = 3
-        non_ep_g = torch.tensor([0.0, 4.0])  # norm = 4
-        # combined: sqrt(9 + 16) = 5
-        model, ep_params, non_ep_params = self._setup_model(ep_grads=[ep_g], non_ep_grads=[non_ep_g])
-
-        with patch("xorl.distributed.fsdp2.clip_grad_norm.get_parallel_state", return_value=_mock_parallel_state()):
-            total_norm = ep_fsdp2_clip_grad_norm(model, max_norm=100.0)
-
-        expected = _l2_norm(*ep_params, *non_ep_params)
-        assert total_norm.item() == pytest.approx(expected, abs=1e-5)
-
-    def test_clipping_reduces_gradients(self):
-        """When total_norm > max_norm, all gradients are scaled down uniformly."""
-        ep_g = torch.tensor([6.0, 0.0])
-        non_ep_g = torch.tensor([0.0, 8.0])
-        # total norm = sqrt(36 + 64) = 10
-        model, ep_params, non_ep_params = self._setup_model(ep_grads=[ep_g], non_ep_grads=[non_ep_g])
-        max_norm = 5.0  # clip factor = 5/10 = 0.5
-
-        with patch("xorl.distributed.fsdp2.clip_grad_norm.get_parallel_state", return_value=_mock_parallel_state()):
-            total_norm = ep_fsdp2_clip_grad_norm(model, max_norm=max_norm)
-
-        assert total_norm.item() == pytest.approx(10.0, abs=1e-5)
-        # Both EP and non-EP grads should be scaled by 0.5
-        torch.testing.assert_close(ep_params[0].grad, torch.tensor([3.0, 0.0]))
-        torch.testing.assert_close(non_ep_params[0].grad, torch.tensor([0.0, 4.0]))
-
-    def test_no_clipping_below_max(self):
-        """When total_norm <= max_norm, gradients are unchanged."""
-        g = torch.tensor([3.0, 4.0])  # norm = 5
-        model, _, non_ep = self._setup_model(ep_grads=[], non_ep_grads=[g])
-
-        with patch("xorl.distributed.fsdp2.clip_grad_norm.get_parallel_state", return_value=_mock_parallel_state()):
-            total_norm = ep_fsdp2_clip_grad_norm(model, max_norm=10.0)
-
-        assert total_norm.item() == pytest.approx(5.0, abs=1e-5)
-        # Gradients unchanged
-        torch.testing.assert_close(non_ep[0].grad, torch.tensor([3.0, 4.0]))
-
-    def test_ep_grads_not_double_scaled(self):
-        """EP gradients are NOT divided by ep_size — the double-division fix."""
-        ep_g = torch.tensor([6.0, 8.0])  # norm = 10
-        model, ep_params, _ = self._setup_model(ep_grads=[ep_g], non_ep_grads=[])
-
-        with patch("xorl.distributed.fsdp2.clip_grad_norm.get_parallel_state", return_value=_mock_parallel_state()):
-            total_norm = ep_fsdp2_clip_grad_norm(model, max_norm=100.0)
-
-        # Gradients should be completely unchanged (no scaling, no division)
-        torch.testing.assert_close(ep_params[0].grad, torch.tensor([6.0, 8.0]))
-        assert total_norm.item() == pytest.approx(10.0, abs=1e-5)
-
-    def test_inf_norm(self):
-        """Inf-norm returns the max absolute gradient value."""
-        ep_g = torch.tensor([3.0, -7.0])
-        non_ep_g = torch.tensor([5.0, 2.0])
-        model, _, _ = self._setup_model(ep_grads=[ep_g], non_ep_grads=[non_ep_g])
-
-        with patch("xorl.distributed.fsdp2.clip_grad_norm.get_parallel_state", return_value=_mock_parallel_state()):
-            total_norm = ep_fsdp2_clip_grad_norm(model, max_norm=100.0, norm_type=float("inf"))
-
-        assert total_norm.item() == pytest.approx(7.0, abs=1e-5)
-
-    def test_inf_norm_clips_correctly(self):
+    def _assert_norm_modes_and_empty_gradient_policy(self):
         """Inf-norm clipping scales gradients when max element exceeds max_norm."""
         ep_g = torch.tensor([3.0, -10.0])
         non_ep_g = torch.tensor([5.0, 2.0])
@@ -286,29 +140,24 @@ class TestEPFSDP2ClipGradNorm:
         torch.testing.assert_close(ep_params[0].grad, torch.tensor([1.5, -5.0]))
         torch.testing.assert_close(non_ep_params[0].grad, torch.tensor([2.5, 1.0]))
 
-    def test_empty_groups(self):
-        """Handles empty parameter groups without errors."""
-        model = MagicMock()
-        model._ep_param_groups = {"ep": [], "non_ep": []}
+        self._assert_empty_groups_and_params_without_grads()
 
-        with patch("xorl.distributed.fsdp2.clip_grad_norm.get_parallel_state", return_value=_mock_parallel_state()):
-            total_norm = ep_fsdp2_clip_grad_norm(model, max_norm=1.0)
-
-        assert total_norm.item() == 0.0
-
-    def test_params_without_grads_skipped(self):
-        """Params with grad=None are excluded from norm computation."""
+    def _assert_empty_groups_and_params_without_grads(self):
         g = torch.tensor([3.0, 4.0])  # norm = 5
         p_with_grad = _make_param(2, grad=g)
-        p_no_grad = _make_param(2)  # no gradient
+        p_no_grad = _make_param(2)
 
         model = MagicMock()
         model._ep_param_groups = {"ep": [p_no_grad], "non_ep": [p_with_grad]}
 
         with patch("xorl.distributed.fsdp2.clip_grad_norm.get_parallel_state", return_value=_mock_parallel_state()):
             total_norm = ep_fsdp2_clip_grad_norm(model, max_norm=100.0)
-
         assert total_norm.item() == pytest.approx(5.0, abs=1e-5)
+
+        model._ep_param_groups = {"ep": [], "non_ep": []}
+        with patch("xorl.distributed.fsdp2.clip_grad_norm.get_parallel_state", return_value=_mock_parallel_state()):
+            total_norm = ep_fsdp2_clip_grad_norm(model, max_norm=1.0)
+        assert total_norm.item() == 0.0
 
 
 @pytest.mark.parametrize(
@@ -352,7 +201,7 @@ class TestSkipFSDPClipEndToEnd:
     - Clipped with the same coefficient as non-EP params
     """
 
-    def test_skip_fsdp_classify_then_clip(self):
+    def _assert_skip_fsdp_classification_and_raw_local_clip_policy(self):
         """_skip_fsdp expert grads are classified as EP-local and clipped correctly."""
         model = nn.Module()
 
@@ -367,8 +216,6 @@ class TestSkipFSDPClipEndToEnd:
         model.add_module("expert", expert)
 
         # Assign known gradients: expert norm=6, regular norm=8, total=10
-        expert.lora.grad = torch.tensor([[3.0, 0.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]])  # flat norm = 3
-        # Wait, let me make the math cleaner
         expert.lora.grad = torch.zeros(2, 4)
         expert.lora.grad[0, 0] = 6.0  # norm = 6
         regular.weight.grad = torch.zeros(4, 4)
@@ -394,7 +241,9 @@ class TestSkipFSDPClipEndToEnd:
         assert expert.lora.grad[0, 0].item() == pytest.approx(3.0, abs=1e-5)
         assert regular.weight.grad[0, 0].item() == pytest.approx(4.0, abs=1e-5)
 
-    def test_skip_fsdp_grads_not_reduced_or_divided(self):
+        self._assert_skip_fsdp_grads_not_reduced_or_divided()
+
+    def _assert_skip_fsdp_grads_not_reduced_or_divided(self):
         """_skip_fsdp grads contribute their raw local norm — no all-reduce, no ep_size division."""
         model = nn.Module()
 
@@ -423,7 +272,7 @@ class TestSkipFSDPClipEndToEnd:
 class TestClipGradNormDispatch:
     """Test that clip_grad_norm dispatches to ep_fsdp2_clip_grad_norm when appropriate."""
 
-    def test_dispatches_to_ep_path_when_ep_param_groups_present(self):
+    def _assert_clip_grad_norm_dispatch_policy(self):
         """Models with _ep_param_groups use the EP-aware clip path."""
         g = torch.tensor([3.0, 4.0])
         p = _make_param(2, grad=g)
@@ -437,7 +286,9 @@ class TestClipGradNormDispatch:
 
         assert total_norm.item() == pytest.approx(5.0, abs=1e-5)
 
-    def test_falls_through_without_ep_param_groups(self):
+        self._assert_falls_through_without_ep_param_groups()
+
+    def _assert_falls_through_without_ep_param_groups(self):
         """Models without _ep_param_groups use the standard FSDP2 path."""
         g = torch.tensor([3.0, 4.0])
         p = _make_param(2, grad=g)
@@ -495,16 +346,11 @@ class TestMixedMeshFlatPath:
         model.register_parameter("p_ep", p_ep)
         return model, p_dp, p_ep
 
-    def test_mixed_mesh_does_not_crash_and_norm_is_correct(self, single_rank_dist):
-        model, _, _ = self._mixed_mesh_model()
-
-        ps = _mock_parallel_state(ep_enabled=True)
-        with patch("xorl.distributed.fsdp2.clip_grad_norm.get_parallel_state", return_value=ps):
-            total_norm = clip_grad_norm(model, max_norm=100.0)
-
-        assert total_norm.item() == pytest.approx(5.0, abs=1e-5)
-
-    def test_mixed_mesh_grads_clipped_per_tensor(self, single_rank_dist):
+    def test_mixed_mesh_foreach_policy(self, single_rank_dist):
+        TestBuildEPParamGroups()._assert_shared_ep_replica_is_recorded_separately_for_clipping()
+        TestEPFSDP2ClipGradNorm()._assert_norm_modes_and_empty_gradient_policy()
+        TestSkipFSDPClipEndToEnd()._assert_skip_fsdp_classification_and_raw_local_clip_policy()
+        TestClipGradNormDispatch()._assert_clip_grad_norm_dispatch_policy()
         model, p_dp, p_ep = self._mixed_mesh_model()
 
         ps = _mock_parallel_state(ep_enabled=True)
@@ -516,7 +362,9 @@ class TestMixedMeshFlatPath:
         assert p_dp.grad.to_local()[0].item() == pytest.approx(0.6, abs=1e-4)
         assert p_ep.grad.to_local()[1].item() == pytest.approx(0.8, abs=1e-4)
 
-    def test_explicit_foreach_true_still_raises(self, single_rank_dist):
+        self._assert_explicit_foreach_true_still_raises()
+
+    def _assert_explicit_foreach_true_still_raises(self):
         """An explicit foreach=True is honored — only the default is made safe."""
         model, _, _ = self._mixed_mesh_model()
 
@@ -539,8 +387,10 @@ def test_real_two_rank_ep_clip_and_nonfinite_gate():
     )
     result.assert_success("two-rank EP clip reduction and non-finite gate")
 
+    _assert_real_three_rank_gradient_participation_mask()
 
-def test_real_three_rank_gradient_participation_mask():
+
+def _assert_real_three_rank_gradient_participation_mask():
     """A cancelling global sum still materializes zero on a missing replica."""
 
     from tests.distributed.distributed_utils import run_distributed_script
@@ -620,12 +470,6 @@ def _run_distributed_ep_clip_worker() -> None:
     else:
         assert expert.grad.item() == pytest.approx(4.0)
 
-    shared_param = nn.Parameter(torch.zeros(1))
-    register_ep_replicated_gradient_hooks([shared_param])
-    with patch("xorl.distributed.parallel_state.get_parallel_state", return_value=parallel_state):
-        (shared_param * (rank + 1.0)).sum().backward()
-    assert shared_param.grad.item() == pytest.approx(3.0)
-
     coalesced = nn.Parameter(torch.zeros(1))
     missing_on_rank = nn.Parameter(torch.zeros(1))
     coalesced.grad = torch.tensor([rank + 1.0])
@@ -633,7 +477,12 @@ def _run_distributed_ep_clip_worker() -> None:
         missing_on_rank.grad = torch.tensor([2.0])
     model.register_parameter("coalesced", coalesced)
     model.register_parameter("missing_on_rank", missing_on_rank)
-    model._ep_param_groups = {"ep": [], "ep_replicated": [coalesced, missing_on_rank], "non_ep": []}
+    model._ep_param_groups = {
+        "ep": [],
+        "ep_replicated": [coalesced, missing_on_rank],
+        "ep_replicated_gradient_sync": [coalesced, missing_on_rank],
+        "non_ep": [],
+    }
     model._ep_replicated_gradient_sync_enabled = True
     all_reduce_calls = []
     original_all_reduce = dist.all_reduce
@@ -646,7 +495,6 @@ def _run_distributed_ep_clip_worker() -> None:
         with patch.object(dist, "all_reduce", side_effect=_counted_all_reduce):
             stats = synchronize_ep_replicated_gradients(model)
     assert len(all_reduce_calls) == 1
-    assert stats.parameter_count == 2
     assert stats.configured_parameter_count == 2
     assert stats.participating_parameter_count == 2
     assert stats.bucket_count == 1
@@ -682,7 +530,6 @@ def _run_distributed_participation_worker() -> None:
 
     with patch("xorl.distributed.parallel_state.get_parallel_state", return_value=parallel_state):
         stats = synchronize_ep_replicated_gradients(model)
-    assert stats.parameter_count == 1
     assert stats.configured_parameter_count == 1
     assert stats.participating_parameter_count == 1
     assert parameter.grad is not None

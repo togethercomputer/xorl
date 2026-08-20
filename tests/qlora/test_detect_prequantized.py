@@ -12,9 +12,6 @@ import json
 import pytest
 import torch
 
-
-pytestmark = [pytest.mark.cpu]
-
 from xorl.models.checkpoint_handlers.buffers import (
     detect_prequantized_block_fp8_checkpoint,
     detect_prequantized_checkpoint,
@@ -24,10 +21,13 @@ from xorl.models.transformers.qwen3.checkpoint_handler import Qwen3CheckpointHan
 from xorl.models.transformers.qwen3_moe.checkpoint_handler import Qwen3MoeCheckpointHandler
 
 
+pytestmark = [pytest.mark.cpu]
+
+
 class TestDetectPrequantizedCheckpoint:
     """Test NVFP4 and block FP8 detection from config files."""
 
-    def test_nvfp4_detection(self, tmp_path):
+    def _assert_prequantized_detection_policy(self, tmp_path):
         """All valid NVFP4 formats detected; non-NVFP4/missing/None/empty/malformed return False; precedence correct."""
         # -- Positive cases --
         # modelopt nested format
@@ -89,8 +89,11 @@ class TestDetectPrequantizedCheckpoint:
             f.write("not valid json {{{")
         assert detect_prequantized_checkpoint(str(d8)) is False
 
-    def test_block_fp8_detection(self, tmp_path):
+        self._assert_block_fp8_detection(tmp_path / "block-fp8")
+
+    def _assert_block_fp8_detection(self, tmp_path):
         """Block FP8 detected via config.json and safetensors index; NVFP4/wrong-size/plain/None return False."""
+        tmp_path.mkdir()
         # config.json with fp8 + [128, 128]
         d1 = tmp_path / "fp8"
         d1.mkdir()
@@ -193,7 +196,7 @@ class TestQwen3DenseCheckpointHandlerPrequantized:
             **kwargs,
         )
 
-    def test_prequantized_skip_and_on_load(self):
+    def _assert_prequantized_skip_and_on_load(self):
         """skip_fn skips quant keys, passes norms; on_load_weight matches; normal mode QKV merge works; bias merge works."""
         handler = self._make_handler(is_prequantized=True)
         skip_fn = handler.get_skip_key_fn()
@@ -232,7 +235,7 @@ class TestQwen3DenseCheckpointHandlerPrequantized:
 class TestGetPrequantizedExcludeModules:
     """Test get_prequantized_exclude_modules: all config formats and edge cases."""
 
-    def test_exclude_modules_all_cases(self, tmp_path):
+    def _assert_exclude_modules_all_cases(self, tmp_path):
         """All config formats return correct modules; empty/missing/None/malformed return empty set; precedence correct."""
         # modelopt nested
         d1 = tmp_path / "nested"
@@ -292,8 +295,14 @@ class TestGetPrequantizedExcludeModules:
 class TestCheckpointHandlerExcludeModules:
     """Test dense and MoE checkpoint handlers with exclude_modules."""
 
-    def test_dense_handler_exclude_modules(self):
+    def test_checkpoint_handler_exclude_modules_policy(self, tmp_path):
         """Excluded modules not skipped in skip_fn and on_load_weight; non-excluded skipped; empty/no exclude normal."""
+        detection_root = tmp_path / "detection"
+        detection_root.mkdir()
+        TestDetectPrequantizedCheckpoint()._assert_prequantized_detection_policy(detection_root)
+        TestQwen3DenseCheckpointHandlerPrequantized()._assert_prequantized_skip_and_on_load()
+        TestGetPrequantizedExcludeModules()._assert_exclude_modules_all_cases(tmp_path)
+
         handler = Qwen3CheckpointHandler(
             num_attention_heads=64,
             num_key_value_heads=8,
@@ -336,7 +345,9 @@ class TestCheckpointHandlerExcludeModules:
             )
             assert h.get_skip_key_fn()("model.layers.0.mlp.down_proj.weight")
 
-    def test_moe_handler_exclude_modules(self):
+        self._assert_moe_handler_exclude_modules()
+
+    def _assert_moe_handler_exclude_modules(self):
         """MoE handler: excluded keys pass through, non-excluded skipped; on_load_weight consistent."""
         handler = Qwen3MoeCheckpointHandler(
             num_experts=64,

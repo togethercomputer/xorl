@@ -49,13 +49,10 @@ def _install_nvidia_ml_library_path() -> None:
 
 
 def _install_nvshmem_library_path() -> None:
-    try:
-        import nvidia.nvshmem  # noqa: PLC0415
+    import nvidia.nvshmem  # noqa: PLC0415
 
-        nvshmem_lib = os.path.join(list(nvidia.nvshmem.__path__)[0], "lib")
-        _prepend_library_path(nvshmem_lib)
-    except Exception:
-        pass
+    nvshmem_lib = os.path.join(list(nvidia.nvshmem.__path__)[0], "lib")
+    _prepend_library_path(nvshmem_lib)
 
 
 def _check(name: str, tensor: torch.Tensor | None) -> None:

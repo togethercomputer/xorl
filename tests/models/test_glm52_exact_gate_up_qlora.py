@@ -62,7 +62,7 @@ def _load_small_base(module: Glm52ExactTP1FusedGateUpBlockFP8QLoRA) -> tuple[tor
     return gate_weight, gate_scales, up_weight, up_scales
 
 
-def test_fused_gate_up_contract_is_one_native_leaf_with_four_logical_fp32_factors() -> None:
+def _assert_fused_gate_up_contract_is_one_native_leaf_with_four_logical_fp32_factors() -> None:
     module = _module()
 
     assert isinstance(module, NativeBlockFP8Linear)
@@ -100,7 +100,7 @@ def test_fused_gate_up_contract_is_one_native_leaf_with_four_logical_fp32_factor
         module.set_runtime_lora_config(1, 0)
 
 
-def test_fused_gate_up_loader_makes_gate_then_up_order_explicit_and_strict() -> None:
+def _assert_fused_gate_up_loader_makes_gate_then_up_order_explicit_and_strict() -> None:
     module = _module()
     gate_weight, gate_scales, up_weight, up_scales = _load_small_base(module)
 
@@ -119,7 +119,7 @@ def test_fused_gate_up_loader_makes_gate_then_up_order_explicit_and_strict() -> 
         module.load_gate_up_prequantized(gate_weight, gate_scales, up_weight, up_scales.to(torch.bfloat16))
 
 
-def test_fused_gate_up_model_dtype_move_preserves_native_state_and_fp32_masters() -> None:
+def _assert_fused_gate_up_model_dtype_move_preserves_native_state_and_fp32_masters() -> None:
     module = _module()
     _load_small_base(module)
     packed_bytes = module.packed_weight_f32.detach().view(torch.uint8).clone()
@@ -144,7 +144,7 @@ def test_fused_gate_up_model_dtype_move_preserves_native_state_and_fp32_masters(
         assert torch.equal(actual, expected)
 
 
-def test_fused_gate_up_rounds_each_master_once_and_preserves_logical_order(monkeypatch) -> None:
+def _assert_fused_gate_up_rounds_each_master_once_and_preserves_logical_order(monkeypatch) -> None:
     module = _module()
     base_weight = torch.arange(256 * 8, dtype=torch.float32).reshape(256, 8).sub_(311).div_(977).to(torch.bfloat16)
     captures = []
@@ -166,7 +166,7 @@ def test_fused_gate_up_rounds_each_master_once_and_preserves_logical_order(monke
     assert torch.equal(actual, expected)
 
 
-def test_fused_gate_up_surrogate_matches_two_logical_qlora_branches(monkeypatch) -> None:
+def _assert_fused_gate_up_surrogate_matches_two_logical_qlora_branches(monkeypatch) -> None:
     module = _module()
     base_weight = torch.arange(256 * 8, dtype=torch.float32).reshape(256, 8).sub_(617).div_(1237).to(torch.bfloat16)
     monkeypatch.setattr(module, "_dequantize_base_weight", lambda: base_weight)
@@ -230,7 +230,7 @@ def test_fused_gate_up_surrogate_matches_two_logical_qlora_branches(monkeypatch)
         assert torch.equal(master.grad, reference_factor.grad)
 
 
-def test_fused_gate_up_input_gradient_matches_two_exact_logical_wrappers(monkeypatch) -> None:
+def _assert_fused_gate_up_input_gradient_matches_two_exact_logical_wrappers(monkeypatch) -> None:
     fused = _module()
     base_weight = torch.arange(256 * 8, dtype=torch.float32).reshape(256, 8).sub_(503).mul_(7).to(torch.bfloat16)
     monkeypatch.setattr(fused, "_dequantize_base_weight", lambda: base_weight)
@@ -262,7 +262,7 @@ def test_fused_gate_up_input_gradient_matches_two_exact_logical_wrappers(monkeyp
     assert torch.equal(fused.up_proj.lora_B.grad, up.lora_B.grad)
 
 
-def test_fused_gate_up_factor_only_backward_does_not_materialize_base(monkeypatch) -> None:
+def _assert_fused_gate_up_factor_only_backward_does_not_materialize_base(monkeypatch) -> None:
     module = _module()
     base_weight = torch.zeros(256, 8, dtype=torch.bfloat16)
     monkeypatch.setattr(module, "_exact_forward_value", _literal_cpu_value(base_weight, []))
@@ -277,7 +277,7 @@ def test_fused_gate_up_factor_only_backward_does_not_materialize_base(monkeypatc
     assert all(dict(module.named_parameters())[name].grad is not None for name in module.logical_factor_names)
 
 
-def test_fused_gate_up_backward_rejects_any_master_mutation(monkeypatch) -> None:
+def _assert_fused_gate_up_backward_rejects_any_master_mutation(monkeypatch) -> None:
     module = _module()
     base_weight = torch.zeros(256, 8, dtype=torch.bfloat16)
     monkeypatch.setattr(module, "_dequantize_base_weight", lambda: base_weight)
@@ -291,7 +291,7 @@ def test_fused_gate_up_backward_rejects_any_master_mutation(monkeypatch) -> None
         output.float().sum().backward()
 
 
-def test_fused_gate_up_contract_fails_closed_before_sglang_import() -> None:
+def _assert_fused_gate_up_contract_fails_closed_before_sglang_import() -> None:
     before = {name for name in sys.modules if name == "sglang" or name.startswith("sglang.")}
     module = _module()
 
@@ -556,3 +556,16 @@ def test_official_fused_gate_up_literal_bytes_graph_metadata_zero_and_gradients(
             dict(module.named_parameters())[name].zero_()
     zero_output = module(input.detach())
     assert torch.equal(zero_output.view(torch.uint8), direct_base.view(torch.uint8))
+
+
+def test_fused_gate_up_cpu_contract(monkeypatch) -> None:
+    _assert_fused_gate_up_contract_is_one_native_leaf_with_four_logical_fp32_factors()
+    _assert_fused_gate_up_loader_makes_gate_then_up_order_explicit_and_strict()
+    _assert_fused_gate_up_model_dtype_move_preserves_native_state_and_fp32_masters()
+    _assert_fused_gate_up_contract_fails_closed_before_sglang_import()
+    _assert_fused_gate_up_rounds_each_master_once_and_preserves_logical_order(monkeypatch)
+    _assert_fused_gate_up_surrogate_matches_two_logical_qlora_branches(monkeypatch)
+    monkeypatch.undo()
+    _assert_fused_gate_up_input_gradient_matches_two_exact_logical_wrappers(monkeypatch)
+    _assert_fused_gate_up_factor_only_backward_does_not_materialize_base(monkeypatch)
+    _assert_fused_gate_up_backward_rejects_any_master_mutation(monkeypatch)

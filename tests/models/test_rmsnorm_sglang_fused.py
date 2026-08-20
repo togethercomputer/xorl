@@ -8,8 +8,6 @@ mode (the K3 regime), and check that the closed-form backward matches autograd
 of the eager reference. The CPU tests exercise the eager fallback.
 """
 
-import os
-
 import pytest
 import torch
 
@@ -42,7 +40,7 @@ EPS = 1e-6
 # --------------------------------------------------------------------------- #
 # CPU fallback (no Triton): sglang_fused must equal the eager sglang path.
 # --------------------------------------------------------------------------- #
-def test_sglang_fused_cpu_residual_matches_eager():
+def _assert_sglang_fused_cpu_residual_matches_eager():
     set_rmsnorm_mode("sglang_fused")
     try:
         norm = RMSNorm(4, eps=EPS)
@@ -61,13 +59,19 @@ def test_sglang_fused_cpu_residual_matches_eager():
         set_rmsnorm_mode("native")
 
 
-# This suite pins the v1 family kernels through the fast_* dispatchers; with
-# families-v2 default-on those dispatchers route to the v2 tree, so pin the
-# kill switch (env is read per call). v2 has its own suite (test_bi_families_v2.py).
-os.environ["XORL_FAMILIES_V2"] = "0"
+@pytest.fixture(autouse=True)
+def _pin_qualified_v1_family():
+    """This suite owns the qualified v1 fast-dispatch path."""
+    from xorl.ops.bi_families_v2 import _select_nonexact_families, _select_qwen35_families_v1
+
+    _select_qwen35_families_v1()
+    try:
+        yield
+    finally:
+        _select_nonexact_families()
 
 
-def test_sglang_fused_cpu_force_no_residual_matches_eager():
+def _assert_sglang_fused_cpu_force_no_residual_matches_eager():
     set_rmsnorm_mode("sglang_fused")
     try:
         norm = RMSNorm(4, eps=EPS)
@@ -85,45 +89,39 @@ def test_sglang_fused_cpu_force_no_residual_matches_eager():
 # --------------------------------------------------------------------------- #
 # GPU bit-exactness under batch-invariant mode (the K3 regime).
 # --------------------------------------------------------------------------- #
-@requires_cuda
-@pytest.mark.gpu
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_fused_residual_bit_exact_vs_eager(dtype):
-    torch.manual_seed(0)
-    device = "cuda"
-    hidden = torch.randn(N_TOKENS, HIDDEN, device=device, dtype=dtype)
-    residual = torch.randn(N_TOKENS, HIDDEN, device=device, dtype=dtype)
-    weight = torch.randn(HIDDEN, device=device, dtype=dtype)
+def _assert_fused_residual_bit_exact_vs_eager():
+    for dtype in (torch.bfloat16, torch.float32):
+        torch.manual_seed(0)
+        device = "cuda"
+        hidden = torch.randn(N_TOKENS, HIDDEN, device=device, dtype=dtype)
+        residual = torch.randn(N_TOKENS, HIDDEN, device=device, dtype=dtype)
+        weight = torch.randn(HIDDEN, device=device, dtype=dtype)
 
-    with set_batch_invariant_mode(True):
-        expected_residual = hidden + residual
-        expected = sglang_residual_rms_norm(expected_residual, weight, EPS)
-        out, residual_out = fast_sglang_residual_rms_norm(hidden, residual, weight, EPS)
+        with set_batch_invariant_mode(True):
+            expected_residual = hidden + residual
+            expected = sglang_residual_rms_norm(expected_residual, weight, EPS)
+            out, residual_out = fast_sglang_residual_rms_norm(hidden, residual, weight, EPS)
 
-    # Residual carry must be bit-identical (it feeds the next layer's stream).
-    assert torch.equal(residual_out, expected_residual), "fused residual add diverged from torch add"
-    assert torch.equal(out, expected), "fused residual RMSNorm diverged from eager"
+        # Residual carry must be bit-identical (it feeds the next layer's stream).
+        assert torch.equal(residual_out, expected_residual), f"fused residual add diverged for {dtype}"
+        assert torch.equal(out, expected), f"fused residual RMSNorm diverged for {dtype}"
 
 
-@requires_cuda
-@pytest.mark.gpu
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-def test_fused_no_residual_bit_exact_vs_eager(dtype):
-    torch.manual_seed(1)
-    device = "cuda"
-    hidden = torch.randn(N_TOKENS, HIDDEN, device=device, dtype=dtype)
-    weight = torch.randn(HIDDEN, device=device, dtype=dtype)
+def _assert_fused_no_residual_bit_exact_vs_eager():
+    for dtype in (torch.bfloat16, torch.float32):
+        torch.manual_seed(1)
+        device = "cuda"
+        hidden = torch.randn(N_TOKENS, HIDDEN, device=device, dtype=dtype)
+        weight = torch.randn(HIDDEN, device=device, dtype=dtype)
 
-    with set_batch_invariant_mode(True):
-        expected = sglang_residual_rms_norm(hidden, weight, EPS)
-        out = fast_sglang_rms_norm(hidden, weight, EPS)
+        with set_batch_invariant_mode(True):
+            expected = sglang_residual_rms_norm(hidden, weight, EPS)
+            out = fast_sglang_rms_norm(hidden, weight, EPS)
 
-    assert torch.equal(out, expected), "fused no-residual RMSNorm diverged from eager"
+        assert torch.equal(out, expected), f"fused no-residual RMSNorm diverged for {dtype}"
 
 
-@requires_cuda
-@pytest.mark.gpu
-def test_fused_residual_matches_3d_packed_shape():
+def _assert_fused_residual_matches_3d_packed_shape():
     torch.manual_seed(2)
     device = "cuda"
     hidden = torch.randn(2, 96, HIDDEN, device=device, dtype=torch.bfloat16)
@@ -144,9 +142,7 @@ def test_fused_residual_matches_3d_packed_shape():
 # --------------------------------------------------------------------------- #
 # GPU: sglang_fused RMSNorm module == sglang module, bit-for-bit.
 # --------------------------------------------------------------------------- #
-@requires_cuda
-@pytest.mark.gpu
-def test_module_sglang_fused_equals_sglang():
+def _assert_module_sglang_fused_equals_sglang():
     torch.manual_seed(3)
     device = "cuda"
     hidden = torch.randn(N_TOKENS, HIDDEN, device=device, dtype=torch.bfloat16)
@@ -189,9 +185,7 @@ def test_module_sglang_fused_equals_sglang():
 # --------------------------------------------------------------------------- #
 # GPU: closed-form backward matches autograd of the eager reference.
 # --------------------------------------------------------------------------- #
-@requires_cuda
-@pytest.mark.gpu
-def test_fused_residual_backward_matches_autograd():
+def _assert_fused_residual_backward_matches_autograd():
     torch.manual_seed(4)
     device = "cuda"
     dtype = torch.bfloat16
@@ -222,9 +216,7 @@ def test_fused_residual_backward_matches_autograd():
     assert torch.allclose(w_f.grad.float(), w_ref.grad.float(), rtol=2e-2, atol=2e-2)
 
 
-@requires_cuda
-@pytest.mark.gpu
-def test_dense_qwen3_layer_forward_bit_exact_sglang_vs_fused():
+def _assert_dense_qwen3_layer_forward_bit_exact_sglang_vs_fused():
     """Full dense Qwen3 decoder-layer forward must be bit-identical between
     sglang and sglang_fused (the model-level K3-preservation gate). Exercises
     input_layernorm (force_sglang_residual path at layer>0) and
@@ -267,9 +259,7 @@ def test_dense_qwen3_layer_forward_bit_exact_sglang_vs_fused():
     assert torch.equal(out_sg, out_sf), "dense layer forward diverged between sglang and sglang_fused"
 
 
-@requires_cuda
-@pytest.mark.gpu
-def test_single_tensor_force_call_bit_matches_serving_fused_residual_tree():
+def _assert_single_tensor_force_call_bit_matches_serving_fused_residual_tree():
     """The layer>0 input-norm / final-norm call shape (pre-summed single tensor,
     force_sglang_residual=True) must be bit-identical to serving's fused residual
     tree (``fused_add_rms_norm_batch_invariant``). Guards the norm-seed trap where
@@ -290,9 +280,7 @@ def test_single_tensor_force_call_bit_matches_serving_fused_residual_tree():
     assert torch.equal(out_module, ref)
 
 
-@requires_cuda
-@pytest.mark.gpu
-def test_fused_no_residual_backward_matches_autograd():
+def _assert_fused_no_residual_backward_matches_autograd():
     torch.manual_seed(5)
     device = "cuda"
     dtype = torch.bfloat16
@@ -322,9 +310,7 @@ def test_fused_no_residual_backward_matches_autograd():
 # aten::rms_norm interpose kernel, NOT the fused sglang residual tree (the two
 # disagree at 1 ulp on rare bf16 boundary values).
 # --------------------------------------------------------------------------- #
-@requires_cuda
-@pytest.mark.gpu
-def test_trunk_contract_no_residual_bit_matches_interpose_kernel():
+def _assert_trunk_contract_no_residual_bit_matches_interpose_kernel():
     torch.manual_seed(21)
     # qk-norm call shape: [tokens, heads, head_dim] with a head_dim-sized weight.
     head_dim = 128
@@ -347,9 +333,7 @@ def test_trunk_contract_no_residual_bit_matches_interpose_kernel():
     assert torch.equal(out, ref_interpose), "contract-lane qk-norm must equal the aten interpose lane bit-for-bit"
 
 
-@requires_cuda
-@pytest.mark.gpu
-def test_no_residual_dispatch_unchanged_without_contract():
+def _assert_no_residual_dispatch_unchanged_without_contract():
     torch.manual_seed(22)
     x = torch.randn(N_TOKENS, HIDDEN, device="cuda", dtype=torch.bfloat16)
     norm = RMSNorm(HIDDEN, eps=EPS, mode="sglang_fused").to(device="cuda", dtype=torch.bfloat16)
@@ -359,9 +343,7 @@ def test_no_residual_dispatch_unchanged_without_contract():
     assert torch.equal(out, ref)
 
 
-@requires_cuda
-@pytest.mark.gpu
-def test_trunk_contract_no_residual_backward_matches_eager():
+def _assert_trunk_contract_no_residual_backward_matches_eager():
     # Same convention as test_fused_no_residual_backward_matches_autograd: fp32
     # weight leaf and the fp32-multiply eager reference (the kernel's semantics),
     # so the comparison is not dominated by bf16 grad-accumulation rounding.
@@ -385,3 +367,28 @@ def test_trunk_contract_no_residual_backward_matches_eager():
     assert torch.isfinite(h_c.grad.float()).all() and torch.isfinite(w_c.grad.float()).all()
     assert torch.allclose(h_c.grad.float(), h_ref.grad.float(), rtol=2e-2, atol=2e-2)
     assert torch.allclose(w_c.grad.float(), w_ref.grad.float(), rtol=2e-2, atol=2e-2)
+
+
+def test_sglang_fused_rmsnorm_cpu_fallback_contract():
+    _assert_sglang_fused_cpu_residual_matches_eager()
+    _assert_sglang_fused_cpu_force_no_residual_matches_eager()
+
+
+@requires_cuda
+@pytest.mark.gpu
+def test_sglang_fused_rmsnorm_forward_backward_and_model_integration_contract():
+    _assert_fused_residual_bit_exact_vs_eager()
+    _assert_fused_no_residual_bit_exact_vs_eager()
+    _assert_fused_residual_matches_3d_packed_shape()
+    _assert_module_sglang_fused_equals_sglang()
+    _assert_fused_residual_backward_matches_autograd()
+    _assert_fused_no_residual_backward_matches_autograd()
+    _assert_dense_qwen3_layer_forward_bit_exact_sglang_vs_fused()
+    _assert_single_tensor_force_call_bit_matches_serving_fused_residual_tree()
+    _assert_sglang_fused_rmsnorm_trunk_contract()
+
+
+def _assert_sglang_fused_rmsnorm_trunk_contract():
+    _assert_trunk_contract_no_residual_bit_matches_interpose_kernel()
+    _assert_no_residual_dispatch_unchanged_without_contract()
+    _assert_trunk_contract_no_residual_backward_matches_eager()
