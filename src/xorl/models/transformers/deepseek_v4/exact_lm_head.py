@@ -205,6 +205,9 @@ class Dsv4ExactTP8LmHeadSelectedLogprob(nn.Module):
     max_lora_rank = 1
     lora_alpha = 1
     scaling = 1.0
+    #: The pinned value program is BF16 end-to-end: BF16 vocabulary gather,
+    #: BF16 temperature store, batch-invariant BF16 log_softmax.
+    logprob_dtype = torch.bfloat16
 
     def __init__(
         self,

@@ -243,16 +243,17 @@ def rank_order_variable_row_all_gather(
 def require_equal_nonzero_row_count(value: Tensor, group: dist.ProcessGroup, *, program: str) -> None:
     """Fail before payload collectives when source-row shapes diverge."""
 
-    local_rows = torch.tensor([value.shape[0]], dtype=torch.int64, device=value.device)
-    world_size = dist.get_world_size(group)
-    gathered_rows = torch.empty(world_size, dtype=torch.int64, device=value.device)
-    dist.all_gather_into_tensor(gathered_rows, local_rows, group=group)
-    if bool((gathered_rows <= 0).any().item()):
+    counts = rank_order_row_counts(
+        value.shape[0],
+        value.device,
+        group,
+        world_size=dist.get_world_size(group),
+        program=program,
+    )
+    if any(count <= 0 for count in counts):
         raise ValueError(f"{program} requires at least one source row on every rank")
-    if bool((gathered_rows != gathered_rows[0]).any().item()):
-        raise ValueError(
-            f"{program} requires equal source-row counts across the group, got {gathered_rows.cpu().tolist()}"
-        )
+    if len(set(counts)) > 1:
+        raise ValueError(f"{program} requires equal source-row counts across the group, got {list(counts)}")
 
 
 def all_reduce_sum_fp32(value: Tensor, group: dist.ProcessGroup) -> Tensor:
@@ -315,6 +316,11 @@ class ExactHeadRowPlan:
     ``gather`` assembles every contributor's rows in rank order (an identity
     for already-replicated rows); ``narrow_local`` returns this rank's slice
     of a row-aligned result.
+
+    The plan is stored on the autograd context from forward to backward, so
+    the closures must capture only plain metadata (the process-group handle,
+    ints, tuples) — never tensors, which would silently extend activation
+    lifetimes past the saved-tensor accounting.
     """
 
     __slots__ = ("gather", "narrow_local")
@@ -382,11 +388,15 @@ class ExactLmHeadFunction(torch.autograd.Function):
                 gathered_temperature,
             )
         local_logprob = row_plan.narrow_local(gathered_logprob).contiguous()
-        if local_logprob.dtype is not torch.float32 or tuple(local_logprob.shape) != tuple(token_ids.shape):
+        # The output dtype is part of each family's pinned value program:
+        # GLM-5.2 scores FP32 logits, DSV4 is BF16 end-to-end (BF16 gather,
+        # BF16 temperature store, batch-invariant BF16 log_softmax).
+        expected_dtype = getattr(component, "logprob_dtype", torch.float32)
+        if local_logprob.dtype is not expected_dtype or tuple(local_logprob.shape) != tuple(token_ids.shape):
             raise RuntimeError(
                 f"{type(component).__name__} returned an invalid selected-logprob tensor: "
                 f"dtype={local_logprob.dtype}, shape={tuple(local_logprob.shape)}, "
-                f"expected FP32 {tuple(token_ids.shape)}"
+                f"expected {expected_dtype} {tuple(token_ids.shape)}"
             )
         ctx.set_materialize_grads(False)
         ctx.component = component
@@ -425,6 +435,12 @@ class ExactLmHeadFunction(torch.autograd.Function):
         ) = ctx.saved_tensors
         if grad_local_logprob is None:
             return (None,) * 9
+        # Revalidate before the first collective so a TP group that was
+        # rebound or destroyed between forward and backward surfaces as the
+        # deterministic contract error, not an NCCL hang.
+        validate_tp_group = getattr(ctx.component, "_validate_tp_group", None)
+        if callable(validate_tp_group):
+            validate_tp_group()
         temperature = None if stored_temperature.numel() == 0 else stored_temperature
         gathered_grad_logprob = ctx.row_plan.gather(grad_local_logprob.float().contiguous())
         vjp = ctx.component._surrogate_vjp_filtered if ctx.has_sampling_filter else ctx.component._surrogate_vjp

@@ -271,6 +271,8 @@ class Glm52ExactTP16LmHeadSelectedLogprob(nn.Module):
 
     contract_version = GLM52_EXACT_TP16_LM_HEAD_CONTRACT_VERSION
     _glm52_exact_active_lora_component = True
+    #: The pinned value program scores FP32 logits from the TP16 gather.
+    logprob_dtype = torch.float32
 
     def __init__(
         self,
