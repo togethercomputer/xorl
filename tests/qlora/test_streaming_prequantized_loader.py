@@ -33,7 +33,7 @@ class _FakeSafeTensorFile:
         return self._tensors[key]
 
 
-def test_load_selected_shard_cache_reads_only_requested_keys(monkeypatch):
+def _assert_load_selected_shard_cache_reads_only_requested_keys(monkeypatch):
     """Selected loading must not materialize unrelated tensors or shards."""
     weight_map = {
         "layer.0.q_proj.weight": "shard-a.safetensors",
@@ -83,47 +83,47 @@ def test_load_selected_shard_cache_reads_only_requested_keys(monkeypatch):
     assert not cache
 
 
-@pytest.mark.parametrize(
-    ("source_fqn", "merge_sources"),
-    [
+def _assert_prequantized_module_key_plan_policy():
+    for source_fqn, merge_sources in (
         ("model.layers.0.self_attn", ("q_proj", "k_proj", "v_proj")),
         ("model.layers.0.mlp", ("gate_proj", "up_proj")),
-    ],
-)
-def test_prequantized_module_keys_are_exact_for_merged_block_fp8(source_fqn, merge_sources):
-    module = BlockFP8QLoRALinear(
-        in_features=128,
-        out_features=128 * len(merge_sources),
-        r=1,
-        lora_alpha=1,
-        device=torch.device("meta"),
-    )
-    module._is_prequantized = True
-    module._source_quant_format = "block_fp8"
-    module._source_fqn = source_fqn
-    module._merge_sources = merge_sources
+    ):
+        module = BlockFP8QLoRALinear(
+            in_features=128,
+            out_features=128 * len(merge_sources),
+            r=1,
+            lora_alpha=1,
+            device=torch.device("meta"),
+        )
+        module._is_prequantized = True
+        module._source_quant_format = "block_fp8"
+        module._source_fqn = source_fqn
+        module._merge_sources = merge_sources
 
-    expected = {
-        f"{source_fqn}.{projection}.{suffix}"
-        for projection in merge_sources
-        for suffix in ("weight", "weight_scale_inv")
-    }
-    weight_map = dict.fromkeys(expected, "selected.safetensors")
-    weight_map.update(
-        {
-            f"{source_fqn}.unrelated.weight": "selected.safetensors",
-            f"{source_fqn}.{merge_sources[0]}.weight_scale": "selected.safetensors",
-            "model.layers.1.self_attn.q_proj.weight": "other.safetensors",
+        expected = {
+            f"{source_fqn}.{projection}.{suffix}"
+            for projection in merge_sources
+            for suffix in ("weight", "weight_scale_inv")
         }
-    )
+        weight_map = dict.fromkeys(expected, "selected.safetensors")
+        weight_map.update(
+            {
+                f"{source_fqn}.unrelated.weight": "selected.safetensors",
+                f"{source_fqn}.{merge_sources[0]}.weight_scale": "selected.safetensors",
+                "model.layers.1.self_attn.q_proj.weight": "other.safetensors",
+            }
+        )
 
-    keys = qlora_utils._prequantized_module_keys(module, weight_map)
+        keys = qlora_utils._prequantized_module_keys(module, weight_map)
 
-    assert len(keys) == len(expected)
-    assert set(keys) == expected
+        assert len(keys) == len(expected)
+        assert set(keys) == expected
+
+    _assert_prequantized_module_keys_select_exactly_one_ep16_expert_slice()
+    _assert_prequantized_module_keys_fail_before_io_when_a_pair_is_missing()
 
 
-def test_prequantized_module_keys_select_exactly_one_ep16_expert_slice():
+def _assert_prequantized_module_keys_select_exactly_one_ep16_expert_slice():
     module = BlockFP8QLoRAMoeExperts(
         num_local_experts=16,
         num_experts=256,
@@ -152,7 +152,7 @@ def test_prequantized_module_keys_select_exactly_one_ep16_expert_slice():
     assert set(keys) == expected
 
 
-def test_prequantized_module_keys_fail_before_io_when_a_pair_is_missing():
+def _assert_prequantized_module_keys_fail_before_io_when_a_pair_is_missing():
     module = BlockFP8QLoRALinear(
         in_features=128,
         out_features=128,
@@ -172,7 +172,7 @@ def test_prequantized_module_keys_fail_before_io_when_a_pair_is_missing():
         )
 
 
-def test_retained_shard_cache_ignores_consumer_clear_until_release():
+def _assert_retained_shard_cache_ignores_consumer_clear_until_release():
     """MoE projection-level clear calls cannot evict later projection tensors."""
     gate_key = "experts.0.gate_proj.weight"
     up_key = "experts.0.up_proj.weight"
@@ -189,6 +189,9 @@ def test_retained_shard_cache_ignores_consumer_clear_until_release():
 
 def test_deferred_loader_releases_each_module_cache_before_loading_next(monkeypatch, tmp_path):
     """At most one deferred module's selected tensors may remain resident."""
+    with monkeypatch.context() as case_patch:
+        _assert_load_selected_shard_cache_reads_only_requested_keys(case_patch)
+    _assert_prequantized_module_key_plan_policy()
 
     class FakeLinear(nn.Module):
         def __init__(self, source_fqn):
@@ -275,3 +278,5 @@ def test_deferred_loader_releases_each_module_cache_before_loading_next(monkeypa
     assert len(releases) == 2
     assert all(not cache for cache in releases)
     assert active_caches == 0
+
+    _assert_retained_shard_cache_ignores_consumer_clear_until_release()

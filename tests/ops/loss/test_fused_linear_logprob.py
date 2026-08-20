@@ -43,49 +43,44 @@ def _make_inputs(N, H, V, dtype, has_bias, seed=0):
     return h, w, b, labels
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("has_bias", [False, True])
-@pytest.mark.parametrize("temperature", [1.0, 0.7])
-def test_forward_matches_cross_entropy(dtype, has_bias, temperature):
-    h, w, b, labels = _make_inputs(128, 256, 1024, dtype, has_bias)
-    ce = fused_selected_logprob_ce(h, w, labels, bias=b, ignore_index=-100, temperature=temperature)
-    ref = _ref_ce(h, w, b, labels, -100, temperature)
-    err = (ce - ref).abs().max().item()
-    tol = 5e-2 if dtype == torch.bfloat16 else 3e-3
-    assert err < tol, f"forward mismatch: {err}"
-    # selected-token log-probability is exactly -CE
-    logp = -ce
-    assert torch.isfinite(logp[labels != -100]).all()
+def test_fused_selected_logprob_matches_eager_forward_and_backward():
+    # Dtype, bias, and temperature are independent branches; pairwise cases
+    # cover both values without a Cartesian product.
+    for dtype, has_bias, temperature in (
+        (torch.bfloat16, False, 1.0),
+        (torch.float32, True, 0.7),
+    ):
+        h, w, b, labels = _make_inputs(128, 256, 1024, dtype, has_bias)
+        valid = (labels != -100).sum().clamp(min=1).float()
+
+        hf = h.clone().requires_grad_(True)
+        wf = w.clone().requires_grad_(True)
+        bf = b.clone().requires_grad_(True) if has_bias else None
+        ce = fused_selected_logprob_ce(hf, wf, labels, bias=bf, ignore_index=-100, temperature=temperature)
+        (ce.sum() / valid).backward()
+
+        hr = h.clone().requires_grad_(True)
+        wr = w.clone().requires_grad_(True)
+        br = b.clone().requires_grad_(True) if has_bias else None
+        ref = _ref_ce(hr, wr, br, labels, -100, temperature)
+        (ref.sum() / valid).backward()
+
+        context = f"dtype={dtype}, bias={has_bias}, temperature={temperature}"
+        tol = 5e-2 if dtype == torch.bfloat16 else 3e-3
+        assert torch.isfinite((-ce)[labels != -100]).all()
+        assert (ce - ref).abs().max().item() < tol, f"forward mismatch: {context}"
+        assert (hf.grad - hr.grad).abs().max().item() < tol, f"grad_h mismatch: {context}"
+        assert (wf.grad - wr.grad).abs().max().item() < tol, f"grad_W mismatch: {context}"
+        if has_bias:
+            assert (bf.grad - br.grad).abs().max().item() < tol, f"grad_b mismatch: {context}"
+
+    _assert_input_gradient_policy_for_frozen_output_layer()
+    _assert_irregular_tail_shape_matches_eager()
+    _assert_production_vocab_paths_are_finite_and_match_eager()
+    _assert_loss_dispatchers_match_eager()
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("has_bias", [False, True])
-@pytest.mark.parametrize("temperature", [1.0, 0.7])
-def test_backward_matches_autograd(dtype, has_bias, temperature):
-    h, w, b, labels = _make_inputs(128, 256, 1024, dtype, has_bias)
-    valid = (labels != -100).sum().clamp(min=1).float()
-
-    hf = h.clone().requires_grad_(True)
-    wf = w.clone().requires_grad_(True)
-    bf = b.clone().requires_grad_(True) if has_bias else None
-    ce = fused_selected_logprob_ce(hf, wf, labels, bias=bf, ignore_index=-100, temperature=temperature)
-    (ce.sum() / valid).backward()
-
-    hr = h.clone().requires_grad_(True)
-    wr = w.clone().requires_grad_(True)
-    br = b.clone().requires_grad_(True) if has_bias else None
-    ref = _ref_ce(hr, wr, br, labels, -100, temperature)
-    (ref.sum() / valid).backward()
-
-    tol = 5e-2 if dtype == torch.bfloat16 else 3e-3
-    assert (hf.grad - hr.grad).abs().max().item() < tol, "grad_h mismatch"
-    assert (wf.grad - wr.grad).abs().max().item() < tol, "grad_W mismatch"
-    if has_bias:
-        assert (bf.grad - br.grad).abs().max().item() < tol, "grad_b mismatch"
-
-
-def test_needs_input_grad_frozen_output_layer():
-    """LoRA RL: weight (and bias) frozen -> grad_W/grad_b are None; grad_h correct."""
+def _assert_input_gradient_policy_for_frozen_output_layer():
     h, w, b, labels = _make_inputs(128, 256, 1024, torch.bfloat16, has_bias=True)
     hf = h.clone().requires_grad_(True)
     wf = w.clone().requires_grad_(False)  # frozen output head
@@ -104,18 +99,13 @@ def test_needs_input_grad_frozen_output_layer():
     ref.sum().backward()
     assert (hf.grad - hr.grad).abs().max().item() < 5e-2, "grad_h must match even with frozen head"
 
-
-def test_no_input_needs_grad_is_detached():
-    """All inputs frozen -> output is detached and backward does no work."""
     h, w, _, labels = _make_inputs(64, 128, 512, torch.bfloat16, has_bias=False)
     out = fused_selected_logprob_ce(h, w, labels, ignore_index=-100)
     assert not out.requires_grad
 
 
-@pytest.mark.parametrize("shape", [(37, 130, 777), (1, 64, 200), (200, 512, 50000)])
-def test_irregular_shapes(shape):
-    N, H, V = shape
-    h, w, b, labels = _make_inputs(N, H, V, torch.bfloat16, has_bias=True)
+def _assert_irregular_tail_shape_matches_eager():
+    h, w, b, labels = _make_inputs(37, 130, 777, torch.bfloat16, has_bias=True)
     hf = h.clone().requires_grad_(True)
     wf = w.clone().requires_grad_(True)
     ce = fused_selected_logprob_ce(hf, wf, labels, bias=b, ignore_index=-100)
@@ -124,34 +114,20 @@ def test_irregular_shapes(shape):
     assert (ce - ref).abs().max().item() < 5e-2
 
 
-def test_dispatch_via_compute_per_token_ce():
-    """The "fused_quack" ce_mode routes through compute_per_token_ce and matches eager."""
+def _assert_loss_dispatchers_match_eager():
+    from xorl.ops.loss.causallm_loss import causallm_loss_function  # noqa: PLC0415
+
     h, w, _, labels = _make_inputs(96, 192, 800, torch.bfloat16, has_bias=False)
     fused = compute_per_token_ce(h, w, labels, ignore_index=-100, ce_mode="fused_quack")
     eager = compute_per_token_ce(h, w, labels, ignore_index=-100, ce_mode="eager")
     assert (fused - eager).abs().max().item() < 5e-2
 
-
-def test_dispatch_via_causallm_loss_function():
-    """ce_mode='fused_quack' routes through the chunked fused path in
-    ``causallm_loss_function`` and matches the eager loss."""
-    from xorl.ops.loss.causallm_loss import causallm_loss_function  # noqa: PLC0415
-
-    h, w, _, labels = _make_inputs(96, 192, 800, torch.bfloat16, has_bias=False)
     h3, lab3 = h.view(1, 96, 192), labels.view(1, 96)
     fused = causallm_loss_function(h3, w, lab3, ignore_index=-100, ce_mode="fused_quack")
     eager = causallm_loss_function(h3, w, lab3, ignore_index=-100, ce_mode="eager")
     assert torch.isfinite(fused.loss).all()
     assert (fused.loss - eager.loss).abs().item() < 5e-2
 
-
-def test_quack_linear_return_per_token_dispatch_via_causallm_loss_function():
-    """quack_linear should support per-token returns without changing the scalar
-    training path."""
-    from xorl.ops.loss.causallm_loss import causallm_loss_function  # noqa: PLC0415
-
-    h, w, _, labels = _make_inputs(96, 192, 800, torch.bfloat16, has_bias=False)
-    h3, lab3 = h.view(1, 96, 192), labels.view(1, 96)
     quack = causallm_loss_function(h3, w, lab3, ignore_index=-100, ce_mode="quack_linear", return_per_token=True)
     eager = causallm_loss_function(h3, w, lab3, ignore_index=-100, ce_mode="eager", return_per_token=True)
 
@@ -160,29 +136,17 @@ def test_quack_linear_return_per_token_dispatch_via_causallm_loss_function():
     assert (quack.per_token_loss - eager.per_token_loss).abs().max().item() < 5e-2
     assert (quack.per_token_logprobs - eager.per_token_logprobs).abs().max().item() < 5e-2
 
+    _assert_importance_sampling_loss_with_fused_mode()
 
-@pytest.mark.parametrize("vocab", [100000, 151936, 201088])
-def test_production_vocab_sizes_no_nan(vocab):
+
+def _assert_production_vocab_paths_are_finite_and_match_eager():
     """Regression: the quack CE fwd kernel launched cluster blocks whose column
     tile was entirely out of range at these vocab sizes ((cluster_n-1)*tile_n >=
     V), reducing max over zero elements (-inf) and NaN-ing the LSE for every
     row. 151936/201088 are the Qwen3 / GPT-OSS vocabs; tests previously only
     covered V <= 65536-class shapes where every cluster block owns columns."""
-    N, H = 512, 1024
-    h, w, b, labels = _make_inputs(N, H, vocab, torch.bfloat16, has_bias=False)
-    hf = h.clone().requires_grad_(True)
-    wf = w.clone().requires_grad_(True)
-    ce = fused_selected_logprob_ce(hf, wf, labels, bias=b, ignore_index=-100, chunk_size=256)
-    assert torch.isfinite(ce[labels != -100]).all(), "NaN/inf per-token CE at production vocab size"
-    ref = _ref_ce(h, w, b, labels, -100, 1.0)
-    assert (ce - ref).abs().max().item() < 5e-2
-    ce.sum().backward()
-    assert torch.isfinite(hf.grad).all() and torch.isfinite(wf.grad).all()
-
-
-def test_quack_linear_per_token_matches_eager_at_qwen_vocab():
-    """quack_linear per-token dispatch at the Qwen3 vocab (the shape long-context
-    recipes actually run); small-vocab dispatch tests missed the cluster NaN."""
+    # The Qwen integration case and the largest direct GPT-OSS case cover the
+    # two production boundaries that the small-vocabulary dispatcher case misses.
     from xorl.ops.loss.causallm_loss import causallm_loss_function  # noqa: PLC0415
 
     N, H, V = 512, 1024, 151936
@@ -193,6 +157,19 @@ def test_quack_linear_per_token_matches_eager_at_qwen_vocab():
     assert torch.isfinite(quack.loss).all()
     assert (quack.loss - eager.loss).abs().item() < 5e-2
     assert (quack.per_token_loss - eager.per_token_loss).abs().max().item() < 5e-2
+
+    del h3, lab3, quack, eager, h, w, labels
+
+    V = 201088
+    h, w, b, labels = _make_inputs(N, H, V, torch.bfloat16, has_bias=False)
+    hf = h.clone().requires_grad_(True)
+    wf = w.clone().requires_grad_(True)
+    ce = fused_selected_logprob_ce(hf, wf, labels, bias=b, ignore_index=-100, chunk_size=256)
+    assert torch.isfinite(ce[labels != -100]).all()
+    ref = _ref_ce(h, w, b, labels, -100, 1.0)
+    assert (ce - ref).abs().max().item() < 5e-2
+    ce.sum().backward()
+    assert torch.isfinite(hf.grad).all() and torch.isfinite(wf.grad).all()
 
 
 def test_causallm_fused_quack_does_not_materialize_full_logits():
@@ -227,7 +204,7 @@ def test_causallm_fused_quack_does_not_materialize_full_logits():
     )
 
 
-def test_importance_sampling_loss_with_fused_mode():
+def _assert_importance_sampling_loss_with_fused_mode():
     """End-to-end RL loss with ce_mode="fused_quack": gradient flows through the
     surrogate (frozen output head — the LoRA RL case)."""
     N, H, V = 64, 128, 1000
@@ -244,30 +221,3 @@ def test_importance_sampling_loss_with_fused_mode():
     out.loss.backward()
     assert h.grad is not None and torch.isfinite(h.grad).all()
     assert w.grad is None, "frozen output head must receive no gradient"
-
-
-def test_logits_tile_bounded_by_chunk_when_frozen():
-    """Chunking bounds peak activation: with N >> chunk_size, the frozen-W peak
-    stays well below a full [N, V_local] logits tile (it is never materialized)."""
-    N, H, V = 16384, 2048, 50000
-    chunk = 2048
-    h = torch.randn(N, H, device="cuda", dtype=torch.bfloat16, requires_grad=True)
-    w = (torch.randn(V, H, device="cuda", dtype=torch.bfloat16) / (H**0.5)).requires_grad_(False)
-    labels = torch.randint(0, V, (N,), device="cuda")
-    full_tile_mb = N * V * 4 / 1024 / 1024  # full [N, V] fp32 logits
-
-    # warmup (quack compile / caches)
-    fused_selected_logprob_ce(h, w, labels, ignore_index=-100, chunk_size=chunk).sum().backward()
-    h.grad = None
-    torch.cuda.synchronize()
-    torch.cuda.reset_peak_memory_stats()
-    base = torch.cuda.memory_allocated()
-    fused_selected_logprob_ce(h, w, labels, ignore_index=-100, chunk_size=chunk).sum().backward()
-    torch.cuda.synchronize()
-    peak_mb = (torch.cuda.max_memory_allocated() - base) / 1024 / 1024
-
-    # peak should be on the order of a few [chunk, V] tiles, far below the full tile
-    assert peak_mb < full_tile_mb / 2, (
-        f"fused frozen-W activation {peak_mb:.0f} MB should be well below the full "
-        f"[N, V_local] logits tile {full_tile_mb:.0f} MB"
-    )

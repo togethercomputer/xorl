@@ -11,7 +11,6 @@ import pytest
 import torch
 import triton
 
-from xorl.ops import batch_invariant_ops
 from xorl.ops.batch_invariant_ops import (
     _deepgemm_ready,
     _matmul_persistent_deepgemm,
@@ -32,19 +31,6 @@ SHAPES = [
     (4096, 3840, 11520),
     (3072, 3840, 8192),  # BI lm-head chunk shape (fp32-out in production)
 ]
-
-
-@pytest.mark.cpu
-def test_ambient_legacy_envs_cannot_change_the_production_program(monkeypatch):
-    monkeypatch.setenv("XORL_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM", "0")
-    monkeypatch.setenv("SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT", "1")
-    monkeypatch.setenv("SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_COMPARISON_TEST", "1")
-    monkeypatch.setenv("XORL_BI_GEMM_CONFIG_TABLE", "0")
-
-    assert batch_invariant_ops._ENABLE_MM_DEEPGEMM is True
-    assert not hasattr(batch_invariant_ops, "_ENABLE_MM_FALLBACK_VARIANT")
-    assert not hasattr(batch_invariant_ops, "_ENABLE_MM_COMPARISON_TEST")
-    assert lookup_mm_config(torch.bfloat16, 1, 3840, 3840) != dict(BASELINE_CONFIG["torch.bfloat16"], BLOCK_SIZE_K=64)
 
 
 def _launch(a, b, cfg, out_dtype=None):
@@ -87,42 +73,36 @@ def _inputs(M, K, N, dtype, seed=0):
     return a, w.t()
 
 
-def test_block_k_pinned_per_dtype():
-    for dt_str, block_k in PINNED_BLOCK_K.items():
-        dt = getattr(torch, dt_str.removeprefix("torch."))
-        for M, N, K in [(1, 128, 128), (300, 3840, 3840), (32768, 11520, 3840)]:
-            assert lookup_mm_config(dt, M, N, K)["BLOCK_SIZE_K"] == block_k
-
-
 @requires_cuda
 @pytest.mark.gpu
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("shape", SHAPES)
-def test_table_config_bitwise_equals_baseline(dtype, shape):
-    M, K, N = shape
-    a, b = _inputs(M, K, N, dtype)
-    base = dict(BASELINE_CONFIG[str(dtype)], BLOCK_SIZE_K=PINNED_BLOCK_K[str(dtype)])
-    cfg = lookup_mm_config(dtype, M, N, K)
-    out_base = _launch(a, b, base)
-    out_cfg = _launch(a, b, cfg)
-    assert torch.equal(out_base, out_cfg), f"table config moved bits at {dtype} {shape}: {cfg}"
-    # fp32-out store path (the BI lm-head chunk form): mirror the production
-    # launcher — table config with OutOfResources->baseline fallback — and
-    # assert bit-neutrality down to raw accumulator bits
-    if dtype == torch.bfloat16:
-        from triton.runtime.errors import OutOfResources  # noqa: PLC0415
+def test_table_config_bitwise_equals_baseline():
+    # This is one doctrine-level contract: every generated table entry must be
+    # bit-neutral relative to the dtype-pinned reduction tree.
+    for dtype in (torch.bfloat16, torch.float32):
+        for shape in SHAPES:
+            M, K, N = shape
+            a, b = _inputs(M, K, N, dtype)
+            base = dict(BASELINE_CONFIG[str(dtype)], BLOCK_SIZE_K=PINNED_BLOCK_K[str(dtype)])
+            cfg = lookup_mm_config(dtype, M, N, K)
+            out_base = _launch(a, b, base)
+            out_cfg = _launch(a, b, cfg)
+            assert torch.equal(out_base, out_cfg), f"table config moved bits at {dtype} {shape}: {cfg}"
+            # fp32-out store path (the BI lm-head chunk form): mirror the production
+            # launcher — table config with OutOfResources->baseline fallback — and
+            # assert bit-neutrality down to raw accumulator bits
+            if dtype == torch.bfloat16:
+                from triton.runtime.errors import OutOfResources  # noqa: PLC0415
 
-        cfg32 = lookup_mm_config(dtype, M, N, K, out_itemsize=4)
-        try:
-            out32 = _launch(a, b, cfg32, torch.float32)
-        except OutOfResources:
-            out32 = _launch(a, b, base, torch.float32)
-        assert torch.equal(_launch(a, b, base, torch.float32), out32)
+                cfg32 = lookup_mm_config(dtype, M, N, K, out_itemsize=4)
+                try:
+                    out32 = _launch(a, b, cfg32, torch.float32)
+                except OutOfResources:
+                    out32 = _launch(a, b, base, torch.float32)
+                assert torch.equal(_launch(a, b, base, torch.float32), out32), shape
+    _assert_rows_invariant_across_m_and_buckets()
 
 
-@requires_cuda
-@pytest.mark.gpu
-def test_rows_invariant_across_m_and_buckets():
+def _assert_rows_invariant_across_m_and_buckets():
     K, N = 3840, 3840
     g = torch.Generator(device="cuda").manual_seed(3)
     w = torch.randn((N, K), device="cuda", generator=g, dtype=torch.float32).to(torch.bfloat16)

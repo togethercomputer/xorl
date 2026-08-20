@@ -36,8 +36,81 @@ def _gkn_factors(shared_a=False, shared_b=False, dtype=torch.bfloat16, seed=0):
     return W, A, B
 
 
+def _cast_once_merge(weight, delta):
+    return (weight.to(torch.float32) + delta).to(weight.dtype)
+
+
+def _assert_permanent_merge_matches_cast_once_contract():
+    for dtype in (torch.bfloat16, torch.float16, torch.float32):
+        torch.manual_seed(0)
+        layer = LoraLinear(128, 64, r=8, lora_alpha=16, dtype=dtype)
+        layer.weight.data.normal_(std=0.05)
+        before = layer.weight.detach().clone()
+        layer.merge_weights()
+        assert torch.equal(layer.weight, before)
+
+        if dtype is torch.float32:
+            continue
+        torch.manual_seed(0)
+        layer = LoraLinear(128, 64, r=8, lora_alpha=16, dtype=dtype)
+        layer.weight.data.normal_(std=0.05)
+        layer.lora_B.data.normal_(std=0.02)
+        before = layer.weight.detach().clone()
+        expected = _cast_once_merge(before, (layer.lora_B @ layer.lora_A) * layer.scaling)
+        layer.merge_weights()
+        assert torch.equal(layer.weight, expected)
+
+    config = MoELoRAConfig(r=8, lora_alpha=16, target_modules=["gate_proj", "up_proj", "down_proj"])
+    for dtype in (torch.bfloat16, torch.float16):
+        experts = MoEExpertsLoRA(
+            num_experts=4,
+            hidden_dim=32,
+            intermediate_size=24,
+            hidden_act="silu",
+            moe_implementation="eager",
+            lora_config=config,
+        ).to(dtype)
+        experts.gate_up_proj.data.normal_(std=0.05)
+        experts.down_proj.data.normal_(std=0.05)
+        gate_up_before = experts.gate_up_proj.detach().clone()
+        down_before = experts.down_proj.detach().clone()
+        experts.merge_weights()
+        assert torch.equal(experts.gate_up_proj, gate_up_before)
+        assert torch.equal(experts.down_proj, down_before)
+
+        experts = MoEExpertsLoRA(
+            num_experts=4,
+            hidden_dim=32,
+            intermediate_size=24,
+            hidden_act="silu",
+            moe_implementation="eager",
+            lora_config=config,
+        ).to(dtype)
+        experts.gate_up_proj.data.normal_(std=0.05)
+        experts.down_proj.data.normal_(std=0.05)
+        torch.manual_seed(7)
+        for projection in ("gate_proj", "up_proj", "down_proj"):
+            getattr(experts, f"{projection}_lora_B").data.normal_(std=0.02)
+
+        gate_up_before = experts.gate_up_proj.detach().clone()
+        down_before = experts.down_proj.detach().clone()
+        updates = {projection: experts._compute_proj_delta(projection) for projection in config.target_modules}
+        intermediate = experts.intermediate_size
+        gate_up_expected = gate_up_before.clone()
+        gate_up_expected[..., :intermediate] = _cast_once_merge(
+            gate_up_before[..., :intermediate], updates["gate_proj"]
+        )
+        gate_up_expected[..., intermediate:] = _cast_once_merge(gate_up_before[..., intermediate:], updates["up_proj"])
+        down_expected = _cast_once_merge(down_before, updates["down_proj"])
+
+        experts.merge_weights()
+
+        assert torch.equal(experts.gate_up_proj, gate_up_expected)
+        assert torch.equal(experts.down_proj, down_expected)
+
+
 class TestCanonicalFold:
-    def test_pinned_order(self):
+    def test_canonical_fold_forward_and_cache_policy(self):
         W, A, B = _gkn_factors()
         delta = torch.bmm(A.float().expand(E, -1, -1), B.float().expand(E, -1, -1)) * SCALING
         want = (W.float() + delta).to(W.dtype)
@@ -45,7 +118,16 @@ class TestCanonicalFold:
         assert torch.equal(got, want)
         assert got.dtype == W.dtype
 
-    def test_shared_factors_expand(self):
+        self._assert_shared_factors_expand()
+        self._assert_fold_commutes_with_expert_sharding()
+        self._assert_linear_orientation()
+        self._assert_zero_delta_is_value_identical()
+        _assert_permanent_merge_matches_cast_once_contract()
+        TestFoldedWeightAutograd()._assert_straight_through_gradient_policy()
+        TestLoraLinearMerged()._assert_merged_forward_selection_policy()
+        TestMoEExpertsLoRAMerged()._assert_merged_weight_and_cache_policy()
+
+    def _assert_shared_factors_expand(self):
         W, A, B = _gkn_factors(shared_a=True)
         got = canonical_lora_fold_gkn(W, A, B, SCALING)
         per_expert = torch.stack(
@@ -53,7 +135,7 @@ class TestCanonicalFold:
         )
         assert torch.allclose(got.float(), per_expert.float(), atol=0, rtol=0) or torch.equal(got, per_expert)
 
-    def test_fold_commutes_with_expert_sharding(self):
+    def _assert_fold_commutes_with_expert_sharding(self):
         # EP invariance: fold of a local expert slice == slice of the full fold.
         W, A, B = _gkn_factors()
         full = canonical_lora_fold_gkn(W, A, B, SCALING)
@@ -61,7 +143,7 @@ class TestCanonicalFold:
             shard = canonical_lora_fold_gkn(W[sl], A[sl], B[sl], SCALING)
             assert torch.equal(shard, full[sl])
 
-    def test_linear_orientation(self):
+    def _assert_linear_orientation(self):
         g = torch.Generator().manual_seed(1)
         W = torch.randn(I, H, generator=g).to(torch.bfloat16)
         A = torch.randn(R, H, generator=g).to(torch.float32) * 0.02
@@ -69,7 +151,7 @@ class TestCanonicalFold:
         want = (W.float() + (B @ A) * SCALING).to(W.dtype)
         assert torch.equal(canonical_lora_fold_linear(W, A, B, SCALING), want)
 
-    def test_zero_delta_is_value_identical(self):
+    def _assert_zero_delta_is_value_identical(self):
         # B == 0: folded values equal the base everywhere (only -0.0 -> +0.0
         # bit flips are permitted; both engines fold identically so the
         # contract holds).
@@ -79,7 +161,7 @@ class TestCanonicalFold:
 
 
 class TestFoldedWeightAutograd:
-    def test_factor_grad_dtype_honors_fsdp_metadata(self):
+    def _assert_factor_grad_dtype_honors_fsdp_metadata(self):
         factor_A = torch.ones(4, 8, dtype=torch.bfloat16, requires_grad=True)
         factor_B = torch.ones(16, 4, dtype=torch.bfloat16, requires_grad=True)
         assert _factor_grad_dtype(factor_A[:2]) == torch.bfloat16
@@ -108,21 +190,26 @@ class TestFoldedWeightAutograd:
         folded.backward(grad_w)
         return A_ref.grad, B_ref.grad
 
-    @pytest.mark.parametrize("shared_a,shared_b", [(False, False), (True, False), (False, True)])
-    def test_gkn_straight_through_matches_autograd(self, shared_a, shared_b):
-        W, A, B = _gkn_factors(shared_a=shared_a, shared_b=shared_b, seed=2)
-        A = A.requires_grad_(True)
-        B = B.requires_grad_(True)
-        folded = canonical_lora_fold_gkn(W, A.detach(), B.detach(), SCALING)
-        out = FoldedLoraWeightGKN.apply(folded, A, B, SCALING)
-        assert torch.equal(out, folded)
-        grad_w = torch.randn_like(folded.float()).to(folded.dtype)
-        out.backward(grad_w)
-        gA_ref, gB_ref = self._reference_grads(W, A, B, SCALING, grad_w, shared_a, shared_b)
-        assert torch.allclose(A.grad.float(), gA_ref.float(), rtol=1e-5, atol=1e-8)
-        assert torch.allclose(B.grad.float(), gB_ref.float(), rtol=1e-5, atol=1e-8)
+    def _assert_straight_through_gradient_policy(self):
+        self._assert_factor_grad_dtype_honors_fsdp_metadata()
 
-    def test_gate_up_fused_straight_through(self):
+        for shared_a, shared_b in ((False, False), (True, False), (False, True)):
+            W, A, B = _gkn_factors(shared_a=shared_a, shared_b=shared_b, seed=2)
+            A = A.requires_grad_(True)
+            B = B.requires_grad_(True)
+            folded = canonical_lora_fold_gkn(W, A.detach(), B.detach(), SCALING)
+            out = FoldedLoraWeightGKN.apply(folded, A, B, SCALING)
+            assert torch.equal(out, folded)
+            grad_w = torch.randn_like(folded.float()).to(folded.dtype)
+            out.backward(grad_w)
+            gA_ref, gB_ref = self._reference_grads(W, A, B, SCALING, grad_w, shared_a, shared_b)
+            assert torch.allclose(A.grad.float(), gA_ref.float(), rtol=1e-5, atol=1e-8)
+            assert torch.allclose(B.grad.float(), gB_ref.float(), rtol=1e-5, atol=1e-8)
+
+        self._assert_gate_up_fused_straight_through()
+        self._assert_linear_straight_through_matches_autograd()
+
+    def _assert_gate_up_fused_straight_through(self):
         g = torch.Generator().manual_seed(3)
         W = torch.randn(E, H, 2 * I, generator=g).to(torch.bfloat16)
         gA = (torch.randn(1, H, R, generator=g) * 0.02).to(torch.bfloat16).requires_grad_(True)
@@ -147,7 +234,7 @@ class TestFoldedWeightAutograd:
             B.grad = None
             break  # gate checked exactly; up follows by symmetry
 
-    def test_linear_straight_through_matches_autograd(self):
+    def _assert_linear_straight_through_matches_autograd(self):
         g = torch.Generator().manual_seed(4)
         W = torch.randn(I, H, generator=g).to(torch.bfloat16)
         A = (torch.randn(R, H, generator=g) * 0.02).requires_grad_(True)
@@ -171,7 +258,7 @@ class TestLoraLinearMerged:
         torch.nn.init.normal_(layer.lora_B, std=0.02)  # nonzero delta
         return layer
 
-    def test_merged_forward_bits(self):
+    def _assert_merged_forward_selection_policy(self):
         layer = self._layer()
         layer.exact_merged_forward = True
         x = torch.randn(6, H)
@@ -182,7 +269,12 @@ class TestLoraLinearMerged:
             got = layer(x)
         assert torch.equal(got, want)
 
-    def test_flag_off_keeps_legacy_path(self):
+        self._assert_flag_off_keeps_legacy_path()
+        self._assert_exact_and_ordinary_selection_is_isolated()
+        self._assert_merged_grads_close_to_unmerged()
+        self._assert_cache_invalidation_on_step_and_runtime_config()
+
+    def _assert_flag_off_keeps_legacy_path(self):
         layer = self._layer()
         x = torch.randn(6, H)
         base = torch.nn.functional.linear(x, layer.weight, None)
@@ -190,7 +282,7 @@ class TestLoraLinearMerged:
         want = base + (lora * layer.scaling)
         assert torch.allclose(layer(x), want, rtol=0, atol=0)
 
-    def test_exact_and_ordinary_modules_do_not_share_selection_state(self):
+    def _assert_exact_and_ordinary_selection_is_isolated(self):
         exact = self._layer()
         ordinary = self._layer()
         ordinary.load_state_dict(exact.state_dict())
@@ -208,14 +300,13 @@ class TestLoraLinearMerged:
         )
         assert torch.equal(ordinary_out, expected_ordinary)
 
-    def test_merged_grads_close_to_unmerged(self):
+    def _assert_merged_grads_close_to_unmerged(self):
         layer = self._layer()
         x = torch.randn(6, H)
         grads = {}
         for flag in ("0", "1"):
             layer.exact_merged_forward = flag == "1"
             layer.lora_A.grad = layer.lora_B.grad = None
-            layer.invalidate_merged_weight_cache()
             layer(x).square().mean().backward()
             grads[flag] = (layer.lora_A.grad.clone(), layer.lora_B.grad.clone())
         # fwd/bwd decoupling: merged-lane grads track the unmerged autograd at
@@ -223,7 +314,7 @@ class TestLoraLinearMerged:
         for a, b in zip(grads["0"], grads["1"]):
             assert torch.allclose(a, b, rtol=5e-2, atol=1e-5)
 
-    def test_cache_invalidation_on_step_and_runtime_config(self):
+    def _assert_cache_invalidation_on_step_and_runtime_config(self):
         layer = self._layer()
         layer.exact_merged_forward = True
         w1 = layer._merged_weight()
@@ -263,7 +354,7 @@ class TestMoEExpertsLoRAMerged:
                 getattr(mod, f"{proj}_lora_B").normal_(std=0.02)
         return mod
 
-    def test_merged_weights_match_canonical_fold(self):
+    def _assert_merged_weight_and_cache_policy(self):
         mod = self._module()
         mod.exact_merged_forward = True
         gate_up_f, down_f = mod._merged_weights()
@@ -278,7 +369,10 @@ class TestMoEExpertsLoRAMerged:
         assert torch.equal(mod.canonical_merged_proj_weight("gate_proj"), gate_up_f[..., :I])
         assert torch.equal(mod.canonical_merged_proj_weight("down_proj"), down_f)
 
-    def test_cache_keyed_on_versions(self):
+        self._assert_cache_is_keyed_on_parameter_versions()
+        self._assert_fused_experts_admission_policy()
+
+    def _assert_cache_is_keyed_on_parameter_versions(self):
         mod = self._module()
         mod.exact_merged_forward = True
         g1, d1 = mod._merged_weights()
@@ -289,13 +383,15 @@ class TestMoEExpertsLoRAMerged:
         g3, _ = mod._merged_weights()
         assert g3 is not g1 and not torch.equal(g1, g3)
 
-    def test_auto_supported_requires_exact_model_program(self):
+    def _assert_fused_experts_admission_policy(self):
         mod = self._module()
         assert not mod.sglang_fused_experts_auto_supported()
         mod.exact_merged_forward = True
         assert mod.sglang_fused_experts_auto_supported()
 
-    def test_fused_flag_without_merged_flag_raises(self):
+        self._assert_fused_flag_without_merged_flag_raises()
+
+    def _assert_fused_flag_without_merged_flag_raises(self):
         mod = self._module()
         with pytest.raises(NotImplementedError, match="merged"):
             mod.sglang_fused_experts_forward(
@@ -304,7 +400,7 @@ class TestMoEExpertsLoRAMerged:
                 torch.randint(0, E, (3, 2)),
             )
 
-    def test_native_ep_keyword_routes_to_masked_lora_partial(self, monkeypatch):
+    def test_native_ep_merged_lora_policy(self, monkeypatch):
         mod = self._module()
         mod.exact_merged_forward = True
         hidden = torch.randn(3, H).to(torch.bfloat16)
@@ -322,7 +418,9 @@ class TestMoEExpertsLoRAMerged:
         assert got is expected
         assert calls == [(hidden, routing, local_ids)]
 
-    def test_native_ep_no_grad_uses_canonical_fold_and_filter(self, monkeypatch):
+        self._assert_native_ep_no_grad_uses_canonical_fold_and_filter(monkeypatch)
+
+    def _assert_native_ep_no_grad_uses_canonical_fold_and_filter(self, monkeypatch):
         mod = self._module()
         mod.exact_merged_forward = True
         hidden = torch.randn(3, H).to(torch.bfloat16)
@@ -383,13 +481,15 @@ class TestTrunkWrapComposition:
         model.q_proj = LoraLinear(H, H, r=R, lora_alpha=R, dtype=torch.bfloat16)
         return model
 
-    def test_wrap_raises_without_merged_flag(self):
+    def test_trunk_wrap_composition_policy(self, monkeypatch):
         from xorl.ops.batch_invariant_ops import wrap_trunk_linears_batch_invariant  # noqa: PLC0415
 
         with pytest.raises(NotImplementedError, match="canonical merged-LoRA"):
             wrap_trunk_linears_batch_invariant(self._model())
 
-    def test_wrap_composes_with_merged_flag(self, monkeypatch):
+        self._assert_wrap_composes_with_merged_flag(monkeypatch)
+
+    def _assert_wrap_composes_with_merged_flag(self, monkeypatch):
         from xorl.ops.batch_invariant_ops import (  # noqa: PLC0415
             set_trunk_linear_contract,
             wrap_trunk_linears_batch_invariant,

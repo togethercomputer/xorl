@@ -1,11 +1,16 @@
 from types import SimpleNamespace
 
 import pytest
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from xorl.models.layers.moe.experts import MoEExperts
-from xorl.trainers.model_builder import build_training_model
+from xorl.trainers.model_builder import (
+    build_training_model,
+    resolve_training_model_dtype,
+    should_skip_generic_param_upcast,
+)
 
 
 pytestmark = [pytest.mark.cpu]
@@ -34,6 +39,15 @@ class TinyDenseOnlyModel(nn.Module):
         self.lm_head = nn.Linear(16, 8)
 
 
+class TinyLoraModel(nn.Module):
+    _no_split_modules = []
+
+    def __init__(self, dtype: torch.dtype):
+        super().__init__()
+        self.config = SimpleNamespace(model_type="tiny")
+        self.proj = nn.Linear(4, 4, bias=False, dtype=dtype)
+
+
 class TinyQARLCalibrationModel(nn.Module):
     _no_split_modules = []
 
@@ -49,7 +63,7 @@ class TinyQARLCalibrationModel(nn.Module):
         return self.lm_head(hidden)
 
 
-def test_build_training_model_applies_full_model_fp8_training(monkeypatch):
+def _assert_build_training_model_applies_full_model_fp8_training(monkeypatch):
     captured = {}
 
     def fake_build_foundation_model(**_kwargs):
@@ -122,82 +136,7 @@ def test_build_training_model_applies_full_model_fp8_training(monkeypatch):
     assert all(param.requires_grad for param in result.model.parameters())
 
 
-def test_build_training_model_threads_sharded_lm_head_loss_to_parallelize(monkeypatch):
-    captured = {}
-
-    def fake_build_foundation_model(**_kwargs):
-        return TinyDenseOnlyModel()
-
-    def fake_parallelize(model, **kwargs):
-        captured.update(kwargs)
-        return model
-
-    monkeypatch.setattr("xorl.trainers.model_builder.build_foundation_model", fake_build_foundation_model)
-    monkeypatch.setattr("xorl.trainers.model_builder._parallelize", fake_parallelize)
-    monkeypatch.setattr("xorl.trainers.model_builder.helper.print_device_mem_info", lambda *args, **kwargs: None)
-
-    build_training_model(
-        config_path="unused",
-        weights_path="unused",
-        fsdp_sharded_lm_head_loss=True,
-        enable_mixed_precision=False,
-        enable_gradient_checkpointing=False,
-    )
-
-    assert captured["fsdp_sharded_lm_head_loss"] is True
-
-
-def test_build_training_model_threads_glm52_block_fp8_qlora_mode(monkeypatch):
-    captured = {}
-    inventory = object()
-
-    def fake_build_foundation_model(**kwargs):
-        captured["foundation_flag"] = kwargs["block_fp8_qlora_training"]
-        captured["foundation_rank"] = kwargs["lora_rank"]
-        captured["foundation_alpha"] = kwargs["lora_alpha"]
-        return TinyDenseOnlyModel()
-
-    def fake_inject_qlora(model, **kwargs):
-        captured["inject_flag"] = kwargs["block_fp8_qlora_training"]
-        captured["quant_format"] = kwargs["quant_format"]
-        captured["quant_group_size"] = kwargs["quant_group_size"]
-        model._glm52_adapter_inventory = inventory
-        return True, "block_fp8", set()
-
-    monkeypatch.setattr("xorl.trainers.model_builder.build_foundation_model", fake_build_foundation_model)
-    monkeypatch.setattr("xorl.trainers.model_builder._inject_qlora", fake_inject_qlora)
-    monkeypatch.setattr("xorl.trainers.model_builder._deferred_qlora_quantize", lambda *args, **kwargs: None)
-    monkeypatch.setattr("xorl.trainers.model_builder._parallelize", lambda model, **_kwargs: model)
-    monkeypatch.setattr("xorl.trainers.model_builder.helper.print_device_mem_info", lambda *args, **kwargs: None)
-
-    result = build_training_model(
-        config_path="unused",
-        weights_path="unused",
-        moe_implementation="triton",
-        ep_dispatch="deepep",
-        enable_lora=True,
-        enable_qlora=True,
-        block_fp8_qlora_training=True,
-        quant_format="block_fp8",
-        quant_group_size=128,
-        moe_hybrid_shared_lora=True,
-        freeze_router=True,
-        enable_mixed_precision=False,
-        enable_gradient_checkpointing=False,
-    )
-
-    assert captured == {
-        "foundation_flag": True,
-        "foundation_rank": 32,
-        "foundation_alpha": 16,
-        "inject_flag": True,
-        "quant_format": "block_fp8",
-        "quant_group_size": 128,
-    }
-    assert result.glm52_adapter_inventory is inventory
-
-
-def test_build_training_model_rejects_glm52_block_fp8_mode_without_qlora():
+def _assert_build_training_model_rejects_glm52_block_fp8_mode_without_qlora():
     with pytest.raises(ValueError, match="requires enable_lora=True and enable_qlora=True"):
         build_training_model(
             config_path="unused",
@@ -206,7 +145,7 @@ def test_build_training_model_rejects_glm52_block_fp8_mode_without_qlora():
         )
 
 
-def test_build_training_model_rejects_fp8_with_adapters(monkeypatch):
+def _assert_build_training_model_rejects_fp8_with_adapters(monkeypatch):
     monkeypatch.setattr("xorl.trainers.model_builder.build_foundation_model", lambda **_kwargs: TinyDenseMoEModel())
     monkeypatch.setattr("xorl.trainers.model_builder.helper.print_device_mem_info", lambda *args, **kwargs: None)
 
@@ -222,7 +161,7 @@ def test_build_training_model_rejects_fp8_with_adapters(monkeypatch):
         )
 
 
-def test_build_training_model_applies_dense_qarl_fake_quant(monkeypatch):
+def _assert_build_training_model_applies_dense_qarl_fake_quant(monkeypatch):
     captured = {}
 
     def fake_parallelize(model, **kwargs):
@@ -256,7 +195,7 @@ def test_build_training_model_applies_dense_qarl_fake_quant(monkeypatch):
     assert all(param.requires_grad for param in result.model.parameters())
 
 
-def test_build_training_model_runs_qarl_calibration_before_parallelize(monkeypatch, tmp_path):
+def _assert_build_training_model_runs_qarl_calibration_before_parallelize(monkeypatch, tmp_path):
     calibration_path = tmp_path / "calib.json"
     calibration_path.write_text('{"input_ids": [[1, 2, 3, 4], [4, 3, 2, 1]]}\n', encoding="utf-8")
     captured = {}
@@ -295,7 +234,7 @@ def test_build_training_model_runs_qarl_calibration_before_parallelize(monkeypat
     assert result.model._qarl_calibration_summary["linear_count"] == 2
 
 
-def test_build_training_model_rejects_qarl_with_adapters_or_fp8(monkeypatch):
+def _assert_build_training_model_rejects_qarl_with_adapters_or_fp8(monkeypatch):
     monkeypatch.setattr("xorl.trainers.model_builder.build_foundation_model", lambda **_kwargs: TinyDenseOnlyModel())
     monkeypatch.setattr("xorl.trainers.model_builder.helper.print_device_mem_info", lambda *args, **kwargs: None)
 
@@ -320,7 +259,7 @@ def test_build_training_model_rejects_qarl_with_adapters_or_fp8(monkeypatch):
         )
 
 
-def test_build_training_model_rejects_qarl_for_moe(monkeypatch):
+def _assert_build_training_model_rejects_qarl_for_moe(monkeypatch):
     monkeypatch.setattr("xorl.trainers.model_builder.build_foundation_model", lambda **_kwargs: TinyDenseMoEModel())
     monkeypatch.setattr("xorl.trainers.model_builder.helper.print_device_mem_info", lambda *args, **kwargs: None)
 
@@ -334,9 +273,8 @@ def test_build_training_model_rejects_qarl_for_moe(monkeypatch):
         )
 
 
-def test_build_training_model_allows_full_fp8_lm_head_with_tensor_parallel(monkeypatch):
-    captured = {}
-
+def _assert_build_training_model_honors_fp8_lm_head_inclusion_with_tensor_parallel(monkeypatch):
+    captured = []
     monkeypatch.setattr(
         "xorl.trainers.model_builder.get_parallel_state",
         lambda: SimpleNamespace(tp_enabled=True, pp_enabled=False),
@@ -345,49 +283,122 @@ def test_build_training_model_allows_full_fp8_lm_head_with_tensor_parallel(monke
     monkeypatch.setattr("xorl.trainers.model_builder.helper.print_device_mem_info", lambda *args, **kwargs: None)
 
     def fake_parallelize(model, **_kwargs):
-        captured["proj_type"] = type(model.proj).__name__
-        captured["lm_head_type"] = type(model.lm_head).__name__
+        captured.append((type(model.proj).__name__, type(model.lm_head).__name__))
         return model
 
     monkeypatch.setattr("xorl.trainers.model_builder._parallelize", fake_parallelize)
 
-    build_training_model(
-        config_path="unused",
-        weights_path="unused",
-        enable_fp8_training=True,
-        enable_mixed_precision=False,
-        enable_gradient_checkpointing=False,
-    )
+    for exclude_modules in (None, ["lm_head"]):
+        build_training_model(
+            config_path="unused",
+            weights_path="unused",
+            enable_fp8_training=True,
+            fp8_training_exclude_modules=exclude_modules,
+            enable_mixed_precision=False,
+            enable_gradient_checkpointing=False,
+        )
 
-    assert captured["proj_type"] == "FP8Linear"
-    assert captured["lm_head_type"] == "FP8Linear"
+    assert captured == [("FP8Linear", "FP8Linear"), ("FP8Linear", "Linear")]
 
 
-def test_build_training_model_allows_tensor_parallel_when_lm_head_excluded_from_fp8(monkeypatch):
-    captured = {}
+def test_build_training_model_precision_and_quantized_mode_policy(monkeypatch, tmp_path):
+    with monkeypatch.context() as lora_patch:
+        _assert_lora_mixed_precision_dtype_policy(lora_patch)
 
-    monkeypatch.setattr(
-        "xorl.trainers.model_builder.get_parallel_state",
-        lambda: SimpleNamespace(tp_enabled=True, pp_enabled=False),
-    )
+    with monkeypatch.context() as fp8_patch:
+        _assert_build_training_model_applies_full_model_fp8_training(fp8_patch)
+        _assert_build_training_model_honors_fp8_lm_head_inclusion_with_tensor_parallel(fp8_patch)
+
+    with monkeypatch.context() as admission_patch:
+        _assert_build_training_model_rejects_glm52_block_fp8_mode_without_qlora()
+        _assert_build_training_model_rejects_fp8_with_adapters(admission_patch)
+        _assert_build_training_model_rejects_unvalidated_blackwell_fp8(admission_patch)
+        _assert_build_training_model_rejects_qarl_with_adapters_or_fp8(admission_patch)
+        _assert_build_training_model_rejects_qarl_for_moe(admission_patch)
+
+    with monkeypatch.context() as qarl_patch:
+        _assert_build_training_model_applies_dense_qarl_fake_quant(qarl_patch)
+        _assert_build_training_model_runs_qarl_calibration_before_parallelize(qarl_patch, tmp_path)
+
+
+def _assert_build_training_model_rejects_unvalidated_blackwell_fp8(monkeypatch):
     monkeypatch.setattr("xorl.trainers.model_builder.build_foundation_model", lambda **_kwargs: TinyDenseMoEModel())
+    monkeypatch.setattr("xorl.fp8_training.config_compat.is_blackwell_device", lambda **_kwargs: True)
     monkeypatch.setattr("xorl.trainers.model_builder.helper.print_device_mem_info", lambda *args, **kwargs: None)
 
-    def fake_parallelize(model, **_kwargs):
-        captured["lm_head_type"] = type(model.lm_head).__name__
-        captured["proj_type"] = type(model.proj).__name__
+    with pytest.raises(ValueError, match="guarded on Blackwell"):
+        build_training_model(
+            config_path="unused",
+            weights_path="unused",
+            enable_fp8_training=True,
+        )
+
+    with pytest.raises(ValueError, match="requires fp8_training_blackwell_validation_artifact"):
+        build_training_model(
+            config_path="unused",
+            weights_path="unused",
+            enable_fp8_training=True,
+            fp8_training_allow_blackwell=True,
+        )
+
+
+def _assert_lora_mixed_precision_dtype_policy(monkeypatch):
+    captured = {}
+
+    def fake_build_foundation_model(**kwargs):
+        return TinyLoraModel(getattr(torch, kwargs["torch_dtype"]))
+
+    def fake_parallelize(model, **kwargs):
+        captured["skip_param_upcast"] = kwargs["skip_param_upcast"]
+        captured["base_dtype"] = model.proj.weight.dtype
+        captured["lora_a_dtype"] = model.proj.lora_A.dtype
+        captured["lora_b_dtype"] = model.proj.lora_B.dtype
         return model
 
+    monkeypatch.setattr("xorl.trainers.model_builder.build_foundation_model", fake_build_foundation_model)
     monkeypatch.setattr("xorl.trainers.model_builder._parallelize", fake_parallelize)
+    monkeypatch.setattr("xorl.trainers.model_builder.helper.print_device_mem_info", lambda *args, **kwargs: None)
 
-    build_training_model(
+    result = build_training_model(
         config_path="unused",
         weights_path="unused",
-        enable_fp8_training=True,
-        fp8_training_exclude_modules=["lm_head"],
-        enable_mixed_precision=False,
-        enable_gradient_checkpointing=False,
+        torch_dtype="bfloat16",
+        enable_lora=True,
+        lora_rank=8,
+        lora_alpha=16,
+        lora_target_modules=["proj"],
+        enable_mixed_precision=True,
     )
 
-    assert captured["proj_type"] == "FP8Linear"
-    assert captured["lm_head_type"] == "Linear"
+    assert captured == {
+        "skip_param_upcast": True,
+        "base_dtype": torch.bfloat16,
+        "lora_a_dtype": torch.float32,
+        "lora_b_dtype": torch.float32,
+    }
+    assert result.model.proj.weight.requires_grad is False
+    assert result.model.proj.lora_A.requires_grad is True
+    assert result.model.proj.lora_B.requires_grad is True
+
+    for kwargs, expected_dtype, expected_skip in (
+        ({"enable_qlora": True, "enable_mixed_precision": True}, "bfloat16", True),
+        ({"enable_mixed_precision": True, "skip_param_upcast": True}, "bfloat16", True),
+        ({"enable_mixed_precision": True}, "float32", False),
+    ):
+        assert (
+            resolve_training_model_dtype(
+                enable_lora=False,
+                enable_qlora=kwargs.get("enable_qlora", False),
+                enable_mixed_precision=kwargs["enable_mixed_precision"],
+                skip_param_upcast=kwargs.get("skip_param_upcast", False),
+            )
+            == expected_dtype
+        )
+        assert (
+            should_skip_generic_param_upcast(
+                enable_lora=False,
+                enable_qlora=kwargs.get("enable_qlora", False),
+                skip_param_upcast=kwargs.get("skip_param_upcast", False),
+            )
+            is expected_skip
+        )

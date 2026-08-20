@@ -6,198 +6,28 @@ These tests monkeypatch the downstream implementations to verify the adapters pa
 expert_scores through, and compare output to a naive reference.
 """
 
-import importlib.util
 import inspect
-import sys
-import types
-from pathlib import Path
 
 import pytest
 import torch
 import torch.nn.functional as F
 
 import xorl.models.layers.moe.backend as moe_backend
+from tests._helpers.moe import counts_from_cumsum, patch_ep_kernels
 from xorl.models.layers.moe.backend import EP_EXPERT_COMPUTE, EP_EXPERT_COMPUTE_MOE_ACT
-from xorl.utils import import_utils
+from xorl.ops.moe import quack as quack_moe
+from xorl.ops.moe import triton as triton_moe
 
 
 pytestmark = pytest.mark.cpu
 
-_MODULE_PATHS = {
-    "xorl.ops.moe.triton": Path(__file__).resolve().parents[2] / "src/xorl/ops/moe/triton.py",
-    "xorl.ops.moe.quack": Path(__file__).resolve().parents[2] / "src/xorl/ops/moe/quack.py",
-}
 
-_BACKEND_INIT_PATH = Path(__file__).resolve().parents[2] / "src/xorl/models/layers/moe/backend/__init__.py"
-_BACKEND_PACKAGE = "xorl.models.layers.moe.backend"
-
-
-def _counts_from_cumsum(cumsum: torch.Tensor) -> list[int]:
-    counts = torch.empty_like(cumsum)
-    counts[0] = cumsum[0]
-    counts[1:] = cumsum[1:] - cumsum[:-1]
-    return counts.tolist()
-
-
-def _naive_group_gemm_same_nk(a, b, cumsum_M, max_M, transpose_a=False, transpose_b=False, **kwargs):
-    del max_M, kwargs
-    assert not transpose_a
-    outputs = []
-    start = 0
-    for expert_idx, count in enumerate(_counts_from_cumsum(cumsum_M)):
-        end = start + count
-        weight = b[expert_idx]
-        if transpose_b:
-            outputs.append(a[start:end] @ weight.transpose(0, 1))
-        else:
-            outputs.append(a[start:end] @ weight)
-        start = end
-    return torch.cat(outputs, dim=0)
-
-
-def _naive_group_gemm_same_mn(a, b, c, cumsum_K, max_K, transpose_a=False, transpose_b=False, **kwargs):
-    del max_K, kwargs
-    start = 0
-    for expert_idx, count in enumerate(_counts_from_cumsum(cumsum_K)):
-        end = start + count
-        lhs = a[start:end].transpose(0, 1) if transpose_a else a[start:end]
-        rhs = b[start:end].transpose(0, 1) if transpose_b else b[start:end]
-        c[expert_idx].copy_(lhs @ rhs)
-        start = end
-    return c
-
-
-def reference_ep_forward(permute_tokens, cumsum, gate_proj, up_proj, down_proj, expert_scores):
-    """Naive reference: per-expert matmul with SiLU + optional score scaling."""
-    outputs = []
-    start = 0
-    for expert_idx, count in enumerate(_counts_from_cumsum(cumsum)):
-        end = start + count
-        x = permute_tokens[start:end]
-        h = F.silu(x @ gate_proj[expert_idx]) * (x @ up_proj[expert_idx])
-        if expert_scores is not None:
-            h = h * expert_scores[start:end].to(h.dtype).unsqueeze(-1)
-        outputs.append(h @ down_proj[expert_idx])
-        start = end
-    return torch.cat(outputs, dim=0)
-
-
-def _patch_kernels_and_load_backend(monkeypatch, backend_type: str):
-    """Patch kernel modules and load backend/__init__.py to get the adapter wrappers."""
-    moe_stub = types.ModuleType("xorl.ops.group_gemm.kernel.moe")
-    moe_stub.expert_histogram = None
-    moe_stub.moe_gather = None
-    moe_stub.moe_index_compute = None
-    moe_stub.moe_scatter = None
-    monkeypatch.setattr(import_utils, "is_fused_moe_available", lambda: True)
-    sys.modules.pop("xorl.ops.group_gemm.kernel.moe", None)
-    sys.modules.pop("xorl.ops.group_gemm.kernel.group_gemm", None)
-    sys.modules.pop("xorl.ops.group_gemm.kernel.quack", None)
-    monkeypatch.setitem(sys.modules, "xorl.ops.group_gemm.kernel.moe", moe_stub)
-
-    if backend_type == "triton":
-        group_gemm_stub = types.ModuleType("xorl.ops.group_gemm.kernel.group_gemm")
-        group_gemm_stub.group_gemm_same_nk = _naive_group_gemm_same_nk
-        group_gemm_stub.group_gemm_same_mn = _naive_group_gemm_same_mn
-        monkeypatch.setitem(sys.modules, "xorl.ops.group_gemm.kernel.group_gemm", group_gemm_stub)
-        module_name = "xorl.ops.moe.triton"
-    else:
-        quack_stub = types.ModuleType("xorl.ops.group_gemm.kernel.quack")
-        quack_stub.cumsum_to_cu_seqlens = lambda cumsum: cumsum
-        quack_stub.quack_group_gemm_same_nk = _naive_group_gemm_same_nk
-        quack_stub.quack_group_gemm_same_mn = _naive_group_gemm_same_mn
-        monkeypatch.setitem(sys.modules, "xorl.ops.group_gemm.kernel.quack", quack_stub)
-        module_name = "xorl.ops.moe.quack"
-
-    spec = importlib.util.spec_from_file_location(f"adapter_test_{backend_type}", _MODULE_PATHS[module_name])
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    monkeypatch.setitem(sys.modules, module_name, module)
-
-    return module
-
-
-def _make_test_data(dtype=torch.float32):
-    torch.manual_seed(42)
-    num_local_experts = 2
-    hidden_dim = 8
-    intermediate_size = 12
-    counts = torch.tensor([3, 2])
-    cumsum = torch.cumsum(counts, dim=0)
-    num_tokens = int(cumsum[-1].item())
-
-    permute_tokens = torch.randn(num_tokens, hidden_dim, dtype=dtype)
-    gate_proj = torch.randn(num_local_experts, hidden_dim, intermediate_size, dtype=dtype)
-    up_proj = torch.randn(num_local_experts, hidden_dim, intermediate_size, dtype=dtype)
-    down_proj = torch.randn(num_local_experts, intermediate_size, hidden_dim, dtype=dtype)
-    gate_up_proj = torch.cat([gate_proj, up_proj], dim=-1)
-    expert_scores = torch.rand(num_tokens, dtype=dtype)
-
-    return permute_tokens, cumsum, gate_proj, up_proj, down_proj, gate_up_proj, intermediate_size, expert_scores
-
-
-def test_quack_ep_registers_without_optional_moe_act(monkeypatch):
+def _assert_quack_ep_registers_without_optional_moe_act():
     """The base Quack EP path must not depend on the optional MoE-act class."""
-    for module_name in list(sys.modules):
-        if module_name == _BACKEND_PACKAGE or module_name.startswith(f"{_BACKEND_PACKAGE}."):
-            monkeypatch.delitem(sys.modules, module_name, raising=False)
-
-    quack_stub = types.ModuleType("xorl.ops.moe.quack")
-
-    class QuackEPGroupGemm:
-        @staticmethod
-        def apply(*args, **kwargs):
-            return args, kwargs
-
-    quack_stub.QuackEPGroupGemm = QuackEPGroupGemm
-    monkeypatch.setitem(sys.modules, "xorl.ops.moe.quack", quack_stub)
-
-    spec = importlib.util.spec_from_file_location(
-        _BACKEND_PACKAGE,
-        _BACKEND_INIT_PATH,
-        submodule_search_locations=[str(_BACKEND_INIT_PATH.parent)],
-    )
-    module = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, _BACKEND_PACKAGE, module)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-
-    assert "quack" in module.EP_EXPERT_COMPUTE
-    assert "quack" not in module.EP_EXPERT_COMPUTE_MOE_ACT
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton/Quack EP kernels require CUDA")
-@pytest.mark.parametrize(
-    ("backend_type", "class_name"),
-    [
-        pytest.param("triton", "TritonEPGroupGemm", id="triton-ep"),
-        pytest.param("quack", "QuackEPGroupGemm", id="quack-ep"),
-    ],
-)
-def test_adapter_forwards_expert_scores(monkeypatch, backend_type, class_name):
-    """Verify that EP adapter wrappers accept and forward expert_scores."""
-    try:
-        kernel_module = _patch_kernels_and_load_backend(monkeypatch, backend_type)
-    except ImportError as exc:
-        pytest.skip(f"{backend_type} unavailable: {exc}")
-
-    (
-        permute_tokens,
-        cumsum,
-        gate_proj,
-        up_proj,
-        down_proj,
-        gate_up_proj,
-        intermediate_size,
-        expert_scores,
-    ) = _make_test_data()
-
-    fn_cls = getattr(kernel_module, class_name)
-    output = fn_cls.apply(permute_tokens, cumsum, gate_up_proj, down_proj, intermediate_size, expert_scores)
-
-    ref = reference_ep_forward(permute_tokens, cumsum, gate_proj, up_proj, down_proj, expert_scores)
-    torch.testing.assert_close(output, ref)
+    assert hasattr(moe_backend, "_QuackEPGroupGemm")
+    assert not hasattr(moe_backend, "_QuackEPGroupGemmMoeAct")
+    assert "quack" in EP_EXPERT_COMPUTE
+    assert "quack" not in EP_EXPERT_COMPUTE_MOE_ACT
 
 
 # ---------------------------------------------------------------------------
@@ -210,32 +40,33 @@ def test_adapter_forwards_expert_scores(monkeypatch, backend_type, class_name):
 _REQUIRED_EP_PARAMS = ("expert_scores", "hidden_act", "activation_native", "swiglu_limit")
 
 
-@pytest.mark.parametrize("name,fn", list(EP_EXPERT_COMPUTE.items()))
-def test_ep_compute_signature_contract(name, fn):
-    """Every EP compute function must explicitly accept expert_scores, hidden_act,
-    and a **kwargs catch-all for forward-compat extras (gate_up_bias, down_bias, etc.).
-    """
-    sig = inspect.signature(fn)
-    params = sig.parameters
+def _assert_ep_registry_signature_contracts():
+    """Every registered EP function exposes the shared forward-compatible API."""
+    registries = {
+        "EP_EXPERT_COMPUTE": EP_EXPERT_COMPUTE,
+        "EP_EXPERT_COMPUTE_MOE_ACT": EP_EXPERT_COMPUTE_MOE_ACT,
+    }
+    for registry_name, registry in registries.items():
+        for name, fn in registry.items():
+            sig = inspect.signature(fn)
+            params = sig.parameters
 
-    for required in _REQUIRED_EP_PARAMS:
-        assert required in params, (
-            f"EP_EXPERT_COMPUTE['{name}'] is missing explicit '{required}' param. Signature: {sig}"
-        )
+            for required in _REQUIRED_EP_PARAMS:
+                assert required in params, (
+                    f"{registry_name}['{name}'] is missing explicit '{required}' param. Signature: {sig}"
+                )
 
-    has_var_keyword = any(p.kind == p.VAR_KEYWORD for p in params.values())
-    assert has_var_keyword, (
-        f"EP_EXPERT_COMPUTE['{name}'] has no **kwargs — new extras like "
-        f"gate_up_bias will break callers. Signature: {sig}"
-    )
+            has_var_keyword = any(p.kind == p.VAR_KEYWORD for p in params.values())
+            assert has_var_keyword, (
+                f"{registry_name}['{name}'] has no **kwargs — new extras like "
+                f"gate_up_bias will break callers. Signature: {sig}"
+            )
 
 
-def test_native_ep_adapter_consumes_fp8_kwargs_when_fp8_compute_is_disabled():
+def _assert_native_ep_adapter_consumes_fp8_kwargs_when_fp8_compute_is_disabled():
     """Native EP is a BF16 fallback path but receives the common EP FP8 kwargs."""
 
-    fn = EP_EXPERT_COMPUTE.get("native")
-    if fn is None:
-        pytest.skip("native EP backend is unavailable")
+    fn = EP_EXPERT_COMPUTE["native"]
 
     permute_tokens = torch.empty(0, 4)
     cumsum = torch.zeros(1, dtype=torch.int32)
@@ -260,10 +91,8 @@ def test_native_ep_adapter_consumes_fp8_kwargs_when_fp8_compute_is_disabled():
     assert out.shape == permute_tokens.shape
 
 
-def test_native_ep_adapter_rejects_fp8_expert_compute_explicitly():
-    fn = EP_EXPERT_COMPUTE.get("native")
-    if fn is None:
-        pytest.skip("native EP backend is unavailable")
+def _assert_native_ep_adapter_rejects_fp8_expert_compute_explicitly():
+    fn = EP_EXPERT_COMPUTE["native"]
 
     permute_tokens = torch.empty(0, 4)
     cumsum = torch.zeros(1, dtype=torch.int32)
@@ -285,10 +114,8 @@ def test_native_ep_adapter_rejects_fp8_expert_compute_explicitly():
         )
 
 
-def test_triton_ep_adapter_consumes_fp8_kwargs_when_fp8_compute_is_disabled(monkeypatch):
-    fn = EP_EXPERT_COMPUTE.get("triton")
-    if fn is None or not hasattr(moe_backend, "TritonEPGroupGemm"):
-        pytest.skip("triton EP backend is unavailable")
+def _assert_triton_ep_adapter_consumes_fp8_kwargs_when_fp8_compute_is_disabled(monkeypatch):
+    fn = EP_EXPERT_COMPUTE["triton"]
 
     def fake_apply(*args):
         return args[0].new_empty(args[0].shape)
@@ -318,10 +145,8 @@ def test_triton_ep_adapter_consumes_fp8_kwargs_when_fp8_compute_is_disabled(monk
     assert out.shape == permute_tokens.shape
 
 
-def test_triton_ep_adapter_rejects_fp8_expert_compute_explicitly():
-    fn = EP_EXPERT_COMPUTE.get("triton")
-    if fn is None:
-        pytest.skip("triton EP backend is unavailable")
+def _assert_triton_ep_adapter_rejects_fp8_expert_compute_explicitly():
+    fn = EP_EXPERT_COMPUTE["triton"]
 
     permute_tokens = torch.empty(0, 4)
     cumsum = torch.zeros(1, dtype=torch.int32)
@@ -345,10 +170,8 @@ def test_triton_ep_adapter_rejects_fp8_expert_compute_explicitly():
         )
 
 
-def test_triton_moe_act_ep_adapter_consumes_common_kwargs(monkeypatch):
-    fn = EP_EXPERT_COMPUTE_MOE_ACT.get("triton")
-    if fn is None or not hasattr(moe_backend, "TritonEPGroupGemmMoeAct"):
-        pytest.skip("triton moe_act EP backend is unavailable")
+def _assert_triton_moe_act_ep_adapter_consumes_common_kwargs(monkeypatch):
+    fn = EP_EXPERT_COMPUTE_MOE_ACT["triton"]
 
     def fake_apply(*args):
         return args[0].new_empty(args[0].shape)
@@ -381,27 +204,8 @@ def test_triton_moe_act_ep_adapter_consumes_common_kwargs(monkeypatch):
     assert out.shape == permute_tokens.shape
 
 
-@pytest.mark.parametrize("name,fn", list(EP_EXPERT_COMPUTE_MOE_ACT.items()))
-def test_moe_act_ep_compute_signature_contract(name, fn):
-    sig = inspect.signature(fn)
-    params = sig.parameters
-
-    for required in _REQUIRED_EP_PARAMS:
-        assert required in params, (
-            f"EP_EXPERT_COMPUTE_MOE_ACT['{name}'] is missing explicit '{required}' param. Signature: {sig}"
-        )
-
-    has_var_keyword = any(p.kind == p.VAR_KEYWORD for p in params.values())
-    assert has_var_keyword, (
-        f"EP_EXPERT_COMPUTE_MOE_ACT['{name}'] has no **kwargs — new extras like "
-        f"gate_up_bias will break callers. Signature: {sig}"
-    )
-
-
-def test_triton_moe_act_ep_adapter_rejects_fp8_expert_compute_explicitly():
-    fn = EP_EXPERT_COMPUTE_MOE_ACT.get("triton")
-    if fn is None:
-        pytest.skip("triton moe_act EP backend is unavailable")
+def _assert_triton_moe_act_ep_adapter_rejects_fp8_expert_compute_explicitly():
+    fn = EP_EXPERT_COMPUTE_MOE_ACT["triton"]
 
     permute_tokens = torch.empty(0, 4)
     cumsum = torch.zeros(1, dtype=torch.int32)
@@ -426,11 +230,9 @@ def test_triton_moe_act_ep_adapter_rejects_fp8_expert_compute_explicitly():
         )
 
 
-def test_quack_ep_adapter_forwards_activation_native(monkeypatch):
-    fn = EP_EXPERT_COMPUTE.get("quack")
-    quack_cls = getattr(moe_backend, "_QuackEPGroupGemm", None)
-    if fn is None or quack_cls is None:
-        pytest.skip("quack EP backend is unavailable")
+def _assert_quack_ep_adapter_forwards_activation_native(monkeypatch):
+    fn = EP_EXPERT_COMPUTE["quack"]
+    quack_cls = moe_backend._QuackEPGroupGemm
 
     seen = {}
 
@@ -463,3 +265,79 @@ def test_quack_ep_adapter_forwards_activation_native(monkeypatch):
 
     assert out.shape == permute_tokens.shape
     assert seen["activation_native"] is True
+
+
+def _reference_ep_forward(permute_tokens, cumsum, gate_proj, up_proj, down_proj, expert_scores):
+    outputs = []
+    start = 0
+    for expert_idx, count in enumerate(counts_from_cumsum(cumsum)):
+        end = start + count
+        x = permute_tokens[start:end]
+        hidden = F.silu(x @ gate_proj[expert_idx]) * (x @ up_proj[expert_idx])
+        hidden = hidden * expert_scores[start:end].to(hidden.dtype).unsqueeze(-1)
+        outputs.append(hidden @ down_proj[expert_idx])
+        start = end
+    return torch.cat(outputs, dim=0)
+
+
+def _assert_ep_group_gemm_propagates_routing_score_gradients(monkeypatch, module, class_name):
+    patch_ep_kernels(monkeypatch, module)
+    fn = getattr(module, class_name)
+
+    torch.manual_seed(0)
+    num_local_experts = 2
+    hidden_dim = 8
+    intermediate_size = 12
+    counts = torch.tensor([3, 2])
+    cumsum = torch.cumsum(counts, dim=0)
+    num_tokens = int(cumsum[-1].item())
+
+    permute_tokens = torch.randn(num_tokens, hidden_dim)
+    gate_proj = torch.randn(num_local_experts, hidden_dim, intermediate_size)
+    up_proj = torch.randn(num_local_experts, hidden_dim, intermediate_size)
+    down_proj = torch.randn(num_local_experts, intermediate_size, hidden_dim)
+    expert_scores = torch.rand(num_tokens, requires_grad=True)
+    upstream = torch.randn(num_tokens, hidden_dim)
+
+    gate_up_proj = torch.cat([gate_proj, up_proj], dim=-1)
+    output = fn.apply(permute_tokens, cumsum, gate_up_proj, down_proj, intermediate_size, expert_scores)
+    output.backward(upstream)
+    grad_scores = expert_scores.grad.detach().clone()
+
+    expert_scores_ref = expert_scores.detach().clone().requires_grad_(True)
+    ref_output = _reference_ep_forward(
+        permute_tokens,
+        cumsum,
+        gate_proj,
+        up_proj,
+        down_proj,
+        expert_scores_ref,
+    )
+    ref_output.backward(upstream)
+
+    torch.testing.assert_close(output, ref_output)
+    torch.testing.assert_close(grad_scores, expert_scores_ref.grad)
+
+
+def test_ep_adapter_registry_backend_arguments_and_fp8_boundary_contract(monkeypatch):
+    _assert_quack_ep_registers_without_optional_moe_act()
+    _assert_ep_registry_signature_contracts()
+    assert {"native", "triton", "quack"} <= EP_EXPERT_COMPUTE.keys()
+    assert "triton" in EP_EXPERT_COMPUTE_MOE_ACT
+    assert hasattr(moe_backend, "TritonEPGroupGemm")
+    assert hasattr(moe_backend, "TritonEPGroupGemmMoeAct")
+
+    for module, class_name in (
+        (triton_moe, "TritonEPGroupGemm"),
+        (quack_moe, "QuackEPGroupGemm"),
+    ):
+        with monkeypatch.context() as kernel_patch:
+            _assert_ep_group_gemm_propagates_routing_score_gradients(kernel_patch, module, class_name)
+
+    _assert_native_ep_adapter_consumes_fp8_kwargs_when_fp8_compute_is_disabled()
+    _assert_native_ep_adapter_rejects_fp8_expert_compute_explicitly()
+    _assert_triton_ep_adapter_consumes_fp8_kwargs_when_fp8_compute_is_disabled(monkeypatch)
+    _assert_triton_ep_adapter_rejects_fp8_expert_compute_explicitly()
+    _assert_triton_moe_act_ep_adapter_consumes_common_kwargs(monkeypatch)
+    _assert_triton_moe_act_ep_adapter_rejects_fp8_expert_compute_explicitly()
+    _assert_quack_ep_adapter_forwards_activation_native(monkeypatch)

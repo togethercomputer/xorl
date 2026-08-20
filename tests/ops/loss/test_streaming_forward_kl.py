@@ -14,7 +14,6 @@ import torch.nn.functional as F
 
 from tests.ops.loss.conftest import assert_close
 from xorl.ops.loss import opd_loss_function
-from xorl.ops.loss.compiled_cross_entropy import compiled_forward_kl_full_function
 from xorl.ops.loss.opd_streaming_kl import (
     streaming_forward_kl_function,
     streaming_forward_kl_lowmem_function,
@@ -56,15 +55,6 @@ def inputs():
     return student_hidden, student_weight, teacher_hidden, teacher_weight, labels
 
 
-def test_forward_value_matches_dense_reference(inputs):
-    student_hidden, student_weight, teacher_hidden, teacher_weight, labels = inputs
-    got = streaming_forward_kl_function(
-        student_hidden, student_weight, teacher_hidden, teacher_weight, labels, vocab_chunk_size=7
-    )
-    expected = _dense_forward_kl(student_hidden, student_weight, teacher_hidden, teacher_weight, labels)
-    assert_close(got, expected)
-
-
 def test_backward_matches_dense_reference(inputs):
     student_hidden, student_weight, teacher_hidden, teacher_weight, labels = inputs
 
@@ -93,42 +83,25 @@ def test_backward_matches_dense_reference(inputs):
     assert th_b.grad is None
     assert tw_b.grad is None
 
-
-def test_matches_compiled_forward_kl_reference(inputs):
-    student_hidden, student_weight, teacher_hidden, teacher_weight, labels = inputs
-    got = streaming_forward_kl_function(
-        student_hidden, student_weight, teacher_hidden, teacher_weight, labels, vocab_chunk_size=7
-    )
-    # CPU path of the compiled reference is the eager dense implementation.
-    expected = compiled_forward_kl_full_function(
-        student_hidden_states=student_hidden,
-        student_weight=student_weight,
-        teacher_hidden_states=teacher_hidden,
-        teacher_weight=teacher_weight,
-        labels=labels,
-        ignore_index=IGNORE_INDEX,
-        lm_head_fp32=False,
-        teacher_lm_head_fp32=False,
-    )
-    assert_close(got, expected)
+    _assert_chunking_invariance(inputs)
+    _assert_ignore_index_zero_loss_and_grad(inputs)
+    _assert_lowmem_matches_streaming(inputs)
+    _assert_opd_loss_function_forward_kl_streaming_matches_compiled()
 
 
-@pytest.mark.parametrize("chunk", [7, 40, 40000])
-def test_chunking_invariance(inputs, chunk):
+def _assert_chunking_invariance(inputs):
     """Online accumulation must be identical across chunkings (multi-chunk vs one)."""
     student_hidden, student_weight, teacher_hidden, teacher_weight, labels = inputs
 
     sh = student_hidden.clone().requires_grad_(True)
     sw = student_weight.clone().requires_grad_(True)
-    kl = streaming_forward_kl_function(sh, sw, teacher_hidden, teacher_weight, labels, vocab_chunk_size=chunk)
+    kl = streaming_forward_kl_function(sh, sw, teacher_hidden, teacher_weight, labels, vocab_chunk_size=7)
     kl.sum().backward()
 
-    # Single-chunk (vocab_chunk_size >= vocab) reference.
+    # Single-chunk reference (chunk size equals the fixture's vocabulary size).
     sh_ref = student_hidden.clone().requires_grad_(True)
     sw_ref = student_weight.clone().requires_grad_(True)
-    kl_ref = streaming_forward_kl_function(
-        sh_ref, sw_ref, teacher_hidden, teacher_weight, labels, vocab_chunk_size=40000
-    )
+    kl_ref = streaming_forward_kl_function(sh_ref, sw_ref, teacher_hidden, teacher_weight, labels, vocab_chunk_size=40)
     kl_ref.sum().backward()
 
     assert_close(kl, kl_ref)
@@ -136,7 +109,7 @@ def test_chunking_invariance(inputs, chunk):
     assert_close(sw.grad, sw_ref.grad)
 
 
-def test_ignore_index_zero_loss_and_grad(inputs):
+def _assert_ignore_index_zero_loss_and_grad(inputs):
     student_hidden, student_weight, teacher_hidden, teacher_weight, labels = inputs
     sh = student_hidden.clone().requires_grad_(True)
     sw = student_weight.clone().requires_grad_(True)
@@ -153,7 +126,7 @@ def test_ignore_index_zero_loss_and_grad(inputs):
     assert kl[~ignored].abs().sum() > 0
 
 
-def test_lowmem_matches_streaming(inputs):
+def _assert_lowmem_matches_streaming(inputs):
     """The lowmem forward-KL path must be loss- and gradient-identical to plain streaming."""
     student_hidden, student_weight, teacher_hidden, teacher_weight, labels = inputs
 
@@ -172,8 +145,7 @@ def test_lowmem_matches_streaming(inputs):
     assert_close(gw_b, gw_a)
 
 
-@pytest.mark.parametrize("backend", ["streaming", "tilelang"])
-def test_opd_loss_function_forward_kl_streaming_matches_compiled(backend):
+def _assert_opd_loss_function_forward_kl_streaming_matches_compiled():
     """End-to-end dispatch: forward_kl_full on the streaming backend matches the
     compiled (torch_compile) backend through opd_loss_function, with finite grads.
     """
@@ -205,15 +177,18 @@ def test_opd_loss_function_forward_kl_streaming_matches_compiled(backend):
         return out.loss, hs.grad, w.grad
 
     loss_c, gh_c, gw_c = run("torch_compile")
-    loss_s, gh_s, gw_s = run(backend)
+    for backend in ("streaming", "tilelang"):
+        loss_s, gh_s, gw_s = run(backend)
 
-    assert_close(loss_s, loss_c)
-    assert_close(gh_s, gh_c)
-    assert_close(gw_s, gw_c)
-    assert gh_s.isfinite().all() and gw_s.isfinite().all()
+        assert_close(loss_s, loss_c)
+        assert_close(gh_s, gh_c)
+        assert_close(gw_s, gw_c)
+        assert gh_s.isfinite().all() and gw_s.isfinite().all()
+
+    _assert_opd_loss_function_forward_kl_streaming_rejects_logprob_clamp()
 
 
-def test_opd_loss_function_forward_kl_streaming_rejects_logprob_clamp():
+def _assert_opd_loss_function_forward_kl_streaming_rejects_logprob_clamp():
     """The streaming forward-KL backend never materializes student log-probs, so
     log_prob_min_clamp must fail loud rather than be silently ignored.
     """

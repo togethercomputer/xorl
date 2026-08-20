@@ -28,6 +28,8 @@ def _tiny_qwen3_moe_config() -> Qwen3MoeConfig:
 
 
 def test_qwen3_moe_decode_cache_matches_full_forward_with_r3_replay():
+    _assert_flash_attention_decode_cache_uses_prefix_attention()
+
     torch.manual_seed(0)
     set_replay_stage(None)
     RoutingReplay.clear_all()
@@ -131,7 +133,7 @@ def test_qwen3_moe_decode_cache_matches_full_forward_with_r3_replay():
         RoutingReplay._target_device = original_target_device
 
 
-def test_flash_attention_decode_cache_uses_prefix_attention():
+def _assert_flash_attention_decode_cache_uses_prefix_attention():
     query = torch.randn(1, 1, 2, 4)
     key = torch.randn(1, 5, 2, 4)
 

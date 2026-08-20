@@ -18,7 +18,7 @@ from xorl.ops.glm5_kernels.flashmla_sparse_mla import FlashMLASparseWithTileLang
 pytestmark = [pytest.mark.cpu]
 
 
-def test_flashmla_batch_flatten_offsets_only_valid_indices():
+def _assert_flashmla_batch_flatten_offsets_only_valid_indices():
     q = torch.zeros(2, 2, 3, 4)
     kv = torch.zeros(2, 3, 4)
     indices = torch.tensor(
@@ -47,6 +47,7 @@ def test_flashmla_batch_flatten_offsets_only_valid_indices():
 
 
 def test_flashmla_backward_compacts_valid_rows_and_scatter_zeros(monkeypatch):
+    _assert_flashmla_batch_flatten_offsets_only_valid_indices()
     captured = {}
 
     def fake_forward(q, kv, indices, scaling):
@@ -93,8 +94,12 @@ def test_flashmla_backward_compacts_valid_rows_and_scatter_zeros(monkeypatch):
     assert torch.count_nonzero(q.grad[3]).item() == 0
     torch.testing.assert_close(kv.grad, torch.full_like(kv.grad, 5))
 
+    _assert_flashmla_all_invalid_rows_have_zero_output_and_gradients(monkeypatch)
+    with monkeypatch.context() as case_patch:
+        _assert_flashmla_backend_fails_closed_outside_production_envelope(case_patch)
 
-def test_flashmla_all_invalid_rows_have_zero_output_and_gradients(monkeypatch):
+
+def _assert_flashmla_all_invalid_rows_have_zero_output_and_gradients(monkeypatch):
     backward = Mock(side_effect=AssertionError("all-invalid input must bypass TileLang backward"))
 
     def fake_forward(q, kv, indices, scaling):
@@ -120,7 +125,7 @@ def test_flashmla_all_invalid_rows_have_zero_output_and_gradients(monkeypatch):
     assert torch.equal(kv.grad, torch.zeros_like(kv))
 
 
-def test_flashmla_backend_fails_closed_outside_production_envelope():
+def _assert_flashmla_backend_fails_closed_outside_production_envelope(monkeypatch):
     q = torch.zeros(1, 1, 64, 576, dtype=torch.bfloat16)
     kv = torch.zeros(1, 2, 576, dtype=torch.bfloat16)
     indices = torch.zeros(1, 1, 2048, dtype=torch.int32)
@@ -137,8 +142,6 @@ def test_flashmla_backend_fails_closed_outside_production_envelope():
             backend="flashmla",
         )
 
-
-def test_flashmla_constraint_rejects_unproven_shape_before_import(monkeypatch):
     q = torch.empty(1, 1, 63, 576, device="meta", dtype=torch.bfloat16)
     kv = torch.empty(1, 2, 576, device="meta", dtype=torch.bfloat16)
     indices = torch.empty(1, 1, 2048, device="meta", dtype=torch.int32)

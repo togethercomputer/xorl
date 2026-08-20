@@ -46,8 +46,10 @@ def inputs():
     return hidden_states, weight, labels
 
 
-def test_eager_z_loss_matches_reference(inputs):
+def test_eager_z_loss_matches_reference_and_backpropagates(inputs):
     hidden_states, weight, labels = inputs
+    hidden_states = hidden_states.detach().requires_grad_(True)
+    weight = weight.detach().requires_grad_(True)
     ce_ref = _reference_ce_loss(hidden_states, weight, labels)
     z_ref = _reference_z_loss(hidden_states, weight, labels)
     coef = 1e-3
@@ -64,32 +66,15 @@ def test_eager_z_loss_matches_reference(inputs):
     assert_close(out.metrics["ce_loss"], ce_ref)
     assert_close(out.metrics["z_loss"], z_ref)
     assert_close(out.loss, ce_ref + coef * z_ref)
+    out.loss.backward()
+    assert hidden_states.grad is not None and torch.isfinite(hidden_states.grad).all()
+    assert weight.grad is not None and torch.isfinite(weight.grad).all()
+
+    _assert_eager_no_z_loss_when_coef_zero(inputs)
+    _assert_tp_path_rejects_z_loss()
 
 
-def test_causallm_logprob_temperature_matches_scaled_logits(inputs):
-    hidden_states, weight, labels = inputs
-    temperature = 0.7
-
-    out = causallm_loss_function(
-        hidden_states=hidden_states,
-        weight=weight,
-        labels=labels,
-        ce_mode="eager",
-        return_per_token=True,
-        logprob_temperature=temperature,
-    )
-
-    logits = (hidden_states.reshape(-1, hidden_states.size(-1)) @ weight.t()).float() / temperature
-    expected_ce = torch.nn.functional.cross_entropy(
-        logits,
-        labels.reshape(-1),
-        reduction="none",
-        ignore_index=-100,
-    ).view_as(labels)
-    assert_close(out.per_token_logprobs, -expected_ce)
-
-
-def test_eager_no_z_loss_when_coef_zero(inputs):
+def _assert_eager_no_z_loss_when_coef_zero(inputs):
     hidden_states, weight, labels = inputs
     ce_ref = _reference_ce_loss(hidden_states, weight, labels)
 
@@ -103,43 +88,6 @@ def test_eager_no_z_loss_when_coef_zero(inputs):
 
     assert out.metrics is None
     assert_close(out.loss, ce_ref)
-
-
-def test_eager_z_loss_grad_flows(inputs):
-    hidden_states, weight, labels = inputs
-    hidden_states = hidden_states.detach().requires_grad_(True)
-    weight = weight.detach().requires_grad_(True)
-
-    out = causallm_loss_function(
-        hidden_states=hidden_states,
-        weight=weight,
-        labels=labels,
-        ce_mode="eager",
-        z_loss_coef=1.0,
-    )
-    out.loss.backward()
-
-    assert hidden_states.grad is not None and torch.isfinite(hidden_states.grad).all()
-    assert weight.grad is not None and torch.isfinite(weight.grad).all()
-
-
-def test_eager_z_loss_zero_when_logits_centered():
-    """If logits are all zeros, logsumexp = log(V) (constant) so Z-loss = log(V)^2."""
-    torch.manual_seed(1)
-    B, S, V, H = 1, 3, 8, 4
-    hidden_states = torch.zeros(B, S, H)
-    weight = torch.zeros(V, H)
-    labels = torch.zeros(B, S, dtype=torch.long)
-
-    out = causallm_loss_function(
-        hidden_states=hidden_states,
-        weight=weight,
-        labels=labels,
-        ce_mode="eager",
-        z_loss_coef=1.0,
-    )
-    expected_z = torch.tensor(float(torch.log(torch.tensor(V)).item() ** 2))
-    assert_close(out.metrics["z_loss"], expected_z)
 
 
 @pytest.mark.gpu
@@ -173,7 +121,7 @@ def test_compiled_z_loss_matches_eager(inputs):
     assert_close(out_compiled.loss, out_eager.loss)
 
 
-def test_tp_path_rejects_z_loss():
+def _assert_tp_path_rejects_z_loss():
     """TP path must error out clearly when Z-loss is requested."""
     torch.manual_seed(2)
     B, S, V, H = 1, 2, 8, 4

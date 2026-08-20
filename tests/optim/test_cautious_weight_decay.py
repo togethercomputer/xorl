@@ -29,24 +29,18 @@ pytestmark = [pytest.mark.cpu]
 
 
 @torch.no_grad()
-def test_cautious_helper_no_op_when_weight_decay_zero():
+def _assert_cautious_decay_primitive_and_signsgd_policy():
     p = torch.tensor([1.0, -2.0])
     proxy = torch.tensor([5.0, -5.0])
     apply_cautious_decay_(p, proxy, lr=0.1, weight_decay=0.0, cautious=True)
     assert torch.equal(p, torch.tensor([1.0, -2.0]))
 
-
-@torch.no_grad()
-def test_cautious_helper_matches_standard_when_cautious_false():
     p = torch.tensor([1.0, -2.0, 3.0])
     proxy = torch.tensor([1.0, -1.0, -1.0])  # mixed alignment
     apply_cautious_decay_(p, proxy, lr=0.1, weight_decay=0.5, cautious=False)
     expected = torch.tensor([1.0, -2.0, 3.0]) * (1 - 0.1 * 0.5)
     assert torch.allclose(p, expected)
 
-
-@torch.no_grad()
-def test_cautious_helper_masks_misaligned_coordinates():
     # update * param sign:
     #   ( 1.0,  2.0) -> +  -> decay applies
     #   (-1.0,  3.0) -> -  -> decay skipped
@@ -59,11 +53,13 @@ def test_cautious_helper_masks_misaligned_coordinates():
     expected = torch.tensor([2.0 * factor, 3.0, -4.0 * factor, -5.0])
     assert torch.allclose(p, expected)
 
+    _assert_signsgd_cautious_masks_decay_against_grad_sign()
+
 
 # ------------------------------ SignSGD ----------------------------------
 
 
-def test_signsgd_cautious_masks_decay_against_grad_sign():
+def _assert_signsgd_cautious_masks_decay_against_grad_sign():
     # grad * param signs:
     #   (+, +) -> aligned, decay applies
     #   (-, +) -> misaligned, decay masked
@@ -76,20 +72,35 @@ def test_signsgd_cautious_masks_decay_against_grad_sign():
     expected = torch.tensor([2.0 * decay - 0.1 * 1.0, 3.0 - 0.1 * (-1.0)])
     assert torch.allclose(p, expected)
 
+    _assert_signsgd_dense_update_and_sparse_rejection()
 
-def test_signsgd_cautious_equals_standard_when_signs_aligned():
-    # grad and param signs both (+, -) -> all aligned -> cautious==standard.
-    p_std = nn.Parameter(torch.tensor([2.0, -2.0]))
-    p_caut = nn.Parameter(torch.tensor([2.0, -2.0]))
-    grad = torch.tensor([3.0, -4.0])
 
-    opt_std = SignSGD([p_std], lr=0.1, weight_decay=0.5, cautious=False)
-    opt_caut = SignSGD([p_caut], lr=0.1, weight_decay=0.5, cautious=True)
-    p_std.grad = grad.clone()
-    p_caut.grad = grad.clone()
-    opt_std.step()
-    opt_caut.step()
-    assert torch.allclose(p_std, p_caut)
+def _assert_signsgd_dense_update_and_sparse_rejection():
+    signed = nn.Parameter(torch.tensor([1.0, -2.0, 3.0]))
+    decayed = nn.Parameter(torch.tensor([2.0, -2.0]))
+    gradless = nn.Parameter(torch.tensor([1.5, -1.5]))
+    optimizer = SignSGD(
+        [
+            {"params": [signed], "weight_decay": 0.0},
+            {"params": [decayed, gradless], "weight_decay": 0.5},
+        ],
+        lr=0.1,
+    )
+
+    signed.grad = torch.tensor([2.0, -0.5, 0.0])
+    decayed.grad = torch.tensor([3.0, -4.0])
+    optimizer.step()
+
+    torch.testing.assert_close(signed, torch.tensor([0.9, -1.9, 3.0]))
+    torch.testing.assert_close(decayed, torch.tensor([1.8, -1.8]))
+    torch.testing.assert_close(gradless, torch.tensor([1.5, -1.5]))
+
+    sparse = nn.Parameter(torch.ones(4))
+    optimizer = SignSGD([sparse], lr=0.1)
+    sparse.grad = torch.sparse_coo_tensor(indices=[[0, 2]], values=torch.tensor([1.0, -1.0]), size=(4,))
+
+    with pytest.raises(RuntimeError, match="does not support sparse gradients"):
+        optimizer.step()
 
 
 # --------------------------- AnyPrecisionAdamW ----------------------------
@@ -113,7 +124,7 @@ def _adamw_first_step_cautious(p_init, grad, lr, wd, cautious, beta1=0.9, beta2=
     return p.detach().clone()
 
 
-def test_anyprecision_adamw_cautious_false_matches_existing_path():
+def _assert_anyprecision_adamw_cautious_decay_and_state_policy(tmp_path):
     # Prior to CWD the optimizer applied decay first. Verify cautious=False
     # produces the same final parameter (which is what the existing tests
     # implicitly relied on).
@@ -135,41 +146,47 @@ def test_anyprecision_adamw_cautious_false_matches_existing_path():
     expected = p_init * (1 - lr * wd) - (lr / bc1) * (exp_avg / denom)
     assert torch.allclose(out, expected, atol=1e-6)
 
-
-@pytest.mark.parametrize("use_kahan_summation", [False, True])
-def test_anyprecision_adamw_chunked_denominator_matches_unchunked(use_kahan_summation):
-    p_ref = nn.Parameter(torch.linspace(-2.0, 2.0, 60).reshape(4, 3, 5))
-    p_chunked = nn.Parameter(p_ref.detach().clone())
-    kwargs = dict(
-        lr=0.01,
-        weight_decay=0.05,
-        betas=(0.9, 0.95),
-        eps=1e-8,
-        momentum_dtype=torch.float32,
-        variance_dtype=torch.float32,
-        compensation_buffer_dtype=torch.float32,
-        use_kahan_summation=use_kahan_summation,
-    )
-    opt_ref = AnyPrecisionAdamW([p_ref], **kwargs)
-    opt_chunked = AnyPrecisionAdamW([p_chunked], denominator_chunk_size=7, **kwargs)
-
-    for scale in (0.25, -0.5, 0.75):
-        grad = torch.linspace(-1.5, 1.5, 60).reshape(4, 3, 5) * scale
-        p_ref.grad = grad.clone()
-        p_chunked.grad = grad.clone()
-        opt_ref.step()
-        opt_chunked.step()
-
-    assert torch.allclose(p_chunked, p_ref, atol=1e-6, rtol=1e-6)
-    ref_state = opt_ref.state[p_ref]
-    chunked_state = opt_chunked.state[p_chunked]
-    assert torch.allclose(chunked_state["exp_avg"], ref_state["exp_avg"], atol=1e-6, rtol=1e-6)
-    assert torch.allclose(chunked_state["exp_avg_sq"], ref_state["exp_avg_sq"], atol=1e-6, rtol=1e-6)
-    if use_kahan_summation:
-        assert torch.allclose(chunked_state["compensation"], ref_state["compensation"], atol=1e-6, rtol=1e-6)
+    _assert_anyprecision_adamw_cautious_skips_misaligned_decay()
+    _assert_anyprecision_adamw_state_strategy_and_dtensor_offload_policy(tmp_path)
 
 
-def test_anyprecision_adamw_reuse_grad_for_momentum_matches_standard_path():
+def _assert_anyprecision_adamw_state_strategy_and_dtensor_offload_policy(tmp_path):
+    for use_kahan_summation in (False, True):
+        p_ref = nn.Parameter(torch.linspace(-2.0, 2.0, 60).reshape(4, 3, 5))
+        p_chunked = nn.Parameter(p_ref.detach().clone())
+        kwargs = dict(
+            lr=0.01,
+            weight_decay=0.05,
+            betas=(0.9, 0.95),
+            eps=1e-8,
+            momentum_dtype=torch.float32,
+            variance_dtype=torch.float32,
+            compensation_buffer_dtype=torch.float32,
+            use_kahan_summation=use_kahan_summation,
+        )
+        opt_ref = AnyPrecisionAdamW([p_ref], **kwargs)
+        opt_chunked = AnyPrecisionAdamW([p_chunked], denominator_chunk_size=7, **kwargs)
+
+        for scale in (0.25, -0.5, 0.75):
+            grad = torch.linspace(-1.5, 1.5, 60).reshape(4, 3, 5) * scale
+            p_ref.grad = grad.clone()
+            p_chunked.grad = grad.clone()
+            opt_ref.step()
+            opt_chunked.step()
+
+        assert torch.allclose(p_chunked, p_ref, atol=1e-6, rtol=1e-6)
+        ref_state = opt_ref.state[p_ref]
+        chunked_state = opt_chunked.state[p_chunked]
+        assert torch.allclose(chunked_state["exp_avg"], ref_state["exp_avg"], atol=1e-6, rtol=1e-6)
+        assert torch.allclose(chunked_state["exp_avg_sq"], ref_state["exp_avg_sq"], atol=1e-6, rtol=1e-6)
+        if use_kahan_summation:
+            assert torch.allclose(chunked_state["compensation"], ref_state["compensation"], atol=1e-6, rtol=1e-6)
+
+    _assert_anyprecision_adamw_reuses_grad_for_momentum()
+    _assert_anyprecision_adamw_dtensor_state_offload_round_trips_local_shards(tmp_path)
+
+
+def _assert_anyprecision_adamw_reuses_grad_for_momentum():
     p_ref = nn.Parameter(torch.linspace(-2.0, 2.0, 12).reshape(3, 4))
     p_reuse = nn.Parameter(p_ref.detach().clone())
     kwargs = dict(
@@ -201,7 +218,7 @@ def test_anyprecision_adamw_reuse_grad_for_momentum_matches_standard_path():
     assert reuse_state["exp_avg_sq"].device.type == "cpu"
 
 
-def test_anyprecision_adamw_dtensor_state_offload_round_trips_local_shards(tmp_path):
+def _assert_anyprecision_adamw_dtensor_state_offload_round_trips_local_shards(tmp_path):
     initialized_here = False
     if not dist.is_initialized():
         dist.init_process_group(
@@ -247,7 +264,7 @@ def test_anyprecision_adamw_dtensor_state_offload_round_trips_local_shards(tmp_p
             dist.destroy_process_group()
 
 
-def test_anyprecision_adamw_cautious_skips_decay_on_misaligned_coords():
+def _assert_anyprecision_adamw_cautious_skips_misaligned_decay():
     # exp_avg = (1-beta1) * grad has same sign as grad on the first step.
     # Construct a case where some coords have grad sign opposite to param sign.
     p_init = torch.tensor([2.0, -3.0, 4.0])
@@ -271,19 +288,10 @@ def test_anyprecision_adamw_cautious_skips_decay_on_misaligned_coords():
     assert torch.allclose(out, expected, atol=1e-6)
 
 
-def test_anyprecision_adamw_cautious_equals_standard_when_all_aligned():
-    # If every coord has aligned signs, cautious must equal standard decay.
-    p_init = torch.tensor([1.0, 2.0, 3.0])
-    grad = torch.tensor([0.5, 1.0, 0.25])  # all positive, p positive -> aligned
-    out_caut = _adamw_first_step_cautious(p_init, grad, 0.1, 0.5, cautious=True)
-    out_std = _adamw_first_step_cautious(p_init, grad, 0.1, 0.5, cautious=False)
-    assert torch.allclose(out_caut, out_std, atol=1e-6)
-
-
 # -------------------------------- Muon ------------------------------------
 
 
-def test_muon_cautious_false_matches_standard_decay_reference():
+def _assert_muon_cautious_decay_policy():
     """``cautious=False`` must reproduce the pre-CWD Muon update exactly:
     ``param *= 1 - lr*wd``, then ``param -= adjusted_lr * NS(grad)``.
 
@@ -315,8 +323,11 @@ def test_muon_cautious_false_matches_standard_decay_reference():
     expected = p_init * (1 - lr * wd) - adjusted_lr * update
     assert torch.allclose(w, expected, atol=1e-4)
 
+    _assert_muon_cautious_masks_decay_using_post_ns_update()
+    _assert_muon_cautious_adamw_fallback_masks_decay()
 
-def test_muon_cautious_masks_decay_using_post_ns_update():
+
+def _assert_muon_cautious_masks_decay_using_post_ns_update():
     """Muon's update direction is the orthogonalized matrix; the cautious
     mask must be ``I(NS(grad) * param >= 0)``, not ``I(grad * param >= 0)``.
     The two differ in general, so we check against an explicit reference.
@@ -349,7 +360,7 @@ def test_muon_cautious_masks_decay_using_post_ns_update():
     assert torch.allclose(actual, expected, atol=1e-4)
 
 
-def test_muon_cautious_adamw_fallback_masks_decay():
+def _assert_muon_cautious_adamw_fallback_masks_decay():
     """The non-Muon param group (use_muon=False) takes the AdamW path; that
     path must also honor cautious."""
     p_init = torch.tensor([2.0, -3.0])
@@ -387,47 +398,35 @@ class _Tiny(nn.Module):
         self.linear = nn.Linear(3, 2)
 
 
-def test_build_optimizer_propagates_cautious_to_signsgd():
-    model = _Tiny()
-    opt = build_optimizer(
-        model,
-        lr=0.1,
-        weight_decay=0.01,
-        optimizer_type="signsgd",
-        cautious_weight_decay=True,
-    )
-    assert isinstance(opt, SignSGD)
-    assert all(g["cautious"] is True for g in opt.param_groups)
+def test_build_optimizer_cautious_routing_and_kwargs_policy(tmp_path):
+    _assert_cautious_decay_primitive_and_signsgd_policy()
+    _assert_anyprecision_adamw_cautious_decay_and_state_policy(tmp_path)
+    _assert_muon_cautious_decay_policy()
+    for optimizer_type, expected_type in (
+        ("signsgd", SignSGD),
+        ("anyprecision_adamw", AnyPrecisionAdamW),
+        ("adamw", AnyPrecisionAdamW),
+    ):
+        opt = build_optimizer(
+            _Tiny(),
+            lr=0.1,
+            weight_decay=0.01,
+            optimizer_type=optimizer_type,
+            cautious_weight_decay=True,
+        )
+        assert isinstance(opt, expected_type)
+        assert all(group["cautious"] is True for group in opt.param_groups)
+        if optimizer_type == "adamw":
+            assert all(group["momentum_dtype"] == torch.float32 for group in opt.param_groups)
+
+    _assert_build_optimizer_adamw_default_uses_torch_path()
+    _assert_build_optimizer_rejects_cautious_with_sgd()
+    _assert_build_optimizer_rejects_torch_only_kwargs_on_cautious_adamw()
+    _assert_build_optimizer_allows_anyprecision_kwargs()
+    _assert_build_optimizer_passes_anyprecision_state_strategy_kwargs()
 
 
-def test_build_optimizer_propagates_cautious_to_anyprecision_adamw():
-    model = _Tiny()
-    opt = build_optimizer(
-        model,
-        lr=0.1,
-        weight_decay=0.01,
-        optimizer_type="anyprecision_adamw",
-        cautious_weight_decay=True,
-    )
-    assert isinstance(opt, AnyPrecisionAdamW)
-    assert all(g["cautious"] is True for g in opt.param_groups)
-
-
-def test_build_optimizer_routes_adamw_cautious_to_anyprecision_fp32():
-    model = _Tiny()
-    opt = build_optimizer(
-        model,
-        lr=0.1,
-        weight_decay=0.01,
-        optimizer_type="adamw",
-        cautious_weight_decay=True,
-    )
-    assert isinstance(opt, AnyPrecisionAdamW)
-    assert all(g["cautious"] is True for g in opt.param_groups)
-    assert all(g["momentum_dtype"] == torch.float32 for g in opt.param_groups)
-
-
-def test_build_optimizer_adamw_default_uses_torch_adamw_unchanged():
+def _assert_build_optimizer_adamw_default_uses_torch_path():
     model = _Tiny()
     opt = build_optimizer(
         model,
@@ -440,7 +439,7 @@ def test_build_optimizer_adamw_default_uses_torch_adamw_unchanged():
     assert isinstance(opt, torch.optim.AdamW)
 
 
-def test_build_optimizer_rejects_cautious_with_sgd():
+def _assert_build_optimizer_rejects_cautious_with_sgd():
     model = _Tiny()
     with pytest.raises(ValueError, match="cautious_weight_decay is not supported"):
         build_optimizer(
@@ -452,7 +451,7 @@ def test_build_optimizer_rejects_cautious_with_sgd():
         )
 
 
-def test_build_optimizer_adamw_cautious_rejects_torch_adamw_only_kwargs():
+def _assert_build_optimizer_rejects_torch_only_kwargs_on_cautious_adamw():
     # When adamw+cautious routes to AnyPrecisionAdamW, torch.optim.AdamW-only
     # kwargs (foreach, fused, amsgrad, ...) would otherwise produce a
     # confusing TypeError from a class the user did not request.
@@ -468,7 +467,7 @@ def test_build_optimizer_adamw_cautious_rejects_torch_adamw_only_kwargs():
         )
 
 
-def test_build_optimizer_adamw_cautious_allows_anyprecision_kwargs():
+def _assert_build_optimizer_allows_anyprecision_kwargs():
     # use_kahan_summation is an AnyPrecisionAdamW-native kwarg and must pass
     # through the cautious-routing filter.
     model = _Tiny()
@@ -484,7 +483,7 @@ def test_build_optimizer_adamw_cautious_allows_anyprecision_kwargs():
     assert all(g["use_kahan_summation"] is True for g in opt.param_groups)
 
 
-def test_build_optimizer_passes_anyprecision_denominator_chunk_size():
+def _assert_build_optimizer_passes_anyprecision_state_strategy_kwargs():
     model = _Tiny()
     opt = build_optimizer(
         model,

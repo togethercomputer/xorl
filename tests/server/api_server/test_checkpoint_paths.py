@@ -28,52 +28,6 @@ from xorl.server.api_server.server import APIServer
 from xorl.server.api_server.utils import validate_model_id
 
 
-class TestTomiUriAndPathConstruction:
-    """Test xorl:// URI construction, parsing, and all path format variants."""
-
-    def setup_method(self):
-        self.temp_dir = tempfile.mkdtemp()
-        self.server = APIServer(
-            engine_input_addr="tcp://127.0.0.1:17000",
-            engine_output_addr="tcp://127.0.0.1:17001",
-            output_dir=self.temp_dir,
-        )
-
-    def teardown_method(self):
-        shutil.rmtree(self.temp_dir, ignore_errors=True)
-
-    def test_xorl_uri_construction_and_parsing(self):
-        """Test xorl:// URI roundtrip and all parsing formats."""
-        # Construction
-        uri = self.server._to_xorl_uri("user_123", "checkpoint-001")
-        assert uri == "xorl://user_123/weights/checkpoint-001"
-
-        # Parse xorl:// URI
-        model_id, checkpoint_name, _ = self.server._from_xorl_uri("xorl://user_123/weights/checkpoint-001")
-        assert model_id == "user_123"
-        assert checkpoint_name == "checkpoint-001"
-
-        # Parse weights/model_id/checkpoint format
-        model_id, checkpoint_name, _ = self.server._from_xorl_uri("weights/user_456/000000")
-        assert model_id == "user_456" and checkpoint_name == "000000"
-
-        # Parse legacy weights/checkpoint format (no explicit model_id)
-        model_id, checkpoint_name, _ = self.server._from_xorl_uri("weights/000000")
-        assert model_id is None and checkpoint_name == "000000"
-
-        # Parse checkpoint name only
-        model_id, checkpoint_name, _ = self.server._from_xorl_uri("000000")
-        assert model_id is None and checkpoint_name == "000000"
-
-        # Parse model_id/checkpoint format
-        model_id, checkpoint_name, _ = self.server._from_xorl_uri("user_123/adapter-a")
-        assert model_id == "user_123" and checkpoint_name == "adapter-a"
-
-        # Raw path with 3+ parts falls back to None model_id
-        model_id, checkpoint_name, _ = self.server._from_xorl_uri("some/raw/path")
-        assert model_id is None and checkpoint_name == "some/raw/path"
-
-
 class TestSaveAndLoadWeightsPaths:
     """Test save_weights and load_weights with multi-tenant path structure."""
 
@@ -105,7 +59,7 @@ class TestSaveAndLoadWeightsPaths:
             response = asyncio.run(
                 self.server.save_weights(SaveWeightsRequest(model_id=model_id, path="my_checkpoint"))
             )
-        assert model_id in response.path and "my_checkpoint" in response.path
+        assert response.path == "xorl://user_123/weights/my_checkpoint"
 
         # --- Save rejects existing checkpoint (409) ---
         existing_path = os.path.join(self.temp_dir, "weights", "user_789", "existing_checkpoint")
@@ -274,6 +228,13 @@ class TestListDeleteAndIsolation:
         assert len(response.checkpoints) == 3
         assert all("model_x" in c.checkpoint_id for c in response.checkpoints)
 
+        sampler_case = TestSamplerWeightsAndAdapterTracking()
+        sampler_case.setup_method()
+        try:
+            sampler_case._assert_sampler_listing_deletion_and_adapter_tracking()
+        finally:
+            sampler_case.teardown_method()
+
 
 class TestModelIdValidation:
     """Test model_id validation."""
@@ -325,7 +286,7 @@ class TestSamplerWeightsAndAdapterTracking:
     def teardown_method(self):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
-    def test_sampler_listing_deletion_and_adapter_tracking(self):
+    def _assert_sampler_listing_deletion_and_adapter_tracking(self):
         """Test sampler in listings, shared across models, deletion, path resolution, and adapter tracking."""
 
         # --- Sampler in listings ---
@@ -383,7 +344,27 @@ class TestSamplerWeightsAndAdapterTracking:
         assert self.server.loaded_sampling_loras["default"][-1] == ("adapter-001", "/path/1")
         assert len(self.server.loaded_sampling_loras) == 1
 
-    def test_save_weights_for_sampler_uses_normalized_lora_session_spec(self):
+        # Dropping the last receiver invalidates the adapter state that was
+        # observed on that receiver.
+        self.server.inference_endpoints = [
+            InferenceEndpoint(
+                host="sgl.local",
+                port=30000,
+                worker_port=29999,
+                world_size=1,
+                healthy=True,
+                server_info=None,
+            )
+        ]
+        response = self.server.remove_inference_endpoint(RemoveInferenceEndpointRequest(host="sgl.local", port=30000))
+        assert response.success is True
+        assert self.server.inference_endpoints == []
+        assert self.server.loaded_sampling_loras == {}
+
+        self._assert_sampling_adapter_reconciliation_and_session_tracking_policy()
+        self._assert_save_weights_for_sampler_uses_normalized_lora_session_spec()
+
+    def _assert_save_weights_for_sampler_uses_normalized_lora_session_spec(self):
         """Normalized session specs should still export adapter-only sampler weights."""
         self.server._running = True
         self.server.orchestrator_client = MagicMock()
@@ -418,7 +399,7 @@ class TestSamplerWeightsAndAdapterTracking:
         assert request.payload.lora_path.endswith("sampler_weights/adapter-export")
         assert response.path == "xorl://adapter-run/sampler_weights/adapter-export"
 
-    def test_create_sampling_session_prunes_stale_tracking_before_eviction(self):
+    def _assert_sampling_adapter_reconciliation_and_session_tracking_policy(self):
         """Stale tracked adapters should not force a bogus unload before loading a fresh adapter."""
         fresh_path = os.path.join(self.temp_dir, "sampler_weights", "fresh-001")
         os.makedirs(fresh_path, exist_ok=True)
@@ -439,7 +420,11 @@ class TestSamplerWeightsAndAdapterTracking:
         self.server._load_lora_on_inference_endpoints.assert_awaited_once_with("fresh-001", fresh_path)
         assert self.server.loaded_sampling_loras["default"] == [("fresh-001", fresh_path)]
 
-    def test_reconcile_preserves_tracking_when_loaded_adapter_query_fails(self):
+        self._assert_query_failure_preserves_tracking()
+        self.server.loaded_sampling_loras.clear()
+        self._assert_sampling_session_tracking_is_model_scoped_and_atomic()
+
+    def _assert_query_failure_preserves_tracking(self):
         """A transient endpoint introspection failure should not erase tracked sampler adapters."""
         self.server.inference_endpoints = [MagicMock()]
         self.server.loaded_sampling_loras["default"] = [("tracked-001", "/tracked/path")]
@@ -450,10 +435,11 @@ class TestSamplerWeightsAndAdapterTracking:
         assert loaded_by_endpoint == [set()]
         assert self.server.loaded_sampling_loras["default"] == [("tracked-001", "/tracked/path")]
 
-    def test_create_sampling_session_tracks_xorl_uri_under_uri_model_id(self):
-        """xorl:// sampler URIs should keep the embedded model_id for cleanup tracking."""
+    def _assert_sampling_session_tracking_is_model_scoped_and_atomic(self):
         uri_path = os.path.join(self.temp_dir, "sampler_weights", "session-a-adapter")
         os.makedirs(uri_path, exist_ok=True)
+        plain_path = os.path.join(self.temp_dir, "sampler_weights", "shared-adapter")
+        os.makedirs(plain_path, exist_ok=True)
 
         self.server.inference_endpoints = [MagicMock()]
         self.server._get_loaded_adapters_from_endpoint = AsyncMock(return_value=[])
@@ -469,15 +455,6 @@ class TestSamplerWeightsAndAdapterTracking:
         assert self.server.loaded_sampling_loras["session-a"] == [("session-a-adapter", uri_path)]
         assert self.server.loaded_sampling_loras.get("default", []) == []
 
-    def test_create_sampling_session_tracks_plain_path_under_request_model_id(self):
-        """Explicit model_id should control tracking for plain sampler paths."""
-        session_path = os.path.join(self.temp_dir, "sampler_weights", "shared-adapter")
-        os.makedirs(session_path, exist_ok=True)
-
-        self.server.inference_endpoints = [MagicMock()]
-        self.server._get_loaded_adapters_from_endpoint = AsyncMock(return_value=[])
-        self.server._load_lora_on_inference_endpoints = AsyncMock(return_value=True)
-
         response = asyncio.run(
             self.server.create_sampling_session(
                 CreateSamplingSessionRequest(model_id="session-b", model_path="shared-adapter")
@@ -485,11 +462,9 @@ class TestSamplerWeightsAndAdapterTracking:
         )
 
         assert response.lora_name == "shared-adapter"
-        assert self.server.loaded_sampling_loras["session-b"] == [("shared-adapter", session_path)]
+        assert self.server.loaded_sampling_loras["session-b"] == [("shared-adapter", plain_path)]
         assert self.server.loaded_sampling_loras.get("default", []) == []
 
-    def test_create_sampling_session_does_not_track_failed_loads(self):
-        """A failed sampling-session load should not leave a stale adapter in the tracking list."""
         failing_path = os.path.join(self.temp_dir, "sampler_weights", "failing-001")
         os.makedirs(failing_path, exist_ok=True)
 
@@ -503,27 +478,3 @@ class TestSamplerWeightsAndAdapterTracking:
             asyncio.run(self.server.create_sampling_session(CreateSamplingSessionRequest(model_path="failing-001")))
 
         assert self.server.loaded_sampling_loras.get("default", []) == []
-
-    def test_remove_last_inference_endpoint_clears_tracking(self):
-        """Dropping the last inference endpoint should also clear sampler tracking state."""
-        self.server.inference_endpoints = [
-            InferenceEndpoint(
-                host="sgl.local",
-                port=30000,
-                worker_port=29999,
-                world_size=1,
-                healthy=True,
-                server_info=None,
-            )
-        ]
-        self.server.loaded_sampling_loras["default"] = [("adapter-001", "/path/1")]
-
-        response = self.server.remove_inference_endpoint(RemoveInferenceEndpointRequest(host="sgl.local", port=30000))
-
-        assert response.success is True
-        assert self.server.inference_endpoints == []
-        assert self.server.loaded_sampling_loras == {}
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])

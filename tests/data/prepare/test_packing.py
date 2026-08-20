@@ -11,10 +11,8 @@ from xorl.data.prepare.packing import (
     add_position_ids,
     allocate_sequentially,
     drop_no_trainable_tokens,
-    ffd_check,
     filter_dataset_with_logging,
     pack_group,
-    pack_parallel,
     process_datasets_for_packing,
 )
 
@@ -22,22 +20,13 @@ from xorl.data.prepare.packing import (
 pytestmark = pytest.mark.cpu
 
 
-def test_ffd_check():
-    """FFD feasibility check: fit, don't fit, edge cases."""
-    # Sequences that fit
-    assert ffd_check(np.array([10, 20, 30, 40]), 50, 3) is True
-    assert ffd_check(np.array([30]), 50, 1) is True
-    assert ffd_check(np.array([25, 25]), 50, 1) is True  # exact fit
-
-    # Sequences that don't fit
-    assert ffd_check(np.array([40, 40, 40, 40]), 50, 2) is False
-    assert ffd_check(np.array([60]), 50, 1) is False
-
-    # Empty
-    assert ffd_check(np.array([]), 50, 1) is True
+def _assert_packing_allocation_primitives():
+    """Live bin packing and rank allocation preserve capacity and coverage."""
+    _assert_pack_group_policy()
+    _assert_sequential_allocation_policy()
 
 
-def test_pack_group():
+def _assert_pack_group_policy():
     """Pack sequences into bins: capacity, bin_size limit, safe/non-safe mode, offset."""
     # Basic packing respects capacity
     seq = np.array([10, 20, 30, 40])
@@ -65,7 +54,7 @@ def test_pack_group():
     assert min(idx for b in bins for idx in b) >= 100
 
 
-def test_allocate_sequentially():
+def _assert_sequential_allocation_policy():
     """Sequential allocation: distributes to ranks, no overlap, full coverage."""
     seq = np.array([10, 20, 30, 40, 50, 60])
 
@@ -90,8 +79,8 @@ def test_allocate_sequentially():
     assert all_idx == {0, 1, 2, 3}
 
 
-def test_add_position_ids():
-    """Add position_ids: single, batched, missing/empty input_ids, preserves fields."""
+def _assert_sample_metadata_and_trainable_token_filter_policy():
+    """Sample preprocessing adds positions and rejects data with no trainable labels."""
     # Single sample
     result = add_position_ids({"input_ids": [1, 2, 3, 4, 5], "labels": [1, 2, 3, 4, 5]})
     assert result["position_ids"] == [0, 1, 2, 3, 4]
@@ -112,11 +101,13 @@ def test_add_position_ids():
     result = add_position_ids({"input_ids": [1, 2, 3], "attention_mask": [1, 1, 1], "labels": [1, 2, 3]})
     assert result["attention_mask"] == [1, 1, 1]
 
+    _assert_trainable_token_filter_policy()
 
-def test_drop_no_trainable_tokens():
+
+def _assert_trainable_token_filter_policy():
     """Drop samples with no trainable tokens, handle batched, raise on missing labels."""
-    assert drop_no_trainable_tokens({"labels": [1, 2, -100, 3]}) == True
-    assert bool(drop_no_trainable_tokens({"labels": [-100, -100, -100]})) == False
+    assert drop_no_trainable_tokens({"labels": [1, 2, -100, 3]}) is True
+    assert bool(drop_no_trainable_tokens({"labels": [-100, -100, -100]})) is False
 
     # Batched
     result = drop_no_trainable_tokens({"labels": [[1, 2, 3], [-100, -100, -100], [1, -100, 2]]})
@@ -127,7 +118,7 @@ def test_drop_no_trainable_tokens():
         drop_no_trainable_tokens({"input_ids": [1, 2, 3]})
 
 
-def test_filter_dataset_with_logging():
+def _assert_dataset_filtering_policy():
     """Filter dataset and verify correct samples are kept."""
     dataset = HFDataset.from_dict(
         {
@@ -141,8 +132,10 @@ def test_filter_dataset_with_logging():
     assert filtered[1]["labels"] == [7, 8, 9]
 
 
-def test_process_datasets_for_packing():
-    """Process train+eval datasets: adds position_ids/length, handles None eval."""
+def _assert_dataset_preprocessing_pipeline():
+    """Dataset preprocessing filters records, adds packing metadata, and handles optional eval data."""
+    _assert_dataset_filtering_policy()
+
     args = Mock()
     args.data.dataset_num_proc = 1
 
@@ -159,8 +152,12 @@ def test_process_datasets_for_packing():
     assert p_eval_none is None
 
 
-def test_packing_dataset():
+def test_packing_dataset(tmp_path):
     """PackingDataset: init, bins, getitem, cache, missing length column."""
+    _assert_sample_metadata_and_trainable_token_filter_policy()
+    _assert_dataset_preprocessing_pipeline()
+    _assert_packing_allocation_primitives()
+
     args = Mock()
     args.data.sample_packing_method = "sequential"
     args.data.sample_packing_sequence_len = 100
@@ -198,6 +195,15 @@ def test_packing_dataset():
         sample = pds[0]
         assert isinstance(sample, list) and len(sample) > 0 and "input_ids" in sample[0]
 
+        # Cache identity must reflect the production ring-attention document
+        # alignment, not merely the standalone string-formatting helper.
+        pds.prepared_dataset_path = str(tmp_path)
+        plain_cache_path = pds._get_bins_cache_path()
+        pds.doc_align = 4
+        ring_cache_path = pds._get_bins_cache_path()
+        assert plain_cache_path.name == "packing_bins_sequential_100_10_None"
+        assert ring_cache_path.name == "packing_bins_sequential_100_10_None_align4"
+
         # Multipack method also works
         args.data.sample_packing_method = "multipack"
         pds2 = PackingDataset(args, tokenizer, dataset, split="train")
@@ -215,14 +221,3 @@ def test_packing_dataset():
             args.data.sample_packing_method = "sequential"
             pds3 = PackingDataset(args, tokenizer, dataset, split="train")
             assert pds3.bins == [[0, 1], [2, 3]]
-
-
-def test_pack_parallel():
-    """pack_parallel: single process and auto num_processes."""
-    seq = np.array([10, 20, 30, 40, 50, 60, 70, 80])
-
-    bins = pack_parallel(seq, 100, 3, 10, num_processes=1, safe_mode=True, mp_start_method=None)
-    assert len(bins) > 0
-
-    bins2 = pack_parallel(seq, 100, 2, 10, num_processes=None, safe_mode=True, mp_start_method=None)
-    assert len(bins2) > 0

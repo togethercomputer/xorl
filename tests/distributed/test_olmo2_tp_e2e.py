@@ -24,8 +24,15 @@ from torch.distributed.tensor.parallel import parallelize_module
 
 from xorl.distributed.parallel_state import init_parallel_state
 from xorl.distributed.torch_parallelize import _build_tp_plan
+from xorl.models.layers.normalization import RMSNorm
 from xorl.models.transformers.olmo2.configuration_olmo2 import Olmo2Config
-from xorl.models.transformers.olmo2.modeling_olmo2 import Olmo2ForCausalLM
+from xorl.models.transformers.olmo2.modeling_olmo2 import Olmo2ForCausalLM, Olmo2QKRMSNorm
+from xorl.models.transformers.olmo2.tp_styles import LocalAxisRMSNormShard
+
+
+QK_NORM_HIDDEN = 8
+QK_NORM_SEQUENCE = 6
+QK_NORM_BATCH = 2
 
 
 def _make_config():
@@ -50,6 +57,46 @@ def _make_config():
     return cfg
 
 
+def _assert_qk_norm_numerical_policy(mesh):
+    plain_norm = Olmo2QKRMSNorm(QK_NORM_HIDDEN)
+    plain_input = torch.randn(
+        QK_NORM_BATCH,
+        QK_NORM_SEQUENCE,
+        QK_NORM_HIDDEN,
+        generator=torch.Generator().manual_seed(0),
+    )
+    plain_reference = RMSNorm(QK_NORM_HIDDEN)
+    plain_reference.weight = torch.nn.Parameter(plain_norm.weight.detach().clone())
+    plain_output = plain_norm(plain_input)
+    assert tuple(plain_output.shape) == (QK_NORM_BATCH, QK_NORM_SEQUENCE, QK_NORM_HIDDEN)
+    torch.testing.assert_close(plain_output, plain_reference(plain_input), atol=1e-6, rtol=1e-6)
+
+    tp_size = mesh.size()
+    rank = dist.get_rank()
+    sharded_norm = parallelize_module(
+        Olmo2QKRMSNorm(QK_NORM_HIDDEN),
+        mesh,
+        LocalAxisRMSNormShard(),
+    )
+    full_input = torch.randn(
+        QK_NORM_BATCH,
+        QK_NORM_SEQUENCE,
+        QK_NORM_HIDDEN,
+        generator=torch.Generator().manual_seed(7),
+    )
+    rank_slice = slice(
+        rank * (QK_NORM_HIDDEN // tp_size),
+        (rank + 1) * (QK_NORM_HIDDEN // tp_size),
+    )
+    local_input = full_input[..., rank_slice].contiguous()
+    sharded_output = sharded_norm(local_input)
+    assert tuple(sharded_output.shape) == (QK_NORM_BATCH, QK_NORM_SEQUENCE, QK_NORM_HIDDEN // tp_size)
+
+    local_reference = RMSNorm(QK_NORM_HIDDEN // tp_size)
+    local_reference.weight = torch.nn.Parameter(sharded_norm.weight.to_local().clone())
+    torch.testing.assert_close(sharded_output, local_reference(local_input), atol=1e-6, rtol=1e-6)
+
+
 def main():
     dist.init_process_group(backend="gloo")
     rank = dist.get_rank()
@@ -66,6 +113,7 @@ def main():
         device_type="cpu",
     )
     mesh = init_device_mesh("cpu", (world_size,), mesh_dim_names=("tp",))
+    _assert_qk_norm_numerical_policy(mesh)
 
     torch.manual_seed(0)
     model = Olmo2ForCausalLM(_make_config())

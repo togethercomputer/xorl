@@ -7,12 +7,22 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from xorl.distributed.canonical_moe import CanonicalMoEGraphMetadata, canonical_moe_reduce_reference
+from xorl.distributed.canonical_moe import CanonicalMoEGraphMetadata
 from xorl.models.transformers.glm5.exact_shared_expert_qlora import (
     GLM52_EXACT_TP16_SHARED_EXPERT_QLORA_CONTRACT_VERSION,
     Glm52ExactTP16SharedExpertBlockFP8QLoRA,
 )
 from xorl.ops.fused_silu_and_mul import exact_fp32_silu_and_mul
+
+
+def _canonical_moe_reference(partials: torch.Tensor, metadata: CanonicalMoEGraphMetadata) -> torch.Tensor:
+    level = [partials[index] for index in range(partials.shape[0])]
+    while len(level) > 1:
+        level = [(level[index] + level[index + 1]).to(torch.bfloat16) for index in range(0, len(level), 2)]
+    result = level[0]
+    result = result.clone()
+    result[~metadata.valid_mask] = 0
+    return result
 
 
 def _pattern(
@@ -64,9 +74,8 @@ def _load_base(module: Glm52ExactTP16SharedExpertBlockFP8QLoRA) -> None:
     )
 
 
-@pytest.mark.parametrize(
-    ("kwargs", "message"),
-    [
+def test_shared_expert_construction_and_runtime_admission_policy() -> None:
+    for kwargs, message in (
         ({"hidden_size": 4096}, "hidden_size=6144"),
         ({"intermediate_size": 4096}, "intermediate_size=2048"),
         ({"tp_size": 8}, "requires TP16"),
@@ -74,14 +83,44 @@ def _load_base(module: Glm52ExactTP16SharedExpertBlockFP8QLoRA) -> None:
         ({"lora_alpha": 0}, "positive integer alpha"),
         ({"bias": True}, "bias-free"),
         ({"enable_aqn": True}, "rejects adaptive quantization noise"),
-    ],
-)
-def test_shared_expert_construction_fails_closed(kwargs: dict, message: str) -> None:
-    with pytest.raises(ValueError, match=message):
-        Glm52ExactTP16SharedExpertBlockFP8QLoRA(device="meta", **kwargs)
+    ):
+        with pytest.raises(ValueError, match=message):
+            Glm52ExactTP16SharedExpertBlockFP8QLoRA(device="meta", **kwargs)
+
+    module = Glm52ExactTP16SharedExpertBlockFP8QLoRA(device="cpu")
+    with pytest.raises(TypeError, match="contributor_ordinal must be an integer"):
+        module(torch.zeros(1, 6144, dtype=torch.bfloat16), contributor_ordinal=True)
+    with pytest.raises(ValueError, match=r"must be in \[0, 16\)"):
+        module(torch.zeros(1, 6144, dtype=torch.bfloat16), contributor_ordinal=16)
+    with pytest.raises(TypeError, match="requires BF16 activations"):
+        module(torch.zeros(1, 6144), contributor_ordinal=0)
+    with pytest.raises(ValueError, match="input width"):
+        module(torch.zeros(1, 128, dtype=torch.bfloat16), contributor_ordinal=0)
+    with pytest.raises(ValueError, match="contiguous sampler-layout"):
+        module(torch.zeros(6144, 2, dtype=torch.bfloat16).transpose(0, 1), contributor_ordinal=0)
+    with pytest.raises(RuntimeError, match="requires CUDA"):
+        module(torch.zeros(1, 6144, dtype=torch.bfloat16), contributor_ordinal=0)
+    with pytest.raises(RuntimeError, match="cannot run independently"):
+        module.gate_proj(torch.zeros(1, 6144, dtype=torch.bfloat16))
+    with pytest.raises(RuntimeError, match="cannot bypass active LoRA"):
+        module.gate_proj.forward_partition(
+            torch.zeros(1, 6144, dtype=torch.bfloat16),
+            output_range=(0, 128),
+        )
+
+    module.tp_size = 8
+    with pytest.raises(RuntimeError, match="runtime contract was mutated"):
+        module(torch.zeros(1, 6144, dtype=torch.bfloat16), contributor_ordinal=0)
+    module.tp_size = 16
+    module.gate_proj.lora_A = nn.Parameter(module.gate_proj.lora_A.to(torch.bfloat16))
+    with pytest.raises(TypeError, match="gate_proj.lora_A must remain FP32"):
+        module(torch.zeros(1, 6144, dtype=torch.bfloat16), contributor_ordinal=0)
+
+    _assert_shared_expert_logical_and_checkpoint_state_policy()
+    _assert_shared_expert_native_base_views_use_output_rows_and_input_columns()
 
 
-def test_shared_expert_registers_one_logical_state_and_preserves_fp32_masters() -> None:
+def _assert_shared_expert_logical_and_checkpoint_state_policy() -> None:
     module = Glm52ExactTP16SharedExpertBlockFP8QLoRA(device="cpu")
     assert module.contract_version == GLM52_EXACT_TP16_SHARED_EXPERT_QLORA_CONTRACT_VERSION
     parameters = dict(module.named_parameters())
@@ -115,8 +154,6 @@ def test_shared_expert_registers_one_logical_state_and_preserves_fp32_masters() 
         if name.endswith(("packed_weight_f32", "weight_scale_inv"))
     )
 
-
-def test_shared_expert_checkpoint_sources_are_canonical_and_immutable() -> None:
     module = Glm52ExactTP16SharedExpertBlockFP8QLoRA(device="meta")
     prefix = "model.layers.3.mlp.shared_experts"
 
@@ -144,7 +181,18 @@ def test_shared_expert_physical_factor_views_match_pinned_sglang_tp_slices() -> 
     module = Glm52ExactTP16SharedExpertBlockFP8QLoRA(device="cpu")
     _fill_factors(module)
     ordinal = 11
-    actual = module.physical_factor_views(ordinal)
+    effective = tuple(
+        factor.to(torch.bfloat16).contiguous()
+        for factor in (
+            module.gate_proj.lora_A,
+            module.gate_proj.lora_B,
+            module.up_proj.lora_A,
+            module.up_proj.lora_B,
+            module.down_proj.lora_A,
+            module.down_proj.lora_B,
+        )
+    )
+    actual = module._physical_factor_views_from_effective(*effective, ordinal)
 
     gate_up_A = torch.cat(
         (
@@ -196,7 +244,7 @@ def test_shared_expert_physical_factor_views_match_pinned_sglang_tp_slices() -> 
     assert all(tensor.is_contiguous() for tensor in (actual.gate_up_A, actual.gate_up_B, actual.down_A, actual.down_B))
 
 
-def test_shared_expert_native_base_views_use_output_rows_and_input_columns() -> None:
+def _assert_shared_expert_native_base_views_use_output_rows_and_input_columns() -> None:
     module = Glm52ExactTP16SharedExpertBlockFP8QLoRA(device="cpu")
     ordinal = 5
     gate_weight = torch.empty((2048, 6144), dtype=torch.float8_e4m3fn)
@@ -234,37 +282,6 @@ def test_shared_expert_native_base_views_use_output_rows_and_input_columns() -> 
     assert torch.equal(actual.gate_up_scales[1], up_scales[ordinal])
     assert torch.equal(actual.down_weight.view(torch.uint8), down_weight[:, start:end].contiguous().view(torch.uint8))
     assert torch.equal(actual.down_scales[:, 0], down_scales[:, ordinal])
-
-
-def test_shared_expert_runtime_contract_fails_before_sglang_kernel_import() -> None:
-    module = Glm52ExactTP16SharedExpertBlockFP8QLoRA(device="cpu")
-    with pytest.raises(TypeError, match="contributor_ordinal must be an integer"):
-        module(torch.zeros(1, 6144, dtype=torch.bfloat16), contributor_ordinal=True)
-    with pytest.raises(ValueError, match=r"must be in \[0, 16\)"):
-        module(torch.zeros(1, 6144, dtype=torch.bfloat16), contributor_ordinal=16)
-    with pytest.raises(TypeError, match="requires BF16 activations"):
-        module(torch.zeros(1, 6144), contributor_ordinal=0)
-    with pytest.raises(ValueError, match="input width"):
-        module(torch.zeros(1, 128, dtype=torch.bfloat16), contributor_ordinal=0)
-    with pytest.raises(ValueError, match="contiguous sampler-layout"):
-        module(torch.zeros(6144, 2, dtype=torch.bfloat16).transpose(0, 1), contributor_ordinal=0)
-    with pytest.raises(RuntimeError, match="requires CUDA"):
-        module(torch.zeros(1, 6144, dtype=torch.bfloat16), contributor_ordinal=0)
-    with pytest.raises(RuntimeError, match="cannot run independently"):
-        module.gate_proj(torch.zeros(1, 6144, dtype=torch.bfloat16))
-    with pytest.raises(RuntimeError, match="cannot bypass active LoRA"):
-        module.gate_proj.forward_partition(
-            torch.zeros(1, 6144, dtype=torch.bfloat16),
-            output_range=(0, 128),
-        )
-
-    module.tp_size = 8
-    with pytest.raises(RuntimeError, match="runtime contract was mutated"):
-        module(torch.zeros(1, 6144, dtype=torch.bfloat16), contributor_ordinal=0)
-    module.tp_size = 16
-    module.gate_proj.lora_A = nn.Parameter(module.gate_proj.lora_A.to(torch.bfloat16))
-    with pytest.raises(TypeError, match="gate_proj.lora_A must remain FP32"):
-        module(torch.zeros(1, 6144, dtype=torch.bfloat16), contributor_ordinal=0)
 
 
 def _manual_local_vjp(
@@ -411,7 +428,7 @@ def test_official_shared_expert_actual_operands_fold_and_surrogate_vjp() -> None
     cold_output = module(input, contributor_ordinal=ordinal)
     warm_output = module(input, contributor_ordinal=ordinal)
 
-    factors = module.physical_factor_views(ordinal)
+    factors = module._physical_factor_views_from_effective(*effective, ordinal)
     base = module._physical_base_views(ordinal)
     batch_info = LoRABatchInfo(
         use_cuda_graph=False,
@@ -486,7 +503,7 @@ def test_official_shared_expert_actual_operands_fold_and_surrogate_vjp() -> None
         torch.tensor([0], dtype=torch.int64, device=device),
         capacity=1,
     )
-    canonical = canonical_moe_reduce_reference(partials, metadata)
+    canonical = _canonical_moe_reference(partials, metadata)
     sampler_slots = CanonicalRowSlots.from_positions(
         torch.tensor([0], dtype=torch.int64, device=device),
         capacity=1,

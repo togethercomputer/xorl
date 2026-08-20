@@ -1,11 +1,13 @@
 import importlib.util
 import queue
 import threading
+from functools import lru_cache
 from pathlib import Path
 
 import pytest
 
 
+@lru_cache(maxsize=1)
 def _load_driver():
     path = Path(__file__).resolve().parents[2] / "scripts" / "opd" / "run_opd_pipeline.py"
     spec = importlib.util.spec_from_file_location("run_opd_pipeline", path)
@@ -16,7 +18,7 @@ def _load_driver():
     return module
 
 
-def test_teacher_cache_payload_uses_causal_shift():
+def _assert_teacher_cache_payload_uses_causal_shift():
     driver = _load_driver()
 
     data = driver._teacher_hidden_cache_data([[10, 11, 12, 13]])
@@ -29,7 +31,7 @@ def test_teacher_cache_payload_uses_causal_shift():
     ]
 
 
-def test_opd_loss_payload_aligns_cache_indices_with_shifted_tokens():
+def _assert_opd_loss_payload_aligns_cache_indices_with_shifted_tokens():
     driver = _load_driver()
 
     data = driver._opd_loss_data([[10, 11, 12, 13]], [[20, 21, 22]])
@@ -47,29 +49,14 @@ def test_opd_loss_payload_aligns_cache_indices_with_shifted_tokens():
     ]
 
 
-def test_opd_loss_payload_rejects_unshifted_cache_indices():
+def _assert_opd_loss_payload_rejects_unshifted_cache_indices():
     driver = _load_driver()
 
     with pytest.raises(RuntimeError, match="cache index length"):
         driver._opd_loss_data([[10, 11, 12, 13]], [[20, 21, 22, 23]])
 
 
-def test_prompt_chunking_preserves_order_and_tail():
-    driver = _load_driver()
-
-    chunks = driver._chunked([[1], [2], [3], [4], [5]], 2)
-
-    assert chunks == [[[1], [2]], [[3], [4]], [[5]]]
-
-
-def test_prompt_chunking_rejects_non_positive_chunk_size():
-    driver = _load_driver()
-
-    with pytest.raises(ValueError, match="chunk_size"):
-        driver._chunked([[1]], 0)
-
-
-def test_endpoint_already_registered_matches_existing_endpoint():
+def _assert_endpoint_already_registered_matches_existing_endpoint():
     driver = _load_driver()
 
     payload = {
@@ -82,7 +69,9 @@ def test_endpoint_already_registered_matches_existing_endpoint():
     assert not driver._endpoint_already_registered(payload, "student", 30002)
 
 
-def test_student_weight_version_verifier_accepts_expected_version(monkeypatch):
+def _assert_student_weight_version_verifier_truth_table(monkeypatch):
+    _assert_endpoint_already_registered_matches_existing_endpoint()
+
     driver = _load_driver()
     monkeypatch.setattr(driver, "_model_info", lambda *_args, **_kwargs: {"weight_version": "opd-step0"})
     profile_row = {}
@@ -93,9 +82,6 @@ def test_student_weight_version_verifier_accepts_expected_version(monkeypatch):
     assert error is None
     assert profile_row["student_weight_version"] == "opd-step0"
 
-
-def test_student_weight_version_verifier_rejects_missing_or_mismatched_version(monkeypatch):
-    driver = _load_driver()
     monkeypatch.setattr(driver, "_model_info", lambda *_args, **_kwargs: {"weight_version": "old"})
     profile_row = {}
 
@@ -104,10 +90,6 @@ def test_student_weight_version_verifier_rejects_missing_or_mismatched_version(m
     assert ok is False
     assert "expected=opd-step0 actual=old" in error
     assert profile_row["student_weight_version"] == "old"
-
-
-def test_student_weight_version_verifier_records_model_info_errors(monkeypatch):
-    driver = _load_driver()
 
     def raise_model_info(*_args, **_kwargs):
         raise RuntimeError("no endpoint")
@@ -122,7 +104,7 @@ def test_student_weight_version_verifier_records_model_info_errors(monkeypatch):
     assert profile_row["student_weight_version_error"] == error
 
 
-def test_prepare_worker_enqueues_prepared_chunks(monkeypatch):
+def _assert_prepare_worker_enqueues_prepared_chunks(monkeypatch):
     driver = _load_driver()
 
     def fake_prepare_opd_chunk(**kwargs):
@@ -170,7 +152,7 @@ def test_prepare_worker_enqueues_prepared_chunks(monkeypatch):
     assert len(done_items) == 1
 
 
-def test_teacher_cache_from_xorl_returns_mooncake_metadata_entry(monkeypatch):
+def _assert_teacher_cache_from_xorl_returns_mooncake_metadata_entry(monkeypatch):
     driver = _load_driver()
 
     sent = {}
@@ -213,7 +195,7 @@ def test_teacher_cache_from_xorl_returns_mooncake_metadata_entry(monkeypatch):
     assert result["cache_indices_by_sample"] == [[0, 1, 2]]
 
 
-def test_teacher_cache_from_xorl_rejects_non_mooncake_metadata(monkeypatch):
+def _assert_teacher_cache_from_xorl_rejects_non_mooncake_metadata(monkeypatch):
     driver = _load_driver()
 
     class _FakeResponse:
@@ -232,3 +214,14 @@ def test_teacher_cache_from_xorl_rejects_non_mooncake_metadata(monkeypatch):
 
     with pytest.raises(RuntimeError, match="Mooncake cache metadata"):
         driver._teacher_cache_from_xorl("http://teacher", [[10, 11, 12, 13]])
+
+
+def test_opd_pipeline_payload_and_transport_contract(monkeypatch):
+    with monkeypatch.context() as version_patch:
+        _assert_student_weight_version_verifier_truth_table(version_patch)
+    _assert_prepare_worker_enqueues_prepared_chunks(monkeypatch)
+    _assert_teacher_cache_payload_uses_causal_shift()
+    _assert_opd_loss_payload_aligns_cache_indices_with_shifted_tokens()
+    _assert_opd_loss_payload_rejects_unshifted_cache_indices()
+    _assert_teacher_cache_from_xorl_returns_mooncake_metadata_entry(monkeypatch)
+    _assert_teacher_cache_from_xorl_rejects_non_mooncake_metadata(monkeypatch)

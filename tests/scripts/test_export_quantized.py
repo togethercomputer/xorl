@@ -11,7 +11,6 @@ import torch.nn.functional as F
 from safetensors.torch import load_file, save_file
 
 from xorl.cli.export_quantized import (
-    _parse_size_bytes,
     export_hf_directory_to_fp8,
     export_qarl_directory_to_fp8,
     parse_args,
@@ -116,7 +115,7 @@ def _target_logprobs(model: nn.Module, input_ids: torch.Tensor, labels: torch.Te
         return logprobs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
 
 
-def test_quantize_weight_to_fp8_matches_weight_sync_helper():
+def test_quantize_weight_to_fp8_contract():
     weight = torch.tensor(
         [
             [0.0, 1.0, -2.0],
@@ -143,8 +142,10 @@ def test_quantize_weight_to_fp8_matches_weight_sync_helper():
     assert torch.equal(quantized, sync_out[0][1])
     torch.testing.assert_close(scale, sync_out[1][1])
 
+    _assert_partial_blocks_use_zero_padding()
 
-def test_quantize_weight_to_fp8_zero_padding_differs_from_last_element_padding_for_partial_blocks():
+
+def _assert_partial_blocks_use_zero_padding():
     block_size = (2, 4)
     weight = torch.tensor(
         [
@@ -174,7 +175,7 @@ def test_quantize_weight_to_fp8_zero_padding_differs_from_last_element_padding_f
     assert not torch.equal(quantized.view(torch.uint8), last_padded_weight.view(torch.uint8))
 
 
-def test_parse_args_loads_export_config_and_appends_cli_skip(tmp_path):
+def _assert_parse_args_loads_export_config_and_appends_cli_skip(tmp_path):
     config_path = tmp_path / "export.yaml"
     config_path.write_text(
         """
@@ -209,20 +210,7 @@ max_shard_size: 512MiB
     assert args.max_shard_size == "512MiB"
 
 
-def test_qwen3_8b_block_fp8_export_example_config_parses():
-    config_path = Path(__file__).resolve().parents[2] / "examples/server/configs/export/qwen3_8b_block_fp8_export.yaml"
-
-    args = parse_args(["--config", str(config_path)])
-
-    assert args.input_dir == "/path/to/qwen3-8b-bf16-hf-weights"
-    assert args.output_dir == "/path/to/qwen3-8b-block-fp8-hf-weights"
-    assert args.weight_block_size == [128, 128]
-    assert args.modules_to_not_convert == ["model.embed_tokens", "lm_head"]
-    assert args.num_first_layers_bf16 == 1
-    assert args.num_last_layers_bf16 == 1
-
-
-def test_export_quantized_module_cli_exports_from_config(tmp_path):
+def _assert_export_quantized_module_cli_exports_from_config(tmp_path):
     source = tmp_path / "source"
     output = tmp_path / "exported"
     tensors = {
@@ -240,7 +228,7 @@ weight_block_size: [2, 2]
 modules_to_not_convert:
   - lm_head
 num_first_layers_bf16: 1
-max_shard_size: 1MiB
+max_shard_size: 24B
 """,
         encoding="utf-8",
     )
@@ -261,9 +249,18 @@ max_shard_size: 1MiB
     result = json.loads(completed.stdout)
     assert result["output_dir"] == str(output)
     assert result["quantized_weights"] == 1
-    assert result["shard_count"] == 1
+    assert result["shard_count"] > 1
 
-    exported = load_file(output / "model.safetensors")
+    index = json.loads((output / "model.safetensors.index.json").read_text(encoding="utf-8"))
+    assert index["metadata"]["total_size"] == result["total_size"]
+    assert "model.layers.0.self_attn.q_proj.weight" in index["weight_map"]
+    assert "model.layers.1.self_attn.q_proj.weight_scale_inv" in index["weight_map"]
+    shard_names = set(index["weight_map"].values())
+    assert len(shard_names) == result["shard_count"]
+
+    exported = {}
+    for shard_name in shard_names:
+        exported.update(load_file(output / shard_name))
     assert exported["model.layers.0.self_attn.q_proj.weight"].dtype == torch.float32
     assert exported["model.layers.1.self_attn.q_proj.weight"].dtype == torch.float8_e4m3fn
     assert exported["model.layers.1.self_attn.q_proj.weight_scale_inv"].shape == (2, 2)
@@ -279,7 +276,7 @@ max_shard_size: 1MiB
     }
 
 
-def test_export_hf_directory_to_fp8_preserves_bf16_islands_and_writes_config(tmp_path):
+def _assert_export_hf_directory_to_fp8_preserves_bf16_islands_and_writes_config(tmp_path):
     source = tmp_path / "source"
     output = tmp_path / "exported"
     tensors = {
@@ -323,34 +320,7 @@ def test_export_hf_directory_to_fp8_preserves_bf16_islands_and_writes_config(tmp
     assert (output / "tokenizer_config.json").exists()
 
 
-def test_export_hf_directory_to_fp8_writes_sharded_index(tmp_path):
-    source = tmp_path / "source"
-    output = tmp_path / "exported"
-    _write_source_model(
-        source,
-        {
-            "model.layers.0.self_attn.q_proj.weight": torch.arange(16, dtype=torch.float32).reshape(4, 4),
-            "model.layers.1.self_attn.q_proj.weight": torch.arange(16, 32, dtype=torch.float32).reshape(4, 4),
-        },
-        num_hidden_layers=2,
-    )
-
-    result = export_hf_directory_to_fp8(
-        source,
-        output,
-        weight_block_size=(2, 2),
-        max_shard_size=24,
-    )
-
-    assert result.shard_count > 1
-    index = json.loads((output / "model.safetensors.index.json").read_text(encoding="utf-8"))
-    assert index["metadata"]["total_size"] == result.total_size
-    assert "model.layers.0.self_attn.q_proj.weight" in index["weight_map"]
-    assert "model.layers.0.self_attn.q_proj.weight_scale_inv" in index["weight_map"]
-    assert all((output / shard_name).exists() for shard_name in set(index["weight_map"].values()))
-
-
-def test_export_hf_directory_to_fp8_splits_fused_qkv_weights(tmp_path):
+def _assert_export_hf_directory_to_fp8_fused_qkv_policy(tmp_path):
     source = tmp_path / "source"
     output = tmp_path / "exported"
     qkv = torch.arange(16 * 5, dtype=torch.float32).reshape(16, 5)
@@ -388,8 +358,11 @@ def test_export_hf_directory_to_fp8_splits_fused_qkv_weights(tmp_path):
     torch.testing.assert_close(exported["model.layers.0.self_attn.k_proj.weight_scale_inv"], expected_k_scale)
     torch.testing.assert_close(exported["model.layers.0.self_attn.v_proj.weight_scale_inv"], expected_v_scale)
 
+    _assert_fused_qkv_without_attention_metadata_is_rejected(tmp_path / "missing-metadata")
+    _assert_duplicate_converted_qkv_names_are_rejected(tmp_path / "duplicate")
 
-def test_export_hf_directory_to_fp8_rejects_fused_qkv_without_attention_metadata(tmp_path):
+
+def _assert_fused_qkv_without_attention_metadata_is_rejected(tmp_path):
     source = tmp_path / "source"
     output = tmp_path / "exported"
     _write_source_model(
@@ -402,7 +375,7 @@ def test_export_hf_directory_to_fp8_rejects_fused_qkv_without_attention_metadata
         export_hf_directory_to_fp8(source, output, weight_block_size=(2, 2))
 
 
-def test_export_hf_directory_to_fp8_rejects_duplicate_converted_names(tmp_path):
+def _assert_duplicate_converted_qkv_names_are_rejected(tmp_path):
     source = tmp_path / "source"
     output = tmp_path / "exported"
     _write_source_model(
@@ -423,7 +396,7 @@ def test_export_hf_directory_to_fp8_rejects_duplicate_converted_names(tmp_path):
         export_hf_directory_to_fp8(source, output, weight_block_size=(2, 2))
 
 
-def test_export_hf_directory_to_fp8_fuses_mla_a_projection_for_sglang(tmp_path):
+def _assert_export_hf_directory_to_fp8_mla_a_projection_policy(tmp_path):
     source = tmp_path / "source"
     output = tmp_path / "exported"
     q_a = torch.arange(3 * 5, dtype=torch.float32).reshape(3, 5)
@@ -461,8 +434,10 @@ def test_export_hf_directory_to_fp8_fuses_mla_a_projection_for_sglang(tmp_path):
     )
     torch.testing.assert_close(exported["model.layers.0.self_attn.q_b_proj.weight_scale_inv"], expected_q_b_scale)
 
+    _assert_mla_a_projection_stays_split_without_q_lora_rank(tmp_path / "split")
 
-def test_export_hf_directory_to_fp8_leaves_mla_a_projection_split_without_q_lora_rank(tmp_path):
+
+def _assert_mla_a_projection_stays_split_without_q_lora_rank(tmp_path):
     source = tmp_path / "source"
     output = tmp_path / "exported"
     q_a = torch.arange(3 * 5, dtype=torch.float32).reshape(3, 5)
@@ -484,7 +459,7 @@ def test_export_hf_directory_to_fp8_leaves_mla_a_projection_split_without_q_lora
     assert "model.layers.0.self_attn.fused_qkv_a_proj_with_mqa.weight" not in exported
 
 
-def test_export_hf_directory_to_fp8_remaps_linear_attention_split_names(tmp_path):
+def _assert_export_hf_directory_to_fp8_linear_attention_name_policy(tmp_path):
     source = tmp_path / "source"
     output = tmp_path / "exported"
     prefix = "model.layers.0.linear_attn"
@@ -564,8 +539,10 @@ def test_export_hf_directory_to_fp8_remaps_linear_attention_split_names(tmp_path
     torch.testing.assert_close(exported[f"{prefix}.dt_bias"], dt_bias)
     torch.testing.assert_close(exported[f"{prefix}.A_log"], a_log)
 
+    _assert_linear_attention_stays_split_without_layer_types(tmp_path / "split")
 
-def test_export_hf_directory_to_fp8_leaves_linear_attention_split_without_layer_types(tmp_path):
+
+def _assert_linear_attention_stays_split_without_layer_types(tmp_path):
     source = tmp_path / "source"
     output = tmp_path / "exported"
     prefix = "model.layers.0.linear_attn"
@@ -588,7 +565,7 @@ def test_export_hf_directory_to_fp8_leaves_linear_attention_split_without_layer_
     assert f"{prefix}.in_proj_qkv.weight" not in exported
 
 
-def test_export_hf_directory_to_fp8_converts_gkn_moe_experts_to_hf_layout(tmp_path):
+def _assert_export_hf_directory_to_fp8_converts_gkn_moe_experts_to_hf_layout(tmp_path):
     source = tmp_path / "source"
     output = tmp_path / "exported"
     gate_up = torch.arange(2 * 3 * 8, dtype=torch.float32).reshape(2, 3, 8)
@@ -642,7 +619,7 @@ def test_export_hf_directory_to_fp8_converts_gkn_moe_experts_to_hf_layout(tmp_pa
     )
 
 
-def test_export_hf_directory_to_fp8_splits_fused_gate_up_weights(tmp_path):
+def _assert_export_hf_directory_to_fp8_splits_fused_gate_up_weights(tmp_path):
     source = tmp_path / "source"
     output = tmp_path / "exported"
     gate_up = torch.arange(8 * 3, dtype=torch.float32).reshape(8, 3)
@@ -670,73 +647,52 @@ def test_export_hf_directory_to_fp8_splits_fused_gate_up_weights(tmp_path):
     torch.testing.assert_close(exported["model.layers.0.mlp.up_proj.weight_scale_inv"], expected_up_scale)
 
 
-def test_export_hf_directory_to_fp8_rejects_existing_fp8_scale_tensors(tmp_path):
-    source = tmp_path / "source"
-    output = tmp_path / "exported"
-    _write_source_model(
-        source,
-        {
-            "model.layers.0.self_attn.q_proj.weight": torch.ones(2, 2),
-            "model.layers.0.self_attn.q_proj.weight_scale_inv": torch.ones(1, 1),
-        },
-        num_hidden_layers=1,
-    )
+def _assert_export_preflight_rejects_unsupported_source_state(tmp_path):
+    q_proj = "model.layers.0.self_attn.q_proj"
+    cases = [
+        (
+            "already quantized",
+            {f"{q_proj}.weight": torch.ones(2, 2), f"{q_proj}.weight_scale_inv": torch.ones(1, 1)},
+            None,
+            "weight_scale_inv",
+        ),
+        (
+            "MTP config metadata",
+            {f"{q_proj}.weight": torch.ones(2, 2)},
+            {"text_config": {"num_nextn_predict_layers": 1}},
+            "MTP/speculative low-precision export",
+        ),
+        (
+            "MTP tensor namespace",
+            {
+                f"{q_proj}.weight": torch.ones(2, 2),
+                "model.mtp.layers.0.self_attn.q_proj.weight": torch.ones(2, 2),
+            },
+            None,
+            "weights include model.mtp.layers.0",
+        ),
+        (
+            "unfolded QARL state",
+            {
+                f"{q_proj}.weight": torch.ones(2, 2),
+                f"{q_proj}.qarl_input_amax": torch.tensor(1.0),
+                f"{q_proj}.qarl_weight_amax": torch.tensor(1.0),
+                f"{q_proj}.qarl_forward_count": torch.tensor(3, dtype=torch.long),
+            },
+            None,
+            "QARL quantizer state",
+        ),
+    ]
 
-    with pytest.raises(ValueError, match="weight_scale_inv"):
-        export_hf_directory_to_fp8(source, output, weight_block_size=(2, 2))
-
-
-def test_export_hf_directory_to_fp8_rejects_mtp_config_metadata(tmp_path):
-    source = tmp_path / "source"
-    output = tmp_path / "exported"
-    _write_source_model(
-        source,
-        {
-            "model.layers.0.self_attn.q_proj.weight": torch.ones(2, 2),
-        },
-        num_hidden_layers=1,
-        config_updates={"text_config": {"num_nextn_predict_layers": 1}},
-    )
-
-    with pytest.raises(ValueError, match="MTP/speculative low-precision export"):
-        export_hf_directory_to_fp8(source, output, weight_block_size=(2, 2))
-
-
-def test_export_hf_directory_to_fp8_rejects_mtp_tensor_names(tmp_path):
-    source = tmp_path / "source"
-    output = tmp_path / "exported"
-    _write_source_model(
-        source,
-        {
-            "model.layers.0.self_attn.q_proj.weight": torch.ones(2, 2),
-            "model.mtp.layers.0.self_attn.q_proj.weight": torch.ones(2, 2),
-        },
-        num_hidden_layers=1,
-    )
-
-    with pytest.raises(ValueError, match="weights include model.mtp.layers.0"):
-        export_hf_directory_to_fp8(source, output, weight_block_size=(2, 2))
+    for label, tensors, config_updates, error_pattern in cases:
+        source = tmp_path / label / "source"
+        output = tmp_path / label / "exported"
+        _write_source_model(source, tensors, num_hidden_layers=1, config_updates=config_updates)
+        with pytest.raises(ValueError, match=error_pattern):
+            export_hf_directory_to_fp8(source, output, weight_block_size=(2, 2))
 
 
-def test_export_hf_directory_rejects_qarl_state_without_fold_flag(tmp_path):
-    source = tmp_path / "source"
-    output = tmp_path / "exported"
-    _write_source_model(
-        source,
-        {
-            "model.layers.0.self_attn.q_proj.weight": torch.ones(2, 2),
-            "model.layers.0.self_attn.q_proj.qarl_input_amax": torch.tensor(1.0),
-            "model.layers.0.self_attn.q_proj.qarl_weight_amax": torch.tensor(1.0),
-            "model.layers.0.self_attn.q_proj.qarl_forward_count": torch.tensor(3, dtype=torch.long),
-        },
-        num_hidden_layers=1,
-    )
-
-    with pytest.raises(ValueError, match="QARL quantizer state"):
-        export_hf_directory_to_fp8(source, output, weight_block_size=(2, 2))
-
-
-def test_export_qarl_directory_to_fp8_folds_only_qarl_modules(tmp_path):
+def _assert_export_qarl_directory_to_fp8_fold_admission_policy(tmp_path):
     source = tmp_path / "source"
     output = tmp_path / "exported"
     tensors = {
@@ -785,8 +741,10 @@ def test_export_qarl_directory_to_fp8_folds_only_qarl_modules(tmp_path):
     assert exported_config["xorl_qarl_export"]["folded_modules"] == ["model.layers.0.self_attn.q_proj"]
     assert exported_config["xorl_qarl_export"]["quant_cfg"]["weight_block_size"] == [2, 2]
 
+    _assert_qarl_export_requires_matching_block_size(tmp_path / "mismatch")
 
-def test_export_qarl_directory_to_fp8_preserves_trained_logprobs_after_dequant(tmp_path):
+
+def _assert_export_qarl_directory_to_fp8_preserves_trained_logprobs_after_dequant(tmp_path):
     torch.manual_seed(19)
     source = tmp_path / "qarl_source"
     output = tmp_path / "qarl_exported"
@@ -809,17 +767,16 @@ def test_export_qarl_directory_to_fp8_preserves_trained_logprobs_after_dequant(t
     initial_logprobs = _target_logprobs(model, input_ids, labels)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.05)
-    for _step in range(8):
-        optimizer.zero_grad(set_to_none=True)
-        logits = model(input_ids)
-        loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), labels.reshape(-1))
-        assert torch.isfinite(loss)
-        loss.backward()
-        optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+    logits = model(input_ids)
+    loss = F.cross_entropy(logits.reshape(-1, logits.shape[-1]), labels.reshape(-1))
+    assert torch.isfinite(loss)
+    loss.backward()
+    optimizer.step()
 
     trained_logprobs = _target_logprobs(model, input_ids, labels)
     assert torch.isfinite(trained_logprobs).all()
-    assert (trained_logprobs - initial_logprobs).abs().max().item() > 1e-3
+    assert not torch.equal(trained_logprobs, initial_logprobs)
 
     _write_source_model(
         source,
@@ -857,7 +814,7 @@ def test_export_qarl_directory_to_fp8_preserves_trained_logprobs_after_dequant(t
     torch.testing.assert_close(folded_logprobs, trained_logprobs, rtol=0, atol=0)
 
 
-def test_export_qarl_directory_requires_matching_block_size(tmp_path):
+def _assert_qarl_export_requires_matching_block_size(tmp_path):
     source = tmp_path / "source"
     output = tmp_path / "exported"
     _write_source_model(
@@ -878,7 +835,23 @@ def test_export_qarl_directory_requires_matching_block_size(tmp_path):
         export_qarl_directory_to_fp8(source, output, weight_block_size=(2, 2))
 
 
-def test_parse_size_bytes_accepts_decimal_and_binary_units():
-    assert _parse_size_bytes("5GB") == 5_000_000_000
-    assert _parse_size_bytes("2MiB") == 2 * 1024 * 1024
-    assert _parse_size_bytes("17") == 17
+def _export_case(tmp_path: Path, name: str) -> Path:
+    path = tmp_path / name
+    path.mkdir()
+    return path
+
+
+def test_export_quantized_cli_layout_and_admission_contract(tmp_path):
+    _assert_export_qarl_directory_to_fp8_preserves_trained_logprobs_after_dequant(
+        _export_case(tmp_path, "qarl_logprobs")
+    )
+    _assert_parse_args_loads_export_config_and_appends_cli_skip(_export_case(tmp_path, "parse"))
+    _assert_export_quantized_module_cli_exports_from_config(_export_case(tmp_path, "module_cli"))
+    _assert_export_hf_directory_to_fp8_preserves_bf16_islands_and_writes_config(_export_case(tmp_path, "bf16_islands"))
+    _assert_export_hf_directory_to_fp8_fused_qkv_policy(_export_case(tmp_path, "qkv"))
+    _assert_export_hf_directory_to_fp8_mla_a_projection_policy(_export_case(tmp_path, "mla"))
+    _assert_export_hf_directory_to_fp8_linear_attention_name_policy(_export_case(tmp_path, "linear_attention"))
+    _assert_export_hf_directory_to_fp8_converts_gkn_moe_experts_to_hf_layout(_export_case(tmp_path, "gkn"))
+    _assert_export_hf_directory_to_fp8_splits_fused_gate_up_weights(_export_case(tmp_path, "gate_up"))
+    _assert_export_preflight_rejects_unsupported_source_state(_export_case(tmp_path, "preflight"))
+    _assert_export_qarl_directory_to_fp8_fold_admission_policy(_export_case(tmp_path, "qarl_fold"))

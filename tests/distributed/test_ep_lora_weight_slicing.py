@@ -40,7 +40,7 @@ class MockConfig:
 class TestLoRAWeightInitAndShapes:
     """Test LoRA weight initialization, shapes, and compatibility with base weights."""
 
-    def test_initial_shapes_zeros_and_base_compatibility(self):
+    def test_global_initialization_and_ep_plan_slicing_policy(self):
         """LoRA weights initialized at global shape, B matrices zeroed, shapes match base weights."""
         config = MockConfig(num_experts=8, hidden_size=32, moe_intermediate_size=64)
         lora_config = MoELoRAConfig(r=4, lora_alpha=8)
@@ -69,13 +69,6 @@ class TestLoRAWeightInitAndShapes:
         assert experts.gate_proj_lora_B.shape[2] == experts.gate_proj.shape[2]  # output dim
         assert experts.down_proj_lora_A.shape[1] == experts.down_proj.shape[1]
         assert experts.down_proj_lora_B.shape[2] == experts.down_proj.shape[2]
-
-
-class TestParallelPlanLoRASlicing:
-    """Test that ParallelPlan correctly includes and slices LoRA weights for EP."""
-
-    def test_ep_plan_and_shard_tensor(self):
-        """EP plan includes all LoRA patterns with Shard(0); shard_tensor slices by ep_rank."""
 
         plan = get_ep_plan()
 
@@ -200,7 +193,3 @@ class TestEPLoRAForwardAndGradients:
         loss.backward()
         assert gate_A2.grad is not None
         assert hidden_states.grad is not None
-
-
-if __name__ == "__main__":
-    pytest.main([__file__, "-v"])

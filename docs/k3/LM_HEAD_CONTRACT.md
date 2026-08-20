@@ -19,11 +19,11 @@ launch. `HEAD_V2_BLOCK_K` fixes the projection's accumulation order and
 those tile statistics in one explicit pairwise tree. Changing either constant
 requires a new cross-engine bitwise gate.
 
-The earlier `bi_lm_head_selected_logprob` path remains available with
-`XORL_FAMILIES_V2=0` (equivalently `SGLANG_FAMILIES_V2=0`), the same switch
-that rolls back the redefined norm trees. One setting moves both engines,
-because the trainer and the sampler have to evaluate the same trees.
-It materializes one vocabulary chunk at a time, records
+The earlier `bi_lm_head_selected_logprob` path remains the structurally selected
+v1 program for exact Qwen3.5-family models. Numerical-family selection belongs
+to the model program rather than a process-environment rollback switch, so the
+trainer and sampler cannot be moved independently. The v1 path materializes one
+vocabulary chunk at a time, records
 the same maximum, exponential sum, and selected logit, then merges chunks in
 pinned order. This rollback is exact but uses more launches.
 
