@@ -19,6 +19,7 @@ import torch.distributed as dist
 from torch.distributed.tensor import Shard, distribute_tensor
 
 from xorl.distributed.parallel_state import get_parallel_state, init_parallel_state
+from xorl.optim.gram_newton_schulz import GramNewtonSchulzOrthogonalizer
 from xorl.optim.muon import Muon
 from xorl.utils.device import get_nccl_backend
 
@@ -27,7 +28,7 @@ THIS_DIR = Path(__file__).resolve().parent
 if str(THIS_DIR) not in sys.path:
     sys.path.insert(0, str(THIS_DIR))
 
-from distributed_utils import run_distributed_script, skip_if_gpu_count_less_than
+from distributed_utils import run_distributed_script, skip_if_gpu_count_less_than  # noqa: E402
 
 
 pytestmark = [pytest.mark.distributed]
@@ -74,6 +75,27 @@ def _single_rank_oracle(weight_full: torch.Tensor, grad_full: torch.Tensor, *, m
     )
     opt.step()
     return p.detach()
+
+
+def _assert_real_fp32_orthogonalization_matches_independent_program(device: torch.device) -> None:
+    """A CUDA FP32 request must not silently execute the Newton-Schulz tree in BF16."""
+
+    coefficients = ((3.4445, -4.775, 2.0315),) * 5
+    input_matrix = torch.linspace(-1.25, 1.75, 64, device=device, dtype=torch.float32).reshape(8, 8)
+    actual = GramNewtonSchulzOrthogonalizer(
+        ns_coefficients=coefficients,
+        ns_use_quack_kernels=False,
+    ).orthogonalize(input_matrix)
+
+    expected = input_matrix.unsqueeze(0)
+    expected = expected / expected.norm(dim=(-2, -1), keepdim=True).clamp_min(1e-7)
+    for a, b, c in coefficients:
+        gram = expected @ expected.mT
+        gram_update = torch.baddbmm(gram, gram, gram, beta=b, alpha=c)
+        expected = torch.baddbmm(expected, gram_update, expected, beta=a)
+
+    assert actual.dtype is torch.float32
+    torch.testing.assert_close(actual, expected.reshape_as(actual), rtol=0, atol=0)
 
 
 def _full_tensor(d):
@@ -130,6 +152,8 @@ def _run(distributed_mode: str, layout: str) -> None:
     expected_full_grad = _single_rank_oracle(weight_full, grad_full, mode="full_gradient")
 
     if dist.get_rank() == 0:
+        if distributed_mode == "full_gradient" and layout == "linear_2d":
+            _assert_real_fp32_orthogonalization_matches_independent_program(device)
         if distributed_mode == "full_gradient":
             err = (full_after - expected_full_grad).abs().max().item()
             assert err < 1e-4, (
@@ -162,7 +186,7 @@ def _main() -> None:
 if __name__ != "__main__":
 
     @skip_if_gpu_count_less_than(2)
-    def test_full_gradient_matches_single_rank_oracle_2d():
+    def test_full_gradient_matches_single_rank_oracle_across_dense_and_moe_layouts():
         result = run_distributed_script(
             __file__,
             num_gpus=2,
@@ -171,8 +195,11 @@ if __name__ != "__main__":
         )
         result.assert_success("2D Shard(0) full_gradient Muon should match single-rank oracle")
 
+        _assert_full_gradient_matches_single_rank_oracle_3d_moe()
+        _assert_shard_local_differs_from_full_gradient_oracle_across_dense_and_moe_layouts()
+
     @skip_if_gpu_count_less_than(2)
-    def test_shard_local_differs_from_full_gradient_oracle_2d():
+    def _assert_shard_local_differs_from_full_gradient_oracle_across_dense_and_moe_layouts():
         result = run_distributed_script(
             __file__,
             num_gpus=2,
@@ -181,8 +208,10 @@ if __name__ != "__main__":
         )
         result.assert_success("2D shard_local should differ from full-gradient oracle on >1 rank")
 
+        _assert_shard_local_differs_from_full_gradient_oracle_3d_moe()
+
     @skip_if_gpu_count_less_than(2)
-    def test_full_gradient_matches_single_rank_oracle_3d_moe():
+    def _assert_full_gradient_matches_single_rank_oracle_3d_moe():
         # Exercises the deferred-reshape path in ``_muon_step`` for an EP-experts-style
         # 3D weight ``[E, H, I]`` sharded on ``H`` (Shard(1)).
         result = run_distributed_script(
@@ -194,7 +223,7 @@ if __name__ != "__main__":
         result.assert_success("3D Shard(1) full_gradient Muon should match single-rank oracle")
 
     @skip_if_gpu_count_less_than(2)
-    def test_shard_local_differs_from_full_gradient_oracle_3d_moe():
+    def _assert_shard_local_differs_from_full_gradient_oracle_3d_moe():
         result = run_distributed_script(
             __file__,
             num_gpus=2,

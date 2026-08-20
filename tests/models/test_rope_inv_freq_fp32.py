@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from xorl.models.auto import build_foundation_model
+from xorl.models.layers import rope as rope_module
 from xorl.models.layers.rope import ROPE_INIT_FUNCTIONS, RotaryEmbedding
 from xorl.models.transformers.qwen3.configuration_qwen3 import Qwen3Config
 
@@ -83,51 +84,54 @@ def _build(rope_type: str, dtype: str, rope_native: bool = False):
     )
 
 
-def test_registry_is_fully_covered():
+def test_rope_registry_fp32_precision_and_contract_lane_policy():
     assert set(ROPE_SCALINGS) == set(ROPE_INIT_FUNCTIONS)
 
+    for rope_type in sorted(ROPE_INIT_FUNCTIONS):
+        rotary = _build(rope_type, "bfloat16").model.rotary_emb
+        table = rotary._resolve_inv_freq(torch.device("cpu"))
 
-@pytest.mark.parametrize("rope_type", sorted(ROPE_INIT_FUNCTIONS))
-def test_inv_freq_survives_model_wide_bf16_cast(rope_type: str):
-    rotary = _build(rope_type, "bfloat16").model.rotary_emb
-    table = rotary._resolve_inv_freq(torch.device("cpu"))
+        assert table.dtype == torch.float32, f"{rope_type}: rope reads a {table.dtype} frequency table"
 
-    assert table.dtype == torch.float32, f"{rope_type}: rope reads a {table.dtype} frequency table"
+        reference, _ = ROPE_INIT_FUNCTIONS[rope_type](_config(rope_type), "cpu")
+        assert torch.equal(table, reference.float()), f"{rope_type}: frequency table is not the fp32 CPU reference"
 
-    reference, _ = ROPE_INIT_FUNCTIONS[rope_type](_config(rope_type), "cpu")
-    assert torch.equal(table, reference.float()), f"{rope_type}: frequency table is not the fp32 CPU reference"
+    _assert_bf16_built_cos_sin_matches_fp32()
+    _assert_contract_lane_bits_unchanged()
+    _assert_native_default_cache_is_lazy_and_follows_execution_device()
 
 
-@pytest.mark.parametrize("rope_type", sorted(ROPE_INIT_FUNCTIONS))
-def test_bf16_built_cos_sin_matches_fp32_built(rope_type: str):
+def _assert_bf16_built_cos_sin_matches_fp32():
     """The bf16-built model's rope table must produce the fp32-built model's cos/sin, bitwise."""
     position_ids = torch.arange(MAX_POS)[None, :]
     x_bf16 = torch.zeros(1, MAX_POS, HEAD_DIM, dtype=torch.bfloat16)
     x_fp32 = torch.zeros(1, MAX_POS, HEAD_DIM, dtype=torch.float32)
 
-    with torch.no_grad():
-        cos_bf16, sin_bf16 = _build(rope_type, "bfloat16").model.rotary_emb(x_bf16, position_ids)
-        cos_fp32, sin_fp32 = _build(rope_type, "float32").model.rotary_emb(x_fp32, position_ids)
+    # Forward consumption is shared across registry entries. Default covers the
+    # unscaled path; YaRN covers a non-unit attention scaling factor.
+    for rope_type in ("default", "yarn"):
+        with torch.no_grad():
+            cos_bf16, sin_bf16 = _build(rope_type, "bfloat16").model.rotary_emb(x_bf16, position_ids)
+            cos_fp32, sin_fp32 = _build(rope_type, "float32").model.rotary_emb(x_fp32, position_ids)
 
-    assert torch.equal(cos_bf16.float(), cos_fp32.to(torch.bfloat16).float()), f"{rope_type}: cos differs"
-    assert torch.equal(sin_bf16.float(), sin_fp32.to(torch.bfloat16).float()), f"{rope_type}: sin differs"
+        assert torch.equal(cos_bf16.float(), cos_fp32.to(torch.bfloat16).float()), f"{rope_type}: cos differs"
+        assert torch.equal(sin_bf16.float(), sin_fp32.to(torch.bfloat16).float()), f"{rope_type}: sin differs"
 
 
-@pytest.mark.parametrize("rope_type", sorted(ROPE_INIT_FUNCTIONS))
-def test_contract_lane_bits_unchanged(rope_type: str):
+def _assert_contract_lane_bits_unchanged():
     """rope_native (the zero-K3 contract lane) built fp32 reads exactly what it read before."""
     position_ids = torch.arange(MAX_POS)[None, :]
     x = torch.zeros(1, MAX_POS, HEAD_DIM, dtype=torch.float32)
 
     with torch.no_grad():
-        contract = _build(rope_type, "float32", rope_native=True).model.rotary_emb(x, position_ids)
-        stock = _build(rope_type, "float32", rope_native=False).model.rotary_emb(x, position_ids)
+        contract = _build("default", "float32", rope_native=True).model.rotary_emb(x, position_ids)
+        stock = _build("default", "float32", rope_native=False).model.rotary_emb(x, position_ids)
 
-    assert torch.equal(contract[0], stock[0]), f"{rope_type}: contract-lane cos moved"
-    assert torch.equal(contract[1], stock[1]), f"{rope_type}: contract-lane sin moved"
+    assert torch.equal(contract[0], stock[0]), "contract-lane cos moved"
+    assert torch.equal(contract[1], stock[1]), "contract-lane sin moved"
 
 
-def test_native_default_cache_is_lazy_and_follows_execution_device():
+def _assert_native_default_cache_is_lazy_and_follows_execution_device():
     rotary = _build("default", "float32", rope_native=True).model.rotary_emb
     assert rotary._sglang_default_cache is None
 
@@ -142,8 +146,10 @@ def test_native_default_cache_is_lazy_and_follows_execution_device():
     assert torch.equal(cos[..., : HEAD_DIM // 2].reshape_as(cached_cos), cached_cos)
     assert torch.equal(sin[..., : HEAD_DIM // 2].reshape_as(cached_sin), cached_sin)
 
+    _assert_qwen_class_b_cache_growth_preserves_cpu_fp32_recipe()
 
-def test_qwen_class_b_candidate_default_cache_growth_preserves_cpu_fp32_recipe():
+
+def _assert_qwen_class_b_cache_growth_preserves_cpu_fp32_recipe():
     config = _config("default")
     config.max_position_embeddings = 8
     config._rope_native = True
@@ -196,3 +202,59 @@ def test_exact_architectures_build_default_rope_tables_on_their_serving_devices(
 
     assert torch.equal(glm_rotary._build_sglang_default_cache(MAX_POS, device), cuda_table)
     assert torch.equal(qwen_rotary._build_sglang_default_cache(MAX_POS, device), cpu_table)
+
+    _assert_dense_qwen_eager_rope_matches_serving_bits()
+
+
+def _assert_dense_qwen_eager_rope_matches_serving_bits():
+    """Keep the dense-Qwen zero-K3 apply contract beside its table owner."""
+    serving_rope_theta = 1_000_000
+    serving_max_position = 40960
+    sequence = 96
+    q_heads = 16
+    kv_heads = 8
+
+    class _Config:
+        rope_scaling = None
+        head_dim = HEAD_DIM
+        hidden_size = q_heads * HEAD_DIM
+        num_attention_heads = q_heads
+        max_position_embeddings = serving_max_position
+        rope_theta = serving_rope_theta
+        rope_parameters = {}
+
+    torch.manual_seed(0)
+    q = torch.randn(1, sequence, q_heads, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, sequence, kv_heads, HEAD_DIM, device="cuda", dtype=torch.bfloat16)
+    positions = torch.arange(sequence, device="cuda")
+
+    rotary = RotaryEmbedding(_Config(), device="cuda")
+    assert rope_module._flash_apply_rotary_emb is None
+    cos, sin = rotary(q.view(1, sequence, -1), positions.unsqueeze(0))
+    q_out, k_out = rope_module.apply_rotary_pos_emb(q, k, cos, sin)
+
+    inv_freq = 1.0 / (
+        serving_rope_theta ** (torch.arange(0, HEAD_DIM, 2, dtype=torch.float32, device="cuda") / HEAD_DIM)
+    )
+    frequencies = torch.einsum(
+        "i,j->ij",
+        torch.arange(serving_max_position, dtype=torch.float32, device="cuda"),
+        inv_freq,
+    )
+    cache = torch.cat((frequencies.cos(), frequencies.sin()), dim=-1)
+
+    def serving_apply(value, selected_cos, selected_sin):
+        selected_cos = selected_cos.unsqueeze(-2).to(value.dtype)
+        selected_sin = selected_sin.unsqueeze(-2).to(value.dtype)
+        first, second = torch.chunk(value, 2, dim=-1)
+        return torch.cat(
+            (first * selected_cos - second * selected_sin, second * selected_cos + first * selected_sin),
+            dim=-1,
+        )
+
+    selected_cos, selected_sin = cache.index_select(0, positions).chunk(2, dim=-1)
+    q_reference = serving_apply(q.view(sequence, q_heads, HEAD_DIM), selected_cos, selected_sin).unsqueeze(0)
+    k_reference = serving_apply(k.view(sequence, kv_heads, HEAD_DIM), selected_cos, selected_sin).unsqueeze(0)
+
+    assert torch.equal(q_out, q_reference)
+    assert torch.equal(k_out, k_reference)

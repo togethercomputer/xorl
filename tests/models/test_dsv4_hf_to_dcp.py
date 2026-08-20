@@ -135,7 +135,7 @@ def _tiny_hf_snapshot(snapshot_dir: Path) -> dict[str, torch.Tensor]:
     return sd
 
 
-def test_converter_meta_dtype_cast_preserves_fp32_destinations():
+def _assert_converter_meta_dtype_cast_preserves_fp32_destinations():
     """The torchrun converter's meta-model cast must not downcast fp32-only params."""
     repo_root = Path(__file__).resolve().parents[2]
     sys.path.insert(0, str(repo_root))
@@ -176,8 +176,10 @@ def test_converter_meta_dtype_cast_preserves_fp32_destinations():
         assert getattr(param, "_keep_fp32", False) is True
 
 
-def test_convert_dsv4_hf_to_dcp_round_trip():
+def test_convert_dsv4_hf_to_dcp_conversion_policy():
     """Run the conversion script's main(), then load the DCP and compare."""
+    _assert_converter_meta_dtype_cast_preserves_fp32_destinations()
+
     repo_root = Path(__file__).resolve().parents[2]
     sys.path.insert(0, str(repo_root))
     try:
@@ -276,17 +278,40 @@ def test_convert_dsv4_hf_to_dcp_round_trip():
         )
         torch.testing.assert_close(lora_roundtrip.model.layers[0].self_attn.wq_a.lora_B, lora_b_before)
 
+    if dist.is_initialized():
+        dist.destroy_process_group()
+    _assert_convert_dsv4_hf_to_dcp_pair_across_shards()
+
 
 def test_automodel_from_pretrained_loads_tiny_hf_snapshot():
-    """AutoModel dispatch must satisfy the HF ``from_pretrained`` contract."""
-    from transformers import AutoModelForCausalLM  # noqa: PLC0415
+    """AutoConfig, XoRL construction, and AutoModel loading share one snapshot contract."""
+    from transformers import AutoConfig, AutoModelForCausalLM  # noqa: PLC0415
 
-    from xorl.models.transformers.deepseek_v4 import DeepseekV4ForCausalLM  # noqa: PLC0415
+    from xorl.models import build_foundation_model  # noqa: PLC0415
+    from xorl.models.transformers.deepseek_v4 import (  # noqa: PLC0415
+        DeepseekV4Config,
+        DeepseekV4ForCausalLM,
+    )
 
     with tempfile.TemporaryDirectory() as tmp:
         snapshot_dir = Path(tmp) / "hf-snap"
         snapshot_dir.mkdir()
         original_sd = _tiny_hf_snapshot(snapshot_dir)
+
+        config = AutoConfig.from_pretrained(snapshot_dir)
+        assert isinstance(config, DeepseekV4Config)
+        assert config.model_type == "deepseek_v4"
+        assert config.num_hidden_layers == 2
+        assert config.n_routed_experts == 4
+        assert AutoModelForCausalLM._model_mapping.get(DeepseekV4Config, None) is DeepseekV4ForCausalLM
+
+        meta_model = build_foundation_model(
+            snapshot_dir,
+            init_device="meta",
+            moe_implementation="eager",
+            attn_implementation="flash_attention_3",
+        )
+        assert isinstance(meta_model, DeepseekV4ForCausalLM)
 
         model = AutoModelForCausalLM.from_pretrained(
             str(snapshot_dir),
@@ -343,7 +368,7 @@ def _split_snapshot_across_shards(
         json.dump({"metadata": {"total_size": 0}, "weight_map": weight_map}, f)
 
 
-def test_convert_dsv4_hf_to_dcp_pair_across_shards():
+def _assert_convert_dsv4_hf_to_dcp_pair_across_shards():
     """The streaming loader holds a weight in ``pending`` until its paired
     ``.scale`` arrives in a later shard. Split a synthetic FP8 expert
     weight across two shards (weight → shard 1, scale → shard 2) and

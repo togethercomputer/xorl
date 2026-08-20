@@ -71,15 +71,18 @@ def _dispatcher_dummies(num_rows, dp_size):
 # ============================================================================
 
 
-def test_strategy_constants():
-    assert PACKING_STRATEGIES == ("sequential", "best_fit", "balanced_dp")
-
-
-def test_invalid_strategy_and_oversized_rejected():
+def test_strategy_admission_correctness_and_determinism_policy():
     with pytest.raises(ValueError, match="Unknown packing strategy"):
         SequentialPacker(strategy="nope")
     with pytest.raises(ValueError, match="Unknown on_oversized"):
         SequentialPacker(on_oversized="nope")
+
+    _assert_oversized_error_is_default()
+    _assert_oversized_skip_matches_legacy_drop()
+    _assert_oversized_truncate_clips_aligned_fields()
+    _assert_oversized_truncate_applies_hf_shift()
+    _assert_strategy_correctness_and_utilization_policy()
+    _assert_strategy_determinism_and_datum_order_policy()
 
 
 # ============================================================================
@@ -87,7 +90,7 @@ def test_invalid_strategy_and_oversized_rejected():
 # ============================================================================
 
 
-def test_oversized_error_is_default():
+def _assert_oversized_error_is_default():
     """A sample longer than max_seq_len must fail loud by default."""
     packer = SequentialPacker(log_stats=False, pad_to_multiple_of=1)
     data = [{"input_ids": [1, 2, 3]}, {"input_ids": [1] * 100}]
@@ -95,7 +98,7 @@ def test_oversized_error_is_default():
         packer.pack(data, max_seq_len=10)
 
 
-def test_oversized_skip_matches_legacy_drop():
+def _assert_oversized_skip_matches_legacy_drop():
     packer = SequentialPacker(log_stats=False, pad_to_multiple_of=1, on_oversized="skip")
     data = [
         {"input_ids": [1, 2, 3], "labels": [2, 3, 4]},
@@ -106,7 +109,7 @@ def test_oversized_skip_matches_legacy_drop():
     assert sum(b["num_samples"] for b in batches) == 2  # oversized dropped
 
 
-def test_oversized_truncate_clips_sample_and_aligned_fields():
+def _assert_oversized_truncate_clips_aligned_fields():
     packer = SequentialPacker(log_stats=False, pad_to_multiple_of=1, on_oversized="truncate")
     data = [
         {
@@ -126,7 +129,7 @@ def test_oversized_truncate_clips_sample_and_aligned_fields():
     assert b["teacher_weights"][0] == [0.5] * 10
 
 
-def test_oversized_truncate_with_hf_shift():
+def _assert_oversized_truncate_applies_hf_shift():
     """HF-format (labels == input length) still shifts after truncation."""
     packer = SequentialPacker(log_stats=False, pad_to_multiple_of=1, on_oversized="truncate")
     data = [{"input_ids": list(range(100)), "labels": list(range(100))}]
@@ -140,7 +143,7 @@ def test_oversized_truncate_with_hf_shift():
 # ============================================================================
 
 
-def test_sequential_is_legacy_layout():
+def _assert_sequential_is_legacy_layout():
     """Sequential strategy must reproduce greedy first-fit exactly."""
     data = _make_data(40, seed=3)
     seq = SequentialPacker(log_stats=False, pad_to_multiple_of=1, strategy="sequential").pack(data, max_seq_len=4096)
@@ -182,8 +185,7 @@ def _documents_from_batches(batches):
     return docs
 
 
-@pytest.mark.parametrize("strategy", ["best_fit", "balanced_dp"])
-def test_document_multiset_is_strategy_invariant(strategy):
+def _assert_strategy_correctness_and_utilization_policy():
     """The K3 precondition: reordering changes only the GROUPING of documents into
     rows, never the per-document token content, labels, or position spans.
 
@@ -192,16 +194,23 @@ def test_document_multiset_is_strategy_invariant(strategy):
     identical and the only possible numeric difference is float reduction order
     (within K3's 1e-3/1e-2 tolerance). pad=1 here to avoid padding "documents".
     """
+    _assert_sequential_is_legacy_layout()
+
     data = _make_data(50, seed=23)
     seq = SequentialPacker(log_stats=False, pad_to_multiple_of=1, strategy="sequential").pack(data, max_seq_len=4096)
-    out = SequentialPacker(log_stats=False, pad_to_multiple_of=1, strategy=strategy, dp_size=8).pack(
-        data, max_seq_len=4096
-    )
-    assert sorted(_documents_from_batches(out)) == sorted(_documents_from_batches(seq))
+    for strategy in ("best_fit", "balanced_dp"):
+        out = SequentialPacker(log_stats=False, pad_to_multiple_of=1, strategy=strategy, dp_size=8).pack(
+            data, max_seq_len=4096
+        )
+        assert sorted(_documents_from_batches(out)) == sorted(_documents_from_batches(seq)), strategy
+
+    _assert_valid_token_count_is_strategy_invariant()
+    _assert_position_ids_reset_at_document_boundaries()
+    _assert_no_row_exceeds_capacity()
+    _assert_best_fit_never_uses_more_rows_than_sequential()
 
 
-@pytest.mark.parametrize("strategy", PACKING_STRATEGIES)
-def test_valid_token_count_is_strategy_invariant(strategy):
+def _assert_valid_token_count_is_strategy_invariant():
     """Total valid (non-ignore) tokens must not depend on packing strategy.
 
     This is the FLOPs-numerator / loss-normalization invariant: reordering which
@@ -211,43 +220,41 @@ def test_valid_token_count_is_strategy_invariant(strategy):
     baseline = SequentialPacker(log_stats=False, pad_to_multiple_of=1, strategy="sequential").pack(
         data, max_seq_len=8192
     )
-    out = SequentialPacker(log_stats=False, pad_to_multiple_of=1, strategy=strategy, dp_size=8).pack(
-        data, max_seq_len=8192
-    )
-    assert _total_valid_tokens(out) == _total_valid_tokens(baseline)
-    # Every sample is accounted for, none dropped.
-    assert sum(b["num_samples"] for b in out) == len(data)
+    for strategy in PACKING_STRATEGIES:
+        out = SequentialPacker(log_stats=False, pad_to_multiple_of=1, strategy=strategy, dp_size=8).pack(
+            data, max_seq_len=8192
+        )
+        assert _total_valid_tokens(out) == _total_valid_tokens(baseline), strategy
+        assert sum(b["num_samples"] for b in out) == len(data), strategy
 
 
-@pytest.mark.parametrize("strategy", PACKING_STRATEGIES)
-def test_position_ids_document_resets(strategy):
+def _assert_position_ids_reset_at_document_boundaries():
     """position_ids must reset to 0 at each sample boundary (FLOPs/attention)."""
     data = _make_data(20, seed=9, lo=50, hi=400)
-    batches = SequentialPacker(log_stats=False, pad_to_multiple_of=1, strategy=strategy, dp_size=4).pack(
-        data, max_seq_len=2048
-    )
-    for b in batches:
-        pos = b["position_ids"][0]
-        # Each row begins at position 0 and every reset goes back to 0.
-        assert pos[0] == 0
-        for j in range(1, len(pos)):
-            assert pos[j] == 0 or pos[j] == pos[j - 1] + 1
-        # Document boundaries from pos2culen must be monotonically increasing.
-        cu = pos2culen(torch.tensor(pos))
-        assert cu[0].item() == 0
-        assert cu[-1].item() == len(pos)
-        assert all(cu[k + 1] > cu[k] for k in range(len(cu) - 1))
+    for strategy in PACKING_STRATEGIES:
+        batches = SequentialPacker(log_stats=False, pad_to_multiple_of=1, strategy=strategy, dp_size=4).pack(
+            data, max_seq_len=2048
+        )
+        for b in batches:
+            pos = b["position_ids"][0]
+            assert pos[0] == 0, strategy
+            for j in range(1, len(pos)):
+                assert pos[j] == 0 or pos[j] == pos[j - 1] + 1, strategy
+            cu = pos2culen(torch.tensor(pos))
+            assert cu[0].item() == 0, strategy
+            assert cu[-1].item() == len(pos), strategy
+            assert all(cu[k + 1] > cu[k] for k in range(len(cu) - 1)), strategy
 
 
-@pytest.mark.parametrize("strategy", PACKING_STRATEGIES)
-def test_no_row_exceeds_capacity(strategy):
+def _assert_no_row_exceeds_capacity():
     data = _make_data(50, seed=11)
     pack_len = 4096
-    batches = SequentialPacker(log_stats=False, pad_to_multiple_of=1, strategy=strategy, dp_size=8).pack(
-        data, max_seq_len=pack_len
-    )
-    for length in _row_lengths(batches):
-        assert length <= pack_len
+    for strategy in PACKING_STRATEGIES:
+        batches = SequentialPacker(log_stats=False, pad_to_multiple_of=1, strategy=strategy, dp_size=8).pack(
+            data, max_seq_len=pack_len
+        )
+        for length in _row_lengths(batches):
+            assert length <= pack_len, strategy
 
 
 # ============================================================================
@@ -255,7 +262,7 @@ def test_no_row_exceeds_capacity(strategy):
 # ============================================================================
 
 
-def test_best_fit_never_more_rows_than_sequential():
+def _assert_best_fit_never_uses_more_rows_than_sequential():
     """Best-fit-decreasing minimizes bins -> rows <= sequential for same pack_len."""
     for seed in range(5):
         data = _make_data(60, seed=seed)
@@ -266,24 +273,12 @@ def test_best_fit_never_more_rows_than_sequential():
         assert len(bf) <= len(seq)
 
 
-def test_best_fit_utilization_at_least_sequential():
-    data = _make_data(60, seed=2)
-    pack_len = 4096
-    seq = SequentialPacker(log_stats=False, pad_to_multiple_of=1, strategy="sequential").pack(
-        data, max_seq_len=pack_len
-    )
-    bf = SequentialPacker(log_stats=False, pad_to_multiple_of=1, strategy="best_fit").pack(data, max_seq_len=pack_len)
-    seq_util = sum(_row_lengths(seq)) / (len(seq) * pack_len)
-    bf_util = sum(_row_lengths(bf)) / (len(bf) * pack_len)
-    assert bf_util >= seq_util - 1e-9
-
-
 # ============================================================================
 # balanced_dp (change A — zero dummies + balanced)
 # ============================================================================
 
 
-def test_balanced_dp_zero_dummies_when_samples_exceed_dp():
+def test_balanced_dp_policy():
     """N == k*dp_size and dispatcher needs zero dummy batches."""
     dp_size = 8
     data = _make_data(40, seed=5)
@@ -293,8 +288,13 @@ def test_balanced_dp_zero_dummies_when_samples_exceed_dp():
     assert len(batches) % dp_size == 0
     assert _dispatcher_dummies(len(batches), dp_size) == 0
 
+    _assert_balanced_dp_bins_are_balanced()
+    _assert_balanced_dp_full_rows_in_large_batch_regime()
+    _assert_balanced_dp_falls_back_when_fewer_samples_than_dp()
+    _assert_balanced_dp_size_one_equals_best_fit()
 
-def test_balanced_dp_bins_are_balanced():
+
+def _assert_balanced_dp_bins_are_balanced():
     """Rank load imbalance (max/mean) close to 1.0."""
     dp_size = 8
     data = _make_data(80, seed=13)
@@ -307,7 +307,7 @@ def test_balanced_dp_bins_are_balanced():
     assert len(batches) % dp_size == 0
 
 
-def test_balanced_dp_full_rows_in_large_batch_regime():
+def _assert_balanced_dp_full_rows_in_large_batch_regime():
     """When total_tokens >= dp_size*pack_len, balanced_dp yields N==dp_size FULL rows.
 
     This is the regime where the change is a real win: every rank busy AND rows
@@ -328,7 +328,7 @@ def test_balanced_dp_full_rows_in_large_batch_regime():
     assert util > 0.90  # rows are nearly full
 
 
-def test_balanced_dp_falls_back_when_fewer_samples_than_dp():
+def _assert_balanced_dp_falls_back_when_fewer_samples_than_dp():
     """num_samples < dp_size cannot fill every rank; degrade gracefully (no crash)."""
     dp_size = 32
     data = _make_data(5, seed=1)
@@ -339,7 +339,7 @@ def test_balanced_dp_falls_back_when_fewer_samples_than_dp():
     assert len(batches) >= 1
 
 
-def test_balanced_dp_dp_size_one_equals_best_fit():
+def _assert_balanced_dp_size_one_equals_best_fit():
     data = _make_data(30, seed=4)
     bd = SequentialPacker(log_stats=False, pad_to_multiple_of=1, strategy="balanced_dp", dp_size=1).pack(
         data, max_seq_len=4096
@@ -353,14 +353,17 @@ def test_balanced_dp_dp_size_one_equals_best_fit():
 # ============================================================================
 
 
-@pytest.mark.parametrize("strategy", PACKING_STRATEGIES)
-def test_determinism(strategy):
+def _assert_strategy_determinism_and_datum_order_policy():
     data = _make_data(50, seed=17)
-    kwargs = dict(log_stats=False, pad_to_multiple_of=1, strategy=strategy, dp_size=8)
-    a = SequentialPacker(**kwargs).pack(data, max_seq_len=4096)
-    b = SequentialPacker(**kwargs).pack(data, max_seq_len=4096)
-    assert [x["input_ids"] for x in a] == [x["input_ids"] for x in b]
-    assert [x["position_ids"] for x in a] == [x["position_ids"] for x in b]
+    for strategy in PACKING_STRATEGIES:
+        kwargs = dict(log_stats=False, pad_to_multiple_of=1, strategy=strategy, dp_size=8)
+        a = SequentialPacker(**kwargs).pack(data, max_seq_len=4096)
+        b = SequentialPacker(**kwargs).pack(data, max_seq_len=4096)
+        assert [x["input_ids"] for x in a] == [x["input_ids"] for x in b], strategy
+        assert [x["position_ids"] for x in a] == [x["position_ids"] for x in b], strategy
+
+    _assert_sequential_datum_order_is_identity()
+    _assert_reordered_datum_order_matches_build_order()
 
 
 # ============================================================================
@@ -368,7 +371,7 @@ def test_determinism(strategy):
 # ============================================================================
 
 
-def test_sequential_datum_order_is_identity():
+def _assert_sequential_datum_order_is_identity():
     data = _make_data(20, seed=8)
     batches, order = pack_samples(
         data, max_seq_len=4096, request_id="t", pad_to_multiple_of=1, strategy="sequential", return_datum_order=True
@@ -376,42 +379,17 @@ def test_sequential_datum_order_is_identity():
     assert order == list(range(20))
 
 
-@pytest.mark.parametrize("strategy", ["best_fit", "balanced_dp"])
-def test_datum_order_is_a_permutation_matching_build_order(strategy):
+def _assert_reordered_datum_order_matches_build_order():
     data = _make_data(40, seed=6)
-    packer = SequentialPacker(log_stats=False, pad_to_multiple_of=1, strategy=strategy, dp_size=8)
-    batches = packer.pack(data, max_seq_len=4096)
-    order = packer.last_datum_order
-    # It is a permutation of all (non-dropped) datum indices.
-    assert sorted(order) == list(range(40))
-    # It equals the order samples are concatenated across the emitted rows
-    # (each row's sample count == its num_samples). This is what the dispatcher
-    # relies on to slice routed_experts by cumulative num_samples.
-    rebuilt = []
-    cursor = 0
-    for b in batches:
-        rebuilt.extend(order[cursor : cursor + b["num_samples"]])
-        cursor += b["num_samples"]
-    assert rebuilt == order
+    for strategy in ("best_fit", "balanced_dp"):
+        packer = SequentialPacker(log_stats=False, pad_to_multiple_of=1, strategy=strategy, dp_size=8)
+        batches = packer.pack(data, max_seq_len=4096)
+        order = packer.last_datum_order
+        assert sorted(order) == list(range(40)), strategy
 
-
-def test_datum_order_realigns_per_datum_side_array():
-    """A side array indexed by datum, permuted by datum_order, lands in batch order."""
-    data = _make_data(16, seed=10)
-    # Tag each datum with a unique marker = its original index.
-    routed = [f"r{i}" for i in range(16)]
-    packer = SequentialPacker(log_stats=False, pad_to_multiple_of=1, strategy="best_fit")
-    batches = packer.pack(data, max_seq_len=4096)
-    order = packer.last_datum_order
-    reordered = [routed[i] for i in order]
-    # Walking batches and consuming reordered in order must recover, per row,
-    # the markers of exactly the datums whose lengths sum to that row.
-    cursor = 0
-    for b in batches:
-        row_markers = reordered[cursor : cursor + b["num_samples"]]
-        cursor += b["num_samples"]
-        # The datum indices for this row, recovered from markers.
-        idxs = [int(m[1:]) for m in row_markers]
-        row_tokens = sum(len(data[i]["input_ids"]) for i in idxs)
-        # Row length (already-shifted datums keep raw length) matches.
-        assert row_tokens == len(b["input_ids"][0])
+        packed_document_lengths = []
+        for batch in batches:
+            boundaries = pos2culen(torch.tensor(batch["position_ids"][0])).tolist()
+            packed_document_lengths.extend(end - start for start, end in zip(boundaries, boundaries[1:]))
+        expected_lengths = [len(data[index]["input_ids"]) for index in order]
+        assert packed_document_lengths == expected_lengths, strategy

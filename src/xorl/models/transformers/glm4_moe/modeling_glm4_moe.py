@@ -36,7 +36,7 @@ from xorl.models.layers.attention import (
     update_causal_mask,
 )
 from xorl.models.layers.fused_projection_lora import project_fused_linear_with_lora
-from xorl.models.layers.moe import MoEBlock
+from xorl.models.layers.moe import MoEBlock, MoEExperts
 from xorl.models.layers.moe.routing_replay import get_replay_stage
 from xorl.models.layers.normalization import compiled_eager_rms_norm
 from xorl.models.layers.rope import apply_rotary_pos_emb
@@ -463,6 +463,9 @@ class Glm4MoePreTrainedModel(XorlPreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
+        elif isinstance(module, MoEExperts):
+            module.gate_up_proj.data.normal_(mean=0.0, std=std)
+            module.down_proj.data.normal_(mean=0.0, std=std)
         elif isinstance(module, Glm4MoeRMSNorm):
             module.weight.data.fill_(1.0)
         elif isinstance(module, Glm4MoeGate):

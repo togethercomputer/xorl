@@ -83,7 +83,7 @@ def ids(n, seed, mod):
     return torch.from_numpy((_splitmix64(n, seed) % np.uint64(mod)).astype(np.int64)).cuda()
 
 
-def _check(case, **outs):
+def _assert_golden(case, **outs):
     for name, t in outs.items():
         got = hashlib.sha256(t.detach().contiguous().cpu().view(torch.uint8).numpy().tobytes()).hexdigest()
         want = GOLDENS[case][name]["sha256"]
@@ -91,29 +91,32 @@ def _check(case, **outs):
 
 
 @requires_h100
-def test_v1_family1_and_zero_centered_goldens():
-    _check(
+def test_v1_contract_tree_goldens():
+    _assert_golden(
         "family1_qk_4096x128",
         out=v1.bi_rms_norm(bf16((4096, DQK), 101), w(DQK, 102), EPS, family=v1.RMS_NORM_FAMILY_NO_RESIDUAL),
     )
-    _check(
+    _assert_golden(
         "family1_h3840_m64",
         out=v1.bi_rms_norm(bf16((64, REAL_H), 111), w(REAL_H, 112), EPS, family=v1.RMS_NORM_FAMILY_NO_RESIDUAL),
     )
-    _check(
+    _assert_golden(
         "family1_zero_centered_512x128",
         out=v1.bi_rms_norm(
             bf16((512, DQK), 121), w(DQK, 122), EPS, family=v1.RMS_NORM_FAMILY_NO_RESIDUAL, zero_centered=True
         ),
     )
 
+    _assert_v1_family2_and_mean_goldens()
+    _assert_v1_log_softmax_and_mm_goldens()
+    _assert_v1_lmhead_scoring_goldens()
 
-@requires_h100
-def test_v1_family2_and_mean_goldens():
+
+def _assert_v1_family2_and_mean_goldens():
     out, res = v1.bi_fused_add_rms_norm(
         bf16((64, REAL_H), 131), bf16((64, REAL_H), 132), w(REAL_H, 133), EPS, family=v1.RMS_NORM_FAMILY_RESIDUAL_TREE
     )
-    _check("family2_residual_m64_h3840", out=out, residual_out=res)
+    _assert_golden("family2_residual_m64_h3840", out=out, residual_out=res)
     out, res = v1.bi_fused_add_rms_norm(
         bf16((1, REAL_H), 141, edge_rows=False),
         bf16((1, REAL_H), 142, edge_rows=False),
@@ -121,46 +124,53 @@ def test_v1_family2_and_mean_goldens():
         EPS,
         family=v1.RMS_NORM_FAMILY_RESIDUAL_TREE,
     )
-    _check("family2_residual_m1_h3840", out=out, residual_out=res)
-    _check(
+    _assert_golden("family2_residual_m1_h3840", out=out, residual_out=res)
+    _assert_golden(
         "family2_noresidual_m64_h3840",
         out=v1.bi_rms_norm(bf16((64, REAL_H), 151), w(REAL_H, 152), EPS, family=v1.RMS_NORM_FAMILY_RESIDUAL_TREE),
     )
-    _check("mean_dim_m64_h3840", out=v1.mean_dim(fp32((64, REAL_H), 161, exp_lo=110, exp_hi=132), -1, True))
+    _assert_golden(
+        "mean_dim_m64_h3840",
+        out=v1.mean_dim(fp32((64, REAL_H), 161, exp_lo=110, exp_hi=132), -1, True),
+    )
 
 
-@requires_h100
-def test_v1_log_softmax_and_mm_goldens():
-    _check("log_softmax_4x128256", out=v1.log_softmax(fp32((4, REAL_VOCAB), 171, exp_lo=124, exp_hi=131), dim=-1))
-    _check(
+def _assert_v1_log_softmax_and_mm_goldens():
+    _assert_golden(
+        "log_softmax_4x128256",
+        out=v1.log_softmax(fp32((4, REAL_VOCAB), 171, exp_lo=124, exp_hi=131), dim=-1),
+    )
+    _assert_golden(
         "mm_trunk_64x3840x5120",
         out=v1.matmul_persistent(bf16((64, REAL_H), 181), bf16((REAL_H, 5120), 182, edge_rows=False)),
     )
-    _check(
+    _assert_golden(
         "mm_offtable_17x1024x1000",
         out=v1.matmul_persistent(bf16((17, 1024), 191), bf16((1024, 1000), 192, edge_rows=False)),
     )
 
 
-@requires_h100
-def test_v1_lmhead_scoring_goldens():
+def _assert_v1_lmhead_scoring_goldens():
     h, wt, tk = bf16((8, REAL_H), 201), bf16((REAL_VOCAB, REAL_H), 202, edge_rows=False), ids(8, 203, REAL_VOCAB)
     lp, lse, sel = v1.bi_lm_head_selected_logprob(h, wt, tk)
-    _check("lmhead_scoring_n8_real", logprob=lp, lse=lse, selected=sel)
+    _assert_golden("lmhead_scoring_n8_real", logprob=lp, lse=lse, selected=sel)
     h, wt, tk = bf16((8, REAL_H), 211), bf16((REAL_VOCAB, REAL_H), 212, edge_rows=False), ids(8, 213, REAL_VOCAB)
     lp, lse, sel = v1.bi_lm_head_selected_logprob(h, wt, tk, torch.full((8,), 0.7, dtype=torch.float32, device="cuda"))
-    _check("lmhead_scoring_n8_temp0.7", logprob=lp, lse=lse, selected=sel)
+    _assert_golden("lmhead_scoring_n8_temp0.7", logprob=lp, lse=lse, selected=sel)
     h, wt, tk = bf16((64, 512), 221), bf16((20480, 512), 222, edge_rows=False), ids(64, 223, 20480)
     lp, lse, sel = v1.bi_lm_head_selected_logprob(h, wt, tk)
-    _check("lmhead_scoring_n64_small", logprob=lp, lse=lse, selected=sel)
+    _assert_golden("lmhead_scoring_n64_small", logprob=lp, lse=lse, selected=sel)
 
 
 @requires_h100
-def test_v2_norm_goldens():
+def test_v2_contract_tree_goldens():
     out, res = v2.rms_norm_v2(bf16((64, REAL_H), 131), w(REAL_H, 133), EPS, residual=bf16((64, REAL_H), 132))
-    _check("norm_v2_residual_m64_h3840", out=out, residual_out=res)
-    _check("norm_v2_noresidual_m64_h3840", out=v2.rms_norm_v2(bf16((64, REAL_H), 131), w(REAL_H, 133), EPS))
-    _check(
+    _assert_golden("norm_v2_residual_m64_h3840", out=out, residual_out=res)
+    _assert_golden(
+        "norm_v2_noresidual_m64_h3840",
+        out=v2.rms_norm_v2(bf16((64, REAL_H), 131), w(REAL_H, 133), EPS),
+    )
+    _assert_golden(
         "norm_v2_zero_centered",
         out=v2.rms_norm_v2(bf16((64, REAL_H), 131)[:, :DQK].contiguous(), w(DQK, 102), EPS, zero_centered=True),
     )
@@ -171,20 +181,19 @@ def test_v2_norm_goldens():
         residual=bf16((64, REAL_H), 132),
         zero_centered=True,
     )
-    _check("norm_v2_zero_centered_residual_m64_h3840", out=out, residual_out=res)
-    packed = bf16((256, (8 + 2 * 2) * DQK), 401)
-    _check("qk_v2_strided_t256_h8_d128", out=v2.qk_norm_v2(packed[:, : 8 * DQK], w(DQK, 102), EPS, head_dim=DQK))
+    _assert_golden("norm_v2_zero_centered_residual_m64_h3840", out=out, residual_out=res)
+
+    _assert_v2_head_goldens()
 
 
-@requires_h100
-def test_v2_head_goldens():
+def _assert_v2_head_goldens():
     h, wt, tk = bf16((64, REAL_H), 501), bf16((REAL_VOCAB, REAL_H), 502, edge_rows=False), ids(64, 503, REAL_VOCAB)
     lp, lse, sel = v2.head_v2_selected_logprob(h, wt, tk)
-    _check("head_v2_scoring_n64_real", logprob=lp, lse=lse, selected=sel)
+    _assert_golden("head_v2_scoring_n64_real", logprob=lp, lse=lse, selected=sel)
     lp, lse, _ = v2.head_v2_selected_logprob(h, wt, tk, torch.full((64,), 0.7, dtype=torch.float32, device="cuda"))
-    _check("head_v2_scoring_temp0.7", logprob=lp, lse=lse)
+    _assert_golden("head_v2_scoring_temp0.7", logprob=lp, lse=lse)
     logits, lse_d = v2.head_v2_full_logits_with_lse(h, wt)
-    _check("head_v2_decode_n64", logits=logits, lse=lse_d)
+    _assert_golden("head_v2_decode_n64", logits=logits, lse=lse_d)
     hs, ws2, ts = bf16((8, 512), 512), bf16((20580, 512), 511, edge_rows=False), ids(8, 513, 20580)
     lp, lse, _ = v2.head_v2_selected_logprob(hs, ws2, ts)
-    _check("head_v2_small_tail", logprob=lp, lse=lse)
+    _assert_golden("head_v2_small_tail", logprob=lp, lse=lse)

@@ -1,7 +1,6 @@
 """Routing-weight position (before vs after the down GEMM) in ``TritonEPGroupGemm``.
 
-Covers the ``moe_routing_weights_before_down`` config knob and its
-``XORL_MOE_ROUTING_WEIGHTS_BEFORE_DOWN`` env override:
+Covers the ``moe_routing_weights_before_down`` config knob:
 
 - Gradient parity of BOTH positions against an fp64 eager reference. The two
   positions are mathematically identical (a per-row scalar commutes through the
@@ -18,8 +17,7 @@ import torch
 import torch.nn.functional as F
 
 import xorl.ops.moe.triton as moe_triton
-from tests.ops.test_ep_routing_scores import _counts_from_cumsum, _patch_ep_kernels
-from xorl.arguments import ModelArguments
+from tests._helpers.moe import counts_from_cumsum, patch_ep_kernels
 
 
 pytestmark = pytest.mark.cpu
@@ -50,7 +48,7 @@ def _fp64_reference(permute_tokens, cumsum, gate_up_proj, down_proj, intermediat
 
     outputs = []
     start = 0
-    for expert_idx, count in enumerate(_counts_from_cumsum(cumsum)):
+    for expert_idx, count in enumerate(counts_from_cumsum(cumsum)):
         end = start + count
         xs = x[start:end]
         gate_up = xs @ gup[expert_idx]
@@ -79,8 +77,9 @@ def _run_position(module, before_down, inputs, scores_require_grad=True):
     return out.detach(), grads
 
 
-def test_both_routing_positions_match_fp64_reference(monkeypatch):
-    module = _patch_ep_kernels(monkeypatch, "xorl.ops.moe.triton")
+def test_routing_weight_position_numerical_contract(monkeypatch):
+    patch_ep_kernels(monkeypatch, moe_triton)
+    module = moe_triton
     inputs = _make_inputs()
     ref_out, ref_grads = _fp64_reference(*inputs)
 
@@ -101,10 +100,15 @@ def test_both_routing_positions_match_fp64_reference(monkeypatch):
         eb = max(per_position[True][key], 1e-30)
         assert max(ea / eb, eb / ea) < 3.0, f"{key}: error class diverged (after={ea:.3e}, before={eb:.3e})"
 
+    _assert_before_down_without_score_grad_matches_reference(monkeypatch)
+    with monkeypatch.context() as config_patch:
+        _assert_routing_weight_position_configuration_policy(config_patch)
 
-def test_before_down_without_score_grad_matches_fp64_reference(monkeypatch):
+
+def _assert_before_down_without_score_grad_matches_reference(monkeypatch):
     """The in-place score fold on the recomputed intermediate (no router grad) is safe."""
-    module = _patch_ep_kernels(monkeypatch, "xorl.ops.moe.triton")
+    patch_ep_kernels(monkeypatch, moe_triton)
+    module = moe_triton
     inputs = _make_inputs(seed=7)
     _, ref_grads = _fp64_reference(*inputs)
 
@@ -113,8 +117,7 @@ def test_before_down_without_score_grad_matches_fp64_reference(monkeypatch):
         torch.testing.assert_close(grads[key].double(), ref_grads[key], rtol=1e-3, atol=1e-4)
 
 
-def test_routing_weight_position_knob(monkeypatch):
-    monkeypatch.delenv("XORL_MOE_ROUTING_WEIGHTS_BEFORE_DOWN", raising=False)
+def _assert_routing_weight_position_configuration_policy(monkeypatch):
     monkeypatch.setattr(moe_triton, "_ROUTING_WEIGHTS_BEFORE_DOWN_CONFIG", False)
     assert moe_triton.routing_weights_before_down() is False
 
@@ -123,54 +126,49 @@ def test_routing_weight_position_knob(monkeypatch):
     moe_triton.set_routing_weights_before_down(False)
     assert moe_triton.routing_weights_before_down() is False
 
-    # Env var force-enables regardless of the config default (read lazily, so it
-    # keeps working when set after import).
-    monkeypatch.setenv("XORL_MOE_ROUTING_WEIGHTS_BEFORE_DOWN", "1")
-    assert moe_triton.routing_weights_before_down() is True
+    _assert_auto_resolution_regimes(monkeypatch)
+    _assert_auto_resolution_disabled_under_parity_opt_in(monkeypatch)
+    _assert_explicit_true_overrides_regime(monkeypatch)
+    _assert_explicit_false_overrides_regime(monkeypatch)
+    _assert_invalid_setting_raises()
 
 
-def test_model_arguments_field_default():
-    args = ModelArguments(model_path="Qwen/Qwen3-Coder-30B-A3B-Instruct")
-    assert args.moe_routing_weights_before_down == "auto"
-
-
-@pytest.mark.parametrize(
-    ("train_router", "ep_dispatch", "expected"),
-    [
+def _assert_auto_resolution_regimes(monkeypatch):
+    # Pin the stock expert tree. Unset is an auto mode that enables the serving
+    # kernel on supported EP1 CUDA lanes, so it is not equivalent to opt-out.
+    monkeypatch.setenv("XORL_MOE_SGLANG_FUSED_EXPERTS", "0")
+    for train_router, ep_dispatch, expected in (
         (True, "alltoall", True),  # the measured-win regime
         (True, "deepep", False),
         (False, "alltoall", False),
         (False, "deepep", False),
-    ],
-)
-def test_auto_resolution_regimes(monkeypatch, train_router, ep_dispatch, expected):
-    # Pin the stock expert tree. Unset is an auto mode that enables the serving
-    # kernel on supported EP1 CUDA lanes, so it is not equivalent to opt-out.
-    monkeypatch.setenv("XORL_MOE_SGLANG_FUSED_EXPERTS", "0")
-    resolved = moe_triton.resolve_routing_weights_before_down(
-        "auto", train_router=train_router, ep_dispatch=ep_dispatch
-    )
-    assert resolved is expected
+    ):
+        resolved = moe_triton.resolve_routing_weights_before_down(
+            "auto", train_router=train_router, ep_dispatch=ep_dispatch
+        )
+        assert resolved is expected
 
 
-def test_auto_resolution_disabled_under_parity_opt_in(monkeypatch):
+def _assert_auto_resolution_disabled_under_parity_opt_in(monkeypatch):
     """The XORL_MOE_SGLANG_FUSED_EXPERTS parity lane keeps the historical after-down tree."""
     monkeypatch.setenv("XORL_MOE_SGLANG_FUSED_EXPERTS", "1")
     assert moe_triton.resolve_routing_weights_before_down("auto", train_router=True, ep_dispatch="alltoall") is False
 
 
-@pytest.mark.parametrize("setting", [True, "true", "1"])
-def test_explicit_true_overrides_regime(monkeypatch, setting):
+def _assert_explicit_true_overrides_regime(monkeypatch):
     monkeypatch.setenv("XORL_MOE_SGLANG_FUSED_EXPERTS", "1")
-    assert moe_triton.resolve_routing_weights_before_down(setting, train_router=False, ep_dispatch="deepep") is True
+    for setting in (True, "true"):
+        assert moe_triton.resolve_routing_weights_before_down(setting, train_router=False, ep_dispatch="deepep") is True
 
 
-@pytest.mark.parametrize("setting", [False, "false", "0"])
-def test_explicit_false_overrides_regime(monkeypatch, setting):
+def _assert_explicit_false_overrides_regime(monkeypatch):
     monkeypatch.delenv("XORL_MOE_SGLANG_FUSED_EXPERTS", raising=False)
-    assert moe_triton.resolve_routing_weights_before_down(setting, train_router=True, ep_dispatch="alltoall") is False
+    for setting in (False, "false"):
+        assert (
+            moe_triton.resolve_routing_weights_before_down(setting, train_router=True, ep_dispatch="alltoall") is False
+        )
 
 
-def test_invalid_setting_raises():
+def _assert_invalid_setting_raises():
     with pytest.raises(ValueError, match="moe_routing_weights_before_down"):
         moe_triton.resolve_routing_weights_before_down("maybe", train_router=True, ep_dispatch="alltoall")

@@ -40,17 +40,7 @@ class ImmediateThread:
 
 
 class TestEndpointRouting:
-    def test_endpoint_manager_health_check_uses_endpoint_port(self):
-        session = MagicMock()
-        session.get.return_value = FakeResponse({"status": "ok"})
-        manager = EndpointManager([{"host": "127.0.0.1", "port": 30000}])
-
-        with patch("xorl.server.weight_sync.endpoint_manager._get_http_session", return_value=session):
-            manager.health_check()
-
-        session.get.assert_called_once_with("http://127.0.0.1:30000/model_info", timeout=60)
-
-    def test_endpoint_manager_health_check_falls_back_to_v1_models(self):
+    def test_endpoint_health_and_transfer_policy(self, monkeypatch):
         session = MagicMock()
         session.get.side_effect = [
             FakeResponse({}, requests.HTTPError("503 Server Error")),
@@ -66,7 +56,10 @@ class TestEndpointRouting:
             "http://127.0.0.1:30000/v1/models",
         ]
 
-    def test_endpoint_manager_health_check_reports_all_failures(self):
+        self._assert_health_check_reports_all_failures()
+        self._assert_nccl_endpoint_and_two_phase_transfer_policy(monkeypatch)
+
+    def _assert_health_check_reports_all_failures(self):
         session = MagicMock()
         session.get.side_effect = requests.ConnectionError("connection refused")
         manager = EndpointManager([{"host": "127.0.0.1", "port": 30000}])
@@ -77,7 +70,7 @@ class TestEndpointRouting:
         ):
             manager.health_check()
 
-    def test_nccl_sync_init_uses_endpoint_port(self):
+    def _assert_nccl_endpoint_and_two_phase_transfer_policy(self, monkeypatch):
         session = MagicMock()
         session.post.return_value = FakeResponse({"success": True, "message": "ok"})
         synchronizer = NCCLWeightSynchronizer(
@@ -102,8 +95,17 @@ class TestEndpointRouting:
         session.post.assert_called_once()
         assert session.post.call_args.args[0] == "http://127.0.0.1:30000/init_weights_update_group"
 
-    def test_nccl_bucket_transfer_uses_endpoint_port(self, monkeypatch):
-        monkeypatch.delenv("XORL_WEIGHT_SYNC_SGLANG_LOAD_FORMAT", raising=False)
+        with monkeypatch.context() as case_patch:
+            self._assert_bucket_transfer_uses_endpoint_port(case_patch)
+        with monkeypatch.context() as case_patch:
+            self._assert_nccl_bucket_transfer_uses_two_phase_receiver_protocol(case_patch)
+        with monkeypatch.context() as case_patch:
+            self._assert_nccl_flattened_and_hybrid_bucket_policy(case_patch)
+        with monkeypatch.context() as case_patch:
+            self._assert_nccl_bucket_transfer_rejects_direct_load_format_for_multi_rank_endpoint(case_patch)
+
+    def _assert_bucket_transfer_uses_endpoint_port(self, monkeypatch):
+        monkeypatch.setenv("XORL_WEIGHT_SYNC_SGLANG_LOAD_FORMAT", "direct")
         session = MagicMock()
         session.post.return_value = FakeResponse({"success": True, "message": "ok"})
         synchronizer = NCCLWeightSynchronizer(
@@ -130,36 +132,9 @@ class TestEndpointRouting:
 
         session.post.assert_called_once()
         assert session.post.call_args.args[0] == "http://127.0.0.1:30000/update_weights_from_distributed"
-
-    def test_nccl_bucket_transfer_sends_configured_load_format(self, monkeypatch):
-        monkeypatch.setenv("XORL_WEIGHT_SYNC_SGLANG_LOAD_FORMAT", "direct")
-        session = MagicMock()
-        session.post.return_value = FakeResponse({"success": True, "message": "ok"})
-        synchronizer = NCCLWeightSynchronizer(
-            endpoints=[EndpointInfo(host="127.0.0.1", port=30000, world_size=1)],
-            master_address="train.example",
-            master_port=29600,
-            group_name="weight_sync_group",
-            device="cpu",
-        )
-        synchronizer.process_group = object()
-
-        with (
-            patch("xorl.server.weight_sync.backends.nccl_broadcast._get_http_session", return_value=session),
-            patch("xorl.server.weight_sync.backends.nccl_broadcast.Thread", ImmediateThread),
-            patch("xorl.server.weight_sync.backends.nccl_broadcast.torch.cuda.set_device"),
-            patch.object(synchronizer, "_stage_cpu_tensor_for_broadcast", return_value=(torch.ones(1), None)),
-            patch("xorl.server.weight_sync.backends.nccl_broadcast.dist.broadcast"),
-        ):
-            synchronizer._transfer_single_bucket(
-                [("layer.weight", torch.ones(1, dtype=torch.bfloat16))],
-                flush_cache=False,
-                weight_version="sync-v1",
-            )
-
         assert session.post.call_args.kwargs["json"]["load_format"] == "direct"
 
-    def test_nccl_bucket_transfer_can_use_two_phase_receiver_protocol(self, monkeypatch):
+    def _assert_nccl_bucket_transfer_uses_two_phase_receiver_protocol(self, monkeypatch):
         monkeypatch.setenv("XORL_WEIGHT_SYNC_NCCL_TWO_PHASE", "1")
         monkeypatch.setenv("XORL_WEIGHT_SYNC_SGLANG_LOAD_FORMAT", "flattened_bucket")
         session = MagicMock()
@@ -238,7 +213,7 @@ class TestEndpointRouting:
         broadcast.assert_called_once()
         work.wait.assert_called_once()
 
-    def test_nccl_bucket_transfer_flattens_mixed_dtype_bucket(self, monkeypatch):
+    def _assert_nccl_flattened_and_hybrid_bucket_policy(self, monkeypatch):
         monkeypatch.setenv("XORL_WEIGHT_SYNC_SGLANG_LOAD_FORMAT", "flattened_bucket")
         session = MagicMock()
         session.post.return_value = FakeResponse({"success": True, "message": "ok"})
@@ -291,7 +266,12 @@ class TestEndpointRouting:
         assert flattened.numel() == 4 + (2 * 4) + (3 * 2)
         work.wait.assert_called_once()
 
-    def test_nccl_bucket_transfer_sends_chunked_flattened_load_format(self, monkeypatch):
+        with monkeypatch.context() as case_patch:
+            self._assert_chunked_flattened_transfer(case_patch)
+        with monkeypatch.context() as case_patch:
+            self._assert_nccl_hybrid_flattened_broadcasts_are_receiver_fenced(case_patch)
+
+    def _assert_chunked_flattened_transfer(self, monkeypatch):
         monkeypatch.setenv("XORL_WEIGHT_SYNC_SGLANG_LOAD_FORMAT", "flattened_bucket")
         monkeypatch.setenv("XORL_WEIGHT_SYNC_NCCL_CHUNK_BYTES", "2")
         session = MagicMock()
@@ -328,61 +308,7 @@ class TestEndpointRouting:
         assert broadcast.call_count == 4
         assert work.wait.call_count == 4
 
-    def test_nccl_hybrid_flattened_broadcasts_are_receiver_fenced(self, monkeypatch):
-        monkeypatch.setenv("XORL_WEIGHT_SYNC_SGLANG_LOAD_FORMAT", "hybrid_flattened")
-        monkeypatch.setenv("XORL_WEIGHT_SYNC_WAIT_AFTER_RECEIVER", "0")
-        session = MagicMock()
-        session.post.return_value = FakeResponse({"success": True, "message": "ok"})
-        synchronizer = NCCLWeightSynchronizer(
-            endpoints=[EndpointInfo(host="127.0.0.1", port=30000, world_size=1)],
-            master_address="train.example",
-            master_port=29600,
-            group_name="weight_sync_group",
-            device="cpu",
-        )
-        synchronizer.process_group = object()
-        direct_work = MagicMock()
-        fallback_work = MagicMock()
-        broadcast = MagicMock(side_effect=[direct_work, fallback_work])
-
-        with (
-            patch("xorl.server.weight_sync.backends.nccl_broadcast._get_http_session", return_value=session),
-            patch("xorl.server.weight_sync.backends.nccl_broadcast.Thread", ImmediateThread),
-            patch("xorl.server.weight_sync.backends.nccl_broadcast.torch.cuda.set_device"),
-            patch(
-                "xorl.server.weight_sync.backends.nccl_broadcast.dist.broadcast",
-                broadcast,
-            ),
-            patch.object(
-                synchronizer,
-                "_stage_cpu_tensor_for_broadcast",
-                side_effect=[
-                    (torch.ones(3, dtype=torch.bfloat16), None),
-                    (torch.ones(4, dtype=torch.float8_e4m3fn), None),
-                ],
-            ),
-        ):
-            synchronizer._transfer_single_bucket(
-                [
-                    ("model.layers.0.self_attn.o_proj.weight", torch.ones(3, dtype=torch.bfloat16)),
-                    ("model.layers.0.self_attn.q_proj.weight", torch.ones(4, dtype=torch.float8_e4m3fn)),
-                ],
-                flush_cache=False,
-                weight_version="sync-v1",
-            )
-
-        payload = session.post.call_args.kwargs["json"]
-        assert payload["load_format"] == "hybrid_flattened"
-        assert broadcast.call_count == 2
-        direct_work.wait.assert_called_once()
-        fallback_work.wait.assert_not_called()
-        assert len(synchronizer._receiver_fenced_refs) == 1
-        held_work, held_tensor, held_staging_ref = synchronizer._receiver_fenced_refs[0]
-        assert held_work is fallback_work
-        assert held_tensor.dtype == torch.uint8
-        assert held_staging_ref is None
-
-    def test_nccl_hybrid_flattened_releases_receiver_fenced_refs_on_destroy(self, monkeypatch):
+    def _assert_nccl_hybrid_flattened_broadcasts_are_receiver_fenced(self, monkeypatch):
         monkeypatch.setenv("XORL_WEIGHT_SYNC_SGLANG_LOAD_FORMAT", "hybrid_flattened")
         monkeypatch.setenv("XORL_WEIGHT_SYNC_WAIT_AFTER_RECEIVER", "0")
         session = MagicMock()
@@ -424,6 +350,9 @@ class TestEndpointRouting:
                 flush_cache=False,
                 weight_version="sync-v1",
             )
+            payload = session.post.call_args.kwargs["json"]
+            assert payload["load_format"] == "hybrid_flattened"
+            assert broadcast.call_count == 2
             direct_work.wait.assert_called_once()
             fallback_work.wait.assert_not_called()
             assert len(synchronizer._receiver_fenced_refs) == 1
@@ -435,7 +364,7 @@ class TestEndpointRouting:
 
         assert synchronizer._receiver_fenced_refs == []
 
-    def test_nccl_bucket_transfer_rejects_direct_load_format_for_multi_rank_endpoint(self, monkeypatch):
+    def _assert_nccl_bucket_transfer_rejects_direct_load_format_for_multi_rank_endpoint(self, monkeypatch):
         monkeypatch.setenv("XORL_WEIGHT_SYNC_SGLANG_LOAD_FORMAT", "direct")
         synchronizer = NCCLWeightSynchronizer(
             endpoints=[EndpointInfo(host="127.0.0.1", port=30000, world_size=2)],

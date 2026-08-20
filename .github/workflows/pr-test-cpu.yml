@@ -78,7 +78,6 @@ jobs:
               tests/distributed/test_rope_class_b_fsdp_transport.py
               tests/distributed/test_torch_parallelize_policies.py
               tests/distributed/test_parallel_plan_meta_slice.py
-              tests/distributed/test_offloading.py
 
           # Context/sequence parallel, pipeline parallel, and the core
           # parallel-state plumbing every other dimension builds on.
@@ -96,8 +95,6 @@ jobs:
               tests/distributed/test_pipeline_parallel.py
               tests/distributed/test_pp_*.py
               tests/distributed/test_parallel_state.py
-              tests/distributed/test_utils.py
-              tests/distributed/test_gradient_accumulate_loss.py
               tests/distributed/test_loss_metric_reductions.py
               tests/distributed/test_muon_full_gradient.py
 

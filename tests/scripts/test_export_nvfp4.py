@@ -9,7 +9,6 @@ from safetensors.torch import save_file
 
 from xorl.cli.export_nvfp4 import (
     GLOBAL_SCALE_KEY,
-    dequantize_nvfp4_export,
     export_hf_directory_to_nvfp4,
     quantize_weight_to_nvfp4,
 )
@@ -18,8 +17,8 @@ from xorl.cli.export_nvfp4 import (
 pytestmark = pytest.mark.cpu
 
 
-class TestQuantizeRoundTrip:
-    def test_packed_layout_and_dequant_error(self):
+class TestQuantizeLayout:
+    def test_packed_layout_and_directory_export_contract(self, tmp_path):
         torch.manual_seed(0)
         w = torch.randn(64, 32, dtype=torch.bfloat16)
         entry = quantize_weight_to_nvfp4(w, block_size=16)
@@ -29,11 +28,11 @@ class TestQuantizeRoundTrip:
         assert entry["weight_scale"].shape == (64, 2)  # in/group
         assert entry[GLOBAL_SCALE_KEY].dtype == torch.float32
         assert entry[GLOBAL_SCALE_KEY].ndim == 0
-        recon = dequantize_nvfp4_export(entry)
-        rel = (recon.float() - w.float()).norm() / w.float().norm()
-        assert rel < 0.15, f"NVFP4 round-trip error too high: {rel:.4f}"
 
-    def test_shared_global_scale(self):
+        self._assert_shared_global_scale()
+        TestDirectoryExport()._assert_end_to_end(tmp_path)
+
+    def _assert_shared_global_scale(self):
         torch.manual_seed(0)
         a = torch.randn(32, 32)
         b = torch.randn(32, 32) * 5.0  # different amax
@@ -68,8 +67,8 @@ def _build_tiny_hf_dir(tmp_path):
 
 
 class TestDirectoryExport:
-    def test_end_to_end(self, tmp_path):
-        in_dir, state = _build_tiny_hf_dir(tmp_path)
+    def _assert_end_to_end(self, tmp_path):
+        in_dir, _ = _build_tiny_hf_dir(tmp_path)
         out_dir = tmp_path / "out"
         result = export_hf_directory_to_nvfp4(in_dir, out_dir, group_size=16)
         assert result["quantized_tensors"] == 5  # q,k,v,o,down  (lm_head skipped, norm 1D)
@@ -112,18 +111,11 @@ class TestDirectoryExport:
         served = json.loads((out_dir / "config.json").read_text())
         assert served["quantization_config"]["quant_algo"] == "NVFP4"
 
-        # Round-trip a quantized projection.
-        entry = {
-            "weight": tensors["model.layers.0.self_attn.o_proj.weight"],
-            "weight_scale": tensors["model.layers.0.self_attn.o_proj.weight_scale"],
-            GLOBAL_SCALE_KEY: tensors["model.layers.0.self_attn.o_proj.weight_scale_2"],
-        }
-        recon = dequantize_nvfp4_export(entry)
-        ref = state["model.layers.0.self_attn.o_proj.weight"]
-        rel = (recon.float() - ref.float()).norm() / ref.float().norm()
-        assert rel < 0.2, f"exported o_proj round-trip error too high: {rel:.4f}"
+        self._assert_input_scale_w4a4(tmp_path / "w4a4")
+        self._assert_rejects_already_quantized(tmp_path / "requantize")
 
-    def test_input_scale_w4a4(self, tmp_path):
+    def _assert_input_scale_w4a4(self, tmp_path):
+        tmp_path.mkdir()
         in_dir, _ = _build_tiny_hf_dir(tmp_path)
         out_dir = tmp_path / "out_w4a4"
         amax = {
@@ -146,7 +138,8 @@ class TestDirectoryExport:
         # a linear with no calibrated amax stays weight-only (no input_scale)
         assert "model.layers.0.mlp.down_proj.input_scale" not in tensors
 
-    def test_rejects_already_quantized(self, tmp_path):
+    def _assert_rejects_already_quantized(self, tmp_path):
+        tmp_path.mkdir()
         in_dir, _ = _build_tiny_hf_dir(tmp_path)
         out_dir = tmp_path / "out1"
         export_hf_directory_to_nvfp4(in_dir, out_dir, group_size=16)

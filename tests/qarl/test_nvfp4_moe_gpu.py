@@ -41,7 +41,7 @@ def _make(num_experts=8, hidden=256, inter=256, device="cuda"):
     return e
 
 
-def test_triton_forward_finite_lossy_and_grad():
+def test_triton_weight_quantization_toggle_forward_and_gradient_policy():
     device = "cuda"
     num_tokens, num_experts, top_k = 64, 8, 2
     x = torch.randn(num_tokens, 256, device=device, dtype=torch.bfloat16)
@@ -65,13 +65,5 @@ def test_triton_forward_finite_lossy_and_grad():
     assert q.gate_up_proj.grad is not None and torch.isfinite(q.gate_up_proj.grad).all()
     assert q.down_proj.grad is not None and torch.isfinite(q.down_proj.grad).all()
 
-
-def test_weight_quant_disable_matches_baseline():
-    device = "cuda"
-    x = torch.randn(64, 256, device=device, dtype=torch.bfloat16)
-    rw, se = _routing(64, 8, 2, device)
-    ref = _make()
-    out_ref = ref(x, rw, se)
-    q = convert_moe_experts_to_qarl(_make(), quantize_weight=False)
-    out_q = q(x, rw, se)
-    torch.testing.assert_close(out_q, out_ref, rtol=0, atol=0)
+    passthrough = convert_moe_experts_to_qarl(_make(), quantize_weight=False)
+    torch.testing.assert_close(passthrough(x, rw, se), out_ref, rtol=0, atol=0)

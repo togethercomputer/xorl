@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import copy
 import gc
 import json
 import weakref
 
+import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -11,7 +13,12 @@ from safetensors.torch import load_file, save_file
 
 from xorl.lora.fold import canonical_lora_fold_linear
 from xorl.lora.modules.delta_linear import LoraDeltaLinear
-from xorl.lora.target_manifest import collect_lora_runtime_modules
+from xorl.lora.target_manifest import (
+    collect_lora_runtime_modules,
+    load_lora_target_manifest,
+    resolve_lora_target_modules,
+    validate_lora_target_manifest,
+)
 from xorl.lora.utils import (
     inject_lora_into_model,
     load_lora_checkpoint,
@@ -81,6 +88,7 @@ def test_river_fused_gdn_geometry_and_manifest_path_filter(tmp_path):
         "model.layers.0.linear_attn.in_proj_qkvz": 2,
         "model.layers.0.linear_attn.out_proj": 2,
     }
+    _assert_manifest_schema_and_runtime_mismatches_fail_closed()
 
     with torch.no_grad():
         gdn.in_proj_qkvz.lora_B.normal_()
@@ -112,9 +120,55 @@ def test_river_fused_gdn_geometry_and_manifest_path_filter(tmp_path):
     }
     config = json.loads((tmp_path / "adapter_config.json").read_text())
     assert sorted(config["target_modules"]) == ["in_proj_qkvz", "out_proj"]
+    _assert_fused_gdn_delta_product_merged_forward_and_gradient_policy()
+    sharded_root = tmp_path / "sharded"
+    sharded_root.mkdir()
+    _assert_sharded_peft_checkpoint_loads_into_fused_gdn(sharded_root)
 
 
-def test_delta_linear_matches_explicit_low_rank_product():
+def _assert_manifest_schema_and_runtime_mismatches_fail_closed():
+    wrong_count = copy.deepcopy(_manifest())
+    wrong_count["expected_modules"][0]["count"] = 2
+    with pytest.raises(ValueError, match="matched 1 modules, expected 2"):
+        inject_lora_into_model(_Model(), r=2, lora_alpha=4, target_manifest=wrong_count)
+
+    model = _Model()
+    inject_lora_into_model(model, r=2, lora_alpha=4, target_manifest=_manifest())
+    wrong_rank = copy.deepcopy(_manifest())
+    wrong_rank["expected_modules"][0]["rank"] = 4
+    with pytest.raises(ValueError, match="rank mismatch"):
+        validate_lora_target_manifest(model, wrong_rank)
+
+    with pytest.raises(ValueError, match="do not match"):
+        resolve_lora_target_modules(["in_proj_qkvz", "out_proj"], _manifest())
+
+    model = _Model()
+    inject_lora_into_model(
+        model,
+        r=2,
+        lora_alpha=4,
+        target_modules=["down_proj", "in_proj_qkvz", "out_proj"],
+    )
+    with pytest.raises(ValueError, match="unlisted LoRA modules"):
+        validate_lora_target_manifest(model, _manifest())
+
+    for field, value, message in (
+        ("schema_version", True, "schema_version"),
+        ("allow_unlisted", "false", "allow_unlisted must be a Boolean"),
+    ):
+        manifest = copy.deepcopy(_manifest())
+        manifest[field] = value
+        with pytest.raises(ValueError, match=message):
+            load_lora_target_manifest(manifest)
+
+    for field in ("count", "rank"):
+        manifest = copy.deepcopy(_manifest())
+        manifest["expected_modules"][0][field] = True
+        with pytest.raises(ValueError, match=field):
+            load_lora_target_manifest(manifest)
+
+
+def _assert_delta_linear_matches_explicit_low_rank_product():
     module = LoraDeltaLinear(8, 12, r=2, lora_alpha=4)
     with torch.no_grad():
         module.lora_B.normal_()
@@ -124,7 +178,9 @@ def test_delta_linear_matches_explicit_low_rank_product():
     assert torch.allclose(module.get_delta_weight(), module.lora_B @ module.lora_A * 2)
 
 
-def test_fused_gdn_delta_merged_forward_uses_canonical_fold_and_keeps_gradients():
+def _assert_fused_gdn_delta_product_merged_forward_and_gradient_policy():
+    _assert_delta_linear_matches_explicit_low_rank_product()
+
     module = LoraDeltaLinear(8, 12, r=2, lora_alpha=4, dtype=torch.float32)
     with torch.no_grad():
         module.lora_B.normal_()
@@ -143,8 +199,26 @@ def test_fused_gdn_delta_merged_forward_uses_canonical_fold_and_keeps_gradients(
     assert torch.count_nonzero(module.lora_B.grad[:2]) == 0
     assert torch.count_nonzero(module.lora_B.grad[7:]) == 0
 
+    model = _Model()
+    inject_lora_into_model(model, r=2, lora_alpha=4, target_manifest=_manifest())
+    gdn = model.model.layers[0].linear_attn
+    gdn.exact_merged_forward = True
+    with torch.no_grad():
+        gdn.out_proj.lora_B.normal_()
+    output_inputs = torch.randn(2, 3, gdn.o_proj.in_features)
+    expected_weight = canonical_lora_fold_linear(
+        gdn.o_proj.weight,
+        gdn.out_proj.lora_A,
+        gdn.out_proj.lora_B,
+        2.0,
+    )
+    expected_output = F.linear(output_inputs, expected_weight, gdn.o_proj.bias)
+    assert torch.equal(gdn._project_output_linear(output_inputs), expected_output)
 
-def test_fused_gdn_merged_weight_cache_is_bounded_by_current_slices():
+    _assert_fused_gdn_merged_weight_cache_is_bounded_and_releases_previous_generation()
+
+
+def _assert_fused_gdn_merged_weight_cache_is_bounded_and_releases_previous_generation():
     module = LoraDeltaLinear(8, 12, r=2, lora_alpha=4, dtype=torch.float32)
     first_base = torch.randn(5, 8)
     second_base = torch.randn(7, 8)
@@ -162,16 +236,9 @@ def test_fused_gdn_merged_weight_cache_is_bounded_by_current_slices():
     current_weights = [entry["weight"] for entry in module._merged_weight_cache["slices"].values()]
     assert all(weight is not retained for weight in previous_weights[:-2] for retained in current_weights)
 
-
-def test_fused_gdn_merged_weight_cache_releases_previous_request_generation():
-    module = LoraDeltaLinear(8, 12, r=2, lora_alpha=4, dtype=torch.float32)
-    first_base = torch.randn(5, 8)
-    second_base = torch.randn(7, 8)
-
-    first = module._merged_weight(first_base, output_start=0, output_end=5)
-    second = module._merged_weight(second_base, output_start=5, output_end=12)
-    previous_generation = (weakref.ref(first), weakref.ref(second))
-    del first, second
+    previous_generation = tuple(weakref.ref(weight) for weight in current_weights)
+    previous_weights.clear()
+    del first, second, current_weights
 
     # Match AdapterManager.prepare_forward(): copying adapter values into the
     # model bumps parameter versions at each serialized request boundary.
@@ -185,26 +252,7 @@ def test_fused_gdn_merged_weight_cache_releases_previous_request_generation():
     assert all(reference() is None for reference in previous_generation)
 
 
-def test_fused_gdn_output_projection_merged_forward_matches_canonical_fold():
-    model = _Model()
-    inject_lora_into_model(model, r=2, lora_alpha=4, target_manifest=_manifest())
-    gdn = model.model.layers[0].linear_attn
-    gdn.exact_merged_forward = True
-    with torch.no_grad():
-        gdn.out_proj.lora_B.normal_()
-    inputs = torch.randn(2, 3, gdn.o_proj.in_features)
-    expected_weight = canonical_lora_fold_linear(
-        gdn.o_proj.weight,
-        gdn.out_proj.lora_A,
-        gdn.out_proj.lora_B,
-        2.0,
-    )
-    expected = F.linear(inputs, expected_weight, gdn.o_proj.bias)
-    actual = gdn._project_output_linear(inputs)
-    assert torch.equal(actual, expected)
-
-
-def test_sharded_peft_checkpoint_loads_into_fused_gdn(tmp_path):
+def _assert_sharded_peft_checkpoint_loads_into_fused_gdn(tmp_path):
     source = _Model()
     inject_lora_into_model(source, r=2, lora_alpha=4, target_manifest=_manifest())
     with torch.no_grad():

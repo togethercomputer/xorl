@@ -16,9 +16,6 @@ import torch
 import torch.nn.functional as F
 
 from xorl.ops.loss.compiled_cross_entropy import (
-    compiled_forward_kl_full_function,
-    compiled_forward_kl_full_with_diag_function,
-    compiled_reverse_kl_with_diag_function,
     compiled_sampled_token_logprobs_function,
 )
 from xorl.ops.loss.opd_loss import (
@@ -55,11 +52,10 @@ def _make_synthetic_inputs(
 # ---------------------------------------------------------------------------
 
 
-def test_reverse_kl_full_default_matches_existing_behavior():
-    """Default loss_mode='reverse_kl_full' produces the same loss as the legacy
-    direct call to compiled_reverse_kl_function (modulo metric emission)."""
+def test_full_vocab_modes_diagnostics_weighting_clamp_and_dispatch_policy():
+    """Full-vocab modes expose one stable policy across diagnostics and weighting branches."""
     sh, sw, th, tw, labels = _make_synthetic_inputs()
-    result = opd_loss_function(
+    reverse = opd_loss_function(
         hidden_states=sh,
         weight=sw,
         labels=labels,
@@ -67,19 +63,16 @@ def test_reverse_kl_full_default_matches_existing_behavior():
         teacher_lm_head_weight=tw,
     )
     # Diagnostic fields default to 0.0 because emit_full_vocab_diagnostics=False.
-    assert result.metrics["opd_teacher_entropy"] == 0.0
-    assert result.metrics["opd_top1_agreement"] == 0.0
-    assert result.metrics["opd_pg_clipfrac"] == 0.0
+    assert reverse.metrics["opd_teacher_entropy"] == 0.0
+    assert reverse.metrics["opd_top1_agreement"] == 0.0
+    assert reverse.metrics["opd_pg_clipfrac"] == 0.0
     # PG-mode-only metrics default to 0.0 when use_policy_gradient=False.
-    assert result.metrics["opd_pg_clipfrac_lower"] == 0.0
-    assert result.metrics["opd_ppo_kl"] == 0.0
-    assert result.metrics["valid_tokens"] > 0
-    assert torch.isfinite(result.loss).item()
+    assert reverse.metrics["opd_pg_clipfrac_lower"] == 0.0
+    assert reverse.metrics["opd_ppo_kl"] == 0.0
+    assert reverse.metrics["valid_tokens"] > 0
+    assert torch.isfinite(reverse.loss).item()
 
-
-def test_reverse_kl_full_with_diagnostics():
-    sh, sw, th, tw, labels = _make_synthetic_inputs()
-    result = opd_loss_function(
+    reverse_diagnostics = opd_loss_function(
         hidden_states=sh,
         weight=sw,
         labels=labels,
@@ -87,16 +80,9 @@ def test_reverse_kl_full_with_diagnostics():
         teacher_lm_head_weight=tw,
         emit_full_vocab_diagnostics=True,
     )
-    # Entropy is non-negative.
-    assert result.metrics["opd_teacher_entropy"] >= 0.0
-    assert result.metrics["opd_student_entropy"] >= 0.0
-    # top1_agreement is in [0, 1].
-    assert 0.0 <= result.metrics["opd_top1_agreement"] <= 1.0
-
-
-def test_forward_kl_full_loss_matches_reference_formula():
-    """forward_kl_full == sum_v p_T(v) * (log p_T(v) - log p_S(v)) over full vocab."""
-    sh, sw, th, tw, labels = _make_synthetic_inputs()
+    assert reverse_diagnostics.metrics["opd_teacher_entropy"] >= 0.0
+    assert reverse_diagnostics.metrics["opd_student_entropy"] >= 0.0
+    assert 0.0 <= reverse_diagnostics.metrics["opd_top1_agreement"] <= 1.0
 
     # Reference: eager computation.
     s_logits = sh @ sw.t()
@@ -108,7 +94,7 @@ def test_forward_kl_full_loss_matches_reference_formula():
     ref_token_kl = ref_token_kl * valid
     ref_mean = ref_token_kl[labels != -100].mean().item()
 
-    result = opd_loss_function(
+    forward = opd_loss_function(
         hidden_states=sh,
         weight=sw,
         labels=labels,
@@ -116,12 +102,9 @@ def test_forward_kl_full_loss_matches_reference_formula():
         teacher_lm_head_weight=tw,
         loss_mode=LOSS_MODE_FORWARD_KL_FULL,
     )
-    assert result.metrics["opd_kl"] == pytest.approx(ref_mean, rel=1e-5, abs=1e-5)
+    assert forward.metrics["opd_kl"] == pytest.approx(ref_mean, rel=1e-5, abs=1e-5)
 
-
-def test_forward_kl_full_with_diagnostics():
-    sh, sw, th, tw, labels = _make_synthetic_inputs()
-    result = opd_loss_function(
+    forward_diagnostics = opd_loss_function(
         hidden_states=sh,
         weight=sw,
         labels=labels,
@@ -130,12 +113,9 @@ def test_forward_kl_full_with_diagnostics():
         loss_mode=LOSS_MODE_FORWARD_KL_FULL,
         emit_full_vocab_diagnostics=True,
     )
-    assert result.metrics["opd_teacher_entropy"] >= 0.0
-    assert 0.0 <= result.metrics["opd_top1_agreement"] <= 1.0
+    assert forward_diagnostics.metrics["opd_teacher_entropy"] >= 0.0
+    assert 0.0 <= forward_diagnostics.metrics["opd_top1_agreement"] <= 1.0
 
-
-def test_unsupported_loss_mode_raises():
-    sh, sw, th, tw, labels = _make_synthetic_inputs()
     with pytest.raises(ValueError, match="forward_kl_topk"):
         opd_loss_function(
             hidden_states=sh,
@@ -146,53 +126,110 @@ def test_unsupported_loss_mode_raises():
             loss_mode="forward_kl_topk",
         )
 
+    clamped = opd_loss_function(
+        hidden_states=sh,
+        weight=sw,
+        labels=labels,
+        teacher_hidden_states=th,
+        teacher_lm_head_weight=tw,
+        loss_max_clamp=0.1,
+    )
+    assert clamped.metrics["opd_loss_max"] <= 0.1 + 1e-6
+    assert clamped.metrics["opd_loss_min"] >= -0.1 - 1e-6
+
+    base = opd_loss_function(
+        hidden_states=sh.clone().detach().requires_grad_(True),
+        weight=sw.clone().detach().requires_grad_(True),
+        labels=labels,
+        teacher_hidden_states=th,
+        teacher_lm_head_weight=tw,
+    )
+    scaled = opd_loss_function(
+        hidden_states=sh.clone().detach().requires_grad_(True),
+        weight=sw.clone().detach().requires_grad_(True),
+        labels=labels,
+        teacher_hidden_states=th,
+        teacher_lm_head_weight=tw,
+        use_task_rewards=True,
+        distillation_loss_coef=2.5,
+    )
+    assert scaled.loss.item() == pytest.approx(base.loss.item() * 2.5, rel=1e-5)
+
+    with_disabled_coef = opd_loss_function(
+        hidden_states=sh.clone().detach().requires_grad_(True),
+        weight=sw.clone().detach().requires_grad_(True),
+        labels=labels,
+        teacher_hidden_states=th,
+        teacher_lm_head_weight=tw,
+        use_task_rewards=False,
+        distillation_loss_coef=999.0,
+    )
+    assert with_disabled_coef.loss.item() == pytest.approx(base.loss.item(), rel=1e-5)
+
+    common_args = dict(
+        hidden_states=sh,
+        weight=sw,
+        labels=labels,
+        teacher_hidden_states=th,
+        teacher_lm_head_weight=tw,
+    )
+    keys_reverse = set(opd_loss_function(**common_args).metrics)
+    keys_reverse_diag = set(opd_loss_function(**common_args, emit_full_vocab_diagnostics=True).metrics)
+    keys_forward = set(opd_loss_function(**common_args, loss_mode=LOSS_MODE_FORWARD_KL_FULL).metrics)
+    keys_forward_diag = set(
+        opd_loss_function(
+            **common_args,
+            loss_mode=LOSS_MODE_FORWARD_KL_FULL,
+            emit_full_vocab_diagnostics=True,
+        ).metrics
+    )
+    keys_k3 = set(opd_loss_function(**common_args, loss_mode="k3").metrics)
+    assert keys_reverse == keys_reverse_diag == keys_forward == keys_forward_diag == keys_k3
+    _assert_kl_estimator_values_straight_through_gradient_and_dispatch()
+    _assert_policy_gradient_mode_requires_inputs_and_emits_finite_metrics()
+    _assert_compiled_sampled_token_logprobs_safe_with_ignored_labels()
+
 
 # ---------------------------------------------------------------------------
 # KL estimators (k1/k2/k3/abs/mse/low_var_kl) — byte-for-byte against VERL formula
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("mode", ["k1", "kl", "abs", "mse", "k2", "k3", "low_var_kl"])
-def test_kl_estimator_matches_verl_kl_penalty(mode):
-    """_kl_penalty_estimator(...) reproduces VERL's kl_penalty_forward formulae."""
+def _assert_kl_estimator_values_straight_through_gradient_and_dispatch():
+    """Estimator modes match VERL, including k3+ gradients and OPD dispatch."""
     torch.manual_seed(7)
     logp = torch.randn(32) * 0.5
     ref = torch.randn(32) * 0.5
 
-    out = _kl_penalty_estimator(logp, ref, mode)
+    for mode in ("k1", "kl", "abs", "mse", "k2", "k3", "low_var_kl"):
+        out = _kl_penalty_estimator(logp, ref, mode)
 
-    if mode in ("kl", "k1"):
-        expected = logp - ref
-    elif mode == "abs":
-        expected = (logp - ref).abs()
-    elif mode in ("mse", "k2"):
-        expected = 0.5 * (logp - ref).square()
-    elif mode in ("k3", "low_var_kl"):
-        kl = (ref - logp).clamp(min=-20, max=20)
-        expected = (kl.exp() - kl - 1).clamp(min=-10, max=10)
-    else:
-        raise AssertionError(mode)
-    torch.testing.assert_close(out, expected)
+        if mode in ("kl", "k1"):
+            expected = logp - ref
+        elif mode == "abs":
+            expected = (logp - ref).abs()
+        elif mode in ("mse", "k2"):
+            expected = 0.5 * (logp - ref).square()
+        elif mode in ("k3", "low_var_kl"):
+            kl = (ref - logp).clamp(min=-20, max=20)
+            expected = (kl.exp() - kl - 1).clamp(min=-10, max=10)
+        else:
+            raise AssertionError(mode)
+        torch.testing.assert_close(out, expected)
 
-
-def test_kl_estimator_plus_suffix_gives_k2_straight_through_gradient():
-    """The "+" suffix preserves the forward value but routes gradient through 0.5*(logp-ref)^2."""
     torch.manual_seed(11)
-    logp = torch.randn(8, requires_grad=True)
-    ref = torch.randn(8)
+    grad_logp = torch.randn(8, requires_grad=True)
+    grad_ref = torch.randn(8)
 
-    out = _kl_penalty_estimator(logp, ref, "k3+")
+    out = _kl_penalty_estimator(grad_logp, grad_ref, "k3+")
     # Forward value matches plain k3.
-    out_k3 = _kl_penalty_estimator(logp.detach(), ref, "k3")
+    out_k3 = _kl_penalty_estimator(grad_logp.detach(), grad_ref, "k3")
     torch.testing.assert_close(out.detach(), out_k3)
     # Backward gradient matches k2.
     out.sum().backward()
-    expected_grad = logp.detach() - ref  # d/dlogp of 0.5*(logp-ref)^2
-    torch.testing.assert_close(logp.grad, expected_grad)
+    expected_grad = grad_logp.detach() - grad_ref  # d/dlogp of 0.5*(logp-ref)^2
+    torch.testing.assert_close(grad_logp.grad, expected_grad)
 
-
-def test_estimator_loss_mode_dispatch():
-    """opd_loss_function with loss_mode='k3' uses the estimator path + emits opd_abs_loss."""
     sh, sw, th, tw, labels = _make_synthetic_inputs()
     result = opd_loss_function(
         hidden_states=sh,
@@ -210,31 +247,11 @@ def test_estimator_loss_mode_dispatch():
 
 
 # ---------------------------------------------------------------------------
-# Clamps
-# ---------------------------------------------------------------------------
-
-
-def test_loss_max_clamp_applied():
-    """loss_max_clamp bounds the per-token loss before weighting."""
-    sh, sw, th, tw, labels = _make_synthetic_inputs()
-    clamped = opd_loss_function(
-        hidden_states=sh,
-        weight=sw,
-        labels=labels,
-        teacher_hidden_states=th,
-        teacher_lm_head_weight=tw,
-        loss_max_clamp=0.1,
-    )
-    assert clamped.metrics["opd_loss_max"] <= 0.1 + 1e-6
-    assert clamped.metrics["opd_loss_min"] >= -0.1 - 1e-6
-
-
-# ---------------------------------------------------------------------------
 # Policy-gradient mode
 # ---------------------------------------------------------------------------
 
 
-def test_pg_mode_requires_old_logprobs():
+def _assert_policy_gradient_mode_requires_inputs_and_emits_finite_metrics():
     sh, sw, th, tw, labels = _make_synthetic_inputs()
     with pytest.raises(ValueError, match="old_logprobs"):
         opd_loss_function(
@@ -247,9 +264,6 @@ def test_pg_mode_requires_old_logprobs():
             use_policy_gradient=True,
         )
 
-
-def test_pg_mode_smoke_returns_finite_loss_and_pg_clipfrac():
-    sh, sw, th, tw, labels = _make_synthetic_inputs()
     # Fake old logprobs ~ student's current logprob to keep ratio near 1.
     old_lp = torch.zeros_like(labels, dtype=torch.float32) - 2.5
     result = opd_loss_function(
@@ -276,146 +290,7 @@ def test_pg_mode_smoke_returns_finite_loss_and_pg_clipfrac():
     assert "opd_kl" in result.metrics
 
 
-# ---------------------------------------------------------------------------
-# Task-reward mixing (coef scaling)
-# ---------------------------------------------------------------------------
-
-
-def test_use_task_rewards_scales_loss_by_coef():
-    sh, sw, th, tw, labels = _make_synthetic_inputs()
-    base = opd_loss_function(
-        hidden_states=sh.clone().detach().requires_grad_(True),
-        weight=sw.clone().detach().requires_grad_(True),
-        labels=labels,
-        teacher_hidden_states=th,
-        teacher_lm_head_weight=tw,
-    )
-    scaled = opd_loss_function(
-        hidden_states=sh.clone().detach().requires_grad_(True),
-        weight=sw.clone().detach().requires_grad_(True),
-        labels=labels,
-        teacher_hidden_states=th,
-        teacher_lm_head_weight=tw,
-        use_task_rewards=True,
-        distillation_loss_coef=2.5,
-    )
-    assert scaled.loss.item() == pytest.approx(base.loss.item() * 2.5, rel=1e-5)
-
-
-def test_use_task_rewards_false_ignores_coef():
-    sh, sw, th, tw, labels = _make_synthetic_inputs()
-    base = opd_loss_function(
-        hidden_states=sh.clone().detach().requires_grad_(True),
-        weight=sw.clone().detach().requires_grad_(True),
-        labels=labels,
-        teacher_hidden_states=th,
-        teacher_lm_head_weight=tw,
-    )
-    with_coef = opd_loss_function(
-        hidden_states=sh.clone().detach().requires_grad_(True),
-        weight=sw.clone().detach().requires_grad_(True),
-        labels=labels,
-        teacher_hidden_states=th,
-        teacher_lm_head_weight=tw,
-        use_task_rewards=False,
-        distillation_loss_coef=999.0,  # ignored when use_task_rewards=False
-    )
-    assert with_coef.loss.item() == pytest.approx(base.loss.item(), rel=1e-5)
-
-
-# ---------------------------------------------------------------------------
-# Metric dict shape invariant (always-emit, no conditional keys)
-# ---------------------------------------------------------------------------
-
-
-def test_metrics_dict_has_stable_key_set_across_loss_modes():
-    """Dict-keyed all_reduce deadlocks if ranks differ on which keys are emitted;
-    every loss_mode must produce the same set of keys."""
-    sh, sw, th, tw, labels = _make_synthetic_inputs()
-    common_args = dict(
-        hidden_states=sh,
-        weight=sw,
-        labels=labels,
-        teacher_hidden_states=th,
-        teacher_lm_head_weight=tw,
-    )
-    keys_reverse = set(opd_loss_function(**common_args).metrics.keys())
-    keys_reverse_diag = set(opd_loss_function(**common_args, emit_full_vocab_diagnostics=True).metrics.keys())
-    keys_forward = set(opd_loss_function(**common_args, loss_mode=LOSS_MODE_FORWARD_KL_FULL).metrics.keys())
-    keys_forward_diag = set(
-        opd_loss_function(
-            **common_args,
-            loss_mode=LOSS_MODE_FORWARD_KL_FULL,
-            emit_full_vocab_diagnostics=True,
-        ).metrics.keys()
-    )
-    keys_k3 = set(opd_loss_function(**common_args, loss_mode="k3").metrics.keys())
-    assert keys_reverse == keys_reverse_diag == keys_forward == keys_forward_diag == keys_k3
-
-
-# ---------------------------------------------------------------------------
-# Backend functions (smoke)
-# ---------------------------------------------------------------------------
-
-
-def test_compiled_reverse_kl_with_diag_returns_4tuple():
-    sh, sw, th, tw, labels = _make_synthetic_inputs()
-    sh_flat = sh.reshape(-1, sh.size(-1))
-    th_flat = th.reshape(-1, th.size(-1))
-    lab_flat = labels.reshape(-1)
-    valid = lab_flat != -100
-    out = compiled_reverse_kl_with_diag_function(
-        student_hidden_states=sh_flat[valid],
-        student_weight=sw,
-        teacher_hidden_states=th_flat[valid],
-        teacher_weight=tw,
-        labels=lab_flat[valid],
-        ignore_index=-100,
-    )
-    assert len(out) == 4
-    token_kl, teacher_entropy, student_entropy, top1_agreement = out
-    assert token_kl.shape == teacher_entropy.shape == student_entropy.shape == top1_agreement.shape
-
-
-def test_compiled_forward_kl_full_smoke():
-    sh, sw, th, tw, labels = _make_synthetic_inputs()
-    sh_flat = sh.reshape(-1, sh.size(-1))
-    th_flat = th.reshape(-1, th.size(-1))
-    lab_flat = labels.reshape(-1)
-    valid = lab_flat != -100
-    token_kl = compiled_forward_kl_full_function(
-        student_hidden_states=sh_flat[valid],
-        student_weight=sw,
-        teacher_hidden_states=th_flat[valid],
-        teacher_weight=tw,
-        labels=lab_flat[valid],
-        ignore_index=-100,
-        log_prob_min_clamp=None,
-    )
-    assert token_kl.shape == lab_flat[valid].shape
-    # forward KL with full distribution is always >= 0.
-    assert (token_kl >= -1e-5).all()
-
-
-def test_compiled_forward_kl_full_with_diag_returns_4tuple():
-    sh, sw, th, tw, labels = _make_synthetic_inputs()
-    sh_flat = sh.reshape(-1, sh.size(-1))
-    th_flat = th.reshape(-1, th.size(-1))
-    lab_flat = labels.reshape(-1)
-    valid = lab_flat != -100
-    out = compiled_forward_kl_full_with_diag_function(
-        student_hidden_states=sh_flat[valid],
-        student_weight=sw,
-        teacher_hidden_states=th_flat[valid],
-        teacher_weight=tw,
-        labels=lab_flat[valid],
-        ignore_index=-100,
-        log_prob_min_clamp=None,
-    )
-    assert len(out) == 4
-
-
-def test_compiled_sampled_token_logprobs_safe_with_ignored_labels():
+def _assert_compiled_sampled_token_logprobs_safe_with_ignored_labels():
     sh, sw, th, tw, labels = _make_synthetic_inputs()
     sh_flat = sh.reshape(-1, sh.size(-1))
     th_flat = th.reshape(-1, th.size(-1))

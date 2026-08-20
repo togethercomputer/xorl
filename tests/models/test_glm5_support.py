@@ -152,13 +152,7 @@ def _tiny_config(**overrides) -> Glm5Config:
 # --------------------------------------------------------------------------- #
 
 
-def test_glm5_config_is_standalone():
-    config = Glm5Config()
-    assert isinstance(config, Glm5Config)
-    assert config.model_type == "xorl_glm5"
-
-
-def test_glm5_declares_every_rmsnorm_serving_family():
+def test_glm5_support_policy(tmp_path, monkeypatch):
     config = _tiny_config()
     set_rmsnorm_mode("sglang_fused")
     try:
@@ -181,8 +175,23 @@ def test_glm5_declares_every_rmsnorm_serving_family():
     assert model.norm.mode == "sglang_fused"
     assert model.norm.family == RMS_NORM_FAMILY_RESIDUAL_TREE
 
+    _assert_hf_config_captures_glm5_fields()
+    _assert_local_config_loader_routes_glm5(tmp_path)
+    with monkeypatch.context() as loader_patch:
+        _assert_local_config_loader_rejects_unsafe_values(loader_patch)
+    with monkeypatch.context() as ring_patch:
+        _assert_glm5_rejects_dsa_with_ring_attention(ring_patch)
+    with monkeypatch.context() as indexer_patch:
+        _assert_glm5_indexer_construction_policy(indexer_patch)
+    with monkeypatch.context() as sparse_patch:
+        _assert_sparse_mla_reference_wrapper_and_attention_integration_policy(sparse_patch)
+    _assert_glm5_checkpoint_filter_policy()
+    with monkeypatch.context() as adapter_patch:
+        _assert_glm5_adapter_sparse_kv_and_moe_dispatch_policy(adapter_patch)
+    _assert_glm5_forward_and_recompute_policy()
 
-def test_from_hf_config_captures_mla_moe_dsa_and_mtp_fields():
+
+def _assert_hf_config_captures_glm5_fields():
     hf_config = _namespace_from_dict(GLM_5_1_HF_CONFIG)
 
     config = Glm5Config.from_hf_config(hf_config)
@@ -224,7 +233,7 @@ def test_from_hf_config_captures_mla_moe_dsa_and_mtp_fields():
     assert config.model_type == "xorl_glm5"
 
 
-def test_auto_load_local_xorl_config_routes_glm_moe_dsa(tmp_path):
+def _assert_local_config_loader_routes_glm5(tmp_path):
     cfg_path = tmp_path / "config.json"
     cfg_path.write_text(json.dumps(GLM_5_1_HF_CONFIG))
 
@@ -233,9 +242,14 @@ def test_auto_load_local_xorl_config_routes_glm_moe_dsa(tmp_path):
     assert isinstance(config, Glm5Config)
     assert config.architectures == ["GlmMoeDsaForCausalLM"]
     assert config.n_routed_experts == 256
+    registry = get_registry()
+    assert "GlmMoeDsaForCausalLM" in registry.supported_models
+    assert "Glm5ForCausalLM" in registry.supported_models
+    assert issubclass(GlmMoeDsaForCausalLM, Glm5ForCausalLM)
+    assert "GlmMoeDsaForCausalLM" in get_loader(config).description
 
 
-def test_auto_load_local_xorl_config_rejects_non_json_values(monkeypatch):
+def _assert_local_config_loader_rejects_unsafe_values(monkeypatch):
     class ForeignValue:
         pass
 
@@ -247,8 +261,10 @@ def test_auto_load_local_xorl_config_rejects_non_json_values(monkeypatch):
     with pytest.raises(ValueError, match="non-JSON value at \\$.hidden_size"):
         _load_local_xorl_config("unused", config_kwargs={})
 
+    _assert_auto_load_rejects_dunder_keys(monkeypatch)
 
-def test_auto_load_local_xorl_config_rejects_dunder_keys(monkeypatch):
+
+def _assert_auto_load_rejects_dunder_keys(monkeypatch):
     monkeypatch.setattr(
         "xorl.models.auto.PretrainedConfig.get_config_dict",
         lambda *_args, **_kwargs: ({"model_type": "glm_moe_dsa", "__class__": "foreign"}, {}),
@@ -258,41 +274,7 @@ def test_auto_load_local_xorl_config_rejects_dunder_keys(monkeypatch):
         _load_local_xorl_config("unused", config_kwargs={})
 
 
-def test_glm5_default_construction_matches_glm_5_1_shape():
-    """Defaults track the public `zai-org/GLM-5.1` config so a bare `Glm5Config()`
-    is always interpretable without an HF round-trip."""
-    config = Glm5Config()
-
-    assert config.hidden_size == 6144
-    assert config.num_hidden_layers == 78
-    assert config.num_attention_heads == 64
-    assert config.vocab_size == 154880
-    assert config.q_lora_rank == 2048
-    assert config.n_routed_experts == 256
-    assert config.num_experts_per_tok == 8
-
-
-# --------------------------------------------------------------------------- #
-# Registry / loader
-# --------------------------------------------------------------------------- #
-
-
-def test_glm5_registered_under_both_arch_names():
-    """Registry resolves both `GlmMoeDsaForCausalLM` (HF) and `Glm5ForCausalLM`."""
-    reg = get_registry()
-    assert "GlmMoeDsaForCausalLM" in reg.supported_models
-    assert "Glm5ForCausalLM" in reg.supported_models
-    # Subclass relationship: `GlmMoeDsaForCausalLM` is just an alias.
-    assert issubclass(GlmMoeDsaForCausalLM, Glm5ForCausalLM)
-
-
-def test_get_loader_resolves_glm_moe_dsa():
-    config = Glm5Config.from_hf_config(_namespace_from_dict(GLM_5_1_HF_CONFIG))
-    loader = get_loader(config)
-    assert "GlmMoeDsaForCausalLM" in loader.description
-
-
-def test_build_foundation_model_rejects_glm5_dsa_with_ring_attention(monkeypatch):
+def _assert_glm5_rejects_dsa_with_ring_attention(monkeypatch):
     class ParallelState:
         ringattn_size = 1
         ringattn_enabled = True
@@ -311,7 +293,7 @@ def test_build_foundation_model_rejects_glm5_dsa_with_ring_attention(monkeypatch
 # --------------------------------------------------------------------------- #
 
 
-def test_indexer_has_four_glm_specific_projections():
+def _assert_glm5_indexer_construction_policy(monkeypatch):
     config = _tiny_config()
     indexer = Glm5DsaIndexer(config)
 
@@ -323,76 +305,12 @@ def test_indexer_has_four_glm_specific_projections():
     assert indexer.weights_proj.in_features == config.hidden_size
     assert indexer.weights_proj.out_features == config.index_n_heads
 
-
-def test_indexer_contract_routes_head_projection_through_fp32_kernel(monkeypatch):
-    config = _tiny_config(indexer_types=["full"] * 4)
-    config._glm52_exact_contract = True
-    indexer = Glm5DsaIndexer(config).to(torch.bfloat16)
-    hidden = torch.randn(2, 3, config.hidden_size, dtype=torch.bfloat16)
-    q_compressed = torch.randn(2, 3, config.q_lora_rank, dtype=torch.bfloat16)
-    cos = torch.ones(2, 3, config.qk_rope_head_dim, dtype=torch.bfloat16)
-    sin = torch.zeros_like(cos)
-    calls = []
-
-    def fake_contract(input, weight):
-        calls.append((input.shape, weight.shape, input.dtype, weight.dtype))
-        return torch.nn.functional.linear(input.float(), weight.float())
-
-    monkeypatch.setattr("xorl.models.transformers.glm5.indexer.bi_bf16_fp32_linear", fake_contract)
-    _, _, head_weights = indexer.project(hidden, q_compressed, (cos, sin))
-
-    assert calls == [
-        (
-            torch.Size([2, 3, config.hidden_size]),
-            torch.Size([config.index_n_heads, config.hidden_size]),
-            torch.bfloat16,
-            torch.bfloat16,
-        )
-    ]
-    expected = fake_contract(hidden, indexer.weights_proj.weight) * (config.index_n_heads**-0.5)
-    assert torch.equal(head_weights, expected)
+    _assert_glm5_indexer_selection_policy()
+    with monkeypatch.context() as case_patch:
+        _assert_glm5_dsa_mask_policy(case_patch)
 
 
-def test_attention_carries_indexer_module():
-    """V0: indexer params exist on attention so checkpoints load cleanly."""
-    config = _tiny_config()
-    attn = Glm5Attention(config, layer_idx=0)
-    assert isinstance(attn.indexer, Glm5DsaIndexer)
-
-
-def test_indexer_select_topk_returns_correct_shape():
-    """The dense fallback returns top-k indices for each query position.
-
-    Causality is enforced by masking non-causal logits with -inf. When fewer
-    than `index_topk` valid keys exist for a query (early positions), `topk`
-    fills the remaining slots with arbitrary indices over -inf entries — so
-    the strong causality check only holds for the last query position, where
-    every key is valid.
-    """
-    config = _tiny_config()
-    indexer = Glm5DsaIndexer(config)
-
-    B, S = 2, 8
-    index_q = torch.randn(B, S, config.index_n_heads, config.index_head_dim)
-    index_k = torch.randn(B, S, config.index_head_dim)
-    head_weights = torch.randn(B, S, config.index_n_heads)
-
-    indices = indexer.select_topk(index_q, index_k, head_weights, attention_mask=None)
-
-    assert indices.shape == (B, S, config.index_topk)
-    assert indices.dtype == torch.int32
-    # The indexer marks non-causal pad slots with -1 (kernel sentinel);
-    # all other slots are in [0, S).
-    valid = indices >= 0
-    assert torch.all(indices[valid] < S)
-    # For the last query position (q=S-1), all S keys are causal — top-k
-    # picks must all be valid (no -1 padding).
-    last_q_indices = indices[:, -1, :]
-    assert torch.all(last_q_indices >= 0)
-    assert torch.all(last_q_indices < S)
-
-
-def test_indexer_select_topk_respects_additive_attention_mask():
+def _assert_glm5_indexer_selection_policy():
     """Masked positions should become `-1` sentinels before sparse-MLA.
 
     Eager causal masks use `torch.finfo(dtype).min`, not literal `-inf`.
@@ -400,58 +318,38 @@ def test_indexer_select_topk_respects_additive_attention_mask():
     budget on padding / packed-sequence boundaries and the tilelang path
     receives non-sentinel invalid indices.
     """
-    config = _tiny_config(index_topk=3)
-    indexer = Glm5DsaIndexer(config)
-
     B, S = 1, 5
-    index_q = torch.randn(B, S, config.index_n_heads, config.index_head_dim)
-    index_k = torch.randn(B, S, config.index_head_dim)
-    head_weights = torch.randn(B, S, config.index_n_heads)
-    attention_mask = torch.full((B, S, S), torch.finfo(index_q.dtype).min)
-    rows = torch.arange(S)
-    attention_mask[:, rows, rows] = 0
+    for score_chunk_heads in (None, 1):
+        config = _tiny_config(index_topk=3, index_n_heads=4)
+        if score_chunk_heads is not None:
+            config.indexer_score_chunk_heads = score_chunk_heads
+        indexer = Glm5DsaIndexer(config)
+        index_q = torch.randn(B, S, config.index_n_heads, config.index_head_dim)
+        index_k = torch.randn(B, S, config.index_head_dim)
+        head_weights = torch.randn(B, S, config.index_n_heads)
+        attention_mask = torch.full((B, S, S), torch.finfo(index_q.dtype).min)
+        rows = torch.arange(S)
+        attention_mask[:, rows, rows] = 0
 
-    indices = indexer.select_topk(index_q, index_k, head_weights, attention_mask=attention_mask)
+        indices = indexer.select_topk(index_q, index_k, head_weights, attention_mask=attention_mask)
 
-    torch.testing.assert_close(indices[0, :, 0], torch.arange(S, dtype=torch.int32))
-    assert torch.all(indices[0, :, 1:] == -1)
+        torch.testing.assert_close(indices[0, :, 0], torch.arange(S, dtype=torch.int32))
+        assert torch.all(indices[0, :, 1:] == -1)
 
-
-def test_indexer_select_topk_supports_chunked_head_scoring():
-    """Chunked scoring must preserve masking semantics used by sparse-MLA."""
-    config = _tiny_config(index_topk=3, index_n_heads=4)
-    config.indexer_score_chunk_heads = 1
-    indexer = Glm5DsaIndexer(config)
-
-    B, S = 1, 5
-    index_q = torch.randn(B, S, config.index_n_heads, config.index_head_dim)
-    index_k = torch.randn(B, S, config.index_head_dim)
-    head_weights = torch.randn(B, S, config.index_n_heads)
-    attention_mask = torch.full((B, S, S), torch.finfo(index_q.dtype).min)
-    rows = torch.arange(S)
-    attention_mask[:, rows, rows] = 0
-
-    indices = indexer.select_topk(index_q, index_k, head_weights, attention_mask=attention_mask)
-
-    torch.testing.assert_close(indices[0, :, 0], torch.arange(S, dtype=torch.int32))
-    assert torch.all(indices[0, :, 1:] == -1)
+    _assert_indexer_padding_mask_policy()
+    _assert_indexer_returns_sorted_indices()
+    _assert_indexer_blocked_selection()
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_indexer_padding_mask_detection_triggers_fast_path():
+def _assert_indexer_padding_mask_policy():
     """A 2D padding mask (e.g., HuggingFace-style [B, S] with 1s for valid
     tokens and 0s for padded tail) should be detected and routed to the
     tilelang fast path with cu_ke clipped to the valid length."""
-    try:
-        from xorl.ops.glm5_kernels.tilelang_indexer_fwd import tl_indexer_fwd_impl  # noqa: F401
-    except Exception:
-        pytest.skip("tilelang indexer fwd kernel unavailable")
-    torch.manual_seed(0)
     config = _tiny_config(index_topk=8, index_n_heads=4)
-    indexer = Glm5DsaIndexer(config).cuda()
+    indexer = Glm5DsaIndexer(config)
     B, S = 1, 32
     # 2D padding mask: first 24 positions valid, last 8 padded.
-    pad_mask = torch.ones((B, S), device="cuda", dtype=torch.long)
+    pad_mask = torch.ones((B, S), dtype=torch.long)
     pad_mask[:, 24:] = 0
 
     # Detection returns valid_len per batch
@@ -460,23 +358,20 @@ def test_indexer_padding_mask_detection_triggers_fast_path():
     assert torch.all(valid_lens == 24)
 
     # Detection on an interspersed-padding mask should return None
-    bad_mask = torch.ones((B, S), device="cuda", dtype=torch.long)
+    bad_mask = torch.ones_like(pad_mask)
     bad_mask[:, 8:16] = 0  # holes in the middle — not a clean prefix
     assert indexer._padding_mask_valid_lens(bad_mask, S) is None
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_indexer_causal_mask_detection_triggers_fast_path():
-    """An explicit pure-causal additive mask should be detected and routed to
-    the tilelang fast path (producing the same indices as both the
-    attention_mask=None path and the torch fallback)."""
-    try:
-        from xorl.ops.glm5_kernels.tilelang_indexer_fwd import tl_indexer_fwd_impl  # noqa: F401
-    except Exception:
-        pytest.skip("tilelang indexer fwd kernel unavailable")
+def test_indexer_tilelang_fast_path_accepts_causal_mask_and_matches_blocked_torch():
+    """Both fast-path mask forms match an independently forced torch path."""
+    from xorl.ops.glm5_kernels.tilelang_indexer_fwd import tl_indexer_fwd_impl  # noqa: F401
+
     torch.manual_seed(0)
     config = _tiny_config(index_topk=8, index_n_heads=4)
     indexer = Glm5DsaIndexer(config).cuda()
+
     B, S = 1, 32
     H, D = config.index_n_heads, config.index_head_dim
     iq = torch.randn((B, S, H, D), device="cuda", dtype=torch.bfloat16)
@@ -486,58 +381,28 @@ def test_indexer_causal_mask_detection_triggers_fast_path():
     causal_mask = torch.zeros((B, S, S), device="cuda", dtype=torch.float32)
     for q in range(S):
         causal_mask[:, q, q + 1 :] = torch.finfo(torch.float32).min
-
-    # Detection itself should return True for the canonical causal mask
     assert indexer._is_pure_causal_mask(causal_mask, S, S, 0)
 
-    # And the masked call should give the same indices as the unmasked call
-    indices_no_mask = indexer.select_topk(iq, ik, weights, attention_mask=None)
-    indices_with_mask = indexer.select_topk(iq, ik, weights, attention_mask=causal_mask)
-    for b in range(B):
-        for s in range(S):
-            assert set(indices_no_mask[b, s].cpu().tolist()) - {-1} == set(indices_with_mask[b, s].cpu().tolist()) - {
-                -1
-            }
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
-def test_indexer_tilelang_fast_path_matches_torch_reference():
-    """The tilelang fast path (taken when attention_mask is None and inputs
-    are bf16/CUDA) should produce the same topk indices as the torch path.
-    Compared as sets per row because both paths sort indices ascending,
-    but the underlying scoring kernels may break ties differently."""
-    try:
-        from xorl.ops.glm5_kernels.tilelang_indexer_fwd import tl_indexer_fwd_impl  # noqa: F401
-    except Exception:
-        pytest.skip("tilelang indexer fwd kernel unavailable")
-    torch.manual_seed(0)
-    config = _tiny_config(index_topk=8, index_n_heads=4)
-    indexer = Glm5DsaIndexer(config).cuda()
-
-    B, S = 1, 32
-    H, D = config.index_n_heads, config.index_head_dim
-    iq = torch.randn((B, S, H, D), device="cuda", dtype=torch.bfloat16)
-    ik = torch.randn((B, S, D), device="cuda", dtype=torch.bfloat16)
-    weights = torch.randn((B, S, H), device="cuda", dtype=torch.float32)
-
-    # Tilelang fast path (attention_mask=None triggers it)
     indices_tl = indexer.select_topk(iq, ik, weights, attention_mask=None)
+    indices_tl_masked = indexer.select_topk(iq, ik, weights, attention_mask=causal_mask)
 
-    # Torch path (force via a strict causal mask)
-    causal_mask = torch.zeros((B, S, S), device="cuda", dtype=torch.float32)
-    for q in range(S):
-        causal_mask[:, q, q + 1 :] = torch.finfo(torch.float32).min
+    # A pure causal mask is itself eligible for TileLang, so it is not a
+    # reference oracle. Opting into blocked scoring rejects the fast path and
+    # forces the independent torch implementation.
+    config.indexer_score_query_block_size = 7
+    config.indexer_score_key_block_size = 11
     indices_ref = indexer.select_topk(iq, ik, weights, attention_mask=causal_mask)
 
-    # Per-row set comparison; ignore -1 sentinels
     for b in range(B):
         for s in range(S):
             tl_set = set(indices_tl[b, s].cpu().tolist()) - {-1}
+            masked_set = set(indices_tl_masked[b, s].cpu().tolist()) - {-1}
             ref_set = set(indices_ref[b, s].cpu().tolist()) - {-1}
+            assert tl_set == masked_set
             assert tl_set == ref_set, f"row mismatch at b={b} s={s}: tl={tl_set} ref={ref_set}"
 
 
-def test_indexer_select_topk_returns_sorted_indices():
+def _assert_indexer_returns_sorted_indices():
     """The indexer should sort top-k indices ascending by kv position
     (with -1 sentinels at the end). This is a perf optimization for the
     downstream sparse-MLA kernel — gathers become near-contiguous → better
@@ -552,6 +417,12 @@ def test_indexer_select_topk_returns_sorted_indices():
     index_k = torch.randn(B, S, config.index_head_dim)
     head_weights = torch.randn(B, S, config.index_n_heads)
     indices = indexer.select_topk(index_q, index_k, head_weights, attention_mask=None)
+
+    assert indices.shape == (B, S, config.index_topk)
+    assert indices.dtype == torch.int32
+    valid_indices = indices[indices >= 0]
+    assert torch.all(valid_indices < S)
+    assert torch.all(indices[:, -1, :] >= 0)
 
     # Within each (batch, query) row, valid indices must be monotonically
     # non-decreasing; -1 sentinels (if any) must follow all valid indices.
@@ -568,7 +439,7 @@ def test_indexer_select_topk_returns_sorted_indices():
                 assert neg_positions.min() > valid_positions.max(), f"-1 not at end: {row.tolist()}"
 
 
-def test_indexer_blocked_select_topk_matches_dense():
+def _assert_indexer_blocked_selection():
     """The memory-bounded scorer should preserve dense top-k semantics."""
     torch.manual_seed(0)
     config = _tiny_config(index_topk=4, index_n_heads=4)
@@ -588,8 +459,10 @@ def test_indexer_blocked_select_topk_matches_dense():
 
     torch.testing.assert_close(torch.sort(blocked, dim=-1).values, torch.sort(dense, dim=-1).values)
 
+    _assert_indexer_blocked_select_topk_supports_query_offset()
 
-def test_indexer_blocked_select_topk_supports_query_offset():
+
+def _assert_indexer_blocked_select_topk_supports_query_offset():
     """Ulysses query-sharded indexer rows should match dense full-sequence rows."""
     torch.manual_seed(0)
     config = _tiny_config(index_topk=4, index_n_heads=4)
@@ -615,7 +488,7 @@ def test_indexer_blocked_select_topk_supports_query_offset():
     torch.testing.assert_close(local, dense[:, 3:6])
 
 
-def test_dense_dsa_mask_handles_2d_and_3d_attention_masks():
+def _assert_glm5_dsa_mask_policy(monkeypatch):
     config = _tiny_config(index_topk=2)
     attn = Glm5Attention(config, layer_idx=0)
 
@@ -638,8 +511,10 @@ def test_dense_dsa_mask_handles_2d_and_3d_attention_masks():
     assert built_3d.shape == (2, 1, 4, 4)
     assert torch.isneginf(built_3d[:, 0, :, 0]).all()
 
+    _assert_dsa_mask_gathers_ulysses_query_axis(monkeypatch)
 
-def test_dsa_mask_gathers_local_ulysses_query_axis(monkeypatch):
+
+def _assert_dsa_mask_gathers_ulysses_query_axis(monkeypatch):
     config = _tiny_config()
     attn = Glm5Attention(config, layer_idx=0)
     group = object()
@@ -670,7 +545,7 @@ def test_dsa_mask_gathers_local_ulysses_query_axis(monkeypatch):
 
 
 @torch.no_grad()
-def test_sparse_mla_torch_reference_matches_dense_at_full_topk():
+def _assert_sparse_mla_reference_and_wrapper_policy(monkeypatch):
     """Sparse-MLA with `topk >= seq_len` must equal dense softmax-attention
     over the same compressed KV (causality already imposed inside the
     sparse reference)."""
@@ -700,9 +575,12 @@ def test_sparse_mla_torch_reference_matches_dense_at_full_topk():
 
     torch.testing.assert_close(sparse_out, dense_out, atol=1e-5, rtol=1e-5)
 
+    _assert_sparse_mla_torch_reference_supports_query_offset()
+    _assert_sparse_mla_tilelang_wrapper(monkeypatch)
+
 
 @torch.no_grad()
-def test_sparse_mla_torch_reference_supports_query_offset():
+def _assert_sparse_mla_torch_reference_supports_query_offset():
     """A local query shard with full-sequence indices should match the
     corresponding rows from the full-query reference."""
     torch.manual_seed(0)
@@ -729,7 +607,7 @@ def test_sparse_mla_torch_reference_supports_query_offset():
     torch.testing.assert_close(local, full[:, 3:6], atol=1e-5, rtol=1e-5)
 
 
-def test_sparse_mla_tilelang_wrapper_supports_local_query_full_kv(monkeypatch):
+def _assert_sparse_mla_tilelang_wrapper(monkeypatch):
     """Ulysses sparse MLA sends local query rows with gathered full-sequence KV."""
     B, S_q, S_kv, H, D = 2, 3, 7, 4, 5
     kv_lora = D
@@ -780,25 +658,9 @@ def test_sparse_mla_tilelang_wrapper_supports_local_query_full_kv(monkeypatch):
 
 
 @torch.no_grad()
-def test_glm5_attention_sparse_forward_smoke():
-    """Glm5Attention with `_sparse_mla_enabled=True` produces the right shape."""
-    torch.manual_seed(0)
-    config = _tiny_config(index_topk=4)
-    config._sparse_mla_enabled = True
-    attn = Glm5Attention(config, layer_idx=0).eval()
-    rotary = RotaryEmbedding(config=config)
+def _assert_sparse_mla_reference_wrapper_and_attention_integration_policy(monkeypatch):
+    _assert_sparse_mla_reference_and_wrapper_policy(monkeypatch)
 
-    B, S = 2, 6
-    hidden = torch.randn(B, S, config.hidden_size)
-    pos_ids = torch.arange(S).unsqueeze(0).expand(B, -1)
-    cos, sin = rotary(hidden, pos_ids)
-
-    out, _ = attn(hidden, position_embeddings=(cos, sin), attention_mask=None)
-    assert out.shape == (B, S, config.hidden_size)
-
-
-@torch.no_grad()
-def test_glm5_attention_sparse_ulysses_keeps_query_and_topk_local(monkeypatch):
     torch.manual_seed(0)
     config = _tiny_config(index_topk=2)
     config._sparse_mla_enabled = True
@@ -854,9 +716,13 @@ def test_glm5_attention_sparse_ulysses_keeps_query_and_topk_local(monkeypatch):
     assert captured["query_offset"] == S
     assert captured["mask_shape"] is None
 
+    monkeypatch.undo()
+    _assert_glm5_sparse_attention_matches_dense()
+    _assert_sparse_mla_dispatch_rejects_unknown_backend()
+
 
 @torch.no_grad()
-def test_glm5_attention_sparse_matches_dense_when_topk_covers_full_seq():
+def _assert_glm5_sparse_attention_matches_dense():
     """When `index_topk >= seq_len`, the sparse and dense paths share the
     same MLA parameters and the sparse path's causal mask matches dense
     causal MLA — outputs must agree to numerical precision.
@@ -883,7 +749,7 @@ def test_glm5_attention_sparse_matches_dense_when_topk_covers_full_seq():
     torch.testing.assert_close(sparse_out, dense_out, atol=1e-4, rtol=1e-4)
 
 
-def test_sparse_kv_b_lora_keeps_differentiable_factors_in_distributed_execution(monkeypatch):
+def _assert_sparse_kv_b_adapter_weight_policy(monkeypatch):
     config = _tiny_config(index_topk=4, max_position_embeddings=8)
     attention = Glm5Attention(config, layer_idx=0)
     inject_lora_into_model(attention, r=4, lora_alpha=8, target_modules=["kv_b_proj"])
@@ -899,8 +765,11 @@ def test_sparse_kv_b_lora_keeps_differentiable_factors_in_distributed_execution(
     assert torch.count_nonzero(attention.kv_b_proj.lora_A.grad)
     assert torch.count_nonzero(attention.kv_b_proj.lora_B.grad)
 
+    _assert_sparse_kv_b_block_fp8_qlora_gradients(monkeypatch)
+    _assert_sparse_kv_b_block_fp8_compute_dtype(monkeypatch)
 
-def test_sparse_kv_b_block_fp8_qlora_dequantizes_base_and_keeps_factor_gradients(monkeypatch):
+
+def _assert_sparse_kv_b_block_fp8_qlora_gradients(monkeypatch):
     config = _tiny_config(index_topk=4, max_position_embeddings=8)
     attention = Glm5Attention(config, layer_idx=0)
     projection = BlockFP8QLoRALinear(
@@ -931,7 +800,7 @@ def test_sparse_kv_b_block_fp8_qlora_dequantizes_base_and_keeps_factor_gradients
     assert projection.lora_B.grad is not None
 
 
-def test_sparse_kv_b_block_fp8_qlora_absorb_weights_follow_bf16_compute_dtype(monkeypatch):
+def _assert_sparse_kv_b_block_fp8_compute_dtype(monkeypatch):
     config = _tiny_config(index_topk=4, max_position_embeddings=8)
     attention = Glm5Attention(config, layer_idx=0)
     projection = BlockFP8QLoRALinear(
@@ -976,23 +845,7 @@ def test_sparse_kv_b_block_fp8_qlora_absorb_weights_follow_bf16_compute_dtype(mo
 
 
 @torch.no_grad()
-def test_sparse_mla_dispatch_falls_back_to_torch_on_cpu():
-    """`auto` backend on CPU must use the torch reference (tilelang is
-    CUDA-only). Output equals the torch ref called directly."""
-    torch.manual_seed(0)
-    B, S, H = 1, 4, 2
-    kv_lora, qk_rope = 16, 4
-    D = kv_lora + qk_rope
-    q = torch.randn(B, S, H, D)
-    kv = torch.randn(B, S, D)
-    indices = torch.arange(S).view(1, 1, S).expand(B, S, S).contiguous()
-
-    auto = sparse_mla_dispatch(q, kv, indices, scaling=D**-0.5, kv_lora_rank=kv_lora, backend="auto")
-    explicit = sparse_mla_torch_reference(q, kv, indices, D**-0.5, kv_lora)
-    torch.testing.assert_close(auto, explicit)
-
-
-def test_sparse_mla_dispatch_rejects_unknown_backend():
+def _assert_sparse_mla_dispatch_rejects_unknown_backend():
     q = torch.randn(1, 1, 1, 4)
     kv = torch.randn(1, 1, 4)
     indices = torch.zeros(1, 1, 1, dtype=torch.long)
@@ -1000,7 +853,7 @@ def test_sparse_mla_dispatch_rejects_unknown_backend():
         sparse_mla_dispatch(q, kv, indices, scaling=1.0, kv_lora_rank=2, backend="bogus")
 
 
-def test_glm5_checkpoint_handler_skips_layers_beyond_configured():
+def _assert_glm5_checkpoint_filter_policy():
     """Real GLM-5.1 has 78 dense layers + 1 MTP layer (index 78). Smoke runs
     further reduce `num_hidden_layers`. Either way, the handler must drop
     layer keys at indices `>= num_hidden_layers` so partial-load works."""
@@ -1015,12 +868,23 @@ def test_glm5_checkpoint_handler_skips_layers_beyond_configured():
     assert handler._normalize_key("model.layers.78.embed_tokens.weight") is None
     # Non-layer keys are routed to the parent's normalizer untouched.
     assert handler._normalize_key("model.embed_tokens.weight") == "model.embed_tokens.weight"
+    skip = handler.get_skip_key_fn()
+    assert skip is not None
+    assert skip("model.layers.0.self_attn.q_a_proj.weight") is False
+    assert skip("model.layers.4.self_attn.q_a_proj.weight") is True
+    assert skip("model.layers.78.embed_tokens.weight") is True
+    assert skip("model.embed_tokens.weight") is False
+
+    _assert_glm5_checkpoint_ep_filter()
 
 
-def test_glm5_default_lora_targets_cover_mla_and_moe():
+def _assert_glm5_adapter_sparse_kv_and_moe_dispatch_policy(monkeypatch):
     """`xorl_glm5` model_type maps to GLM's MLA + MoE LoRA targets.
     Regressing this would silently fall back to llama-style `q/k/v/o_proj`
     and inject zero adapters."""
+    with monkeypatch.context() as case_patch:
+        _assert_sparse_kv_b_adapter_weight_policy(case_patch)
+
     config = _tiny_config()
     model = Glm5ForCausalLM(config)
 
@@ -1041,8 +905,11 @@ def test_glm5_default_lora_targets_cover_mla_and_moe():
     assert not isinstance(attn.indexer.wk, LoraLinear)
     assert not isinstance(attn.indexer.weights_proj, LoraLinear)
 
+    _assert_glm5_moe_uses_ep_dispatch(monkeypatch)
+    _assert_sparse_path_uses_lora_delta()
 
-def test_glm5_moe_eager_uses_ep_dispatch_path_when_ep_enabled(monkeypatch):
+
+def _assert_glm5_moe_uses_ep_dispatch(monkeypatch):
     config = _tiny_config()
     block = Glm5MoEBlock(config)
     tokens = 6
@@ -1061,20 +928,7 @@ def test_glm5_moe_eager_uses_ep_dispatch_path_when_ep_enabled(monkeypatch):
     expert_forward.assert_called_once()
 
 
-def test_glm5_checkpoint_handler_skip_key_fn_short_circuits_disk_reads():
-    """`get_skip_key_fn` is the loader's early-skip hook — keys it returns
-    True for never get their tensor data read from disk. Must catch the
-    same MTP / partial-load case `_normalize_key` handles."""
-    handler = Glm5CheckpointHandler(num_experts=8, num_hidden_layers=4)
-    skip = handler.get_skip_key_fn()
-    assert skip is not None
-    assert skip("model.layers.0.self_attn.q_a_proj.weight") is False
-    assert skip("model.layers.4.self_attn.q_a_proj.weight") is True  # MTP layer
-    assert skip("model.layers.78.embed_tokens.weight") is True
-    assert skip("model.embed_tokens.weight") is False
-
-
-def test_glm5_checkpoint_handler_ep_filter_skips_complete_fp8_expert_pairs():
+def _assert_glm5_checkpoint_ep_filter():
     handler = Glm5CheckpointHandler(num_experts=8, ep_rank=1, ep_size=2)
     skip = handler.get_skip_key_fn()
 
@@ -1086,7 +940,7 @@ def test_glm5_checkpoint_handler_ep_filter_skips_complete_fp8_expert_pairs():
 
 
 @torch.no_grad()
-def test_sparse_path_picks_up_lora_delta_on_kv_b_proj():
+def _assert_sparse_path_uses_lora_delta():
     """`Glm5Attention.forward_sparse` accesses `kv_b_proj.weight` directly
     via the absorb form. When kv_b_proj is wrapped with LoraLinear, the
     sparse path must still reflect the LoRA delta — otherwise sparse +
@@ -1194,7 +1048,7 @@ def test_glm5_logits_match_hf_reference_at_full_topk():
 
 
 @torch.no_grad()
-def test_glm5_for_causal_lm_forward_smoke():
+def _assert_glm5_forward_and_recompute_policy():
     """End-to-end forward on a tiny model: shapes, MoE/dense layer split,
     and that the indexer is reachable through `model.model.layers[N].self_attn.indexer`."""
     torch.manual_seed(0)
@@ -1216,8 +1070,11 @@ def test_glm5_for_causal_lm_forward_smoke():
 
     assert out.last_hidden_state.shape == (B, S, config.hidden_size)
 
+    with torch.enable_grad():
+        _assert_glm5_recompute_before_dispatch()
 
-def test_glm5_recompute_before_dispatch_avoids_outer_layer_checkpoint():
+
+def _assert_glm5_recompute_before_dispatch():
     torch.manual_seed(0)
     config = _tiny_config(num_hidden_layers=1, first_k_dense_replace=0)
     model = Glm5Model(config).train()

@@ -14,7 +14,7 @@ from xorl.models.transformers.qwen3_moe.checkpoint_handler import Qwen3MoeCheckp
 pytestmark = [pytest.mark.cpu]
 
 
-def test_moe_experts_register_only_fused_gate_up_proj():
+def _assert_moe_experts_register_fused_gate_up_for_base_and_lora():
     experts = MoEExperts(num_experts=3, hidden_dim=4, intermediate_size=5, moe_implementation="eager")
 
     named_params = dict(experts.named_parameters())
@@ -31,9 +31,7 @@ def test_moe_experts_register_only_fused_gate_up_proj():
     torch.testing.assert_close(experts.gate_up_proj[..., :5], torch.ones(3, 4, 5))
     torch.testing.assert_close(experts.gate_up_proj[..., 5:], torch.full((3, 4, 5), 2.0))
 
-
-def test_moe_experts_lora_registers_fused_base_weight():
-    experts = MoEExpertsLoRA(
+    lora_experts = MoEExpertsLoRA(
         num_experts=3,
         hidden_dim=4,
         intermediate_size=5,
@@ -41,16 +39,16 @@ def test_moe_experts_lora_registers_fused_base_weight():
         lora_config=MoELoRAConfig(r=2, lora_alpha=4),
     )
 
-    named_params = dict(experts.named_parameters())
+    named_params = dict(lora_experts.named_parameters())
     assert "gate_up_proj" in named_params
     assert "gate_proj" not in named_params
     assert "up_proj" not in named_params
     assert named_params["gate_up_proj"].shape == (3, 4, 10)
-    assert experts.gate_proj.shape == (3, 4, 5)
-    assert experts.up_proj.shape == (3, 4, 5)
+    assert lora_experts.gate_proj.shape == (3, 4, 5)
+    assert lora_experts.up_proj.shape == (3, 4, 5)
 
 
-def test_qwen3_moe_checkpoint_handler_round_trips_fused_experts():
+def _assert_qwen_moe_checkpoint_handler_fused_expert_contract():
     hidden_size = 4
     intermediate_size = 3
     handler = Qwen3MoeCheckpointHandler(
@@ -101,8 +99,11 @@ def test_qwen3_moe_checkpoint_handler_round_trips_fused_experts():
     torch.testing.assert_close(saved["model.layers.0.mlp.experts.0.down_proj.weight"], down_0)
     torch.testing.assert_close(saved["model.layers.0.mlp.experts.1.down_proj.weight"], down_1)
 
+    _assert_qwen3_5_moe_checkpoint_handler_round_trips_fused_experts()
+    _assert_qwen_moe_checkpoint_handlers_skip_deferred_qlora_expert_loading()
 
-def test_qwen3_5_moe_checkpoint_handler_round_trips_fused_experts():
+
+def _assert_qwen3_5_moe_checkpoint_handler_round_trips_fused_experts():
     hidden_size = 4
     intermediate_size = 3
     gate_up_weight = torch.arange(0, 48, dtype=torch.float32).view(2, 2 * intermediate_size, hidden_size)
@@ -139,8 +140,8 @@ def test_qwen3_5_moe_checkpoint_handler_round_trips_fused_experts():
     torch.testing.assert_close(saved["model.layers.0.mlp.experts.1.down_proj.weight"], down_weight[1])
 
 
-def test_qwen3_moe_checkpoint_handler_skips_deferred_qlora_expert_loading():
-    handler = Qwen3MoeCheckpointHandler(
+def _assert_qwen_moe_checkpoint_handlers_skip_deferred_qlora_expert_loading():
+    qwen3_handler = Qwen3MoeCheckpointHandler(
         num_experts=2,
         num_attention_heads=2,
         num_key_value_heads=1,
@@ -148,7 +149,7 @@ def test_qwen3_moe_checkpoint_handler_skips_deferred_qlora_expert_loading():
         skip_expert_loading=True,
     )
 
-    skip_fn = handler.get_skip_key_fn()
+    skip_fn = qwen3_handler.get_skip_key_fn()
     assert skip_fn is not None
     assert skip_fn("model.layers.0.mlp.experts.0.gate_proj.weight")
     assert skip_fn("model.layers.0.mlp.experts.0.up_proj.weight")
@@ -156,12 +157,10 @@ def test_qwen3_moe_checkpoint_handler_skips_deferred_qlora_expert_loading():
     assert skip_fn("model.layers.0.mlp.experts.gate_up_proj")
     assert skip_fn("model.layers.0.mlp.experts.down_proj")
 
-    assert handler.on_load_weight("model.layers.0.mlp.experts.0.gate_proj.weight", torch.randn(3, 4)) == []
-    assert handler.on_load_weight("model.layers.0.mlp.experts.gate_up_proj", torch.randn(2, 4, 6)) == []
+    assert qwen3_handler.on_load_weight("model.layers.0.mlp.experts.0.gate_proj.weight", torch.randn(3, 4)) == []
+    assert qwen3_handler.on_load_weight("model.layers.0.mlp.experts.gate_up_proj", torch.randn(2, 4, 6)) == []
 
-
-def test_qwen3_5_moe_checkpoint_handler_skips_deferred_qlora_expert_loading():
-    handler = Qwen3_5MoeCheckpointHandler(
+    qwen35_handler = Qwen3_5MoeCheckpointHandler(
         num_experts=2,
         num_attention_heads=2,
         num_key_value_heads=1,
@@ -171,7 +170,7 @@ def test_qwen3_5_moe_checkpoint_handler_skips_deferred_qlora_expert_loading():
         skip_expert_loading=True,
     )
 
-    skip_fn = handler.get_skip_key_fn()
+    skip_fn = qwen35_handler.get_skip_key_fn()
     assert skip_fn is not None
     assert skip_fn("model.layers.0.mlp.experts.0.gate_proj.weight")
     assert skip_fn("model.layers.0.mlp.experts.0.up_proj.weight")
@@ -179,8 +178,8 @@ def test_qwen3_5_moe_checkpoint_handler_skips_deferred_qlora_expert_loading():
     assert skip_fn("model.layers.0.mlp.experts.gate_up_proj.weight")
     assert skip_fn("model.layers.0.mlp.experts.down_proj.weight")
 
-    assert handler.on_load_weight("model.layers.0.mlp.experts.0.gate_proj.weight", torch.randn(3, 4)) == []
-    assert handler.on_load_weight("model.layers.0.mlp.experts.gate_up_proj.weight", torch.randn(2, 6, 4)) == []
+    assert qwen35_handler.on_load_weight("model.layers.0.mlp.experts.0.gate_proj.weight", torch.randn(3, 4)) == []
+    assert qwen35_handler.on_load_weight("model.layers.0.mlp.experts.gate_up_proj.weight", torch.randn(2, 6, 4)) == []
 
 
 def test_save_model_weights_drops_qarl_buffers_and_unfuses_qkv(tmp_path):
@@ -190,6 +189,8 @@ def test_save_model_weights_drops_qarl_buffers_and_unfuses_qkv(tmp_path):
     1-dimensional tensor``). ``save_model_weights`` must drop all ``qarl_*`` buffers before
     the handler runs, and still unfuse ``qkv_proj`` -> q/k/v.
     """
+    _assert_moe_experts_register_fused_gate_up_for_base_and_lora()
+    _assert_qwen_moe_checkpoint_handler_fused_expert_contract()
     n_heads, n_kv, head_dim, hidden = 2, 1, 2, 4
     q_dim, kv_dim = n_heads * head_dim, n_kv * head_dim
     handler = Qwen3MoeCheckpointHandler(

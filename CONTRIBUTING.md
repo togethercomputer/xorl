@@ -47,6 +47,7 @@ The hooks include:
 - **ruff-format** — code formatting (line length 120)
 - **codespell** — catches typos
 - **trailing-whitespace / end-of-file-fixer** — file hygiene
+- **check-public-tree** — rejects private paths, cluster references, and internal identifiers
 
 CI runs the same hooks, so if pre-commit passes locally, CI will too.
 
@@ -56,12 +57,18 @@ Additional guidelines:
 
 ## Testing
 
+Test additions, consolidation, and removal follow the evidence-based process in [TEST_TRIAGE.md](TEST_TRIAGE.md).
+
 ```bash
-# Run unit tests
-pytest tests/
+# Create the repository-local Python 3.12 test environment from uv.lock
+uv venv .venv --python 3.12
+UV_PROJECT_ENVIRONMENT=.venv uv sync --group test --no-install-project
+
+# Run unit tests against this checkout rather than an ambient xorl install
+PYTHONPATH="$PWD/src" .venv/bin/python -m pytest tests/
 
 # Run a specific test file
-pytest tests/server/api_server/test_checkpoint_paths.py -v
+PYTHONPATH="$PWD/src" .venv/bin/python -m pytest tests/server/api_server/test_checkpoint_paths.py -v
 ```
 
 Tests must pass locally before requesting review.

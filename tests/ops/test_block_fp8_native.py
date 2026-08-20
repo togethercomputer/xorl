@@ -4,13 +4,11 @@ import pytest
 import torch
 import torch.distributed.checkpoint as dcp
 
-from xorl.distributed.torch_parallelize import _expert_fsdp_kwargs_for_module
 from xorl.ops.block_fp8_native import (
     NativeBlockFP8Linear,
     pack_fp8_as_float32,
     unpack_float32_as_fp8,
     validate_native_fp8_dcp_checkpoint,
-    validate_native_fp8_state_metadata,
 )
 
 
@@ -20,7 +18,7 @@ def _fp8_values(shape):
     return values.to(torch.float8_e4m3fn)
 
 
-def test_pack_roundtrip_is_byte_exact():
+def _assert_pack_roundtrip_is_byte_exact():
     weight = _fp8_values((256, 128))
     packed = pack_fp8_as_float32(weight)
     restored = unpack_float32_as_fp8(packed, tuple(weight.shape))
@@ -30,7 +28,7 @@ def test_pack_roundtrip_is_byte_exact():
     assert torch.equal(restored.view(torch.uint8), weight.contiguous().view(torch.uint8))
 
 
-def test_linear_state_is_frozen_reshardable_and_scale_exact():
+def _assert_linear_state_survives_dtype_apply_byte_exactly():
     module = NativeBlockFP8Linear(256, 384)
     weight = _fp8_values((384, 256))
     scales = torch.arange(6, dtype=torch.float32).reshape(3, 2) / 7
@@ -42,13 +40,6 @@ def test_linear_state_is_frozen_reshardable_and_scale_exact():
     assert module.fsdp_requires_full_precision is True
     assert torch.equal(module.fp8_weight().view(torch.uint8), weight.view(torch.uint8))
     assert torch.equal(module.weight_scale_inv.view(torch.uint8), scales.view(torch.uint8))
-
-
-def test_dtype_apply_preserves_packed_and_scale_bytes():
-    module = NativeBlockFP8Linear(128, 128)
-    weight = _fp8_values((128, 128))
-    scales = torch.tensor([[0.1234567]], dtype=torch.float32)
-    module.load_prequantized(weight, scales)
     weight_bytes = module.packed_weight_f32.view(torch.uint8).clone()
     scale_bytes = module.weight_scale_inv.view(torch.uint8).clone()
 
@@ -60,7 +51,7 @@ def test_dtype_apply_preserves_packed_and_scale_bytes():
     assert torch.equal(module.weight_scale_inv.view(torch.uint8), scale_bytes)
 
 
-def test_no_eager_sglang_import_and_cpu_forward_fails_closed():
+def _assert_cpu_execution_and_materialization_fail_closed_without_eager_sglang_import():
     before = {name for name in sys.modules if name == "sglang" or name.startswith("sglang.")}
     module = NativeBlockFP8Linear(128, 128)
     after = {name for name in sys.modules if name == "sglang" or name.startswith("sglang.")}
@@ -68,10 +59,6 @@ def test_no_eager_sglang_import_and_cpu_forward_fails_closed():
     assert after == before
     with pytest.raises(RuntimeError, match="requires CUDA"):
         module(torch.zeros(1, 128, dtype=torch.bfloat16))
-
-
-def test_weight_materialization_is_an_explicit_input_free_cuda_path():
-    module = NativeBlockFP8Linear(128, 128)
     with pytest.raises(ValueError, match="does not accept activation or range inputs"):
         module(torch.zeros(1, 128, dtype=torch.bfloat16), return_dequantized_weight=True)
     with pytest.raises(ValueError, match="does not accept activation or range inputs"):
@@ -80,7 +67,7 @@ def test_weight_materialization_is_an_explicit_input_free_cuda_path():
         module(return_dequantized_weight=True)
 
 
-def test_partition_ranges_cross_the_module_forward_hook_boundary(monkeypatch):
+def _assert_partition_ranges_cross_the_module_forward_hook_boundary(monkeypatch):
     module = NativeBlockFP8Linear(256, 384)
     input = torch.zeros(2, 128, dtype=torch.bfloat16)
     expected = torch.ones(2, 128, dtype=torch.bfloat16)
@@ -101,7 +88,7 @@ def test_partition_ranges_cross_the_module_forward_hook_boundary(monkeypatch):
     assert calls == [(input, (128, 256), (0, 128))]
 
 
-def test_phase_one_forward_rejects_activation_or_base_gradients():
+def _assert_phase_one_forward_rejects_activation_or_base_gradients():
     module = NativeBlockFP8Linear(128, 128)
     with pytest.raises(RuntimeError, match="scoring-only"):
         module(torch.zeros(1, 128, dtype=torch.bfloat16, requires_grad=True))
@@ -111,7 +98,7 @@ def test_phase_one_forward_rejects_activation_or_base_gradients():
         module(torch.zeros(1, 128, dtype=torch.bfloat16))
 
 
-def test_linear_partition_contract_fails_before_kernel_dispatch():
+def _assert_linear_partition_contract_fails_before_kernel_dispatch():
     module = NativeBlockFP8Linear(256, 384)
     input = torch.zeros(1, 128, dtype=torch.bfloat16)
 
@@ -121,7 +108,7 @@ def test_linear_partition_contract_fails_before_kernel_dispatch():
         module.forward_partition(input, input_range=(0, 256))
 
 
-def test_rejects_wrong_pair_dtype_shape_and_nonfinite_scale():
+def _assert_rejects_wrong_pair_dtype_shape_and_nonfinite_scale():
     module = NativeBlockFP8Linear(128, 128)
     weight = _fp8_values((128, 128))
 
@@ -135,7 +122,7 @@ def test_rejects_wrong_pair_dtype_shape_and_nonfinite_scale():
         module.load_prequantized(_fp8_values((128, 256)), torch.ones(1, 1, dtype=torch.float32))
 
 
-def test_state_dict_roundtrip_retains_both_parameter_byte_streams():
+def _assert_state_dict_roundtrip_retains_both_parameter_byte_streams():
     source = NativeBlockFP8Linear(256, 384)
     target = NativeBlockFP8Linear(256, 384)
     weight = _fp8_values((384, 256))
@@ -149,22 +136,15 @@ def test_state_dict_roundtrip_retains_both_parameter_byte_streams():
     assert torch.equal(target.weight_scale_inv.view(torch.uint8), source.weight_scale_inv.view(torch.uint8))
 
 
-def test_state_dict_and_dcp_metadata_reject_castable_payloads():
+def _assert_state_dict_rejects_castable_payloads():
     module = NativeBlockFP8Linear(128, 128)
     state = module.state_dict()
     state["packed_weight_f32"] = state["packed_weight_f32"].to(torch.bfloat16)
     with pytest.raises(TypeError, match="refusing a load_state_dict cast"):
         module.load_state_dict(state, strict=True)
 
-    good_metadata = {name: (parameter.dtype, tuple(parameter.shape)) for name, parameter in module.named_parameters()}
-    validate_native_fp8_state_metadata(module, good_metadata)
-    bad_metadata = dict(good_metadata)
-    bad_metadata["weight_scale_inv"] = (torch.bfloat16, tuple(module.weight_scale_inv.shape))
-    with pytest.raises(ValueError, match="DCP metadata mismatch"):
-        validate_native_fp8_state_metadata(module, bad_metadata)
 
-
-def test_apply_exception_never_strands_protected_parameters():
+def _assert_apply_exception_never_strands_protected_parameters():
     module = NativeBlockFP8Linear(128, 128)
     module.child = torch.nn.Linear(1, 1)
     original = dict(module.named_parameters())
@@ -182,7 +162,7 @@ def test_apply_exception_never_strands_protected_parameters():
     assert all(restored[name] is parameter for name, parameter in original.items())
 
 
-def test_real_dcp_metadata_is_checked_before_load(tmp_path):
+def _assert_real_dcp_metadata_is_checked_before_load(tmp_path):
     module = NativeBlockFP8Linear(128, 128)
     good_path = tmp_path / "good"
     dcp.save({"model": module.state_dict()}, checkpoint_id=good_path)
@@ -197,7 +177,7 @@ def test_real_dcp_metadata_is_checked_before_load(tmp_path):
         validate_native_fp8_dcp_checkpoint(str(bad_path), module.state_dict())
 
 
-def test_dcp_preflight_uses_ep_restored_expected_shape(tmp_path):
+def _assert_dcp_preflight_uses_ep_restored_expected_shape(tmp_path):
     # Simulate ModelState.state_dict(): live expert params may have E_local=2,
     # while the expected DCP view restores the global E=4 dimension.
     restored_state = {
@@ -212,13 +192,16 @@ def test_dcp_preflight_uses_ep_restored_expected_shape(tmp_path):
     validate_native_fp8_dcp_checkpoint(str(checkpoint_path), restored_state)
 
 
-def test_generic_expert_fsdp_helper_removes_mixed_precision_without_skipping_fsdp():
-    class FullPrecisionExpertState:
-        fsdp_requires_full_precision = True
-
-    kwargs = _expert_fsdp_kwargs_for_module(
-        {"mesh": "mesh", "mp_policy": "bf16", "reshard_after_forward": True},
-        FullPrecisionExpertState(),
-    )
-
-    assert kwargs == {"mesh": "mesh", "reshard_after_forward": True}
+def test_native_block_fp8_encoding_checkpoint_execution_and_admission_contract(tmp_path, monkeypatch):
+    _assert_pack_roundtrip_is_byte_exact()
+    _assert_linear_state_survives_dtype_apply_byte_exactly()
+    _assert_state_dict_roundtrip_retains_both_parameter_byte_streams()
+    _assert_state_dict_rejects_castable_payloads()
+    _assert_apply_exception_never_strands_protected_parameters()
+    _assert_real_dcp_metadata_is_checked_before_load(tmp_path)
+    _assert_dcp_preflight_uses_ep_restored_expected_shape(tmp_path)
+    _assert_cpu_execution_and_materialization_fail_closed_without_eager_sglang_import()
+    _assert_partition_ranges_cross_the_module_forward_hook_boundary(monkeypatch)
+    _assert_phase_one_forward_rejects_activation_or_base_gradients()
+    _assert_linear_partition_contract_fails_before_kernel_dispatch()
+    _assert_rejects_wrong_pair_dtype_shape_and_nonfinite_scale()

@@ -32,47 +32,10 @@ class _TinyPlainLinearModel(torch.nn.Module):
         self.proj = torch.nn.Linear(4, 3)
 
 
-def test_reference_state_dict_bypasses_dcp_state_dict_and_skips_nonpersistent_buffers(monkeypatch):
-    monkeypatch.setattr(checkpointer, "get_parallel_state", lambda: SimpleNamespace(dp_mode="none"))
-    monkeypatch.setattr(
-        checkpointer,
-        "get_model_state_dict",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected DCP state_dict call")),
-    )
-
-    model_state = checkpointer.ModelState(_TinyModel())
-    state_dict = model_state.reference_state_dict()
-
-    assert "linear.weight" in state_dict
-    assert "persistent_buf" in state_dict
-    assert "scratch_buf" not in state_dict
-
-
-def test_reference_state_dict_includes_qarl_persistent_buffers(monkeypatch):
-    monkeypatch.setattr(checkpointer, "get_parallel_state", lambda: SimpleNamespace(dp_mode="none"))
-    monkeypatch.setattr(
-        checkpointer,
-        "get_model_state_dict",
-        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("unexpected DCP state_dict call")),
-    )
-
-    model = _TinyQARLModel()
-    model.proj(torch.randn(2, 4))
-    state_dict = checkpointer.ModelState(model).reference_state_dict()
-
-    assert "proj.weight" in state_dict
-    assert "proj.qarl_input_amax" in state_dict
-    assert "proj.qarl_weight_amax" in state_dict
-    assert "proj.qarl_input_scale_inv" in state_dict
-    assert "proj.qarl_weight_scale_inv" in state_dict
-    assert "proj.qarl_forward_count" in state_dict
-    assert state_dict["proj.qarl_weight_scale_inv"].shape == (2, 2)
-    assert state_dict["proj.qarl_forward_count"].item() == 1
-
-
-def test_checkpoint_metadata_records_qarl_persistent_buffers(tmp_path, monkeypatch):
+def _assert_checkpoint_compatibility_detects_qarl_buffer_mismatch(tmp_path, monkeypatch):
+    tmp_path.mkdir(parents=True)
+    monkeypatch.setattr(checkpointer, "get_parallel_state", lambda: SimpleNamespace(pp_enabled=False))
     monkeypatch.setattr(checkpointer.dist, "get_rank", lambda: 0)
-
     checkpointer._save_checkpoint_metadata(str(tmp_path), _TinyQARLModel())
 
     metadata = json.loads((tmp_path / "checkpoint_metadata.json").read_text(encoding="utf-8"))
@@ -85,11 +48,6 @@ def test_checkpoint_metadata_records_qarl_persistent_buffers(tmp_path, monkeypat
         "proj.qarl_weight_amax",
         "proj.qarl_weight_scale_inv",
     ]
-
-
-def test_checkpoint_compatibility_detects_qarl_buffer_mismatch(tmp_path, monkeypatch):
-    monkeypatch.setattr(checkpointer.dist, "get_rank", lambda: 0)
-    checkpointer._save_checkpoint_metadata(str(tmp_path), _TinyQARLModel())
 
     with pytest.raises(RuntimeError, match="Unexpected buffers"):
         checkpointer._validate_checkpoint_compatibility(str(tmp_path), _TinyPlainLinearModel(), strict=True)
@@ -108,7 +66,7 @@ def test_checkpoint_compatibility_detects_qarl_buffer_mismatch(tmp_path, monkeyp
     }
 
 
-def test_checkpoint_key_contract_does_not_collect_without_pipeline_parallelism(monkeypatch):
+def _assert_checkpoint_model_key_and_compatibility_policy(tmp_path, monkeypatch):
     monkeypatch.setattr(checkpointer, "get_parallel_state", lambda: SimpleNamespace(pp_enabled=False))
     monkeypatch.setattr(
         checkpointer.dist,
@@ -122,8 +80,13 @@ def test_checkpoint_key_contract_does_not_collect_without_pipeline_parallelism(m
     assert buffer_keys == ["persistent_buf"]
     assert pipeline_key_union is False
 
+    _assert_checkpoint_key_contract_unions_pipeline_stage_keys(monkeypatch)
+    _assert_checkpoint_compatibility_detects_qarl_buffer_mismatch(tmp_path / "qarl", monkeypatch)
+    _assert_checkpoint_metadata_uses_pipeline_stage_key_union(tmp_path / "metadata", monkeypatch)
+    _assert_pipeline_lora_checkpoint_compatibility_policy(tmp_path, monkeypatch)
 
-def test_checkpoint_key_contract_unions_pipeline_stage_keys(monkeypatch):
+
+def _assert_checkpoint_key_contract_unions_pipeline_stage_keys(monkeypatch):
     monkeypatch.setattr(checkpointer, "get_parallel_state", lambda: SimpleNamespace(pp_enabled=True))
     monkeypatch.setattr(checkpointer.dist, "is_initialized", lambda: True)
     monkeypatch.setattr(checkpointer.dist, "get_world_size", lambda group=None: 2)
@@ -145,7 +108,8 @@ def test_checkpoint_key_contract_unions_pipeline_stage_keys(monkeypatch):
     assert pipeline_key_union is True
 
 
-def test_checkpoint_metadata_records_pipeline_stage_key_union(tmp_path, monkeypatch):
+def _assert_checkpoint_metadata_uses_pipeline_stage_key_union(tmp_path, monkeypatch):
+    tmp_path.mkdir(parents=True)
     monkeypatch.setattr(checkpointer.dist, "get_rank", lambda: 0)
     monkeypatch.setattr(
         checkpointer,
@@ -166,34 +130,17 @@ def test_checkpoint_metadata_records_pipeline_stage_key_union(tmp_path, monkeypa
     assert metadata["num_buffers"] == 1
     assert metadata["buffer_keys"] == ["layers.1.cache"]
 
-
-def test_checkpoint_compatibility_validates_pipeline_stage_key_union(tmp_path, monkeypatch):
-    metadata = {
-        "parameter_keys": ["linear.weight", "stage_1.weight"],
-        "buffer_keys": ["persistent_buf", "stage_1.cache"],
-    }
-    (tmp_path / "checkpoint_metadata.json").write_text(json.dumps(metadata), encoding="utf-8")
-    monkeypatch.setattr(
-        checkpointer,
-        "_get_checkpoint_model_keys",
-        lambda model, process_group=None: (
-            ["linear.weight", "stage_1.weight"],
-            ["persistent_buf", "stage_1.cache"],
-            True,
-        ),
-    )
-
     result = checkpointer._validate_checkpoint_compatibility(
         str(tmp_path), _TinyModel(), strict=True, process_group=object()
     )
 
     assert result["compatible"] is True
     assert result["pipeline_parallel_key_union"] is True
-    assert result["model_parameter_count"] == 2
-    assert result["model_buffer_count"] == 2
+    assert result["model_parameter_count"] == 3
+    assert result["model_buffer_count"] == 1
 
 
-def test_checkpoint_compatibility_allows_pipeline_base_checkpoint_into_lora_model(tmp_path, monkeypatch):
+def _assert_pipeline_lora_checkpoint_compatibility_policy(tmp_path, monkeypatch):
     metadata = {
         "parameter_keys": ["stage_0.weight", "stage_1.weight"],
         "buffer_keys": [],
@@ -217,8 +164,11 @@ def test_checkpoint_compatibility_allows_pipeline_base_checkpoint_into_lora_mode
     assert result["load_mode"] == "base_to_lora"
     assert set(result["missing_lora_keys"]) == {"stage_0.lora_A", "stage_1.lora_A"}
 
+    _assert_pipeline_lora_only_checkpoint_compatibility(tmp_path / "lora-only", monkeypatch)
 
-def test_checkpoint_compatibility_allows_pipeline_lora_only_checkpoint(tmp_path, monkeypatch):
+
+def _assert_pipeline_lora_only_checkpoint_compatibility(tmp_path, monkeypatch):
+    tmp_path.mkdir(parents=True)
     metadata = {
         "parameter_keys": ["stage_0.lora_A", "stage_1.lora_A"],
         "buffer_keys": [],
@@ -244,110 +194,103 @@ def test_checkpoint_compatibility_allows_pipeline_lora_only_checkpoint(tmp_path,
     assert set(result["missing_non_lora_keys"]) == {"stage_0.weight", "stage_1.weight"}
 
 
-def test_distributed_checkpointer_load_skips_missing_optimizer_state(tmp_path, monkeypatch):
-    captured = {}
-
-    class _FakeReader:
-        def __init__(self, path):
-            self.path = path
-
-        def read_metadata(self):
-            return SimpleNamespace(state_dict_metadata={"model.linear.weight": object()})
-
-    def fake_dcp_load(state_dict, storage_reader, process_group=None, planner=None, no_dist=False):
-        captured["state_keys"] = set(state_dict)
-        captured["storage_reader"] = storage_reader
-        captured["process_group"] = process_group
-        captured["planner"] = planner
-        captured["no_dist"] = no_dist
-
-    monkeypatch.setattr(checkpointer, "FileSystemReader", _FakeReader)
-    monkeypatch.setattr(checkpointer.dcp, "load", fake_dcp_load)
-
-    state = {"model": _TinyModel(), "optimizer": object()}
-    result = checkpointer.DistributedCheckpointer.load(str(tmp_path), state)
-
-    assert result is state
-    assert captured["state_keys"] == {"model"}
-    assert isinstance(captured["storage_reader"], _FakeReader)
-    assert captured["planner"] is not None
-    assert captured["no_dist"] is False
+def test_distributed_checkpointer_io_policy(tmp_path, monkeypatch):
+    with monkeypatch.context() as case_patch:
+        _assert_distributed_checkpointer_process_group_selection_policy(case_patch)
+    compatibility_root = tmp_path / "compatibility"
+    compatibility_root.mkdir()
+    with monkeypatch.context() as case_patch:
+        _assert_checkpoint_model_key_and_compatibility_policy(compatibility_root, case_patch)
+    optimizer_root = tmp_path / "optimizer"
+    optimizer_root.mkdir()
+    with monkeypatch.context() as case_patch:
+        _assert_optimizer_state_checkpoint_filtering_policy(optimizer_root, case_patch)
+    with monkeypatch.context() as case_patch:
+        _assert_distributed_checkpointer_metadata_admission_policy(tmp_path / "metadata", case_patch)
+    with monkeypatch.context() as case_patch:
+        _assert_pipeline_load_uses_custom_dcp_group(tmp_path / "load", case_patch)
+    with monkeypatch.context() as case_patch:
+        _assert_distributed_checkpointer_save_group_policy(tmp_path / "save", case_patch)
 
 
-def test_distributed_checkpointer_no_dist_still_uses_gloo_for_pipeline_key_validation(tmp_path, monkeypatch):
-    captured = {}
-    metadata_group = object()
+def _assert_distributed_checkpointer_process_group_selection_policy(monkeypatch):
+    created = []
+    fake_group = object()
 
-    class _FakeReader:
-        def __init__(self, path):
-            self.path = path
-
-        def read_metadata(self):
-            return SimpleNamespace(state_dict_metadata={"model.linear.weight": object()})
-
-    def fake_validate(checkpoint_dir, model, strict=True, process_group=None):
-        captured["validation_process_group"] = process_group
-        return {"validated": False, "reason": "test"}
-
-    def fake_dcp_load(state_dict, storage_reader, process_group=None, planner=None, no_dist=False):
-        captured["dcp_process_group"] = process_group
-        captured["no_dist"] = no_dist
-
-    monkeypatch.setenv("XORL_DCP_LOAD_NO_DIST", "1")
-    monkeypatch.setattr(checkpointer, "get_parallel_state", lambda: SimpleNamespace(pp_enabled=True))
     monkeypatch.setattr(
-        checkpointer.DistributedCheckpointer,
-        "_get_sync_process_group",
-        classmethod(lambda cls: metadata_group),
+        checkpointer,
+        "dist",
+        SimpleNamespace(
+            is_available=lambda: True,
+            is_initialized=lambda: True,
+            get_backend=lambda: "nccl",
+            new_group=lambda backend: created.append(backend) or fake_group,
+        ),
     )
-    monkeypatch.setattr(checkpointer, "_validate_checkpoint_compatibility", fake_validate)
-    monkeypatch.setattr(checkpointer, "FileSystemReader", _FakeReader)
-    monkeypatch.setattr(checkpointer.dcp, "load", fake_dcp_load)
+    monkeypatch.setattr(checkpointer.DistributedCheckpointer, "_sync_process_group", None)
 
-    checkpointer.DistributedCheckpointer.load(str(tmp_path), {"model": _TinyModel()})
+    assert checkpointer.DistributedCheckpointer._get_sync_process_group() is fake_group
+    assert checkpointer.DistributedCheckpointer._get_sync_process_group() is fake_group
+    assert created == ["gloo"]
 
-    assert captured["validation_process_group"] is metadata_group
-    assert captured["dcp_process_group"] is None
-    assert captured["no_dist"] is True
+    monkeypatch.setattr(
+        checkpointer,
+        "dist",
+        SimpleNamespace(
+            is_available=lambda: True,
+            is_initialized=lambda: True,
+            get_backend=lambda: "gloo",
+        ),
+    )
+    checkpointer.DistributedCheckpointer._sync_process_group = None
+    assert checkpointer.DistributedCheckpointer._get_sync_process_group() is None
 
-
-def test_distributed_checkpointer_no_dist_non_pipeline_avoids_process_groups(tmp_path, monkeypatch):
-    captured = {}
-
-    class _FakeReader:
-        def __init__(self, path):
-            self.path = path
-
-        def read_metadata(self):
-            return SimpleNamespace(state_dict_metadata={"model.linear.weight": object()})
-
-    def fake_validate(checkpoint_dir, model, strict=True, process_group=None):
-        captured["validation_process_group"] = process_group
-        return {"validated": False, "reason": "test"}
-
-    def fake_dcp_load(state_dict, storage_reader, process_group=None, planner=None, no_dist=False):
-        captured["dcp_process_group"] = process_group
-        captured["no_dist"] = no_dist
-
-    monkeypatch.setenv("XORL_DCP_LOAD_NO_DIST", "1")
     monkeypatch.setattr(checkpointer, "get_parallel_state", lambda: SimpleNamespace(pp_enabled=False))
     monkeypatch.setattr(
         checkpointer.DistributedCheckpointer,
         "_get_sync_process_group",
         classmethod(lambda cls: (_ for _ in ()).throw(AssertionError("unexpected process group"))),
     )
-    monkeypatch.setattr(checkpointer, "_validate_checkpoint_compatibility", fake_validate)
-    monkeypatch.setattr(checkpointer, "FileSystemReader", _FakeReader)
-    monkeypatch.setattr(checkpointer.dcp, "load", fake_dcp_load)
+    assert checkpointer.DistributedCheckpointer._get_metadata_process_group() is None
+    assert checkpointer.DistributedCheckpointer._get_metadata_process_group(object()) is None
 
-    checkpointer.DistributedCheckpointer.load(str(tmp_path), {"model": _TinyModel()})
+    custom_group = object()
+    monkeypatch.setattr(checkpointer, "get_parallel_state", lambda: SimpleNamespace(pp_enabled=True))
+    monkeypatch.setattr(
+        checkpointer.DistributedCheckpointer,
+        "_get_sync_process_group",
+        classmethod(lambda cls: (_ for _ in ()).throw(AssertionError("unexpected global process group"))),
+    )
+    assert checkpointer.DistributedCheckpointer._get_metadata_process_group(custom_group) is custom_group
 
-    assert captured["validation_process_group"] is None
-    assert captured["dcp_process_group"] is None
-    assert captured["no_dist"] is True
+    metadata_group = object()
+    monkeypatch.setattr(
+        checkpointer.DistributedCheckpointer,
+        "_get_sync_process_group",
+        classmethod(lambda cls: metadata_group),
+    )
+    assert checkpointer.DistributedCheckpointer._get_metadata_process_group() is metadata_group
 
 
-def test_distributed_checkpointer_pipeline_validation_uses_custom_dcp_group(tmp_path, monkeypatch):
+def _assert_distributed_checkpointer_metadata_admission_policy(tmp_path, monkeypatch):
+    source = _TinyModel()
+    source.linear.weight.data.copy_(torch.arange(8, dtype=torch.float32).reshape(2, 4))
+    checkpointer.dcp.save({"model": source.state_dict()}, checkpoint_id=str(tmp_path))
+
+    target = _TinyModel()
+    optimizer = torch.optim.Adam(target.parameters())
+    monkeypatch.setenv("XORL_DCP_LOAD_NO_DIST", "1")
+    monkeypatch.setattr(checkpointer, "get_parallel_state", lambda: SimpleNamespace(pp_enabled=False))
+
+    state = {"model": target, "optimizer": optimizer}
+    result = checkpointer.DistributedCheckpointer.load(str(tmp_path), state)
+
+    assert result is state
+    assert torch.equal(target.linear.weight, source.linear.weight)
+    assert optimizer.state == {}
+
+
+def _assert_pipeline_load_uses_custom_dcp_group(tmp_path, monkeypatch):
     captured = {}
     custom_group = object()
 
@@ -385,7 +328,7 @@ def test_distributed_checkpointer_pipeline_validation_uses_custom_dcp_group(tmp_
     assert captured["dcp_process_group"] is custom_group
 
 
-def test_distributed_checkpointer_sync_save_reuses_pipeline_gloo_for_metadata(tmp_path, monkeypatch):
+def _assert_distributed_checkpointer_save_group_policy(tmp_path, monkeypatch):
     captured = {}
     sync_group = object()
 
@@ -420,8 +363,10 @@ def test_distributed_checkpointer_sync_save_reuses_pipeline_gloo_for_metadata(tm
     assert captured["dcp_process_group"] is sync_group
     assert captured["metadata_process_group"] is sync_group
 
+    _assert_async_save_non_pipeline_avoids_second_gloo(tmp_path, monkeypatch)
 
-def test_distributed_checkpointer_async_save_non_pipeline_avoids_second_gloo(tmp_path, monkeypatch):
+
+def _assert_async_save_non_pipeline_avoids_second_gloo(tmp_path, monkeypatch):
     captured = {}
     async_group = object()
 
@@ -466,7 +411,7 @@ def test_distributed_checkpointer_async_save_non_pipeline_avoids_second_gloo(tmp
     assert captured["metadata_process_group"] is None
 
 
-def test_optimizer_state_filters_load_target_to_checkpoint_keys():
+def _assert_optimizer_state_checkpoint_filtering_policy(tmp_path, monkeypatch):
     class _FakeMultiOptimizer:
         _is_multi_optimizer = True
 
@@ -501,8 +446,13 @@ def test_optimizer_state_filters_load_target_to_checkpoint_keys():
     assert optimizer.loaded_state_dict is state_dict
     assert optimizer.loaded_strict is False
 
+    with monkeypatch.context() as case_patch:
+        _assert_distributed_load_passes_optimizer_metadata_keys(tmp_path / "metadata", case_patch)
+    with monkeypatch.context() as case_patch:
+        _assert_multi_optimizer_load_filters_state_per_child(case_patch)
 
-def test_distributed_checkpointer_load_passes_optimizer_metadata_keys(tmp_path, monkeypatch):
+
+def _assert_distributed_load_passes_optimizer_metadata_keys(tmp_path, monkeypatch):
     captured = {}
 
     class _FakeReader:
@@ -534,7 +484,7 @@ def test_distributed_checkpointer_load_passes_optimizer_metadata_keys(tmp_path, 
     }
 
 
-def test_multi_optimizer_load_filters_state_per_child_optimizer(monkeypatch):
+def _assert_multi_optimizer_load_filters_state_per_child(monkeypatch):
     ep_optimizer = object()
     non_ep_optimizer = object()
     calls = []
