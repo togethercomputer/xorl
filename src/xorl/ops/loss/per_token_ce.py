@@ -24,6 +24,14 @@ from xorl.ops.loss.vocab_parallel_cross_entropy import (
 
 _MODULE_LM_HEAD_MIN_CHUNK_ROWS = 128
 
+#: The one remaining transform-scoring rejection: an FP8 lm_head module owns
+#: its own quantized projection, so the closed-form raw-weight VJP of the
+#: shared scoring core does not apply to it.
+SAMPLING_TRANSFORM_LM_HEAD_MODULE_ERROR = (
+    "top-k/top-p/min-p and per-row logprob_temperature replay score from the raw lm-head weight and do not "
+    "support an FP8 lm_head module; set lm_head_fp32: true so the master weight is scored instead"
+)
+
 LogprobTemperature = float | torch.Tensor
 LogprobTopK = int | torch.Tensor
 LogprobProbability = float | torch.Tensor
@@ -188,8 +196,13 @@ def compute_per_token_ce(
         logprob_temperature: Temperature applied before the selected-token
             logprob/CE calculation. ``1.0`` preserves raw model logprobs; values
             such as a rollout temperature of ``0.7`` compute behavior-policy
-            logprobs matching ``log_softmax(logits / temperature)``. Exact heads
-            also accept a contiguous per-row FP32 tensor.
+            logprobs matching ``log_softmax(logits / temperature)``. Every mode
+            also accepts a contiguous per-row FP32 tensor.
+        logprob_top_k/logprob_top_p/logprob_min_p: Per-row replay transforms.
+            Non-identity values score the selected token on the joint support
+            of the pinned sampling-transform program; a replayed token outside
+            current support scores ``-inf`` logprob with zero gradient. All
+            modes support them except an FP8 ``lm_head`` module.
 
     Returns:
         per_token_ce: Per-token cross-entropy loss, shape (BT,)
@@ -266,14 +279,45 @@ def compute_per_token_ce(
     # raw-weight FP32 path below rather than calling ``FP8Linear.forward``. The
     # passed ``weight`` is the master (non-quantized) lm_head weight.
     use_lm_head_module = lm_head is not None and not lm_head_fp32
+
+    # Replay transforms on the generic modes all route through the one shared
+    # chunked scoring core; ``bi_fused`` keeps its own kernels and composes the
+    # same program inside :mod:`xorl.ops.loss.bi_fused_lm_head`.
+    if (has_sampling_filter or isinstance(logprob_temperature, torch.Tensor)) and ce_mode != "bi_fused":
+        if use_lm_head_module:
+            raise NotImplementedError(SAMPLING_TRANSFORM_LM_HEAD_MODULE_ERROR)
+        from xorl.ops.loss.sampling_transform_ce import (  # noqa: PLC0415
+            sampling_transform_per_token_ce,
+        )
+
+        if isinstance(logprob_temperature, torch.Tensor):
+            temperature_rows = logprob_temperature
+        elif logprob_temperature == 1.0:
+            temperature_rows = None
+        else:
+            temperature_rows = torch.full(
+                (rows,),
+                float(logprob_temperature),
+                dtype=torch.float32,
+                device=hidden_states_flat.device,
+            )
+        return sampling_transform_per_token_ce(
+            hidden_states_flat,
+            weight,
+            labels_flat,
+            ignore_index=ignore_index,
+            temperature_rows=temperature_rows,
+            top_ks=logprob_top_ks,
+            top_ps=logprob_top_ps,
+            min_ps=logprob_min_ps,
+            lm_head_fp32=lm_head_fp32,
+            tp_group=tp_group,
+        )
+
     # ``fused_quack`` is an explicit opt-in that fuses the selected-token logprob
     # via chunked cuBLAS matmul + a fused CuTeDSL cross-entropy reduction
     # (chunk-sized logits, scalar TP reductions); it serves TP and non-TP cases.
     if ce_mode == "fused_quack":
-        if has_sampling_filter:
-            raise NotImplementedError("top-k/top-p/min-p replay is supported only by exact LM-head modes")
-        if isinstance(logprob_temperature, torch.Tensor):
-            raise NotImplementedError("per-row logprob_temperature is supported only by exact LM-head modes")
         local_weight = weight.to_local() if hasattr(weight, "to_local") else weight
         hidden_for_ce = hidden_states_flat
         if lm_head_fp32:
@@ -333,12 +377,7 @@ def compute_per_token_ce(
             min_ps=logprob_min_ps,
         )
 
-    if has_sampling_filter:
-        raise NotImplementedError("top-k/top-p/min-p replay is supported only by exact LM-head modes")
-
     if tp_group is not None:
-        if isinstance(logprob_temperature, torch.Tensor):
-            raise NotImplementedError("per-row logprob_temperature is supported only by exact LM-head modes")
         if use_lm_head_module:
             if logprob_temperature != 1.0:
                 raise NotImplementedError("logprob_temperature with tensor-parallel lm_head modules is not supported")
@@ -368,8 +407,6 @@ def compute_per_token_ce(
         )
 
     if use_lm_head_module:
-        if isinstance(logprob_temperature, torch.Tensor):
-            raise NotImplementedError("per-row logprob_temperature is supported only by exact LM-head modes")
         return _module_lm_head_ce(
             hidden_states_flat,
             labels_flat,
@@ -379,8 +416,6 @@ def compute_per_token_ce(
             logprob_temperature=logprob_temperature,
         )
 
-    if isinstance(logprob_temperature, torch.Tensor):
-        raise NotImplementedError("per-row logprob_temperature is supported only by exact LM-head modes")
     hidden_for_ce = hidden_states_flat.float() if lm_head_fp32 else hidden_states_flat
     hidden_for_ce = _scale_hidden_for_temperature(hidden_for_ce, logprob_temperature)
     if ce_mode == "compiled":

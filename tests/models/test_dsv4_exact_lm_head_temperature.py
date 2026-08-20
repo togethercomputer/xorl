@@ -9,10 +9,16 @@ import xorl.models.transformers.deepseek_v4.exact_lm_head as exact_head
 from xorl.models.transformers.deepseek_v4.exact_lm_head import (
     _Dsv4ExactDistributedHeadFunction,
     _rank_order_variable_row_all_gather,
-    _selected_logprob_reference_grad,
-    _selected_logprob_reference_grad_filtered,
-    _selected_logprob_reference_grad_partitioned,
     _temperature_scale_bf16_logits,
+)
+from xorl.ops.exact_sampling_transforms import (
+    selected_logprob_reference_grad as _selected_logprob_reference_grad,
+)
+from xorl.ops.exact_sampling_transforms import (
+    selected_logprob_reference_grad_filtered as _selected_logprob_reference_grad_filtered,
+)
+from xorl.ops.exact_sampling_transforms import (
+    selected_logprob_reference_grad_partitioned as _selected_logprob_reference_grad_partitioned,
 )
 from xorl.ops.loss.per_token_ce import compute_per_token_ce
 
@@ -176,6 +182,7 @@ def test_dsv4_custom_boundary_carries_temperature_through_adapter_backward(
         lora_b,
         token_ids,
         temperature,
+        (None, None, None),
         FakeComponent(),
     )
     logprob.sum().backward()

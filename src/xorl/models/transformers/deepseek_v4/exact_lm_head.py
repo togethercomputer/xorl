@@ -25,8 +25,17 @@ from xorl.ops.exact_sampling_transforms import (
     EXACT_FILTER_ROW_CHUNK,
     exact_sampling_identity_rows,
     exact_sampling_support,
-    exact_selected_logprob_from_support,
     exact_selected_logprob_partitioned_from_support,
+    normalize_temperature_rows,
+)
+from xorl.ops.exact_sampling_transforms import (
+    selected_logprob_reference_grad as _selected_logprob_reference_grad,
+)
+from xorl.ops.exact_sampling_transforms import (
+    selected_logprob_reference_grad_partitioned as _selected_logprob_reference_grad_partitioned,
+)
+from xorl.ops.exact_sampling_transforms import (
+    validate_temperature_rows as _validate_temperature_rows,
 )
 
 
@@ -134,31 +143,6 @@ def _rank_order_vocab_all_gather(local_logits: Tensor, group: dist.ProcessGroup)
     )
 
 
-def _validate_temperature_rows(
-    temperature: Tensor | None,
-    *,
-    rows: int,
-    device: torch.device,
-) -> Tensor | None:
-    if temperature is None:
-        return None
-    if temperature.dtype is not torch.float32:
-        raise TypeError(f"DSV4 exact temperature must be FP32, got {temperature.dtype}")
-    if temperature.device != device or tuple(temperature.shape) != (rows,):
-        raise ValueError(
-            "DSV4 exact temperature must be row-aligned on the head device, got "
-            f"shape={tuple(temperature.shape)} device={temperature.device}"
-        )
-    if not temperature.is_contiguous() or temperature.requires_grad:
-        raise ValueError("DSV4 exact temperature must be contiguous sampling metadata")
-    if temperature.device.type != "meta":
-        torch._assert_async(
-            (torch.isfinite(temperature) & (temperature > 0)).all(),
-            "DSV4 exact temperature must contain finite values > 0",
-        )
-    return temperature
-
-
 def _temperature_scale_bf16_logits(
     logits: Tensor,
     temperature: Tensor | None,
@@ -180,59 +164,6 @@ def _temperature_scale_bf16_logits(
     if temperature is None:
         return logits
     return exact_temperature_scale_bf16_logits(logits, temperature)
-
-
-def _selected_logprob_reference_grad(
-    full_logits: Tensor,
-    token_ids: Tensor,
-    grad_logprob: Tensor,
-    temperature: Tensor | None,
-) -> Tensor:
-    with torch.enable_grad(), torch.autocast(device_type=full_logits.device.type, enabled=False):
-        logits = full_logits.float().detach().requires_grad_(True)
-        score_logits = logits if temperature is None else logits * (1.0 / temperature).unsqueeze(1)
-        selected = F.log_softmax(score_logits, dim=-1).gather(1, token_ids.unsqueeze(1)).squeeze(1)
-        (gradient,) = torch.autograd.grad(selected, logits, grad_outputs=grad_logprob.float())
-    return gradient.contiguous()
-
-
-def _selected_logprob_reference_grad_filtered(
-    full_logits: Tensor,
-    token_ids: Tensor,
-    grad_logprob: Tensor,
-    temperature: Tensor | None,
-    support: Tensor,
-) -> Tensor:
-    with torch.enable_grad(), torch.autocast(device_type=full_logits.device.type, enabled=False):
-        logits = full_logits.float().detach().requires_grad_(True)
-        score_logits = logits if temperature is None else logits * (1.0 / temperature).unsqueeze(1)
-        selected, _, _ = exact_selected_logprob_from_support(score_logits, token_ids, support)
-        (gradient,) = torch.autograd.grad(selected, logits, grad_outputs=grad_logprob.float())
-    return gradient.contiguous()
-
-
-def _selected_logprob_reference_grad_partitioned(
-    full_logits: Tensor,
-    token_ids: Tensor,
-    grad_logprob: Tensor,
-    temperature: Tensor | None,
-    support: Tensor,
-    identity_rows: Tensor,
-) -> Tensor:
-    native_grad = _selected_logprob_reference_grad(
-        full_logits,
-        token_ids,
-        grad_logprob,
-        temperature,
-    )
-    filtered_grad = _selected_logprob_reference_grad_filtered(
-        full_logits,
-        token_ids,
-        grad_logprob,
-        temperature,
-        support,
-    )
-    return torch.where(identity_rows.unsqueeze(1), native_grad, filtered_grad).contiguous()
 
 
 def _local_surrogate_vjp(
@@ -279,15 +210,9 @@ class _Dsv4ExactDistributedHeadFunction(torch.autograd.Function):
         local_lora_b: Tensor,
         local_token_ids: Tensor,
         local_temperature: Tensor | None,
-        local_sampling_transforms: tuple[Tensor | None, Tensor | None, Tensor | None]
-        | "Dsv4ExactTP8LmHeadSelectedLogprob",
-        component: "Dsv4ExactTP8LmHeadSelectedLogprob" | None = None,
+        local_sampling_transforms: tuple[Tensor | None, Tensor | None, Tensor | None],
+        component: "Dsv4ExactTP8LmHeadSelectedLogprob",
     ) -> Tensor:
-        legacy_call = component is None
-        if legacy_call:
-            component = local_sampling_transforms
-            local_sampling_transforms = (None, None, None)
-        ctx.legacy_call = legacy_call
         group = component._validate_tp_group()
         row_counts = _rank_order_row_counts(local_hidden.shape[0], local_hidden.device, group)
         if sum(row_counts) <= 0:
@@ -379,8 +304,7 @@ class _Dsv4ExactDistributedHeadFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_local_logprob: Tensor | None):
         if grad_local_logprob is None:
-            result = (None, None, None, None, None, None, None, None)
-            return result[:-1] if ctx.legacy_call else result
+            return (None, None, None, None, None, None, None, None)
         (
             gathered_hidden,
             local_weight,
@@ -420,8 +344,7 @@ class _Dsv4ExactDistributedHeadFunction(torch.autograd.Function):
         )
         if grad_hidden is not None:
             grad_hidden = grad_hidden.narrow(0, ctx.source_offset, ctx.local_rows).contiguous()
-        result = (grad_hidden, None, grad_a, grad_b, None, None, None, None)
-        return result[:-1] if ctx.legacy_call else result
+        return (grad_hidden, None, grad_a, grad_b, None, None, None, None)
 
 
 class Dsv4ExactTP8LmHeadLoraLinear(LoraLinear):
@@ -853,21 +776,11 @@ def dsv4_exact_lm_head_per_token_ce(
     local_weight = local(weight)
     lora_a = local(lm_head.lora_A)
     local_lora_b = local(lm_head.lora_B)
-    if isinstance(logprob_temperature, Tensor):
-        temperature_rows = _validate_temperature_rows(
-            logprob_temperature,
-            rows=hidden_states_flat.shape[0],
-            device=hidden_states_flat.device,
-        )
-    elif float(logprob_temperature) == 1.0:
-        temperature_rows = None
-    else:
-        temperature_rows = torch.full(
-            (hidden_states_flat.shape[0],),
-            float(logprob_temperature),
-            dtype=torch.float32,
-            device=hidden_states_flat.device,
-        )
+    temperature_rows = normalize_temperature_rows(
+        logprob_temperature,
+        rows=hidden_states_flat.shape[0],
+        device=hidden_states_flat.device,
+    )
     valid_indices = (labels_flat != int(ignore_index)).nonzero(as_tuple=True)[0]
     local_valid_count = int(valid_indices.numel())
     max_valid_count = torch.tensor([local_valid_count], dtype=torch.int64, device=hidden_states_flat.device)

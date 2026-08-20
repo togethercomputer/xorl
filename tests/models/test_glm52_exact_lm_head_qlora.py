@@ -18,12 +18,18 @@ from xorl.models.transformers.glm5.exact_lm_head_qlora import (
     _Glm52ExactTP16LmHeadFunction,
     _local_qlora_surrogate_vjp,
     _rank_order_vocab_from_stacked,
-    _selected_logprob_reference_grad,
-    _selected_logprob_reference_grad_filtered,
-    _selected_logprob_reference_grad_partitioned,
     glm52_lm_head_shard,
 )
 from xorl.ops.bi_families_v2 import exact_temperature_scale_fp32_logits
+from xorl.ops.exact_sampling_transforms import (
+    selected_logprob_reference_grad as _selected_logprob_reference_grad,
+)
+from xorl.ops.exact_sampling_transforms import (
+    selected_logprob_reference_grad_filtered as _selected_logprob_reference_grad_filtered,
+)
+from xorl.ops.exact_sampling_transforms import (
+    selected_logprob_reference_grad_partitioned as _selected_logprob_reference_grad_partitioned,
+)
 
 
 def _component(tp_rank: int = 0, tp_group=None) -> Glm52ExactTP16LmHeadSelectedLogprob:
@@ -281,6 +287,7 @@ def _assert_custom_boundary_is_grad_enabled_and_saves_effective_factor_bytes() -
         lora_B,
         token_ids,
         temperature,
+        (None, None, None),
         FakeComponent(),
     )
     assert logprob.requires_grad

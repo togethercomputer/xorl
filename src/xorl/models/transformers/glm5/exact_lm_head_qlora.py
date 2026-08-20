@@ -37,8 +37,17 @@ from xorl.ops.exact_sampling_transforms import (
     EXACT_FILTER_ROW_CHUNK,
     exact_sampling_identity_rows,
     exact_sampling_support,
-    exact_selected_logprob_from_support,
     exact_selected_logprob_partitioned_from_support,
+    normalize_temperature_rows,
+)
+from xorl.ops.exact_sampling_transforms import (
+    selected_logprob_reference_grad as _selected_logprob_reference_grad,
+)
+from xorl.ops.exact_sampling_transforms import (
+    selected_logprob_reference_grad_partitioned as _selected_logprob_reference_grad_partitioned,
+)
+from xorl.ops.exact_sampling_transforms import (
+    validate_temperature_rows as _validate_temperature_rows,
 )
 
 
@@ -251,31 +260,6 @@ def _require_equal_nonzero_row_count(value: Tensor, group: dist.ProcessGroup) ->
         )
 
 
-def _validate_temperature_rows(
-    temperature: Tensor | None,
-    *,
-    rows: int,
-    device: torch.device,
-) -> Tensor | None:
-    if temperature is None:
-        return None
-    if temperature.dtype is not torch.float32:
-        raise TypeError(f"GLM-5.2 exact temperature must be FP32, got {temperature.dtype}")
-    if temperature.device != device or tuple(temperature.shape) != (rows,):
-        raise ValueError(
-            "GLM-5.2 exact temperature must be row-aligned on the head device, got "
-            f"shape={tuple(temperature.shape)} device={temperature.device}"
-        )
-    if not temperature.is_contiguous() or temperature.requires_grad:
-        raise ValueError("GLM-5.2 exact temperature must be contiguous sampling metadata")
-    if temperature.device.type != "meta":
-        torch._assert_async(
-            (torch.isfinite(temperature) & (temperature > 0)).all(),
-            "GLM-5.2 exact temperature must contain finite values > 0",
-        )
-    return temperature
-
-
 def _local_qlora_surrogate_logits(
     hidden: Tensor,
     local_weight: Tensor,
@@ -354,63 +338,6 @@ def _local_qlora_surrogate_vjp(
     return grad_hidden, by_label.get("A"), by_label.get("B")
 
 
-def _selected_logprob_reference_grad(
-    full_logits: Tensor,
-    token_ids: Tensor,
-    grad_logprob: Tensor,
-    temperature: Tensor | None,
-) -> Tensor:
-    """Differentiate the standalone FP32 QLoRA log-softmax reference."""
-
-    with torch.enable_grad(), torch.autocast(device_type=full_logits.device.type, enabled=False):
-        logits = full_logits.detach().requires_grad_(True)
-        score_logits = logits if temperature is None else logits * (1.0 / temperature).unsqueeze(1)
-        selected = F.log_softmax(score_logits, dim=-1).gather(1, token_ids.unsqueeze(1)).squeeze(1)
-        (grad_logits,) = torch.autograd.grad(selected, logits, grad_outputs=grad_logprob.float())
-    return grad_logits.contiguous()
-
-
-def _selected_logprob_reference_grad_filtered(
-    full_logits: Tensor,
-    token_ids: Tensor,
-    grad_logprob: Tensor,
-    temperature: Tensor | None,
-    support: Tensor,
-) -> Tensor:
-    """Differentiate over the exact support chosen by the value forward."""
-
-    with torch.enable_grad(), torch.autocast(device_type=full_logits.device.type, enabled=False):
-        logits = full_logits.detach().requires_grad_(True)
-        score_logits = logits if temperature is None else logits * (1.0 / temperature).unsqueeze(1)
-        selected, _, _ = exact_selected_logprob_from_support(score_logits, token_ids, support)
-        (grad_logits,) = torch.autograd.grad(selected, logits, grad_outputs=grad_logprob.float())
-    return grad_logits.contiguous()
-
-
-def _selected_logprob_reference_grad_partitioned(
-    full_logits: Tensor,
-    token_ids: Tensor,
-    grad_logprob: Tensor,
-    temperature: Tensor | None,
-    support: Tensor,
-    identity_rows: Tensor,
-) -> Tensor:
-    native_grad = _selected_logprob_reference_grad(
-        full_logits,
-        token_ids,
-        grad_logprob,
-        temperature,
-    )
-    filtered_grad = _selected_logprob_reference_grad_filtered(
-        full_logits,
-        token_ids,
-        grad_logprob,
-        temperature,
-        support,
-    )
-    return torch.where(identity_rows.unsqueeze(1), native_grad, filtered_grad).contiguous()
-
-
 class _Glm52ExactTP16LmHeadFunction(torch.autograd.Function):
     """Own the literal forward and delegate only the VJP to the QLoRA oracle."""
 
@@ -423,14 +350,9 @@ class _Glm52ExactTP16LmHeadFunction(torch.autograd.Function):
         local_lora_B: Tensor,
         token_ids: Tensor,
         temperature: Tensor | None,
-        sampling_transforms: tuple[Tensor | None, Tensor | None, Tensor | None] | Glm52ExactTP16LmHeadSelectedLogprob,
-        component: Glm52ExactTP16LmHeadSelectedLogprob | None = None,
+        sampling_transforms: tuple[Tensor | None, Tensor | None, Tensor | None],
+        component: Glm52ExactTP16LmHeadSelectedLogprob,
     ) -> Tensor:
-        legacy_call = component is None
-        if legacy_call:
-            component = sampling_transforms
-            sampling_transforms = (None, None, None)
-        ctx.legacy_call = legacy_call
         effective_A = lora_A.to(torch.bfloat16).contiguous()
         effective_B = local_lora_B.to(torch.bfloat16).contiguous()
         has_sampling_filter = sampling_transforms[0] is not None
@@ -488,8 +410,7 @@ class _Glm52ExactTP16LmHeadFunction(torch.autograd.Function):
             min_ps,
         ) = ctx.saved_tensors
         if grad_logprob is None:
-            result = (None, None, None, None, None, None, None, None)
-            return result[:-1] if ctx.legacy_call else result
+            return (None, None, None, None, None, None, None, None)
         temperature = None if stored_temperature.numel() == 0 else stored_temperature
         vjp = ctx.component._surrogate_vjp_filtered if ctx.has_sampling_filter else ctx.component._surrogate_vjp
         args = (
@@ -507,8 +428,7 @@ class _Glm52ExactTP16LmHeadFunction(torch.autograd.Function):
             *args,
             needs_input_grad=(ctx.needs_input_grad[0], ctx.needs_input_grad[2], ctx.needs_input_grad[3]),
         )
-        result = (grad_hidden, None, grad_A, grad_B, None, None, None, None)
-        return result[:-1] if ctx.legacy_call else result
+        return (grad_hidden, None, grad_A, grad_B, None, None, None, None)
 
 
 class _Glm52ExactDistributedTP16LmHeadFunction(torch.autograd.Function):
@@ -532,15 +452,9 @@ class _Glm52ExactDistributedTP16LmHeadFunction(torch.autograd.Function):
         local_lora_B: Tensor,
         local_token_ids: Tensor,
         local_temperature: Tensor | None,
-        local_sampling_transforms: tuple[Tensor | None, Tensor | None, Tensor | None]
-        | Glm52ExactTP16LmHeadSelectedLogprob,
-        component: Glm52ExactTP16LmHeadSelectedLogprob | None = None,
+        local_sampling_transforms: tuple[Tensor | None, Tensor | None, Tensor | None],
+        component: Glm52ExactTP16LmHeadSelectedLogprob,
     ) -> Tensor:
-        legacy_call = component is None
-        if legacy_call:
-            component = local_sampling_transforms
-            local_sampling_transforms = (None, None, None)
-        ctx.legacy_call = legacy_call
         group = component._validate_tp_group()
         _require_equal_nonzero_row_count(local_hidden_states, group)
         effective_A = lora_A.to(torch.bfloat16).contiguous()
@@ -618,8 +532,7 @@ class _Glm52ExactDistributedTP16LmHeadFunction(torch.autograd.Function):
             min_ps,
         ) = ctx.saved_tensors
         if grad_local_logprob is None:
-            result = (None, None, None, None, None, None, None, None)
-            return result[:-1] if ctx.legacy_call else result
+            return (None, None, None, None, None, None, None, None)
         temperature = None if stored_temperature.numel() == 0 else stored_temperature
         group = ctx.component._validate_tp_group()
         gathered_grad_logprob = _rank_order_row_all_gather(grad_local_logprob.float().contiguous(), group)
@@ -645,8 +558,7 @@ class _Glm52ExactDistributedTP16LmHeadFunction(torch.autograd.Function):
                 ctx.source_rank * ctx.local_rows,
                 ctx.local_rows,
             ).contiguous()
-        result = (grad_hidden, None, grad_A, grad_B, None, None, None, None)
-        return result[:-1] if ctx.legacy_call else result
+        return (grad_hidden, None, grad_A, grad_B, None, None, None, None)
 
 
 class Glm52ExactTP16LmHeadLoraLinear(LoraLinear):
@@ -1344,21 +1256,11 @@ def glm52_exact_lm_head_per_token_ce(
     local_lora_B = _plain_local(lm_head.lora_B)
     valid = labels_flat != int(ignore_index)
     safe_labels = torch.where(valid, labels_flat, torch.zeros_like(labels_flat))
-    if isinstance(logprob_temperature, Tensor):
-        temperature_rows = _validate_temperature_rows(
-            logprob_temperature,
-            rows=hidden_states_flat.shape[0],
-            device=hidden_states_flat.device,
-        )
-    elif float(logprob_temperature) == 1.0:
-        temperature_rows = None
-    else:
-        temperature_rows = torch.full(
-            (hidden_states_flat.shape[0],),
-            float(logprob_temperature),
-            dtype=torch.float32,
-            device=hidden_states_flat.device,
-        )
+    temperature_rows = normalize_temperature_rows(
+        logprob_temperature,
+        rows=hidden_states_flat.shape[0],
+        device=hidden_states_flat.device,
+    )
     ce_chunks: list[Tensor] = []
     for start in range(0, hidden_states_flat.shape[0], GLM52_EXACT_LM_HEAD_LOCAL_CHUNK_ROWS):
         end = min(start + GLM52_EXACT_LM_HEAD_LOCAL_CHUNK_ROWS, hidden_states_flat.shape[0])

@@ -10,13 +10,13 @@ call keeps the original non-materialized path.
 
 Backward is the closed-form CE gradient computed against the saved forward
 ``lse`` with chunked cuBLAS recompute (stock-numerics class, like the other
-fused CE backwards — the contract governs the forward bits only). All three
-recompute GEMMs run on the resident bf16 tensors with fp32 accumulation
-(``out_dtype=float32``), so no fp32 copy of hidden or weight ever
-materializes.
-"""
+fused CE backwards — the contract governs the forward bits only).
 
-import math
+Per-row temperature and top-k/top-p/min-p replay route through the shared
+chunked scoring core in :mod:`xorl.ops.loss.sampling_transform_ce`, injected
+with the batch-invariant kernels so the forward values stay contract-exact;
+the scalar-one no-filter call keeps the original non-materialized path.
+"""
 
 import torch
 import torch.distributed as dist
@@ -37,9 +37,14 @@ from xorl.ops.bi_families_v2 import (
 from xorl.ops.exact_sampling_transforms import (
     EXACT_FILTER_ROW_CHUNK,
     TOP_K_ALL,
-    exact_sampling_identity_rows,
     exact_sampling_support,
-    exact_selected_logprob_partitioned_from_support,
+    normalize_temperature_rows,
+    score_with_sampling_transforms,
+)
+from xorl.ops.loss.sampling_transform_ce import (
+    ChunkedScoringPolicy,
+    chunked_transform_scored_ce,
+    gather_vocab_shards,
 )
 
 
@@ -47,27 +52,37 @@ _TEMPERATURE_MATERIALIZE_ROW_CHUNK = EXACT_FILTER_ROW_CHUNK
 _TP_LOCAL_ROW_CHUNK = 8
 
 
-def _score_exact_sampling_rows(
-    logits,
-    token_ids,
-    top_ks,
-    top_ps,
-    min_ps,
-    native_selected_score,
-):
-    support = exact_sampling_support(logits, top_ks, top_ps, min_ps)
-    identity_rows = exact_sampling_identity_rows(
-        top_ks,
-        top_ps,
-        min_ps,
-        vocab_size=logits.shape[1],
-    )
-    return exact_selected_logprob_partitioned_from_support(
-        logits,
-        token_ids,
-        support,
-        identity_rows,
-        native_selected_score,
+def _bi_scoring_policy(vocab_chunk: int) -> ChunkedScoringPolicy:
+    """The batch-invariant lane's injection into the shared scoring core."""
+
+    use_v2 = families_v2_enabled()
+    if use_v2:
+
+        def logits_fn(hidden_chunk, weight):
+            logits, _ = head_v2_full_logits_with_lse(hidden_chunk, weight, temperature=None)
+            return logits
+
+        def native_selected_score(logits, token_ids):
+            return head_v2_selected_logprob_from_logits(logits, token_ids, temperature=None)
+
+    else:
+
+        def logits_fn(hidden_chunk, weight):
+            return bi_lm_head_full_logits(hidden_chunk, weight, vocab_chunk=vocab_chunk)
+
+        def native_selected_score(logits, token_ids):
+            return bi_lm_head_selected_logprob_from_logits(
+                logits,
+                token_ids,
+                temperature=None,
+                vocab_chunk=vocab_chunk,
+            )
+
+    return ChunkedScoringPolicy(
+        logits_fn=logits_fn,
+        temperature_fn=exact_temperature_scale_fp32_logits,
+        native_selected_score=native_selected_score,
+        row_chunk=_TEMPERATURE_MATERIALIZE_ROW_CHUNK,
     )
 
 
@@ -131,27 +146,6 @@ def _tp_broadcast_source_rows(
     return chunk
 
 
-def _tp_gather_full_logits(
-    local_logits: torch.Tensor,
-    *,
-    vocab_sizes: tuple[int, ...],
-    group: dist.ProcessGroup,
-) -> torch.Tensor:
-    """Gather possibly ragged vocabulary shards in process-group rank order."""
-
-    max_vocab = max(vocab_sizes)
-    padded = local_logits.new_zeros((local_logits.shape[0], max_vocab))
-    padded[:, : local_logits.shape[1]].copy_(local_logits)
-    world_size = dist.get_world_size(group)
-    gathered = local_logits.new_empty((world_size * local_logits.shape[0], max_vocab))
-    dist.all_gather_into_tensor(gathered, padded.contiguous(), group=group)
-    rank_major = gathered.view(world_size, local_logits.shape[0], max_vocab)
-    return torch.cat(
-        [rank_major[rank, :, :vocab_size] for rank, vocab_size in enumerate(vocab_sizes)],
-        dim=1,
-    ).contiguous()
-
-
 def _tp_exact_full_logits(
     hidden: torch.Tensor,
     local_weight: torch.Tensor,
@@ -165,7 +159,7 @@ def _tp_exact_full_logits(
         local_logits, _ = head_v2_full_logits_with_lse(hidden, local_weight, temperature=None)
     else:
         local_logits = bi_lm_head_full_logits(hidden, local_weight, vocab_chunk=vocab_chunk)
-    return _tp_gather_full_logits(local_logits, vocab_sizes=vocab_sizes, group=group)
+    return gather_vocab_shards(local_logits, vocab_sizes=vocab_sizes, group=group)
 
 
 def _tp_score_full_logits(
@@ -197,7 +191,7 @@ def _tp_score_full_logits(
     if top_ks is None:
         logprob, lse, _ = native_score(transformed_logits, labels)
     else:
-        logprob, lse, _ = _score_exact_sampling_rows(
+        logprob, lse, _ = score_with_sampling_transforms(
             transformed_logits,
             labels,
             top_ks,
@@ -528,6 +522,12 @@ class _BiFusedVocabParallelPerTokenCE(torch.autograd.Function):
 
 
 class _BiFusedLmHeadPerTokenCE(torch.autograd.Function):
+    """The identity (no-temperature, no-filter) fast path: fused kernels only.
+
+    Transform-carrying calls never reach this Function — they route through
+    the shared chunked scoring core with the batch-invariant policy.
+    """
+
     @staticmethod
     def forward(
         ctx,
@@ -535,195 +535,32 @@ class _BiFusedLmHeadPerTokenCE(torch.autograd.Function):
         weight,
         labels_safe,
         valid_mask,
-        temp_row,
-        top_ks,
-        top_ps,
-        min_ps,
         vocab_chunk,
     ):
-        use_v2 = families_v2_enabled()
-        has_sampling_filter = top_ks is not None
-        if temp_row is None and not has_sampling_filter and use_v2:
+        if families_v2_enabled():
             # head v2 (families-v2 migration): same GEMM K-chain, epilogue-stats
             # online LSE; logits never materialize; backward only consumes lse.
-            logprob, lse, _ = head_v2_selected_logprob(hidden, weight, labels_safe, temperature=temp_row)
-        elif temp_row is None and not has_sampling_filter:
-            logprob, lse, _ = bi_lm_head_selected_logprob(
-                hidden, weight, labels_safe, temperature=temp_row, vocab_chunk=vocab_chunk
-            )
+            logprob, lse, _ = head_v2_selected_logprob(hidden, weight, labels_safe, temperature=None)
         else:
-            logprob_chunks = []
-            lse_chunks = []
-            for start in range(0, hidden.shape[0], _TEMPERATURE_MATERIALIZE_ROW_CHUNK):
-                end = min(start + _TEMPERATURE_MATERIALIZE_ROW_CHUNK, hidden.shape[0])
-                hidden_chunk = hidden[start:end]
-                labels_chunk = labels_safe[start:end]
-                temperature_chunk = None if temp_row is None else temp_row[start:end]
-                if use_v2:
-                    logits, _ = head_v2_full_logits_with_lse(hidden_chunk, weight, temperature=None)
-                    transformed_logits = (
-                        logits
-                        if temperature_chunk is None
-                        else exact_temperature_scale_fp32_logits(logits, temperature_chunk)
-                    )
-                    if has_sampling_filter:
-                        logprob_chunk, lse_chunk, _ = _score_exact_sampling_rows(
-                            transformed_logits,
-                            labels_chunk,
-                            top_ks[start:end],
-                            top_ps[start:end],
-                            min_ps[start:end],
-                            lambda score_logits, score_ids: head_v2_selected_logprob_from_logits(
-                                score_logits,
-                                score_ids,
-                                temperature=None,
-                            ),
-                        )
-                    else:
-                        logprob_chunk, lse_chunk, _ = head_v2_selected_logprob_from_logits(
-                            transformed_logits,
-                            labels_chunk,
-                            temperature=None,
-                        )
-                else:
-                    logits = bi_lm_head_full_logits(hidden_chunk, weight, vocab_chunk=vocab_chunk)
-                    transformed_logits = (
-                        logits
-                        if temperature_chunk is None
-                        else exact_temperature_scale_fp32_logits(logits, temperature_chunk)
-                    )
-                    if has_sampling_filter:
-                        logprob_chunk, lse_chunk, _ = _score_exact_sampling_rows(
-                            transformed_logits,
-                            labels_chunk,
-                            top_ks[start:end],
-                            top_ps[start:end],
-                            min_ps[start:end],
-                            lambda score_logits, score_ids: bi_lm_head_selected_logprob_from_logits(
-                                score_logits,
-                                score_ids,
-                                temperature=None,
-                                vocab_chunk=vocab_chunk,
-                            ),
-                        )
-                    else:
-                        logprob_chunk, lse_chunk, _ = bi_lm_head_selected_logprob_from_logits(
-                            transformed_logits,
-                            labels_chunk,
-                            temperature=None,
-                            vocab_chunk=vocab_chunk,
-                        )
-                logprob_chunks.append(logprob_chunk)
-                lse_chunks.append(lse_chunk)
-            if logprob_chunks:
-                logprob = torch.cat(logprob_chunks, dim=0)
-                lse = torch.cat(lse_chunks, dim=0)
-            else:
-                logprob = torch.empty((0,), dtype=torch.float32, device=hidden.device)
-                lse = logprob.clone()
-        ctx.save_for_backward(
-            hidden,
-            weight,
-            labels_safe,
-            valid_mask,
-            lse,
-            temp_row,
-            top_ks,
-            top_ps,
-            min_ps,
-        )
+            logprob, lse, _ = bi_lm_head_selected_logprob(
+                hidden, weight, labels_safe, temperature=None, vocab_chunk=vocab_chunk
+            )
+        ctx.save_for_backward(hidden, weight, labels_safe, valid_mask, lse)
         ctx.vocab_chunk = vocab_chunk
-        ctx.use_v2 = use_v2
         return torch.where(valid_mask, -logprob, torch.zeros_like(logprob))
 
     @staticmethod
     def backward(ctx, grad_ce):
-        hidden, weight, labels, valid_mask, lse, temp_row, top_ks, top_ps, min_ps = ctx.saved_tensors
+        hidden, weight, labels, valid_mask, lse = ctx.saved_tensors
         vocab_chunk = ctx.vocab_chunk
         n_tokens = hidden.shape[0]
         vocab = weight.shape[0]
         need_h = ctx.needs_input_grad[0]
         need_w = ctx.needs_input_grad[1]
 
-        if top_ks is not None:
-            grad_h = torch.zeros(hidden.shape, dtype=torch.float32, device=hidden.device) if need_h else None
-            grad_w = torch.zeros_like(weight) if need_w else None
-            for row_start in range(0, n_tokens, _TEMPERATURE_MATERIALIZE_ROW_CHUNK):
-                row_end = min(row_start + _TEMPERATURE_MATERIALIZE_ROW_CHUNK, n_tokens)
-                hidden_chunk = hidden[row_start:row_end]
-                labels_chunk = labels[row_start:row_end]
-                valid_chunk = valid_mask[row_start:row_end]
-                temperature_chunk = None if temp_row is None else temp_row[row_start:row_end]
-                if ctx.use_v2:
-                    exact_logits, _ = head_v2_full_logits_with_lse(hidden_chunk, weight, temperature=None)
-                else:
-                    exact_logits = bi_lm_head_full_logits(hidden_chunk, weight, vocab_chunk=vocab_chunk)
-                transformed_logits = (
-                    exact_logits
-                    if temperature_chunk is None
-                    else exact_temperature_scale_fp32_logits(exact_logits, temperature_chunk)
-                )
-                support = exact_sampling_support(
-                    transformed_logits,
-                    top_ks[row_start:row_end],
-                    top_ps[row_start:row_end],
-                    min_ps[row_start:row_end],
-                )
-                selected_support = support.gather(1, labels_chunk.unsqueeze(1)).squeeze(1)
-                g = (grad_ce[row_start:row_end] * valid_chunk * selected_support).float()
-                g_col = g.unsqueeze(1)
-                lse_col = lse[row_start:row_end].unsqueeze(1)
-                inv_t = None if temperature_chunk is None else (1.0 / temperature_chunk).unsqueeze(1)
-                grad_h_chunk = (
-                    torch.zeros(hidden_chunk.shape, dtype=torch.float32, device=hidden.device) if need_h else None
-                )
-                rows = torch.arange(row_end - row_start, device=hidden.device)
-
-                for col_start in range(0, vocab, vocab_chunk):
-                    col_end = min(col_start + vocab_chunk, vocab)
-                    w_c = weight[col_start:col_end]
-                    logits_c = torch.mm(hidden_chunk, w_c.t(), out_dtype=torch.float32)
-                    if inv_t is not None:
-                        logits_c *= inv_t
-                    grad_z = logits_c.sub_(lse_col).exp_().mul_(g_col)
-                    grad_z *= support[:, col_start:col_end]
-                    in_chunk = selected_support & (labels_chunk >= col_start) & (labels_chunk < col_end)
-                    grad_z[rows[in_chunk], labels_chunk[in_chunk] - col_start] -= g[in_chunk]
-                    if inv_t is not None:
-                        grad_z *= inv_t
-                    grad_z16 = grad_z.to(hidden.dtype)
-                    if need_h:
-                        torch.addmm(
-                            grad_h_chunk,
-                            grad_z16,
-                            w_c,
-                            out_dtype=torch.float32,
-                            out=grad_h_chunk,
-                        )
-                    if need_w:
-                        grad_w[col_start:col_end].add_(
-                            torch.mm(grad_z16.t(), hidden_chunk, out_dtype=torch.float32).to(weight.dtype)
-                        )
-                if need_h:
-                    grad_h[row_start:row_end] = grad_h_chunk
-
-            return (
-                grad_h.to(hidden.dtype) if need_h else None,
-                grad_w if need_w else None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
-
-        selected_support = torch.ones_like(valid_mask)
         g = (grad_ce * valid_mask).float()
         g_col = g.unsqueeze(1)
         lse_col = lse.unsqueeze(1)
-        inv_t = None if temp_row is None else (1.0 / temp_row).unsqueeze(1)
         grad_h = torch.zeros(hidden.shape, dtype=torch.float32, device=hidden.device) if need_h else None
         grad_w = torch.empty_like(weight) if need_w else None
         rows = torch.arange(n_tokens, device=hidden.device)
@@ -733,13 +570,9 @@ class _BiFusedLmHeadPerTokenCE(torch.autograd.Function):
             w_c = weight[col_start:col_end]
             # bf16 tensor-core GEMM, fp32 accumulate + fp32 out (no fp32 copies)
             logits_c = torch.mm(hidden, w_c.t(), out_dtype=torch.float32)
-            if inv_t is not None:
-                logits_c *= inv_t
             grad_z = logits_c.sub_(lse_col).exp_().mul_(g_col)
-            in_chunk = selected_support & (labels >= col_start) & (labels < col_end)
+            in_chunk = (labels >= col_start) & (labels < col_end)
             grad_z[rows[in_chunk], labels[in_chunk] - col_start] -= g[in_chunk]
-            if inv_t is not None:
-                grad_z *= inv_t  # dy/dz = 1/T
             grad_z16 = grad_z.to(hidden.dtype)
             if need_h:
                 torch.addmm(grad_h, grad_z16, w_c, out_dtype=torch.float32, out=grad_h)
@@ -749,10 +582,6 @@ class _BiFusedLmHeadPerTokenCE(torch.autograd.Function):
         return (
             grad_h.to(hidden.dtype) if need_h else None,
             grad_w if need_w else None,
-            None,
-            None,
-            None,
-            None,
             None,
             None,
             None,
@@ -779,38 +608,32 @@ def bi_fused_per_token_ce(
         raise ValueError("ce_mode='bi_fused' requires CUDA tensors")
     if hidden_states.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
         raise ValueError("ce_mode='bi_fused' requires bf16 hidden states and lm-head weight")
-    valid_mask = labels != ignore_index
-    labels_safe = torch.where(valid_mask, labels, torch.zeros_like(labels))
-    if isinstance(temperature, torch.Tensor):
-        if temperature.dtype is not torch.float32:
-            raise TypeError("ce_mode='bi_fused' requires per-row FP32 temperature")
-        if temperature.device != hidden_states.device or tuple(temperature.shape) != (hidden_states.shape[0],):
-            raise ValueError("ce_mode='bi_fused' requires temperature aligned one-to-one with hidden-state rows")
-        if not temperature.is_contiguous() or temperature.requires_grad:
-            raise ValueError("ce_mode='bi_fused' requires contiguous, non-differentiable temperature metadata")
-        torch._assert_async(
-            (torch.isfinite(temperature) & (temperature > 0)).all(),
-            "ce_mode='bi_fused' requires finite temperature > 0",
-        )
-        temp_row = temperature
-    elif temperature == 1.0:
-        temp_row = None
-    else:
-        temperature = float(temperature)
-        if not math.isfinite(temperature) or temperature <= 0:
-            raise ValueError("ce_mode='bi_fused' requires finite temperature > 0")
-        temp_row = torch.full((hidden_states.shape[0],), temperature, dtype=torch.float32, device=hidden_states.device)
+    temp_row = normalize_temperature_rows(
+        temperature,
+        rows=hidden_states.shape[0],
+        device=hidden_states.device,
+    )
     if (top_ks is None, top_ps is None, min_ps is None).count(True) not in (0, 3):
         raise ValueError("ce_mode='bi_fused' requires all or none of top-k/top-p/min-p row metadata")
+    if temp_row is not None or top_ks is not None:
+        return chunked_transform_scored_ce(
+            hidden_states,
+            weight,
+            labels,
+            ignore_index=ignore_index,
+            temperature_rows=temp_row,
+            top_ks=top_ks,
+            top_ps=top_ps,
+            min_ps=min_ps,
+            policy=_bi_scoring_policy(vocab_chunk),
+        )
+    valid_mask = labels != ignore_index
+    labels_safe = torch.where(valid_mask, labels, torch.zeros_like(labels))
     return _BiFusedLmHeadPerTokenCE.apply(
         hidden_states,
         weight,
         labels_safe,
         valid_mask,
-        temp_row,
-        top_ks,
-        top_ps,
-        min_ps,
         vocab_chunk,
     )
 
@@ -855,30 +678,11 @@ def bi_fused_vocab_parallel_per_token_ce(
     valid_mask = labels != ignore_index
     labels_safe = torch.where(valid_mask, labels, torch.zeros_like(labels))
 
-    if isinstance(temperature, torch.Tensor):
-        if temperature.dtype is not torch.float32:
-            raise TypeError("ce_mode='bi_fused' requires per-row FP32 temperature")
-        if temperature.device != hidden_states.device or tuple(temperature.shape) != (hidden_states.shape[0],):
-            raise ValueError("ce_mode='bi_fused' requires temperature aligned one-to-one with local hidden rows")
-        if not temperature.is_contiguous() or temperature.requires_grad:
-            raise ValueError("ce_mode='bi_fused' requires contiguous, non-differentiable temperature metadata")
-        torch._assert_async(
-            (torch.isfinite(temperature) & (temperature > 0)).all(),
-            "ce_mode='bi_fused' requires finite temperature > 0",
-        )
-        temp_row = temperature
-    elif temperature == 1.0:
-        temp_row = None
-    else:
-        temperature = float(temperature)
-        if not math.isfinite(temperature) or temperature <= 0:
-            raise ValueError("ce_mode='bi_fused' requires finite temperature > 0")
-        temp_row = torch.full(
-            (hidden_states.shape[0],),
-            temperature,
-            dtype=torch.float32,
-            device=hidden_states.device,
-        )
+    temp_row = normalize_temperature_rows(
+        temperature,
+        rows=hidden_states.shape[0],
+        device=hidden_states.device,
+    )
     if (top_ks is None, top_ps is None, min_ps is None).count(True) not in (0, 3):
         raise ValueError("ce_mode='bi_fused' requires all or none of top-k/top-p/min-p row metadata")
     for name, value in (("top_ks", top_ks), ("top_ps", top_ps), ("min_ps", min_ps)):
