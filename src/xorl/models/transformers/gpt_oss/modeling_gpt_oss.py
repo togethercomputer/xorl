@@ -24,7 +24,7 @@ from xorl.distributed.sequence_parallel.strategy import get_cp_strategy
 from xorl.models.base import XorlPreTrainedModel
 from xorl.models.layers.attention import AttentionKwargs, update_causal_mask
 from xorl.models.layers.attention.backend import ATTENTION_FUNCTIONS
-from xorl.models.layers.moe import MoEBlock
+from xorl.models.layers.moe import MoEBlock, MoEExperts
 from xorl.models.layers.normalization import RMSNorm
 from xorl.models.layers.rope import rope_class_b_enabled, stock_fused_apply_rotary_pos_emb
 from xorl.models.outputs import MoeCausalLMOutput, MoeModelOutput
@@ -690,6 +690,15 @@ class GptOssPreTrainedModel(XorlPreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
+        elif isinstance(module, MoEExperts):
+            # Grouped expert weights are raw nn.Parameters allocated with
+            # torch.empty, so nothing else in this chain reaches them: without
+            # this branch they keep whatever the allocator returned. That reads
+            # as "works" because recycled pages are usually zeroed -- the model
+            # runs with dead experts -- and as an all-NaN forward whenever the
+            # recycled bytes happen to decode to NaN/Inf.
+            module.gate_up_proj.data.normal_(mean=0.0, std=std)
+            module.down_proj.data.normal_(mean=0.0, std=std)
         elif isinstance(module, RMSNorm):
             module.weight.data.fill_(1.0)
 

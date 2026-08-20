@@ -11,7 +11,7 @@ from xorl.models.base import XorlPreTrainedModel
 from xorl.models.layers import ACT2FN, RMSNorm, RotaryEmbedding
 from xorl.models.layers.attention import is_flash_attention, update_causal_mask
 from xorl.models.layers.attention.backend import get_attention_fn
-from xorl.models.layers.moe import MoEBlock
+from xorl.models.layers.moe import MoEBlock, MoEExperts
 from xorl.models.layers.moe.routing_replay import get_replay_stage
 from xorl.models.outputs import MoeCausalLMOutput, MoeModelOutput
 from xorl.models.transformers.deepseek_v3 import parallelize
@@ -413,6 +413,15 @@ class DeepseekV3PreTrainedModel(XorlPreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=std)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
+        elif isinstance(module, MoEExperts):
+            # Grouped expert weights are raw nn.Parameters allocated with
+            # torch.empty, so nothing else in this chain reaches them: without
+            # this branch they keep whatever the allocator returned. That reads
+            # as "works" because recycled pages are usually zeroed -- the model
+            # runs with dead experts -- and as an all-NaN forward whenever the
+            # recycled bytes happen to decode to NaN/Inf.
+            module.gate_up_proj.data.normal_(mean=0.0, std=std)
+            module.down_proj.data.normal_(mean=0.0, std=std)
         elif isinstance(module, RMSNorm):
             module.weight.data.fill_(1.0)
         elif isinstance(module, RotaryEmbedding):
