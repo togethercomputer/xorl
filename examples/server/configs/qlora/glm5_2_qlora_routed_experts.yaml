@@ -1,0 +1,121 @@
+# Server-side configuration for XORL Training Server
+# GLM-5.2 exact active-LoRA over the official native block-FP8 base.
+#
+# 16x H100 80GB (WORLD16/PP1/TP1/DP1/EP16/CP16) — see docs/k3/DEFAULTS_AND_PARETO.md.
+# The official FP8 checkpoint is ~704 GB on disk; EP16 puts ~46 GB of expert
+# weight per rank before activations. This does NOT fit on fewer GPUs.
+#
+# Unlike every Qwen LoRA/QLoRA config in this directory, the adapted target set
+# is NOT configurable here. GLM-5.2 block-FP8 QLoRA builds its complete
+# deterministic inventory (625 adapted linears + 75 routed expert banks =
+# 1,700 FP32 factors) and rejects `lora_target_modules` /
+# `lora_target_manifest` / `qlora_exclude_modules` outright.
+# See src/xorl/models/transformers/glm5/qlora.py and docs/k3/LORA_CONTRACT.md.
+
+# ============================================================================
+# Model Configuration
+# ============================================================================
+model_path: zai-org/GLM-5.2-FP8
+tokenizer_path: zai-org/GLM-5.2-FP8
+# Canonical GLM-5.2 is a numerical PROGRAM, not a set of options: the exact
+# forward requires flash_attention_4 and rejects flash_attention_3 outright
+# (src/xorl/models/auto.py:722). Leaving it unset would also resolve correctly.
+attn_implementation: flash_attention_4
+moe_implementation: triton   # required by the GLM-5.2 block-FP8 QLoRA admission
+# A scoped run keeps the exact FORWARD program (Class-B RoPE, sglang_fused
+# RMSNorm, sparse MLA, canonical packed_ep16_v2 MoE transport) and therefore the
+# exact lane's transport too. Only the adapted target set is narrower, so results
+# stay comparable with a full-scope run.
+ep_dispatch: alltoall
+
+# ============================================================================
+# Parallelism Configuration
+# ============================================================================
+data_parallel_mode: fsdp2
+tensor_parallel_size: 1            # adapter-bearing modules require body TP1
+lm_head_tensor_parallel_size: 16   # exact lm-head component requires TP16
+expert_parallel_size: 16           # exact routed-expert component requires EP16
+ulysses_parallel_size: 16
+ringattn_parallel_size: 1          # GLM-5 DSA does not support ring attention
+data_parallel_replicate_size: 1
+data_parallel_shard_size: 1        # LoRA + EP asserts ep_fsdp_size == 1
+# The exact GLM-5.2 lm head is a separate FSDP unit computing vocab-parallel CE
+# against its local shard; torch_parallelize.py:563 refuses to build without it.
+fsdp_sharded_lm_head_loss: true
+# lm_head_tensor_parallel_size>1 requires cp_fsdp_mode='all' so the external SP
+# gradient sync does not double-reduce against the lm_head replica reduction
+# (torch_parallelize.py:594). This is the default; set explicitly because the
+# exact lane depends on it.
+cp_fsdp_mode: all
+
+# ============================================================================
+# Memory & Performance
+# ============================================================================
+enable_mixed_precision: true
+enable_gradient_checkpointing: true
+enable_full_shard: true
+enable_activation_offload: false
+init_device: meta
+load_weights_mode: all_ranks
+
+# ============================================================================
+# Checkpointing
+# ============================================================================
+output_dir: outputs/GLM-5.2-server-qlora-routed
+load_checkpoint_path: ""
+ckpt_manager: dcp
+
+# ============================================================================
+# Logging
+# ============================================================================
+log_level: INFO
+
+# ============================================================================
+# Worker Configuration
+# ============================================================================
+worker_connection_timeout: 180.0
+worker_max_retries: 5
+
+# ============================================================================
+# Data Processing Configuration
+# ============================================================================
+sample_packing_sequence_len: 32768
+enable_packing: true
+
+# ============================================================================
+# QLoRA Configuration (GLM-5.2 exact active-LoRA)
+# ============================================================================
+# Adapt ONLY the 75 routed-expert banks (450 factors). Attention, dense MLPs,
+# shared experts, and the lm_head stay frozen native FP8. This isolates how much
+# of the task is learned in the routed experts alone -- the closest GLM-5.2
+# analogue of the Qwen reference recipe's MoE-only adapters.
+glm52_lora_scope: routed_experts
+
+enable_lora: true
+enable_qlora: true
+block_fp8_qlora_training: true
+quant_format: block_fp8
+quant_group_size: 128
+moe_hybrid_shared_lora: true
+lora_export_format: sglang_shared_outer
+freeze_router: true
+merge_qkv: true
+# NOTE: docs/k3/LORA_CONTRACT.md qualifies ONLY rank 1 / alpha 1 for the exact
+# lane. Rank 64 is accepted by the code (glm52_exact_lora_scaling requires only
+# positive integers) but is OUTSIDE the qualified configuration, so the
+# train/serve bit-exactness claim does not cover it.
+# alpha == rank keeps scaling at 1.0, matching the rank-1 baseline.
+# The exact lane requires max_lora_rank == lora_rank (defaults to lora_rank).
+lora_rank: 64
+lora_alpha: 64
+# NOTE: lora_target_modules is intentionally absent — setting it is rejected.
+
+skip_initial_checkpoint: true
+
+# ============================================================================
+# Deliberately omitted — canonical GLM-5.2 resolves these itself
+# (docs/src/content/docs/config-reference/server.md, "Numerical alignment flags"):
+#   sparse_mla_enabled -> true, sparse_mla_backend -> flashmla,
+#   rmsnorm_mode -> sglang_fused, rope_native -> true, rope_class_b -> true,
+#   attention_cast_bf16 -> false, ce_mode -> bi_fused.
+# Setting them by hand risks selecting a different numerical program.

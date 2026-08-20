@@ -232,9 +232,17 @@ def _find_target_modules(
     Uses the LoRA mapping registry to determine which modules can have
     LoRA applied to them. Supports two matching modes:
 
-    1. Direct match: Module name matches a target (e.g., "q_proj", "experts")
-    2. Indirect match: Module has children matching targets (e.g., MoE experts
+    1. Path match: a target containing a path separator or glob metacharacter
+       (e.g. "*.mlp.experts.*.gate_proj") is matched with fnmatch against the
+       FULL module path. Leaf matching discards a module's position in the tree,
+       so a bare "gate_proj" cannot distinguish a routed expert from a shared
+       expert or a dense MLP; a path pattern can.
+    2. Direct match: Module name matches a target (e.g., "q_proj", "experts")
+    3. Indirect match: Module has children matching targets (e.g., MoE experts
        module has "gate_proj", "up_proj", "down_proj" as weight attributes)
+
+    Path patterns participate in the same coverage check as bare names: a
+    pattern matching nothing raises rather than silently adapting less.
 
     The algorithm processes modules top-down and skips children of replaced
     modules to avoid double-replacement.
@@ -256,6 +264,11 @@ def _find_target_modules(
     replaced_prefixes: Set[str] = set()  # Track replaced module paths to skip their children
     matched_targets: Set[str] = set(satisfied_targets or ())
 
+    # A target is a path pattern when it carries positional information. Bare
+    # names keep the historical leaf/indirect semantics untouched.
+    path_patterns = [t for t in target_modules if any(ch in t for ch in ".*?[")]
+    leaf_targets = [t for t in target_modules if t not in path_patterns]
+
     for name, module in model.named_modules():
         # Skip if this module is under an already-matched parent
         # (avoid replacing children of modules we're going to replace)
@@ -268,8 +281,16 @@ def _find_target_modules(
 
         module_name = name.split(".")[-1] if name else ""
 
+        # Path match: explicit about position, so it wins over leaf matching.
+        matched_pattern = next((p for p in path_patterns if fnmatch.fnmatch(name, p)), None)
+        if matched_pattern is not None:
+            matched_paths.append(name)
+            replaced_prefixes.add(name)
+            matched_targets.add(matched_pattern)
+            continue
+
         # Direct match: module name matches target_modules
-        if module_name in target_modules:
+        if module_name in leaf_targets:
             matched_paths.append(name)
             replaced_prefixes.add(name)
             matched_targets.add(module_name)
@@ -279,7 +300,7 @@ def _find_target_modules(
         # This handles MoE experts where user specifies "gate_proj" but the
         # actual module to replace is "experts" which contains gate_proj weights
         module_attrs = set(dir(module))
-        indirect_matches = {target for target in target_modules if target in module_attrs}
+        indirect_matches = {target for target in leaf_targets if target in module_attrs}
         if indirect_matches:
             matched_paths.append(name)
             replaced_prefixes.add(name)

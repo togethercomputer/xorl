@@ -817,6 +817,7 @@ def build_foundation_model(
     server_training: bool = False,
     enable_lora: bool = False,
     block_fp8_qlora_training: bool = False,
+    glm52_lora_scope: str = "all",
     glm52_fullparam_fp8_training: bool = False,
     lora_rank: Optional[int] = None,
     lora_alpha: Optional[int] = None,
@@ -853,13 +854,22 @@ def build_foundation_model(
         raise ValueError(
             "glm52_fullparam_fp8_training and block_fp8_qlora_training are mutually exclusive training lanes"
         )
-    exact_active_lora = bool(server_training and glm52_model and block_fp8_qlora_training and ep_dispatch == "alltoall")
+    # Scope selects WHICH FACTORS TRAIN, not which modules are adapted: the
+    # complete exact family is always constructed so gradients can flow through
+    # every region (NativeBlockFP8Linear is forward-only). Out-of-scope factors
+    # are frozen after construction and keep lora_B == 0, so the forward program
+    # is identical for every scope.
+    glm52_lora_scope = str(glm52_lora_scope or "all")
+    exact_active_lora = bool(
+        server_training and glm52_model and block_fp8_qlora_training and ep_dispatch == "alltoall"
+    )
     if exact_active_lora:
         glm52_exact_lora_scaling(lora_rank, lora_alpha)
     # Training lanes select the same exact value family through their own
     # admission flags.  The scoring-only flag must remain off for either one:
     # it describes a frozen trunk, which neither training admission permits.
     config._glm52_block_fp8_qlora = bool(block_fp8_qlora_training)
+    config._glm52_lora_scope = glm52_lora_scope
     config._glm52_fullparam_training = bool(glm52_fullparam_fp8_training)
     config._glm52_exact_contract = bool(
         server_training and glm52_model and not block_fp8_qlora_training and not glm52_fullparam_fp8_training

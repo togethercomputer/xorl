@@ -221,6 +221,7 @@ def build_training_model(
     # --- QLoRA ---
     enable_qlora: bool = False,
     block_fp8_qlora_training: bool = False,
+    glm52_lora_scope: str = "all",
     quant_format: str = "nvfp4",
     quant_group_size: int = 16,
     qlora_exclude_modules: Optional[List[str]] = None,
@@ -406,6 +407,7 @@ def build_training_model(
         server_training=server_training,
         enable_lora=enable_lora,
         block_fp8_qlora_training=block_fp8_qlora_training,
+        glm52_lora_scope=glm52_lora_scope,
         glm52_fullparam_fp8_training=glm52_fullparam_fp8_training,
         lora_rank=lora_rank,
         lora_alpha=lora_alpha,

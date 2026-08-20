@@ -828,8 +828,16 @@ class Glm52ExactTP16LmHeadSelectedLogprob(nn.Module):
             )
         if local_weight.requires_grad:
             raise RuntimeError("GLM-5.2 exact LM-head base weight must remain frozen")
-        if not lora_A.requires_grad or not local_lora_B.requires_grad:
-            raise RuntimeError("GLM-5.2 exact LM-head A and B factor masters must both be trainable")
+        if lora_A.requires_grad != local_lora_B.requires_grad:
+            # The invariant is that the pair SHARES trainability -- a half-frozen
+            # pair would take a gradient on one side of a product whose other
+            # side is fixed. Both-frozen is consistent and is what a narrowed
+            # glm52_lora_scope produces: the lm-head module is still constructed
+            # so gradients flow THROUGH it, but its factors do not learn.
+            raise RuntimeError(
+                "GLM-5.2 exact LM-head A and B factor masters must share trainability, got "
+                f"A.requires_grad={lora_A.requires_grad}, B.requires_grad={local_lora_B.requires_grad}"
+            )
 
         expected_strides = {
             "local_weight": (GLM52_LM_HEAD_HIDDEN_SIZE, 1),
