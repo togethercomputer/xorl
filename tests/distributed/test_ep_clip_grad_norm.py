@@ -93,6 +93,36 @@ class TestBuildEPParamGroups:
         assert model._ep_replicated_gradient_sync_enabled is True
         assert getattr(shared.weight, "_xorl_ep_replicated_gradient_hook", None) is None
 
+    def test_plan_fallback_replicate_is_not_an_ep_replica(self):
+        """A per-expert factor no ep_plan pattern matched must still count per rank.
+
+        ``ParallelPlan.apply`` stamps ``Replicate()`` as the fallback for every
+        unmatched parameter, so classifying on placement alone would treat
+        rank-unique per-expert factors as replicas and scale the reported grad
+        norm by 1/sqrt(ep_size).  Only the singleton expert axis marks a shared
+        factor.
+        """
+        model = nn.Module()
+        expert = nn.Module()
+        expert._skip_fsdp = True
+        expert.per_expert_lora_A = nn.Parameter(torch.randn(2, 4))  # two local experts
+        expert.shared_lora_A = nn.Parameter(torch.randn(1, 4))  # singleton expert axis
+        model.add_module("expert", expert)
+        model._fqn2spec_info = {
+            # what apply() stamps when no ep_plan pattern matches the factor
+            "expert.per_expert_lora_A": SimpleNamespace(placement=Replicate()),
+            "expert.shared_lora_A": SimpleNamespace(placement=Replicate(), gradient_reduction="ep_sum"),
+        }
+
+        _build_ep_param_groups(model)
+
+        assert {id(p) for p in model._ep_param_groups["ep"]} == {
+            id(expert.per_expert_lora_A),
+            id(expert.shared_lora_A),
+        }
+        assert {id(p) for p in model._ep_param_groups["ep_replicated"]} == {id(expert.shared_lora_A)}
+        assert {id(p) for p in model._ep_param_groups["ep_replicated_gradient_sync"]} == {id(expert.shared_lora_A)}
+
 
 # ---------------------------------------------------------------------------
 # 2. ep_fsdp2_clip_grad_norm: norm computation and clipping

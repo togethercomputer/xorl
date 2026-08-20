@@ -826,7 +826,21 @@ def _build_ep_param_groups(model: "nn.Module") -> None:
     non_ep_params = []
     for name, p in model.named_parameters():
         spec_info = fqn2spec_info.get(name) or getattr(p, "spec_info", None)
-        is_ep_replicated = Replicate is not None and isinstance(getattr(spec_info, "placement", None), Replicate)
+        # ``ParallelPlan.apply`` stamps ``Replicate()`` for two different
+        # reasons: a genuine shared factor (singleton expert axis) and the
+        # fallback for every parameter no ``ep_plan`` pattern matched.  Only the
+        # first is evidence of EP replication, so require the singleton expert
+        # axis that both the plan and the EP LoRA backends use as the
+        # shared-factor marker.  Placement alone makes a plan gap (minimax_m3
+        # lists no LoRA patterns; nemotron_h omits gate_proj_lora_A/B) count
+        # rank-unique per-expert gradients once instead of once per rank, which
+        # scales the reported grad norm by 1/sqrt(ep_size).
+        is_ep_replicated = (
+            Replicate is not None
+            and isinstance(getattr(spec_info, "placement", None), Replicate)
+            and p.dim() > 0
+            and p.shape[0] == 1
+        )
         gradient_reduction = validate_gradient_reduction_domain(
             getattr(spec_info, "gradient_reduction", GradientReductionDomain.NONE)
         )
