@@ -47,7 +47,7 @@ from xorl.distributed.pp_byte_contract import PPByteContractError
 from xorl.models.layers.normalization import set_rmsnorm_mode
 from xorl.models.transformers.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
 from xorl.models.transformers.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
-from xorl.ops.loss.causallm_loss import causallm_loss_function
+from xorl.objectives.causallm_loss import causallm_loss_function
 from xorl.trainers.training_utils import forward_only_pp, pad_micro_batches_for_pp
 from xorl.utils.device import get_nccl_backend
 

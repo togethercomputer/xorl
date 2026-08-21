@@ -12,13 +12,13 @@ import torch
 import torch.distributed as dist
 
 import xorl.distributed.parallel_state as parallel_state_impl
+from xorl.objectives.causallm_loss import causallm_loss_function
+from xorl.objectives.reducers import TokenPartial
 from xorl.ops import bi_families_v2
 from xorl.ops.loss.bi_fused_lm_head import (
     bi_fused_per_token_ce,
     bi_fused_vocab_parallel_per_token_ce,
 )
-from xorl.ops.loss.causallm_loss import causallm_loss_function
-from xorl.ops.loss.reducers import TokenPartial
 
 
 _HIDDEN = 128

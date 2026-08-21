@@ -4,8 +4,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from xorl.ops.loss.causallm_loss import causallm_loss_function
-from xorl.ops.loss.importance_sampling_loss import importance_sampling_loss_function
+from xorl.objectives.causallm_loss import causallm_loss_function
+from xorl.objectives.importance_sampling_loss import importance_sampling_loss_function
 from xorl.ops.loss.per_token_ce import compute_per_token_ce
 
 

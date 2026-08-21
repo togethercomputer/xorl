@@ -1,24 +1,14 @@
-"""
-Loss functions for training.
+"""Cross-entropy / selected-logprob KERNELS.
 
-This module provides various loss functions for language model training:
-- causallm_loss_function: Standard causal language modeling loss
-- importance_sampling_loss_function: Importance sampling loss for GRPO/RL
-- cispo_loss_function: Clipped IS-weight policy optimization
-- policy_loss_function: PPO-style policy loss with TIS correction
-- drgrpo_loss_function: DR-GRPO loss with PPO clipping and KL penalty
+The RL and supervised objective functions moved to :mod:`xorl.objectives`
+(issue #78 phase 2).  Their public API is re-exported here lazily (PEP 562)
+for one deprecation cycle so ``from xorl.ops.loss import ...`` keeps working
+without creating an import cycle (the objectives import the kernels in this
+package).
 """
 
-from typing import Callable, Dict, Literal
+from typing import Literal
 
-from xorl.ops.loss.causallm_loss import causallm_loss_function, fsdp_sharded_causallm_loss_function
-from xorl.ops.loss.cispo_loss import cispo_loss_function
-from xorl.ops.loss.grpo_loss import drgrpo_loss_function
-from xorl.ops.loss.importance_sampling_loss import importance_sampling_loss_function
-from xorl.ops.loss.loss_output import LossOutput
-from xorl.ops.loss.opd_loss import OPDLossMetrics, opd_loss_function, opd_vocab_parallel_loss_function
-from xorl.ops.loss.policy_loss import policy_loss_function
-from xorl.ops.loss.reducers import Reducer, SequencePartial, TokenPartial
 from xorl.ops.loss.vocab_parallel_cross_entropy import vocab_parallel_cross_entropy
 
 
@@ -27,50 +17,38 @@ from xorl.ops.loss.vocab_parallel_cross_entropy import vocab_parallel_cross_entr
 # ``bi_fused`` runs the shared batch-invariant projection and fixed-order LSE.
 CrossEntropyMode = Literal["eager", "compiled", "bi_fused", "quack_linear", "fused_quack"]
 
-
-# ---------------------------------------------------------------------------
-# Loss function registry
-# ---------------------------------------------------------------------------
-LOSS_REGISTRY: Dict[str, Callable] = {
-    "causallm_loss": causallm_loss_function,
-    "cross_entropy": causallm_loss_function,  # alias
-    "importance_sampling": importance_sampling_loss_function,
-    "cispo": cispo_loss_function,
-    "policy_loss": policy_loss_function,
-    "drgrpo": drgrpo_loss_function,
-    "opd_loss": opd_loss_function,
-}
-
-
-def get_loss_function(name: str) -> Callable:
-    """Look up a loss function by name."""
-    if name not in LOSS_REGISTRY:
-        raise ValueError(f"Unknown loss function: {name}. Available: {list(LOSS_REGISTRY.keys())}")
-    return LOSS_REGISTRY[name]
-
-
-def register_loss_function(name: str, fn: Callable) -> None:
-    """Register a custom loss function."""
-    LOSS_REGISTRY[name] = fn
+_OBJECTIVE_EXPORTS = frozenset(
+    {
+        "LOSS_REGISTRY",
+        "LossOutput",
+        "OPDLossMetrics",
+        "Reducer",
+        "SequencePartial",
+        "TokenPartial",
+        "causallm_loss_function",
+        "cispo_loss_function",
+        "drgrpo_loss_function",
+        "fsdp_sharded_causallm_loss_function",
+        "get_loss_function",
+        "importance_sampling_loss_function",
+        "opd_loss_function",
+        "opd_vocab_parallel_loss_function",
+        "policy_loss_function",
+        "register_loss_function",
+    }
+)
 
 
-__all__ = [
+def __getattr__(name: str):
+    if name in _OBJECTIVE_EXPORTS:
+        import xorl.objectives as _objectives
+
+        return getattr(_objectives, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+__all__ = [  # noqa: F822  (objective names resolve via __getattr__)
     "CrossEntropyMode",
-    "LossOutput",
-    "OPDLossMetrics",
-    "LOSS_REGISTRY",
-    "Reducer",
-    "SequencePartial",
-    "TokenPartial",
-    "get_loss_function",
-    "register_loss_function",
-    "causallm_loss_function",
-    "fsdp_sharded_causallm_loss_function",
-    "drgrpo_loss_function",
-    "importance_sampling_loss_function",
-    "cispo_loss_function",
-    "opd_loss_function",
-    "opd_vocab_parallel_loss_function",
-    "policy_loss_function",
     "vocab_parallel_cross_entropy",
+    *sorted(_OBJECTIVE_EXPORTS),
 ]

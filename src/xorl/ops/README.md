@@ -23,9 +23,9 @@ Three kinds of code live here with three different rules:
   byte-pinned programs shared with the serving engine. The `bi_` / `exact_` /
   `canonical_` / `class_b` prefixes are historical names for the same
   concept. Planned home: `ops/exact/` (#78 phase 3).
-- `loss/` — the CE/selected-logprob kernel stack **plus** (for now) the RL
-  objective functions; the objectives move to `xorl/objectives/`
-  (#78 phase 2).
+- `loss/` — the CE/selected-logprob kernel stack. The RL/supervised
+  objective functions live in `xorl/objectives/` (#78 phase 2); old module
+  paths here are compat stubs for one deprecation cycle.
 - `moe/` — MoE expert compute backends (triton/quack/native, LoRA variants).
   `ep_kernels/` (DeepEP sort/scatter) merges in here (#78 phase 5).
 - `linear_attention/` — GDN/linear-attention kernels; also currently hosts
@@ -40,5 +40,5 @@ Three kinds of code live here with three different rules:
 ## What does NOT belong here
 
 New `nn.Module` layer classes (→ `models/layers/`), RL objectives
-(→ `xorl/objectives/` once it exists), and orchestration logic. `ops/` is
+(→ `xorl/objectives/`), and orchestration logic. `ops/` is
 for kernels and the autograd boundaries directly over them.

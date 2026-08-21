@@ -36,8 +36,8 @@ from xorl.models.checkpoint_handlers.buffers import (  # noqa: F401
     parse_expert_full_key,
     parse_expert_key,
 )
+from xorl.objectives.reducers import TokenPartial
 from xorl.ops.loss import fsdp_sharded_causallm_loss_function, get_loss_function
-from xorl.ops.loss.reducers import TokenPartial
 from xorl.utils import logging
 from xorl.utils.device import get_device_id, get_device_type, synchronize
 from xorl.utils.helper import empty_cache, get_dtype_size

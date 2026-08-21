@@ -23,9 +23,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 import torch.distributed as dist  # noqa: E402
 
 from xorl.distributed.parallel_state import get_parallel_state, init_parallel_state  # noqa: E402
-from xorl.ops.loss.causallm_loss import fsdp_sharded_causallm_loss_function  # noqa: E402
-from xorl.ops.loss.opd_loss import opd_vocab_parallel_loss_function  # noqa: E402
-from xorl.ops.loss.reducers import TokenPartial  # noqa: E402
+from xorl.objectives.causallm_loss import fsdp_sharded_causallm_loss_function  # noqa: E402
+from xorl.objectives.opd_loss import opd_vocab_parallel_loss_function  # noqa: E402
+from xorl.objectives.reducers import TokenPartial  # noqa: E402
 from xorl.server.runner.model_runner import ModelRunner  # noqa: E402
 from xorl.trainers.training_utils import sync_lm_head_tp_gradient, sync_lm_head_tp_parameters  # noqa: E402
 

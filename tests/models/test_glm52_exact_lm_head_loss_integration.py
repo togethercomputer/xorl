@@ -125,7 +125,7 @@ def test_per_token_ce_flattens_collated_sampling_transforms_in_decision_order(
 
 
 def test_causallm_exact_head_admits_its_tp_group_and_rejects_z_loss(monkeypatch: pytest.MonkeyPatch) -> None:
-    causallm_impl = importlib.import_module("xorl.ops.loss.causallm_loss")
+    causallm_impl = importlib.import_module("xorl.objectives.causallm_loss")
     lm_head = nn.Module()
     lm_head._glm52_exact_tp16_lm_head = True
     hidden = torch.arange(8, dtype=torch.float32).reshape(1, 2, 4).to(torch.bfloat16).requires_grad_(True)

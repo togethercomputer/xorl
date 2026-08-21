@@ -4,8 +4,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+import xorl.objectives.causallm_loss as causallm_loss_impl
 import xorl.ops.loss.bi_fused_lm_head as bi_fused_lm_head_impl
-import xorl.ops.loss.causallm_loss as causallm_loss_impl
 import xorl.ops.loss.per_token_ce as per_token_ce_impl
 import xorl.server.runner.model_runner as model_runner_module
 from xorl.server.runner.model_runner import ModelRunner

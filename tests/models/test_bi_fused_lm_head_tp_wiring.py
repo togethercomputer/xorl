@@ -5,11 +5,11 @@ import torch
 from torch import nn
 
 import xorl.models.module_utils as module_utils
-import xorl.ops.loss.causallm_loss as causallm_loss_impl
+import xorl.objectives.causallm_loss as causallm_loss_impl
 import xorl.ops.loss.per_token_ce as per_token_ce_impl
 import xorl.trainers.training_utils as training_utils
-from xorl.ops.loss.loss_output import LossOutput
-from xorl.ops.loss.reducers import TokenPartial
+from xorl.objectives.loss_output import LossOutput
+from xorl.objectives.reducers import TokenPartial
 
 
 def test_causallm_routes_bi_fused_tp_before_ordinary_vocab_ce(monkeypatch):

@@ -442,8 +442,8 @@ def _pp_quack_linear_ce_sum(hidden, labels, *, lm_head, num_chunks: int = 8):
     hidden (pipeline) and lm_head.weight (its FSDP unit reduce-scatters them).
     """
     from xorl.models.module_utils import get_lm_head_weight  # noqa: PLC0415
+    from xorl.objectives.causallm_loss import _chunk_size_from_num_chunks  # noqa: PLC0415
     from xorl.ops._vendored.quack.linear_cross_entropy import chunked_linear_cross_entropy  # noqa: PLC0415
-    from xorl.ops.loss.causallm_loss import _chunk_size_from_num_chunks  # noqa: PLC0415
 
     weight = get_lm_head_weight(lm_head, fsdp_sharded_loss=False)
     h = hidden.reshape(-1, hidden.shape[-1])

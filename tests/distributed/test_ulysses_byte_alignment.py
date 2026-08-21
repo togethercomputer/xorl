@@ -43,7 +43,7 @@ import torch
 from xorl.models.layers.normalization import set_rmsnorm_mode
 from xorl.models.transformers.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
 from xorl.models.transformers.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
-from xorl.ops.loss.causallm_loss import causallm_loss_function
+from xorl.objectives.causallm_loss import causallm_loss_function
 
 
 THIS_DIR = Path(__file__).resolve().parent

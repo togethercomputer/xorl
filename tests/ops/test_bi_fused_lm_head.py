@@ -1,8 +1,8 @@
 import pytest
 import torch
 
+from xorl.objectives.causallm_loss import causallm_loss_function
 from xorl.ops.loss.bi_fused_lm_head import bi_fused_per_token_ce
-from xorl.ops.loss.causallm_loss import causallm_loss_function
 
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

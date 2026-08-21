@@ -3,10 +3,6 @@ from .linear_attention import (
     chunk_gated_delta_rule,
     fused_recurrent_gated_delta_rule,
 )
-from .loss import (
-    causallm_loss_function,
-    importance_sampling_loss_function,
-)
 from .moe.quack import quack_moe_forward
 from .moe.triton import TritonMoeExpertsFunction, triton_moe_forward
 from .moe.triton_lora import (
@@ -14,6 +10,17 @@ from .moe.triton_lora import (
     triton_moe_lora_forward,
 )
 from .ssm import Mamba2Mixer, ssd_chunked
+
+
+def __getattr__(name: str):
+    # Objective functions moved to xorl.objectives (#78 phase 2); resolve the
+    # historical xorl.ops re-exports lazily to avoid an import cycle (the
+    # objectives import the loss kernels under this package).
+    if name in ("causallm_loss_function", "importance_sampling_loss_function"):
+        import xorl.objectives as _objectives
+
+        return getattr(_objectives, name)
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 __all__ = [

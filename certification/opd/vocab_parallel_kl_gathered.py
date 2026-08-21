@@ -24,9 +24,9 @@ import torch.nn.functional as F
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import Shard, distribute_tensor
 
-from xorl.ops.loss.opd_loss import opd_vocab_parallel_loss_function
-from xorl.ops.loss.opd_streaming_kl import streaming_reverse_kl_function
-from xorl.ops.loss.reducers import TokenPartial
+from xorl.objectives.opd_loss import opd_vocab_parallel_loss_function
+from xorl.objectives.opd_streaming_kl import streaming_reverse_kl_function
+from xorl.objectives.reducers import TokenPartial
 from xorl.ops.loss.vocab_parallel_reverse_kl import vocab_parallel_reverse_kl_gathered
 from xorl.server.runner.model_runner import ModelRunner
 
