@@ -718,7 +718,7 @@ class WeightSyncHandler:
         Handle sync inference weights request (all ranks participate).
 
         The ``sync_method`` field selects the transport backend.  Currently
-        supported: ``"nccl_broadcast"``, ``"nccl_simple"``, ``"p2p"``, and
+        supported: ``"nccl_broadcast"``, ``"p2p"``, and
         experimental ``"sparse_delta"``. New backends can be
         added by implementing :class:`WeightTransportBackend` and registering
         in :func:`backends.create_backend`.

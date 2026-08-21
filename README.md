@@ -82,24 +82,15 @@ The default install already includes `xorl-client` from its public repository. T
 pip install -e submodules/xorl-client
 ```
 
-Do not install the xorl-sglang submodule into the default PyTorch 2.12 environment. For a single environment containing XoRL, xorl-client, and xorl-sglang, use the alternate `pyproject.sglang.toml` profile, which pins the compatible PyTorch 2.11/CUDA 13 stack:
+Do not install the xorl-sglang submodule into the default PyTorch 2.12 environment. It pins PyTorch 2.11/CUDA 13 and Triton 3.6.0, so give it an environment separate from the default `.venv`:
 
-**uv:**
-```bash
-cp pyproject.sglang.toml pyproject.toml
-UV_PROJECT_ENVIRONMENT=.venv-sglang uv sync
-source .venv-sglang/bin/activate
-```
-
-**conda:**
 ```bash
 conda create -n xorl-sglang python=3.12
 conda activate xorl-sglang
-cp pyproject.sglang.toml pyproject.toml
-pip install -e . -e "submodules/xorl-sglang/python[all]"
+pip install -e "submodules/xorl-sglang/python[all]"
 ```
 
-> **Note:** Copying the alternate manifest replaces the tracked `pyproject.toml`; `uv sync` also generates the ignored local `uv.lock` for this profile. Do this in a clean checkout, restore `pyproject.toml`, and do not add the generated lock with unrelated changes. The separate `.venv-sglang` keeps this profile isolated from the default `.venv`. The default profile uses PyTorch 2.12.1/CUDA 13.2 and Triton 3.7.1, while the combined profile uses PyTorch 2.11/CUDA 13 and Triton 3.6.0. Both use FlashAttention 4.
+> **Note:** The default profile uses PyTorch 2.12.1/CUDA 13.2 and Triton 3.7.1. Both profiles use FlashAttention 4.
 
 See the [installation guide](https://togethercomputer.github.io/xorl/getting-started/installation/) for full setup including optional dependencies (DeepEP, Flash Attention).
 

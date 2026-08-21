@@ -134,7 +134,6 @@ weight_sync/
 └── backends/
     ├── base.py             # WeightTransportBackend ABC + TransportConfig dataclass
     ├── nccl_broadcast.py   # NCCLBroadcastBackend (default)
-    ├── nccl_simple.py      # Simplified NCCL transfer helper
     ├── p2p.py              # Mooncake RDMA P2P backend
     ├── sparse_delta.py     # Experimental packed sparse-delta backend
     └── __init__.py         # create_backend() factory

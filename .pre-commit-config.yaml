@@ -14,9 +14,6 @@ repos:
       - id: check-toml
       - id: check-ast
       - id: check-added-large-files
-        # The semantic audit ledger intentionally retains evidence for every
-        # reviewed scope. Keep the size guard for all other additions.
-        exclude: ^test_audit_decisions\.json$
       - id: check-merge-conflict
       - id: check-shebang-scripts-are-executable
       - id: detect-private-key
