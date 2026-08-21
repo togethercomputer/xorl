@@ -26,7 +26,6 @@ Three kinds of code live here with three different rules:
   objective functions live in `xorl/objectives/` (#78 phase 2); old module
   paths here are compat stubs for one deprecation cycle.
 - `moe/` — MoE expert compute backends (triton/quack/native, LoRA variants).
-  `ep_kernels/` (DeepEP sort/scatter) merges in here (#78 phase 5).
 - `linear_attention/` — GDN/linear-attention kernels. The `GatedDeltaNet`
   layer class lives in `models/layers/gated_deltanet.py` (#78 phase 4); the
   old paths re-export it lazily for one deprecation cycle.
