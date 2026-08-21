@@ -26,7 +26,7 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from xorl.ops.canonical_moe_leaf import canonical_moe_leaf_fp32_v1_op
+from xorl.ops.exact.canonical_moe_leaf import canonical_moe_leaf_fp32_v1_op
 
 
 CANONICAL_MOE_FOLD_VERSION = "canonical_moe_fold_fp64_v3"
@@ -677,7 +677,7 @@ def _canonical_moe_cast_fp64_to_transport(
     if folded_fp64.dtype is not torch.float64:
         raise TypeError(f"Canonical MoE final cast requires FP64 input, got {folded_fp64.dtype}")
     if folded_fp64.is_cuda and transport_dtype in (torch.bfloat16, torch.float16):
-        from xorl.ops.canonical_moe_cast import canonical_moe_fp64_to_lowp_rne  # noqa: PLC0415
+        from xorl.ops.exact.canonical_moe_cast import canonical_moe_fp64_to_lowp_rne  # noqa: PLC0415
 
         return canonical_moe_fp64_to_lowp_rne(folded_fp64.contiguous(), transport_dtype)
     return folded_fp64.to(transport_dtype)

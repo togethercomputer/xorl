@@ -25,8 +25,8 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from xorl.models.transformers.glm5.exact_lora_contract import glm52_exact_lora_scaling
-from xorl.ops.block_fp8_native import NativeBlockFP8Linear, _sglang_native_block_fp8_linear_value
-from xorl.ops.fused_silu_and_mul import exact_fp32_silu_and_mul
+from xorl.ops.exact.block_fp8_native import NativeBlockFP8Linear, _sglang_native_block_fp8_linear_value
+from xorl.ops.exact.fused_silu_and_mul import exact_fp32_silu_and_mul
 
 
 GLM52_EXACT_TP16_SHARED_EXPERT_QLORA_CONTRACT_VERSION = "glm52_exact_tp16_shared_expert_qlora_v2"

@@ -16,7 +16,7 @@ from xorl.models.transformers.glm5.exact_gate_up_qlora import (
 )
 from xorl.models.transformers.glm5.exact_lora_contract import glm52_exact_lora_scaling
 from xorl.models.transformers.glm5.exact_qlora import Glm52ExactTP1BlockFP8QLoRALinear
-from xorl.ops.fused_silu_and_mul import exact_fp32_silu_and_mul
+from xorl.ops.exact.fused_silu_and_mul import exact_fp32_silu_and_mul
 
 
 GLM52_EXACT_TP1_DENSE_MLP_CONTRACT_VERSION = "glm52_exact_tp1_dense_mlp_qlora_v2"

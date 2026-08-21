@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 
 from xorl.models.layers import rope as xrope
-from xorl.ops.fused_silu_and_mul import exact_fp32_silu_and_mul
+from xorl.ops.exact.fused_silu_and_mul import exact_fp32_silu_and_mul
 
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

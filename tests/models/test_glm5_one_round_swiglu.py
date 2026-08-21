@@ -48,7 +48,7 @@ from xorl.models.exact_contract import (
 )
 from xorl.models.transformers.glm5.configuration_glm5 import Glm5Config
 from xorl.models.transformers.glm5.modeling_glm5 import GLM52_LOCAL_PARTIAL_POLICY, Glm5MLP
-from xorl.ops.fused_silu_and_mul import exact_fp32_silu_and_mul
+from xorl.ops.exact.fused_silu_and_mul import exact_fp32_silu_and_mul
 
 
 # GLM-5.2 geometries with byte evidence: the 128-wide TP16 shared-expert

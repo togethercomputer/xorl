@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from xorl.ops.rope_class_b import (
+from xorl.ops.exact.rope_class_b import (
     build_class_b_cos_sin,
     class_b_apply_rotary_pos_emb,
 )

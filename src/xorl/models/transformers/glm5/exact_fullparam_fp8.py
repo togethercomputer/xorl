@@ -25,12 +25,12 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from xorl.ops.block_fp8_native import (
+from xorl.ops.exact.block_fp8_native import (
     _sglang_native_block_fp8_linear_value,
     pack_fp8_as_float32,
     unpack_float32_as_fp8,
 )
-from xorl.ops.fused_silu_and_mul import exact_fp32_silu_and_mul
+from xorl.ops.exact.fused_silu_and_mul import exact_fp32_silu_and_mul
 
 
 logger = logging.getLogger(__name__)

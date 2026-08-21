@@ -33,7 +33,7 @@ from xorl.models.layers.moe.backend import expert_adapter_backend_contract
 from xorl.models.layers.moe.experts import MoEExperts
 from xorl.models.transformers.glm5.exact_lora_contract import glm52_exact_lora_scaling
 from xorl.models.transformers.glm5.native_fp8 import Glm52NativeBlockFP8Experts
-from xorl.ops.block_fp8_native import pack_fp8_as_float32
+from xorl.ops.exact.block_fp8_native import pack_fp8_as_float32
 
 
 GLM52_EXACT_EP16_ROUTED_QLORA_CONTRACT_VERSION = "glm52_exact_ep16_routed_qlora_v2"

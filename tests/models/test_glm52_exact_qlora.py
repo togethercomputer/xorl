@@ -10,7 +10,7 @@ from xorl.models.transformers.glm5.exact_qlora import (
     GLM52_EXACT_TP1_QLORA_CONTRACT_VERSION,
     Glm52ExactTP1BlockFP8QLoRALinear,
 )
-from xorl.ops.block_fp8_native import NativeBlockFP8Linear
+from xorl.ops.exact.block_fp8_native import NativeBlockFP8Linear
 
 
 def _module() -> Glm52ExactTP1BlockFP8QLoRALinear:

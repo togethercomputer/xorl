@@ -12,7 +12,7 @@ from xorl.models.transformers.glm5.exact_shared_expert_qlora import (
     GLM52_EXACT_TP16_SHARED_EXPERT_QLORA_CONTRACT_VERSION,
     Glm52ExactTP16SharedExpertBlockFP8QLoRA,
 )
-from xorl.ops.fused_silu_and_mul import exact_fp32_silu_and_mul
+from xorl.ops.exact.fused_silu_and_mul import exact_fp32_silu_and_mul
 
 
 def _canonical_moe_reference(partials: torch.Tensor, metadata: CanonicalMoEGraphMetadata) -> torch.Tensor:

@@ -20,7 +20,7 @@ from xorl.models.transformers.glm5.qlora import (
     prepare_glm52_block_fp8_qlora,
 )
 from xorl.models.transformers.glm5.support import validate_glm5_training_mode
-from xorl.ops.block_fp8_native import NativeBlockFP8Linear
+from xorl.ops.exact.block_fp8_native import NativeBlockFP8Linear
 from xorl.qlora.modules.block_fp8_linear import BlockFP8QLoRALinear
 from xorl.qlora.modules.moe_experts import BlockFP8QLoRAMoeExperts
 

@@ -19,7 +19,7 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.tensor import DTensor, Shard
 
 from xorl.models.transformers.glm5.native_fp8 import Glm52NativeBlockFP8Experts
-from xorl.ops.block_fp8_native import NativeBlockFP8Linear
+from xorl.ops.exact.block_fp8_native import NativeBlockFP8Linear
 
 
 THIS_DIR = Path(__file__).resolve().parent

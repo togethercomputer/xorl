@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from xorl.models.layers.moe.experts import MoEExperts
-from xorl.ops.block_fp8_native import (
+from xorl.ops.exact.block_fp8_native import (
     NATIVE_BLOCK_FP8_CONTRACT_VERSION,
     NativeBlockFP8Linear,
     pack_fp8_as_float32,
@@ -1003,7 +1003,7 @@ class Glm52NativeBlockFP8DenseMLP(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        from xorl.ops.fused_silu_and_mul import exact_fp32_silu_and_mul  # noqa: PLC0415
+        from xorl.ops.exact.fused_silu_and_mul import exact_fp32_silu_and_mul  # noqa: PLC0415
 
         gate_up = self.gate_up_proj(hidden_states)
         activated = exact_fp32_silu_and_mul(gate_up)

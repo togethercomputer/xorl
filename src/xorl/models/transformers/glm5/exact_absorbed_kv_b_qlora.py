@@ -20,7 +20,7 @@ import torch
 from torch import Tensor, nn
 
 from xorl.models.transformers.glm5.exact_lora_contract import glm52_exact_lora_scaling
-from xorl.ops.block_fp8_native import NativeBlockFP8Linear
+from xorl.ops.exact.block_fp8_native import NativeBlockFP8Linear
 
 
 GLM52_EXACT_TP1_ABSORBED_KV_B_QLORA_CONTRACT_VERSION = "glm52_exact_tp1_absorbed_kv_b_qlora_v2"

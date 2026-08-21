@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from xorl.ops.canonical_moe_cast import canonical_moe_fp64_to_lowp_rne
+from xorl.ops.exact.canonical_moe_cast import canonical_moe_fp64_to_lowp_rne
 
 
 @pytest.mark.gpu

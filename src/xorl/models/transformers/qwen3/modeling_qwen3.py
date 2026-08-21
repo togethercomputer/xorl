@@ -30,7 +30,7 @@ from xorl.models.outputs import BaseModelOutput, CausalLMOutput
 from xorl.models.transformers.qwen3 import parallelize
 from xorl.models.transformers.qwen3.checkpoint_handler import Qwen3CheckpointHandler
 from xorl.models.transformers.qwen3.configuration_qwen3 import Qwen3Config
-from xorl.ops.fused_silu_and_mul import fused_silu_and_mul
+from xorl.ops.exact.fused_silu_and_mul import fused_silu_and_mul
 from xorl.utils import logging
 
 

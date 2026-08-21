@@ -24,7 +24,7 @@ from xorl.models.transformers.deepseek_v3.support import (
     has_packed_expert_weights,
 )
 from xorl.models.transformers.qwen3_5_shared import qwen3_5_apply_rotary_pos_emb
-from xorl.ops.fused_silu_and_mul import fused_silu_and_mul
+from xorl.ops.exact.fused_silu_and_mul import fused_silu_and_mul
 from xorl.utils import logging
 
 

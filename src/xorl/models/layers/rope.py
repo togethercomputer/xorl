@@ -637,8 +637,8 @@ def rope_class_b_enabled() -> bool:
 
 
 def stock_fused_apply_rotary_pos_emb(q, k, cos, sin, *, interleaved: bool = False, doubled: bool = True):
-    """Class-B RoPE application backed by the compiled expression in ``xorl.ops.rope_class_b``."""
-    from xorl.ops.rope_class_b import class_b_apply_rotary_pos_emb  # noqa: PLC0415
+    """Class-B RoPE application backed by the compiled expression in ``xorl.ops.exact.rope_class_b``."""
+    from xorl.ops.exact.rope_class_b import class_b_apply_rotary_pos_emb  # noqa: PLC0415
 
     return class_b_apply_rotary_pos_emb(q, k, cos, sin, interleaved=interleaved, doubled=doubled)
 

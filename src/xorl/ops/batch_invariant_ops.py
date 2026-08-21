@@ -23,7 +23,7 @@ import triton
 import triton.language as tl
 from triton.runtime.errors import OutOfResources
 
-from xorl.ops.bi_gemm_configs import baseline_mm_config, lookup_mm_config
+from xorl.ops.exact.bi_gemm_configs import baseline_mm_config, lookup_mm_config
 
 
 # --- Stubs for SGLang-internal imports ---------------------------------------

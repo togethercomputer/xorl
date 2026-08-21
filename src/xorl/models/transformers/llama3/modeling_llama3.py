@@ -24,7 +24,7 @@ from xorl.models.outputs import BaseModelOutput, CausalLMOutput
 from xorl.models.transformers.llama3 import parallelize
 from xorl.models.transformers.llama3.checkpoint_handler import Llama3CheckpointHandler
 from xorl.models.transformers.llama3.configuration_llama3 import Llama3Config
-from xorl.ops.fused_silu_and_mul import fused_silu_and_mul
+from xorl.ops.exact.fused_silu_and_mul import fused_silu_and_mul
 from xorl.utils import logging
 
 

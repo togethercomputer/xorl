@@ -17,7 +17,7 @@ from xorl.ops.batch_invariant_ops import (
     matmul_kernel_persistent,
     set_batch_invariant_mode,
 )
-from xorl.ops.bi_gemm_configs import BASELINE_CONFIG, PINNED_BLOCK_K, lookup_mm_config
+from xorl.ops.exact.bi_gemm_configs import BASELINE_CONFIG, PINNED_BLOCK_K, lookup_mm_config
 
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

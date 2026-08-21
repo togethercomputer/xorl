@@ -1040,7 +1040,7 @@ class DistributedCheckpointer(CheckpointerBase):
         # the global expert dimension and therefore matches DCP metadata.
         expected_model_state = load_state["model"].state_dict()
         if any("packed_weight_f32" in name or name.endswith("weight_scale_inv") for name in expected_model_state):
-            from xorl.ops.block_fp8_native import validate_native_fp8_dcp_checkpoint  # noqa: PLC0415
+            from xorl.ops.exact.block_fp8_native import validate_native_fp8_dcp_checkpoint  # noqa: PLC0415
 
             validate_native_fp8_dcp_checkpoint(
                 checkpoint_dir,

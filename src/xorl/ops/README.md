@@ -11,18 +11,17 @@ Three kinds of code live here with three different rules:
 | kind | rule |
 | --- | --- |
 | **Vendored** — `_vendored/` (`quack/`, `flashqla/`) | Never hand-edit, lint, or reformat. Each tree carries a `VENDORED.md` with provenance and the local-patch ledger. First-party tooling skips them (`[tool.ruff]` excludes in `pyproject.toml`; top-level `exclude:` in `.pre-commit-config.yaml`). |
-| **Byte-contract-gated** — `bi_families_v2.py` | Vendored byte-identical into the serving engine; both copies are sha256-gated. Any edit here without the paired serving-side edit breaks the gate. It keeps the engine's formatting (black, 88 columns) and is excluded from all rewriting hooks. |
+| **Byte-contract-gated** — `bi_families_v2.py` (sha256-gated), `batch_invariant_ops.py` (parity-diffable twin of SGLang's copy; edits must consider the serving side) | Vendored byte-identical into the serving engine; both copies are sha256-gated. Any edit here without the paired serving-side edit breaks the gate. It keeps the engine's formatting (black, 88 columns) and is excluded from all rewriting hooks. |
 | **First-party** — everything else | Normal rules. |
 
 ## Map (current)
 
-- `bi_families_v2.py`, `batch_invariant_ops.py`, `bi_gemm_configs.py`,
-  `exact_sampling_transforms.py`, `rope_class_b.py`, `canonical_moe_leaf.py`,
-  `canonical_moe_cast.py`, `fused_silu_and_mul.py`, `kernel_config_pin.py`,
-  `block_fp8_native.py` — the **serving-parity (exact) contract family**:
-  byte-pinned programs shared with the serving engine. The `bi_` / `exact_` /
-  `canonical_` / `class_b` prefixes are historical names for the same
-  concept. Planned home: `ops/exact/` (#78 phase 3).
+- `exact/` — the **serving-parity (exact) contract family**: byte-pinned
+  programs shared with the serving engine (#78 phase 3). Three members are
+  aliased rather than moved: `bi_families_v2.py` (sha256-gated),
+  `batch_invariant_ops.py` (diffable parity twin of SGLang's copy), and
+  `exact_sampling_transforms.py` (in-flight in #74). Old root-level module
+  paths are compat stubs for one deprecation cycle.
 - `loss/` — the CE/selected-logprob kernel stack. The RL/supervised
   objective functions live in `xorl/objectives/` (#78 phase 2); old module
   paths here are compat stubs for one deprecation cycle.

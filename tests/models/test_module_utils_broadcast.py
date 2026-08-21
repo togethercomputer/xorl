@@ -14,7 +14,7 @@ from torch.distributed.tensor import DTensor
 
 from xorl.models import module_utils
 from xorl.models.transformers.glm5.native_fp8 import NativeBlockFP8PairBuffer
-from xorl.ops.block_fp8_native import NativeBlockFP8Linear
+from xorl.ops.exact.block_fp8_native import NativeBlockFP8Linear
 
 
 pytestmark = [pytest.mark.cpu]

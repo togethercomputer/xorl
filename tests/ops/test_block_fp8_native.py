@@ -4,7 +4,7 @@ import pytest
 import torch
 import torch.distributed.checkpoint as dcp
 
-from xorl.ops.block_fp8_native import (
+from xorl.ops.exact.block_fp8_native import (
     NativeBlockFP8Linear,
     pack_fp8_as_float32,
     unpack_float32_as_fp8,

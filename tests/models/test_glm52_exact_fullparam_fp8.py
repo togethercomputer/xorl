@@ -26,8 +26,8 @@ from xorl.models.transformers.glm5.exact_fullparam_fp8 import (
     quantize_master_to_serving_bytes,
 )
 from xorl.models.transformers.glm5.native_fp8 import Glm52NativeBlockFP8DenseMLP
-from xorl.ops.block_fp8_native import NativeBlockFP8Linear
-from xorl.ops.fused_silu_and_mul import exact_fp32_silu_and_mul
+from xorl.ops.exact.block_fp8_native import NativeBlockFP8Linear
+from xorl.ops.exact.fused_silu_and_mul import exact_fp32_silu_and_mul
 
 
 def _linear(in_features: int = 8, out_features: int = 16) -> Glm52ExactTP1BlockFP8FullParamLinear:

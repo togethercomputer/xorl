@@ -26,7 +26,7 @@ from xorl.models.transformers.glm5.sparse_selector import (
     select_glm52_logical_indices,
 )
 from xorl.ops.batch_invariant_ops import bi_bf16_fp32_linear, matmul_persistent
-from xorl.ops.rope_class_b import build_class_b_cos_sin
+from xorl.ops.exact.rope_class_b import build_class_b_cos_sin
 
 
 GLM52_FUSED_INDEX_K_IMPORT = "sglang.kernels.ops.quantization.dsv32.elementwise.fused_k_indexer_norm_rope"

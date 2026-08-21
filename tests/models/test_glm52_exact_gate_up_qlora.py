@@ -12,8 +12,8 @@ from xorl.models.transformers.glm5.exact_gate_up_qlora import (
     Glm52ExactTP1FusedGateUpBlockFP8QLoRA,
 )
 from xorl.models.transformers.glm5.exact_qlora import Glm52ExactTP1BlockFP8QLoRALinear
-from xorl.ops.block_fp8_native import NativeBlockFP8Linear
-from xorl.ops.fused_silu_and_mul import exact_fp32_silu_and_mul
+from xorl.ops.exact.block_fp8_native import NativeBlockFP8Linear
+from xorl.ops.exact.fused_silu_and_mul import exact_fp32_silu_and_mul
 
 
 def _module() -> Glm52ExactTP1FusedGateUpBlockFP8QLoRA:

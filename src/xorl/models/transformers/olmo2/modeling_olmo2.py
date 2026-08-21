@@ -26,7 +26,7 @@ from xorl.models.outputs import BaseModelOutput, CausalLMOutput
 from xorl.models.transformers.olmo2 import parallelize
 from xorl.models.transformers.olmo2.checkpoint_handler import Olmo2CheckpointHandler
 from xorl.models.transformers.olmo2.configuration_olmo2 import Olmo2Config
-from xorl.ops.fused_silu_and_mul import fused_silu_and_mul
+from xorl.ops.exact.fused_silu_and_mul import fused_silu_and_mul
 from xorl.utils import logging
 
 

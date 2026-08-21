@@ -146,7 +146,7 @@ def _fabricate_snapshot(config, snapshot_dir: str) -> None:
     import safetensors.torch as st
 
     from xorl.models.transformers.glm5.native_fp8 import Glm52NativeBlockFP8Experts
-    from xorl.ops.block_fp8_native import NativeBlockFP8Linear
+    from xorl.ops.exact.block_fp8_native import NativeBlockFP8Linear
 
     model = _build_meta_model(config)
     state: dict[str, torch.Tensor] = {}
@@ -286,7 +286,7 @@ def _run_construction_gate() -> None:
     )
     from xorl.models.transformers.glm5.modeling_glm5 import Glm5ForCausalLM
     from xorl.models.transformers.glm5.native_fp8 import Glm52NativeBlockFP8Experts
-    from xorl.ops.block_fp8_native import NativeBlockFP8Linear
+    from xorl.ops.exact.block_fp8_native import NativeBlockFP8Linear
 
     snapshot_dir = os.environ[_SNAPSHOT_ENV]
     dist.init_process_group("nccl")
