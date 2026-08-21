@@ -156,14 +156,14 @@ def test_adapter_program_rejects_partial_targets_and_non_rank_one() -> None:
         )
 
 
-def test_exact_loss_mode_rejects_non_tp_aware_bi_fused_path() -> None:
+def test_exact_loss_mode_rejects_non_tp_aware_batch_invariant_path() -> None:
     config = _official_config()
     config._dsv4_flash_exact_mode = True
 
     assert resolve_cross_entropy_mode(config, None) == "compiled"
     assert resolve_cross_entropy_mode(config, "compiled") == "compiled"
     with pytest.raises(ValueError, match="requires ce_mode='compiled'"):
-        resolve_cross_entropy_mode(config, "bi_fused")
+        resolve_cross_entropy_mode(config, "batch_invariant")
 
 
 def test_inventory_derives_exact_345_non_routed_43_banks_and_948_factors() -> None:

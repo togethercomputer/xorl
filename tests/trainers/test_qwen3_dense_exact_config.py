@@ -69,7 +69,7 @@ def test_dense_qwen3_resolves_shared_exact_program():
     assert not program.activation_native
     assert program.rope_native
     assert program.rope_fp32_single_round
-    assert resolve_cross_entropy_mode(config, None) == "bi_fused"
+    assert resolve_cross_entropy_mode(config, None) == "batch_invariant"
     assert _resolve_rope_modes(
         config,
         rope_native=None,

@@ -2114,7 +2114,7 @@ class ModelRunner:
         ):
             return lm_head
         if (
-            self.ce_mode == "bi_fused"
+            self.ce_mode == "batch_invariant"
             and lm_head is not None
             and getattr(lm_head, "_xorl_fsdp_sharded_lm_head_loss", False)
         ):

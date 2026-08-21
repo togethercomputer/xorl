@@ -447,8 +447,8 @@ def test_generic_part_keeps_silent_fallback():
     assert hidden.shape == (1, 8, model.config.hidden_size)
 
 
-def test_bi_fused_pp_loss_defers_terminal_head_lookup():
-    loss_fn = make_pp_loss_fn("bi_fused")
+def test_batch_invariant_pp_loss_defers_terminal_head_lookup():
+    loss_fn = make_pp_loss_fn("batch_invariant")
     with pytest.raises(ValueError, match="terminal-stage lm_head"):
         loss_fn(torch.zeros(1, 2, 4), torch.zeros(1, 2, dtype=torch.long))
 

@@ -48,5 +48,5 @@ lora_alpha: 16
 lora_target_modules: ["q_proj", "k_proj", "v_proj", "g_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
 
 skip_initial_checkpoint: true
-# bi_fused = K3 lm-head contract CE (fp32-class, tp1, no z-loss); requires tree >= 09a5ae3d3 (older trees silently ran eager for bi_fused)
-ce_mode: bi_fused
+# batch_invariant = K3 lm-head contract CE (fp32-class, tp1, no z-loss); requires tree >= 09a5ae3d3 (older trees silently ran eager for batch_invariant)
+ce_mode: batch_invariant

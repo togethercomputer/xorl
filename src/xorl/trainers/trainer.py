@@ -1325,7 +1325,7 @@ class Trainer:
                     or getattr(pp_lm_head, "_dsv4_exact_tp8_lm_head", False)
                 )
             )
-            lm_head_in_loss = ce_mode in {"quack_linear", "bi_fused"} or exact_head
+            lm_head_in_loss = ce_mode in {"quack_linear", "batch_invariant"} or exact_head
             stages = []
             for model_part, init_stage in zip(self.model_parts, self.pp_stages):
                 stage_index = init_stage.stage_index

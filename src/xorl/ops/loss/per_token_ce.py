@@ -29,7 +29,7 @@ LogprobTopK = int | torch.Tensor
 LogprobProbability = float | torch.Tensor
 
 
-def resolve_bi_fused_lm_head_tp_groups(
+def resolve_batch_invariant_lm_head_tp_groups(
     ce_mode: str,
     tp_group: Optional[dist.ProcessGroup],
     lm_head: Optional[torch.nn.Module],
@@ -41,7 +41,7 @@ def resolve_bi_fused_lm_head_tp_groups(
     being passed as ``tp_group``.
     """
 
-    if ce_mode != "bi_fused" or lm_head is None:
+    if ce_mode != "batch_invariant" or lm_head is None:
         return None
     if getattr(lm_head, "_glm52_exact_tp16_lm_head", False) or getattr(lm_head, "_dsv4_exact_tp8_lm_head", False):
         return None
@@ -57,7 +57,7 @@ def resolve_bi_fused_lm_head_tp_groups(
         or tp_group is not dedicated_group
     ):
         raise NotImplementedError(
-            "ce_mode='bi_fused' requires the marked vocabulary-sharded lm_head to use its dedicated LM-head TP group"
+            "ce_mode='batch_invariant' requires the marked vocabulary-sharded lm_head to use its dedicated LM-head TP group"
         )
     return dedicated_group, getattr(ps, "lm_head_tp_replica_group", None)
 
@@ -288,26 +288,26 @@ def compute_per_token_ce(
             ignore_index=ignore_index,
         )
 
-    # ``bi_fused`` is the K3 lm-head contract (vendored identically in SGLang).
+    # ``batch_invariant`` is the K3 lm-head contract (vendored identically in SGLang).
     # Hidden states stay bf16. Per-row temperature materializes the same FP32
     # transformed logits that serving samples and scores, unlike the
     # scale-hidden-pre-GEMM convention used by the other modes.
-    if ce_mode == "bi_fused":
-        from xorl.ops.loss.bi_fused_lm_head import (  # noqa: PLC0415
-            bi_fused_per_token_ce,
-            bi_fused_vocab_parallel_per_token_ce,
+    if ce_mode == "batch_invariant":
+        from xorl.ops.loss.batch_invariant_lm_head import (  # noqa: PLC0415
+            batch_invariant_per_token_ce,
+            batch_invariant_vocab_parallel_per_token_ce,
         )
 
-        bi_fused_tp_groups = resolve_bi_fused_lm_head_tp_groups(ce_mode, tp_group, lm_head)
+        batch_invariant_tp_groups = resolve_batch_invariant_lm_head_tp_groups(ce_mode, tp_group, lm_head)
         if use_lm_head_module:
-            raise NotImplementedError("ce_mode='bi_fused' does not support FP8 lm_head modules")
+            raise NotImplementedError("ce_mode='batch_invariant' does not support FP8 lm_head modules")
         if not lm_head_fp32:
             raise NotImplementedError(
-                "ce_mode='bi_fused' implements the fp32-class lm-head contract; set lm_head_fp32: true"
+                "ce_mode='batch_invariant' implements the fp32-class lm-head contract; set lm_head_fp32: true"
             )
         local_weight = weight.to_local() if hasattr(weight, "to_local") else weight
-        if bi_fused_tp_groups is not None:
-            return bi_fused_vocab_parallel_per_token_ce(
+        if batch_invariant_tp_groups is not None:
+            return batch_invariant_vocab_parallel_per_token_ce(
                 hidden_states_flat,
                 local_weight,
                 labels_flat,
@@ -320,9 +320,9 @@ def compute_per_token_ce(
             )
         if tp_group is not None:
             raise NotImplementedError(
-                "ce_mode='bi_fused' supports TP only through the dedicated vocabulary-sharded LM-head TP path"
+                "ce_mode='batch_invariant' supports TP only through the dedicated vocabulary-sharded LM-head TP path"
             )
-        return bi_fused_per_token_ce(
+        return batch_invariant_per_token_ce(
             hidden_states_flat,
             local_weight,
             labels_flat,

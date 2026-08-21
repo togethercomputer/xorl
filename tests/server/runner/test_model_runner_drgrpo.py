@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 
 import xorl.objectives.causallm_loss as causallm_loss_impl
-import xorl.ops.loss.bi_fused_lm_head as bi_fused_lm_head_impl
+import xorl.ops.loss.batch_invariant_lm_head as batch_invariant_lm_head_impl
 import xorl.ops.loss.per_token_ce as per_token_ce_impl
 import xorl.server.runner.model_runner as model_runner_module
 from xorl.server.runner.model_runner import ModelRunner
@@ -53,7 +53,7 @@ class _TinyMarkedBiFusedModel(torch.nn.Module):
         return SimpleNamespace(last_hidden_state=self.embed(input_ids))
 
 
-def _make_bi_fused_lm_head_tp_runner(monkeypatch):
+def _make_batch_invariant_lm_head_tp_runner(monkeypatch):
     tp_group = object()
     ps = SimpleNamespace(
         lm_head_tp_size=2,
@@ -85,19 +85,19 @@ def _make_bi_fused_lm_head_tp_runner(monkeypatch):
         return F.cross_entropy(logits, labels, reduction="none", ignore_index=ignore_index)
 
     monkeypatch.setattr(
-        bi_fused_lm_head_impl,
-        "bi_fused_vocab_parallel_per_token_ce",
+        batch_invariant_lm_head_impl,
+        "batch_invariant_vocab_parallel_per_token_ce",
         fake_vocab_parallel_ce,
     )
     runner = object.__new__(ModelRunner)
     runner.model = _TinyMarkedBiFusedModel()
-    runner.ce_mode = "bi_fused"
+    runner.ce_mode = "batch_invariant"
     runner.lm_head_fp32 = True
     return runner, tp_group, routed_groups
 
 
-def test_compute_micro_batch_loss_routes_marked_bi_fused_causallm(monkeypatch):
-    runner, tp_group, routed_groups = _make_bi_fused_lm_head_tp_runner(monkeypatch)
+def test_compute_micro_batch_loss_routes_marked_batch_invariant_causallm(monkeypatch):
+    runner, tp_group, routed_groups = _make_batch_invariant_lm_head_tp_runner(monkeypatch)
 
     loss, per_token_outputs, _metrics, _metric_ops, _outputs = runner._compute_micro_batch_loss(
         {
@@ -114,18 +114,18 @@ def test_compute_micro_batch_loss_routes_marked_bi_fused_causallm(monkeypatch):
     assert runner.model.lm_head.weight.grad is not None
 
 
-def test_marked_ordinary_head_is_exposed_only_for_bi_fused_loss_metadata():
+def test_marked_ordinary_head_is_exposed_only_for_batch_invariant_loss_metadata():
     runner = object.__new__(ModelRunner)
     runner.model = _TinyMarkedBiFusedModel()
     runner.ce_mode = "eager"
     assert runner._get_loss_lm_head_module(runner.model.lm_head) is None
 
-    runner.ce_mode = "bi_fused"
+    runner.ce_mode = "batch_invariant"
     assert runner._get_loss_lm_head_module(runner.model.lm_head) is runner.model.lm_head
 
 
-def test_compute_micro_batch_loss_routes_marked_bi_fused_drgrpo_backward(monkeypatch):
-    runner, tp_group, routed_groups = _make_bi_fused_lm_head_tp_runner(monkeypatch)
+def test_compute_micro_batch_loss_routes_marked_batch_invariant_drgrpo_backward(monkeypatch):
+    runner, tp_group, routed_groups = _make_batch_invariant_lm_head_tp_runner(monkeypatch)
 
     loss, per_token_outputs, metrics, _metric_ops, _outputs = runner._compute_micro_batch_loss(
         {

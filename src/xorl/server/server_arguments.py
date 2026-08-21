@@ -678,7 +678,7 @@ class ServerArguments:
         default=None,
         metadata={
             "help": "Cross-entropy implementation. Omitted means compiled for ordinary models and "
-            "bi_fused for canonical GLM-5.2. 'bi_fused' is the batch-invariant "
+            "batch_invariant for canonical GLM-5.2. 'batch_invariant' is the batch-invariant "
             "K3 lm-head contract, fp32-class; needs tp=1, no z-loss, bf16 hidden/weight, lm_head_fp32), "
             "'compiled' (torch.compile), 'quack_linear' (Quack scalar loss; return_per_token uses fused "
             "selected-logprob CE), 'fused_quack', or 'eager' (baseline, may OOM at 32K)"
@@ -1228,6 +1228,16 @@ class ServerArguments:
     def __post_init__(self):
         """Validate and set defaults."""
         from xorl.fp8_training.config_compat import normalize_fp8_training_config  # noqa: PLC0415
+
+        if self.ce_mode == "bi_fused":
+            import warnings
+
+            warnings.warn(
+                "ce_mode='bi_fused' is deprecated; use ce_mode='batch_invariant'",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            self.ce_mode = "batch_invariant"
 
         if self.rope_class_b is not None:
             import warnings

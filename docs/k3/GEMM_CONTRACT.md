@@ -15,7 +15,7 @@ The output tile, group size, pipeline depth, and warp count do not split the K
 reduction, so they remain performance-tuning axes after passing the bitwise
 gate.
 
-`bi_gemm_configs.py` contains the shared, shape-keyed table. Each entry keeps
+`batch_invariant_gemm_configs.py` contains the shared, shape-keyed table. Each entry keeps
 the dtype's pinned K tile, compares bitwise with the baseline configuration,
 and checks that an identical row keeps identical output bits across row-count
 buckets. Set `XORL_BI_GEMM_CONFIG_TABLE=0` to use the pinned baseline table.

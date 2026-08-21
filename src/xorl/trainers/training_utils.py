@@ -512,7 +512,7 @@ def make_pp_loss_fn(
         lm_head is not None
         and (getattr(lm_head, "_glm52_exact_tp16_lm_head", False) or getattr(lm_head, "_dsv4_exact_tp8_lm_head", False))
     )
-    if ce_mode == "bi_fused" or exact_head:
+    if ce_mode == "batch_invariant" or exact_head:
         # Every rank constructs the schedule, but only the terminal stage calls
         # the loss. Defer the missing-head error so headless PP stages remain
         # independent of the output projection.
@@ -580,7 +580,9 @@ def make_pp_loss_fn(
             return _pp_quack_linear_ce_sum(hidden, labels, lm_head=lm_head)
 
         return _quack_loss
-    raise ValueError(f"Unknown ce_mode: {ce_mode!r} (expected 'eager', 'compiled', 'quack_linear', or 'bi_fused')")
+    raise ValueError(
+        f"Unknown ce_mode: {ce_mode!r} (expected 'eager', 'compiled', 'quack_linear', or 'batch_invariant')"
+    )
 
 
 def pad_micro_batches_for_pp(

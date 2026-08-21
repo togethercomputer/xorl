@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from xorl.objectives.causallm_loss import causallm_loss_function
-from xorl.ops.loss.bi_fused_lm_head import bi_fused_per_token_ce
+from xorl.ops.loss.batch_invariant_lm_head import batch_invariant_per_token_ce
 
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -22,9 +22,11 @@ def _inputs(seed=0):
 
 @requires_cuda
 @pytest.mark.gpu
-def test_bi_fused_matches_eager_fp32_reference():
+def test_batch_invariant_matches_eager_fp32_reference():
     hidden, weight, labels = _inputs()
-    out = causallm_loss_function(hidden, weight, labels, ce_mode="bi_fused", lm_head_fp32=True, return_per_token=True)
+    out = causallm_loss_function(
+        hidden, weight, labels, ce_mode="batch_invariant", lm_head_fp32=True, return_per_token=True
+    )
     ref = causallm_loss_function(hidden, weight, labels, ce_mode="eager", lm_head_fp32=True, return_per_token=True)
     assert torch.allclose(out.per_token_logprobs, ref.per_token_logprobs, rtol=1e-4, atol=1e-5)
     assert torch.allclose(out.loss.float(), ref.loss.float(), rtol=1e-4, atol=1e-5)
@@ -34,12 +36,12 @@ def test_bi_fused_matches_eager_fp32_reference():
 
 @requires_cuda
 @pytest.mark.gpu
-def test_bi_fused_backward_matches_eager_autograd():
+def test_batch_invariant_backward_matches_eager_autograd():
     hidden, weight, labels = _inputs(1)
 
     h1 = hidden.clone().requires_grad_(True)
     w1 = weight.clone().requires_grad_(True)
-    causallm_loss_function(h1, w1, labels, ce_mode="bi_fused", lm_head_fp32=True).loss.backward()
+    causallm_loss_function(h1, w1, labels, ce_mode="batch_invariant", lm_head_fp32=True).loss.backward()
 
     h2 = hidden.clone().requires_grad_(True)
     w2 = weight.clone().requires_grad_(True)
@@ -51,9 +53,9 @@ def test_bi_fused_backward_matches_eager_autograd():
 
 @requires_cuda
 @pytest.mark.gpu
-def test_bi_fused_deterministic_and_batch_invariant():
+def test_batch_invariant_deterministic_and_batch_invariant():
     hidden, weight, labels = _inputs(2)
-    kw = dict(ce_mode="bi_fused", lm_head_fp32=True, return_per_token=True)
+    kw = dict(ce_mode="batch_invariant", lm_head_fp32=True, return_per_token=True)
     a = causallm_loss_function(hidden, weight, labels, **kw).per_token_logprobs
     b = causallm_loss_function(hidden, weight, labels, **kw).per_token_logprobs
     assert torch.equal(a, b)
@@ -63,20 +65,20 @@ def test_bi_fused_deterministic_and_batch_invariant():
 
 @requires_cuda
 @pytest.mark.gpu
-def test_bi_fused_guards():
+def test_batch_invariant_guards():
     hidden, weight, labels = _inputs(3)
     with pytest.raises(NotImplementedError, match="lm_head_fp32"):
-        causallm_loss_function(hidden, weight, labels, ce_mode="bi_fused", lm_head_fp32=False)
+        causallm_loss_function(hidden, weight, labels, ce_mode="batch_invariant", lm_head_fp32=False)
     with pytest.raises(NotImplementedError, match="softmax_auxiliary_loss"):
-        causallm_loss_function(hidden, weight, labels, ce_mode="bi_fused", lm_head_fp32=True, z_loss_coef=0.1)
+        causallm_loss_function(hidden, weight, labels, ce_mode="batch_invariant", lm_head_fp32=True, z_loss_coef=0.1)
 
 
 @requires_cuda
 @pytest.mark.gpu
-def test_bi_fused_temperature_matches_eager_reference():
+def test_batch_invariant_temperature_matches_eager_reference():
     hidden, weight, labels = _inputs(4)
     kw = dict(lm_head_fp32=True, logprob_temperature=0.7, return_per_token=True)
-    out = causallm_loss_function(hidden, weight, labels, ce_mode="bi_fused", **kw)
+    out = causallm_loss_function(hidden, weight, labels, ce_mode="batch_invariant", **kw)
     ref = causallm_loss_function(hidden, weight, labels, ce_mode="eager", **kw)
     assert torch.allclose(out.per_token_logprobs, ref.per_token_logprobs, rtol=1e-4, atol=1e-5)
     assert (out.per_token_loss.view(-1)[:7] == 0).all()
@@ -84,13 +86,13 @@ def test_bi_fused_temperature_matches_eager_reference():
 
 @requires_cuda
 @pytest.mark.gpu
-def test_bi_fused_temperature_backward_matches_eager_autograd():
+def test_batch_invariant_temperature_backward_matches_eager_autograd():
     hidden, weight, labels = _inputs(5)
 
     h1 = hidden.clone().requires_grad_(True)
     w1 = weight.clone().requires_grad_(True)
     causallm_loss_function(
-        h1, w1, labels, ce_mode="bi_fused", lm_head_fp32=True, logprob_temperature=0.7
+        h1, w1, labels, ce_mode="batch_invariant", lm_head_fp32=True, logprob_temperature=0.7
     ).loss.backward()
 
     h2 = hidden.clone().requires_grad_(True)
@@ -103,7 +105,7 @@ def test_bi_fused_temperature_backward_matches_eager_autograd():
 
 @requires_cuda
 @pytest.mark.gpu
-def test_bi_fused_mixed_row_temperature_matches_reference_and_backward():
+def test_batch_invariant_mixed_row_temperature_matches_reference_and_backward():
     hidden, weight, labels = _inputs(51)
     temperature = torch.linspace(0.7, 1.3, N, dtype=torch.float32, device="cuda").reshape(1, N)
 
@@ -113,7 +115,7 @@ def test_bi_fused_mixed_row_temperature_matches_reference_and_backward():
         exact_hidden,
         exact_weight,
         labels,
-        ce_mode="bi_fused",
+        ce_mode="batch_invariant",
         lm_head_fp32=True,
         logprob_temperature=temperature,
         return_per_token=True,
@@ -139,13 +141,13 @@ def test_bi_fused_mixed_row_temperature_matches_reference_and_backward():
 
 @requires_cuda
 @pytest.mark.gpu
-def test_bi_fused_per_row_unit_temperature_preserves_forward_bytes():
+def test_batch_invariant_per_row_unit_temperature_preserves_forward_bytes():
     hidden, weight, labels = _inputs(52)
     scalar = causallm_loss_function(
         hidden,
         weight,
         labels,
-        ce_mode="bi_fused",
+        ce_mode="batch_invariant",
         lm_head_fp32=True,
         return_per_token=True,
     )
@@ -153,7 +155,7 @@ def test_bi_fused_per_row_unit_temperature_preserves_forward_bytes():
         hidden,
         weight,
         labels,
-        ce_mode="bi_fused",
+        ce_mode="batch_invariant",
         lm_head_fp32=True,
         logprob_temperature=torch.ones((1, N), dtype=torch.float32, device="cuda"),
         return_per_token=True,
@@ -164,7 +166,7 @@ def test_bi_fused_per_row_unit_temperature_preserves_forward_bytes():
 @requires_cuda
 @pytest.mark.gpu
 @pytest.mark.parametrize("family", ["v1", "v2"])
-def test_bi_fused_temperature_matches_serving_materialize_then_score(family):
+def test_batch_invariant_temperature_matches_serving_materialize_then_score(family):
     pytest.importorskip("sglang")
     from sglang.srt.batch_invariant_ops import (
         bi_lm_head_selected_logprob_from_logits as serving_v1_score,
@@ -195,13 +197,13 @@ def test_bi_fused_temperature_matches_serving_materialize_then_score(family):
             logits, _ = head_v2_full_logits_with_lse(hidden, weight)
             score = serving_v2_score
 
-        actual = bi_fused_per_token_ce(hidden, weight, labels, temperature=temperature)
+        actual = batch_invariant_per_token_ce(hidden, weight, labels, temperature=temperature)
         transformed = serving_scale(logits, temperature)
         expected_logprob, _, _ = score(transformed, labels, temperature=None)
         assert torch.equal(actual.view(torch.uint8), (-expected_logprob).view(torch.uint8))
 
-        scalar_unit = bi_fused_per_token_ce(hidden, weight, labels, temperature=1.0)
-        row_unit = bi_fused_per_token_ce(hidden, weight, labels, temperature=torch.ones_like(temperature))
+        scalar_unit = batch_invariant_per_token_ce(hidden, weight, labels, temperature=1.0)
+        row_unit = batch_invariant_per_token_ce(hidden, weight, labels, temperature=torch.ones_like(temperature))
         assert torch.equal(scalar_unit.view(torch.uint8), row_unit.view(torch.uint8))
     finally:
         bi_families_v2._select_nonexact_families()

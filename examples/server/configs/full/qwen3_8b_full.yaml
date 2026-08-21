@@ -36,5 +36,5 @@ enable_packing: true
 
 # Full weight training
 skip_initial_checkpoint: true
-# bi_fused = K3 lm-head contract CE (fp32-class, tp1, no z-loss); requires tree >= 09a5ae3d3 (older trees silently ran eager for bi_fused)
-ce_mode: bi_fused
+# batch_invariant = K3 lm-head contract CE (fp32-class, tp1, no z-loss); requires tree >= 09a5ae3d3 (older trees silently ran eager for batch_invariant)
+ce_mode: batch_invariant

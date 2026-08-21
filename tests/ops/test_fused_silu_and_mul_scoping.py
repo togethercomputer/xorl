@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as F
 
 from xorl.models.transformers.qwen3_5.modeling_qwen3_5 import Qwen3_5MLP
-from xorl.ops.exact.fused_silu_and_mul import one_round_swiglu, fused_silu_and_mul
+from xorl.ops.exact.fused_silu_and_mul import fused_silu_and_mul, one_round_swiglu
 
 
 def _two_round_reference(x: torch.Tensor) -> torch.Tensor:

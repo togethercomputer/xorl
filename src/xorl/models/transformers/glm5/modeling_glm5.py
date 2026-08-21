@@ -15,10 +15,10 @@ from xorl.distributed.canonical_moe import (
     LogicalRowOwnership,
     OutputDistribution,
     ParallelPlan,
-    moe_fixed_order_leaf_fp32_v1,
     canonical_moe_reduce_cp_sharded_v3,
     canonical_moe_reduce_fp64_v3,
     canonical_moe_reduce_packed_ep16_v2,
+    moe_fixed_order_leaf_fp32_v1,
     resolve_canonical_moe_transport,
 )
 from xorl.distributed.moe.deepep import sync_pending_combine
@@ -70,7 +70,7 @@ from xorl.models.transformers.glm5.rotary import glm5_apply_rotary_pos_emb
 from xorl.models.transformers.glm5.sparse_mla import sparse_mla_dispatch
 from xorl.models.transformers.glm5.support import validate_glm5_sequence_parallel
 from xorl.ops.exact.block_fp8_native import NativeBlockFP8Linear
-from xorl.ops.exact.fused_silu_and_mul import one_round_swiglu, fused_silu_and_mul
+from xorl.ops.exact.fused_silu_and_mul import fused_silu_and_mul, one_round_swiglu
 from xorl.utils import logging
 
 
@@ -271,7 +271,9 @@ class Glm5MlaAttention(nn.Module):
             cos,
             sin,
             interleaved=getattr(self.config, "rope_interleave", True),
-            fp32_single_round=bool(getattr(self.config, "_rope_fp32_single_round", False) or glm52_exact_forward_enabled(self.config)),
+            fp32_single_round=bool(
+                getattr(self.config, "_rope_fp32_single_round", False) or glm52_exact_forward_enabled(self.config)
+            ),
         )
         k_rot = k_rot.expand(*k_pass.shape[:-1], -1)
 
@@ -461,7 +463,9 @@ class Glm5Attention(Glm5MlaAttention):
             cos,
             sin,
             interleaved=getattr(self.config, "rope_interleave", True),
-            fp32_single_round=bool(getattr(self.config, "_rope_fp32_single_round", False) or glm52_exact_forward_enabled(self.config)),
+            fp32_single_round=bool(
+                getattr(self.config, "_rope_fp32_single_round", False) or glm52_exact_forward_enabled(self.config)
+            ),
         )
         k_pe = k_pe.squeeze(2)
 

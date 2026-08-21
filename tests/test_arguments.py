@@ -829,3 +829,27 @@ def _assert_parse_args_load_optimizer_flag(tmp_path, monkeypatch):
         args = parse_args(Arguments)
 
         assert args.train.load_optimizer is expected
+
+
+def test_deprecated_rope_class_b_alias_maps_to_new_field():
+    import warnings
+
+    from xorl.arguments import ModelArguments
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        args = ModelArguments(config_path="dummy", rope_class_b=True)
+    assert args.rope_fp32_single_round is True
+    assert any("rope_class_b is deprecated" in str(w.message) for w in caught)
+
+
+def test_deprecated_bi_fused_ce_mode_normalizes_to_batch_invariant():
+    import warnings
+
+    from xorl.arguments import TrainingArguments
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        args = TrainingArguments(output_dir="/tmp/xorl-test", ce_mode="bi_fused")
+    assert args.ce_mode == "batch_invariant"
+    assert any("ce_mode='bi_fused' is deprecated" in str(w.message) for w in caught)

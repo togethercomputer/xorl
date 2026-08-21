@@ -462,7 +462,9 @@ class RotaryEmbedding(nn.Module):
         self._set_inv_freq_fp32(self._cpu_fp32_inv_freq())
         self._sglang_default_cache = None
         self._use_sglang_default_cache = bool(getattr(config, "_rope_native", False) and self.rope_type == "default")
-        self._fp32_single_round = bool(getattr(config, "_rope_fp32_single_round", False) or glm52_exact_forward_enabled(config))
+        self._fp32_single_round = bool(
+            getattr(config, "_rope_fp32_single_round", False) or glm52_exact_forward_enabled(config)
+        )
 
     def _cpu_fp32_inv_freq(self) -> torch.Tensor:
         """Frequency table computed on CPU in fp32 — the provenance serving's cos/sin cache is built with."""
@@ -623,9 +625,7 @@ def set_rope_native(enabled: bool):
 # first would land back in Class A, so the Class-B lane keeps the table in fp32 all
 # the way to the kernel.
 
-_rope_fp32_single_round = (
-    os.environ.get("XORL_ROPE_FP32_SINGLE_ROUND", os.environ.get("XORL_ROPE_CLASS_B", "")) == "1"
-)
+_rope_fp32_single_round = os.environ.get("XORL_ROPE_FP32_SINGLE_ROUND", os.environ.get("XORL_ROPE_CLASS_B", "")) == "1"
 
 
 def set_rope_fp32_single_round(enabled: bool) -> None:

@@ -15,7 +15,7 @@ from xorl.ops.exact.sampling_transforms import (
     exact_support_workspace_bytes,
     normalize_exact_sampling_transforms,
 )
-from xorl.ops.loss.bi_fused_lm_head import _score_exact_sampling_rows
+from xorl.ops.loss.batch_invariant_lm_head import _score_exact_sampling_rows
 
 
 def _rows(values):
@@ -196,7 +196,7 @@ def test_chunked_selected_score_and_vjp_equal_direct_program():
 
 def test_filtered_exact_heads_do_not_save_dense_support_on_autograd_contexts():
     modules = [
-        importlib.import_module("xorl.ops.loss.bi_fused_lm_head"),
+        importlib.import_module("xorl.ops.loss.batch_invariant_lm_head"),
         importlib.import_module("xorl.models.transformers.glm5.exact_lm_head_qlora"),
         importlib.import_module("xorl.models.transformers.deepseek_v4.exact_lm_head"),
     ]

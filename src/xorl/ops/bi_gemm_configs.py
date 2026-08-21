@@ -1,3 +1,7 @@
-"""Moved to ``xorl.ops.exact.bi_gemm_configs`` (issue #78 phase 3); compat stub."""
+"""Moved to ``xorl.ops.exact.batch_invariant_gemm_configs`` (issue #78); alias stub."""
 
-from xorl.ops.exact.bi_gemm_configs import *  # noqa: F401,F403
+import importlib as _importlib
+import sys as _sys
+
+
+_sys.modules[__name__] = _importlib.import_module("xorl.ops.exact.batch_invariant_gemm_configs")

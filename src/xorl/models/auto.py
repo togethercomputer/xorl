@@ -768,18 +768,22 @@ def resolve_cross_entropy_mode(config: PretrainedConfig, ce_mode: Optional[str])
             )
         return "compiled"
     if _is_exact_qwen35(config):
-        if ce_mode not in (None, "bi_fused"):
-            raise ValueError(f"Exact Qwen3.5-family server training requires ce_mode='bi_fused'; received {ce_mode!r}")
-        return "bi_fused"
+        if ce_mode not in (None, "batch_invariant"):
+            raise ValueError(
+                f"Exact Qwen3.5-family server training requires ce_mode='batch_invariant'; received {ce_mode!r}"
+            )
+        return "batch_invariant"
     if _is_exact_qwen3_dense(config):
-        if ce_mode not in (None, "bi_fused"):
-            raise ValueError(f"Exact dense Qwen3 server training requires ce_mode='bi_fused'; received {ce_mode!r}")
-        return "bi_fused"
+        if ce_mode not in (None, "batch_invariant"):
+            raise ValueError(
+                f"Exact dense Qwen3 server training requires ce_mode='batch_invariant'; received {ce_mode!r}"
+            )
+        return "batch_invariant"
     if not _is_exact_glm52(config):
         return ce_mode or "compiled"
-    if ce_mode not in (None, "bi_fused"):
-        raise ValueError(f"Canonical GLM-5.2 exact forward requires ce_mode='bi_fused'; received {ce_mode!r}")
-    return "bi_fused"
+    if ce_mode not in (None, "batch_invariant"):
+        raise ValueError(f"Canonical GLM-5.2 exact forward requires ce_mode='batch_invariant'; received {ce_mode!r}")
+    return "batch_invariant"
 
 
 def build_foundation_model(

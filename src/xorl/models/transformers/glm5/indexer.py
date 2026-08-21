@@ -332,7 +332,9 @@ class Glm5DsaIndexer(nn.Module):
             cos,
             sin,
             interleaved=getattr(self.config, "indexer_rope_interleave", True),
-            fp32_single_round=bool(getattr(self.config, "_rope_fp32_single_round", False) or glm52_exact_forward_enabled(self.config)),
+            fp32_single_round=bool(
+                getattr(self.config, "_rope_fp32_single_round", False) or glm52_exact_forward_enabled(self.config)
+            ),
         )
 
         index_q = torch.cat([q_pe, q_no_pe], dim=-1)

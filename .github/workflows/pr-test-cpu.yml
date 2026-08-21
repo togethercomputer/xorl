@@ -62,7 +62,7 @@ jobs:
               tests/distributed/test_lm_head_tp_*.py
               tests/distributed/test_tensor_parallel.py
               tests/distributed/test_vocab_parallel_ce.py
-              tests/distributed/test_bi_fused_lm_head_tp.py
+              tests/distributed/test_batch_invariant_lm_head_tp.py
               tests/distributed/test_fused_linear_logprob_tp.py
               tests/distributed/test_olmo2_*.py
 

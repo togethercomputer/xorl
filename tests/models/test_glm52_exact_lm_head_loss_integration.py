@@ -45,7 +45,7 @@ def test_per_token_ce_routes_exact_head_before_generic_tp_and_fp32_paths(monkeyp
         weight,
         labels,
         -100,
-        "bi_fused",
+        "batch_invariant",
         tp_group=tp_group,
         lm_head_fp32=True,
         lm_head=lm_head,
@@ -55,7 +55,7 @@ def test_per_token_ce_routes_exact_head_before_generic_tp_and_fp32_paths(monkeyp
     assert captures["lm_head"] is lm_head
     assert captures["tp_group"] is tp_group
     assert captures["ignore_index"] == -100
-    assert captures["ce_mode"] == "bi_fused"
+    assert captures["ce_mode"] == "batch_invariant"
     assert captures["lm_head_fp32"] is True
     assert captures["logprob_temperature"] == 1.0
     assert captures["hidden"] is hidden
@@ -80,7 +80,7 @@ def test_per_token_ce_preserves_exact_per_row_temperature_metadata(monkeypatch: 
         torch.zeros((6, 4), dtype=torch.bfloat16),
         torch.tensor([1, 2], dtype=torch.int64),
         -100,
-        "bi_fused",
+        "batch_invariant",
         tp_group=object(),
         lm_head_fp32=True,
         lm_head=lm_head,
@@ -108,7 +108,7 @@ def test_per_token_ce_flattens_collated_sampling_transforms_in_decision_order(
         torch.zeros((6, 4), dtype=torch.bfloat16),
         torch.tensor([1, 2], dtype=torch.int64),
         -100,
-        "bi_fused",
+        "batch_invariant",
         tp_group=object(),
         lm_head_fp32=True,
         lm_head=lm_head,
@@ -141,7 +141,7 @@ def test_causallm_exact_head_admits_its_tp_group_and_rejects_z_loss(monkeypatch:
         hidden,
         weight,
         labels,
-        ce_mode="bi_fused",
+        ce_mode="batch_invariant",
         tp_group=object(),
         lm_head_fp32=True,
         lm_head=lm_head,
@@ -156,7 +156,7 @@ def test_causallm_exact_head_admits_its_tp_group_and_rejects_z_loss(monkeypatch:
             hidden.detach(),
             weight,
             labels,
-            ce_mode="bi_fused",
+            ce_mode="batch_invariant",
             tp_group=object(),
             lm_head_fp32=True,
             lm_head=lm_head,
@@ -209,13 +209,13 @@ def test_pp_exact_head_loss_matches_dispatcher_value_and_gradients(monkeypatch: 
         get_lm_head_weight(direct_head),
         labels.reshape(-1),
         ignore_index=-100,
-        ce_mode="bi_fused",
+        ce_mode="batch_invariant",
         tp_group=tp_group,
         lm_head_fp32=True,
         lm_head=direct_head,
     ).sum()
     pp = make_pp_loss_fn(
-        "bi_fused",
+        "batch_invariant",
         lm_head=pp_head,
         tp_group=tp_group,
         lm_head_fp32=True,
@@ -252,7 +252,7 @@ def test_pp_exact_head_loss_relays_mixed_temperatures_through_real_dispatcher(
     owner = SimpleNamespace(_pp_loss_temperatures=deque([temperatures]))
 
     actual = make_pp_loss_fn(
-        "bi_fused",
+        "batch_invariant",
         lm_head=lm_head,
         tp_group=object(),
         lm_head_fp32=True,
@@ -297,7 +297,7 @@ def test_pp_exact_head_loss_keeps_sharded_weight_and_microbatch_temperature_orde
     first_temperature = torch.tensor([[0.5, 1.0]], dtype=torch.float32)
     second_temperature = torch.tensor([[1.25, 2.0]], dtype=torch.float32)
     owner = SimpleNamespace(_pp_loss_temperatures=deque([first_temperature, second_temperature]))
-    loss_fn = make_pp_loss_fn("bi_fused", lm_head=lm_head, loss_owner=owner)
+    loss_fn = make_pp_loss_fn("batch_invariant", lm_head=lm_head, loss_owner=owner)
     labels = torch.tensor([[1, 2]], dtype=torch.int64)
 
     loss_fn(torch.randn(1, 2, 4, dtype=torch.bfloat16), labels)
@@ -319,7 +319,7 @@ def test_cached_pp_exact_loss_reads_the_current_step_scalar_temperature(monkeypa
         return hidden.float().sum(dim=-1) * 0
 
     monkeypatch.setattr(per_token_ce_impl, "compute_per_token_ce", _capture_ce)
-    cached_loss_fn = make_pp_loss_fn("bi_fused", lm_head=lm_head, loss_owner=owner)
+    cached_loss_fn = make_pp_loss_fn("batch_invariant", lm_head=lm_head, loss_owner=owner)
     hidden = torch.randn(1, 2, 4, dtype=torch.bfloat16)
     labels = torch.tensor([[1, 2]], dtype=torch.int64)
 

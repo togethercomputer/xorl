@@ -11,7 +11,7 @@ Modes (one torchrun launch each):
 - ``generic``: native RMSNorm + eager attention + eager CE. Pins the PP
   plumbing itself (send/recv, pruning, metadata routing, stage-local RoPE).
 - ``exact``: ``_qwen35_exact_contract`` v1 program — ``sglang_fused`` BI
-  RMSNorm kernels, FA4 varlen attention, exact-contract GDN, ``bi_fused``
+  RMSNorm kernels, FA4 varlen attention, exact-contract GDN, ``batch_invariant``
   head with ``lm_head_fp32``. Pins the contract lane, and additionally gates
   microbatch composition invariance, PP-mandated padding, and fail-closed
   metadata handling.
@@ -122,7 +122,7 @@ def _build_config(mode: str) -> Qwen3_5Config:
         tie_word_embeddings=False,
     )
     if mode in _EXACT_MODES:
-        # The exact v1 value program: BI RMSNorm families + FA4 + bi_fused head.
+        # The exact v1 value program: BI RMSNorm families + FA4 + batch_invariant head.
         set_rmsnorm_mode("sglang_fused")
         config._attn_implementation = "flash_attention_4"
         config._qwen35_exact_contract = True
@@ -137,7 +137,7 @@ def _build_config(mode: str) -> Qwen3_5Config:
 
 def _ce_kwargs(mode: str) -> dict:
     if mode in _EXACT_MODES:
-        return {"ce_mode": "bi_fused", "lm_head_fp32": True}
+        return {"ce_mode": "batch_invariant", "lm_head_fp32": True}
     return {"ce_mode": "eager"}
 
 

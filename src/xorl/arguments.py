@@ -927,7 +927,7 @@ class TrainingArguments:
         default=None,
         metadata={
             "help": "Cross-entropy computation mode for the local-trainer path. "
-            "Omitted means compiled for ordinary models and bi_fused for canonical GLM-5.2. "
+            "Omitted means compiled for ordinary models and batch_invariant for canonical GLM-5.2. "
             "'compiled': torch.compile + auto_chunker, avoids materializing "
             "the full [batch*seq, vocab] logits tensor. 'quack_linear': Quack chunked "
             "linear + cross-entropy scalar training loss; return_per_token routes through "
@@ -1662,6 +1662,15 @@ class TrainingArguments:
     )
 
     def __post_init__(self):
+        if self.ce_mode == "bi_fused":
+            import warnings
+
+            warnings.warn(
+                "ce_mode='bi_fused' is deprecated; use ce_mode='batch_invariant'",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            self.ce_mode = "batch_invariant"
         from xorl.fp8_training.config_compat import normalize_fp8_training_config  # noqa: PLC0415
         from xorl.qarl import normalize_qarl_quant_cfg  # noqa: PLC0415
 

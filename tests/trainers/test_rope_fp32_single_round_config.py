@@ -155,7 +155,7 @@ def test_canonical_glm_resolves_complete_exact_program(monkeypatch):
         sparse_mla_enabled=True,
         sparse_mla_backend="flashmla",
     )
-    assert resolve_cross_entropy_mode(config, None) == "bi_fused"
+    assert resolve_cross_entropy_mode(config, None) == "batch_invariant"
 
 
 @pytest.mark.parametrize(
@@ -193,7 +193,7 @@ def test_canonical_glm_rejects_incompatible_numerical_override(override, value):
 
 def test_canonical_glm_rejects_incompatible_ce_override():
     config = _exact_glm52_config()
-    with pytest.raises(ValueError, match="requires ce_mode='bi_fused'"):
+    with pytest.raises(ValueError, match="requires ce_mode='batch_invariant'"):
         resolve_cross_entropy_mode(config, "compiled")
 
 
@@ -262,7 +262,7 @@ def test_exact_qwen35_resolves_the_certified_numerical_program(config_factory):
         sparse_mla_enabled=False,
         sparse_mla_backend="auto",
     )
-    assert resolve_cross_entropy_mode(config, None) == "bi_fused"
+    assert resolve_cross_entropy_mode(config, None) == "batch_invariant"
 
 
 @pytest.mark.parametrize("config_factory", [_exact_qwen35_dense_config, _exact_qwen35_moe_config])
@@ -372,7 +372,7 @@ def test_exact_qwen35_rejects_incompatible_numerical_override(override, value):
 def test_exact_qwen35_rejects_incompatible_ce_override():
     config = _exact_qwen35_moe_config()
     config._qwen35_exact_contract = True
-    with pytest.raises(ValueError, match="requires ce_mode='bi_fused'"):
+    with pytest.raises(ValueError, match="requires ce_mode='batch_invariant'"):
         resolve_cross_entropy_mode(config, "compiled")
 
 

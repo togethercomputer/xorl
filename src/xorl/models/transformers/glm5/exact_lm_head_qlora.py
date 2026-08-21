@@ -1315,8 +1315,8 @@ def glm52_exact_lm_head_per_token_ce(
 
     if not is_glm52_exact_tp16_lm_head(lm_head):
         raise TypeError("glm52_exact_lm_head_per_token_ce requires the constructed exact GLM-5.2 lm_head")
-    if ce_mode != "bi_fused":
-        raise NotImplementedError("The GLM-5.2 exact active-LoRA lm_head requires ce_mode='bi_fused'")
+    if ce_mode != "batch_invariant":
+        raise NotImplementedError("The GLM-5.2 exact active-LoRA lm_head requires ce_mode='batch_invariant'")
     if not lm_head_fp32:
         raise NotImplementedError("The GLM-5.2 exact active-LoRA lm_head requires lm_head_fp32=true")
 

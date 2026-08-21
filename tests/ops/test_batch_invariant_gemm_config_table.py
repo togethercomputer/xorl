@@ -11,7 +11,7 @@ import pytest
 import torch
 import triton
 
-from xorl.ops.exact.bi_gemm_configs import BASELINE_CONFIG, PINNED_BLOCK_K, lookup_mm_config
+from xorl.ops.exact.batch_invariant_gemm_configs import BASELINE_CONFIG, PINNED_BLOCK_K, lookup_mm_config
 from xorl.ops.sglang.batch_invariant_ops import (
     _deepgemm_ready,
     _matmul_persistent_deepgemm,
