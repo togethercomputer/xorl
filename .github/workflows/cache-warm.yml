@@ -54,9 +54,11 @@ jobs:
       # most of the cache's size, so warming without it would leave the shards
       # downloading the part that actually costs them.
       - name: Install dependencies
+        env:
+          SGLANG_BUILD_RUST_EXTS: none
         run: |
           uv sync --group test
-          uv pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cpu --reinstall
+          uv pip install torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cpu --reinstall
 
   pre-commit:
     name: pre-commit

@@ -127,16 +127,26 @@ jobs:
       # CPU build for this job.
       #
       # The versions are pinned to the same releases pyproject.toml pins
-      # (torch 2.11.0 / torchvision 0.26.0). Left unpinned, this resolves to
-      # the newest CPU build on the index -- which once silently ran the whole
-      # CPU suite on torch 2.13.0 against a project pinning 2.12.1. Keep these
-      # two in step with the torch/torchvision pins in pyproject.toml;
+      # (torch 2.11.0 / torchvision 0.26.0 / torchaudio 2.11.0). Left
+      # unpinned, this resolves to the newest CPU build on the index -- which
+      # once silently ran the whole CPU suite on torch 2.13.0 against a
+      # project pinning 2.12.1. Keep these in step with the pins in
+      # pyproject.toml (torchaudio comes via the sglang tree's metadata);
       # tests/distributed/test_native_fp8_fsdp2_materialization.py asserts the
-      # release and will fail loudly if they drift apart.
+      # release and will fail loudly if they drift apart. torchaudio must join
+      # the swap: its CUDA build's compiled extension cannot load against CPU
+      # torch, and sglang imports it.
+      #
+      # SGLANG_BUILD_RUST_EXTS=none skips the sglang editable's Rust extension
+      # modules (gRPC/multimodal PyO3 cores) -- the test lanes never import
+      # them, and building them needs a cargo toolchain the GPU runner image
+      # does not carry. Set here too so every lane installs the same tree.
       - name: Install dependencies
+        env:
+          SGLANG_BUILD_RUST_EXTS: none
         run: |
           uv sync --group test
-          uv pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cpu --reinstall
+          uv pip install torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 --index-url https://download.pytorch.org/whl/cpu --reinstall
 
       # ``--no-sync`` keeps the CPU torch installed above. A bare ``uv run``
       # re-syncs against the lock first, which would reinstall the CUDA wheel
