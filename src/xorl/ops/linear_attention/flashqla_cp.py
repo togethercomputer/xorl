@@ -30,13 +30,13 @@ from __future__ import annotations
 
 import torch
 
-from xorl.ops.linear_attention.flashqla.ops.gated_delta_rule.chunk import robust_kkt_solve
-from xorl.ops.linear_attention.flashqla.ops.gated_delta_rule.chunk.hopper import (
+from xorl.ops._vendored.flashqla.ops.gated_delta_rule.chunk import robust_kkt_solve
+from xorl.ops._vendored.flashqla.ops.gated_delta_rule.chunk.hopper import (
     fused_gdr_bwd,
     fused_gdr_fwd,
     fused_gdr_h,
 )
-from xorl.ops.linear_attention.flashqla.ops.utils import chunk_local_cumsum as flashqla_chunk_local_cumsum
+from xorl.ops._vendored.flashqla.ops.utils import chunk_local_cumsum as flashqla_chunk_local_cumsum
 from xorl.ops.linear_attention.modules.l2norm import l2norm_bwd, l2norm_fwd
 from xorl.ops.linear_attention.ops.common.chunk_o import chunk_bwd_dv_local
 from xorl.ops.linear_attention.ops.common.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd

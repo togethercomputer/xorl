@@ -6,10 +6,10 @@ Two implementations are available:
                  (:mod:`xorl.ops.linear_attention.ops.gated_delta_rule`). Default.
                  Supports Ulysses context parallelism via ``cp_context``.
 * ``flashqla`` — the vendored Qwen FlashQLA fused TileLang kernels
-                 (:mod:`xorl.ops.linear_attention.flashqla`). Hopper (SM90) only,
+                 (:mod:`xorl.ops._vendored.flashqla`). Hopper (SM90) only,
                  requires ``tilelang``. Faster fwd/bwd. The single-GPU kernel is
                  CP-unaware; under Ulysses CP it is driven by xorl's native CP
-                 orchestration via :mod:`xorl.ops.linear_attention.flashqla_cp`
+                 orchestration via :mod:`xorl.ops._vendored.flashqla_cp`
                  (see :func:`flashqla_chunk_gated_delta_rule_cp`).
 
 Select the backend with the ``XORL_GDN_BACKEND`` environment variable
@@ -109,7 +109,7 @@ def flashqla_chunk_gated_delta_rule(**kwargs: Any) -> Any:
             from xorl.ops.linear_attention import tilelang_gemm_v1  # noqa: PLC0415
 
             tilelang_gemm_v1.patch()
-            from xorl.ops.linear_attention.flashqla import chunk_gated_delta_rule as _chunk  # noqa: PLC0415
+            from xorl.ops._vendored.flashqla import chunk_gated_delta_rule as _chunk  # noqa: PLC0415
         except Exception as exc:  # pragma: no cover - environment dependent
             raise RuntimeError(
                 f"Failed to import the FlashQLA GDN backend ({GDN_BACKEND_ENV}=flashqla). "
@@ -127,7 +127,7 @@ def flashqla_chunk_gated_delta_rule_cp(**kwargs: Any) -> Any:
     Like :func:`flashqla_chunk_gated_delta_rule`, the import is deferred (FlashQLA pulls
     in ``tilelang`` and validates SM90 at import time). This path drives the FlashQLA
     interior with xorl's Ulysses/sequence-parallel orchestration; see
-    :mod:`xorl.ops.linear_attention.flashqla_cp`.
+    :mod:`xorl.ops._vendored.flashqla_cp`.
     """
     global _flashqla_chunk_cp
     if _flashqla_chunk_cp is None:
@@ -135,7 +135,7 @@ def flashqla_chunk_gated_delta_rule_cp(**kwargs: Any) -> Any:
             from xorl.ops.linear_attention import tilelang_gemm_v1  # noqa: PLC0415
 
             tilelang_gemm_v1.patch()
-            from xorl.ops.linear_attention.flashqla_cp import (  # noqa: PLC0415
+            from xorl.ops._vendored.flashqla_cp import (  # noqa: PLC0415
                 flashqla_chunk_gated_delta_rule_cp as _chunk_cp,
             )
         except Exception as exc:  # pragma: no cover - environment dependent

@@ -307,7 +307,7 @@ def _quack_linear_cross_entropy_loss(
     if hidden_states_flat.shape[-1] % 8 != 0 or weight.shape[0] % 8 != 0:
         raise ValueError("ce_mode='quack_linear' requires hidden and vocab dimensions to be divisible by 8")
 
-    from xorl.ops.quack.linear_cross_entropy import chunked_linear_cross_entropy  # noqa: PLC0415
+    from xorl.ops._vendored.quack.linear_cross_entropy import chunked_linear_cross_entropy  # noqa: PLC0415
 
     hidden_states_flat, labels_flat = _pad_quack_linear_rows(
         hidden_states_flat,

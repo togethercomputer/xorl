@@ -56,8 +56,8 @@ _DEFAULT_CHUNK = 8192
 
 
 try:
-    from xorl.ops.quack.cross_entropy import cross_entropy_bwd_out as _quack_ce_bwd_out
-    from xorl.ops.quack.cross_entropy import cross_entropy_fwd_out as _quack_ce_fwd_out
+    from xorl.ops._vendored.quack.cross_entropy import cross_entropy_bwd_out as _quack_ce_bwd_out
+    from xorl.ops._vendored.quack.cross_entropy import cross_entropy_fwd_out as _quack_ce_fwd_out
 
     _HAS_QUACK = True
 except Exception:  # pragma: no cover - quack/CuTeDSL optional

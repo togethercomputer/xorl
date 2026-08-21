@@ -40,7 +40,7 @@ def _flashqla_chunk_or_skip():
 
     if "prefer_instruction" not in inspect.signature(_tl.copy).parameters:
         pytest.skip("tilelang lacks prefer_instruction (PR #2303); FlashQLA TMA path unavailable")
-    from xorl.ops.linear_attention.flashqla import chunk_gated_delta_rule as flashqla_chunk  # noqa: PLC0415
+    from xorl.ops._vendored.flashqla import chunk_gated_delta_rule as flashqla_chunk  # noqa: PLC0415
 
     return flashqla_chunk
 
@@ -150,7 +150,7 @@ def _assert_gdn_backend_env_dispatches_to_flashqla(monkeypatch):
 def test_contract_lane_pins_autocp_off(monkeypatch):
     """The armed lane must skip intra_card_cp_preprocess; arg/env must restore it."""
     fn = _flashqla_chunk_or_skip()
-    import xorl.ops.linear_attention.flashqla.ops.gated_delta_rule.chunk as chunk_mod  # noqa: PLC0415
+    import xorl.ops._vendored.flashqla.ops.gated_delta_rule.chunk as chunk_mod  # noqa: PLC0415
 
     calls = []
     real = chunk_mod.intra_card_cp_preprocess

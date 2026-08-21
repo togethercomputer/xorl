@@ -42,9 +42,9 @@ def chunk_gated_delta_rule_fwd_decode(
     from xorl.ops.linear_attention import tilelang_gemm_v1  # noqa: PLC0415
 
     tilelang_gemm_v1.patch()
-    from xorl.ops.linear_attention.flashqla.ops.gated_delta_rule.chunk.hopper import fused_gdr_fwd  # noqa: PLC0415
-    from xorl.ops.linear_attention.flashqla.ops.utils import chunk_local_cumsum  # noqa: PLC0415
-    from xorl.ops.linear_attention.flashqla.utils import l2norm  # noqa: PLC0415
+    from xorl.ops._vendored.flashqla.ops.gated_delta_rule.chunk.hopper import fused_gdr_fwd  # noqa: PLC0415
+    from xorl.ops._vendored.flashqla.ops.utils import chunk_local_cumsum  # noqa: PLC0415
+    from xorl.ops._vendored.flashqla.utils import l2norm  # noqa: PLC0415
     from xorl.ops.linear_attention.ops.common.chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd  # noqa: PLC0415
 
     if scale is None:

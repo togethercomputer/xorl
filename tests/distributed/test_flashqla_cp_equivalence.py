@@ -19,7 +19,7 @@ if not torch.cuda.is_available():
     pytest.skip("FlashQLA CP parity requires CUDA", allow_module_level=True)
 
 from xorl.distributed.parallel_state import init_parallel_state  # noqa: E402
-from xorl.ops.linear_attention.flashqla_cp import flashqla_chunk_gated_delta_rule_cp  # noqa: E402
+from xorl.ops._vendored.flashqla_cp import flashqla_chunk_gated_delta_rule_cp  # noqa: E402
 from xorl.ops.linear_attention.ops.cp import build_linear_attention_cp_context  # noqa: E402
 from xorl.ops.linear_attention.ops.gated_delta_rule import chunk_gated_delta_rule  # noqa: E402
 from xorl.utils.device import get_nccl_backend  # noqa: E402
