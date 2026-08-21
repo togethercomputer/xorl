@@ -55,10 +55,12 @@ jobs:
     # and torch._inductor compile kernels at runtime) and 2 GPUs for the
     # distributed shard.
     #
-    # research-common-2-gpu replaces the xorl-2-h100-gpu-runner scale set
-    # (defined in togethercomputer/xorl-ci), whose runner registrations went
-    # offline and stopped picking up jobs.
-    runs-on: research-common-2-gpu
+    # xorl-2-h100-rc-gpu-runner is the research-common-h100 cluster's ARC scale
+    # set registered to this repository (same runner image and 2xH100 shape as
+    # the turbox xorl-2-h100-gpu-runner scale set it replaces, whose runner
+    # registrations went offline and stopped picking up jobs). ARC matches
+    # `runs-on` against the scale-set name, not the pods' extra RUNNER_LABELS.
+    runs-on: xorl-2-h100-rc-gpu-runner
     # Per shard, not for the whole lane. The unsharded run finished in 23 minutes;
     # the largest shard should be well inside this.
     timeout-minutes: 30
