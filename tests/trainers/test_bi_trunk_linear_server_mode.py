@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 
 from xorl.ops import bi_families_v2
-from xorl.ops.batch_invariant_ops import is_trunk_linear_contract_enabled, set_trunk_linear_contract
+from xorl.ops.sglang.batch_invariant_ops import is_trunk_linear_contract_enabled, set_trunk_linear_contract
 from xorl.trainers.model_builder import build_training_model
 
 
@@ -37,7 +37,7 @@ class TinyTrunkModel(nn.Module):
 
 class ExactTinyTrunkModel(TinyTrunkModel):
     def _apply_qwen35_gdn_exact(self):
-        from xorl.ops.batch_invariant_ops import wrap_trunk_linears_batch_invariant
+        from xorl.ops.sglang.batch_invariant_ops import wrap_trunk_linears_batch_invariant
 
         return wrap_trunk_linears_batch_invariant(self)
 
@@ -134,7 +134,7 @@ def test_glm52_selects_v2_family_structurally(monkeypatch):
 
 def test_dense_qwen_exact_program_is_reinstalled_after_lora_replacement(monkeypatch):
     from xorl.lora.modules.linear import LoraLinear
-    from xorl.ops.batch_invariant_ops import wrap_trunk_linears_batch_invariant
+    from xorl.ops.sglang.batch_invariant_ops import wrap_trunk_linears_batch_invariant
 
     captured = {}
     model = TinyTrunkModel()

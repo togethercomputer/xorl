@@ -609,17 +609,17 @@ def build_training_model(
     # ------------------------------------------------------------------
     # 5. Exact model contract / legacy scoped trunk contract (must precede FSDP2)
     # ------------------------------------------------------------------
-    from xorl.ops.bi_families_v2 import _select_nonexact_families  # noqa: PLC0415
+    from xorl.ops.sglang.bi_families_v2 import _select_nonexact_families  # noqa: PLC0415
 
     _select_nonexact_families()
     if glm52_exact_forward_enabled(model.config):
-        from xorl.ops.bi_families_v2 import _select_glm52_families_v2  # noqa: PLC0415
+        from xorl.ops.sglang.bi_families_v2 import _select_glm52_families_v2  # noqa: PLC0415
 
         _select_glm52_families_v2()
     elif getattr(model.config, "_qwen3_dense_exact_contract", False):
         from xorl.lora.modules.base import LoraModule  # noqa: PLC0415
-        from xorl.ops.batch_invariant_ops import wrap_trunk_linears_batch_invariant  # noqa: PLC0415
-        from xorl.ops.bi_families_v2 import _select_qwen3_dense_families_v2  # noqa: PLC0415
+        from xorl.ops.sglang.batch_invariant_ops import wrap_trunk_linears_batch_invariant  # noqa: PLC0415
+        from xorl.ops.sglang.bi_families_v2 import _select_qwen3_dense_families_v2  # noqa: PLC0415
 
         # Foundation construction initially wraps plain projections, but TP
         # unfusing and LoRA/QLoRA injection replace those module objects. The

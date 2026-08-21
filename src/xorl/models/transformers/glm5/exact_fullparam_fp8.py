@@ -838,7 +838,7 @@ class Glm52ExactFullParamRouterWeight(nn.Module):
         if self._effective_weight.device != hidden_states.device:
             raise RuntimeError("GLM-5.2 full-param router view and activations must share one CUDA device")
 
-        from xorl.ops.batch_invariant_ops import bi_router_gemm  # noqa: PLC0415
+        from xorl.ops.sglang.batch_invariant_ops import bi_router_gemm  # noqa: PLC0415
 
         return bi_router_gemm(hidden_states, self._effective_weight)
 

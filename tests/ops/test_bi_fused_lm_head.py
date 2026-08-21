@@ -177,8 +177,8 @@ def test_bi_fused_temperature_matches_serving_materialize_then_score(family):
     )
 
     from xorl.ops import bi_families_v2
-    from xorl.ops.batch_invariant_ops import bi_lm_head_full_logits
-    from xorl.ops.bi_families_v2 import head_v2_full_logits_with_lse
+    from xorl.ops.sglang.batch_invariant_ops import bi_lm_head_full_logits
+    from xorl.ops.sglang.bi_families_v2 import head_v2_full_logits_with_lse
 
     torch.manual_seed(53)
     hidden = torch.randn((4, 128), dtype=torch.bfloat16, device="cuda")
@@ -210,7 +210,7 @@ def test_bi_fused_temperature_matches_serving_materialize_then_score(family):
 @requires_cuda
 @pytest.mark.gpu
 def test_bi_kernel_unit_temperature_is_exact_identity():
-    from xorl.ops.batch_invariant_ops import bi_lm_head_selected_logprob
+    from xorl.ops.sglang.batch_invariant_ops import bi_lm_head_selected_logprob
 
     hidden, weight, _ = _inputs(6)
     hidden = hidden.view(-1, hidden.shape[-1])
@@ -228,7 +228,7 @@ def test_bi_kernel_unit_temperature_is_exact_identity():
 @requires_cuda
 @pytest.mark.gpu
 def test_bi_kernel_p1_tokens_clamp_to_exact_zero():
-    from xorl.ops.batch_invariant_ops import bi_lm_head_selected_logprob
+    from xorl.ops.sglang.batch_invariant_ops import bi_lm_head_selected_logprob
 
     torch.manual_seed(7)
     N, H, V = 8192, 1024, 12800

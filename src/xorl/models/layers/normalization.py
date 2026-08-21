@@ -7,7 +7,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from xorl.ops.batch_invariant_ops import (
+from xorl.ops.sglang.batch_invariant_ops import (
     RMS_NORM_FAMILIES,
     RMS_NORM_FAMILY_NO_RESIDUAL,
     RMS_NORM_FAMILY_RESIDUAL_TREE,
@@ -21,7 +21,7 @@ from xorl.ops.batch_invariant_ops import (
     mean_dim,
     set_batch_invariant_mode,
 )
-from xorl.ops.bi_families_v2 import families_v2_enabled, rms_norm_v2
+from xorl.ops.sglang.bi_families_v2 import families_v2_enabled, rms_norm_v2
 
 
 RMSNormMode = Literal["eager", "native", "compile", "sglang", "sglang_fused", "sglang_jit", "sglang_kernel"]
@@ -629,7 +629,7 @@ class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization.
 
     ``family`` declares which batch-invariant kernel family the site's serving
-    counterpart executes (see ``xorl.ops.batch_invariant_ops``):
+    counterpart executes (see ``xorl.ops.sglang.batch_invariant_ops``):
     ``"serving_no_residual"`` for qk-norms and layer-0 input layernorms,
     ``"serving_residual_tree"`` for residual-carrying norms (input layernorm at
     layer>0, post-attention layernorm, final norm). The declaration replaces the

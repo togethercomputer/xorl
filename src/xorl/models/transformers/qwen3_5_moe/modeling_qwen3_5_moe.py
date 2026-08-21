@@ -118,7 +118,7 @@ class Qwen3_5MoeMLP(nn.Module):
     @staticmethod
     def _linear_with_contract(module: nn.Linear, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         if getattr(module, "_xorl_bi_trunk_wrapped", False):
-            from xorl.ops.batch_invariant_ops import _BatchInvariantTrunkLinearFn  # noqa: PLC0415
+            from xorl.ops.sglang.batch_invariant_ops import _BatchInvariantTrunkLinearFn  # noqa: PLC0415
 
             return _BatchInvariantTrunkLinearFn.apply(x, weight, module.bias)
         return F.linear(x, weight, module.bias)
@@ -448,7 +448,7 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
             max_rows_for_ep_combine,
             sglang_fused_gate_sigmoid_mul_add,
         )
-        from xorl.ops.batch_invariant_ops import _BatchInvariantTrunkLinearFn  # noqa: PLC0415
+        from xorl.ops.sglang.batch_invariant_ops import _BatchInvariantTrunkLinearFn  # noqa: PLC0415
 
         ps = get_parallel_state()
         if not ps.ep_enabled:

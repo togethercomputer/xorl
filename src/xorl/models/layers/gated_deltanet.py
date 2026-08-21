@@ -196,7 +196,7 @@ class GatedDeltaNet(nn.Module):
         weight: torch.Tensor,
     ) -> torch.Tensor:
         if getattr(module, "_xorl_bi_trunk_wrapped", False):
-            from xorl.ops.batch_invariant_ops import batch_invariant_trunk_linear  # noqa: PLC0415
+            from xorl.ops.sglang.batch_invariant_ops import batch_invariant_trunk_linear  # noqa: PLC0415
 
             return batch_invariant_trunk_linear(inputs, weight, module.bias)
         return F.linear(inputs, weight, module.bias)

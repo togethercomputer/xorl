@@ -23,7 +23,7 @@ both round correctly.
 import pytest
 import torch
 
-from xorl.ops.bi_families_v2 import (
+from xorl.ops.sglang.bi_families_v2 import (
     V2_NORM_SPLIT_MIN_TILES,
     V2_NORM_TILE,
     qk_norm_v2,
@@ -61,7 +61,7 @@ def _reference(x, weight, eps=EPS, residual=None, zero_centered=False):
 
 def _force(monkeypatch, realization):
     """Pin the realization so the bit gates never depend on the dispatch rule."""
-    import xorl.ops.bi_families_v2 as module
+    import xorl.ops.sglang.bi_families_v2 as module
 
     monkeypatch.setattr(module, "_v2_norm_use_split", lambda *_a, **_k: realization == "split")
 
@@ -168,7 +168,7 @@ def test_split_realization_is_actually_exercised(monkeypatch):
     Without this, a refactor that dropped the split realization entirely would
     leave the equality tests above passing vacuously.
     """
-    import xorl.ops.bi_families_v2 as module
+    import xorl.ops.sglang.bi_families_v2 as module
 
     calls = []
     original = module._rms_norm_v2_split
@@ -191,7 +191,7 @@ def test_split_realization_is_actually_exercised(monkeypatch):
 @pytest.mark.parametrize("rows", [1, 64, 256, 512, 2048])
 def test_shipped_hidden_sizes_always_take_the_fused_realization(hidden_size, rows):
     """Common shipped hidden sizes stay below the measured split boundary."""
-    import xorl.ops.bi_families_v2 as module
+    import xorl.ops.sglang.bi_families_v2 as module
 
     n_tiles = -(-hidden_size // V2_NORM_TILE)
     assert n_tiles < V2_NORM_SPLIT_MIN_TILES
@@ -206,7 +206,7 @@ def test_dispatch_rule_needs_a_deep_tile_chain_and_few_rows():
     ``has_residual=False`` — the residual specialization has its own, higher
     threshold in ``V2_NORM_RESIDUAL_SPLIT_MIN_TILES``.
     """
-    import xorl.ops.bi_families_v2 as module
+    import xorl.ops.sglang.bi_families_v2 as module
 
     shallow = V2_NORM_SPLIT_MIN_TILES - 1
     assert module._v2_norm_use_split(1, shallow, has_residual=False) is False
@@ -220,7 +220,7 @@ def test_dispatch_rule_needs_a_deep_tile_chain_and_few_rows():
 def test_dispatch_uses_the_split_kernels_tile_basis():
     """The rejected rule was passed the fused kernel's 4096-wide chunk count,
     understating split parallelism by exactly 8x."""
-    import xorl.ops.bi_families_v2 as module
+    import xorl.ops.sglang.bi_families_v2 as module
 
     hidden_size = 5120
     split_tiles = -(-hidden_size // V2_NORM_TILE)

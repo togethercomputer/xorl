@@ -16,7 +16,7 @@ import torch
 
 from xorl.models.transformers.qwen3.configuration_qwen3 import Qwen3Config
 from xorl.models.transformers.qwen3.modeling_qwen3 import Qwen3ForCausalLM
-from xorl.ops.batch_invariant_ops import set_batch_invariant_mode
+from xorl.ops.sglang.batch_invariant_ops import set_batch_invariant_mode
 
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

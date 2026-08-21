@@ -8,7 +8,7 @@ import torch.distributed as dist
 from xorl.objectives.importance_sampling_loss import K3_DEBUG_THRESHOLDS
 from xorl.objectives.loss_output import LossOutput
 from xorl.objectives.reducers import Reducer, TokenPartial
-from xorl.ops.exact_sampling_transforms import TOP_K_ALL
+from xorl.ops.exact.sampling_transforms import TOP_K_ALL
 from xorl.ops.loss.per_token_ce import compute_per_token_ce
 
 

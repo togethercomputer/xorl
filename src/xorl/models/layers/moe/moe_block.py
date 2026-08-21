@@ -54,7 +54,7 @@ class _BIRouterGemm(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, hidden, weight):
-        from xorl.ops.batch_invariant_ops import bi_router_gemm  # noqa: PLC0415
+        from xorl.ops.sglang.batch_invariant_ops import bi_router_gemm  # noqa: PLC0415
 
         ctx.save_for_backward(hidden, weight)
         return bi_router_gemm(hidden, weight)

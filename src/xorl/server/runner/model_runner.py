@@ -74,8 +74,7 @@ from xorl.models.transformers.deepseek_v3.support import deepseek_v3_default_lor
 from xorl.models.transformers.deepseek_v4.exact_contract import DSV4_FLASH_REQUIRED_TARGET_MODULES
 from xorl.models.transformers.glm5.index_share import IndexShareMode
 from xorl.models.transformers.glm5.support import glm5_default_lora_targets
-from xorl.ops.batch_invariant_ops import enable_batch_invariant_mode, get_batch_invariant_ops
-from xorl.ops.exact_sampling_transforms import TOP_K_ALL
+from xorl.ops.exact.sampling_transforms import TOP_K_ALL
 from xorl.ops.loss import (
     LossOutput,
     OPDLossMetrics,
@@ -88,6 +87,7 @@ from xorl.ops.loss import (
     opd_vocab_parallel_loss_function,
     policy_loss_function,
 )
+from xorl.ops.sglang.batch_invariant_ops import enable_batch_invariant_mode, get_batch_invariant_ops
 from xorl.optim import build_optimizer
 from xorl.server.runner.adapters import LoRAAdapterManager
 from xorl.server.runner.adapters.gradient_finalizer import AdapterGradientMutationFailure

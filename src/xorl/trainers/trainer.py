@@ -401,7 +401,7 @@ class Trainer:
             helper.enable_third_party_logging()
 
         if os.environ.get("XORL_BATCH_INVARIANT_MATMUL", "0") == "1":
-            from xorl.ops.batch_invariant_ops import enable_batch_invariant_mode  # noqa: PLC0415
+            from xorl.ops.sglang.batch_invariant_ops import enable_batch_invariant_mode  # noqa: PLC0415
 
             enable_batch_invariant_mode()
             logger.info_rank0("XORL_BATCH_INVARIANT_MATMUL=1: enabled SGLang-compatible batch-invariant ops")

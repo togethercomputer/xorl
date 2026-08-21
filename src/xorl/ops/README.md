@@ -11,17 +11,18 @@ Three kinds of code live here with three different rules:
 | kind | rule |
 | --- | --- |
 | **Vendored** — `_vendored/` (`quack/`, `flashqla/`) | Never hand-edit, lint, or reformat. Each tree carries a `VENDORED.md` with provenance and the local-patch ledger. First-party tooling skips them (`[tool.ruff]` excludes in `pyproject.toml`; top-level `exclude:` in `.pre-commit-config.yaml`). |
-| **Byte-contract-gated** — `bi_families_v2.py` (sha256-gated), `batch_invariant_ops.py` (parity-diffable twin of SGLang's copy; edits must consider the serving side) | Vendored byte-identical into the serving engine; both copies are sha256-gated. Any edit here without the paired serving-side edit breaks the gate. It keeps the engine's formatting (black, 88 columns) and is excluded from all rewriting hooks. |
+| **Serving-parity twins** — `sglang/` (`bi_families_v2.py`, `batch_invariant_ops.py`) | Modules mirrored into/from the serving engine. `bi_families_v2.py` is sha256-gated byte-identical (keeps the engine's black-88 formatting, excluded from all rewriting hooks); `batch_invariant_ops.py` is vendored-adapted and stays a single diffable file. Edits require considering the paired serving-side copy. |
 | **First-party** — everything else | Normal rules. |
 
 ## Map (current)
 
 - `exact/` — the **serving-parity (exact) contract family**: byte-pinned
-  programs shared with the serving engine (#78 phase 3). Three members are
-  aliased rather than moved: `bi_families_v2.py` (sha256-gated),
-  `batch_invariant_ops.py` (diffable parity twin of SGLang's copy), and
-  `exact_sampling_transforms.py` (in-flight in #74). Old root-level module
-  paths are compat stubs for one deprecation cycle.
+  programs shared with the serving engine (#78 phase 3), including the
+  replay contract (`sampling_transforms.py`).
+- `sglang/` — the literal serving-engine twins (`bi_families_v2.py`,
+  `batch_invariant_ops.py`); see the edit-policy table. Old root-level
+  module paths for both packages are compat stubs for one deprecation
+  cycle.
 - `loss/` — the CE/selected-logprob kernel stack. The RL/supervised
   objective functions live in `xorl/objectives/` (#78 phase 2); old module
   paths here are compat stubs for one deprecation cycle.

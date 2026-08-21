@@ -19,7 +19,7 @@ from xorl.models.transformers.qwen3_5.modeling_qwen3_5 import Qwen3_5RMSNorm
 from xorl.models.transformers.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig
 from xorl.models.transformers.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeForCausalLM
 from xorl.models.transformers.qwen3_5_shared import _apply_qwen35_gdn_exact
-from xorl.ops.batch_invariant_ops import (
+from xorl.ops.sglang.batch_invariant_ops import (
     is_trunk_linear_contract_enabled,
     set_trunk_linear_contract,
     wrap_trunk_linears_batch_invariant,

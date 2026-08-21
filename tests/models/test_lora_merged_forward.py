@@ -482,7 +482,7 @@ class TestTrunkWrapComposition:
         return model
 
     def test_trunk_wrap_composition_policy(self, monkeypatch):
-        from xorl.ops.batch_invariant_ops import wrap_trunk_linears_batch_invariant  # noqa: PLC0415
+        from xorl.ops.sglang.batch_invariant_ops import wrap_trunk_linears_batch_invariant  # noqa: PLC0415
 
         with pytest.raises(NotImplementedError, match="canonical merged-LoRA"):
             wrap_trunk_linears_batch_invariant(self._model())
@@ -490,7 +490,7 @@ class TestTrunkWrapComposition:
         self._assert_wrap_composes_with_merged_flag(monkeypatch)
 
     def _assert_wrap_composes_with_merged_flag(self, monkeypatch):
-        from xorl.ops.batch_invariant_ops import (  # noqa: PLC0415
+        from xorl.ops.sglang.batch_invariant_ops import (  # noqa: PLC0415
             set_trunk_linear_contract,
             wrap_trunk_linears_batch_invariant,
         )

@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 from xorl.objectives.loss_output import LossOutput
 from xorl.objectives.reducers import Reducer, TokenPartial
-from xorl.ops.exact_sampling_transforms import TOP_K_ALL
+from xorl.ops.exact.sampling_transforms import TOP_K_ALL
 from xorl.ops.loss.compiled_cross_entropy import (
     compiled_ce_and_lse_sq_function,
     compiled_cross_entropy_function,

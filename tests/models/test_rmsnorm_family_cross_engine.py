@@ -26,11 +26,11 @@ from xorl.models.layers.normalization import (  # noqa: E402
     RMSNorm,
     fast_zero_centered_batch_invariant_rms_norm,
 )
-from xorl.ops.batch_invariant_ops import (  # noqa: E402
+from xorl.ops.sglang.batch_invariant_ops import (  # noqa: E402
     bi_rms_norm,
     set_batch_invariant_mode,
 )
-from xorl.ops.bi_families_v2 import rms_norm_v2 as xorl_rms_norm_v2  # noqa: E402
+from xorl.ops.sglang.bi_families_v2 import rms_norm_v2 as xorl_rms_norm_v2  # noqa: E402
 
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

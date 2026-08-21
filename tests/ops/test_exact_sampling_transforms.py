@@ -5,7 +5,7 @@ import math
 import pytest
 import torch
 
-from xorl.ops.exact_sampling_transforms import (
+from xorl.ops.exact.sampling_transforms import (
     EXACT_FILTER_ROW_CHUNK,
     EXACT_SAMPLING_TRANSFORM_PROGRAM,
     TOP_K_ALL,

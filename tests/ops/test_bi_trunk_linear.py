@@ -17,7 +17,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from xorl.lora.modules.linear import LoraLinear
-from xorl.ops.batch_invariant_ops import (
+from xorl.ops.sglang.batch_invariant_ops import (
     is_trunk_linear_contract_enabled,
     matmul_persistent,
     rms_norm_batch_invariant,

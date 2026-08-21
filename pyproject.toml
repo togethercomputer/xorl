@@ -149,7 +149,7 @@ line-length = 120
 force-exclude = true
 extend-exclude = [
   "src/xorl/ops/_vendored",
-  "src/xorl/ops/bi_families_v2.py",
+  "src/xorl/ops/sglang/bi_families_v2.py",
 ]
 
 [tool.ruff.lint]

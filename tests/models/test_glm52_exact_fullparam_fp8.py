@@ -587,7 +587,7 @@ def test_cuda_expert_quantization_preserves_expert_boundaries_and_fuse_after_qua
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires Hopper CUDA")
 def test_cuda_router_forward_bytes_match_frozen_router_program_on_published_bytes() -> None:
     device = _hopper_or_skip()
-    from xorl.ops.batch_invariant_ops import bi_router_gemm
+    from xorl.ops.sglang.batch_invariant_ops import bi_router_gemm
 
     torch.manual_seed(4)
     num_experts, hidden_size = 256, 512

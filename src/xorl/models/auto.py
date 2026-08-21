@@ -1128,10 +1128,10 @@ def build_foundation_model(
     model.config._attn_implementation = attn_implementation
 
     if config._qwen3_dense_exact_contract:
-        from xorl.ops.batch_invariant_ops import (  # noqa: PLC0415
+        from xorl.ops.sglang.batch_invariant_ops import (  # noqa: PLC0415
             wrap_trunk_linears_batch_invariant,
         )
-        from xorl.ops.bi_families_v2 import (  # noqa: PLC0415
+        from xorl.ops.sglang.bi_families_v2 import (  # noqa: PLC0415
             _select_qwen3_dense_families_v2,
         )
 

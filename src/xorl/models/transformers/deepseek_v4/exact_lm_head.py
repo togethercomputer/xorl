@@ -20,14 +20,14 @@ from torch import Tensor, nn
 
 from xorl.distributed.canonical_moe import LogicalRowOwnership
 from xorl.lora.modules.linear import LoraLinear
-from xorl.ops.bi_families_v2 import exact_temperature_scale_bf16_logits
-from xorl.ops.exact_sampling_transforms import (
+from xorl.ops.exact.sampling_transforms import (
     EXACT_FILTER_ROW_CHUNK,
     exact_sampling_identity_rows,
     exact_sampling_support,
     exact_selected_logprob_from_support,
     exact_selected_logprob_partitioned_from_support,
 )
+from xorl.ops.sglang.bi_families_v2 import exact_temperature_scale_bf16_logits
 
 
 DSV4_EXACT_TP8_LM_HEAD_CONTRACT_VERSION = "dsv4_flash_exact_tp8_lm_head_rank1_lora_v1"

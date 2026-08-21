@@ -10,7 +10,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from xorl.distributed.parallel_state import get_parallel_state
-from xorl.ops.exact_sampling_transforms import (
+from xorl.ops.exact.sampling_transforms import (
     TOP_K_ALL,
     normalize_exact_sampling_transforms,
 )

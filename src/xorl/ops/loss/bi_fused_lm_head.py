@@ -1,7 +1,7 @@
 """Trainable wrapper for the batch-invariant fused LM-head logprob contract.
 
 Forward scores per-token cross-entropy through
-:func:`xorl.ops.batch_invariant_ops.bi_lm_head_selected_logprob` — the K3
+:func:`xorl.ops.sglang.batch_invariant_ops.bi_lm_head_selected_logprob` — the K3
 lm-head contract vendored identically in SGLang, so trainer and serving
 logprobs are bitwise identical from bit-exact hidden states. The bf16 weight
 stays resident (no fp32 lm-head copy). Per-row temperature materializes the
@@ -21,25 +21,25 @@ import math
 import torch
 import torch.distributed as dist
 
-from xorl.ops.batch_invariant_ops import (
-    BI_LM_HEAD_VOCAB_CHUNK,
-    bi_lm_head_full_logits,
-    bi_lm_head_selected_logprob,
-    bi_lm_head_selected_logprob_from_logits,
-)
-from xorl.ops.bi_families_v2 import (
-    exact_temperature_scale_fp32_logits,
-    families_v2_enabled,
-    head_v2_full_logits_with_lse,
-    head_v2_selected_logprob,
-    head_v2_selected_logprob_from_logits,
-)
-from xorl.ops.exact_sampling_transforms import (
+from xorl.ops.exact.sampling_transforms import (
     EXACT_FILTER_ROW_CHUNK,
     TOP_K_ALL,
     exact_sampling_identity_rows,
     exact_sampling_support,
     exact_selected_logprob_partitioned_from_support,
+)
+from xorl.ops.sglang.batch_invariant_ops import (
+    BI_LM_HEAD_VOCAB_CHUNK,
+    bi_lm_head_full_logits,
+    bi_lm_head_selected_logprob,
+    bi_lm_head_selected_logprob_from_logits,
+)
+from xorl.ops.sglang.bi_families_v2 import (
+    exact_temperature_scale_fp32_logits,
+    families_v2_enabled,
+    head_v2_full_logits_with_lse,
+    head_v2_selected_logprob,
+    head_v2_selected_logprob_from_logits,
 )
 
 

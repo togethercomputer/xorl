@@ -64,8 +64,8 @@ def _apply_qwen35_gdn_exact(model: torch.nn.Module) -> dict[str, int]:
         validate_native_ep_combine_size(ps.ep_size)
 
     from xorl.lora.modules.base import LoraModule  # noqa: PLC0415
-    from xorl.ops.batch_invariant_ops import wrap_trunk_linears_batch_invariant  # noqa: PLC0415
-    from xorl.ops.bi_families_v2 import _select_qwen35_families_v1  # noqa: PLC0415
+    from xorl.ops.sglang.batch_invariant_ops import wrap_trunk_linears_batch_invariant  # noqa: PLC0415
+    from xorl.ops.sglang.bi_families_v2 import _select_qwen35_families_v1  # noqa: PLC0415
 
     # RMSNorm uses the qualified v2 tree. The LM-head/LSE remains on its
     # separately qualified v1 program; that selector does not control norms.

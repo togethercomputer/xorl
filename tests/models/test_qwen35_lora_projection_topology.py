@@ -19,7 +19,7 @@ from xorl.lora.utils import (
 )
 from xorl.models.layers.gated_deltanet import GatedDeltaNet
 from xorl.models.transformers.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeMLP
-from xorl.ops.batch_invariant_ops import set_trunk_linear_contract, wrap_trunk_linears_batch_invariant
+from xorl.ops.sglang.batch_invariant_ops import set_trunk_linear_contract, wrap_trunk_linears_batch_invariant
 
 
 RANK = 16

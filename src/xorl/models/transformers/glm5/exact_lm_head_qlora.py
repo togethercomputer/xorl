@@ -32,14 +32,14 @@ from torch import Tensor, nn
 
 from xorl.lora.modules.linear import LoraLinear
 from xorl.models.transformers.glm5.exact_lora_contract import glm52_exact_lora_scaling
-from xorl.ops.bi_families_v2 import exact_temperature_scale_fp32_logits
-from xorl.ops.exact_sampling_transforms import (
+from xorl.ops.exact.sampling_transforms import (
     EXACT_FILTER_ROW_CHUNK,
     exact_sampling_identity_rows,
     exact_sampling_support,
     exact_selected_logprob_from_support,
     exact_selected_logprob_partitioned_from_support,
 )
+from xorl.ops.sglang.bi_families_v2 import exact_temperature_scale_fp32_logits
 
 
 GLM52_EXACT_TP16_LM_HEAD_CONTRACT_VERSION = "glm52_exact_tp16_lm_head_qlora_v2"
