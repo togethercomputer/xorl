@@ -49,13 +49,16 @@ jobs:
       github.event_name != 'pull_request' ||
       (!github.event.pull_request.draft &&
       github.event.pull_request.head.repo.full_name == github.repository)
-    # Scale set defined in togethercomputer/xorl-ci. Its runner pod holds the GPUs
-    # directly, so there is deliberately no `container:` here: a job container
-    # would be scheduled without GPU resources. The runner image is built FROM
-    # nvcr.io/nvidia/cuda:13.2.1-cudnn-runtime-ubuntu24.04 plus build-essential,
-    # because triton and torch._inductor compile kernels at runtime and need both
-    # a CUDA runtime and a C/C++ compiler.
-    runs-on: xorl-2-h100-gpu-runner
+    # The runner pod holds the GPUs directly, so there is deliberately no
+    # `container:` here: a job container would be scheduled without GPU
+    # resources. The runner needs a CUDA runtime and a C/C++ compiler (triton
+    # and torch._inductor compile kernels at runtime) and 2 GPUs for the
+    # distributed shard.
+    #
+    # research-common replaces the xorl-2-h100-gpu-runner scale set (defined in
+    # togethercomputer/xorl-ci), whose runner registrations went offline and
+    # stopped picking up jobs.
+    runs-on: research-common
     # Per shard, not for the whole lane. The unsharded run finished in 23 minutes;
     # the largest shard should be well inside this.
     timeout-minutes: 30
