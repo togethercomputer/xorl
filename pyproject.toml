@@ -13,20 +13,27 @@ description = "Xorl: Simple and high-performance distributed training framework 
 requires-python = "==3.12.*"
 
 dependencies = [
-  "boto3>=1.35.0",
-  "datasets>=4.4.0",
+  # Pin the xorl-client data/evaluation chain as well as the GPU stack. Without
+  # these constraints, pip backtracks across years of s3fs/Inspect releases.
+  "aiobotocore==2.25.1",
+  "boto3==1.40.61",
+  "botocore==1.40.61",
+  "datasets==5.0.1",
+  "fsspec==2025.9.0",
+  "inspect-ai==0.3.255",
   "packaging>=23.0,<26.0",
   "tenacity>=8.0.0",
   "torchdata>=0.8.0,<1.0",
   "tiktoken",
-  # transformers 5.4.0 enabled a strict ``validate_layer_type`` check that
-  # rejects the legitimate Qwen3.5 length-N ``layer_types`` *pattern* (e.g.
-  # the ``["linear_attention", "full_attention"]`` 2-element rotation tested
-  # in ``tests/models/test_qwen3_5_registry.py``) when ``num_hidden_layers``
-  # exceeds ``len(layer_types)``. Pin to <5.4 until either (a) the Qwen3.5
-  # config opts out of the validator or (b) upstream relaxes it.
-  "transformers[torch]>=5.0,<5.4",
+  # Matches the checked-in xorl-sglang tree's own transformers pin. The
+  # transformers 5.4+ ``validate_layer_type`` check is satisfied because the
+  # Qwen3.5 configs expand length-N ``layer_types`` patterns to
+  # ``num_hidden_layers`` entries before validation runs.
+  "transformers[torch]==5.12.1",
   "psutil",
+  "s3fs==2025.9.0",
+  "tinker==0.25.0",
+  "tinker-cookbook==0.1.0",
   "wandb",
   "safetensors",
   "einops",
@@ -37,50 +44,35 @@ dependencies = [
   "uvicorn",
   "pyzmq",
   "msgpack",
-  # Required to import the pinned SGLang tree's pure-Triton kernel wrappers
-  # used by exact native FP8/MXFP4 trainer forwards. sglang-kernel is
-  # deliberately NOT listed here: its compiled extension is built against the
-  # pinned SGLang torch (2.11) ABI and cannot load under this profile's torch.
-  # DSV4 exact-kernel training and serving run in the isolated torch-2.11
-  # combined environment at the repository-root .venv-sglang instead.
   "msgspec==0.21.1",
-  "xgrammar==0.2.1",
-  "compressed-tensors==0.17.1",
   "fastapi",
   # P2P / Mooncake weight sync
   "mooncake-transfer-engine==0.3.9",
-  "xorl-client @ git+https://github.com/togethercomputer/xorl-client.git",
-  # PyTorch 2.12.1 with CUDA 13.2 runtime wheels. A compatible NVIDIA driver
-  # is required.
-  "torch @ https://download.pytorch.org/whl/cu132/torch-2.12.1%2Bcu132-cp312-cp312-manylinux_2_28_x86_64.whl",
-  "torchvision @ https://download.pytorch.org/whl/cu132/torchvision-0.27.1%2Bcu132-cp312-cp312-manylinux_2_28_x86_64.whl",
-  "triton @ https://download.pytorch.org/whl/triton-3.7.1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
-  # Flash Attention 4 for the CUDA 13 / PyTorch 2.12 stack. FA3-only lower-level
-  # interfaces remain guarded in code for older environments.
+  "xorl-client @ git+https://github.com/togethercomputer/xorl-client.git@2a3a60a783c98e2a8ff722bad06dab18caee350c",
+  # PyTorch 2.11 with its CUDA 13 runtime dependencies. These versions match
+  # the checked-in xorl-sglang package metadata, so xorl, xorl-client, and the
+  # xorl-sglang submodule (including its compiled sglang-kernel extension) all
+  # run in this one environment.
+  "torch==2.11.0",
+  "torchvision==0.26.0",
+  "triton==3.6.0",
   "flash-attn-4==4.0.0b19",
+  # Resolved to the checked-in fork by [tool.uv.sources] below.
+  "sglang[all]",
   # TileLang kernels — used by DeepSeek-V4 sparse MLA, DSA indexer, FP8
   # act-quant, the hyper-connection sinkhorn, and the vendored FlashQLA GDN
-  # backend. Tests gracefully skip when unavailable. FlashQLA requires the
-  # tl_gemm builtin (>=0.1.10) AND prefer_instruction (tile-ai/tilelang
-  # PR #2303, merged post-v0.1.10 so absent from every PyPI wheel); we pin
-  # the blessed prebuilt wheel of stock tile-ai/tilelang@a8d93798 (includes
-  # #2303, cp38-abi3, CUDA 13.1) from togethercomputer/xorl-wheels — see
-  # src/xorl/ops/linear_attention/flashqla/VENDORED.md. Switch to PyPI
-  # tilelang>=0.1.11 once a release carrying #2303 ships; bump deliberately
-  # + revalidate the GPU smokes (sparse-MLA bwd NaN history and the FlashQLA
+  # backend. FlashQLA requires the tl_gemm builtin (>=0.1.10) AND
+  # prefer_instruction (tile-ai/tilelang PR #2303). PyPI 0.1.11 is the first
+  # release carrying #2303 and matches the pinned SGLang tree's own tilelang
+  # pin, so the blessed prebuilt 0.1.10+git wheel from
+  # togethercomputer/xorl-wheels is no longer needed — see
+  # src/xorl/ops/linear_attention/flashqla/VENDORED.md. Bump deliberately +
+  # revalidate the GPU smokes (sparse-MLA bwd NaN history and the FlashQLA
   # contract-pin tests) when picking up a new build.
-  "tilelang @ https://github.com/togethercomputer/xorl-wheels/releases/download/tilelang_0.1.10_cu131/tilelang-0.1.10%2Bcu131.gita8d93798-cp38-abi3-linux_x86_64.whl",
-  # tilelang runtime pins: apache-tvm-ffi 0.1.12 aborts at import against the
-  # blessed wheel (duplicate FFI type registration); z3-solver 4.16 drops the
-  # libz3.so.4.15 soname the wheel links.
-  "apache-tvm-ffi==0.1.11",
+  "tilelang==0.1.11",
+  # The tilelang wheel's bundled TVM dlopens the libz3.so.4.15 soname;
+  # z3-solver 4.16 drops it.
   "z3-solver<4.16",
-  # nvidia-cutlass-dsl 4.6.0 removed cutlass.cute.core.ThrCopy, which the
-  # Quack compatibility layer still needs at import time.
-  "nvidia-cutlass-dsl==4.5.2",
-  # Some vendored compatibility modules intentionally import the canonical
-  # top-level Quack helpers. Keep that dependency pinned to the validated ABI.
-  "quack-kernels==0.5.0",
   # Fast Hadamard transform — preferred backend for DSv4
   # ops.utils.rotate_activation. Imported lazily; the helper falls back to a
   # pure-torch FWHT (iterative butterfly) when the wheel is unavailable, so
@@ -128,6 +120,17 @@ test = [
 # NOTE 2: When updating this line, make sure to update Dockerfile under docker/ to the same
 #         version and release new docker images.
 required-version = ">=0.8.14"
+override-dependencies = [
+  # XoRL's Quack imports use the pre-4.6 CUTLASS API (nvidia-cutlass-dsl 4.6.0
+  # removed cutlass.cute.core.ThrCopy, which the Quack compatibility layer
+  # still needs at import time). The pinned SGLang hash_topk, LoRA, and
+  # sgl-kernel paths are qualified with this ABI pair.
+  "nvidia-cutlass-dsl==4.5.2",
+  "quack-kernels==0.5.0",
+]
+
+[tool.uv.sources]
+sglang = { path = "submodules/xorl-sglang/python", editable = true }
 
 
 [tool.setuptools.dynamic]

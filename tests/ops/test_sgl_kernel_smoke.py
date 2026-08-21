@@ -9,10 +9,10 @@ dies mid-run.
 
 This test makes that state loud in whichever environment carries the
 package: if the ``sglang-kernel`` distribution is installed, its compiled
-ops must actually load and execute. An environment without the package
-(the default torch-2.12 trainer profile) skips; DSV4 exact-kernel work
-runs in the isolated torch-2.11 combined environment at
-``submodules/xorl-sglang/.venv``, where this test must pass.
+ops must actually load and execute. The default combined profile pins the
+torch 2.11 stack that ``sglang-kernel`` is built against, so a full
+``uv sync`` environment carries the package and this test must pass there.
+An environment without the package (e.g. the CPU-only CI shards) skips.
 """
 
 from __future__ import annotations
@@ -29,8 +29,8 @@ def _sgl_kernel_installed() -> bool:
 
 @pytest.mark.skipif(
     not _sgl_kernel_installed(),
-    reason="sglang-kernel is not part of this profile; DSV4 exact kernels run "
-    "in the torch-2.11 combined environment (submodules/xorl-sglang/.venv).",
+    reason="sglang-kernel is not installed in this environment; the full "
+    "combined profile (uv sync) carries it.",
 )
 def test_sgl_kernel_extension_loads_and_executes() -> None:
     # Importing sgl_kernel eagerly loads the architecture-specific compiled

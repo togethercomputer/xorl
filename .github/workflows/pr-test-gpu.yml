@@ -81,6 +81,10 @@ jobs:
           # checkout stores the token in .git/config unless told not to, where it
           # can leak into anything that later archives the workspace.
           persist-credentials: false
+          # ``uv sync`` resolves sglang to the checked-in xorl-sglang submodule
+          # (see [tool.uv.sources] in pyproject.toml), so the submodule must be
+          # present before the install step.
+          submodules: true
 
       - uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57 # v8.0.0
 

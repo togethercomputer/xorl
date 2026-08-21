@@ -111,6 +111,10 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+          # ``uv sync`` resolves sglang to the checked-in xorl-sglang submodule
+          # (see [tool.uv.sources] in pyproject.toml), so the submodule must be
+          # present before the install step.
+          submodules: true
 
       - uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57 # v8.0.0
         with:
@@ -118,20 +122,20 @@ jobs:
           prune-cache: false
           cache-dependency-glob: pyproject.toml
 
-      # ``pyproject.toml`` pins torch to a CUDA 13.2 wheel. That wheel runs fine
+      # ``pyproject.toml`` pins torch to the CUDA 13 build. That wheel runs fine
       # on a CPU-only host, but it is a multi-gigabyte download, so swap in the
       # CPU build for this job.
       #
       # The versions are pinned to the same release pyproject.toml pins. Left
       # unpinned, this resolves to the newest CPU build on the index -- which
       # silently ran the whole CPU suite on torch 2.13.0 against a project that
-      # pins 2.12.1. Keep these two in step with the torch/torchvision URLs in
+      # pinned 2.12.1. Keep these two in step with the torch/torchvision pins in
       # pyproject.toml; tests/distributed/test_native_fp8_fsdp2_materialization.py
       # asserts the release and will fail loudly if they drift apart.
       - name: Install dependencies
         run: |
           uv sync --group test
-          uv pip install torch==2.12.1 torchvision==0.27.1 --index-url https://download.pytorch.org/whl/cpu --reinstall
+          uv pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cpu --reinstall
 
       # ``--no-sync`` keeps the CPU torch installed above. A bare ``uv run``
       # re-syncs against the lock first, which would reinstall the CUDA wheel
