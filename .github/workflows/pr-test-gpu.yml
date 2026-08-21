@@ -55,10 +55,10 @@ jobs:
     # and torch._inductor compile kernels at runtime) and 2 GPUs for the
     # distributed shard.
     #
-    # research-common replaces the xorl-2-h100-gpu-runner scale set (defined in
-    # togethercomputer/xorl-ci), whose runner registrations went offline and
-    # stopped picking up jobs.
-    runs-on: research-common
+    # research-common-2-gpu replaces the xorl-2-h100-gpu-runner scale set
+    # (defined in togethercomputer/xorl-ci), whose runner registrations went
+    # offline and stopped picking up jobs.
+    runs-on: research-common-2-gpu
     # Per shard, not for the whole lane. The unsharded run finished in 23 minutes;
     # the largest shard should be well inside this.
     timeout-minutes: 30
