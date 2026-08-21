@@ -30,7 +30,7 @@ def _gemm_interface():
     # quack backend (e.g. the torch-2.11 combined environment used by the
     # DSV4 exact lane, which carries SGLang's cutlass-dsl pin) must still be
     # able to import this package.
-    from xorl.ops.quack import gemm_interface  # noqa: PLC0415
+    from xorl.ops._vendored.quack import gemm_interface  # noqa: PLC0415
 
     return gemm_interface
 

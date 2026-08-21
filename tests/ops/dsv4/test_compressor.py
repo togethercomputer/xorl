@@ -5,10 +5,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from xorl.ops.dsv4 import utils
-from xorl.ops.dsv4.compressor import DeepSeekV4Compressor
-from xorl.ops.dsv4.exact_attention import _legacy_compressor_state_pages
-from xorl.ops.dsv4.rope import precompute_freqs_cis
+from xorl.ops.families.dsv4 import utils
+from xorl.ops.families.dsv4.compressor import DeepSeekV4Compressor
+from xorl.ops.families.dsv4.exact_attention import _legacy_compressor_state_pages
+from xorl.ops.families.dsv4.rope import precompute_freqs_cis
 
 
 pytestmark = pytest.mark.cpu

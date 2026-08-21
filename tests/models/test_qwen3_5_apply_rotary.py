@@ -77,7 +77,7 @@ def _assert_interleaved_matches_pairwise_reference():
     torch.testing.assert_close(k_ours, k_ref, atol=1e-6, rtol=1e-6)
 
 
-def _assert_class_b_rotary_admission_policy(monkeypatch):
+def _assert_fp32_single_round_rotary_admission_policy(monkeypatch):
     sentinel = (object(), object())
     calls = []
 
@@ -96,20 +96,20 @@ def _assert_class_b_rotary_admission_policy(monkeypatch):
     cos = torch.zeros((1, 2, 4), dtype=torch.float32)
     sin = torch.zeros_like(cos)
 
-    assert qwen3_5_shared.qwen3_5_apply_rotary_pos_emb(q, k, cos, sin, class_b=True) is sentinel
+    assert qwen3_5_shared.qwen3_5_apply_rotary_pos_emb(q, k, cos, sin, fp32_single_round=True) is sentinel
     assert calls == [(q, k, cos, sin, False)]
 
-    _assert_class_b_fails_loudly_outside_cuda_contract()
+    _assert_fp32_single_round_fails_loudly_outside_cuda_contract()
 
 
-def _assert_class_b_fails_loudly_outside_cuda_contract():
+def _assert_fp32_single_round_fails_loudly_outside_cuda_contract():
     cos = torch.zeros((1, 2, 4), dtype=torch.float32)
     sin = torch.zeros_like(cos)
     for dtype in (torch.bfloat16, torch.float32):
         q = torch.zeros((1, 2, 1, 4), dtype=dtype)
         k = torch.zeros_like(q)
         with pytest.raises(RuntimeError, match="requires CUDA"):
-            qwen3_5_apply_rotary_pos_emb(q, k, cos, sin, class_b=True)
+            qwen3_5_apply_rotary_pos_emb(q, k, cos, sin, fp32_single_round=True)
 
 
 def _assert_qwen35_attention_keeps_half_rotate_when_mrope_is_interleaved(attention_type, config_type):
@@ -151,7 +151,7 @@ def _assert_qwen35_attention_keeps_half_rotate_when_mrope_is_interleaved(attenti
 
 def test_qwen35_rotary_numerics_admission_and_attention_policy(monkeypatch):
     _assert_interleaved_matches_pairwise_reference()
-    _assert_class_b_rotary_admission_policy(monkeypatch)
+    _assert_fp32_single_round_rotary_admission_policy(monkeypatch)
 
     for attention_type, config_type in (
         (modeling_qwen3_5.Qwen3_5Attention, Qwen3_5Config),

@@ -24,7 +24,7 @@ pytestmark = pytest.mark.cpu
 def _cpu_env(monkeypatch):
     monkeypatch.setenv("XORL_DSV4_ROPE_MAX_SEQ_LEN", "256")
     monkeypatch.setenv("XORL_DSV4_SPARSE_ATTN_IMPL", "sparse")
-    from xorl.ops.dsv4.rope import precompute_freqs_cis  # noqa: PLC0415
+    from xorl.ops.families.dsv4.rope import precompute_freqs_cis  # noqa: PLC0415
 
     precompute_freqs_cis.cache_clear()
     yield

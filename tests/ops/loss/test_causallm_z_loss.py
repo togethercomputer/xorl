@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from tests.ops.loss.conftest import assert_close
-from xorl.ops.loss.causallm_loss import causallm_loss_function
+from xorl.objectives.causallm_loss import causallm_loss_function
 
 
 def _reference_z_loss(hidden_states, weight, labels, ignore_index=-100):

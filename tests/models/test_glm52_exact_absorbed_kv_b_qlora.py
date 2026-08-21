@@ -10,7 +10,7 @@ from xorl.models.transformers.glm5.exact_absorbed_kv_b_qlora import (
     GLM52_EXACT_TP1_ABSORBED_KV_B_QLORA_CONTRACT_VERSION,
     Glm52ExactTP1AbsorbedKvBBlockFP8QLoRA,
 )
-from xorl.ops.block_fp8_native import NativeBlockFP8Linear
+from xorl.ops.exact.block_fp8_native import NativeBlockFP8Linear
 
 
 _NUM_HEADS = 64

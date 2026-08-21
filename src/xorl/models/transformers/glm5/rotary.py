@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import torch
 
-from xorl.models.layers.rope import rope_class_b_enabled, stock_fused_apply_rotary_pos_emb
+from xorl.models.layers.rope import rope_fp32_single_round_enabled, stock_fused_apply_rotary_pos_emb
 
 
 def glm5_rotate_half(x: torch.Tensor, interleaved: bool = False) -> torch.Tensor:
@@ -24,10 +24,10 @@ def glm5_apply_rotary_pos_emb(
     cos: torch.Tensor,
     sin: torch.Tensor,
     interleaved: bool = False,
-    class_b: bool | None = None,
+    fp32_single_round: bool | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    use_class_b = rope_class_b_enabled() if class_b is None else class_b
-    if use_class_b and q.is_cuda:
+    use_fp32_single_round = rope_fp32_single_round_enabled() if fp32_single_round is None else fp32_single_round
+    if use_fp32_single_round and q.is_cuda:
         return stock_fused_apply_rotary_pos_emb(q, k, cos, sin, interleaved=interleaved)
 
     if interleaved:

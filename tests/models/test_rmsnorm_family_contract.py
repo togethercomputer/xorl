@@ -34,7 +34,7 @@ from xorl.models.transformers.qwen3.configuration_qwen3 import Qwen3Config
 from xorl.models.transformers.qwen3.modeling_qwen3 import Qwen3DecoderLayer
 from xorl.models.transformers.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
 from xorl.models.transformers.qwen3_moe.modeling_qwen3_moe import Qwen3MoeDecoderLayer, Qwen3MoeModel
-from xorl.ops.batch_invariant_ops import (
+from xorl.ops.sglang.batch_invariant_ops import (
     bi_fused_add_rms_norm,
     bi_rms_norm,
     fused_add_rms_norm_batch_invariant,
@@ -57,7 +57,7 @@ HIDDEN_SHAPE = (1024, 2048)
 @pytest.fixture(autouse=True)
 def _pin_qualified_v1_family():
     """Keep the v1-family contract independent of test collection order."""
-    from xorl.ops.bi_families_v2 import _select_nonexact_families, _select_qwen35_families_v1
+    from xorl.ops.sglang.bi_families_v2 import _select_nonexact_families, _select_qwen35_families_v1
 
     _select_qwen35_families_v1()
     try:

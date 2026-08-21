@@ -27,7 +27,7 @@ vocabulary chunk at a time, records
 the same maximum, exponential sum, and selected logit, then merges chunks in
 pinned order. This rollback is exact but uses more launches.
 
-The trainer exposes this as `ce_mode="bi_fused"`. Its custom autograd function
+The trainer exposes this as `ce_mode="batch_invariant"`. Its custom autograd function
 saves the exact forward LSE and recomputes the conventional closed-form CE
 gradient by chunks. Only forward values enter the train/serve equality
 contract; backward remains ordinary checked training numerics.
@@ -42,7 +42,7 @@ second fp32 copy of the LM-head weight.
 Run on a Hopper GPU:
 
 ```bash
-pytest tests/ops/test_bi_fused_lm_head.py -v
+pytest tests/ops/test_batch_invariant_lm_head.py -v
 ```
 
 The gate compares forward probabilities and loss with an eager fp32 reference,

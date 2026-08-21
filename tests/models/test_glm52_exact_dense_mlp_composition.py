@@ -8,7 +8,7 @@ from xorl.models.transformers.glm5.exact_gate_up_qlora import (
     Glm52ExactTP1FusedGateUpBlockFP8QLoRA,
 )
 from xorl.models.transformers.glm5.exact_qlora import Glm52ExactTP1BlockFP8QLoRALinear
-from xorl.ops.fused_silu_and_mul import exact_fp32_silu_and_mul
+from xorl.ops.exact.fused_silu_and_mul import one_round_swiglu
 
 
 def _pattern(
@@ -167,7 +167,7 @@ def test_official_tp1_dense_vertical_composition_bytes_and_manual_vjp() -> None:
 
     trainer_gate_up = gate_up(input)
     trainer_gate_up.retain_grad()
-    trainer_activation = exact_fp32_silu_and_mul(trainer_gate_up)
+    trainer_activation = one_round_swiglu(trainer_gate_up)
     trainer_activation.retain_grad()
     trainer_output = down(trainer_activation)
 
@@ -266,11 +266,11 @@ def test_official_tp1_dense_vertical_composition_bytes_and_manual_vjp() -> None:
     )
     # Match the BF16 activation-storage boundary traversed by autograd, then
     # differentiate the exact one-round activation exactly as the trainer
-    # does: through exact_fp32_silu_and_mul's own autograd definition.
+    # does: through one_round_swiglu's own autograd definition.
     with torch.enable_grad():
         manual_gate_up_leaf = trainer_gate_up.detach().requires_grad_(True)
         (manual_gate_up_grad,) = torch.autograd.grad(
-            exact_fp32_silu_and_mul(manual_gate_up_leaf),
+            one_round_swiglu(manual_gate_up_leaf),
             manual_gate_up_leaf,
             grad_outputs=manual_activation_grad.to(trainer_activation.dtype),
         )

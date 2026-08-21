@@ -2,7 +2,7 @@
 
 Run through pytest (which self-launches torchrun) or directly with two ranks::
 
-    torchrun --nproc_per_node=2 tests/distributed/test_bi_fused_lm_head_tp.py
+    torchrun --nproc_per_node=2 tests/distributed/test_batch_invariant_lm_head_tp.py
 """
 
 import os
@@ -12,13 +12,13 @@ import torch
 import torch.distributed as dist
 
 import xorl.distributed.parallel_state as parallel_state_impl
+from xorl.objectives.causallm_loss import causallm_loss_function
+from xorl.objectives.reducers import TokenPartial
 from xorl.ops import bi_families_v2
-from xorl.ops.loss.bi_fused_lm_head import (
-    bi_fused_per_token_ce,
-    bi_fused_vocab_parallel_per_token_ce,
+from xorl.ops.loss.batch_invariant_lm_head import (
+    batch_invariant_per_token_ce,
+    batch_invariant_vocab_parallel_per_token_ce,
 )
-from xorl.ops.loss.causallm_loss import causallm_loss_function
-from xorl.ops.loss.reducers import TokenPartial
 
 
 _HIDDEN = 128
@@ -69,7 +69,7 @@ def _assert_forward_bytes_and_backward(
         top_ps = torch.ones(hidden.shape[0], dtype=torch.float32, device="cuda")
         min_ps = torch.zeros(hidden.shape[0], dtype=torch.float32, device="cuda")
 
-    actual = bi_fused_vocab_parallel_per_token_ce(
+    actual = batch_invariant_vocab_parallel_per_token_ce(
         hidden,
         local_weight,
         labels,
@@ -81,7 +81,7 @@ def _assert_forward_bytes_and_backward(
     )
     reference_weight = full_weight.detach().clone().requires_grad_(trainable_weight)
     reference_hidden = hidden.detach().clone().requires_grad_(True)
-    reference = bi_fused_per_token_ce(
+    reference = batch_invariant_per_token_ce(
         reference_hidden,
         reference_weight,
         labels,
@@ -99,7 +99,7 @@ def _assert_forward_bytes_and_backward(
         local_weight.detach(),
         labels,
         return_per_token=True,
-        ce_mode="bi_fused",
+        ce_mode="batch_invariant",
         tp_group=dist.group.WORLD,
         lm_head_fp32=True,
         lm_head=SimpleNamespace(_xorl_fsdp_sharded_lm_head_loss=True),
@@ -160,7 +160,7 @@ def _run_cases(rank: int, world_size: int) -> None:
         local_weight = full_weight[rank * 256 : (rank + 1) * 256].contiguous()
         hidden = torch.empty((0, _HIDDEN), dtype=torch.bfloat16, device="cuda", requires_grad=True)
         labels = torch.empty((0,), dtype=torch.int64, device="cuda")
-        empty_ce = bi_fused_vocab_parallel_per_token_ce(
+        empty_ce = batch_invariant_vocab_parallel_per_token_ce(
             hidden,
             local_weight,
             labels,
@@ -186,7 +186,7 @@ def main() -> None:
         _run_cases(rank, world_size)
         dist.barrier()
         if rank == 0:
-            print("bi_fused LM-head TP ragged/empty forward+backward passed")
+            print("batch_invariant LM-head TP ragged/empty forward+backward passed")
     finally:
         parallel_state_impl._PARALLEL_STATE = previous_parallel_state
         dist.destroy_process_group()
@@ -200,7 +200,7 @@ if __name__ != "__main__":
     @pytest.mark.gpu
     @pytest.mark.distributed
     @skip_if_gpu_count_less_than(2)
-    def test_bi_fused_lm_head_tp_2gpu() -> None:
+    def test_batch_invariant_lm_head_tp_2gpu() -> None:
         result = run_distributed_script(os.path.abspath(__file__), num_gpus=2, timeout=240)
         result.assert_success()
 

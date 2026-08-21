@@ -14,10 +14,10 @@ from .canonical_moe import (
     OutputDistribution,
     ParallelRole,
     canonical_moe_fold_fp64_v3,
-    canonical_moe_leaf_fp32_v1,
     canonical_moe_reduce_cp_sharded_v3,
     canonical_moe_reduce_fp64_v3,
     canonical_moe_reduce_packed_ep16_v2,
     canonical_moe_reduce_reference,
+    moe_fixed_order_leaf_fp32_v1,
     resolve_canonical_moe_transport,
 )

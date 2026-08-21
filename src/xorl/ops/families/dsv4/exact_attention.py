@@ -935,7 +935,7 @@ class _ExactC0Attention(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: Tensor):
-        from xorl.ops.dsv4.attention_core import sparse_attn_torch  # noqa: PLC0415
+        from xorl.ops.families.dsv4.attention_core import sparse_attn_torch  # noqa: PLC0415
 
         if ctx.carry_offset is not None:
             (
@@ -1225,7 +1225,7 @@ class _ExactHybridAttention(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: Tensor):
-        from xorl.ops.dsv4.attention_core import sparse_attn_torch  # noqa: PLC0415
+        from xorl.ops.families.dsv4.attention_core import sparse_attn_torch  # noqa: PLC0415
 
         if ctx.carry_offset is not None:
             (

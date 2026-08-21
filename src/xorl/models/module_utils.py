@@ -36,8 +36,8 @@ from xorl.models.checkpoint_handlers.buffers import (  # noqa: F401
     parse_expert_full_key,
     parse_expert_key,
 )
+from xorl.objectives.reducers import TokenPartial
 from xorl.ops.loss import fsdp_sharded_causallm_loss_function, get_loss_function
-from xorl.ops.loss.reducers import TokenPartial
 from xorl.utils import logging
 from xorl.utils.device import get_device_id, get_device_type, synchronize
 from xorl.utils.helper import empty_cache, get_dtype_size
@@ -2878,12 +2878,12 @@ def compute_loss(
         getattr(lm_head, "_glm52_exact_tp16_lm_head", False) or getattr(lm_head, "_dsv4_exact_tp8_lm_head", False)
     )
     requested_ce_mode = (loss_fn_params or {}).get("ce_mode")
-    bi_fused_lm_head_tp = bool(
-        requested_ce_mode == "bi_fused"
+    batch_invariant_lm_head_tp = bool(
+        requested_ce_mode == "batch_invariant"
         and getattr(ps, "lm_head_tp_size", 1) > 1
         and getattr(ps, "lm_head_tp_group", None) is not None
     )
-    if bi_fused_lm_head_tp:
+    if batch_invariant_lm_head_tp:
         loss_fn_params = dict(loss_fn_params or {})
         global_valid_tokens = loss_fn_params.pop("fsdp_sharded_lm_head_loss_global_valid_tokens", None)
         loss_fn_params.pop("fsdp_sharded_lm_head_loss_num_chunks", None)
@@ -2895,7 +2895,7 @@ def compute_loss(
     fsdp_sharded_loss = (
         bool(getattr(lm_head, "_xorl_fsdp_sharded_lm_head_loss", False))
         and not exact_lm_head
-        and not bi_fused_lm_head_tp
+        and not batch_invariant_lm_head_tp
     )
     if fsdp_sharded_loss and fn_name not in {"causallm_loss", "cross_entropy"}:
         raise NotImplementedError(f"fsdp_sharded_lm_head_loss is not supported for loss function {fn_name!r}.")
@@ -2987,7 +2987,7 @@ def compute_loss(
             raise RuntimeError("The exact GLM-5.2 lm head was not prepared for sharded TP16 loss")
         loss_kwargs["lm_head"] = lm_head
         loss_kwargs["tp_group"] = ps.lm_head_tp_group
-    elif bi_fused_lm_head_tp:
+    elif batch_invariant_lm_head_tp:
         loss_kwargs["lm_head"] = lm_head
         loss_kwargs["tp_group"] = ps.lm_head_tp_group
     elif ps.tp_enabled:

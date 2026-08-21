@@ -44,7 +44,7 @@ from xorl.models.outputs import MoeCausalLMOutput, MoeModelOutput
 from xorl.models.transformers.glm4_moe import parallelize
 from xorl.models.transformers.glm4_moe.checkpoint_handler import Glm4MoeCheckpointHandler
 from xorl.models.transformers.glm4_moe.configuration_glm4_moe import Glm4MoeConfig
-from xorl.ops.fused_silu_and_mul import fused_silu_and_mul
+from xorl.ops.exact.fused_silu_and_mul import fused_silu_and_mul
 from xorl.utils import logging
 
 

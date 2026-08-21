@@ -5,8 +5,8 @@ from safetensors.torch import save_file
 from tests._helpers.opd import reference_opd_loss
 from tests.ops.loss.conftest import assert_close
 from xorl.distillation.teacher_store import TeacherHeadShardView, TeacherHeadStore, prepare_lm_head_teacher_store
+from xorl.objectives.opd_loss import _oprd_hidden_distance, _oprd_hidden_distance_from_fetcher
 from xorl.ops.loss import TokenPartial, opd_loss_function
-from xorl.ops.loss.opd_loss import _oprd_hidden_distance, _oprd_hidden_distance_from_fetcher
 
 
 pytestmark = pytest.mark.cpu

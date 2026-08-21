@@ -11,7 +11,7 @@ import torch
 import torch.distributed as dist
 
 from xorl.distributed.parallel_state import init_parallel_state
-from xorl.ops.linear_attention import GatedDeltaNet
+from xorl.models.layers.gated_deltanet import GatedDeltaNet
 from xorl.ops.linear_attention.ops.cp import build_linear_attention_cp_context
 from xorl.utils.device import get_nccl_backend
 

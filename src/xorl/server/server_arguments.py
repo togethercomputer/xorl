@@ -175,12 +175,17 @@ class ServerArguments:
         default=None,
         metadata={"help": "Use native RoPE. Auto-enables for canonical GLM-5.2 when omitted."},
     )
-    rope_class_b: Optional[bool] = field(
+    rope_fp32_single_round: Optional[bool] = field(
         default=None,
         metadata={
-            "help": "Use compiled Class-B RoPE fp32-chain numerics. Auto-enables for canonical GLM-5.2 and "
-            "exact Qwen3.5-family training when omitted."
+            "help": "Use the compiled fp32 single-round RoPE numerics (one fp32 chain, one final round; "
+            "formerly 'Class-B'). Auto-enables for canonical GLM-5.2 and exact Qwen3.5-family training "
+            "when omitted."
         },
+    )
+    rope_class_b: Optional[bool] = field(
+        default=None,
+        metadata={"help": "DEPRECATED alias for rope_fp32_single_round."},
     )
 
     attention_cast_bf16: bool = field(
@@ -673,7 +678,7 @@ class ServerArguments:
         default=None,
         metadata={
             "help": "Cross-entropy implementation. Omitted means compiled for ordinary models and "
-            "bi_fused for canonical GLM-5.2. 'bi_fused' is the batch-invariant "
+            "batch_invariant for canonical GLM-5.2. 'batch_invariant' is the batch-invariant "
             "K3 lm-head contract, fp32-class; needs tp=1, no z-loss, bf16 hidden/weight, lm_head_fp32), "
             "'compiled' (torch.compile), 'quack_linear' (Quack scalar loss; return_per_token uses fused "
             "selected-logprob CE), 'fused_quack', or 'eager' (baseline, may OOM at 32K)"
@@ -1224,6 +1229,27 @@ class ServerArguments:
         """Validate and set defaults."""
         from xorl.fp8_training.config_compat import normalize_fp8_training_config  # noqa: PLC0415
 
+        if self.ce_mode == "bi_fused":
+            import warnings
+
+            warnings.warn(
+                "ce_mode='bi_fused' is deprecated; use ce_mode='batch_invariant'",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            self.ce_mode = "batch_invariant"
+
+        if self.rope_class_b is not None:
+            import warnings
+
+            warnings.warn(
+                "rope_class_b is deprecated; use rope_fp32_single_round",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if self.rope_fp32_single_round is None:
+                self.rope_fp32_single_round = self.rope_class_b
+
         if isinstance(self.max_grad_norm, bool):
             raise ValueError("max_grad_norm must be a finite number; use a value <= 0 to disable clipping")
         try:
@@ -1496,7 +1522,7 @@ class ServerArguments:
                 "qwen35_rmsnorm_family": self.qwen35_rmsnorm_family,
                 "activation_native": self.activation_native,
                 "rope_native": self.rope_native,
-                "rope_class_b": self.rope_class_b,
+                "rope_fp32_single_round": self.rope_fp32_single_round,
                 "attention_cast_bf16": self.attention_cast_bf16,
                 "flash_attention_deterministic": self.flash_attention_deterministic,
                 "sparse_mla_enabled": self.sparse_mla_enabled,

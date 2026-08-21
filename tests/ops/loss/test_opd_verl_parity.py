@@ -15,13 +15,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from xorl.ops.loss.compiled_cross_entropy import (
-    compiled_sampled_token_logprobs_function,
-)
-from xorl.ops.loss.opd_loss import (
+from xorl.objectives.opd_loss import (
     LOSS_MODE_FORWARD_KL_FULL,
     _kl_penalty_estimator,
     opd_loss_function,
+)
+from xorl.ops.loss.compiled_cross_entropy import (
+    compiled_sampled_token_logprobs_function,
 )
 
 

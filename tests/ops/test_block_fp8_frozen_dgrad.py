@@ -26,7 +26,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from xorl.ops.block_fp8_native import (
+from xorl.ops.exact.block_fp8_native import (
     NATIVE_BLOCK_FP8_FROZEN_DGRAD_CONTRACT_VERSION,
     NativeBlockFP8Linear,
 )
@@ -126,7 +126,7 @@ def test_cuda_dgrad_matches_reference_and_composite_and_mutates_nothing(caplog) 
     packed_before = module.packed_weight_f32.detach().view(torch.uint8).clone()
     scales_before = module.weight_scale_inv.detach().clone()
 
-    with caplog.at_level(logging.INFO, logger="xorl.ops.block_fp8_native"):
+    with caplog.at_level(logging.INFO, logger="xorl.ops.exact.block_fp8_native"):
         module.enable_frozen_activation_dgrad()
         module.enable_frozen_activation_dgrad()  # idempotent
     engagement = [record for record in caplog.records if "frozen-trunk activation dgrad engaged" in record.message]

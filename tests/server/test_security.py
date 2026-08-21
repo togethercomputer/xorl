@@ -6,7 +6,7 @@ from io import BytesIO
 import pytest
 import torch
 
-from xorl.ops.quack._worker_protocol import recv_message, send_message
+from xorl.ops._vendored.quack._worker_protocol import recv_message, send_message
 from xorl.server.security import (
     build_http_endpoint_url,
     resolve_diagnostic_input,
@@ -107,12 +107,12 @@ def _assert_diagnostic_input_requires_configured_root_and_regular_private_file(t
 
 
 def test_compile_worker_security_and_protocol_policy():
-    from xorl.ops.quack._compile_worker import _resolve_compile_function
+    from xorl.ops._vendored.quack._compile_worker import _resolve_compile_function
 
     with pytest.raises(ValueError, match="Quack module"):
         _resolve_compile_function("os", "system")
     with pytest.raises(ValueError, match="safe qualified name"):
-        _resolve_compile_function("xorl.ops.quack.autotuner", "__builtins__.eval")
+        _resolve_compile_function("xorl.ops._vendored.quack.autotuner", "__builtins__.eval")
 
     _assert_compile_worker_protocol_roundtrips_safe_types_and_rejects_oversized_header()
 

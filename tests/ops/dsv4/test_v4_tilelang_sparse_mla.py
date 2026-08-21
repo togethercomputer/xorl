@@ -181,7 +181,7 @@ FORWARD_IDS = [f"b{b}_s{s}_h{h}_d{d}_kv{kv}_top{tk}" for b, s, h, d, kv, tk in F
 @pytest.mark.parametrize("batch,seqlen,heads,dim,seqlen_kv,topk", FORWARD_CONFIGS, ids=FORWARD_IDS)
 def test_sparse_mla_forward_policy(batch, seqlen, heads, dim, seqlen_kv, topk):
     """Compare tilelang sparse MLA forward against PyTorch reference."""
-    from xorl.ops.dsv4.kernel.tilelang_sparse_mla_fwd import sparse_mqa_fwd_interface  # noqa: PLC0415
+    from xorl.ops.families.dsv4.kernel.tilelang_sparse_mla_fwd import sparse_mqa_fwd_interface  # noqa: PLC0415
 
     q, kv, attn_sink, topk_idxs = make_inputs(batch, seqlen, heads, dim, seqlen_kv, topk)
     sm_scale = (1.0 / dim) ** 0.5
@@ -205,7 +205,7 @@ def test_sparse_mla_forward_policy(batch, seqlen, heads, dim, seqlen_kv, topk):
 # ---------------------------------------------------------------------------
 def _assert_attn_sink_policy():
     """Test attn_sink reference parity and prove that the kernel does not ignore it."""
-    from xorl.ops.dsv4.kernel.tilelang_sparse_mla_fwd import sparse_mqa_fwd_interface  # noqa: PLC0415
+    from xorl.ops.families.dsv4.kernel.tilelang_sparse_mla_fwd import sparse_mqa_fwd_interface  # noqa: PLC0415
 
     # Zero is the boundary; random contains both signs. Positive-only and
     # negative-only tensors use the identical arithmetic, while the separate
@@ -233,7 +233,7 @@ def _assert_attn_sink_policy():
 
 def _assert_attn_sink_changes_output(sparse_mqa_fwd_interface):
     """Verify attn_sink actually changes output (not ignored)."""
-    from xorl.ops.dsv4.kernel.tilelang_sparse_mla_fwd import sparse_mqa_fwd_interface  # noqa: PLC0415
+    from xorl.ops.families.dsv4.kernel.tilelang_sparse_mla_fwd import sparse_mqa_fwd_interface  # noqa: PLC0415
 
     batch, seqlen, heads, dim, seqlen_kv, topk = 1, 128, 8, 512, 160, 64
     q, kv, _, topk_idxs = make_inputs(batch, seqlen, heads, dim, seqlen_kv, topk)
@@ -309,7 +309,7 @@ def ref_dense_attn_with_grad(q, kv, attn_sink, topk_idxs, sm_scale):
 @pytest.mark.parametrize("batch,seqlen,heads,dim,seqlen_kv,topk", BACKWARD_CONFIGS, ids=BACKWARD_IDS)
 def test_sparse_mla_backward_policy(batch, seqlen, heads, dim, seqlen_kv, topk):
     """Compare tilelang backward gradients against PyTorch autograd reference."""
-    from xorl.ops.dsv4.attention_core import sparse_attn_tilelang  # noqa: PLC0415
+    from xorl.ops.families.dsv4.attention_core import sparse_attn_tilelang  # noqa: PLC0415
 
     q_base, kv_base, attn_sink_base, topk_idxs = make_inputs(batch, seqlen, heads, dim, seqlen_kv, topk)
     sm_scale = (1.0 / dim) ** 0.5
@@ -359,8 +359,8 @@ def test_sparse_mla_backward_deterministic_dkv():
     atomic path within bf16 GEMM tolerance, with no NaN."""
     import os as _os  # noqa: PLC0415
 
-    from xorl.ops.dsv4.kernel.tilelang_sparse_mla_bwd import sparse_mqa_bwd_interface  # noqa: PLC0415
-    from xorl.ops.dsv4.kernel.tilelang_sparse_mla_fwd import sparse_mqa_fwd_interface  # noqa: PLC0415
+    from xorl.ops.families.dsv4.kernel.tilelang_sparse_mla_bwd import sparse_mqa_bwd_interface  # noqa: PLC0415
+    from xorl.ops.families.dsv4.kernel.tilelang_sparse_mla_fwd import sparse_mqa_fwd_interface  # noqa: PLC0415
 
     batch, seqlen, heads, dim, seqlen_kv, topk = 1, 256, 64, 512, 320, 128
     q, kv, attn_sink, topk_idxs = make_inputs(batch, seqlen, heads, dim, seqlen_kv, topk)
@@ -392,7 +392,7 @@ def test_sparse_mla_backward_deterministic_dkv():
 @requires_tilelang()
 def test_sparse_mla_partial_invalid_indices_forward_backward_policy():
     """Forward and backward must ignore -1 sparse slots without touching invalid dKV rows."""
-    from xorl.ops.dsv4.attention_core import sparse_attn_tilelang  # noqa: PLC0415
+    from xorl.ops.families.dsv4.attention_core import sparse_attn_tilelang  # noqa: PLC0415
 
     batch, seqlen, heads, dim, seqlen_kv, topk = 1, 128, 8, 512, 160, 64
     q_base, kv_base, attn_sink_base, topk_idxs = make_inputs(batch, seqlen, heads, dim, seqlen_kv, topk)
@@ -427,7 +427,7 @@ def test_sparse_mla_partial_invalid_indices_forward_backward_policy():
 # ---------------------------------------------------------------------------
 def _assert_partial_invalid_forward_interface():
     """Test with some indices set to -1 (invalid)."""
-    from xorl.ops.dsv4.kernel.tilelang_sparse_mla_fwd import sparse_mqa_fwd_interface  # noqa: PLC0415
+    from xorl.ops.families.dsv4.kernel.tilelang_sparse_mla_fwd import sparse_mqa_fwd_interface  # noqa: PLC0415
 
     batch, seqlen, heads, dim, seqlen_kv, topk = 1, 256, 8, 512, 320, 128
     q, kv, attn_sink, topk_idxs = make_inputs(batch, seqlen, heads, dim, seqlen_kv, topk)

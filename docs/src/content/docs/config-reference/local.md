@@ -175,7 +175,7 @@ Each entry in `datasets` (or `test_datasets`) is a dict:
 | `activation_gpu_limit` | `0.0` | GB of activations to keep on GPU when offloading. `0.0` = offload all. |
 | `enable_compile` | `false` | `torch.compile` for model forward pass. |
 | `compile_dynamic_shapes` | `false` | Pass `dynamic=True` to `torch.compile`; keep disabled unless a workload has benchmarked a dynamic-shape win. |
-| `ce_mode` | `null` (resolved) | Ordinary models and exact DSV4-Flash resolve to `compiled`; exact dense Qwen3, Qwen3.5-family, and GLM-5.2 programs resolve to `bi_fused`. Explicit modes also include `eager`, `quack_linear`, and `fused_quack`, subject to loss/topology checks. |
+| `ce_mode` | `null` (resolved) | Ordinary models and exact DSV4-Flash resolve to `compiled`; exact dense Qwen3, Qwen3.5-family, and GLM-5.2 programs resolve to `batch_invariant`. Explicit modes also include `eager`, `quack_linear`, and `fused_quack`, subject to loss/topology checks. |
 | `ce_num_chunks` | `8` | Number of token chunks for chunked/compiled cross-entropy. |
 | `enable_fp8_training` | `false` | Experimental full-weight block-FP8 compute with BF16/FP32 master parameters. Mutually exclusive with QARL. |
 | `enable_qarl` | `false` | Experimental dynamic fake-quant training with full-precision masters and STE gradients. E4M3 applies to dense `nn.Linear` modules; NVFP4 also supports MoE expert containers. Mutually exclusive with full-weight FP8 training. |

@@ -4,7 +4,7 @@ K3 lane doctrine: a lever that participates in the training graph ships with
 a grad-engagement gate — the module forward/backward must produce non-None,
 finite gradients for every parameter and for the input, and the gradients
 must match a reference trajectory. The op-level backward test
-(tests/ops/test_exact_fp32_silu_and_mul.py) covers the kernel; this gate
+(tests/ops/test_one_round_swiglu.py) covers the kernel; this gate
 covers engagement through Qwen3_5MLP, where the fused one-round path is
 selected by the exact-contract policy rather than by a flag.
 """

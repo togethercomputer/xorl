@@ -33,7 +33,7 @@ from xorl.models.transformers.glm5.native_fp8 import (
     replace_glm52_native_fp8_modules,
     validate_glm52_native_fp8_config,
 )
-from xorl.ops.block_fp8_native import NativeBlockFP8Linear
+from xorl.ops.exact.block_fp8_native import NativeBlockFP8Linear
 from xorl.qlora.modules.block_fp8_linear import BlockFP8QLoRALinear
 from xorl.qlora.modules.moe_experts import BlockFP8QLoRAMoeExperts
 

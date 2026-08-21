@@ -47,7 +47,7 @@ from xorl.models.outputs import MoeCausalLMOutput, MoeModelOutput
 from xorl.models.transformers.qwen3_moe import parallelize
 from xorl.models.transformers.qwen3_moe.checkpoint_handler import Qwen3MoeCheckpointHandler
 from xorl.models.transformers.qwen3_moe.configuration_qwen3_moe import Qwen3MoeConfig
-from xorl.ops.fused_silu_and_mul import fused_silu_and_mul
+from xorl.ops.exact.fused_silu_and_mul import fused_silu_and_mul
 from xorl.utils import logging
 
 

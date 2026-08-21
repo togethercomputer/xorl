@@ -25,12 +25,12 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from xorl.ops.block_fp8_native import (
+from xorl.ops.exact.block_fp8_native import (
     _sglang_native_block_fp8_linear_value,
     pack_fp8_as_float32,
     unpack_float32_as_fp8,
 )
-from xorl.ops.fused_silu_and_mul import exact_fp32_silu_and_mul
+from xorl.ops.exact.fused_silu_and_mul import one_round_swiglu
 
 
 logger = logging.getLogger(__name__)
@@ -663,7 +663,7 @@ class Glm52FullParamDenseMLP(nn.Module):
         # SiLU and multiply in FP32 with one final rounding.  The historical
         # trainer op rounded between SiLU and multiply, so it is not the same
         # numerical program.
-        activated = exact_fp32_silu_and_mul(gate_up)
+        activated = one_round_swiglu(gate_up)
         return self.down_proj(activated)
 
 
@@ -838,7 +838,7 @@ class Glm52ExactFullParamRouterWeight(nn.Module):
         if self._effective_weight.device != hidden_states.device:
             raise RuntimeError("GLM-5.2 full-param router view and activations must share one CUDA device")
 
-        from xorl.ops.batch_invariant_ops import bi_router_gemm  # noqa: PLC0415
+        from xorl.ops.sglang.batch_invariant_ops import bi_router_gemm  # noqa: PLC0415
 
         return bi_router_gemm(hidden_states, self._effective_weight)
 

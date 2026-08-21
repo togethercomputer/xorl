@@ -25,8 +25,8 @@ from xorl.models.transformers.glm5.sparse_selector import (
     GLM52_SELECTOR_VERSION,
     select_glm52_logical_indices,
 )
-from xorl.ops.batch_invariant_ops import bi_bf16_fp32_linear, matmul_persistent
-from xorl.ops.rope_class_b import build_class_b_cos_sin
+from xorl.ops.exact.rope_fp32_single_round import build_single_round_cos_sin
+from xorl.ops.sglang.batch_invariant_ops import bi_bf16_fp32_linear, matmul_persistent
 
 
 GLM52_FUSED_INDEX_K_IMPORT = "sglang.kernels.ops.quantization.dsv32.elementwise.fused_k_indexer_norm_rope"
@@ -72,7 +72,7 @@ def _fused_sampler_index_k_prepare(
             f"got key={tuple(raw_key.shape)} cos={tuple(cos.shape)} sin={tuple(sin.shape)}"
         )
 
-    cos_half, sin_half = build_class_b_cos_sin(cos, sin)
+    cos_half, sin_half = build_single_round_cos_sin(cos, sin)
     cos_sin_cache = torch.cat((cos_half, sin_half), dim=-1).contiguous()
     flat_key = raw_key.reshape(-1, raw_key.shape[-1])
     if flat_key.stride(-1) != 1:
@@ -332,7 +332,9 @@ class Glm5DsaIndexer(nn.Module):
             cos,
             sin,
             interleaved=getattr(self.config, "indexer_rope_interleave", True),
-            class_b=bool(getattr(self.config, "_rope_class_b", False) or glm52_exact_forward_enabled(self.config)),
+            fp32_single_round=bool(
+                getattr(self.config, "_rope_fp32_single_round", False) or glm52_exact_forward_enabled(self.config)
+            ),
         )
 
         index_q = torch.cat([q_pe, q_no_pe], dim=-1)
@@ -478,7 +480,7 @@ class Glm5DsaIndexer(nn.Module):
             return None
 
         try:
-            from xorl.ops.glm5_kernels.tilelang_indexer_fwd import (  # noqa: PLC0415
+            from xorl.ops.families.glm5.tilelang_indexer_fwd import (  # noqa: PLC0415
                 clean_logits_,
                 tl_indexer_fwd_impl,
             )

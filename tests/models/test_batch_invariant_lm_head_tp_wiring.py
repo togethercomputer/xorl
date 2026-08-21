@@ -5,14 +5,14 @@ import torch
 from torch import nn
 
 import xorl.models.module_utils as module_utils
-import xorl.ops.loss.causallm_loss as causallm_loss_impl
+import xorl.objectives.causallm_loss as causallm_loss_impl
 import xorl.ops.loss.per_token_ce as per_token_ce_impl
 import xorl.trainers.training_utils as training_utils
-from xorl.ops.loss.loss_output import LossOutput
-from xorl.ops.loss.reducers import TokenPartial
+from xorl.objectives.loss_output import LossOutput
+from xorl.objectives.reducers import TokenPartial
 
 
-def test_causallm_routes_bi_fused_tp_before_ordinary_vocab_ce(monkeypatch):
+def test_causallm_routes_batch_invariant_tp_before_ordinary_vocab_ce(monkeypatch):
     tp_group = object()
     replica_group = object()
     ps = SimpleNamespace(
@@ -54,7 +54,7 @@ def test_causallm_routes_bi_fused_tp_before_ordinary_vocab_ce(monkeypatch):
         hidden,
         weight,
         labels,
-        ce_mode="bi_fused",
+        ce_mode="batch_invariant",
         tp_group=tp_group,
         lm_head_fp32=True,
         lm_head=lm_head,
@@ -63,14 +63,14 @@ def test_causallm_routes_bi_fused_tp_before_ordinary_vocab_ce(monkeypatch):
 
     assert captured["tp_group"] is tp_group
     assert captured["lm_head"] is lm_head
-    assert captured["ce_mode"] == "bi_fused"
+    assert captured["ce_mode"] == "batch_invariant"
     assert captured["hidden"].shape == (3, 4)
     assert reduced_groups == [tp_group, replica_group, tp_group, replica_group]
     torch.testing.assert_close(result.loss, torch.tensor(1.0))
     assert torch.equal(result.per_token_loss, torch.tensor([[0.0, 1.0, 2.0]]))
 
 
-def test_causallm_explicit_reducer_returns_local_bi_fused_tp_partial(monkeypatch):
+def test_causallm_explicit_reducer_returns_local_batch_invariant_tp_partial(monkeypatch):
     tp_group = object()
     replica_group = object()
     ps = SimpleNamespace(
@@ -98,7 +98,7 @@ def test_causallm_explicit_reducer_returns_local_bi_fused_tp_partial(monkeypatch
         torch.randn(1, 3, 4, dtype=torch.bfloat16),
         lm_head.weight,
         torch.tensor([[1, -100, 3]]),
-        ce_mode="bi_fused",
+        ce_mode="batch_invariant",
         tp_group=tp_group,
         lm_head_fp32=True,
         lm_head=lm_head,
@@ -119,7 +119,7 @@ def test_causallm_explicit_reducer_returns_local_bi_fused_tp_partial(monkeypatch
         (True, 2, True, False, True),
     ],
 )
-def test_causallm_rejects_malformed_bi_fused_tp_topology(
+def test_causallm_rejects_malformed_batch_invariant_tp_topology(
     monkeypatch,
     marked,
     lm_head_tp_size,
@@ -147,14 +147,14 @@ def test_causallm_rejects_malformed_bi_fused_tp_topology(
             torch.randn(1, 3, 4, dtype=torch.bfloat16),
             torch.randn(6, 4, dtype=torch.bfloat16),
             torch.tensor([[1, -100, 3]]),
-            ce_mode="bi_fused",
+            ce_mode="batch_invariant",
             tp_group=tp_group,
             lm_head_fp32=True,
             lm_head=lm_head,
         )
 
 
-def test_compute_loss_keeps_sharded_bi_fused_tp_and_global_token_scale(monkeypatch):
+def test_compute_loss_keeps_sharded_batch_invariant_tp_and_global_token_scale(monkeypatch):
     tp_group = object()
     replica_group = object()
     ps = SimpleNamespace(
@@ -190,7 +190,7 @@ def test_compute_loss_keeps_sharded_bi_fused_tp_and_global_token_scale(monkeypat
         loss_fn_name="causallm_loss",
         loss_fn_inputs={"labels": labels},
         loss_fn_params={
-            "ce_mode": "bi_fused",
+            "ce_mode": "batch_invariant",
             "lm_head_fp32": True,
             "fsdp_sharded_lm_head_loss_num_chunks": 4,
             "fsdp_sharded_lm_head_loss_global_valid_tokens": torch.tensor(8),
@@ -201,15 +201,15 @@ def test_compute_loss_keeps_sharded_bi_fused_tp_and_global_token_scale(monkeypat
     kwargs = captured["loss_kwargs"]
     assert kwargs["tp_group"] is tp_group
     assert kwargs["lm_head"] is lm_head
-    assert "bi_fused_vocab_parallel" not in kwargs
-    assert "bi_fused_loss_reduce_group" not in kwargs
+    assert "batch_invariant_vocab_parallel" not in kwargs
+    assert "batch_invariant_loss_reduce_group" not in kwargs
     assert "fsdp_sharded_lm_head_loss_num_chunks" not in kwargs
     assert "fsdp_sharded_lm_head_loss_global_valid_tokens" not in kwargs
     torch.testing.assert_close(kwargs["loss_reducer"].scale, torch.tensor(8.0))
     torch.testing.assert_close(result.loss, torch.tensor(0.25))
 
 
-def test_compute_loss_rejects_unsharded_bi_fused_lm_head_tp(monkeypatch):
+def test_compute_loss_rejects_unsharded_batch_invariant_lm_head_tp(monkeypatch):
     ps = SimpleNamespace(
         lm_head_tp_size=2,
         lm_head_tp_group=object(),
@@ -224,11 +224,11 @@ def test_compute_loss_rejects_unsharded_bi_fused_lm_head_tp(monkeypatch):
             torch.randn(1, 3, 4, dtype=torch.bfloat16),
             loss_fn_name="causallm_loss",
             loss_fn_inputs={"labels": torch.tensor([[1, -100, 3]])},
-            loss_fn_params={"ce_mode": "bi_fused", "lm_head_fp32": True},
+            loss_fn_params={"ce_mode": "batch_invariant", "lm_head_fp32": True},
         )
 
 
-def test_pp_routes_only_sharded_dedicated_bi_fused_lm_head_tp(monkeypatch):
+def test_pp_routes_only_sharded_dedicated_batch_invariant_lm_head_tp(monkeypatch):
     lm_head = nn.Linear(4, 6, bias=False, dtype=torch.bfloat16)
     hidden = torch.randn(1, 3, 4, dtype=torch.bfloat16)
     labels = torch.tensor([[1, -100, 3]])
@@ -239,7 +239,7 @@ def test_pp_routes_only_sharded_dedicated_bi_fused_lm_head_tp(monkeypatch):
             hidden,
             labels,
             lm_head=lm_head,
-            ce_mode="bi_fused",
+            ce_mode="batch_invariant",
             tp_group=tp_group,
             lm_head_fp32=True,
         )
@@ -261,7 +261,7 @@ def test_pp_routes_only_sharded_dedicated_bi_fused_lm_head_tp(monkeypatch):
         hidden,
         labels,
         lm_head=lm_head,
-        ce_mode="bi_fused",
+        ce_mode="batch_invariant",
         tp_group=tp_group,
         lm_head_fp32=True,
     )
@@ -269,5 +269,5 @@ def test_pp_routes_only_sharded_dedicated_bi_fused_lm_head_tp(monkeypatch):
     assert captured["fsdp_sharded_loss"] is True
     assert captured["tp_group"] is tp_group
     assert captured["lm_head"] is lm_head
-    assert "bi_fused_vocab_parallel" not in captured
+    assert "batch_invariant_vocab_parallel" not in captured
     torch.testing.assert_close(loss_sum, torch.tensor(3.0))

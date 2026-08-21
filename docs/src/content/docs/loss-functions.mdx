@@ -71,13 +71,13 @@ Per-token output behavior depends on the selected loss and the request's `return
 
 ### Compiled cross-entropy (`ce_mode`)
 
-The `ce_mode` setting controls the LM-head and cross-entropy implementation. When omitted, XoRL resolves it from the model: ordinary models and exact DSV4-Flash use `compiled`, while exact dense Qwen3, Qwen3.5-family, and GLM-5.2 numerical programs require `bi_fused`.
+The `ce_mode` setting controls the LM-head and cross-entropy implementation. When omitted, XoRL resolves it from the model: ordinary models and exact DSV4-Flash use `compiled`, while exact dense Qwen3, Qwen3.5-family, and GLM-5.2 numerical programs require `batch_invariant`.
 
 | Value | Description | Important constraints |
 |---|---|---|
 | `compiled` | `torch.compile`-compiled chunked cross-entropy | General production default |
 | `eager` | Standard eager cross-entropy | Debugging; may materialize the full logits tensor |
-| `bi_fused` | Batch-invariant selected-token logprob/CE path | Required by the current exact dense Qwen3, Qwen3.5-family, and GLM-5.2 programs; topology and dtype restrictions are checked at runtime |
+| `batch_invariant` | Batch-invariant selected-token logprob/CE path | Required by the current exact dense Qwen3, Qwen3.5-family, and GLM-5.2 programs; topology and dtype restrictions are checked at runtime |
 | `quack_linear` | Quack chunked linear plus scalar cross-entropy | Causal-LM path; pipeline parallelism supports this mode on its last stage |
 | `fused_quack` | Chunked matmul plus fused selected-token CE | Used by supported per-token loss paths; not supported by every loss/topology combination |
 

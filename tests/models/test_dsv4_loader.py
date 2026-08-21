@@ -28,7 +28,7 @@ pytestmark = pytest.mark.cpu
 
 @pytest.fixture(autouse=True)
 def _clear_rope_cache():
-    from xorl.ops.dsv4.rope import precompute_freqs_cis  # noqa: PLC0415
+    from xorl.ops.families.dsv4.rope import precompute_freqs_cis  # noqa: PLC0415
 
     precompute_freqs_cis.cache_clear()
     yield

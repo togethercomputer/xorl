@@ -23,7 +23,7 @@ from xorl.models.transformers.glm5.exact_lm_head_qlora import (
     _selected_logprob_reference_grad_partitioned,
     glm52_lm_head_shard,
 )
-from xorl.ops.bi_families_v2 import exact_temperature_scale_fp32_logits
+from xorl.ops.sglang.bi_families_v2 import exact_temperature_scale_fp32_logits
 
 
 def _component(tp_rank: int = 0, tp_group=None) -> Glm52ExactTP16LmHeadSelectedLogprob:

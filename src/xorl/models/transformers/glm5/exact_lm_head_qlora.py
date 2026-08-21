@@ -32,14 +32,14 @@ from torch import Tensor, nn
 
 from xorl.lora.modules.linear import LoraLinear
 from xorl.models.transformers.glm5.exact_lora_contract import glm52_exact_lora_scaling
-from xorl.ops.bi_families_v2 import exact_temperature_scale_fp32_logits
-from xorl.ops.exact_sampling_transforms import (
+from xorl.ops.exact.sampling_transforms import (
     EXACT_FILTER_ROW_CHUNK,
     exact_sampling_identity_rows,
     exact_sampling_support,
     exact_selected_logprob_from_support,
     exact_selected_logprob_partitioned_from_support,
 )
+from xorl.ops.sglang.bi_families_v2 import exact_temperature_scale_fp32_logits
 
 
 GLM52_EXACT_TP16_LM_HEAD_CONTRACT_VERSION = "glm52_exact_tp16_lm_head_qlora_v2"
@@ -1315,8 +1315,8 @@ def glm52_exact_lm_head_per_token_ce(
 
     if not is_glm52_exact_tp16_lm_head(lm_head):
         raise TypeError("glm52_exact_lm_head_per_token_ce requires the constructed exact GLM-5.2 lm_head")
-    if ce_mode != "bi_fused":
-        raise NotImplementedError("The GLM-5.2 exact active-LoRA lm_head requires ce_mode='bi_fused'")
+    if ce_mode != "batch_invariant":
+        raise NotImplementedError("The GLM-5.2 exact active-LoRA lm_head requires ce_mode='batch_invariant'")
     if not lm_head_fp32:
         raise NotImplementedError("The GLM-5.2 exact active-LoRA lm_head requires lm_head_fp32=true")
 

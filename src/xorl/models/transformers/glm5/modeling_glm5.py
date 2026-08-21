@@ -15,10 +15,10 @@ from xorl.distributed.canonical_moe import (
     LogicalRowOwnership,
     OutputDistribution,
     ParallelPlan,
-    canonical_moe_leaf_fp32_v1,
     canonical_moe_reduce_cp_sharded_v3,
     canonical_moe_reduce_fp64_v3,
     canonical_moe_reduce_packed_ep16_v2,
+    moe_fixed_order_leaf_fp32_v1,
     resolve_canonical_moe_transport,
 )
 from xorl.distributed.moe.deepep import sync_pending_combine
@@ -69,8 +69,8 @@ from xorl.models.transformers.glm5.native_fp8 import (
 from xorl.models.transformers.glm5.rotary import glm5_apply_rotary_pos_emb
 from xorl.models.transformers.glm5.sparse_mla import sparse_mla_dispatch
 from xorl.models.transformers.glm5.support import validate_glm5_sequence_parallel
-from xorl.ops.block_fp8_native import NativeBlockFP8Linear
-from xorl.ops.fused_silu_and_mul import exact_fp32_silu_and_mul, fused_silu_and_mul
+from xorl.ops.exact.block_fp8_native import NativeBlockFP8Linear
+from xorl.ops.exact.fused_silu_and_mul import fused_silu_and_mul, one_round_swiglu
 from xorl.utils import logging
 
 
@@ -140,7 +140,7 @@ class Glm5MLP(nn.Module):
         gate = self.gate_proj(x)
         up = self.up_proj(x)
         if self._exact_one_round:
-            hidden_states = exact_fp32_silu_and_mul(torch.cat([gate, up], dim=-1))
+            hidden_states = one_round_swiglu(torch.cat([gate, up], dim=-1))
         elif self._use_fused_silu:
             hidden_states = fused_silu_and_mul(torch.cat([gate, up], dim=-1))
         else:
@@ -271,7 +271,9 @@ class Glm5MlaAttention(nn.Module):
             cos,
             sin,
             interleaved=getattr(self.config, "rope_interleave", True),
-            class_b=bool(getattr(self.config, "_rope_class_b", False) or glm52_exact_forward_enabled(self.config)),
+            fp32_single_round=bool(
+                getattr(self.config, "_rope_fp32_single_round", False) or glm52_exact_forward_enabled(self.config)
+            ),
         )
         k_rot = k_rot.expand(*k_pass.shape[:-1], -1)
 
@@ -461,7 +463,9 @@ class Glm5Attention(Glm5MlaAttention):
             cos,
             sin,
             interleaved=getattr(self.config, "rope_interleave", True),
-            class_b=bool(getattr(self.config, "_rope_class_b", False) or glm52_exact_forward_enabled(self.config)),
+            fp32_single_round=bool(
+                getattr(self.config, "_rope_fp32_single_round", False) or glm52_exact_forward_enabled(self.config)
+            ),
         )
         k_pe = k_pe.squeeze(2)
 
@@ -1103,7 +1107,7 @@ class Glm5MoEBlock(MoEBlock):
             # Serving computes the exact-mode shared expert with the one-round
             # FP32 SwiGLU (SiluAndMul.forward_exact since xorl-sglang
             # f10b907d8); the canonical partial must produce those bytes.
-            activated = exact_fp32_silu_and_mul(torch.cat([gate, up], dim=-1))
+            activated = one_round_swiglu(torch.cat([gate, up], dim=-1))
         else:
             activated = F.silu(gate) * up
         if isinstance(self.shared_experts.down_proj, NativeBlockFP8Linear):
@@ -1201,7 +1205,7 @@ class Glm5MoEBlock(MoEBlock):
             contributor_ordinal=ep_rank,
             contributor_count=ps.ep_size,
         )
-        local_partial = canonical_moe_leaf_fp32_v1(shared, routed)
+        local_partial = moe_fixed_order_leaf_fp32_v1(shared, routed)
 
         capacity = int(getattr(self.config, "_glm52_canonical_moe_capacity", local_partial.shape[0]))
         if local_partial.shape[0] > capacity:

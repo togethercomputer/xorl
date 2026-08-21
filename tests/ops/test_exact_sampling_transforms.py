@@ -5,7 +5,7 @@ import math
 import pytest
 import torch
 
-from xorl.ops.exact_sampling_transforms import (
+from xorl.ops.exact.sampling_transforms import (
     EXACT_FILTER_ROW_CHUNK,
     EXACT_SAMPLING_TRANSFORM_PROGRAM,
     TOP_K_ALL,
@@ -15,7 +15,7 @@ from xorl.ops.exact_sampling_transforms import (
     exact_support_workspace_bytes,
     normalize_exact_sampling_transforms,
 )
-from xorl.ops.loss.bi_fused_lm_head import _score_exact_sampling_rows
+from xorl.ops.loss.batch_invariant_lm_head import _score_exact_sampling_rows
 
 
 def _rows(values):
@@ -196,7 +196,7 @@ def test_chunked_selected_score_and_vjp_equal_direct_program():
 
 def test_filtered_exact_heads_do_not_save_dense_support_on_autograd_contexts():
     modules = [
-        importlib.import_module("xorl.ops.loss.bi_fused_lm_head"),
+        importlib.import_module("xorl.ops.loss.batch_invariant_lm_head"),
         importlib.import_module("xorl.models.transformers.glm5.exact_lm_head_qlora"),
         importlib.import_module("xorl.models.transformers.deepseek_v4.exact_lm_head"),
     ]
@@ -224,13 +224,13 @@ def test_identity_row_metadata_collapses_to_no_filter_switch():
 @pytest.mark.parametrize(
     "module_name,function_name,extra",
     [
-        ("xorl.ops.loss.policy_loss", "policy_loss_function", {"compute_kl_stats": True}),
+        ("xorl.objectives.policy_loss", "policy_loss_function", {"compute_kl_stats": True}),
         (
-            "xorl.ops.loss.importance_sampling_loss",
+            "xorl.objectives.importance_sampling_loss",
             "importance_sampling_loss_function",
             {"compute_kl_stats": True},
         ),
-        ("xorl.ops.loss.cispo_loss", "cispo_loss_function", {"compute_kl_stats": True}),
+        ("xorl.objectives.cispo_loss", "cispo_loss_function", {"compute_kl_stats": True}),
     ],
 )
 def test_rl_surrogates_are_finite_and_zero_gradient_outside_current_support(
@@ -261,7 +261,7 @@ def test_rl_surrogates_are_finite_and_zero_gradient_outside_current_support(
 
 @pytest.mark.parametrize("ratio_type", ["token", "sequence"])
 def test_drgrpo_is_finite_and_zero_gradient_outside_current_support(monkeypatch, ratio_type):
-    module = importlib.import_module("xorl.ops.loss.grpo_loss")
+    module = importlib.import_module("xorl.objectives.grpo_loss")
     ce = torch.tensor([math.inf, 0.4], dtype=torch.float32, requires_grad=True)
     monkeypatch.setattr(module, "compute_per_token_ce", lambda *args, **kwargs: ce)
     output = module.drgrpo_loss_function(

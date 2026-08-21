@@ -65,7 +65,7 @@ dependencies = [
   # PR #2303, merged post-v0.1.10 so absent from every PyPI wheel); we pin
   # the blessed prebuilt wheel of stock tile-ai/tilelang@a8d93798 (includes
   # #2303, cp38-abi3, CUDA 13.1) from togethercomputer/xorl-wheels — see
-  # src/xorl/ops/linear_attention/flashqla/VENDORED.md. Switch to PyPI
+  # src/xorl/ops/_vendored/flashqla/VENDORED.md. Switch to PyPI
   # tilelang>=0.1.11 once a release carrying #2303 ships; bump deliberately
   # + revalidate the GPU smokes (sparse-MLA bwd NaN history and the FlashQLA
   # contract-pin tests) when picking up a new build.
@@ -148,9 +148,8 @@ line-length = 120
 # is how pre-commit invokes ruff.
 force-exclude = true
 extend-exclude = [
-  "src/xorl/ops/quack",
-  "src/xorl/ops/linear_attention/flashqla",
-  "src/xorl/ops/bi_families_v2.py",
+  "src/xorl/ops/_vendored",
+  "src/xorl/ops/sglang/bi_families_v2.py",
 ]
 
 [tool.ruff.lint]

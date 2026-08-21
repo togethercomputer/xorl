@@ -16,7 +16,7 @@ from xorl.distributed.torch_parallelize import (
 )
 from xorl.models.transformers.glm5.exact_qlora import Glm52ExactTP1BlockFP8QLoRALinear
 from xorl.models.transformers.glm5.exact_shared_expert_qlora import Glm52ExactTP16SharedExpertBlockFP8QLoRA
-from xorl.ops.block_fp8_native import NativeBlockFP8Linear
+from xorl.ops.exact.block_fp8_native import NativeBlockFP8Linear
 
 
 class _FakeBlock:

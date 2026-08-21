@@ -2,7 +2,7 @@ import pytest
 import torch
 
 from xorl.models.layers.moe.moe_block import MoEBlock, _BIRouterGemm
-from xorl.ops.batch_invariant_ops import bi_bf16_fp32_linear, bi_router_gemm, bi_router_topk_weights
+from xorl.ops.sglang.batch_invariant_ops import bi_bf16_fp32_linear, bi_router_gemm, bi_router_topk_weights
 
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

@@ -31,7 +31,7 @@ from xorl.models.outputs import BaseModelOutput, CausalLMOutput
 from xorl.models.transformers.qwen2 import parallelize
 from xorl.models.transformers.qwen2.checkpoint_handler import Qwen2CheckpointHandler
 from xorl.models.transformers.qwen2.configuration_qwen2 import Qwen2Config
-from xorl.ops.fused_silu_and_mul import fused_silu_and_mul
+from xorl.ops.exact.fused_silu_and_mul import fused_silu_and_mul
 
 
 _RUNTIME_CONFIG_ATTRS = {

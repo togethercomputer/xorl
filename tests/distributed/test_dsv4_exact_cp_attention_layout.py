@@ -21,7 +21,7 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
 from xorl.data.collators.sequence_shard_collator import zigzag_reorder_packed_sequence  # noqa: E402
-from xorl.ops.dsv4.cp_utils import (  # noqa: E402
+from xorl.ops.families.dsv4.cp_utils import (  # noqa: E402
     build_dsv4_exact_cp_layout,
     gather_dsv4_exact_cp_rows,
 )

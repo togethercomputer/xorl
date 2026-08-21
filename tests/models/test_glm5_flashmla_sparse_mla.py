@@ -11,8 +11,8 @@ from xorl.models.transformers.glm5.sparse_mla import (
     _flatten_sparse_mla_inputs,
     sparse_mla_dispatch,
 )
-from xorl.ops.glm5_kernels import flashmla_sparse_mla
-from xorl.ops.glm5_kernels.flashmla_sparse_mla import FlashMLASparseWithTileLangBackward
+from xorl.ops.families.glm5 import flashmla_sparse_mla
+from xorl.ops.families.glm5.flashmla_sparse_mla import FlashMLASparseWithTileLangBackward
 
 
 pytestmark = [pytest.mark.cpu]

@@ -137,7 +137,7 @@ def _assert_fused_rms_norm_gated_module_routes_under_exact_model_program():
 
 
 def _assert_gated_deltanet_gating_routes_under_exact_model_program():
-    from xorl.ops.linear_attention.layers.gated_deltanet import GatedDeltaNet  # noqa: PLC0415
+    from xorl.models.layers.gated_deltanet import GatedDeltaNet  # noqa: PLC0415
 
     ordinary = (
         GatedDeltaNet(

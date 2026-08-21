@@ -21,7 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
 
-from xorl.ops.batch_invariant_ops import wrap_trunk_linears_batch_invariant
+from xorl.ops.sglang.batch_invariant_ops import wrap_trunk_linears_batch_invariant
 from xorl.utils.device import get_nccl_backend
 
 

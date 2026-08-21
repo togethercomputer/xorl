@@ -71,7 +71,7 @@ def _run() -> None:
     mesh = dist.device_mesh.init_device_mesh("cuda", (dist.get_world_size(),), mesh_dim_names=("dp_shard",))
 
     model = _Root().to(device)
-    fully_shard(model.decoder, mesh=mesh, mp_policy=_decoder_bf16_mixed_precision_policy(class_b=True))
+    fully_shard(model.decoder, mesh=mesh, mp_policy=_decoder_bf16_mixed_precision_policy(fp32_single_round=True))
     fully_shard(model, mesh=mesh, mp_policy=_bf16_mixed_precision_policy())
 
     x = torch.randn((2, 4, 8), dtype=torch.float32, device=device, requires_grad=True)
@@ -83,7 +83,7 @@ def _run() -> None:
     assert model.decoder.proj.weight.grad is not None
     assert torch.isfinite(model.decoder.proj.weight.grad.to_local()).all()
 
-    control = _decoder_bf16_mixed_precision_policy(class_b=False)
+    control = _decoder_bf16_mixed_precision_policy(fp32_single_round=False)
     assert control.cast_forward_inputs is True, "control must retain stock FSDP input casting"
 
     dist.destroy_process_group()
@@ -92,7 +92,7 @@ def _run() -> None:
 if __name__ != "__main__":
 
     @skip_if_gpu_count_less_than(1)
-    def test_class_b_table_survives_nested_fsdp_boundary():
+    def test_fp32_single_round_table_survives_nested_fsdp_boundary():
         result = run_distributed_script(__file__, num_gpus=1, timeout=120)
         result.assert_success("Class-B RoPE table should remain fp32 across decoder FSDP")
 

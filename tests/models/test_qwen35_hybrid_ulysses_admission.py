@@ -8,7 +8,7 @@ import pytest
 import torch
 import triton
 
-from xorl.ops.kernel_config_pin import (
+from xorl.ops.exact.kernel_config_pin import (
     KernelConfigPinError,
     pin_exact_kernel_configs,
     seed_exact_kernel_config_pin,
@@ -67,7 +67,7 @@ class TestKernelConfigPin:
         assert first == second and os.path.isdir(second)
 
     def test_seed_refuses_to_delete_unowned_cache(self, tmp_path):
-        from xorl.ops.kernel_config_pin import CACHE_SUBDIR, OWNED_SENTINEL
+        from xorl.ops.exact.kernel_config_pin import CACHE_SUBDIR, OWNED_SENTINEL
 
         pin = self._seeded(tmp_path)
         (pin / CACHE_SUBDIR / OWNED_SENTINEL).unlink()  # simulate a foreign dir

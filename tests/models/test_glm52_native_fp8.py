@@ -15,7 +15,7 @@ from xorl.models.transformers.glm5.native_fp8 import (
     native_fp8_dense_source_map,
     validate_glm52_native_fp8_config,
 )
-from xorl.ops.block_fp8_native import NativeBlockFP8Linear, unpack_float32_as_fp8
+from xorl.ops.exact.block_fp8_native import NativeBlockFP8Linear, unpack_float32_as_fp8
 
 
 OFFICIAL_QUANT_CONFIG = {

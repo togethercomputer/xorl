@@ -74,8 +74,7 @@ from xorl.models.transformers.deepseek_v3.support import deepseek_v3_default_lor
 from xorl.models.transformers.deepseek_v4.exact_contract import DSV4_FLASH_REQUIRED_TARGET_MODULES
 from xorl.models.transformers.glm5.index_share import IndexShareMode
 from xorl.models.transformers.glm5.support import glm5_default_lora_targets
-from xorl.ops.batch_invariant_ops import enable_batch_invariant_mode, get_batch_invariant_ops
-from xorl.ops.exact_sampling_transforms import TOP_K_ALL
+from xorl.ops.exact.sampling_transforms import TOP_K_ALL
 from xorl.ops.loss import (
     LossOutput,
     OPDLossMetrics,
@@ -88,6 +87,7 @@ from xorl.ops.loss import (
     opd_vocab_parallel_loss_function,
     policy_loss_function,
 )
+from xorl.ops.sglang.batch_invariant_ops import enable_batch_invariant_mode, get_batch_invariant_ops
 from xorl.optim import build_optimizer
 from xorl.server.runner.adapters import LoRAAdapterManager
 from xorl.server.runner.adapters.gradient_finalizer import AdapterGradientMutationFailure
@@ -1663,7 +1663,7 @@ class ModelRunner:
             qwen35_rmsnorm_family=self.model_config.get("qwen35_rmsnorm_family"),
             activation_native=self.model_config.get("activation_native", False),
             rope_native=self.model_config.get("rope_native"),
-            rope_class_b=self.model_config.get("rope_class_b"),
+            rope_fp32_single_round=self.model_config.get("rope_fp32_single_round"),
             attention_cast_bf16=self.model_config.get("attention_cast_bf16", False),
             sparse_mla_enabled=self.model_config.get("sparse_mla_enabled"),
             sparse_mla_backend=self.model_config.get("sparse_mla_backend"),
@@ -1689,7 +1689,7 @@ class ModelRunner:
                 "rmsnorm_mode": numerical_program["rmsnorm_mode"],
                 "activation_native": numerical_program["activation_native"],
                 "rope_native": numerical_program["rope_native"],
-                "rope_class_b": numerical_program["rope_class_b"],
+                "rope_fp32_single_round": numerical_program["rope_fp32_single_round"],
                 "attention_cast_bf16": numerical_program["attention_cast_bf16"],
                 "sparse_mla_enabled": numerical_program["sparse_mla_enabled"],
                 "sparse_mla_backend": numerical_program["sparse_mla_backend"],
@@ -2114,7 +2114,7 @@ class ModelRunner:
         ):
             return lm_head
         if (
-            self.ce_mode == "bi_fused"
+            self.ce_mode == "batch_invariant"
             and lm_head is not None
             and getattr(lm_head, "_xorl_fsdp_sharded_lm_head_loss", False)
         ):

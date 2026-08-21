@@ -14,8 +14,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from xorl.objectives.importance_sampling_loss import importance_sampling_loss_function
 from xorl.ops.loss.fused_linear_logprob import fused_selected_logprob_ce
-from xorl.ops.loss.importance_sampling_loss import importance_sampling_loss_function
 from xorl.ops.loss.per_token_ce import compute_per_token_ce
 
 
@@ -115,7 +115,7 @@ def _assert_irregular_tail_shape_matches_eager():
 
 
 def _assert_loss_dispatchers_match_eager():
-    from xorl.ops.loss.causallm_loss import causallm_loss_function  # noqa: PLC0415
+    from xorl.objectives.causallm_loss import causallm_loss_function  # noqa: PLC0415
 
     h, w, _, labels = _make_inputs(96, 192, 800, torch.bfloat16, has_bias=False)
     fused = compute_per_token_ce(h, w, labels, ignore_index=-100, ce_mode="fused_quack")
@@ -147,7 +147,7 @@ def _assert_production_vocab_paths_are_finite_and_match_eager():
     covered V <= 65536-class shapes where every cluster block owns columns."""
     # The Qwen integration case and the largest direct GPT-OSS case cover the
     # two production boundaries that the small-vocabulary dispatcher case misses.
-    from xorl.ops.loss.causallm_loss import causallm_loss_function  # noqa: PLC0415
+    from xorl.objectives.causallm_loss import causallm_loss_function  # noqa: PLC0415
 
     N, H, V = 512, 1024, 151936
     h, w, _, labels = _make_inputs(N, H, V, torch.bfloat16, has_bias=False)
@@ -180,7 +180,7 @@ def test_causallm_fused_quack_does_not_materialize_full_logits():
     the full logits tile. This is the assertion that actually distinguishes the
     fixed code from the broken fall-through (a loss-match test passes either way,
     since the old fall-through == eager)."""
-    from xorl.ops.loss.causallm_loss import causallm_loss_function  # noqa: PLC0415
+    from xorl.objectives.causallm_loss import causallm_loss_function  # noqa: PLC0415
 
     N, H, V = 16384, 2048, 50000
     h = torch.randn(1, N, H, device="cuda", dtype=torch.bfloat16, requires_grad=True)

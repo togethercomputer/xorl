@@ -11,7 +11,7 @@ Modes (one torchrun launch each):
 - ``generic``: native RMSNorm + eager attention + eager CE. Pins the PP
   plumbing itself (send/recv, pruning, metadata routing, stage-local RoPE).
 - ``exact``: ``_qwen35_exact_contract`` v1 program — ``sglang_fused`` BI
-  RMSNorm kernels, FA4 varlen attention, exact-contract GDN, ``bi_fused``
+  RMSNorm kernels, FA4 varlen attention, exact-contract GDN, ``batch_invariant``
   head with ``lm_head_fp32``. Pins the contract lane, and additionally gates
   microbatch composition invariance, PP-mandated padding, and fail-closed
   metadata handling.
@@ -47,7 +47,7 @@ from xorl.distributed.pp_byte_contract import PPByteContractError
 from xorl.models.layers.normalization import set_rmsnorm_mode
 from xorl.models.transformers.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
 from xorl.models.transformers.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
-from xorl.ops.loss.causallm_loss import causallm_loss_function
+from xorl.objectives.causallm_loss import causallm_loss_function
 from xorl.trainers.training_utils import forward_only_pp, pad_micro_batches_for_pp
 from xorl.utils.device import get_nccl_backend
 
@@ -122,7 +122,7 @@ def _build_config(mode: str) -> Qwen3_5Config:
         tie_word_embeddings=False,
     )
     if mode in _EXACT_MODES:
-        # The exact v1 value program: BI RMSNorm families + FA4 + bi_fused head.
+        # The exact v1 value program: BI RMSNorm families + FA4 + batch_invariant head.
         set_rmsnorm_mode("sglang_fused")
         config._attn_implementation = "flash_attention_4"
         config._qwen35_exact_contract = True
@@ -137,7 +137,7 @@ def _build_config(mode: str) -> Qwen3_5Config:
 
 def _ce_kwargs(mode: str) -> dict:
     if mode in _EXACT_MODES:
-        return {"ce_mode": "bi_fused", "lm_head_fp32": True}
+        return {"ce_mode": "batch_invariant", "lm_head_fp32": True}
     return {"ce_mode": "eager"}
 
 

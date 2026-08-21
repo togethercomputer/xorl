@@ -214,7 +214,7 @@ def _dequantize_native_block_fp8(payload: Dsv4NativeBlockFp8Payload) -> torch.Te
 
 
 def _native_block_fp8_value(input: torch.Tensor, payload: Dsv4NativeBlockFp8Payload) -> torch.Tensor:
-    from xorl.ops.block_fp8_native import _sglang_native_block_fp8_linear_value  # noqa: PLC0415
+    from xorl.ops.exact.block_fp8_native import _sglang_native_block_fp8_linear_value  # noqa: PLC0415
 
     rows = input.numel() // payload.in_features
     weight, scales = payload()
@@ -1142,7 +1142,7 @@ def _native_fp8_slice_value(
     input_start: int = 0,
     input_end: int | None = None,
 ) -> torch.Tensor:
-    from xorl.ops.block_fp8_native import (  # noqa: PLC0415
+    from xorl.ops.exact.block_fp8_native import (  # noqa: PLC0415
         _sglang_native_block_fp8_linear_value,
     )
 
@@ -1245,7 +1245,7 @@ def _dsv4_native_shared_tp_forward(
         raise ValueError("DSV4 shared intermediate size must divide the TP width")
     width = intermediate // tp_size
     start, end = tp_rank * width, (tp_rank + 1) * width
-    from xorl.ops.block_fp8_native import (  # noqa: PLC0415
+    from xorl.ops.exact.block_fp8_native import (  # noqa: PLC0415
         _sglang_native_block_fp8_linear_value,
     )
 
@@ -1464,12 +1464,12 @@ def dsv4_native_shared_expert_tp_partial(
 class _Dsv4RoutedSharedJoin(torch.autograd.Function):
     @staticmethod
     def forward(ctx, routed: torch.Tensor, shared: torch.Tensor, scale: float):
-        from xorl.distributed.canonical_moe import canonical_moe_leaf_fp32_v1  # noqa: PLC0415
+        from xorl.distributed.canonical_moe import moe_fixed_order_leaf_fp32_v1  # noqa: PLC0415
 
         ctx.scale = scale
         ctx.routed_dtype = routed.dtype
         ctx.shared_dtype = shared.dtype
-        return canonical_moe_leaf_fp32_v1(shared, routed, routed_scale=scale)
+        return moe_fixed_order_leaf_fp32_v1(shared, routed, routed_scale=scale)
 
     @staticmethod
     def backward(ctx, grad_output):

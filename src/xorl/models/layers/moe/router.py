@@ -249,7 +249,7 @@ class TopKRouter(nn.Module):
             # Exact router contract: fixed-order renorm + cast so the top-k weights
             # are bit-identical to SGLang's batch-invariant path (the stock
             # sum(dim=-1) reduction is build-dependent; see bi_router_topk_weights).
-            from xorl.ops.batch_invariant_ops import bi_router_topk_weights  # noqa: PLC0415
+            from xorl.ops.sglang.batch_invariant_ops import bi_router_topk_weights  # noqa: PLC0415
 
             routing_weights = bi_router_topk_weights(routing_weights, self.norm_topk_prob, input_dtype)
         else:

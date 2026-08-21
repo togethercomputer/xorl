@@ -22,7 +22,7 @@ def _flashqla_chunk_or_skip():
 
     if "prefer_instruction" not in inspect.signature(tl.copy).parameters:
         pytest.skip("tilelang lacks the required prefer_instruction support")
-    from xorl.ops.linear_attention.flashqla import (  # noqa: PLC0415
+    from xorl.ops._vendored.flashqla import (  # noqa: PLC0415
         chunk_gated_delta_rule,
     )
 

@@ -1,7 +1,7 @@
-"""DeepSeek V4 operator kernels and helpers.
+"""Moved to ``xorl.ops.families.dsv4`` (issue #78 phase 4); alias stub."""
 
-The ``kernel`` submodule contains the TileLang-based kernels (sparse MLA fwd/bwd,
-DSA indexer fwd/bwd, FP8 act-quant, hyper-connection sinkhorn). Higher-level
-layer wrappers (compressor, indexer, attention) live alongside this package
-in subsequent phases.
-"""
+import importlib as _importlib
+import sys as _sys
+
+
+_sys.modules[__name__] = _importlib.import_module("xorl.ops.families.dsv4")

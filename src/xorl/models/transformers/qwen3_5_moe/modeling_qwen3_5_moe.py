@@ -18,6 +18,7 @@ from xorl.models.layers import ACT2FN, RotaryEmbedding
 from xorl.models.layers.attention import AttentionKwargs, update_causal_mask
 from xorl.models.layers.attention.backend import ATTENTION_FUNCTIONS
 from xorl.models.layers.attention.backend.eager import eager_attention_forward
+from xorl.models.layers.gated_deltanet import GatedDeltaNet
 from xorl.models.layers.moe import MoEBlock, MoEExperts
 from xorl.models.layers.moe.ep_native_combine import validate_native_ep_combine_size
 from xorl.models.layers.normalization import (
@@ -43,8 +44,7 @@ from xorl.models.transformers.qwen3_5_shared import (
     has_linear_attention_layers,
     qwen3_5_apply_rotary_pos_emb,
 )
-from xorl.ops.fused_silu_and_mul import exact_fp32_silu_and_mul, fused_silu_and_mul
-from xorl.ops.linear_attention import GatedDeltaNet
+from xorl.ops.exact.fused_silu_and_mul import fused_silu_and_mul, one_round_swiglu
 from xorl.ops.linear_attention.ops.cp import build_linear_attention_cp_context
 from xorl.utils import logging
 
@@ -105,7 +105,7 @@ class Qwen3_5MoeMLP(nn.Module):
 
     def _fused_act(self, gate_up):
         if self._exact_one_round:
-            return exact_fp32_silu_and_mul(gate_up)
+            return one_round_swiglu(gate_up)
         return fused_silu_and_mul(gate_up)
 
     def unfuse_for_tp(self):
@@ -118,7 +118,7 @@ class Qwen3_5MoeMLP(nn.Module):
     @staticmethod
     def _linear_with_contract(module: nn.Linear, x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         if getattr(module, "_xorl_bi_trunk_wrapped", False):
-            from xorl.ops.batch_invariant_ops import _BatchInvariantTrunkLinearFn  # noqa: PLC0415
+            from xorl.ops.sglang.batch_invariant_ops import _BatchInvariantTrunkLinearFn  # noqa: PLC0415
 
             return _BatchInvariantTrunkLinearFn.apply(x, weight, module.bias)
         return F.linear(x, weight, module.bias)
@@ -336,7 +336,7 @@ class Qwen3_5MoeAttention(nn.Module):
             key_states,
             cos,
             sin,
-            class_b=bool(getattr(self.config, "_rope_class_b", False)),
+            fp32_single_round=bool(getattr(self.config, "_rope_fp32_single_round", False)),
         )
         if getattr(self.config, "_attention_cast_bf16", False):
             query_states = query_states.to(torch.bfloat16)
@@ -448,7 +448,7 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
             max_rows_for_ep_combine,
             sglang_fused_gate_sigmoid_mul_add,
         )
-        from xorl.ops.batch_invariant_ops import _BatchInvariantTrunkLinearFn  # noqa: PLC0415
+        from xorl.ops.sglang.batch_invariant_ops import _BatchInvariantTrunkLinearFn  # noqa: PLC0415
 
         ps = get_parallel_state()
         if not ps.ep_enabled:
@@ -528,7 +528,7 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
         self._capture_diagnostic_component("moe_native_shared_gate_up", gate_up)
         # Exact serving-value path: one-round FP32, paired with serving's
         # fp32_silu_and_mul (in-scope for the exact contract by construction).
-        act = exact_fp32_silu_and_mul(gate_up)
+        act = one_round_swiglu(gate_up)
         self._capture_diagnostic_component("moe_native_shared_act", act)
         down = _BatchInvariantTrunkLinearFn.apply(act, w_down[:, lo_s : lo_s + shard].contiguous(), None)
         self._capture_diagnostic_component("moe_native_shared_down", down)

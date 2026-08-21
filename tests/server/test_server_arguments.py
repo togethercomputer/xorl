@@ -325,7 +325,7 @@ def test_shipped_exact_qwen35_lora_backends_pass_exact_admission(clean_shipped_a
         rmsnorm_mode=raw.get("rmsnorm_mode"),
         activation_native=raw.get("activation_native", False),
         rope_native=raw.get("rope_native"),
-        rope_class_b=raw.get("rope_class_b"),
+        rope_fp32_single_round=raw.get("rope_fp32_single_round"),
         attention_cast_bf16=raw.get("attention_cast_bf16", False),
         sparse_mla_enabled=raw.get("sparse_mla_enabled"),
         sparse_mla_backend=raw.get("sparse_mla_backend"),
@@ -379,7 +379,7 @@ def test_canonical_moe_and_rope_auto_defaults_serialize(tmp_path):
     assert model_config["lm_head_fp32"] is None
     assert model_config["rmsnorm_mode"] is None
     assert model_config["rope_native"] is None
-    assert model_config["rope_class_b"] is None
+    assert model_config["rope_fp32_single_round"] is None
     assert model_config["sparse_mla_enabled"] is None
     assert args.to_config_dict()["train"]["ce_mode"] is None
 

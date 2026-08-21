@@ -21,7 +21,7 @@ from xorl.models.layers.normalization import (
 )
 from xorl.models.transformers.qwen3.configuration_qwen3 import Qwen3Config
 from xorl.models.transformers.qwen3.modeling_qwen3 import Qwen3DecoderLayer
-from xorl.ops.batch_invariant_ops import (
+from xorl.ops.sglang.batch_invariant_ops import (
     fused_add_rms_norm_batch_invariant,
     rms_norm_batch_invariant,
     set_batch_invariant_mode,
@@ -62,7 +62,7 @@ def _assert_sglang_fused_cpu_residual_matches_eager():
 @pytest.fixture(autouse=True)
 def _pin_qualified_v1_family():
     """This suite owns the qualified v1 fast-dispatch path."""
-    from xorl.ops.bi_families_v2 import _select_nonexact_families, _select_qwen35_families_v1
+    from xorl.ops.sglang.bi_families_v2 import _select_nonexact_families, _select_qwen35_families_v1
 
     _select_qwen35_families_v1()
     try:

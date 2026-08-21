@@ -6,7 +6,7 @@ U1 reference must run in its own process):
 - phase "ref" (1 GPU, no torch.distributed): the exact-contract program on a
   FULL-ATTENTION-ONLY tiny model with the production head geometry
   (8 Q-heads / 2 KV-heads / head_dim 256, bf16, FA4, sglang_fused BI RMSNorm,
-  bi_fused head) over packed varlen inputs; writes last-hidden and per-token
+  batch_invariant head) over packed varlen inputs; writes last-hidden and per-token
   logprob bytes to an npz.
 - phase "shard" (torchrun, ULYSSES_GATE_DEGREE ranks): the same model and
   tokens through the production Ulysses path (sequence-sharded input_ids,
@@ -43,7 +43,7 @@ import torch
 from xorl.models.layers.normalization import set_rmsnorm_mode
 from xorl.models.transformers.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
 from xorl.models.transformers.qwen3_5.modeling_qwen3_5 import Qwen3_5ForCausalLM
-from xorl.ops.loss.causallm_loss import causallm_loss_function
+from xorl.objectives.causallm_loss import causallm_loss_function
 
 
 THIS_DIR = Path(__file__).resolve().parent
@@ -152,7 +152,7 @@ def _logprobs(model, hidden, labels):
             weight=model.lm_head.weight,
             labels=labels,
             return_per_token=True,
-            ce_mode="bi_fused",
+            ce_mode="batch_invariant",
             lm_head_fp32=True,
         )
     return result.per_token_logprobs

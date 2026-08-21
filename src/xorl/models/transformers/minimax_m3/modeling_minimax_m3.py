@@ -401,7 +401,7 @@ class MiniMaxM3Attention(nn.Module):
             key_states,
             cos,
             sin,
-            class_b=bool(getattr(self.config, "_rope_class_b", False)),
+            fp32_single_round=bool(getattr(self.config, "_rope_fp32_single_round", False)),
         ) + (value_states,)
 
     def _project_index_qk(
@@ -424,7 +424,7 @@ class MiniMaxM3Attention(nn.Module):
             index_key,
             cos,
             sin,
-            class_b=bool(getattr(self.config, "_rope_class_b", False)),
+            fp32_single_round=bool(getattr(self.config, "_rope_fp32_single_round", False)),
         )
 
     def _project_output(self, attn_output: torch.Tensor) -> torch.Tensor:

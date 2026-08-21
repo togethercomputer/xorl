@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from xorl.ops.quack import _worker_protocol as worker_protocol
-from xorl.ops.quack import cache_utils, cute_dsl_ptxas
+from xorl.ops._vendored.quack import _worker_protocol as worker_protocol
+from xorl.ops._vendored.quack import cache_utils, cute_dsl_ptxas
 
 
 def test_quack_process_and_cache_safety_policy(tmp_path, monkeypatch):

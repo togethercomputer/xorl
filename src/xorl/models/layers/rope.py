@@ -462,7 +462,9 @@ class RotaryEmbedding(nn.Module):
         self._set_inv_freq_fp32(self._cpu_fp32_inv_freq())
         self._sglang_default_cache = None
         self._use_sglang_default_cache = bool(getattr(config, "_rope_native", False) and self.rope_type == "default")
-        self._class_b = bool(getattr(config, "_rope_class_b", False) or glm52_exact_forward_enabled(config))
+        self._fp32_single_round = bool(
+            getattr(config, "_rope_fp32_single_round", False) or glm52_exact_forward_enabled(config)
+        )
 
     def _cpu_fp32_inv_freq(self) -> torch.Tensor:
         """Frequency table computed on CPU in fp32 — the provenance serving's cos/sin cache is built with."""
@@ -545,7 +547,7 @@ class RotaryEmbedding(nn.Module):
             cos_half, sin_half = cos_sin.chunk(2, dim=-1)
             cos = torch.cat((cos_half, cos_half), dim=-1).view(*position_ids.shape, -1)
             sin = torch.cat((sin_half, sin_half), dim=-1).view(*position_ids.shape, -1)
-            out_dtype = torch.float32 if self._class_b else x.dtype
+            out_dtype = torch.float32 if self._fp32_single_round else x.dtype
             return cos.to(device=x.device, dtype=out_dtype), sin.to(device=x.device, dtype=out_dtype)
 
         inv_freq = self._resolve_inv_freq(x.device)
@@ -561,7 +563,7 @@ class RotaryEmbedding(nn.Module):
 
         # Class B feeds cos/sin straight into an fp32 kernel cache; a bf16 round here
         # would put the result back in Class A.
-        out_dtype = torch.float32 if self._class_b else x.dtype
+        out_dtype = torch.float32 if self._fp32_single_round else x.dtype
         return cos.to(dtype=out_dtype), sin.to(dtype=out_dtype)
 
 
@@ -623,24 +625,24 @@ def set_rope_native(enabled: bool):
 # first would land back in Class A, so the Class-B lane keeps the table in fp32 all
 # the way to the kernel.
 
-_rope_class_b = os.environ.get("XORL_ROPE_CLASS_B") == "1"
+_rope_fp32_single_round = os.environ.get("XORL_ROPE_FP32_SINGLE_ROUND", os.environ.get("XORL_ROPE_CLASS_B", "")) == "1"
 
 
-def set_rope_class_b(enabled: bool) -> None:
+def set_rope_fp32_single_round(enabled: bool) -> None:
     """Select compiled fp32-chain numerics aligned with SGLang's stock fused CUDA kernel."""
-    global _rope_class_b
-    _rope_class_b = enabled
+    global _rope_fp32_single_round
+    _rope_fp32_single_round = enabled
 
 
-def rope_class_b_enabled() -> bool:
-    return _rope_class_b
+def rope_fp32_single_round_enabled() -> bool:
+    return _rope_fp32_single_round
 
 
 def stock_fused_apply_rotary_pos_emb(q, k, cos, sin, *, interleaved: bool = False, doubled: bool = True):
-    """Class-B RoPE application backed by the compiled expression in ``xorl.ops.rope_class_b``."""
-    from xorl.ops.rope_class_b import class_b_apply_rotary_pos_emb  # noqa: PLC0415
+    """Class-B RoPE application backed by the compiled expression in ``xorl.ops.exact.rope_fp32_single_round``."""
+    from xorl.ops.exact.rope_fp32_single_round import single_round_apply_rotary_pos_emb  # noqa: PLC0415
 
-    return class_b_apply_rotary_pos_emb(q, k, cos, sin, interleaved=interleaved, doubled=doubled)
+    return single_round_apply_rotary_pos_emb(q, k, cos, sin, interleaved=interleaved, doubled=doubled)
 
 
 def apply_rotary_pos_emb(q, k, cos, sin, *, force_native: bool = False):
@@ -658,7 +660,7 @@ def apply_rotary_pos_emb(q, k, cos, sin, *, force_native: bool = False):
         cos: The cosine part from RotaryEmbedding, shape [batch, seq_len, head_dim].
         sin: The sine part from RotaryEmbedding, shape [batch, seq_len, head_dim].
     """
-    if _rope_class_b and q.is_cuda:
+    if _rope_fp32_single_round and q.is_cuda:
         return stock_fused_apply_rotary_pos_emb(q, k, cos, sin)
 
     if _flash_apply_rotary_emb is not None and q.is_cuda and not (_rope_native or force_native):
@@ -708,9 +710,9 @@ __all__ = [
     "RotaryEmbedding",
     "apply_rotary_pos_emb",
     "dynamic_rope_update",
-    "rope_class_b_enabled",
+    "rope_fp32_single_round_enabled",
     "rope_config_validation",
     "rotate_half",
-    "set_rope_class_b",
+    "set_rope_fp32_single_round",
     "stock_fused_apply_rotary_pos_emb",
 ]

@@ -26,7 +26,7 @@ from xorl.models.transformers.qwen3_5_moe.modeling_qwen3_5_moe import (
     Qwen3_5MoeModel,
     Qwen3_5MoeRMSNorm,
 )
-from xorl.ops.batch_invariant_ops import rms_norm_batch_invariant, set_batch_invariant_mode
+from xorl.ops.sglang.batch_invariant_ops import rms_norm_batch_invariant, set_batch_invariant_mode
 
 
 HIDDEN = 2048
@@ -447,7 +447,7 @@ def _assert_family2_residual_matches_serving_tree():
         fast_zero_centered_batch_invariant_residual_rms_norm,
         native_zero_centered_rms_norm,
     )
-    from xorl.ops.batch_invariant_ops import mean_dim  # noqa: PLC0415
+    from xorl.ops.sglang.batch_invariant_ops import mean_dim  # noqa: PLC0415
 
     torch.manual_seed(11)
     x = torch.randn(513, HIDDEN, device="cuda", dtype=torch.bfloat16)

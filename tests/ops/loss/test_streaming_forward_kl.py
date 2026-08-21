@@ -13,11 +13,11 @@ import torch
 import torch.nn.functional as F
 
 from tests.ops.loss.conftest import assert_close
-from xorl.ops.loss import opd_loss_function
-from xorl.ops.loss.opd_streaming_kl import (
+from xorl.objectives.opd_streaming_kl import (
     streaming_forward_kl_function,
     streaming_forward_kl_lowmem_function,
 )
+from xorl.ops.loss import opd_loss_function
 
 
 pytestmark = pytest.mark.cpu

@@ -12,8 +12,8 @@ from xorl.models.transformers.glm5.exact_gate_up_qlora import (
     Glm52ExactTP1FusedGateUpBlockFP8QLoRA,
 )
 from xorl.models.transformers.glm5.exact_qlora import Glm52ExactTP1BlockFP8QLoRALinear
-from xorl.ops.block_fp8_native import NativeBlockFP8Linear
-from xorl.ops.fused_silu_and_mul import exact_fp32_silu_and_mul
+from xorl.ops.exact.block_fp8_native import NativeBlockFP8Linear
+from xorl.ops.exact.fused_silu_and_mul import one_round_swiglu
 
 
 def _module() -> Glm52ExactTP1FusedGateUpBlockFP8QLoRA:
@@ -429,7 +429,7 @@ def test_official_fused_gate_up_literal_bytes_graph_metadata_zero_and_gradients(
     # Serving's exact mode computes the one-round FP32 SwiGLU
     # (SiluAndMul.forward_exact, xorl-sglang f10b907d8); the trainer op must
     # match a one-round sampler oracle bitwise.
-    trainer_activation = exact_fp32_silu_and_mul(cold_actual)
+    trainer_activation = one_round_swiglu(cold_actual)
     sampler_activation = fp32_silu_and_mul(expected)
     assert torch.equal(trainer_activation.view(torch.uint8), sampler_activation.view(torch.uint8))
 

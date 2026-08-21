@@ -19,6 +19,7 @@ from xorl.models.layers.attention import (
 )
 from xorl.models.layers.attention.backend import get_attention_fn
 from xorl.models.layers.fused_projection_lora import project_fused_linear_with_lora
+from xorl.models.layers.gated_deltanet import GatedDeltaNet
 from xorl.models.layers.normalization import (
     compiled_zero_centered_rms_norm,
     eager_zero_centered_rms_norm,
@@ -42,8 +43,7 @@ from xorl.models.transformers.qwen3_5_shared import (
     has_linear_attention_layers,
     qwen3_5_apply_rotary_pos_emb,
 )
-from xorl.ops.fused_silu_and_mul import exact_fp32_silu_and_mul, fused_silu_and_mul
-from xorl.ops.linear_attention import GatedDeltaNet
+from xorl.ops.exact.fused_silu_and_mul import fused_silu_and_mul, one_round_swiglu
 from xorl.ops.linear_attention.ops.cp import build_linear_attention_cp_context
 from xorl.utils import logging
 
@@ -104,7 +104,7 @@ class Qwen3_5MLP(nn.Module):
 
     def _fused_act(self, gate_up):
         if self._exact_one_round:
-            return exact_fp32_silu_and_mul(gate_up)
+            return one_round_swiglu(gate_up)
         return fused_silu_and_mul(gate_up)
 
     def unfuse_for_tp(self):
@@ -273,7 +273,7 @@ class Qwen3_5Attention(nn.Module):
             key_states,
             cos,
             sin,
-            class_b=bool(getattr(self.config, "_rope_class_b", False)),
+            fp32_single_round=bool(getattr(self.config, "_rope_fp32_single_round", False)),
         )
         if getattr(self.config, "_attention_cast_bf16", False):
             query_states = query_states.to(torch.bfloat16)

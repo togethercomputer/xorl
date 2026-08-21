@@ -270,7 +270,7 @@ def test_native_combine_captures_actual_operands(monkeypatch):
     """The layer-selected diagnostic hook exposes every exact-combine boundary."""
     import xorl.distributed.parallel_state as parallel_state  # noqa: PLC0415
     import xorl.models.layers.moe.ep_native_combine as combine  # noqa: PLC0415
-    import xorl.ops.batch_invariant_ops as batch_invariant_ops  # noqa: PLC0415
+    import xorl.ops.sglang.batch_invariant_ops as batch_invariant_ops  # noqa: PLC0415
 
     class DummyParallelState:
         ep_enabled = True

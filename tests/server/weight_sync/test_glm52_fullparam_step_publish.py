@@ -42,7 +42,7 @@ _INTERMEDIATE = 128
 
 
 def _seeded_bank(expert_start: int, device: torch.device) -> Glm52FullParamBlockFP8RoutedExperts:
-    from xorl.ops.block_fp8_native import pack_fp8_as_float32
+    from xorl.ops.exact.block_fp8_native import pack_fp8_as_float32
 
     bank = Glm52FullParamBlockFP8RoutedExperts(_LOCAL_EXPERTS, _HIDDEN, _INTERMEDIATE, device=device)
     gate_up_fp8 = (

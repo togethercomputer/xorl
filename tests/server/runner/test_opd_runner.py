@@ -9,7 +9,7 @@ import torch
 from tests._helpers.opd import make_teacher_files
 from xorl.data.constants import IGNORE_INDEX
 from xorl.distillation import MooncakeHiddenStore, TeacherActivationCache
-from xorl.ops.loss.opd_loss import OPDLossMetrics
+from xorl.objectives.opd_loss import OPDLossMetrics
 from xorl.server.runner.model_runner import ModelRunner
 
 

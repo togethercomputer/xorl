@@ -236,6 +236,6 @@ The retained tensors and avoided work differ by model and backend. Measure peak 
 | [`src/xorl/ops/group_gemm/kernel/group_gemm.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/ops/group_gemm/kernel/group_gemm.py) | `group_gemm_same_nk_kernel` — Triton autotuned grouped GEMM with optional STORE_ACTIVATIONS |
 | [`src/xorl/ops/__init__.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/ops/__init__.py) | `triton_moe_forward`, `triton_moe_lora_forward`, backend registry |
 | [`src/xorl/ops/group_gemm/kernel/quack.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/ops/group_gemm/kernel/quack.py) | `quack_group_gemm_same_nk` — CuTe GEMM wrapper; `XORL_QUACK_TUNED` env var |
-| [`src/xorl/ops/quack/gemm_interface.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/ops/quack/gemm_interface.py) | Quack GEMM interface — SM90/SM100 configs, autotuner, gated activation kernels |
+| [`src/xorl/ops/_vendored/quack/gemm_interface.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/ops/_vendored/quack/gemm_interface.py) | Quack GEMM interface — SM90/SM100 configs, autotuner, gated activation kernels |
 | [`src/xorl/models/layers/moe/backend/quack.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/models/layers/moe/backend/quack.py) | `quack_expert_forward` — non-EP quack MoE forward |
 | [`src/xorl/ops/moe/quack.py`](https://github.com/togethercomputer/xorl/blob/main/src/xorl/ops/moe/quack.py) | `QuackEPGroupGemm`, `QuackEPGroupGemmMoeAct` — EP + moe_act variants |

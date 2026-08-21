@@ -10,7 +10,7 @@ import torch
 
 
 def _exact_attention_module():
-    from xorl.ops.dsv4 import exact_attention  # noqa: PLC0415
+    from xorl.ops.families.dsv4 import exact_attention  # noqa: PLC0415
 
     return exact_attention
 

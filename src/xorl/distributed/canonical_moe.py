@@ -26,12 +26,12 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-from xorl.ops.canonical_moe_leaf import canonical_moe_leaf_fp32_v1_op
+from xorl.ops.exact.moe_fixed_order_reduce_leaf import moe_fixed_order_leaf_fp32_v1_op
 
 
 CANONICAL_MOE_FOLD_VERSION = "canonical_moe_fold_fp64_v3"
 CANONICAL_MOE_REDUCE_VERSION = "canonical_moe_reduce_fp64_v3"
-CANONICAL_MOE_LEAF_VERSION = "canonical_moe_leaf_fp32_v1"
+CANONICAL_MOE_LEAF_VERSION = "moe_fixed_order_leaf_fp32_v1"
 CANONICAL_MOE_PACKED_EP16_TRANSPORT_VERSION = "packed_ep16_v2"
 CANONICAL_MOE_CP_SHARDED_TRANSPORT_VERSION = "cp_sharded_v3"
 GLM52_NUM_LAYERS = 78
@@ -616,7 +616,7 @@ def _validate_runtime_plan(
     )
 
 
-def canonical_moe_leaf_fp32_v1(
+def moe_fixed_order_leaf_fp32_v1(
     shared: torch.Tensor,
     routed: torch.Tensor,
     routed_scale: float = 1.0,
@@ -629,7 +629,7 @@ def canonical_moe_leaf_fp32_v1(
     primitive prevents compiler reassociation without materializing an FP32
     output tensor.
     """
-    return canonical_moe_leaf_fp32_v1_op(shared, routed, routed_scale)
+    return moe_fixed_order_leaf_fp32_v1_op(shared, routed, routed_scale)
 
 
 def _canonical_moe_fold_fp64_tree(partials_by_logical_ordinal: torch.Tensor) -> torch.Tensor:
@@ -659,7 +659,7 @@ def _canonical_moe_fold_fp64_tree(partials_by_logical_ordinal: torch.Tensor) -> 
     return level[0]
 
 
-def _canonical_moe_fp64_fold_chunk_elements(contributor_count: int) -> int:
+def _moe_fixed_order_fp64_fold_chunk_elements(contributor_count: int) -> int:
     """Maximum payload elements whose initial FP64 level fits the bound."""
     if contributor_count <= 0:
         raise ValueError("Canonical MoE fold requires a positive contributor count")
@@ -677,9 +677,9 @@ def _canonical_moe_cast_fp64_to_transport(
     if folded_fp64.dtype is not torch.float64:
         raise TypeError(f"Canonical MoE final cast requires FP64 input, got {folded_fp64.dtype}")
     if folded_fp64.is_cuda and transport_dtype in (torch.bfloat16, torch.float16):
-        from xorl.ops.canonical_moe_cast import canonical_moe_fp64_to_lowp_rne  # noqa: PLC0415
+        from xorl.ops.exact.moe_fixed_order_reduce_cast import moe_fixed_order_fp64_to_lowp_rne  # noqa: PLC0415
 
-        return canonical_moe_fp64_to_lowp_rne(folded_fp64.contiguous(), transport_dtype)
+        return moe_fixed_order_fp64_to_lowp_rne(folded_fp64.contiguous(), transport_dtype)
     return folded_fp64.to(transport_dtype)
 
 
@@ -704,7 +704,7 @@ def canonical_moe_fold_fp64_v3(partials_by_logical_ordinal: torch.Tensor) -> tor
 
     payload_shape = partials.shape[1:]
     payload_elements = partials[0].numel()
-    chunk_elements = _canonical_moe_fp64_fold_chunk_elements(contributor_count)
+    chunk_elements = _moe_fixed_order_fp64_fold_chunk_elements(contributor_count)
     if payload_elements <= chunk_elements:
         return _canonical_moe_cast_fp64_to_transport(
             _canonical_moe_fold_fp64_tree(partials),
@@ -1223,7 +1223,7 @@ __all__ = [
     "ParallelPlan",
     "ParallelRole",
     "canonical_moe_fold_fp64_v3",
-    "canonical_moe_leaf_fp32_v1",
+    "moe_fixed_order_leaf_fp32_v1",
     "canonical_moe_reduce_reference",
     "canonical_moe_reduce_packed_ep16_v2",
     "canonical_moe_reduce_cp_sharded_v3",

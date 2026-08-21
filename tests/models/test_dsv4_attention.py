@@ -26,7 +26,7 @@ def _small_rope_buffer(monkeypatch):
     monkeypatch.setenv("XORL_DSV4_SPARSE_ATTN_IMPL", "sparse")  # pure-torch ref
     # Clear the @lru_cache on precompute_freqs_cis so cross-test state with
     # different (dim, seqlen, factor, ...) keys doesn't leak.
-    from xorl.ops.dsv4.rope import precompute_freqs_cis  # noqa: PLC0415
+    from xorl.ops.families.dsv4.rope import precompute_freqs_cis  # noqa: PLC0415
 
     precompute_freqs_cis.cache_clear()
     yield
@@ -135,7 +135,7 @@ def test_attn_sink_is_fp32_and_keep_fp32_marked():
 def test_kv_qat_enabled_from_quantization_config():
     """Xorl mirrors Miles' config-driven FP8-QAT gate instead of an env toggle."""
     from xorl.models.transformers.deepseek_v4.modeling_deepseek_v4 import DeepSeekV4Attention  # noqa: PLC0415
-    from xorl.ops.dsv4.utils import dsv4_kv_qat_enabled  # noqa: PLC0415
+    from xorl.ops.families.dsv4.utils import dsv4_kv_qat_enabled  # noqa: PLC0415
 
     cfg = _tiny_config(compress_ratios=[0])
     assert dsv4_kv_qat_enabled(cfg) is False
@@ -215,7 +215,7 @@ def test_exact_cp_selects_the_serving_kv_boundary(monkeypatch, compress_ratio, c
     from xorl.models.transformers.deepseek_v4.modeling_deepseek_v4 import (  # noqa: PLC0415
         DeepSeekV4Attention,
     )
-    from xorl.ops.dsv4 import exact_attention  # noqa: PLC0415
+    from xorl.ops.families.dsv4 import exact_attention  # noqa: PLC0415
 
     class _FakeCPGroup:
         def size(self):
@@ -303,8 +303,8 @@ def test_exact_ring_cp_restores_gathered_rows_and_uses_local_rope_positions(monk
     from xorl.models.transformers.deepseek_v4.modeling_deepseek_v4 import (  # noqa: PLC0415
         DeepSeekV4Attention,
     )
-    from xorl.ops.dsv4 import exact_attention  # noqa: PLC0415
-    from xorl.ops.dsv4.cp_utils import Dsv4ExactCPLayout  # noqa: PLC0415
+    from xorl.ops.families.dsv4 import exact_attention  # noqa: PLC0415
+    from xorl.ops.families.dsv4.cp_utils import Dsv4ExactCPLayout  # noqa: PLC0415
 
     class _FakeCPGroup:
         @staticmethod
@@ -404,8 +404,8 @@ def test_exact_packed_requests_reset_c0_c4_c128_state(monkeypatch, compress_rati
 
     from xorl.models.transformers.deepseek_v4 import modeling_deepseek_v4  # noqa: PLC0415
     from xorl.models.transformers.deepseek_v4.modeling_deepseek_v4 import DeepSeekV4Attention  # noqa: PLC0415
-    from xorl.ops.dsv4 import exact_attention  # noqa: PLC0415
-    from xorl.ops.dsv4.cp_utils import build_dsv4_exact_cp_layout  # noqa: PLC0415
+    from xorl.ops.families.dsv4 import exact_attention  # noqa: PLC0415
+    from xorl.ops.families.dsv4.cp_utils import build_dsv4_exact_cp_layout  # noqa: PLC0415
 
     cfg = _tiny_config(compress_ratios=[compress_ratio])
     cfg._dsv4_flash_exact_mode = True

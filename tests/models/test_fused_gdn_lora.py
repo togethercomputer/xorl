@@ -24,7 +24,7 @@ from xorl.lora.utils import (
     load_lora_checkpoint,
     save_lora_checkpoint,
 )
-from xorl.ops.linear_attention.layers.gated_deltanet import GatedDeltaNet
+from xorl.models.layers.gated_deltanet import GatedDeltaNet
 
 
 class _SharedExpert(nn.Module):

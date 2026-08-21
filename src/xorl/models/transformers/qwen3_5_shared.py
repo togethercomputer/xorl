@@ -64,8 +64,8 @@ def _apply_qwen35_gdn_exact(model: torch.nn.Module) -> dict[str, int]:
         validate_native_ep_combine_size(ps.ep_size)
 
     from xorl.lora.modules.base import LoraModule  # noqa: PLC0415
-    from xorl.ops.batch_invariant_ops import wrap_trunk_linears_batch_invariant  # noqa: PLC0415
-    from xorl.ops.bi_families_v2 import _select_qwen35_families_v1  # noqa: PLC0415
+    from xorl.ops.sglang.batch_invariant_ops import wrap_trunk_linears_batch_invariant  # noqa: PLC0415
+    from xorl.ops.sglang.bi_families_v2 import _select_qwen35_families_v1  # noqa: PLC0415
 
     # RMSNorm uses the qualified v2 tree. The LM-head/LSE remains on its
     # separately qualified v1 program; that selector does not control norms.
@@ -119,9 +119,9 @@ def qwen3_5_apply_rotary_pos_emb(
     cos: torch.Tensor,
     sin: torch.Tensor,
     interleaved: bool = False,
-    class_b: bool = False,
+    fp32_single_round: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if class_b:
+    if fp32_single_round:
         if not q.is_cuda or not k.is_cuda:
             raise RuntimeError("Qwen3.5-family Class-B RoPE requires CUDA q/k tensors")
         if q.dtype is not torch.bfloat16 or k.dtype is not torch.bfloat16:

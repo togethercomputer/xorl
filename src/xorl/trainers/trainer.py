@@ -401,7 +401,7 @@ class Trainer:
             helper.enable_third_party_logging()
 
         if os.environ.get("XORL_BATCH_INVARIANT_MATMUL", "0") == "1":
-            from xorl.ops.batch_invariant_ops import enable_batch_invariant_mode  # noqa: PLC0415
+            from xorl.ops.sglang.batch_invariant_ops import enable_batch_invariant_mode  # noqa: PLC0415
 
             enable_batch_invariant_mode()
             logger.info_rank0("XORL_BATCH_INVARIANT_MATMUL=1: enabled SGLang-compatible batch-invariant ops")
@@ -713,7 +713,7 @@ class Trainer:
             qwen35_rmsnorm_family=args.model.qwen35_rmsnorm_family,
             activation_native=args.model.activation_native,
             rope_native=args.model.rope_native,
-            rope_class_b=args.model.rope_class_b,
+            rope_fp32_single_round=args.model.rope_fp32_single_round,
             attention_cast_bf16=args.model.attention_cast_bf16,
             sparse_mla_enabled=args.model.sparse_mla_enabled,
             sparse_mla_backend=args.model.sparse_mla_backend,
@@ -737,7 +737,7 @@ class Trainer:
         args.model.qwen35_rmsnorm_family = numerical_program["qwen35_rmsnorm_family"]
         args.model.activation_native = numerical_program["activation_native"]
         args.model.rope_native = numerical_program["rope_native"]
-        args.model.rope_class_b = numerical_program["rope_class_b"]
+        args.model.rope_fp32_single_round = numerical_program["rope_fp32_single_round"]
         args.model.attention_cast_bf16 = numerical_program["attention_cast_bf16"]
         args.model.sparse_mla_enabled = numerical_program["sparse_mla_enabled"]
         args.model.sparse_mla_backend = numerical_program["sparse_mla_backend"]
@@ -1325,7 +1325,7 @@ class Trainer:
                     or getattr(pp_lm_head, "_dsv4_exact_tp8_lm_head", False)
                 )
             )
-            lm_head_in_loss = ce_mode in {"quack_linear", "bi_fused"} or exact_head
+            lm_head_in_loss = ce_mode in {"quack_linear", "batch_invariant"} or exact_head
             stages = []
             for model_part, init_stage in zip(self.model_parts, self.pp_stages):
                 stage_index = init_stage.stage_index

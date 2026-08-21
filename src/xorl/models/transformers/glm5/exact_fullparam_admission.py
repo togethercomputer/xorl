@@ -42,7 +42,7 @@ from xorl.models.transformers.glm5.native_fp8 import (
     Glm52NativeBlockFP8Experts,
     validate_glm52_native_fp8_config,
 )
-from xorl.ops.block_fp8_native import NativeBlockFP8Linear
+from xorl.ops.exact.block_fp8_native import NativeBlockFP8Linear
 
 
 logger = logging.getLogger(__name__)

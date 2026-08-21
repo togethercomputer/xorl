@@ -4,7 +4,7 @@ default_stages: [pre-commit, pre-push, manual]
 # and bi_families_v2.py is vendored byte-identical into the serving engine
 # with both copies sha256-gated, so it keeps that engine's formatting
 # (black, 88 columns). See src/xorl/ops/README.md.
-exclude: ^(submodules/|\.venv/|src/xorl/ops/quack/|src/xorl/ops/linear_attention/flashqla/|src/xorl/ops/bi_families_v2\.py$)
+exclude: ^(submodules/|\.venv/|src/xorl/ops/_vendored/|src/xorl/ops/sglang/bi_families_v2\.py$)
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0

@@ -57,7 +57,7 @@ def _make_inputs(S, S_kv, H, D, tail, topk, *, device, seed=1234):
 
 @pytest.mark.skipif(not _have_cuda_h100(), reason="needs H100+")
 def test_sparse_mla_fwd_kernel_matches_torch_reference():
-    from xorl.ops.glm5_kernels.tilelang_sparse_mla_fwd import sparse_mla_fwd_interface
+    from xorl.ops.families.glm5.tilelang_sparse_mla_fwd import sparse_mla_fwd_interface
 
     S, S_kv, H, D, tail, topk = 256, 1024, 64, 512, 64, 128
     sm_scale = (D + tail) ** -0.5
@@ -82,7 +82,7 @@ def _assert_sparse_mla_bwd_kernel_produces_finite_gradients():
       (b) dq matches torch to bf16 attention tolerance
       (c) dkv max-abs error < 1× dkv_ref_max (signal-to-noise > 1)
     """
-    from xorl.ops.glm5_kernels.sparse_mla import SparseMLA
+    from xorl.ops.families.glm5.sparse_mla import SparseMLA
 
     S, S_kv, H, D, tail, topk = 256, 1024, 64, 512, 64, 128
     sm_scale = (D + tail) ** -0.5
@@ -130,8 +130,8 @@ def test_sparse_mla_bwd_reference_and_deterministic_policy():
 
     import os as _os  # noqa: PLC0415
 
-    from xorl.ops.glm5_kernels.tilelang_sparse_mla_bwd import sparse_mla_bwd  # noqa: PLC0415
-    from xorl.ops.glm5_kernels.tilelang_sparse_mla_fwd import sparse_mla_fwd_interface  # noqa: PLC0415
+    from xorl.ops.families.glm5.tilelang_sparse_mla_bwd import sparse_mla_bwd  # noqa: PLC0415
+    from xorl.ops.families.glm5.tilelang_sparse_mla_fwd import sparse_mla_fwd_interface  # noqa: PLC0415
 
     S, S_kv, H, D, tail, topk = 256, 1024, 64, 512, 64, 128
     sm_scale = (D + tail) ** -0.5

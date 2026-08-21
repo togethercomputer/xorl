@@ -24,7 +24,7 @@ class TinyModel(nn.Module):
                 "qwen35_rmsnorm_family": "v2",
                 "activation_native": True,
                 "rope_native": True,
-                "rope_class_b": True,
+                "rope_fp32_single_round": True,
                 "attention_cast_bf16": True,
                 "sparse_mla_enabled": False,
                 "sparse_mla_backend": "auto",
@@ -53,7 +53,7 @@ def _trainer_args():
             qwen35_rmsnorm_family="v2",
             activation_native=True,
             rope_native=True,
-            rope_class_b=True,
+            rope_fp32_single_round=True,
             attention_cast_bf16=True,
             sparse_mla_enabled=False,
             sparse_mla_backend="auto",
@@ -111,7 +111,7 @@ def test_local_trainer_forwards_model_numeric_alignment_flags(monkeypatch):
     assert captured["qwen35_rmsnorm_family"] == "v2"
     assert captured["activation_native"] is True
     assert captured["rope_native"] is True
-    assert captured["rope_class_b"] is True
+    assert captured["rope_fp32_single_round"] is True
     assert captured["attention_cast_bf16"] is True
     assert captured["moe_routing_weights_before_down"] is True
     assert captured["lora_rank"] == 16

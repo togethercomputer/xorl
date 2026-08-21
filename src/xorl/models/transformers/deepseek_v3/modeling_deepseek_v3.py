@@ -24,7 +24,7 @@ from xorl.models.transformers.deepseek_v3.support import (
     has_packed_expert_weights,
 )
 from xorl.models.transformers.qwen3_5_shared import qwen3_5_apply_rotary_pos_emb
-from xorl.ops.fused_silu_and_mul import fused_silu_and_mul
+from xorl.ops.exact.fused_silu_and_mul import fused_silu_and_mul
 from xorl.utils import logging
 
 
@@ -143,7 +143,7 @@ class DeepseekV3Attention(nn.Module):
             cos,
             sin,
             interleaved=getattr(self.config, "rope_interleave", True),
-            class_b=bool(getattr(self.config, "_rope_class_b", False)),
+            fp32_single_round=bool(getattr(self.config, "_rope_fp32_single_round", False)),
         )
         k_rot = k_rot.expand(*k_pass.shape[:-1], -1)
 

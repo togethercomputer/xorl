@@ -143,7 +143,7 @@ def _sparse_mla_tilelang(
     miles' 3D ``[B*S_q, H, D]`` and ``[B*S_kv, 1, D]`` forms before calling
     `SparseMLA.apply`, then reshapes back.
     """
-    from xorl.ops.glm5_kernels.sparse_mla import SparseMLA  # noqa: PLC0415  (lazy: tilelang is optional)
+    from xorl.ops.families.glm5.sparse_mla import SparseMLA  # noqa: PLC0415  (lazy: tilelang is optional)
 
     del query_offset
     B, S_q, H, D = q.shape
@@ -239,7 +239,7 @@ def _sparse_mla_flashmla(
     if error is not None:
         raise RuntimeError(f"backend='flashmla' requested outside its certified GLM-5.2 envelope: {error}")
 
-    from xorl.ops.glm5_kernels.flashmla_sparse_mla import (  # noqa: PLC0415
+    from xorl.ops.families.glm5.flashmla_sparse_mla import (  # noqa: PLC0415
         FlashMLASparseWithTileLangBackward,
     )
 

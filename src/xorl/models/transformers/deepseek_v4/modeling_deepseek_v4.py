@@ -42,9 +42,9 @@ from xorl.models.layers.moe.routing_replay import get_replay_stage
 from xorl.models.layers.normalization import RMSNorm
 from xorl.models.module_utils import DEFAULT_GRADIENT_CHECKPOINTING_METHOD
 from xorl.models.outputs import MoeCausalLMOutput, MoeModelOutput
-from xorl.ops.dsv4.attention_core import dense_attn_torch, sparse_attn_tilelang, sparse_attn_torch
-from xorl.ops.dsv4.compressor import DeepSeekV4Compressor
-from xorl.ops.dsv4.cp_utils import (
+from xorl.ops.families.dsv4.attention_core import dense_attn_torch, sparse_attn_tilelang, sparse_attn_torch
+from xorl.ops.families.dsv4.compressor import DeepSeekV4Compressor
+from xorl.ops.families.dsv4.cp_utils import (
     Dsv4ExactCPLayout,
     all_gather_cp,
     build_dsv4_exact_cp_layout,
@@ -54,11 +54,11 @@ from xorl.ops.dsv4.cp_utils import (
     get_q_positions_for_cp,
     get_window_topk_idxs_cp,
 )
-from xorl.ops.dsv4.hyper_connection import DeepSeekV4HyperConnectionUtil
-from xorl.ops.dsv4.qat import fp8_simulate_qat
-from xorl.ops.dsv4.rope import apply_rotary_emb, wrapped_precompute_freqs_cis
-from xorl.ops.dsv4.utils import dsv4_kv_qat_enabled
-from xorl.ops.dsv4.v4_indexer import V4Indexer
+from xorl.ops.families.dsv4.hyper_connection import DeepSeekV4HyperConnectionUtil
+from xorl.ops.families.dsv4.qat import fp8_simulate_qat
+from xorl.ops.families.dsv4.rope import apply_rotary_emb, wrapped_precompute_freqs_cis
+from xorl.ops.families.dsv4.utils import dsv4_kv_qat_enabled
+from xorl.ops.families.dsv4.v4_indexer import V4Indexer
 
 
 # Defaults: when ``XORL_DSV4_SPARSE_ATTN_IMPL`` is unset, autodetect —
@@ -393,7 +393,7 @@ class DeepSeekV4Attention(nn.Module):
                 raise RuntimeError("DSV4 exact decode-cache carry admits one request without context parallelism")
             carry_state = self.__dict__.get("_dsv4_decode_state")
             if carry_state is None:
-                from xorl.ops.dsv4.exact_attention import Dsv4DecodeCarryState  # noqa: PLC0415
+                from xorl.ops.families.dsv4.exact_attention import Dsv4DecodeCarryState  # noqa: PLC0415
 
                 carry_state = Dsv4DecodeCarryState()
                 self._dsv4_decode_state = carry_state
@@ -464,14 +464,14 @@ class DeepSeekV4Attention(nn.Module):
         q = self.wq_b(q_lora)  # [B, S, n_heads * head_dim]
         q = q.unflatten(-1, (self.n_local_heads, self.head_dim))  # [B, S, H, D]
         if self._exact_attention:
-            from xorl.ops.dsv4.exact_attention import exact_q_norm_rope  # noqa: PLC0415
+            from xorl.ops.families.dsv4.exact_attention import exact_q_norm_rope  # noqa: PLC0415
 
             q = exact_q_norm_rope(q, freqs_cis, self.eps, position_offset=carry_offset or 0)
         else:
             q_dtype = q.dtype
             q = q.float()
             q = (q * torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)).to(q_dtype)
-            # ``apply_rotary_emb`` (xorl.ops.dsv4.rope) writes into ``q[..., -rd:]``
+            # ``apply_rotary_emb`` (xorl.ops.families.dsv4.rope) writes into ``q[..., -rd:]``
             # in place, so the slice's storage must be exclusively ours. Without
             # ``q.clone()``, the in-place rotary would mutate the upstream
             # ``self.wq_b(...)`` activation that's still held by autograd, which
@@ -529,7 +529,7 @@ class DeepSeekV4Attention(nn.Module):
                         request_x = x.index_select(1, local_rows) if ratio else None
 
                     if ratio == 0:
-                        from xorl.ops.dsv4.exact_attention import exact_c0_attention  # noqa: PLC0415
+                        from xorl.ops.families.dsv4.exact_attention import exact_c0_attention  # noqa: PLC0415
 
                         request_o = exact_c0_attention(
                             request_q,
@@ -543,7 +543,7 @@ class DeepSeekV4Attention(nn.Module):
                             kv_preprocessed=False,
                         )
                     else:
-                        from xorl.ops.dsv4.exact_attention import exact_compressed_attention  # noqa: PLC0415
+                        from xorl.ops.families.dsv4.exact_attention import exact_compressed_attention  # noqa: PLC0415
 
                         request_o = exact_compressed_attention(
                             request_q,
@@ -571,7 +571,7 @@ class DeepSeekV4Attention(nn.Module):
                     if ratio:
                         exact_x = all_gather_cp(exact_x, dim=1, cp_group=self.cp_group)
                 if ratio == 0:
-                    from xorl.ops.dsv4.exact_attention import exact_c0_attention  # noqa: PLC0415
+                    from xorl.ops.families.dsv4.exact_attention import exact_c0_attention  # noqa: PLC0415
 
                     o = exact_c0_attention(
                         q,
@@ -587,7 +587,7 @@ class DeepSeekV4Attention(nn.Module):
                         kv_preprocessed=False,
                     )
                 else:
-                    from xorl.ops.dsv4.exact_attention import exact_compressed_attention  # noqa: PLC0415
+                    from xorl.ops.families.dsv4.exact_attention import exact_compressed_attention  # noqa: PLC0415
 
                     o = exact_compressed_attention(
                         q,
@@ -669,7 +669,7 @@ class DeepSeekV4Attention(nn.Module):
 
         # Inverse RoPE on the rope slice of the output.
         if self._exact_attention:
-            from xorl.ops.dsv4.exact_attention import exact_inverse_rope  # noqa: PLC0415
+            from xorl.ops.families.dsv4.exact_attention import exact_inverse_rope  # noqa: PLC0415
 
             o = exact_inverse_rope(o, freqs_cis, position_offset=carry_offset or 0)
         else:

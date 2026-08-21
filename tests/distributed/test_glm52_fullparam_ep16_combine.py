@@ -57,7 +57,7 @@ def _seed_bank(rank: int, device: torch.device = torch.device("cpu"), kind: str 
         Glm52FullParamBlockFP8RoutedExperts,
     )
     from xorl.models.transformers.glm5.native_fp8 import Glm52NativeBlockFP8Experts
-    from xorl.ops.block_fp8_native import pack_fp8_as_float32
+    from xorl.ops.exact.block_fp8_native import pack_fp8_as_float32
 
     if kind == "frozen":
         bank = Glm52NativeBlockFP8Experts(_LOCAL_EXPERTS, _HIDDEN, _INTERMEDIATE, device=device)
