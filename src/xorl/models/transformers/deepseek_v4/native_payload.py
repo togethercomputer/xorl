@@ -1464,12 +1464,12 @@ def dsv4_native_shared_expert_tp_partial(
 class _Dsv4RoutedSharedJoin(torch.autograd.Function):
     @staticmethod
     def forward(ctx, routed: torch.Tensor, shared: torch.Tensor, scale: float):
-        from xorl.distributed.canonical_moe import canonical_moe_leaf_fp32_v1  # noqa: PLC0415
+        from xorl.distributed.canonical_moe import moe_fixed_order_leaf_fp32_v1  # noqa: PLC0415
 
         ctx.scale = scale
         ctx.routed_dtype = routed.dtype
         ctx.shared_dtype = shared.dtype
-        return canonical_moe_leaf_fp32_v1(shared, routed, routed_scale=scale)
+        return moe_fixed_order_leaf_fp32_v1(shared, routed, routed_scale=scale)
 
     @staticmethod
     def backward(ctx, grad_output):

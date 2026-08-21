@@ -14,7 +14,7 @@ except ImportError:  # pragma: no cover - exercised only without Triton
     _TRITON_AVAILABLE = False
 
 
-def validate_canonical_moe_fp64_cast_input(
+def validate_moe_fixed_order_fp64_cast_input(
     value: torch.Tensor,
     output_dtype: torch.dtype,
 ) -> None:
@@ -31,7 +31,7 @@ def validate_canonical_moe_fp64_cast_input(
 if _TRITON_AVAILABLE:
 
     @triton.jit
-    def _canonical_moe_fp64_to_lowp_rne_kernel(
+    def _moe_fixed_order_fp64_to_lowp_rne_kernel(
         input_ptr,
         output_ptr,
         n_elements,
@@ -46,7 +46,7 @@ if _TRITON_AVAILABLE:
         tl.store(output_ptr + offsets, value, mask=mask)
 
 
-def _canonical_moe_fp64_to_lowp_cuda(
+def _moe_fixed_order_fp64_to_lowp_cuda(
     value: torch.Tensor,
     output_dtype: torch.dtype,
 ) -> torch.Tensor:
@@ -56,7 +56,7 @@ def _canonical_moe_fp64_to_lowp_cuda(
     if output.numel() == 0:
         return output
     block_size = 256
-    _canonical_moe_fp64_to_lowp_rne_kernel[(triton.cdiv(output.numel(), block_size),)](
+    _moe_fixed_order_fp64_to_lowp_rne_kernel[(triton.cdiv(output.numel(), block_size),)](
         value,
         output,
         output.numel(),
@@ -67,30 +67,30 @@ def _canonical_moe_fp64_to_lowp_cuda(
 
 
 @torch.library.custom_op("xorl_k3::_canonical_moe_fp64_to_bf16_rne", mutates_args=())
-def _canonical_moe_fp64_to_bf16_rne_op(value: torch.Tensor) -> torch.Tensor:
+def _moe_fixed_order_fp64_to_bf16_rne_op(value: torch.Tensor) -> torch.Tensor:
     """Round FP64 directly to BF16."""
-    validate_canonical_moe_fp64_cast_input(value, torch.bfloat16)
-    return _canonical_moe_fp64_to_lowp_cuda(value, torch.bfloat16)
+    validate_moe_fixed_order_fp64_cast_input(value, torch.bfloat16)
+    return _moe_fixed_order_fp64_to_lowp_cuda(value, torch.bfloat16)
 
 
-@_canonical_moe_fp64_to_bf16_rne_op.register_fake
-def _canonical_moe_fp64_to_bf16_rne_fake(value: torch.Tensor) -> torch.Tensor:
+@_moe_fixed_order_fp64_to_bf16_rne_op.register_fake
+def _moe_fixed_order_fp64_to_bf16_rne_fake(value: torch.Tensor) -> torch.Tensor:
     return torch.empty_like(value, dtype=torch.bfloat16)
 
 
 @torch.library.custom_op("xorl_k3::_canonical_moe_fp64_to_fp16_rne", mutates_args=())
-def _canonical_moe_fp64_to_fp16_rne_op(value: torch.Tensor) -> torch.Tensor:
+def _moe_fixed_order_fp64_to_fp16_rne_op(value: torch.Tensor) -> torch.Tensor:
     """Round FP64 directly to FP16."""
-    validate_canonical_moe_fp64_cast_input(value, torch.float16)
-    return _canonical_moe_fp64_to_lowp_cuda(value, torch.float16)
+    validate_moe_fixed_order_fp64_cast_input(value, torch.float16)
+    return _moe_fixed_order_fp64_to_lowp_cuda(value, torch.float16)
 
 
-@_canonical_moe_fp64_to_fp16_rne_op.register_fake
-def _canonical_moe_fp64_to_fp16_rne_fake(value: torch.Tensor) -> torch.Tensor:
+@_moe_fixed_order_fp64_to_fp16_rne_op.register_fake
+def _moe_fixed_order_fp64_to_fp16_rne_fake(value: torch.Tensor) -> torch.Tensor:
     return torch.empty_like(value, dtype=torch.float16)
 
 
-def _canonical_moe_fp64_to_lowp_backward(ctx, grad_output: torch.Tensor):
+def _moe_fixed_order_fp64_to_lowp_backward(ctx, grad_output: torch.Tensor):
     del ctx
     # Match torch's straight-through cast derivative.  The surrounding FP64
     # tree then distributes this FP64 gradient to every contributor before its
@@ -98,26 +98,26 @@ def _canonical_moe_fp64_to_lowp_backward(ctx, grad_output: torch.Tensor):
     return grad_output.to(torch.float64)
 
 
-_canonical_moe_fp64_to_bf16_rne_op.register_autograd(
-    _canonical_moe_fp64_to_lowp_backward,
+_moe_fixed_order_fp64_to_bf16_rne_op.register_autograd(
+    _moe_fixed_order_fp64_to_lowp_backward,
 )
-_canonical_moe_fp64_to_fp16_rne_op.register_autograd(
-    _canonical_moe_fp64_to_lowp_backward,
+_moe_fixed_order_fp64_to_fp16_rne_op.register_autograd(
+    _moe_fixed_order_fp64_to_lowp_backward,
 )
 
 
-def canonical_moe_fp64_to_lowp_rne(
+def moe_fixed_order_fp64_to_lowp_rne(
     value: torch.Tensor,
     output_dtype: torch.dtype,
 ) -> torch.Tensor:
     """Validate and directly round FP64 to the canonical transport dtype."""
-    validate_canonical_moe_fp64_cast_input(value, output_dtype)
+    validate_moe_fixed_order_fp64_cast_input(value, output_dtype)
     if output_dtype is torch.bfloat16:
-        return _canonical_moe_fp64_to_bf16_rne_op(value)
-    return _canonical_moe_fp64_to_fp16_rne_op(value)
+        return _moe_fixed_order_fp64_to_bf16_rne_op(value)
+    return _moe_fixed_order_fp64_to_fp16_rne_op(value)
 
 
 __all__ = [
-    "canonical_moe_fp64_to_lowp_rne",
-    "validate_canonical_moe_fp64_cast_input",
+    "moe_fixed_order_fp64_to_lowp_rne",
+    "validate_moe_fixed_order_fp64_cast_input",
 ]

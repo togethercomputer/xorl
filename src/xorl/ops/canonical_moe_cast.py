@@ -1,3 +1,7 @@
-"""Moved to ``xorl.ops.exact.canonical_moe_cast`` (issue #78 phase 3); compat stub."""
+"""Moved to ``xorl.ops.exact.moe_fixed_order_reduce_cast`` (issue #78); alias stub."""
 
-from xorl.ops.exact.canonical_moe_cast import *  # noqa: F401,F403
+import importlib as _importlib
+import sys as _sys
+
+
+_sys.modules[__name__] = _importlib.import_module("xorl.ops.exact.moe_fixed_order_reduce_cast")

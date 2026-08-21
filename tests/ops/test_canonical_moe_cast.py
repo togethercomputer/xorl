@@ -3,7 +3,7 @@
 import pytest
 import torch
 
-from xorl.ops.exact.canonical_moe_cast import canonical_moe_fp64_to_lowp_rne
+from xorl.ops.exact.moe_fixed_order_reduce_cast import moe_fixed_order_fp64_to_lowp_rne
 
 
 @pytest.mark.gpu
@@ -23,7 +23,7 @@ def test_cuda_direct_rne_result_and_backward(
 ):
     value = torch.tensor([midpoint_witness], device="cuda", dtype=torch.float64, requires_grad=True)
 
-    output = canonical_moe_fp64_to_lowp_rne(value, output_dtype)
+    output = moe_fixed_order_fp64_to_lowp_rne(value, output_dtype)
 
     assert int(output.view(torch.uint16).item()) == expected_bits
     assert int(value.detach().to(output_dtype).view(torch.uint16).item()) == double_rounded_bits

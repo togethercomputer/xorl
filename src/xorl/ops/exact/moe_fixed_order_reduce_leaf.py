@@ -14,7 +14,7 @@ except ImportError:  # pragma: no cover - exercised only without Triton
     _TRITON_AVAILABLE = False
 
 
-def validate_canonical_moe_leaf_operands(
+def validate_moe_fixed_order_leaf_operands(
     shared: torch.Tensor,
     routed: torch.Tensor,
 ) -> None:
@@ -51,7 +51,7 @@ if _TRITON_AVAILABLE:
         )
 
     @triton.jit
-    def _canonical_moe_leaf_fp32_kernel(
+    def _moe_fixed_order_leaf_fp32_kernel(
         shared_ptr,
         routed_ptr,
         output_ptr,
@@ -69,7 +69,7 @@ if _TRITON_AVAILABLE:
         tl.store(output_ptr + offsets, leaf, mask=mask)
 
 
-def _canonical_moe_leaf_cuda(
+def _moe_fixed_order_leaf_cuda(
     shared: torch.Tensor,
     routed: torch.Tensor,
     routed_scale: float,
@@ -80,7 +80,7 @@ def _canonical_moe_leaf_cuda(
     if output.numel() == 0:
         return output
     block_size = 256
-    _canonical_moe_leaf_fp32_kernel[(triton.cdiv(output.numel(), block_size),)](
+    _moe_fixed_order_leaf_fp32_kernel[(triton.cdiv(output.numel(), block_size),)](
         shared,
         routed,
         output,
@@ -92,7 +92,7 @@ def _canonical_moe_leaf_cuda(
     return output
 
 
-def _canonical_moe_leaf_cpu(
+def _moe_fixed_order_leaf_cpu(
     shared: torch.Tensor,
     routed: torch.Tensor,
     routed_scale: float,
@@ -108,20 +108,20 @@ def _canonical_moe_leaf_cpu(
 
 
 @torch.library.custom_op("xorl_k3::_canonical_moe_leaf_fp32_v1", mutates_args=())
-def _canonical_moe_leaf_fp32_v1_op(
+def _moe_fixed_order_leaf_fp32_v1_op(
     shared: torch.Tensor,
     routed: torch.Tensor,
     routed_scale: float,
 ) -> torch.Tensor:
     """Opaque one-FMA leaf primitive; output is the transport dtype."""
-    validate_canonical_moe_leaf_operands(shared, routed)
+    validate_moe_fixed_order_leaf_operands(shared, routed)
     if shared.is_cuda:
-        return _canonical_moe_leaf_cuda(shared, routed, routed_scale)
-    return _canonical_moe_leaf_cpu(shared, routed, routed_scale)
+        return _moe_fixed_order_leaf_cuda(shared, routed, routed_scale)
+    return _moe_fixed_order_leaf_cpu(shared, routed, routed_scale)
 
 
-@_canonical_moe_leaf_fp32_v1_op.register_fake
-def _canonical_moe_leaf_fp32_v1_fake(
+@_moe_fixed_order_leaf_fp32_v1_op.register_fake
+def _moe_fixed_order_leaf_fp32_v1_fake(
     shared: torch.Tensor,
     routed: torch.Tensor,
     routed_scale: float,
@@ -130,34 +130,34 @@ def _canonical_moe_leaf_fp32_v1_fake(
     return torch.empty_like(shared)
 
 
-def _canonical_moe_leaf_setup_context(ctx, inputs, output) -> None:
+def _moe_fixed_order_leaf_setup_context(ctx, inputs, output) -> None:
     del output
     shared, _routed, routed_scale = inputs
     ctx.input_dtype = shared.dtype
     ctx.routed_scale = float(routed_scale)
 
 
-def _canonical_moe_leaf_backward(ctx, grad_output: torch.Tensor):
+def _moe_fixed_order_leaf_backward(ctx, grad_output: torch.Tensor):
     grad_fp32 = grad_output.float()
     grad_shared = grad_fp32.to(ctx.input_dtype)
     grad_routed = (grad_fp32 * ctx.routed_scale).to(ctx.input_dtype)
     return grad_shared, grad_routed, None
 
 
-_canonical_moe_leaf_fp32_v1_op.register_autograd(
-    _canonical_moe_leaf_backward,
-    setup_context=_canonical_moe_leaf_setup_context,
+_moe_fixed_order_leaf_fp32_v1_op.register_autograd(
+    _moe_fixed_order_leaf_backward,
+    setup_context=_moe_fixed_order_leaf_setup_context,
 )
 
 
-def canonical_moe_leaf_fp32_v1_op(
+def moe_fixed_order_leaf_fp32_v1_op(
     shared: torch.Tensor,
     routed: torch.Tensor,
     routed_scale: float,
 ) -> torch.Tensor:
     """Validate and execute the compile-opaque canonical contributor leaf."""
-    validate_canonical_moe_leaf_operands(shared, routed)
-    return _canonical_moe_leaf_fp32_v1_op(shared, routed, float(routed_scale))
+    validate_moe_fixed_order_leaf_operands(shared, routed)
+    return _moe_fixed_order_leaf_fp32_v1_op(shared, routed, float(routed_scale))
 
 
-__all__ = ["canonical_moe_leaf_fp32_v1_op", "validate_canonical_moe_leaf_operands"]
+__all__ = ["moe_fixed_order_leaf_fp32_v1_op", "validate_moe_fixed_order_leaf_operands"]

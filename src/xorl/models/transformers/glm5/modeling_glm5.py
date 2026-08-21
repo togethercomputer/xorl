@@ -15,7 +15,7 @@ from xorl.distributed.canonical_moe import (
     LogicalRowOwnership,
     OutputDistribution,
     ParallelPlan,
-    canonical_moe_leaf_fp32_v1,
+    moe_fixed_order_leaf_fp32_v1,
     canonical_moe_reduce_cp_sharded_v3,
     canonical_moe_reduce_fp64_v3,
     canonical_moe_reduce_packed_ep16_v2,
@@ -1201,7 +1201,7 @@ class Glm5MoEBlock(MoEBlock):
             contributor_ordinal=ep_rank,
             contributor_count=ps.ep_size,
         )
-        local_partial = canonical_moe_leaf_fp32_v1(shared, routed)
+        local_partial = moe_fixed_order_leaf_fp32_v1(shared, routed)
 
         capacity = int(getattr(self.config, "_glm52_canonical_moe_capacity", local_partial.shape[0]))
         if local_partial.shape[0] > capacity:

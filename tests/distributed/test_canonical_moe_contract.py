@@ -23,12 +23,12 @@ from xorl.distributed.canonical_moe import (
     ParallelPlan,
     ParallelRole,
     _canonical_moe_fold_fp64_tree,
-    _canonical_moe_fp64_fold_chunk_elements,
+    _moe_fixed_order_fp64_fold_chunk_elements,
     _resolve_transport_chunk_rows,
     _RuntimePlan,
     _transport_and_fold,
     canonical_moe_fold_fp64_v3,
-    canonical_moe_leaf_fp32_v1,
+    moe_fixed_order_leaf_fp32_v1,
     canonical_moe_reduce_cp_sharded_v3,
     canonical_moe_reduce_fp64_v3,
     canonical_moe_reduce_packed_ep16_v2,
@@ -184,7 +184,7 @@ def test_chunked_fp64_tree_is_bitwise_exact_across_payload_boundaries(
     witness_count = min(4, contributors)
     partials[:witness_count, 0, :4] = torch.tensor([[4096.0], [1.0], [-4096.0], [1.0]], dtype=dtype)[:witness_count]
 
-    chunk_elements = _canonical_moe_fp64_fold_chunk_elements(contributors)
+    chunk_elements = _moe_fixed_order_fp64_fold_chunk_elements(contributors)
     assert chunk_elements < rows * payload
     actual = canonical_moe_fold_fp64_v3(partials)
     expected = _explicit_tree(partials)
@@ -244,7 +244,7 @@ def test_chunked_fp64_tree_strided_payload_is_bitwise_exact(
 @pytest.mark.cpu
 @pytest.mark.parametrize("contributors", [1, 3, 16, 17, 64])
 def test_fp64_fold_chunk_planner_bounds_the_initial_level(contributors: int):
-    chunk_elements = _canonical_moe_fp64_fold_chunk_elements(contributors)
+    chunk_elements = _moe_fixed_order_fp64_fold_chunk_elements(contributors)
     level_bytes = contributors * chunk_elements * torch.float64.itemsize
 
     assert 0 < level_bytes <= _CANONICAL_MOE_FP64_FOLD_MAX_LEVEL_BYTES
@@ -345,17 +345,17 @@ def test_leaf_uses_compile_stable_one_round_fp32_fma_before_transport_cast(
     transport_bits: int,
     dynamic: bool,
 ):
-    assert CANONICAL_MOE_LEAF_VERSION == "canonical_moe_leaf_fp32_v1"
+    assert CANONICAL_MOE_LEAF_VERSION == "moe_fixed_order_leaf_fp32_v1"
     shared = torch.tensor([shared_value], dtype=dtype)
     routed = torch.tensor([routed_value], dtype=dtype)
 
     fma_oracle = _one_round_leaf_oracle(shared, routed, scale)
     scale_fp32 = torch.tensor(scale, dtype=torch.float32)
     separately_rounded = shared.float() + routed.float() * scale_fp32
-    eager = canonical_moe_leaf_fp32_v1(shared, routed, scale)
+    eager = moe_fixed_order_leaf_fp32_v1(shared, routed, scale)
 
     def leaf_fn(shared_arg: torch.Tensor, routed_arg: torch.Tensor) -> torch.Tensor:
-        return canonical_moe_leaf_fp32_v1(shared_arg, routed_arg, scale)
+        return moe_fixed_order_leaf_fp32_v1(shared_arg, routed_arg, scale)
 
     compiled = torch.compile(leaf_fn, fullgraph=True, dynamic=dynamic)(shared, routed)
 
@@ -380,7 +380,7 @@ def test_leaf_autograd_matches_declared_fp32_scale_under_compile(
     grad_output = torch.tensor([0.5, -1.25, 2.0], dtype=dtype)
 
     def leaf_fn(shared_arg: torch.Tensor, routed_arg: torch.Tensor) -> torch.Tensor:
-        return canonical_moe_leaf_fp32_v1(shared_arg, routed_arg, scale)
+        return moe_fixed_order_leaf_fp32_v1(shared_arg, routed_arg, scale)
 
     compiled = torch.compile(leaf_fn, fullgraph=True, dynamic=dynamic)
     output = compiled(shared, routed)
@@ -435,7 +435,7 @@ def test_cuda_leaf_matches_one_round_oracle_under_compile(
     )
 
     def leaf_fn(shared_arg: torch.Tensor, routed_arg: torch.Tensor) -> torch.Tensor:
-        return canonical_moe_leaf_fp32_v1(shared_arg, routed_arg, scale)
+        return moe_fixed_order_leaf_fp32_v1(shared_arg, routed_arg, scale)
 
     eager = leaf_fn(shared, routed)
     compiled = torch.compile(leaf_fn, fullgraph=True, dynamic=dynamic)(shared, routed)
@@ -461,12 +461,12 @@ def test_cuda_leaf_replays_in_cuda_graph_without_fp32_output(dtype: torch.dtype)
     shared = torch.tensor([0.25, -0.5, 1.0], device="cuda", dtype=dtype)
     routed = torch.tensor([-2.0, 0.75, 4.0], device="cuda", dtype=dtype)
     scale = -1.375
-    canonical_moe_leaf_fp32_v1(shared, routed, scale)
+    moe_fixed_order_leaf_fp32_v1(shared, routed, scale)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        output = canonical_moe_leaf_fp32_v1(shared, routed, scale)
+        output = moe_fixed_order_leaf_fp32_v1(shared, routed, scale)
     first = output.clone()
     routed.copy_(torch.tensor([3.0, -1.0, 0.5], device="cuda", dtype=dtype))
     graph.replay()
@@ -537,7 +537,7 @@ def test_shared_fold_replays_in_cuda_graph(monkeypatch: pytest.MonkeyPatch, cont
     # production-sized. The production-shape allocator bound is tested below.
     monkeypatch.setattr(canonical_moe, "_CANONICAL_MOE_FP64_FOLD_MAX_LEVEL_BYTES", 32 * 1024)
     partials = torch.randn((contributors, 64, 32), device="cuda", dtype=torch.bfloat16)
-    assert _canonical_moe_fp64_fold_chunk_elements(contributors) < partials[0].numel()
+    assert _moe_fixed_order_fp64_fold_chunk_elements(contributors) < partials[0].numel()
     canonical_moe_fold_fp64_v3(partials)
     torch.cuda.synchronize()
 
