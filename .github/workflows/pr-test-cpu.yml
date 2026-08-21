@@ -126,12 +126,13 @@ jobs:
       # on a CPU-only host, but it is a multi-gigabyte download, so swap in the
       # CPU build for this job.
       #
-      # The versions are pinned to the same release pyproject.toml pins. Left
-      # unpinned, this resolves to the newest CPU build on the index -- which
-      # silently ran the whole CPU suite on torch 2.13.0 against a project that
-      # pinned 2.12.1. Keep these two in step with the torch/torchvision pins in
-      # pyproject.toml; tests/distributed/test_native_fp8_fsdp2_materialization.py
-      # asserts the release and will fail loudly if they drift apart.
+      # The versions are pinned to the same releases pyproject.toml pins
+      # (torch 2.11.0 / torchvision 0.26.0). Left unpinned, this resolves to
+      # the newest CPU build on the index -- which once silently ran the whole
+      # CPU suite on torch 2.13.0 against a project pinning 2.12.1. Keep these
+      # two in step with the torch/torchvision pins in pyproject.toml;
+      # tests/distributed/test_native_fp8_fsdp2_materialization.py asserts the
+      # release and will fail loudly if they drift apart.
       - name: Install dependencies
         run: |
           uv sync --group test
