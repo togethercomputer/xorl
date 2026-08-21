@@ -12,7 +12,7 @@ from xorl.models.transformers.glm5.exact_shared_expert_qlora import (
     GLM52_EXACT_TP16_SHARED_EXPERT_QLORA_CONTRACT_VERSION,
     Glm52ExactTP16SharedExpertBlockFP8QLoRA,
 )
-from xorl.ops.exact.fused_silu_and_mul import exact_fp32_silu_and_mul
+from xorl.ops.exact.fused_silu_and_mul import one_round_swiglu
 
 
 def _canonical_moe_reference(partials: torch.Tensor, metadata: CanonicalMoEGraphMetadata) -> torch.Tensor:
@@ -352,7 +352,7 @@ def _manual_local_vjp(
         gate_up_input = exact_gate_up.detach().requires_grad_(True)
         # Mirror the module's VJP reference: differentiate the one-round FP32
         # SwiGLU program the forward now emits.
-        activation = exact_fp32_silu_and_mul(gate_up_input)
+        activation = one_round_swiglu(gate_up_input)
         (gate_up_grad,) = torch.autograd.grad(
             activation,
             gate_up_input,

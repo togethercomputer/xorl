@@ -30,7 +30,7 @@ from xorl.ops.exact.block_fp8_native import (
     pack_fp8_as_float32,
     unpack_float32_as_fp8,
 )
-from xorl.ops.exact.fused_silu_and_mul import exact_fp32_silu_and_mul
+from xorl.ops.exact.fused_silu_and_mul import one_round_swiglu
 
 
 logger = logging.getLogger(__name__)
@@ -663,7 +663,7 @@ class Glm52FullParamDenseMLP(nn.Module):
         # SiLU and multiply in FP32 with one final rounding.  The historical
         # trainer op rounded between SiLU and multiply, so it is not the same
         # numerical program.
-        activated = exact_fp32_silu_and_mul(gate_up)
+        activated = one_round_swiglu(gate_up)
         return self.down_proj(activated)
 
 

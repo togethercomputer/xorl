@@ -8,7 +8,7 @@ Two programs live here, deliberately:
 - ``fused_silu_and_mul`` — the historical TWO-ROUND program (SiLU result
   rounded to the input dtype, then multiplied). Every pre-existing caller
   keeps these exact bytes; nothing off the exact-contract path changes.
-- ``exact_fp32_silu_and_mul`` — the ONE-ROUND FP32 program (SiLU and
+- ``one_round_swiglu`` — the ONE-ROUND FP32 program (SiLU and
   multiply in fp32, single rounding), byte-paired with serving's
   ``fp32_silu_and_mul`` (xorl-sglang f10b907d8). Selected ONLY by the
   exact-contract dispatch (``_exact_one_round_swiglu``).
@@ -238,7 +238,7 @@ def _fp32_silu_and_mul(input_tensor: torch.Tensor) -> torch.Tensor:
 
 
 @triton.jit
-def _exact_fp32_silu_and_mul_kernel(
+def _one_round_swiglu_kernel(
     input_ptr,
     output_ptr,
     N: tl.constexpr,
@@ -260,7 +260,7 @@ def _exact_fp32_silu_and_mul_kernel(
     tl.store(output_ptr + row_idx * N + col_offsets, result, mask=mask)
 
 
-def _exact_fp32_silu_and_mul_forward(input_tensor: torch.Tensor) -> torch.Tensor:
+def _one_round_swiglu_forward(input_tensor: torch.Tensor) -> torch.Tensor:
     original_shape = input_tensor.shape
     input_2d = input_tensor.view(-1, original_shape[-1])
     num_tokens = input_2d.shape[0]
@@ -272,7 +272,7 @@ def _exact_fp32_silu_and_mul_forward(input_tensor: torch.Tensor) -> torch.Tensor
     )
     BLOCK_SIZE = min(1024, triton.next_power_of_2(N))
     grid = (num_tokens, triton.cdiv(N, BLOCK_SIZE))
-    _exact_fp32_silu_and_mul_kernel[grid](
+    _one_round_swiglu_kernel[grid](
         input_2d,
         output,
         N,
@@ -284,7 +284,7 @@ def _exact_fp32_silu_and_mul_forward(input_tensor: torch.Tensor) -> torch.Tensor
 
 
 @triton.jit
-def _exact_fp32_silu_and_mul_backward_kernel(
+def _one_round_swiglu_backward_kernel(
     grad_output_ptr,
     input_ptr,
     grad_input_ptr,
@@ -314,7 +314,7 @@ def _exact_fp32_silu_and_mul_backward_kernel(
     tl.store(grad_input_ptr + row_idx * 2 * N + N + col_offsets, d_up.to(up.dtype), mask=mask)
 
 
-def _exact_fp32_silu_and_mul_backward(grad_output: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
+def _one_round_swiglu_backward(grad_output: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
     original_shape = input_tensor.shape
     input_2d = input_tensor.view(-1, original_shape[-1])
     grad_output_2d = grad_output.view(-1, grad_output.shape[-1])
@@ -323,7 +323,7 @@ def _exact_fp32_silu_and_mul_backward(grad_output: torch.Tensor, input_tensor: t
     grad_input = torch.empty_like(input_2d)
     BLOCK_SIZE = min(1024, triton.next_power_of_2(N))
     grid = (num_tokens, triton.cdiv(N, BLOCK_SIZE))
-    _exact_fp32_silu_and_mul_backward_kernel[grid](
+    _one_round_swiglu_backward_kernel[grid](
         grad_output_2d,
         input_2d,
         grad_input,
@@ -339,15 +339,15 @@ class ExactFp32SiluAndMulFunction(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input_tensor: torch.Tensor) -> torch.Tensor:
         ctx.save_for_backward(input_tensor)
-        return _exact_fp32_silu_and_mul_forward(input_tensor)
+        return _one_round_swiglu_forward(input_tensor)
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor) -> torch.Tensor:
         (input_tensor,) = ctx.saved_tensors
-        return _exact_fp32_silu_and_mul_backward(grad_output, input_tensor)
+        return _one_round_swiglu_backward(grad_output, input_tensor)
 
 
-def exact_fp32_silu_and_mul(input_tensor: torch.Tensor) -> torch.Tensor:
+def one_round_swiglu(input_tensor: torch.Tensor) -> torch.Tensor:
     """One-round FP32 SwiGLU with autograd support (exact-contract callers only).
 
     Byte-paired with serving's fp32_silu_and_mul; see the module docstring
@@ -357,3 +357,7 @@ def exact_fp32_silu_and_mul(input_tensor: torch.Tensor) -> torch.Tensor:
     if not _use_fp32_fused_swiglu(input_tensor):
         return _fp32_silu_and_mul(input_tensor)
     return ExactFp32SiluAndMulFunction.apply(input_tensor)
+
+
+# Deprecated alias (renamed in #78/#81): the exact-contract single-rounding SwiGLU.
+exact_fp32_silu_and_mul = one_round_swiglu

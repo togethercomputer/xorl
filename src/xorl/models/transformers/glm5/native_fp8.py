@@ -1003,10 +1003,10 @@ class Glm52NativeBlockFP8DenseMLP(nn.Module):
         )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        from xorl.ops.exact.fused_silu_and_mul import exact_fp32_silu_and_mul  # noqa: PLC0415
+        from xorl.ops.exact.fused_silu_and_mul import one_round_swiglu  # noqa: PLC0415
 
         gate_up = self.gate_up_proj(hidden_states)
-        activated = exact_fp32_silu_and_mul(gate_up)
+        activated = one_round_swiglu(gate_up)
         return self.down_proj(activated)
 
 

@@ -20,7 +20,7 @@ import torch
 import torch.nn.functional as F
 
 from xorl.models.transformers.qwen3_5.modeling_qwen3_5 import Qwen3_5MLP
-from xorl.ops.exact.fused_silu_and_mul import exact_fp32_silu_and_mul, fused_silu_and_mul
+from xorl.ops.exact.fused_silu_and_mul import one_round_swiglu, fused_silu_and_mul
 
 
 def _two_round_reference(x: torch.Tensor) -> torch.Tensor:
@@ -61,7 +61,7 @@ def test_default_op_keeps_two_round_bytes(shape):
 def test_exact_op_is_one_round(shape=(96, 7168)):
     torch.manual_seed(3)
     x = torch.randn(*shape, device="cuda", dtype=torch.bfloat16).contiguous()
-    assert torch.equal(exact_fp32_silu_and_mul(x), _one_round_reference(x))
+    assert torch.equal(one_round_swiglu(x), _one_round_reference(x))
 
 
 @pytest.mark.gpu
@@ -88,5 +88,5 @@ def test_exact_qwen35_mlp_selects_one_round():
     x = torch.randn(96, 64, device="cuda", dtype=torch.bfloat16)
     with torch.no_grad():
         out = mlp(x)
-        reference = mlp.down_proj(exact_fp32_silu_and_mul(mlp.gate_up_proj(x)))
+        reference = mlp.down_proj(one_round_swiglu(mlp.gate_up_proj(x)))
     assert torch.equal(out, reference)

@@ -130,7 +130,7 @@ def test_dense_mlp_forward_composes_fused_gate_up_production_activation_and_exac
         return _literal_linear_value(input, down_base, factor_A, factor_B)
 
     monkeypatch.setattr(module, "_exact_forward_value", gate_up_value)
-    monkeypatch.setattr(exact_dense_mlp_module, "exact_fp32_silu_and_mul", activation_value)
+    monkeypatch.setattr(exact_dense_mlp_module, "one_round_swiglu", activation_value)
     monkeypatch.setattr(module.down_proj, "_exact_forward_value", down_value)
     input = torch.arange(24, dtype=torch.float32).reshape(3, 8).sub_(7).div_(53).to(torch.bfloat16)
 

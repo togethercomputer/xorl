@@ -6,7 +6,7 @@ xorl-sglang f10b907d8), and GLM-5.2 serves its dense and shared-expert MLPs
 through that op. These gates pin the trainer half of the pairing at GLM
 geometries:
 
-1. the trainer op (``exact_fp32_silu_and_mul``) matches serving's
+1. the trainer op (``one_round_swiglu``) matches serving's
    ``fp32_silu_and_mul`` bitwise on matched bf16 inputs at the TP16
    shared-expert shard ([T, 256] gate_up) and the dense width
    ([T, 2*12288], the Glm5Config default intermediate size) — direct sglang
@@ -15,7 +15,7 @@ geometries:
    from the one-round output on these inputs, so the byte gates above have
    discriminating power (the deterministic fixture must differ in at least
    one element);
-3. the separate-tensor form ``exact_fp32_silu_and_mul(cat([gate, up], -1))``
+3. the separate-tensor form ``one_round_swiglu(cat([gate, up], -1))``
    — the ``_canonical_shared_local_partial`` pattern — equals serving on the
    concatenated tensor;
 4. grad smoke: the op under ``requires_grad`` produces finite grads at the
@@ -48,7 +48,7 @@ from xorl.models.exact_contract import (
 )
 from xorl.models.transformers.glm5.configuration_glm5 import Glm5Config
 from xorl.models.transformers.glm5.modeling_glm5 import GLM52_LOCAL_PARTIAL_POLICY, Glm5MLP
-from xorl.ops.exact.fused_silu_and_mul import exact_fp32_silu_and_mul
+from xorl.ops.exact.fused_silu_and_mul import one_round_swiglu
 
 
 # GLM-5.2 geometries with byte evidence: the 128-wide TP16 shared-expert
@@ -80,7 +80,7 @@ def test_trainer_op_matches_serving_one_round_bitwise(rows: int, width: int) -> 
     fp32_silu_and_mul = _serving_one_round_op()
     matched = _matched_input(rows, width, seed=17)
 
-    trainer = exact_fp32_silu_and_mul(matched)
+    trainer = one_round_swiglu(matched)
     serving = fp32_silu_and_mul(matched)
 
     assert trainer.dtype is torch.bfloat16 and serving.dtype is torch.bfloat16
@@ -97,7 +97,7 @@ def test_old_two_op_program_differs_bitwise(rows: int, width: int) -> None:
     matched = _matched_input(rows, width, seed=17)
     split = width // 2
 
-    one_round = exact_fp32_silu_and_mul(matched)
+    one_round = one_round_swiglu(matched)
     two_op = F.silu(matched[..., :split]) * matched[..., split:]
 
     differing = int((one_round.view(torch.uint16) != two_op.view(torch.uint16)).sum())
@@ -121,7 +121,7 @@ def test_separate_gate_up_concat_form_matches_serving() -> None:
     up = _matched_input(rows, 2 * shard, seed=29)[..., shard:].contiguous()
     concatenated = torch.cat([gate, up], dim=-1)
 
-    trainer = exact_fp32_silu_and_mul(concatenated)
+    trainer = one_round_swiglu(concatenated)
     serving = fp32_silu_and_mul(concatenated)
 
     assert torch.equal(trainer.view(torch.uint8), serving.view(torch.uint8))
@@ -134,7 +134,7 @@ def test_grad_smoke_at_shard_geometry() -> None:
     matched = _matched_input(rows, width, seed=31).requires_grad_(True)
     grad_output = _matched_input(rows, 2 * (width // 2), seed=37)[..., : width // 2].contiguous()
 
-    output = exact_fp32_silu_and_mul(matched)
+    output = one_round_swiglu(matched)
     output.backward(grad_output)
 
     assert matched.grad is not None
@@ -276,7 +276,7 @@ def test_stamped_glm5_mlp_routes_to_the_one_round_op(monkeypatch) -> None:
         activated = F.silu(gate_up[..., :split].float()).to(gate_up.dtype)
         return (activated * gate_up[..., split:]).to(gate_up.dtype)
 
-    monkeypatch.setattr(modeling_glm5, "exact_fp32_silu_and_mul", one_round_capture)
+    monkeypatch.setattr(modeling_glm5, "one_round_swiglu", one_round_capture)
     monkeypatch.setattr(modeling_glm5, "fused_silu_and_mul", two_round_capture)
 
     torch.manual_seed(5)

@@ -70,7 +70,7 @@ from xorl.models.transformers.glm5.rotary import glm5_apply_rotary_pos_emb
 from xorl.models.transformers.glm5.sparse_mla import sparse_mla_dispatch
 from xorl.models.transformers.glm5.support import validate_glm5_sequence_parallel
 from xorl.ops.exact.block_fp8_native import NativeBlockFP8Linear
-from xorl.ops.exact.fused_silu_and_mul import exact_fp32_silu_and_mul, fused_silu_and_mul
+from xorl.ops.exact.fused_silu_and_mul import one_round_swiglu, fused_silu_and_mul
 from xorl.utils import logging
 
 
@@ -140,7 +140,7 @@ class Glm5MLP(nn.Module):
         gate = self.gate_proj(x)
         up = self.up_proj(x)
         if self._exact_one_round:
-            hidden_states = exact_fp32_silu_and_mul(torch.cat([gate, up], dim=-1))
+            hidden_states = one_round_swiglu(torch.cat([gate, up], dim=-1))
         elif self._use_fused_silu:
             hidden_states = fused_silu_and_mul(torch.cat([gate, up], dim=-1))
         else:
@@ -1103,7 +1103,7 @@ class Glm5MoEBlock(MoEBlock):
             # Serving computes the exact-mode shared expert with the one-round
             # FP32 SwiGLU (SiluAndMul.forward_exact since xorl-sglang
             # f10b907d8); the canonical partial must produce those bytes.
-            activated = exact_fp32_silu_and_mul(torch.cat([gate, up], dim=-1))
+            activated = one_round_swiglu(torch.cat([gate, up], dim=-1))
         else:
             activated = F.silu(gate) * up
         if isinstance(self.shared_experts.down_proj, NativeBlockFP8Linear):

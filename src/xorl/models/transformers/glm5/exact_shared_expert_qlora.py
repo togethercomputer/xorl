@@ -26,7 +26,7 @@ from torch import Tensor, nn
 
 from xorl.models.transformers.glm5.exact_lora_contract import glm52_exact_lora_scaling
 from xorl.ops.exact.block_fp8_native import NativeBlockFP8Linear, _sglang_native_block_fp8_linear_value
-from xorl.ops.exact.fused_silu_and_mul import exact_fp32_silu_and_mul
+from xorl.ops.exact.fused_silu_and_mul import one_round_swiglu
 
 
 GLM52_EXACT_TP16_SHARED_EXPERT_QLORA_CONTRACT_VERSION = "glm52_exact_tp16_shared_expert_qlora_v2"
@@ -521,7 +521,7 @@ class Glm52ExactTP16SharedExpertBlockFP8QLoRA(nn.Module):
         # Exact SGLang target mode resolves SiluAndMul.forward_exact to the
         # one-round FP32 SwiGLU (xorl-sglang f10b907d8); this site must
         # produce those bytes.
-        activated = exact_fp32_silu_and_mul(gate_up)
+        activated = one_round_swiglu(gate_up)
 
         down_base = _sglang_native_block_fp8_linear_value(
             activated,
@@ -674,7 +674,7 @@ class Glm52ExactTP16SharedExpertBlockFP8QLoRA(nn.Module):
                 gate_up_input = exact_gate_up.detach().requires_grad_(True)
                 # VJP reference differentiates the same one-round program the
                 # forward emits (backward stays trainer-owned numerics).
-                activation = exact_fp32_silu_and_mul(gate_up_input)
+                activation = one_round_swiglu(gate_up_input)
                 (gate_up_grad,) = torch.autograd.grad(
                     activation,
                     gate_up_input,

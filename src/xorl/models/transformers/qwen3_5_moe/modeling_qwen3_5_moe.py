@@ -44,7 +44,7 @@ from xorl.models.transformers.qwen3_5_shared import (
     has_linear_attention_layers,
     qwen3_5_apply_rotary_pos_emb,
 )
-from xorl.ops.exact.fused_silu_and_mul import exact_fp32_silu_and_mul, fused_silu_and_mul
+from xorl.ops.exact.fused_silu_and_mul import one_round_swiglu, fused_silu_and_mul
 from xorl.ops.linear_attention.ops.cp import build_linear_attention_cp_context
 from xorl.utils import logging
 
@@ -105,7 +105,7 @@ class Qwen3_5MoeMLP(nn.Module):
 
     def _fused_act(self, gate_up):
         if self._exact_one_round:
-            return exact_fp32_silu_and_mul(gate_up)
+            return one_round_swiglu(gate_up)
         return fused_silu_and_mul(gate_up)
 
     def unfuse_for_tp(self):
@@ -528,7 +528,7 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
         self._capture_diagnostic_component("moe_native_shared_gate_up", gate_up)
         # Exact serving-value path: one-round FP32, paired with serving's
         # fp32_silu_and_mul (in-scope for the exact contract by construction).
-        act = exact_fp32_silu_and_mul(gate_up)
+        act = one_round_swiglu(gate_up)
         self._capture_diagnostic_component("moe_native_shared_act", act)
         down = _BatchInvariantTrunkLinearFn.apply(act, w_down[:, lo_s : lo_s + shard].contiguous(), None)
         self._capture_diagnostic_component("moe_native_shared_down", down)

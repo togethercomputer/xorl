@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 
 from xorl.models.layers import rope as xrope
-from xorl.ops.exact.fused_silu_and_mul import exact_fp32_silu_and_mul
+from xorl.ops.exact.fused_silu_and_mul import one_round_swiglu
 
 
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -101,7 +101,7 @@ def test_swiglu_xorl_one_round_bit_exact_vs_sglang_fp32():
     inter = 6144
     gate_up = torch.randn(SEQ, 2 * inter, device=DEV, dtype=DT)
 
-    x_xorl_exact = exact_fp32_silu_and_mul(gate_up)
+    x_xorl_exact = one_round_swiglu(gate_up)
     d = gate_up.shape[-1] // 2
     x_sg = (F.silu(gate_up[..., :d].float()) * gate_up[..., d:].float()).to(DT)
 

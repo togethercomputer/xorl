@@ -27,7 +27,7 @@ from xorl.models.transformers.glm5.exact_fullparam_fp8 import (
 )
 from xorl.models.transformers.glm5.native_fp8 import Glm52NativeBlockFP8DenseMLP
 from xorl.ops.exact.block_fp8_native import NativeBlockFP8Linear
-from xorl.ops.exact.fused_silu_and_mul import exact_fp32_silu_and_mul
+from xorl.ops.exact.fused_silu_and_mul import one_round_swiglu
 
 
 def _linear(in_features: int = 8, out_features: int = 16) -> Glm52ExactTP1BlockFP8FullParamLinear:
@@ -343,7 +343,7 @@ def test_dense_mlp_routes_to_one_round_and_discriminates_the_old_program(monkeyp
     generator = torch.Generator().manual_seed(9173)
     input = (torch.randn(32, 128, generator=generator) * 1.5).to(torch.bfloat16)
     gate_up = _dense_mlp_gate_up(input)
-    expected = exact_fp32_silu_and_mul(gate_up)
+    expected = one_round_swiglu(gate_up)
     split = gate_up.shape[-1] // 2
     retired = F.silu(gate_up[..., :split]) * gate_up[..., split:]
 
@@ -366,7 +366,7 @@ def test_dense_mlp_one_round_gradient_matches_the_selected_program(monkeypatch) 
     module(input).backward(grad_output)
 
     reference_input = input.detach().clone().requires_grad_(True)
-    exact_fp32_silu_and_mul(_dense_mlp_gate_up(reference_input)).backward(grad_output)
+    one_round_swiglu(_dense_mlp_gate_up(reference_input)).backward(grad_output)
     assert input.grad is not None
     assert torch.equal(input.grad, reference_input.grad)
     assert bool(torch.all(torch.isfinite(input.grad.float())))
