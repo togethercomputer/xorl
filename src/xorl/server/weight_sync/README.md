@@ -134,7 +134,6 @@ weight_sync/
 └── backends/
     ├── base.py             # WeightTransportBackend ABC + TransportConfig dataclass
     ├── nccl_broadcast.py   # NCCLBroadcastBackend (default)
-    ├── nccl_simple.py      # Simplified NCCL transfer helper
     ├── p2p.py              # Mooncake RDMA P2P backend
     ├── sparse_delta.py     # Experimental packed sparse-delta backend
     └── __init__.py         # create_backend() factory
@@ -302,10 +301,9 @@ P2P tuning options:
 - FP8 P2P sync requires an explicit sync quantization config, for example via
   `POST /api/v1/set_sync_quantization` or a per-call `quantization` field:
   `{"quant_method":"fp8","fmt":"e4m3","weight_block_size":[128,128]}`.
-  Client wrappers may expose this as `XORL_WEIGHT_SYNC_QUANTIZATION` or
-  `XORL_SYNC_QUANTIZATION`. A launch-only SGLang `--quantization fp8` flag is
-  not enough unless endpoint auto-detection is confirmed to populate the sync
-  request's `quantization` field.
+  A launch-only SGLang `--quantization fp8` flag is not enough unless endpoint
+  auto-detection is confirmed to populate the sync request's `quantization`
+  field.
 - With P2P and explicit FP8 sync quantization, the handler quantizes supported
   projection weights on the trainer side, transfers FP8 weights plus
   `weight_scale_inv` tensors, and skips receiver post-processing by default
@@ -353,10 +351,6 @@ P2P tuning options:
   serialized prepare behavior.
 - `XORL_P2P_PREPARE_TIMEOUT_S`: per-endpoint prepare HTTP timeout. Default:
   120 seconds.
-- `XORL_SERIAL_INFERENCE_ENDPOINT_SYNC=1`: fallback/debug guard for
-  multi-endpoint P2P. It sends each receiver endpoint through its own serialized
-  sync group, avoiding cross-endpoint Mooncake session reuse at the cost of
-  giving up normal endpoint fanout parallelism.
 - `XORL_P2P_SCATTER_COPY_MODE`: controls how rank 0 builds per-sender tensor
   map payloads for direct-EP scatter. Default `none` reuses read-only locator
   lists/dicts while constructing scatter payloads. Set `list` to shallow-copy

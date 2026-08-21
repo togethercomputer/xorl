@@ -66,7 +66,6 @@ Run the conventional contract tests on a CUDA system:
 
 ```bash
 pytest tests/ops/test_bi_families_v2_norm.py -q
-pytest tests/ops/test_bi_families_v2_norm_dispatch.py -q
 pytest tests/ops/test_bi_families_v2_dispatch.py -q
 pytest tests/models/test_rmsnorm_family_contract.py -q
 pytest tests/models/test_rmsnorm_family_cross_engine.py -q

@@ -1,6 +1,6 @@
 """FSDP2 composition smoke for the scoped batch-invariant trunk-linear contract.
 
-Verifies XORL_BI_TRUNK_LINEAR's module wrap composes with fully_shard (2 GPUs):
+Verifies the trunk-linear contract's module wrap composes with fully_shard (2 GPUs):
 the sharded forward must be bit-identical to the unsharded wrapped module (same
 persistent-GEMM kernel over the all-gathered bf16 params), gradients must be
 finite, and the grad norm must match an unwrapped cuBLAS FSDP2 reference within
@@ -123,7 +123,7 @@ if __name__ != "__main__":
     @skip_if_gpu_count_less_than(2)
     def test_bi_trunk_linear_composes_with_fsdp2():
         result = run_distributed_script(__file__, num_gpus=2, timeout=180)
-        result.assert_success("XORL_BI_TRUNK_LINEAR wrap should compose with fully_shard")
+        result.assert_success("trunk-linear contract wrap should compose with fully_shard")
 
 
 if __name__ == "__main__":

@@ -1,4 +1,4 @@
-"""Scoped batch-invariant trunk-linear contract (XORL_BI_TRUNK_LINEAR).
+"""Scoped batch-invariant trunk-linear contract.
 
 The trunk contract routes ONLY transformer-trunk nn.Linear forwards through the
 batch-invariant persistent GEMM (bit-identical to the aten::mm interpose lane and
@@ -243,15 +243,15 @@ def test_global_interpose_raises_on_grad_requiring_inputs():
     wn = torch.randn(HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     xb = torch.randn(2, 16, HIDDEN, device="cuda", dtype=torch.bfloat16, requires_grad=True)
     with set_batch_invariant_mode(True):
-        with pytest.raises(RuntimeError, match="XORL_BI_TRUNK_LINEAR"):
+        with pytest.raises(RuntimeError, match="inference/verification-only"):
             _ = x @ w
-        with pytest.raises(RuntimeError, match="XORL_BI_TRUNK_LINEAR"):
+        with pytest.raises(RuntimeError, match="inference/verification-only"):
             _ = torch.rms_norm(x, (HIDDEN,), wn, 1e-6)
-        with pytest.raises(RuntimeError, match="XORL_BI_TRUNK_LINEAR"):
+        with pytest.raises(RuntimeError, match="inference/verification-only"):
             _ = torch.bmm(xb, xb.transpose(1, 2))
-        with pytest.raises(RuntimeError, match="XORL_BI_TRUNK_LINEAR"):
+        with pytest.raises(RuntimeError, match="inference/verification-only"):
             _ = torch.log_softmax(x.float(), dim=-1)
-        with pytest.raises(RuntimeError, match="XORL_BI_TRUNK_LINEAR"):
+        with pytest.raises(RuntimeError, match="inference/verification-only"):
             _ = x.float().mean(-1)
 
 

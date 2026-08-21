@@ -9,14 +9,13 @@ title: "Installation"
 - An NVIDIA driver compatible with the selected wheel profile
 - NVIDIA Hopper (H100/H800) or newer for Hopper-specific NVFP4, DeepEP, and tuned kernel paths
 
-XoRL ships two deliberately different dependency profiles:
+XoRL pins a single dependency profile:
 
 | Profile | Manifest | PyTorch / CUDA runtime | Triton | Attention stack | Use it for |
 |---|---|---|---|---|---|
 | Default | `pyproject.toml` | 2.12.1 / CUDA 13.2 | 3.7.1 | FlashAttention 4 (`4.0.0b19`) | Local training and the XoRL training server |
-| Combined xorl-sglang | `pyproject.sglang.toml` | 2.11.0 / CUDA 13 | 3.6.0 | FlashAttention 4 (`4.0.0b19`) | A single environment that also runs the pinned xorl-sglang submodule |
 
-These profiles are not interchangeable. Use the manifest that matches the process you intend to run rather than upgrading or mixing their pinned Torch, Triton, or attention packages independently.
+Use the pinned versions as they ship rather than upgrading or mixing Torch, Triton, or attention packages independently.
 
 ## Clone the repo
 
@@ -65,41 +64,15 @@ The default XoRL dependency set already installs `xorl-client` from its public r
 pip install -e submodules/xorl-client
 ```
 
-Do not install xorl-sglang into the default PyTorch 2.12 environment. To install XoRL, xorl-client, and xorl-sglang together, use the alternate manifest:
-
-**uv:**
-```bash
-cp pyproject.sglang.toml pyproject.toml
-UV_PROJECT_ENVIRONMENT=.venv-sglang uv sync
-source .venv-sglang/bin/activate
-```
-
-**conda:**
-```bash
-conda create -n xorl-sglang python=3.12
-conda activate xorl-sglang
-cp pyproject.sglang.toml pyproject.toml
-pip install -e . -e "submodules/xorl-sglang/python[all]"
-```
-
-> **Note:** Copying the alternate manifest replaces the tracked `pyproject.toml`; `uv sync` also generates the ignored local `uv.lock` for this profile. Do this in a clean checkout, restore `pyproject.toml`, and do not add the generated lock with unrelated changes. The separate `.venv-sglang` keeps this profile isolated from the default `.venv`. The version table above is the source of truth for the two profiles.
+Do not install xorl-sglang into the default PyTorch 2.12 environment. The submodule pins its own PyTorch 2.11 / CUDA 13 stack, so install it into a separate environment from the one built by `pyproject.toml`.
 
 > These submodules are only needed for **server training / online RL**. If you are only running local SFT or pretraining, you can skip this step.
 
 
 ## Verify Installation
 
-For the default profile:
-
 ```bash
 python -c "import torch, triton, xorl; print(torch.__version__, triton.__version__, xorl.__version__)"
-python -c "from flash_attn.cute import flash_attn_func; print('FlashAttention 4 ok')"
-```
-
-For the combined xorl-sglang profile:
-
-```bash
-python -c "import torch, triton, xorl, sglang; print(torch.__version__, triton.__version__)"
 python -c "from flash_attn.cute import flash_attn_func; print('FlashAttention 4 ok')"
 ```
 
