@@ -6,8 +6,8 @@ import torch
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
-import xorl.ops.linear_attention.layers.gated_deltanet as gated_deltanet
-from xorl.ops.linear_attention import GatedDeltaNet
+import xorl.models.layers.gated_deltanet as gated_deltanet
+from xorl.models.layers.gated_deltanet import GatedDeltaNet
 from xorl.ops.linear_attention.modules import ShortConvolution, causal_conv1d_qkv_contract
 from xorl.ops.linear_attention.modules.bi_contract import _is_gdn_contract_enabled
 from xorl.ops.linear_attention.modules.conv_contract import _pack_conv_weight

@@ -19,6 +19,7 @@ from xorl.models.layers.attention import (
 )
 from xorl.models.layers.attention.backend import get_attention_fn
 from xorl.models.layers.fused_projection_lora import project_fused_linear_with_lora
+from xorl.models.layers.gated_deltanet import GatedDeltaNet
 from xorl.models.layers.normalization import (
     compiled_zero_centered_rms_norm,
     eager_zero_centered_rms_norm,
@@ -43,7 +44,6 @@ from xorl.models.transformers.qwen3_5_shared import (
     qwen3_5_apply_rotary_pos_emb,
 )
 from xorl.ops.exact.fused_silu_and_mul import exact_fp32_silu_and_mul, fused_silu_and_mul
-from xorl.ops.linear_attention import GatedDeltaNet
 from xorl.ops.linear_attention.ops.cp import build_linear_attention_cp_context
 from xorl.utils import logging
 

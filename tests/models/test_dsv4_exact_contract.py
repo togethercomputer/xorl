@@ -28,7 +28,7 @@ from xorl.models.transformers.deepseek_v4.exact_lm_head import (
     bind_dsv4_exact_lm_head,
     dsv4_lm_head_shard,
 )
-from xorl.ops.dsv4.exact_attention import (
+from xorl.ops.families.dsv4.exact_attention import (
     _causal_window_indices,
     _hybrid_indices_for_positions,
     _hybrid_prefill_indices,

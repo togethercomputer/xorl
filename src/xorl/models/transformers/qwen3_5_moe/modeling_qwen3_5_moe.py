@@ -18,6 +18,7 @@ from xorl.models.layers import ACT2FN, RotaryEmbedding
 from xorl.models.layers.attention import AttentionKwargs, update_causal_mask
 from xorl.models.layers.attention.backend import ATTENTION_FUNCTIONS
 from xorl.models.layers.attention.backend.eager import eager_attention_forward
+from xorl.models.layers.gated_deltanet import GatedDeltaNet
 from xorl.models.layers.moe import MoEBlock, MoEExperts
 from xorl.models.layers.moe.ep_native_combine import validate_native_ep_combine_size
 from xorl.models.layers.normalization import (
@@ -44,7 +45,6 @@ from xorl.models.transformers.qwen3_5_shared import (
     qwen3_5_apply_rotary_pos_emb,
 )
 from xorl.ops.exact.fused_silu_and_mul import exact_fp32_silu_and_mul, fused_silu_and_mul
-from xorl.ops.linear_attention import GatedDeltaNet
 from xorl.ops.linear_attention.ops.cp import build_linear_attention_cp_context
 from xorl.utils import logging
 

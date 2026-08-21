@@ -27,13 +27,16 @@ Three kinds of code live here with three different rules:
   paths here are compat stubs for one deprecation cycle.
 - `moe/` — MoE expert compute backends (triton/quack/native, LoRA variants).
   `ep_kernels/` (DeepEP sort/scatter) merges in here (#78 phase 5).
-- `linear_attention/` — GDN/linear-attention kernels; also currently hosts
-  the `GatedDeltaNet` layer class (moves to `models/layers/`, #78 phase 4).
-- `ssm/` — Mamba-2 kernels; also currently hosts the `Mamba2Mixer` layer
-  class (same plan as above).
+- `linear_attention/` — GDN/linear-attention kernels. The `GatedDeltaNet`
+  layer class lives in `models/layers/gated_deltanet.py` (#78 phase 4); the
+  old paths re-export it lazily for one deprecation cycle.
+- `ssm/` — Mamba-2 kernels; `Mamba2Mixer` likewise lives in
+  `models/layers/mamba2_mixer.py`.
 - `quantize/` — NF4/INT4/FP4/FP8 quantization codecs and fake-quant ops.
-- `glm5_kernels/`, `dsv4/` — model-family-specific kernels; planned home:
-  `models/transformers/{glm5,deepseek_v4}/kernels/` (#78 phase 4).
+- `families/` — model-family-specific kernels (`glm5/`, `dsv4/`, #78
+  phase 4). Kept under `ops/` (not inside `models/transformers/<family>/`)
+  because the model packages have import side effects (DSV4 registers with
+  the HF Auto registries on import); old paths are alias stubs.
 - `_vendored/` — vendored trees (see above); old paths (`ops/quack`, `ops/linear_attention/flashqla`) are alias stubs for one deprecation cycle.
 
 ## What does NOT belong here

@@ -478,7 +478,7 @@ class Glm5DsaIndexer(nn.Module):
             return None
 
         try:
-            from xorl.ops.glm5_kernels.tilelang_indexer_fwd import (  # noqa: PLC0415
+            from xorl.ops.families.glm5.tilelang_indexer_fwd import (  # noqa: PLC0415
                 clean_logits_,
                 tl_indexer_fwd_impl,
             )

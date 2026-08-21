@@ -15,7 +15,8 @@ import torch.nn.functional as F
 from transformers.models.nemotron_h.configuration_nemotron_h import NemotronHConfig
 from transformers.models.nemotron_h.modeling_nemotron_h import NemotronHMamba2Mixer
 
-from xorl.ops.ssm import Mamba2Mixer, causal_depthwise_conv1d, ssd_chunked
+from xorl.models.layers.mamba2_mixer import Mamba2Mixer
+from xorl.ops.ssm import causal_depthwise_conv1d, ssd_chunked
 
 
 pytestmark = pytest.mark.cpu

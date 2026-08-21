@@ -18,8 +18,8 @@ import warnings
 import pytest
 import torch
 
-import xorl.ops.linear_attention.layers.gated_deltanet as gated_deltanet
-from xorl.ops.linear_attention import GatedDeltaNet
+import xorl.models.layers.gated_deltanet as gated_deltanet
+from xorl.models.layers.gated_deltanet import GatedDeltaNet
 from xorl.ops.linear_attention.backend import FLASHQLA_AUTOCP_ENV, resolve_flashqla_auto_cp
 from xorl.ops.linear_attention.modules.bi_contract import gdn_contract
 

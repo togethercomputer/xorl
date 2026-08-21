@@ -1,5 +1,4 @@
 from .linear_attention import (
-    GatedDeltaNet,
     chunk_gated_delta_rule,
     fused_recurrent_gated_delta_rule,
 )
@@ -9,7 +8,7 @@ from .moe.triton_lora import (
     TritonMoeExpertsLoRAFunction,
     triton_moe_lora_forward,
 )
-from .ssm import Mamba2Mixer, ssd_chunked
+from .ssm import ssd_chunked
 
 
 def __getattr__(name: str):
@@ -20,6 +19,15 @@ def __getattr__(name: str):
         import xorl.objectives as _objectives
 
         return getattr(_objectives, name)
+    # Layer classes moved to xorl.models.layers (#78 phase 4).
+    if name == "GatedDeltaNet":
+        from xorl.models.layers.gated_deltanet import GatedDeltaNet
+
+        return GatedDeltaNet
+    if name == "Mamba2Mixer":
+        from xorl.models.layers.mamba2_mixer import Mamba2Mixer
+
+        return Mamba2Mixer
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 

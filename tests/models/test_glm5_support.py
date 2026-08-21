@@ -366,7 +366,7 @@ def _assert_indexer_padding_mask_policy():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
 def test_indexer_tilelang_fast_path_accepts_causal_mask_and_matches_blocked_torch():
     """Both fast-path mask forms match an independently forced torch path."""
-    from xorl.ops.glm5_kernels.tilelang_indexer_fwd import tl_indexer_fwd_impl  # noqa: F401
+    from xorl.ops.families.glm5.tilelang_indexer_fwd import tl_indexer_fwd_impl  # noqa: F401
 
     torch.manual_seed(0)
     config = _tiny_config(index_topk=8, index_n_heads=4)
@@ -624,7 +624,7 @@ def _assert_sparse_mla_tilelang_wrapper(monkeypatch):
 
     monkeypatch.setitem(
         sys.modules,
-        "xorl.ops.glm5_kernels.sparse_mla",
+        "xorl.ops.families.glm5.sparse_mla",
         SimpleNamespace(SparseMLA=FakeSparseMLA),
     )
 

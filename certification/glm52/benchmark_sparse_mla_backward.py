@@ -36,7 +36,7 @@ def main() -> None:
     except ImportError as exc:
         raise SystemExit("This certification requires TileLang") from exc
 
-    from xorl.ops.glm5_kernels.sparse_mla import SparseMLA  # noqa: PLC0415
+    from xorl.ops.families.glm5.sparse_mla import SparseMLA  # noqa: PLC0415
 
     sequence, kv_sequence, heads, rank, tail, topk = 2048, 32768, 64, 512, 64, 2048
     scale = (rank + tail) ** -0.5

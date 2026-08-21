@@ -161,7 +161,7 @@ FORWARD_CONFIG_IDS = [f"sq{sq}_b{b}_h{h}_d{d}_cr{cr}_top{tk}" for sq, b, h, d, c
 @pytest.mark.parametrize("seqlen_q,batch,heads,dim,compress_ratio,topk", FORWARD_CONFIGS, ids=FORWARD_CONFIG_IDS)
 def test_indexer_forward_scores(seqlen_q, batch, heads, dim, compress_ratio, topk):
     """Compare tilelang forward logits against PyTorch reference."""
-    from xorl.ops.dsv4.kernel.tilelang_indexer_fwd import (
+    from xorl.ops.families.dsv4.kernel.tilelang_indexer_fwd import (
         _make_causal_cu_seqlens,
         batched_indexer_fwd,
     )
@@ -204,7 +204,7 @@ def test_indexer_forward_scores(seqlen_q, batch, heads, dim, compress_ratio, top
 # ---------------------------------------------------------------------------
 def _assert_large_values():
     """Test with large input values to check for overflow/underflow."""
-    from xorl.ops.dsv4.kernel.tilelang_indexer_fwd import (
+    from xorl.ops.families.dsv4.kernel.tilelang_indexer_fwd import (
         _make_causal_cu_seqlens,
         batched_indexer_fwd,
     )
@@ -238,7 +238,7 @@ def _assert_large_values():
 # ---------------------------------------------------------------------------
 def _assert_zero_inputs():
     """Test that zero inputs produce zero scores."""
-    from xorl.ops.dsv4.kernel.tilelang_indexer_fwd import (
+    from xorl.ops.families.dsv4.kernel.tilelang_indexer_fwd import (
         _make_causal_cu_seqlens,
         batched_indexer_fwd,
     )
