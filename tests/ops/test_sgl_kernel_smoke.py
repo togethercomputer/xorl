@@ -29,8 +29,7 @@ def _sgl_kernel_installed() -> bool:
 
 @pytest.mark.skipif(
     not _sgl_kernel_installed(),
-    reason="sglang-kernel is not installed in this environment; the full "
-    "combined profile (uv sync) carries it.",
+    reason="sglang-kernel is not installed in this environment; the full combined profile (uv sync) carries it.",
 )
 def test_sgl_kernel_extension_loads_and_executes() -> None:
     # Importing sgl_kernel eagerly loads the architecture-specific compiled
