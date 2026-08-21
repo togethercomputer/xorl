@@ -1,6 +1,10 @@
 default_stages: [pre-commit, pre-push, manual]
-exclude: ^(submodules/|\.venv/|src/xorl/ops/quack/)
-
+# Vendored trees and byte-contract-gated files are never rewritten by any
+# hook: quack/ and flashqla/ are third-party snapshots (see their VENDORED.md),
+# and bi_families_v2.py is vendored byte-identical into the serving engine
+# with both copies sha256-gated, so it keeps that engine's formatting
+# (black, 88 columns). See src/xorl/ops/README.md.
+exclude: ^(submodules/|\.venv/|src/xorl/ops/quack/|src/xorl/ops/linear_attention/flashqla/|src/xorl/ops/bi_families_v2\.py$)
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v5.0.0
@@ -28,11 +32,6 @@ repos:
       - id: ruff
         args: [--fix-only]
       - id: ruff-format
-        # bi_families_v2.py is vendored byte-identical into the serving engine
-        # and both copies are sha256-gated, so it carries that engine's
-        # formatting (black, 88 columns). Reformatting it here at 120 would
-        # break the byte-equality the contract depends on. Lint still runs.
-        exclude: ^src/xorl/ops/bi_families_v2\.py$
   - repo: https://github.com/codespell-project/codespell
     rev: v2.4.1
     hooks:
