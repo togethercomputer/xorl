@@ -51,10 +51,25 @@ def _mark_owned(path: str) -> None:
         f.write("created by xorl.ops.exact.kernel_config_pin; safe for it to replace\n")
 
 
-def _rmtree_owned(path: str) -> None:
-    """Delete `path` only if this module created it (sentinel present)."""
+def _rmtree_owned(path: str, *, containing_dir: str) -> None:
+    """Delete ``path`` only if this module created it and it stays inside
+    ``containing_dir`` after symlink resolution.
+
+    The sentinel alone is not sufficient authorization: whoever controls the
+    pin-directory env var could pre-place it anywhere.  Requiring the resolved
+    target to live under the (also resolved) pin directory, and refusing
+    symlinked targets, bounds any deletion to the pin tree itself.
+    """
+    if os.path.islink(path):
+        raise KernelConfigPinError(f"refusing to delete {path!r}: it is a symlink")
     if not os.path.isdir(path):
         return
+    resolved = os.path.realpath(path)
+    container = os.path.realpath(containing_dir)
+    if os.path.commonpath([resolved, container]) != container or resolved == container:
+        raise KernelConfigPinError(
+            f"refusing to delete {resolved!r}: it escapes the pin directory {container!r}",
+        )
     if not os.path.isfile(os.path.join(path, OWNED_SENTINEL)):
         raise KernelConfigPinError(
             f"refusing to delete {path!r}: it lacks the ownership sentinel "
@@ -117,7 +132,7 @@ def seed_exact_kernel_config_pin(pin_dir: str, *, source_cache: str | None = Non
             f"seed source cache {cache_src!r} contains the pin destination {cache_dst!r}; "
             "copying would recurse into itself",
         )
-    _rmtree_owned(cache_dst)
+    _rmtree_owned(cache_dst, containing_dir=pin_dir)
     if os.path.isdir(cache_src):
         shutil.copytree(cache_src, cache_dst)
     else:
@@ -168,7 +183,7 @@ def pin_exact_kernel_configs(*, rank: int | None = None) -> str:
     if rank is None:
         rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
     clone = os.path.join(pin_dir, "clones", f"rank{rank}")
-    _rmtree_owned(clone)
+    _rmtree_owned(clone, containing_dir=pin_dir)
     shutil.copytree(os.path.join(pin_dir, CACHE_SUBDIR), clone)
     _mark_owned(clone)
     os.environ["TRITON_CACHE_DIR"] = clone
