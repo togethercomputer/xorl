@@ -850,6 +850,6 @@ def test_deprecated_bi_fused_ce_mode_normalizes_to_batch_invariant():
 
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        args = TrainingArguments(output_dir="/tmp/xorl-test", ce_mode="bi_fused")
+        args = TrainingArguments(output_dir="/tmp/xorl-test", init_device="meta", ce_mode="bi_fused")
     assert args.ce_mode == "batch_invariant"
     assert any("ce_mode='bi_fused' is deprecated" in str(w.message) for w in caught)
