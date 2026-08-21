@@ -146,14 +146,14 @@ def _assert_native_default_cache_is_lazy_and_follows_execution_device():
     assert torch.equal(cos[..., : HEAD_DIM // 2].reshape_as(cached_cos), cached_cos)
     assert torch.equal(sin[..., : HEAD_DIM // 2].reshape_as(cached_sin), cached_sin)
 
-    _assert_qwen_class_b_cache_growth_preserves_cpu_fp32_recipe()
+    _assert_qwen_fp32_single_round_cache_growth_preserves_cpu_fp32_recipe()
 
 
-def _assert_qwen_class_b_cache_growth_preserves_cpu_fp32_recipe():
+def _assert_qwen_fp32_single_round_cache_growth_preserves_cpu_fp32_recipe():
     config = _config("default")
     config.max_position_embeddings = 8
     config._rope_native = True
-    config._rope_class_b = True
+    config._rope_fp32_single_round = True
     config._glm52_exact_contract = False
     config._qwen35_exact_contract = True
     rotary = RotaryEmbedding(config)
@@ -177,14 +177,14 @@ def test_exact_architectures_build_default_rope_tables_on_their_serving_devices(
 
     glm_config = _config("default")
     glm_config._rope_native = True
-    glm_config._rope_class_b = True
+    glm_config._rope_fp32_single_round = True
     glm_config._glm52_exact_contract = True
     glm_config._qwen35_exact_contract = False
     glm_rotary = RotaryEmbedding(glm_config)
 
     qwen_config = _config("default")
     qwen_config._rope_native = True
-    qwen_config._rope_class_b = False
+    qwen_config._rope_fp32_single_round = False
     qwen_config._glm52_exact_contract = False
     qwen_config._qwen35_exact_contract = True
     qwen_rotary = RotaryEmbedding(qwen_config)

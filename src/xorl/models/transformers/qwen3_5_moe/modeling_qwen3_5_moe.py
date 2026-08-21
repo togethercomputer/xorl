@@ -336,7 +336,7 @@ class Qwen3_5MoeAttention(nn.Module):
             key_states,
             cos,
             sin,
-            class_b=bool(getattr(self.config, "_rope_class_b", False)),
+            fp32_single_round=bool(getattr(self.config, "_rope_fp32_single_round", False)),
         )
         if getattr(self.config, "_attention_cast_bf16", False):
             query_states = query_states.to(torch.bfloat16)

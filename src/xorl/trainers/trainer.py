@@ -713,7 +713,7 @@ class Trainer:
             qwen35_rmsnorm_family=args.model.qwen35_rmsnorm_family,
             activation_native=args.model.activation_native,
             rope_native=args.model.rope_native,
-            rope_class_b=args.model.rope_class_b,
+            rope_fp32_single_round=args.model.rope_fp32_single_round,
             attention_cast_bf16=args.model.attention_cast_bf16,
             sparse_mla_enabled=args.model.sparse_mla_enabled,
             sparse_mla_backend=args.model.sparse_mla_backend,
@@ -737,7 +737,7 @@ class Trainer:
         args.model.qwen35_rmsnorm_family = numerical_program["qwen35_rmsnorm_family"]
         args.model.activation_native = numerical_program["activation_native"]
         args.model.rope_native = numerical_program["rope_native"]
-        args.model.rope_class_b = numerical_program["rope_class_b"]
+        args.model.rope_fp32_single_round = numerical_program["rope_fp32_single_round"]
         args.model.attention_cast_bf16 = numerical_program["attention_cast_bf16"]
         args.model.sparse_mla_enabled = numerical_program["sparse_mla_enabled"]
         args.model.sparse_mla_backend = numerical_program["sparse_mla_backend"]

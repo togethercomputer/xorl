@@ -25,7 +25,7 @@ from .exact_contract import (
 )
 from .layers.attention import get_attention_fn
 from .layers.normalization import set_rmsnorm_mode
-from .layers.rope import set_rope_class_b, set_rope_native
+from .layers.rope import set_rope_fp32_single_round, set_rope_native
 from .loader import ModelLoader, get_loader
 from .transformers.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
 from .transformers.deepseek_v3.support import validate_deepseek_v3_router_settings
@@ -522,7 +522,7 @@ class ResolvedModelNumericalProgram:
     qwen35_rmsnorm_family: Optional[str]
     activation_native: bool
     rope_native: bool
-    rope_class_b: bool
+    rope_fp32_single_round: bool
     attention_cast_bf16: bool
     sparse_mla_enabled: bool
     sparse_mla_backend: str
@@ -532,42 +532,42 @@ def _resolve_rope_modes(
     config: PretrainedConfig,
     *,
     rope_native: Optional[bool],
-    rope_class_b: Optional[bool],
+    rope_fp32_single_round: Optional[bool],
 ) -> tuple[bool, bool]:
     if _is_exact_glm52(config):
-        if rope_native is False or rope_class_b is False:
+        if rope_native is False or rope_fp32_single_round is False:
             raise ValueError(
                 "Canonical GLM-5.2 requires native Class-B RoPE; explicit rope_native=false "
-                "or rope_class_b=false is incompatible with the model's numerical contract"
+                "or rope_fp32_single_round=false is incompatible with the model's numerical contract"
             )
         return True, True
 
     if _is_exact_qwen35(config):
-        if rope_native is False or rope_class_b is False:
+        if rope_native is False or rope_fp32_single_round is False:
             raise ValueError(
                 "Exact Qwen3.5-family server training requires native Class-B RoPE; "
-                "explicit rope_native=false or rope_class_b=false is incompatible "
+                "explicit rope_native=false or rope_fp32_single_round=false is incompatible "
                 "with the model's numerical contract"
             )
         return True, True
 
     if _is_exact_qwen3_dense(config):
-        if rope_native is False or rope_class_b is False:
+        if rope_native is False or rope_fp32_single_round is False:
             raise ValueError(
                 "Exact dense Qwen3 server training requires native Class-B RoPE; "
-                "explicit rope_native=false or rope_class_b=false is incompatible "
+                "explicit rope_native=false or rope_fp32_single_round=false is incompatible "
                 "with the model's numerical contract"
             )
         return True, True
 
     effective_rope_native = bool(rope_native)
-    effective_rope_class_b = bool(rope_class_b)
-    if effective_rope_class_b and not effective_rope_native:
+    effective_rope_fp32_single_round = bool(rope_fp32_single_round)
+    if effective_rope_fp32_single_round and not effective_rope_native:
         raise ValueError(
-            "rope_class_b=True requires rope_native=True: the Class-B contract uses "
+            "rope_fp32_single_round=True requires rope_native=True: the Class-B contract uses "
             "the CPU-built serving-layout cos/sin cache selected by rope_native"
         )
-    return effective_rope_native, effective_rope_class_b
+    return effective_rope_native, effective_rope_fp32_single_round
 
 
 def resolve_model_numerical_program(
@@ -580,7 +580,7 @@ def resolve_model_numerical_program(
     rmsnorm_mode: Optional[str],
     activation_native: bool,
     rope_native: Optional[bool],
-    rope_class_b: Optional[bool],
+    rope_fp32_single_round: Optional[bool],
     attention_cast_bf16: bool,
     sparse_mla_enabled: Optional[bool],
     sparse_mla_backend: Optional[str],
@@ -593,10 +593,10 @@ def resolve_model_numerical_program(
     explicit values fail before weights are loaded.
     """
 
-    effective_rope_native, effective_rope_class_b = _resolve_rope_modes(
+    effective_rope_native, effective_rope_fp32_single_round = _resolve_rope_modes(
         config,
         rope_native=rope_native,
-        rope_class_b=rope_class_b,
+        rope_fp32_single_round=rope_fp32_single_round,
     )
     if qwen35_rmsnorm_family not in (None, "v1", "v2"):
         raise ValueError(f"qwen35_rmsnorm_family must be one of None, 'v1', or 'v2'; got {qwen35_rmsnorm_family!r}")
@@ -627,7 +627,7 @@ def resolve_model_numerical_program(
             qwen35_rmsnorm_family="v2",
             activation_native=True,
             rope_native=True,
-            rope_class_b=effective_rope_class_b,
+            rope_fp32_single_round=effective_rope_fp32_single_round,
             attention_cast_bf16=True,
             sparse_mla_enabled=False,
             sparse_mla_backend="auto",
@@ -657,7 +657,7 @@ def resolve_model_numerical_program(
             qwen35_rmsnorm_family=None,
             activation_native=False,
             rope_native=True,
-            rope_class_b=effective_rope_class_b,
+            rope_fp32_single_round=effective_rope_fp32_single_round,
             attention_cast_bf16=False,
             sparse_mla_enabled=False,
             sparse_mla_backend="auto",
@@ -694,7 +694,7 @@ def resolve_model_numerical_program(
             qwen35_rmsnorm_family=None,
             activation_native=False,
             rope_native=False,
-            rope_class_b=False,
+            rope_fp32_single_round=False,
             attention_cast_bf16=False,
             sparse_mla_enabled=False,
             sparse_mla_backend="auto",
@@ -714,7 +714,7 @@ def resolve_model_numerical_program(
             qwen35_rmsnorm_family=None,
             activation_native=activation_native,
             rope_native=effective_rope_native,
-            rope_class_b=effective_rope_class_b,
+            rope_fp32_single_round=effective_rope_fp32_single_round,
             attention_cast_bf16=attention_cast_bf16,
             sparse_mla_enabled=False if sparse_mla_enabled is None else sparse_mla_enabled,
             sparse_mla_backend=sparse_mla_backend or "auto",
@@ -751,7 +751,7 @@ def resolve_model_numerical_program(
         qwen35_rmsnorm_family=None,
         activation_native=False,
         rope_native=True,
-        rope_class_b=True,
+        rope_fp32_single_round=True,
         attention_cast_bf16=False,
         sparse_mla_enabled=True,
         sparse_mla_backend="flashmla",
@@ -809,7 +809,7 @@ def build_foundation_model(
     qwen35_rmsnorm_family: Optional[Literal["v1", "v2"]] = None,
     activation_native: bool = False,
     rope_native: Optional[bool] = None,
-    rope_class_b: Optional[bool] = None,
+    rope_fp32_single_round: Optional[bool] = None,
     attention_cast_bf16: bool = False,
     sparse_mla_enabled: Optional[bool] = None,
     sparse_mla_backend: Optional[str] = None,
@@ -945,7 +945,7 @@ def build_foundation_model(
         qwen35_rmsnorm_family=qwen35_rmsnorm_family,
         activation_native=activation_native,
         rope_native=rope_native,
-        rope_class_b=rope_class_b,
+        rope_fp32_single_round=rope_fp32_single_round,
         attention_cast_bf16=attention_cast_bf16,
         sparse_mla_enabled=sparse_mla_enabled,
         sparse_mla_backend=sparse_mla_backend,
@@ -965,9 +965,9 @@ def build_foundation_model(
     # rotary helper.
     if not (canonical_glm52 or config._qwen35_exact_contract):
         set_rope_native(numerical_program.rope_native)
-        set_rope_class_b(numerical_program.rope_class_b)
+        set_rope_fp32_single_round(numerical_program.rope_fp32_single_round)
     config._rope_native = numerical_program.rope_native
-    config._rope_class_b = numerical_program.rope_class_b
+    config._rope_fp32_single_round = numerical_program.rope_fp32_single_round
     config._resolved_numerical_program = asdict(numerical_program)
     if canonical_glm52:
         logger.info_rank0(f"Canonical GLM-5.2 numerical program: {numerical_program}")

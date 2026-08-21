@@ -49,7 +49,7 @@ def _program(config, **overrides):
         "rmsnorm_mode": None,
         "activation_native": False,
         "rope_native": None,
-        "rope_class_b": None,
+        "rope_fp32_single_round": None,
         "attention_cast_bf16": False,
         "sparse_mla_enabled": None,
         "sparse_mla_backend": None,
@@ -68,12 +68,12 @@ def test_dense_qwen3_resolves_shared_exact_program():
     assert program.rmsnorm_mode == "sglang_fused"
     assert not program.activation_native
     assert program.rope_native
-    assert program.rope_class_b
+    assert program.rope_fp32_single_round
     assert resolve_cross_entropy_mode(config, None) == "bi_fused"
     assert _resolve_rope_modes(
         config,
         rope_native=None,
-        rope_class_b=None,
+        rope_fp32_single_round=None,
     ) == (True, True)
 
 
@@ -85,7 +85,7 @@ def test_dense_qwen3_resolves_shared_exact_program():
         ("rmsnorm_mode", "native"),
         ("activation_native", True),
         ("rope_native", False),
-        ("rope_class_b", False),
+        ("rope_fp32_single_round", False),
     ],
 )
 def test_dense_qwen3_rejects_numerical_opt_out(name, value):

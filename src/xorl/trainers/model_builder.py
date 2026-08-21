@@ -293,7 +293,7 @@ def build_training_model(
     qwen35_rmsnorm_family: Optional[str] = None,
     activation_native: bool = False,
     rope_native: Optional[bool] = None,
-    rope_class_b: Optional[bool] = None,
+    rope_fp32_single_round: Optional[bool] = None,
     attention_cast_bf16: bool = False,
     sparse_mla_enabled: Optional[bool] = None,
     sparse_mla_backend: Optional[str] = None,
@@ -325,9 +325,9 @@ def build_training_model(
             "Use physical pipeline parallelism with one stage per rank "
             "(pipeline_parallel_virtual_stages=1)."
         )
-    if rope_class_b is True and rope_native is False:
+    if rope_fp32_single_round is True and rope_native is False:
         raise ValueError(
-            "rope_class_b=True requires rope_native=True: the Class-B contract uses "
+            "rope_fp32_single_round=True requires rope_native=True: the Class-B contract uses "
             "the CPU-built serving-layout cos/sin cache selected by rope_native"
         )
     if block_fp8_qlora_training and (not enable_lora or not enable_qlora):
@@ -398,7 +398,7 @@ def build_training_model(
         qwen35_rmsnorm_family=qwen35_rmsnorm_family,
         activation_native=activation_native,
         rope_native=rope_native,
-        rope_class_b=rope_class_b,
+        rope_fp32_single_round=rope_fp32_single_round,
         attention_cast_bf16=attention_cast_bf16,
         sparse_mla_enabled=sparse_mla_enabled,
         sparse_mla_backend=sparse_mla_backend,
@@ -421,7 +421,7 @@ def build_training_model(
     # Set module-level flags for rope and activation
     if getattr(model.config, "_rope_native", False):
         logger.info_rank0("Using native RoPE (flash_attn fused kernel disabled)")
-    if getattr(model.config, "_rope_class_b", False):
+    if getattr(model.config, "_rope_fp32_single_round", False):
         logger.info_rank0(
             "Using compiled Class-B RoPE fp32-chain numerics aligned with SGLang's stock fused CUDA kernel"
         )

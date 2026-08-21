@@ -135,12 +135,12 @@ def _bf16_mixed_precision_policy(
 def _decoder_bf16_mixed_precision_policy(
     reduce_dtype: torch.dtype = torch.float32,
     *,
-    class_b: bool = False,
+    fp32_single_round: bool = False,
 ):
     """Preserve the fp32 RoPE table when the Class-B contract is active."""
     return _bf16_mixed_precision_policy(
         reduce_dtype=reduce_dtype,
-        cast_forward_inputs=not class_b,
+        cast_forward_inputs=not fp32_single_round,
     )
 
 
@@ -443,7 +443,7 @@ def parallelize_model_fsdp2(
         fsdp_kwargs["mp_policy"] = mp_policy
         decoder_mp_policy = _decoder_bf16_mixed_precision_policy(
             reduce_dtype=reduce_dtype,
-            class_b=bool(getattr(model.config, "_rope_class_b", False)),
+            fp32_single_round=bool(getattr(model.config, "_rope_fp32_single_round", False)),
         )
         if not decoder_mp_policy.cast_forward_inputs:
             logger.info_rank0(

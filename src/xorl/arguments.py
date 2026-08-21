@@ -585,12 +585,17 @@ class ModelArguments:
         default=None,
         metadata={"help": "Use native RoPE. Auto-enables for canonical GLM-5.2 when omitted."},
     )
-    rope_class_b: Optional[bool] = field(
+    rope_fp32_single_round: Optional[bool] = field(
         default=None,
         metadata={
-            "help": "Use compiled Class-B RoPE fp32-chain numerics. Auto-enables for canonical GLM-5.2 and "
-            "exact Qwen3.5-family training when omitted."
+            "help": "Use the compiled fp32 single-round RoPE numerics (one fp32 chain, one final round; "
+            "formerly 'Class-B'). Auto-enables for canonical GLM-5.2 and exact Qwen3.5-family training "
+            "when omitted."
         },
+    )
+    rope_class_b: Optional[bool] = field(
+        default=None,
+        metadata={"help": "DEPRECATED alias for rope_fp32_single_round."},
     )
     attention_cast_bf16: bool = field(
         default=False, metadata={"help": "Explicitly cast Q/K to bfloat16 after RoPE for SGLang alignment."}
@@ -624,6 +629,16 @@ class ModelArguments:
     )
 
     def __post_init__(self):
+        if self.rope_class_b is not None:
+            import warnings
+
+            warnings.warn(
+                "rope_class_b is deprecated; use rope_fp32_single_round",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if self.rope_fp32_single_round is None:
+                self.rope_fp32_single_round = self.rope_class_b
         if self.config_path is None and self.model_path is None:
             raise ValueError("`config_path` must be specified when `model_path` is None.")
 

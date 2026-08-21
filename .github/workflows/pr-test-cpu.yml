@@ -75,7 +75,7 @@ jobs:
               tests/distributed/test_native_fp8_fsdp2_materialization.py
               tests/distributed/test_bi_trunk_linear_fsdp.py
               tests/distributed/test_qwen35_lora_projection_fsdp2.py
-              tests/distributed/test_rope_class_b_fsdp_transport.py
+              tests/distributed/test_rope_fp32_single_round_fsdp_transport.py
               tests/distributed/test_torch_parallelize_policies.py
               tests/distributed/test_parallel_plan_meta_slice.py
 

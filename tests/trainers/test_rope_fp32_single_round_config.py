@@ -15,7 +15,7 @@ from xorl.models.auto import (
     resolve_cross_entropy_mode,
     resolve_model_numerical_program,
 )
-from xorl.models.layers.rope import RotaryEmbedding, rope_class_b_enabled, set_rope_class_b
+from xorl.models.layers.rope import RotaryEmbedding, rope_fp32_single_round_enabled, set_rope_fp32_single_round
 from xorl.models.transformers.glm5.configuration_glm5 import Glm5Config
 from xorl.models.transformers.qwen3_5.configuration_qwen3_5 import Qwen3_5Config
 from xorl.models.transformers.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeConfig
@@ -72,29 +72,29 @@ def _exact_qwen35_moe_config() -> Qwen3_5MoeConfig:
     )
 
 
-def test_class_b_requires_serving_table_provenance():
-    with pytest.raises(ValueError, match="rope_class_b=True requires rope_native=True"):
+def test_fp32_single_round_requires_serving_table_provenance():
+    with pytest.raises(ValueError, match="rope_fp32_single_round=True requires rope_native=True"):
         build_training_model(
             config_path="unused",
             weights_path="unused",
-            rope_class_b=True,
+            rope_fp32_single_round=True,
             rope_native=False,
         )
 
 
-def test_class_b_selector_can_be_reset():
-    set_rope_class_b(True)
-    assert rope_class_b_enabled()
-    set_rope_class_b(False)
-    assert not rope_class_b_enabled()
+def test_fp32_single_round_selector_can_be_reset():
+    set_rope_fp32_single_round(True)
+    assert rope_fp32_single_round_enabled()
+    set_rope_fp32_single_round(False)
+    assert not rope_fp32_single_round_enabled()
 
 
-def test_canonical_glm_resolves_native_class_b_without_environment(monkeypatch):
+def test_canonical_glm_resolves_native_fp32_single_round_without_environment(monkeypatch):
     monkeypatch.delenv("XORL_ROPE_CLASS_B", raising=False)
     config = _exact_glm52_config()
-    assert _resolve_rope_modes(config, rope_native=None, rope_class_b=None) == (True, True)
+    assert _resolve_rope_modes(config, rope_native=None, rope_fp32_single_round=None) == (True, True)
 
-    set_rope_class_b(False)
+    set_rope_fp32_single_round(False)
     rotary = RotaryEmbedding(config)
     cos, sin = rotary(
         torch.zeros((1, 1, config.hidden_size), dtype=torch.bfloat16),
@@ -103,18 +103,18 @@ def test_canonical_glm_resolves_native_class_b_without_environment(monkeypatch):
     assert cos.dtype is sin.dtype is torch.float32
 
 
-@pytest.mark.parametrize("name", ["rope_native", "rope_class_b"])
-def test_canonical_glm_rejects_explicit_class_b_opt_out(name):
+@pytest.mark.parametrize("name", ["rope_native", "rope_fp32_single_round"])
+def test_canonical_glm_rejects_explicit_fp32_single_round_opt_out(name):
     config = _exact_glm52_config()
-    kwargs = {"rope_native": None, "rope_class_b": None, name: False}
+    kwargs = {"rope_native": None, "rope_fp32_single_round": None, name: False}
     with pytest.raises(ValueError, match="Canonical GLM-5.2 requires native Class-B RoPE"):
         _resolve_rope_modes(config, **kwargs)
 
 
 def test_non_glm_rope_defaults_and_opt_in_are_unchanged():
     config = PretrainedConfig()
-    assert _resolve_rope_modes(config, rope_native=None, rope_class_b=None) == (False, False)
-    assert _resolve_rope_modes(config, rope_native=True, rope_class_b=True) == (True, True)
+    assert _resolve_rope_modes(config, rope_native=None, rope_fp32_single_round=None) == (False, False)
+    assert _resolve_rope_modes(config, rope_native=True, rope_fp32_single_round=True) == (True, True)
 
 
 def test_canonical_glm_resolves_complete_exact_program(monkeypatch):
@@ -137,7 +137,7 @@ def test_canonical_glm_resolves_complete_exact_program(monkeypatch):
         rmsnorm_mode=None,
         activation_native=False,
         rope_native=None,
-        rope_class_b=None,
+        rope_fp32_single_round=None,
         attention_cast_bf16=False,
         sparse_mla_enabled=None,
         sparse_mla_backend="auto",
@@ -150,7 +150,7 @@ def test_canonical_glm_resolves_complete_exact_program(monkeypatch):
         qwen35_rmsnorm_family=None,
         activation_native=False,
         rope_native=True,
-        rope_class_b=True,
+        rope_fp32_single_round=True,
         attention_cast_bf16=False,
         sparse_mla_enabled=True,
         sparse_mla_backend="flashmla",
@@ -181,7 +181,7 @@ def test_canonical_glm_rejects_incompatible_numerical_override(override, value):
         "rmsnorm_mode": None,
         "activation_native": False,
         "rope_native": None,
-        "rope_class_b": None,
+        "rope_fp32_single_round": None,
         "attention_cast_bf16": False,
         "sparse_mla_enabled": None,
         "sparse_mla_backend": "auto",
@@ -208,7 +208,7 @@ def test_non_glm_numerical_defaults_are_preserved():
         rmsnorm_mode=None,
         activation_native=False,
         rope_native=None,
-        rope_class_b=None,
+        rope_fp32_single_round=None,
         attention_cast_bf16=False,
         sparse_mla_enabled=None,
         sparse_mla_backend=None,
@@ -221,7 +221,7 @@ def test_non_glm_numerical_defaults_are_preserved():
         qwen35_rmsnorm_family=None,
         activation_native=False,
         rope_native=False,
-        rope_class_b=False,
+        rope_fp32_single_round=False,
         attention_cast_bf16=False,
         sparse_mla_enabled=False,
         sparse_mla_backend="auto",
@@ -243,7 +243,7 @@ def test_exact_qwen35_resolves_the_certified_numerical_program(config_factory):
         rmsnorm_mode=None,
         activation_native=False,
         rope_native=None,
-        rope_class_b=None,
+        rope_fp32_single_round=None,
         attention_cast_bf16=False,
         sparse_mla_enabled=None,
         sparse_mla_backend=None,
@@ -257,7 +257,7 @@ def test_exact_qwen35_resolves_the_certified_numerical_program(config_factory):
         qwen35_rmsnorm_family="v2",
         activation_native=True,
         rope_native=True,
-        rope_class_b=True,
+        rope_fp32_single_round=True,
         attention_cast_bf16=True,
         sparse_mla_enabled=False,
         sparse_mla_backend="auto",
@@ -266,14 +266,14 @@ def test_exact_qwen35_resolves_the_certified_numerical_program(config_factory):
 
 
 @pytest.mark.parametrize("config_factory", [_exact_qwen35_dense_config, _exact_qwen35_moe_config])
-def test_exact_qwen35_resolves_class_b_and_rejects_opt_out(config_factory):
+def test_exact_qwen35_resolves_fp32_single_round_and_rejects_opt_out(config_factory):
     config = config_factory()
     config._qwen35_exact_contract = True
 
-    default_modes = _resolve_rope_modes(config, rope_native=None, rope_class_b=None)
+    default_modes = _resolve_rope_modes(config, rope_native=None, rope_fp32_single_round=None)
     assert default_modes == (True, True)
     with pytest.raises(ValueError, match="requires native Class-B RoPE"):
-        _resolve_rope_modes(config, rope_native=None, rope_class_b=False)
+        _resolve_rope_modes(config, rope_native=None, rope_fp32_single_round=False)
 
     program = resolve_model_numerical_program(
         config,
@@ -284,13 +284,13 @@ def test_exact_qwen35_resolves_class_b_and_rejects_opt_out(config_factory):
         rmsnorm_mode=None,
         activation_native=False,
         rope_native=None,
-        rope_class_b=True,
+        rope_fp32_single_round=True,
         attention_cast_bf16=False,
         sparse_mla_enabled=None,
         sparse_mla_backend=None,
     )
     assert program.rope_native is True
-    assert program.rope_class_b is True
+    assert program.rope_fp32_single_round is True
 
 
 @pytest.mark.parametrize("config_factory", [_exact_qwen35_dense_config, _exact_qwen35_moe_config])
@@ -306,7 +306,7 @@ def test_exact_qwen35_rmsnorm_v2_is_the_architecture_scoped_default(config_facto
         "qwen35_rmsnorm_family": None,
         "activation_native": False,
         "rope_native": None,
-        "rope_class_b": None,
+        "rope_fp32_single_round": None,
         "attention_cast_bf16": False,
         "sparse_mla_enabled": None,
         "sparse_mla_backend": None,
@@ -330,7 +330,7 @@ def test_non_qwen_rejects_qwen35_rmsnorm_v2():
             qwen35_rmsnorm_family="v2",
             activation_native=False,
             rope_native=None,
-            rope_class_b=None,
+            rope_fp32_single_round=None,
             attention_cast_bf16=False,
             sparse_mla_enabled=None,
             sparse_mla_backend=None,
@@ -359,7 +359,7 @@ def test_exact_qwen35_rejects_incompatible_numerical_override(override, value):
         "rmsnorm_mode": None,
         "activation_native": False,
         "rope_native": None,
-        "rope_class_b": None,
+        "rope_fp32_single_round": None,
         "attention_cast_bf16": False,
         "sparse_mla_enabled": None,
         "sparse_mla_backend": None,

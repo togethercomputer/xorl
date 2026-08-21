@@ -26,7 +26,7 @@ from xorl.models.layers.attention import AttentionKwargs, update_causal_mask
 from xorl.models.layers.attention.backend import ATTENTION_FUNCTIONS
 from xorl.models.layers.moe import MoEBlock, MoEExperts
 from xorl.models.layers.normalization import RMSNorm
-from xorl.models.layers.rope import rope_class_b_enabled, stock_fused_apply_rotary_pos_emb
+from xorl.models.layers.rope import rope_fp32_single_round_enabled, stock_fused_apply_rotary_pos_emb
 from xorl.models.outputs import MoeCausalLMOutput, MoeModelOutput
 from xorl.models.transformers.gpt_oss import parallelize
 from xorl.models.transformers.gpt_oss.checkpoint_handler import GptOssCheckpointHandler
@@ -85,7 +85,7 @@ def gpt_oss_apply_rotary_pos_emb(
         cos: ``[batch, seq, head_dim // 2]``
         sin: ``[batch, seq, head_dim // 2]``
     """
-    if rope_class_b_enabled() and query.is_cuda:
+    if rope_fp32_single_round_enabled() and query.is_cuda:
         return stock_fused_apply_rotary_pos_emb(query, key, cos, sin, doubled=False)
 
     # Unsqueeze for head dimension: [batch, seq, 1, head_dim // 2]
@@ -160,7 +160,7 @@ class GptOssRotaryEmbedding(nn.Module):
         freqs = torch.einsum("bi,j->bij", position_ids.float(), inv_freq)
         cos = freqs.cos() * concentration
         sin = freqs.sin() * concentration
-        if rope_class_b_enabled():
+        if rope_fp32_single_round_enabled():
             return cos.float(), sin.float()
         return cos, sin
 

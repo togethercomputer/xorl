@@ -119,9 +119,9 @@ def qwen3_5_apply_rotary_pos_emb(
     cos: torch.Tensor,
     sin: torch.Tensor,
     interleaved: bool = False,
-    class_b: bool = False,
+    fp32_single_round: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    if class_b:
+    if fp32_single_round:
         if not q.is_cuda or not k.is_cuda:
             raise RuntimeError("Qwen3.5-family Class-B RoPE requires CUDA q/k tensors")
         if q.dtype is not torch.bfloat16 or k.dtype is not torch.bfloat16:

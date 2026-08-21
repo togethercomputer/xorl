@@ -271,7 +271,7 @@ class Glm5MlaAttention(nn.Module):
             cos,
             sin,
             interleaved=getattr(self.config, "rope_interleave", True),
-            class_b=bool(getattr(self.config, "_rope_class_b", False) or glm52_exact_forward_enabled(self.config)),
+            fp32_single_round=bool(getattr(self.config, "_rope_fp32_single_round", False) or glm52_exact_forward_enabled(self.config)),
         )
         k_rot = k_rot.expand(*k_pass.shape[:-1], -1)
 
@@ -461,7 +461,7 @@ class Glm5Attention(Glm5MlaAttention):
             cos,
             sin,
             interleaved=getattr(self.config, "rope_interleave", True),
-            class_b=bool(getattr(self.config, "_rope_class_b", False) or glm52_exact_forward_enabled(self.config)),
+            fp32_single_round=bool(getattr(self.config, "_rope_fp32_single_round", False) or glm52_exact_forward_enabled(self.config)),
         )
         k_pe = k_pe.squeeze(2)
 

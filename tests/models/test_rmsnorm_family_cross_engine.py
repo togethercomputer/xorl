@@ -74,13 +74,13 @@ def test_rmsnorm_site_class_cross_engine_bitwise_policy():
             family2 = sgl_bio.rms_norm_residual_tree_batch_invariant(x, w, EPS)
             assert not torch.equal(serving_out, family2), "serving families agree on the seed shape; gate is vacuous"
 
-    _assert_presummed_residual_tree_site_class_bitwise()
-    _assert_post_attention_residual_site_class_bitwise()
+    _assert_presummed_residual_tree_site_fp32_single_rounditwise()
+    _assert_post_attention_residual_site_fp32_single_rounditwise()
     _assert_zero_centered_family1_twin_bitwise()
     _assert_zero_centered_families_v2_candidate_bitwise()
 
 
-def _assert_presummed_residual_tree_site_class_bitwise():
+def _assert_presummed_residual_tree_site_fp32_single_rounditwise():
     """Input layernorm at layer>0 / final norm: xorl normalizes the pre-summed
     single tensor through the residual tree; SGLang fuses the add. On the same
     summed value both must produce identical bits (gate via a zero residual and
@@ -100,7 +100,7 @@ def _assert_presummed_residual_tree_site_class_bitwise():
         assert torch.equal(xorl_out, serving_funnel), f"pre-summed funnel {shape} diverged"
 
 
-def _assert_post_attention_residual_site_class_bitwise():
+def _assert_post_attention_residual_site_fp32_single_rounditwise():
     """Post-attention layernorm: xorl's fused residual dispatch must bit-match
     SGLang's fused residual dispatch, on both the normed output and the carried
     residual stream."""

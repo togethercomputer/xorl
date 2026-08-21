@@ -38,19 +38,19 @@ logger = logging.getLogger(__name__)
 # it dynamo silently falls back to eager -- reverting those layers to Class A with no error and
 # no log line. That is indistinguishable from a numerics bug downstream, so pin the budget and
 # make exhaustion loud.
-_ROPE_CLASS_B_RECOMPILE_LIMIT = 2048
-_ROPE_CLASS_B_ACCUMULATED_LIMIT = 8192
+_ROPE_SINGLE_ROUND_RECOMPILE_LIMIT = 2048
+_ROPE_SINGLE_ROUND_ACCUMULATED_LIMIT = 8192
 
 
 def _pin_compile_budget() -> None:
     cfg = torch._dynamo.config
-    cfg.recompile_limit = max(getattr(cfg, "recompile_limit", 0), _ROPE_CLASS_B_RECOMPILE_LIMIT)
+    cfg.recompile_limit = max(getattr(cfg, "recompile_limit", 0), _ROPE_SINGLE_ROUND_RECOMPILE_LIMIT)
     cfg.accumulated_recompile_limit = max(
-        getattr(cfg, "accumulated_recompile_limit", 0), _ROPE_CLASS_B_ACCUMULATED_LIMIT
+        getattr(cfg, "accumulated_recompile_limit", 0), _ROPE_SINGLE_ROUND_ACCUMULATED_LIMIT
     )
     # A silent eager fallback breaks the zero-K3 contract, so fail instead. Opt out with
-    # XORL_ROPE_CLASS_B_ALLOW_FALLBACK=1 for throughput experiments outside the contract.
-    if os.environ.get("XORL_ROPE_CLASS_B_ALLOW_FALLBACK") != "1" and hasattr(cfg, "fail_on_recompile_limit_hit"):
+    # XORL_ROPE_SINGLE_ROUND_ALLOW_FALLBACK=1 for throughput experiments outside the contract.
+    if os.environ.get("XORL_ROPE_SINGLE_ROUND_ALLOW_FALLBACK") != "1" and hasattr(cfg, "fail_on_recompile_limit_hit"):
         cfg.fail_on_recompile_limit_hit = True
     logger.info(
         "rope Class B: recompile_limit=%s accumulated=%s fail_on_limit=%s",
@@ -85,7 +85,7 @@ def _rotary_emb(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, is_neox: 
 _rotary_emb_compiled = torch.compile(dynamic=True)(_rotary_emb)
 
 
-class _ClassBRoPE(torch.autograd.Function):
+class _SingleRoundRoPE(torch.autograd.Function):
     """Class-B rope with a hand-written backward.
 
     RoPE is a block rotation, so its adjoint is the same rotation driven by a negated sin.
@@ -115,7 +115,7 @@ class _ClassBRoPE(torch.autograd.Function):
         )
 
 
-def build_class_b_cos_sin(cos, sin, *, doubled: bool = True):
+def build_single_round_cos_sin(cos, sin, *, doubled: bool = True):
     """Flatten the trainer's cos/sin into the fp32 ``[num_tokens, rotary_dim // 2]`` serving layout.
 
     With ``doubled`` (the default) cos/sin arrive in the ``[..., rotary_dim]`` layout the shared
@@ -126,7 +126,7 @@ def build_class_b_cos_sin(cos, sin, *, doubled: bool = True):
     return cos[..., :half].reshape(-1, half).float(), sin[..., :half].reshape(-1, half).float()
 
 
-def class_b_apply_rotary_pos_emb(q, k, cos, sin, *, interleaved: bool = False, doubled: bool = True):
+def single_round_apply_rotary_pos_emb(q, k, cos, sin, *, interleaved: bool = False, doubled: bool = True):
     """Class-B RoPE over ``[B, S, H, D]`` q/k.
 
     ``interleaved`` selects GPT-J pairing; the default is the half-split Neox pairing. Partial
@@ -138,14 +138,14 @@ def class_b_apply_rotary_pos_emb(q, k, cos, sin, *, interleaved: bool = False, d
             f"got cos={cos.dtype}, sin={sin.dtype}. A mixed-precision wrapper "
             "likely downcast the table in transit."
         )
-    cos_f, sin_f = build_class_b_cos_sin(cos, sin, doubled=doubled)
+    cos_f, sin_f = build_single_round_cos_sin(cos, sin, doubled=doubled)
     rotary_dim = 2 * cos_f.shape[-1]
     batch, seq_len = q.shape[0], q.shape[1]
     num_tokens = batch * seq_len
 
     q_rot = q[..., :rotary_dim].reshape(num_tokens, -1, rotary_dim)
     k_rot = k[..., :rotary_dim].reshape(num_tokens, -1, rotary_dim)
-    q_out, k_out = _ClassBRoPE.apply(q_rot, k_rot, cos_f, sin_f, not interleaved)
+    q_out, k_out = _SingleRoundRoPE.apply(q_rot, k_rot, cos_f, sin_f, not interleaved)
     q_out = q_out.view(batch, seq_len, -1, rotary_dim)
     k_out = k_out.view(batch, seq_len, -1, rotary_dim)
 
@@ -156,6 +156,6 @@ def class_b_apply_rotary_pos_emb(q, k, cos, sin, *, interleaved: bool = False, d
 
 
 __all__ = [
-    "build_class_b_cos_sin",
-    "class_b_apply_rotary_pos_emb",
+    "build_single_round_cos_sin",
+    "single_round_apply_rotary_pos_emb",
 ]

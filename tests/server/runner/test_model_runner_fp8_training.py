@@ -18,7 +18,7 @@ def _fake_model_config() -> SimpleNamespace:
             "rmsnorm_mode": "eager",
             "activation_native": False,
             "rope_native": False,
-            "rope_class_b": False,
+            "rope_fp32_single_round": False,
             "attention_cast_bf16": False,
             "sparse_mla_enabled": False,
             "sparse_mla_backend": None,

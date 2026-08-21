@@ -53,7 +53,7 @@ These stored defaults are resolved after the model architecture is known. Ordina
 | `rmsnorm_mode` | `null` (resolved) | Ordinary models and exact DSV4-Flash resolve to `native`; exact dense Qwen3, Qwen3.5-family, and GLM-5.2 programs require `sglang_fused`. Other explicit diagnostic modes are also accepted by the argument type. |
 | `activation_native` | `false` (resolved) | Use native SiLU instead of the fused Triton kernel. Exact Qwen3.5-family programs resolve this to `true`; the other exact programs retain their architecture-owned fused arithmetic. |
 | `rope_native` | `null` (resolved) | Ordinary models and exact DSV4-Flash resolve to `false`; exact dense Qwen3, Qwen3.5-family, and GLM-5.2 programs resolve to `true`. |
-| `rope_class_b` | `null` (resolved) | Select the compiled Class-B RoPE FP32-chain path. It is enabled for exact dense Qwen3, Qwen3.5-family, and GLM-5.2 programs; DSV4 owns a separate RoPE program. |
+| `rope_fp32_single_round` | `null` (resolved) | Select the compiled Class-B RoPE FP32-chain path. It is enabled for exact dense Qwen3, Qwen3.5-family, and GLM-5.2 programs; DSV4 owns a separate RoPE program. |
 | `attention_cast_bf16` | `false` (resolved) | Explicitly cast Q/K to BF16 after RoPE. Exact Qwen3.5-family programs resolve this to `true`; dense Qwen3, GLM-5.2, and DSV4-Flash exact programs require `false`. |
 | `qwen35_rmsnorm_family` | `null` (resolved) | Exact Qwen3.5/3.6 programs require the qualified `v2` arithmetic; other architectures reject an override. |
 | `sparse_mla_enabled` | `null` (resolved) | Canonical GLM-5.2 enables the sparse-MLA path; ordinary models resolve to `false`. |

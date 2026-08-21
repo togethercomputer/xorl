@@ -55,7 +55,7 @@ serving engine and cannot be renamed unilaterally):
 | --- | --- |
 | **batch-invariant / `bi_`** | a kernel whose per-element reduction order does not depend on batch composition, so the same token produces the same bits in any batch — the property that makes trainer/sampler logprobs comparable bitwise. |
 | **K3 / "zero-K3"** | the k3 KL-divergence estimator between trainer and sampler logprobs for the same tokens; "zero-K3" = bit-identical train/serve forward, the goal of the exact contracts. |
-| **Class-A / Class-B RoPE** | the two RoPE numerics classes across the trainer/sampler pair: Class A rounds to bf16 per op (8 rounding points); Class B computes one fp32 chain with a single final round (SGLang's fused CUDA rope and its compiled RL-lane path). `rope_class_b: true` selects Class B. |
+| **Class-A / Class-B RoPE** | the two RoPE numerics classes across the trainer/sampler pair: Class A rounds to bf16 per op (8 rounding points); Class B computes one fp32 chain with a single final round (SGLang's fused CUDA rope and its compiled RL-lane path). `rope_fp32_single_round: true` selects Class B. |
 | **canonical MoE reduce** | the pinned fixed-order expert-contribution reduction (contributor-leaf arithmetic + final FP64-accumulator cast) shared with serving, versioned by `CANONICAL_MOE_REDUCE_VERSION`. |
 | **one-round SwiGLU** | the exact-contract SwiGLU with a single FP32 rounding point (`exact_fp32_silu_and_mul`), vs the generic fused SwiGLU. |
 | **families v1 / v2** | versioned batch-invariant kernel families (norms, LM head); v2 is the epilogue-stats generation. `bi_families_v2` is the serving twin module. |

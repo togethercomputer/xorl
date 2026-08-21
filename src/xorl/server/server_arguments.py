@@ -175,12 +175,17 @@ class ServerArguments:
         default=None,
         metadata={"help": "Use native RoPE. Auto-enables for canonical GLM-5.2 when omitted."},
     )
-    rope_class_b: Optional[bool] = field(
+    rope_fp32_single_round: Optional[bool] = field(
         default=None,
         metadata={
-            "help": "Use compiled Class-B RoPE fp32-chain numerics. Auto-enables for canonical GLM-5.2 and "
-            "exact Qwen3.5-family training when omitted."
+            "help": "Use the compiled fp32 single-round RoPE numerics (one fp32 chain, one final round; "
+            "formerly 'Class-B'). Auto-enables for canonical GLM-5.2 and exact Qwen3.5-family training "
+            "when omitted."
         },
+    )
+    rope_class_b: Optional[bool] = field(
+        default=None,
+        metadata={"help": "DEPRECATED alias for rope_fp32_single_round."},
     )
 
     attention_cast_bf16: bool = field(
@@ -1224,6 +1229,17 @@ class ServerArguments:
         """Validate and set defaults."""
         from xorl.fp8_training.config_compat import normalize_fp8_training_config  # noqa: PLC0415
 
+        if self.rope_class_b is not None:
+            import warnings
+
+            warnings.warn(
+                "rope_class_b is deprecated; use rope_fp32_single_round",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+            if self.rope_fp32_single_round is None:
+                self.rope_fp32_single_round = self.rope_class_b
+
         if isinstance(self.max_grad_norm, bool):
             raise ValueError("max_grad_norm must be a finite number; use a value <= 0 to disable clipping")
         try:
@@ -1496,7 +1512,7 @@ class ServerArguments:
                 "qwen35_rmsnorm_family": self.qwen35_rmsnorm_family,
                 "activation_native": self.activation_native,
                 "rope_native": self.rope_native,
-                "rope_class_b": self.rope_class_b,
+                "rope_fp32_single_round": self.rope_fp32_single_round,
                 "attention_cast_bf16": self.attention_cast_bf16,
                 "flash_attention_deterministic": self.flash_attention_deterministic,
                 "sparse_mla_enabled": self.sparse_mla_enabled,
