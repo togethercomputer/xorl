@@ -2537,6 +2537,11 @@ class MoEExperts(nn.Module):
             and self.hidden_act in {"silu", "gelu_tanh"}
             and self.swiglu_limit <= 0.0
             and not self.fp8_training_enabled
+            # The parity lane is the bf16 serving path; its grouped-GEMM
+            # backward only accepts half-precision activations. FP32 modules
+            # (e.g. unit-test fixtures) keep the stock triton tree quietly.
+            and self.gate_up_proj.dtype in (torch.bfloat16, torch.float16)
+            and self.down_proj.dtype in (torch.bfloat16, torch.float16)
         )
 
     def invalidate_sglang_fused_weight_cache(self) -> None:
