@@ -55,13 +55,14 @@ all finite).
 
 - **Hopper (SM90) only.** Imported lazily (the package validates SM90 at import time).
 - **Stock upstream tilelang (no fork)** with the `tl_gemm` builtin (>=0.1.10) AND
-  `prefer_instruction` (tile-ai/tilelang PR #2303). #2303 is merged upstream but post-`v0.1.10`,
-  so it is **not** in the PyPI `tilelang==0.1.10` wheel. `pyproject.toml` therefore pins a prebuilt
-  wheel of stock `tile-ai/tilelang@a8d93798` (includes #2303), hosted on
-  `togethercomputer/xorl-wheels` (`tilelang_0.1.10_cu131`, cp38-abi3, CUDA 13.1) — switch to PyPI
-  `tilelang>=0.1.11` once a release carrying #2303 ships. Also needs `apache-tvm-ffi==0.1.11`
-  (0.1.12 aborts at import against this wheel: duplicate FFI type registration) and
-  `z3-solver<4.16` (4.16 drops the `libz3.so.4.15` soname the wheel links).
+  `prefer_instruction` (tile-ai/tilelang PR #2303). PyPI `tilelang==0.1.11` (released
+  2026-06-08) is the first release carrying #2303, so `pyproject.toml` pins it directly —
+  it also matches the pinned SGLang tree's own tilelang pin. (Before 0.1.11 shipped, the
+  pin was a prebuilt wheel of stock `tile-ai/tilelang@a8d93798` hosted on
+  `togethercomputer/xorl-wheels` as `tilelang_0.1.10_cu131`; that wheel is retired.)
+  `apache-tvm-ffi==0.1.11` comes pinned via the SGLang tree's metadata, and
+  `z3-solver<4.16` is still required (the 0.1.11 wheel's bundled TVM dlopens the
+  `libz3.so.4.15` soname, which z3-solver 4.16 drops).
   `gemm_v1` itself is supplied in-repo by `../tilelang_gemm_v1.py` (vendored shim, quack-style
   injection), so the wheel is unmodified upstream. Stock tilelang's unified `T.gemm` (tileop
   inline-wgmma) is ~4-5x slower here.

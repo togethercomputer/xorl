@@ -49,13 +49,18 @@ jobs:
       github.event_name != 'pull_request' ||
       (!github.event.pull_request.draft &&
       github.event.pull_request.head.repo.full_name == github.repository)
-    # Scale set defined in togethercomputer/xorl-ci. Its runner pod holds the GPUs
-    # directly, so there is deliberately no `container:` here: a job container
-    # would be scheduled without GPU resources. The runner image is built FROM
-    # nvcr.io/nvidia/cuda:13.2.1-cudnn-runtime-ubuntu24.04 plus build-essential,
-    # because triton and torch._inductor compile kernels at runtime and need both
-    # a CUDA runtime and a C/C++ compiler.
-    runs-on: xorl-2-h100-gpu-runner
+    # The runner pod holds the GPUs directly, so there is deliberately no
+    # `container:` here: a job container would be scheduled without GPU
+    # resources. The runner needs a CUDA runtime and a C/C++ compiler (triton
+    # and torch._inductor compile kernels at runtime) and 2 GPUs for the
+    # distributed shard.
+    #
+    # xorl-2-h100-rc-gpu-runner is the research-common-h100 cluster's ARC scale
+    # set registered to this repository (same runner image and 2xH100 shape as
+    # the turbox xorl-2-h100-gpu-runner scale set it replaces, whose runner
+    # registrations went offline and stopped picking up jobs). ARC matches
+    # `runs-on` against the scale-set name, not the pods' extra RUNNER_LABELS.
+    runs-on: xorl-2-h100-rc-gpu-runner
     # Per shard, not for the whole lane. The unsharded run finished in 23 minutes;
     # the largest shard should be well inside this.
     timeout-minutes: 30
@@ -81,10 +86,19 @@ jobs:
           # checkout stores the token in .git/config unless told not to, where it
           # can leak into anything that later archives the workspace.
           persist-credentials: false
+          # ``uv sync`` resolves sglang to the checked-in xorl-sglang submodule
+          # (see [tool.uv.sources] in pyproject.toml), so the submodule must be
+          # present before the install step.
+          submodules: true
 
       - uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57 # v8.0.0
 
+      # SGLANG_BUILD_RUST_EXTS=none: the sglang editable's Rust extension
+      # modules (gRPC/multimodal PyO3 cores) need a cargo toolchain the runner
+      # image does not carry, and no test in this lane imports them.
       - name: Install dependencies
+        env:
+          SGLANG_BUILD_RUST_EXTS: none
         run: uv sync --group test
 
       - name: Run GPU tests

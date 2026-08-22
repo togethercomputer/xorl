@@ -10,6 +10,11 @@ from safetensors.torch import load_file as load_safetensors_file
 
 pytest.importorskip("sglang")
 
+# sglang.srt's import chain reaches flashinfer, which probes CUDA device
+# properties at import time and asserts on CPU-only torch builds.
+if not torch.cuda.is_available():
+    pytest.skip("sglang.srt serving imports require CUDA-enabled torch", allow_module_level=True)
+
 from sglang.srt.lora.layers import (  # noqa: E402
     ColumnParallelLinearWithLoRA,
     ReplicatedLinearWithLoRA,

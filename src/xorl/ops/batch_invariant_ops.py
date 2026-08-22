@@ -1430,8 +1430,10 @@ def bi_fused_add_rms_norm(
 #   3. merge — global max over chunk maxima (exact), then the rescaled sumexp
 #      accumulated in pinned chunk order; lse = gmax + log(acc).
 # All transcendentals stay inside these kernels: tl.exp/tl.log measured
-# bit-identical across triton 3.5.1 (serving venv) and 3.7.1 (trainer venv),
-# as is the fixed-tile tl.dot fp32 accumulator. VOCAB_CHUNK and STATS_BLOCK are
+# bit-identical across triton 3.5.1 and 3.7.1 back when serving and trainer
+# ran split venvs — the combined profile now pins one triton (3.6.0) for both
+# engines, so the cross-engine triton version matches by construction. The
+# fixed-tile tl.dot fp32 accumulator measured likewise. VOCAB_CHUNK and STATS_BLOCK are
 # contract constants — changing either changes the bits (the LSE reduction
 # tree). The chunk GEMM's tile config is shape-keyed via bi_gemm_configs: only
 # its BLOCK_SIZE_K (pinned there) is bit-relevant.
