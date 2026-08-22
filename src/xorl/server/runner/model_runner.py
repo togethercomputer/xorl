@@ -87,6 +87,8 @@ from xorl.ops.loss import (
     opd_loss_function,
     opd_vocab_parallel_loss_function,
     policy_loss_function,
+    value_loss_function,
+    value_prediction_function,
 )
 from xorl.optim import build_optimizer
 from xorl.server.runner.adapters import LoRAAdapterManager
@@ -527,6 +529,36 @@ class ModelRunner:
             "logprob_top_ps",
             "logprob_min_ps",
         },
+        "value_loss": {
+            "labels",
+            "target_tokens",
+            "weights",
+            "logprobs",
+            "advantages",
+            "returns",
+            "old_values",
+            "_original_position_ids",
+            "rollout_logprobs",
+            "logprob_temperatures",
+            "logprob_top_ks",
+            "logprob_top_ps",
+            "logprob_min_ps",
+        },
+        "value_prediction": {
+            "labels",
+            "target_tokens",
+            "weights",
+            "logprobs",
+            "advantages",
+            "returns",
+            "old_values",
+            "_original_position_ids",
+            "rollout_logprobs",
+            "logprob_temperatures",
+            "logprob_top_ks",
+            "logprob_top_ps",
+            "logprob_min_ps",
+        },
         "opd_loss": {
             "labels",
             "target_tokens",
@@ -933,6 +965,14 @@ class ModelRunner:
             ),
             None,
         )
+        value_head = next(
+            (
+                candidate
+                for part in self._adapter_manager.model_parts
+                if (candidate := getattr(part, "value_head", None)) is not None
+            ),
+            None,
+        )
         direct_parameter_ids: set[int] = set()
         managed_fsdp_parameter_ids: set[int] = set()
         producer_by_parameter_id: dict[int, ProducerFamily] = {}
@@ -946,7 +986,9 @@ class ModelRunner:
 
         def _walk_module_tree(module: nn.Module, *, inherited_fsdp: bool = False, direct: bool = False) -> None:
             managed_fsdp = inherited_fsdp or isinstance(module, FSDPModule)
-            direct = direct or module is lm_head
+            # The value head's weight, like lm_head's, is consumed directly by
+            # the loss instead of through the module's forward.
+            direct = direct or module is lm_head or (value_head is not None and module is value_head)
             selector = getattr(module, "adapter_gradient_producer_family", None)
             selected = selector() if callable(selector) else selector
             producer = None
@@ -1282,6 +1324,10 @@ class ModelRunner:
             guard_payload.update(expert_guard_by_parameter_id.get(id(parameter), {}))
             guard_payload.update(exact_lm_head_guard_by_parameter_id.get(id(parameter), {}))
             guard_payloads[name] = guard_payload
+            # Policy-loss steps never touch the value head, so its factors may
+            # legitimately have no gradient; every other adapter factor keeps
+            # the strict presence contract.
+            is_value_head_param = name.startswith("value_head.") or ".value_head." in name
             declarations[name] = ParameterOwnershipDeclaration(
                 topology=topology,
                 producer=producer,
@@ -1289,7 +1335,9 @@ class ModelRunner:
                 completed_domains=tuple(completed),
                 capture_domains=tuple(capture),
                 pending_domains=tuple(pending),
-                presence=GradientPresencePolicy.REQUIRED_IF_ACTIVE,
+                presence=GradientPresencePolicy.AUTHORIZED_ZERO
+                if is_value_head_param
+                else GradientPresencePolicy.REQUIRED_IF_ACTIVE,
                 config_guard_fingerprint=self._adapter_gradient_hash(guard_payload),
                 config_guard_fields=tuple(sorted(guard_payload.items())),
                 managed_fsdp_shard=id(parameter) in managed_fsdp_parameter_ids,
@@ -1551,6 +1599,17 @@ class ModelRunner:
         )
         construction_target_modules = None if block_fp8_qlora_training else target_modules
 
+        enable_value_head = bool(self.lora_config.get("enable_value_head", False))
+        if enable_value_head:
+            if not lora_enabled or enable_qlora:
+                raise ValueError("enable_value_head requires plain LoRA (enable_lora=true, enable_qlora=false)")
+            if target_modules is not None and "lm_head" in target_modules:
+                raise ValueError(
+                    "enable_value_head requires lm_head excluded from the LoRA targets "
+                    "(set train_unembed=false or pass explicit lora_target_modules): a value_loss backward "
+                    "produces no lm-head adapter gradients, which the gradient-ownership plan would reject"
+                )
+
         model_dtype = resolve_training_model_dtype(
             enable_lora=lora_enabled,
             enable_qlora=enable_qlora,
@@ -1587,6 +1646,7 @@ class ModelRunner:
             lora_target_manifest=self.lora_config.get("lora_target_manifest"),
             unfuse_for_lora=self.lora_config.get("unfuse_for_lora", False),
             moe_hybrid_shared_lora=self.lora_config.get("moe_hybrid_shared_lora", False),
+            enable_value_head=enable_value_head,
             enable_qlora=enable_qlora,
             block_fp8_qlora_training=block_fp8_qlora_training,
             quant_format=self.lora_config.get("quant_format", "nvfp4"),
@@ -1673,6 +1733,13 @@ class ModelRunner:
 
         self.model = result.model
         self.model_config_obj = result.model_config
+        value_head = getattr(self.model, "value_head", None)
+        if value_head is not None:
+            # The value head's frozen base weight is not part of any base-model
+            # checkpoint; whatever the load path materialized, the contract is
+            # an exactly-zero base so V(s) lives entirely in the LoRA factors.
+            with torch.no_grad():
+                value_head.weight.zero_()
         self._select_exact_dsv4_lora_export_format()
         if getattr(get_parallel_state(), "lm_head_tp_size", 1) > 1:
             sync_lm_head_tp_parameters(
@@ -2063,6 +2130,21 @@ class ModelRunner:
     def _get_effective_lm_head_weight(self):
         """Get lm_head weight, merging LoRA delta on-the-fly if needed."""
         return self._get_effective_lm_head_weight_for(self.model.lm_head)
+
+    def _get_effective_value_head_weight(self):
+        """Get the scalar value head's weight, merging its LoRA delta.
+
+        The value head is a LoRA module with a zero frozen base weight, so the
+        effective weight IS the folded adapter delta; consuming it here (like
+        the lm_head weight) routes gradients through the same direct-output-
+        projection ownership lane.
+        """
+        value_head = getattr(self.model, "value_head", None)
+        if value_head is None:
+            raise ValueError(
+                "value_loss/value_prediction require a value head; start the server with enable_value_head=true"
+            )
+        return self._get_effective_lm_head_weight_for(value_head)
 
     @staticmethod
     def _get_effective_lm_head_weight_for(lm_head):
@@ -6551,6 +6633,43 @@ class ModelRunner:
                     get_parallel_state().ulysses_group,
                     is_metric_ops,
                 )
+
+        elif loss_fn in {"value_loss", "value_prediction"}:
+            value_head_weight = self._get_effective_value_head_weight()
+            target_tokens = micro_batch.get("target_tokens", micro_batch.get("labels"))
+            if target_tokens is None:
+                raise ValueError(f"{loss_fn} requires target_tokens or labels for the valid-token mask")
+
+            if loss_fn == "value_loss":
+                returns = micro_batch.get("returns")
+                if returns is None:
+                    raise ValueError("value_loss requires per-token 'returns' in loss_fn_inputs")
+                _result = value_loss_function(
+                    hidden_states=hidden_states,
+                    weight=value_head_weight,
+                    labels=target_tokens,
+                    returns=returns,
+                    old_values=micro_batch.get("old_values"),
+                    clip_range=float(params.get("clip_range", 0.0)),
+                    vf_coef=float(params.get("vf_coef", 1.0)),
+                    loss_reducer=token_sum_reducer,
+                    metric_reducer=token_sum_reducer,
+                )
+            else:
+                _result = value_prediction_function(
+                    hidden_states=hidden_states,
+                    weight=value_head_weight,
+                    labels=target_tokens,
+                    metric_reducer=token_sum_reducer,
+                )
+            local_loss_sum = _result.loss
+            # Per-token values ride the generic per-token channel (the client
+            # reads them from loss_fn_outputs[i].logprobs).
+            per_token_outputs["logprobs"] = _result.per_token_logprobs
+            if return_per_token and _result.per_token_loss is not None:
+                per_token_outputs["loss"] = _result.per_token_loss
+            is_metrics = _result.metrics
+            is_metric_ops = _result.metric_ops
 
         elif loss_fn == "opd_loss":
             profile_loss_start = _profile_now() if profile_timings else 0.0

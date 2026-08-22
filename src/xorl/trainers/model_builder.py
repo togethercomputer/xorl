@@ -218,6 +218,7 @@ def build_training_model(
     lora_target_manifest: Optional[dict[str, Any] | str] = None,
     moe_hybrid_shared_lora: bool = False,
     unfuse_for_lora: bool = False,
+    enable_value_head: bool = False,
     # --- QLoRA ---
     enable_qlora: bool = False,
     block_fp8_qlora_training: bool = False,
@@ -569,6 +570,11 @@ def build_training_model(
             lora_target_manifest=lora_target_manifest,
             moe_hybrid_shared_lora=moe_hybrid_shared_lora,
         )
+
+    if enable_value_head:
+        if not enable_lora or enable_qlora:
+            raise ValueError("enable_value_head currently requires plain LoRA (enable_lora=True, enable_qlora=False)")
+        _attach_value_head(model, lora_rank=lora_rank, lora_alpha=lora_alpha)
 
     # ------------------------------------------------------------------
     # 4. LoRA + mixed precision: upcast trainable params to fp32
@@ -951,6 +957,42 @@ def _inject_lora(
         )
 
     helper.print_device_mem_info("VRAM usage after LoRA injection")
+
+
+def _attach_value_head(model: nn.Module, *, lora_rank: int, lora_alpha: int) -> None:
+    """Attach a scalar LoRA value head (critic) as ``model.value_head``.
+
+    The head is a ``LoraLinear(hidden_size, 1)`` whose base weight is zero and
+    frozen: the value function lives entirely in the LoRA factors, so
+    ``V(s) = lora_B @ lora_A @ h * (alpha / r)``. A scalar head is rank-1, so
+    the factorization loses no expressivity, and because its parameters are
+    named ``value_head.lora_A``/``value_head.lora_B`` the multi-adapter
+    machinery (per-session copies, optimizer state, layouts, rank slicing,
+    deterministic init) manages them like any other adapter factor.
+
+    The base weight is absent from base-model checkpoints; the server runner
+    re-zeroes it after weight loading.
+    """
+    from xorl.lora.modules.linear import LoraLinear  # noqa: PLC0415
+
+    lm_head_weight = model.lm_head.weight
+    value_head = LoraLinear(
+        in_features=model.config.hidden_size,
+        out_features=1,
+        r=lora_rank,
+        lora_alpha=lora_alpha,
+        bias=False,
+        device=lm_head_weight.device,
+        dtype=lm_head_weight.dtype,
+    )
+    with torch.no_grad():
+        if value_head.weight.device.type != "meta":
+            value_head.weight.zero_()
+    value_head.weight.requires_grad_(False)
+    model.value_head = value_head
+    logger.info_rank0(
+        f"Attached scalar LoRA value head: hidden_size={model.config.hidden_size}, r={lora_rank}, alpha={lora_alpha}"
+    )
 
 
 def _deferred_qlora_quantize(

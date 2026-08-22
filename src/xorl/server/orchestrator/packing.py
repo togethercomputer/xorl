@@ -76,6 +76,11 @@ CAUSAL_TARGET_ALIGNED_FIELDS = (
     "logprob_top_ks",
     "logprob_top_ps",
     "logprob_min_ps",
+    # Value-model (critic) per-token fields: aligned with labels[1:] like
+    # advantages/logprobs. Unlike advantages, a 0.0 entry does NOT mask the
+    # token — masking comes only from weights/target_tokens.
+    "returns",
+    "old_values",
 )
 
 NORMALIZED_SAMPLING_METADATA_FIELDS = {

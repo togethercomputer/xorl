@@ -364,7 +364,14 @@ class CheckpointManager:
             sliced_state_dict[name] = tensor.narrow(rank_dim, 0, active_rank).contiguous()
         return sliced_state_dict
 
-    def _save_lora_weights(self, save_path: str, model_id: str, *, preserve_lora_dtype: bool = False) -> None:
+    def _save_lora_weights(
+        self,
+        save_path: str,
+        model_id: str,
+        *,
+        preserve_lora_dtype: bool = False,
+        exclude_value_head: bool = False,
+    ) -> None:
         """
         Core LoRA saving logic: activate adapter, gather weights, write PEFT checkpoint.
 
@@ -412,6 +419,7 @@ class CheckpointManager:
                 lora_state_dict=lora_state_dict,
                 lora_export_format=lora_export_format,
                 preserve_lora_dtype=preserve_lora_dtype,
+                exclude_value_head=exclude_value_head,
             )
             if adapter_session_spec is not None:
                 write_session_spec(save_path, adapter_session_spec)
@@ -1202,8 +1210,10 @@ class CheckpointManager:
 
         local_error = None
         try:
-            # Save LoRA weights (collective operation)
-            self._save_lora_weights(lora_path, model_id)
+            # Save LoRA weights (collective operation). This is the sampler-
+            # facing export: serving engines have no value head, so its
+            # factors are dropped (training-resume saves keep them).
+            self._save_lora_weights(lora_path, model_id, exclude_value_head=True)
         except Exception as e:
             logger.error(f"Failed to save LoRA-only checkpoint for model_id={model_id}: {e}", exc_info=True)
             local_error = str(e)

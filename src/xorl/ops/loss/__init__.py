@@ -19,6 +19,7 @@ from xorl.ops.loss.loss_output import LossOutput
 from xorl.ops.loss.opd_loss import OPDLossMetrics, opd_loss_function, opd_vocab_parallel_loss_function
 from xorl.ops.loss.policy_loss import policy_loss_function
 from xorl.ops.loss.reducers import Reducer, SequencePartial, TokenPartial
+from xorl.ops.loss.value_loss import value_loss_function, value_prediction_function
 from xorl.ops.loss.vocab_parallel_cross_entropy import vocab_parallel_cross_entropy
 
 
@@ -39,6 +40,8 @@ LOSS_REGISTRY: Dict[str, Callable] = {
     "policy_loss": policy_loss_function,
     "drgrpo": drgrpo_loss_function,
     "opd_loss": opd_loss_function,
+    "value_loss": value_loss_function,
+    "value_prediction": value_prediction_function,
 }
 
 
@@ -72,5 +75,7 @@ __all__ = [
     "opd_loss_function",
     "opd_vocab_parallel_loss_function",
     "policy_loss_function",
+    "value_loss_function",
+    "value_prediction_function",
     "vocab_parallel_cross_entropy",
 ]
