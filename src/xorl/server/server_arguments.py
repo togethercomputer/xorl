@@ -1112,6 +1112,15 @@ class ServerArguments:
         },
     )
 
+    enable_value_head: bool = field(
+        default=False,
+        metadata={
+            "help": "Attach a scalar LoRA value head (critic) as model.value_head, enabling the 'value_loss' and "
+            "'value_prediction' loss functions for PPO/SAO-style RL. Requires plain LoRA, no pipeline parallelism, "
+            "and lm_head excluded from the LoRA targets (train_unembed=false or an explicit target list)."
+        },
+    )
+
     # ========================================================================
     # QLoRA Configuration
     # ========================================================================
@@ -1439,6 +1448,20 @@ class ServerArguments:
             raise ValueError("pipeline_parallel_virtual_stages requires pipeline_parallel_size > 1.")
         if self.enable_lora and self.merge_lora_interval > 0:
             raise ValueError("merge_lora_interval is not supported with multi-adapter LoRA server training")
+        if self.enable_value_head:
+            if not self.enable_lora or self.enable_qlora:
+                raise ValueError("enable_value_head requires plain LoRA (enable_lora=true, enable_qlora=false)")
+            if self.pipeline_parallel_size > 1:
+                raise ValueError("enable_value_head is not supported with pipeline parallelism yet")
+            if self.fsdp_sharded_lm_head_loss or self.lm_head_tensor_parallel_size > 1:
+                raise ValueError(
+                    "enable_value_head is not supported with fsdp_sharded_lm_head_loss or lm-head tensor parallelism"
+                )
+            if self.lora_target_modules is not None and "lm_head" in self.lora_target_modules:
+                raise ValueError(
+                    "enable_value_head requires lm_head excluded from the LoRA targets: a value_loss backward "
+                    "produces no lm-head adapter gradients, which the gradient-ownership plan would reject"
+                )
         if self.adapter_gradient_ownership_bucket_bytes <= 0:
             raise ValueError("adapter_gradient_ownership_bucket_bytes must be positive")
         if self.load_weights_mode not in {"grouped", "all_ranks", "skip"}:
@@ -1631,6 +1654,7 @@ class ServerArguments:
                 "unfuse_for_lora": self.unfuse_for_lora,
                 "moe_hybrid_shared_lora": self.moe_hybrid_shared_lora,
                 "lora_export_format": self.lora_export_format,
+                "enable_value_head": self.enable_value_head,
                 "enable_qlora": self.enable_qlora,
                 "block_fp8_qlora_training": self.block_fp8_qlora_training,
                 "quant_format": self.quant_format,

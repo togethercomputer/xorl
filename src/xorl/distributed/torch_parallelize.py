@@ -567,6 +567,10 @@ def parallelize_model_fsdp2(
     if exact_dsv4_lm_head and getattr(parallel_state, "lm_head_tp_size", 1) != 8:
         raise RuntimeError("The exact DSV4-Flash lm head requires lm_head_tensor_parallel_size=8")
     if lm_head_mod is not None and (fsdp_sharded_lm_head_loss or exact_dsv4_lm_head):
+        if getattr(model, "value_head", None) is not None:
+            raise NotImplementedError(
+                "enable_value_head is not supported with fsdp_sharded_lm_head_loss or the exact lm-head lanes"
+            )
         if parallel_state.tp_enabled:
             raise NotImplementedError("fsdp_sharded_lm_head_loss is not supported with tensor parallelism.")
         if not parallel_state.cp_enabled and not lm_head_tp:
@@ -622,7 +626,11 @@ def parallelize_model_fsdp2(
             fully_shard(lm_head_mod, **fsdp_kwargs)
             logger.info_rank0("Using FSDP-sharded lm_head loss over the FSDP group.")
     elif not pp_enabled and fsdp_kwargs.get("reshard_after_forward", True) is not False:
-        last_modules = [m for m in [norm_mod, lm_head_mod] if m is not None]
+        # A scalar value head (critic) is consumed like lm_head: the loss reads
+        # its weight AFTER the model forward, so it must live in the same
+        # stay-gathered unit that norm.forward() unshards.
+        value_head_mod = getattr(model, "value_head", None)
+        last_modules = [m for m in [norm_mod, lm_head_mod, value_head_mod] if m is not None]
         if last_modules:
             last_fsdp_kwargs = dict(fsdp_kwargs)
             last_fsdp_kwargs["reshard_after_forward"] = False
