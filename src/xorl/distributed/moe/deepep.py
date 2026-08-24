@@ -11,6 +11,7 @@ Key design choices:
 """
 
 import os as _os
+import time as _time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
@@ -60,6 +61,7 @@ def preflight_internode_transport(
     hidden_dim: int,
     buffer_size_gb: float = 2.0,
     num_sms: int = 20,
+    buffer_hidden_bytes: Optional[int] = None,
 ) -> None:
     """Probe DeepEP's internode transport with a tiny dispatch+combine before training.
 
@@ -97,7 +99,7 @@ def preflight_internode_transport(
 
     buffer = get_default_buffer(ep_group=ep_group, buffer_size_gb=buffer_size_gb, num_sms=num_sms)
     try:
-        buffer.init_buffer(hidden_bytes=hidden_dim * 2)
+        buffer.init_buffer(hidden_bytes=hidden_dim * 2 if buffer_hidden_bytes is None else int(buffer_hidden_bytes))
         recv_x, _, _, _, handle = dispatch_no_grad(buffer, x, routing_weights, selected_experts, num_experts=world)
         out = combine_no_grad(buffer, recv_x.contiguous(), handle)
     except Exception as exc:
@@ -131,9 +133,12 @@ def get_hidden_bytes(x: torch.Tensor) -> int:
 # Deferred combine sync
 # ---------------------------------------------------------------------------
 _pending_combine_event: Optional["EventOverlap"] = None
+_ALLOW_UNSAFE_ASYNC_COMBINE: Optional[bool] = None
 
 
 def _allow_unsafe_async_combine() -> bool:
+    if _ALLOW_UNSAFE_ASYNC_COMBINE is not None:
+        return _ALLOW_UNSAFE_ASYNC_COMBINE
     return _os.environ.get("XORL_DEEPEP_UNSAFE_ASYNC_COMBINE", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
@@ -270,6 +275,52 @@ class DispatchContext:
     dtype: torch.dtype
     device: torch.device
     hidden_dim: int
+    # DeepEP normal mode returns rank-local expert ids (``-1`` marks a route
+    # owned by another rank) and the transported FP32 routing weights.  The
+    # generic grouped-GEMM path only needs their expert-sorted projections,
+    # but DSV4's native Marlin runner consumes the receive layout directly so
+    # its local top-k reduction is the same numerical program as serving.
+    recv_topk_idx: Optional[torch.Tensor] = None
+    recv_topk_weights: Optional[torch.Tensor] = None
+    # Monotonic process-local identity for this original DeepEP handle.  Every
+    # EP rank constructs handles in the same forward order; the optional trace
+    # uses this value to diagnose rank-asymmetric backward scheduling without
+    # adding a collective or touching the numerical program.
+    call_id: int = -1
+
+
+_deepep_call_counter = 0
+
+
+def _next_deepep_call_id() -> int:
+    global _deepep_call_counter
+    call_id = _deepep_call_counter
+    _deepep_call_counter += 1
+    return call_id
+
+
+def _trace_deepep_boundary(
+    call_id: int,
+    boundary: str,
+    state: str,
+    logical_rank: int = -1,
+    trace_label: str | None = None,
+) -> None:
+    """Append one opt-in liveness record without synchronizing any device."""
+
+    trace_dir = _os.environ.get("XORL_DEEPEP_BOUNDARY_TRACE_DIR", "").strip()
+    if not trace_dir:
+        return
+    rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else -1
+    _os.makedirs(trace_dir, exist_ok=True)
+    label = "none" if trace_label is None else str(trace_label).replace(" ", "_")
+    line = (
+        f"{_time.monotonic_ns()} rank={rank} call_id={call_id} "
+        f"boundary={boundary} state={state} logical_rank={logical_rank} label={label}\n"
+    )
+    with open(_os.path.join(trace_dir, f"rank{rank:05d}.log"), "a", encoding="utf-8") as handle:
+        handle.write(line)
+        handle.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -473,6 +524,8 @@ class _FusedDispatchAndPermute(torch.autograd.Function):
         buffer: "DeepEPBuffer",
         num_experts: int,
     ):
+        call_id = _next_deepep_call_id()
+        _trace_deepep_boundary(call_id, "original_dispatch_forward", "enter")
         buffer.init_buffer(hidden_bytes=get_hidden_bytes(x))
         topk_idx_deepep = topk_idx.to(deep_ep.topk_idx_t)
         topk_weights_f32 = topk_weights.to(torch.float32)
@@ -523,6 +576,7 @@ class _FusedDispatchAndPermute(torch.autograd.Function):
         ctx.buffer = buffer
         ctx.handle = handle
         ctx.input_dtype = x.dtype
+        ctx.call_id = call_id
         ctx.num_recv_tokens = num_recv_tokens
         ctx.hidden_dim = x.shape[1]
 
@@ -535,7 +589,11 @@ class _FusedDispatchAndPermute(torch.autograd.Function):
             dtype=x.dtype,
             device=x.device,
             hidden_dim=x.shape[1],
+            recv_topk_idx=recv_topk_idx,
+            recv_topk_weights=recv_topk_weights,
+            call_id=call_id,
         )
+        _trace_deepep_boundary(call_id, "original_dispatch_forward", "exit")
         return expert_input, cumsum, dispatch_ctx
 
     @staticmethod
@@ -590,7 +648,18 @@ class _FusedDispatchNoPermute(torch.autograd.Function):
         topk_weights: torch.Tensor,
         buffer: "DeepEPBuffer",
         num_experts: int,
+        complete_backward_device_boundary: bool,
+        backward_trace_label: str | None,
+        backward_layer_dependency: torch.Tensor | None,
+        backward_shared_dependency: torch.Tensor | None,
     ):
+        call_id = _next_deepep_call_id()
+        _trace_deepep_boundary(
+            call_id,
+            "original_dispatch_forward",
+            "enter",
+            trace_label=backward_trace_label,
+        )
         buffer.init_buffer(hidden_bytes=get_hidden_bytes(x))
         topk_idx_deepep = topk_idx.to(deep_ep.topk_idx_t)
         topk_weights_f32 = topk_weights.to(torch.float32)
@@ -635,6 +704,31 @@ class _FusedDispatchNoPermute(torch.autograd.Function):
         ctx.buffer = buffer
         ctx.handle = handle
         ctx.input_dtype = x.dtype
+        ctx.call_id = call_id
+        ctx.complete_backward_device_boundary = bool(complete_backward_device_boundary)
+        ctx.backward_trace_label = backward_trace_label
+        # These two ignored forward operands are ordering edges, not value
+        # operands.  Returning explicit zero gradients for them only after the
+        # terminal reverse-combine completes prevents their FSDP backward
+        # branches from entering c10d while DeepEP still owns the device.
+        ctx.backward_layer_dependency_meta = (
+            None
+            if backward_layer_dependency is None
+            else (
+                tuple(backward_layer_dependency.shape),
+                backward_layer_dependency.dtype,
+                backward_layer_dependency.device,
+            )
+        )
+        ctx.backward_shared_dependency_meta = (
+            None
+            if backward_shared_dependency is None
+            else (
+                tuple(backward_shared_dependency.shape),
+                backward_shared_dependency.dtype,
+                backward_shared_dependency.device,
+            )
+        )
 
         dispatch_ctx = DispatchContext(
             handle=handle,
@@ -645,6 +739,15 @@ class _FusedDispatchNoPermute(torch.autograd.Function):
             dtype=x.dtype,
             device=x.device,
             hidden_dim=x.shape[1],
+            recv_topk_idx=recv_topk_idx,
+            recv_topk_weights=recv_topk_weights,
+            call_id=call_id,
+        )
+        _trace_deepep_boundary(
+            call_id,
+            "original_dispatch_forward",
+            "exit",
+            trace_label=backward_trace_label,
         )
         return recv_x, cumsum, dispatch_ctx
 
@@ -652,10 +755,16 @@ class _FusedDispatchNoPermute(torch.autograd.Function):
     def backward(ctx, grad_recv_x, grad_cumsum, grad_dispatch_ctx):
         del grad_cumsum, grad_dispatch_ctx
         if grad_recv_x is None:
-            return None, None, None, None, None
+            return None, None, None, None, None, None, None, None, None
 
         buffer = ctx.buffer
         handle = ctx.handle
+        _trace_deepep_boundary(
+            ctx.call_id,
+            "input_reverse_combine",
+            "enter",
+            trace_label=ctx.backward_trace_label,
+        )
         previous_event = EventOverlap(EventHandle())
         grad_x, _, event = buffer.buffer.combine(
             x=grad_recv_x.contiguous(),
@@ -667,10 +776,41 @@ class _FusedDispatchNoPermute(torch.autograd.Function):
         )
         event.current_stream_wait()
         grad_x.record_stream(torch.cuda.current_stream())
+        _trace_deepep_boundary(
+            ctx.call_id,
+            "input_reverse_combine",
+            "api_return",
+            trace_label=ctx.backward_trace_label,
+        )
+        if ctx.complete_backward_device_boundary:
+            # GLM's shared-expert FSDP root and transformer residual can use
+            # c10d private streams.  Do not release either autograd edge while
+            # this layer's final normal-mode DeepEP reverse-combine can still
+            # be spinning on its own private stream: that cross-communicator
+            # overlap forms a device cycle despite identical host order on all
+            # ranks.  This boundary changes scheduling only; no value is cast,
+            # communicated again, or added to a nonzero gradient.
+            torch.cuda.current_stream(grad_x.device).synchronize()
+            _trace_deepep_boundary(
+                ctx.call_id,
+                "input_reverse_combine",
+                "device_complete",
+                trace_label=ctx.backward_trace_label,
+            )
 
         if grad_x.dtype != ctx.input_dtype:
             grad_x = grad_x.to(ctx.input_dtype)
-        return grad_x, None, None, None, None
+        dependency_grads = []
+        for metadata in (
+            getattr(ctx, "backward_layer_dependency_meta", None),
+            getattr(ctx, "backward_shared_dependency_meta", None),
+        ):
+            if metadata is None:
+                dependency_grads.append(None)
+                continue
+            shape, dtype, device = metadata
+            dependency_grads.append(torch.zeros(shape, dtype=dtype, device=device))
+        return grad_x, None, None, None, None, None, None, *dependency_grads
 
 
 class _FusedUnpermuteAndCombine(torch.autograd.Function):
@@ -791,6 +931,64 @@ class _FusedUnpermuteAndCombine(torch.autograd.Function):
         return grad_expert_output, None, None, None
 
 
+class _FusedNativeReceiveCombine(torch.autograd.Function):
+    """Handle-based combine for a runner that consumes DeepEP receive rows.
+
+    Unlike :class:`_FusedUnpermuteAndCombine`, this boundary performs no
+    trainer-owned scatter-add.  The native MoE runner has already reduced the
+    local top-k slots for each received row, so DeepEP's original dispatch
+    handle is the complete inverse movement required by serving.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        recv_output: torch.Tensor,
+        buffer: "DeepEPBuffer",
+        dispatch_ctx: DispatchContext,
+        async_combine: bool,
+    ):
+        previous_event = EventOverlap(EventHandle())
+        combined_x, _, event = buffer.buffer.combine(
+            x=recv_output.contiguous(),
+            handle=dispatch_ctx.handle,
+            config=buffer.combine_config,
+            previous_event=previous_event,
+            async_finish=True,
+            allocate_on_comm_stream=True,
+        )
+        if async_combine:
+            _store_pending_event(event)
+        else:
+            event.current_stream_wait()
+        combined_x.record_stream(torch.cuda.current_stream())
+
+        ctx.buffer = buffer
+        ctx.handle = dispatch_ctx.handle
+        ctx.input_dtype = recv_output.dtype
+        return combined_x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        if grad_output is None:
+            return None, None, None, None
+
+        previous_event = EventOverlap(EventHandle())
+        grad_recv, _, _, _, _, event = ctx.buffer.buffer.dispatch(
+            x=grad_output.contiguous(),
+            handle=ctx.handle,
+            config=ctx.buffer.dispatch_config,
+            previous_event=previous_event,
+            async_finish=True,
+            allocate_on_comm_stream=True,
+        )
+        event.current_stream_wait()
+        grad_recv.record_stream(torch.cuda.current_stream())
+        if grad_recv.dtype != ctx.input_dtype:
+            grad_recv = grad_recv.to(ctx.input_dtype)
+        return grad_recv, None, None, None
+
+
 # ---------------------------------------------------------------------------
 # No-grad dispatch/combine (for inference or profiling)
 # ---------------------------------------------------------------------------
@@ -893,6 +1091,11 @@ def token_pre_dispatch_no_permute(
     selected_experts: torch.Tensor,
     num_experts: int,
     num_local_experts: int = 0,
+    *,
+    complete_backward_device_boundary: bool = False,
+    backward_trace_label: str | None = None,
+    backward_layer_dependency: torch.Tensor | None = None,
+    backward_shared_dependency: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, DispatchContext]:
     """Dispatch tokens with DeepEP but leave them in recv order.
 
@@ -907,8 +1110,49 @@ def token_pre_dispatch_no_permute(
         routing_weights,
         buffer,
         num_experts,
+        complete_backward_device_boundary,
+        backward_trace_label,
+        backward_layer_dependency,
+        backward_shared_dependency,
     )
     return recv_x, cumsum, ctx
+
+
+def token_pre_dispatch_native(
+    buffer: DeepEPBuffer,
+    hidden_states: torch.Tensor,
+    routing_weights: torch.Tensor,
+    selected_experts: torch.Tensor,
+    num_experts: int,
+    *,
+    complete_backward_device_boundary: bool = False,
+    backward_trace_label: str | None = None,
+    backward_layer_dependency: torch.Tensor | None = None,
+    backward_shared_dependency: torch.Tensor | None = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, DispatchContext]:
+    """Dispatch without permutation and expose transported local top-k data.
+
+    This is the native-runner boundary: expert ids and weights come from the
+    actual DeepEP receive, never from replayed router state.  Routing weights
+    are intentionally non-differentiable here; the admitted DSV4 exact program
+    freezes its router while hidden-state and active-LoRA gradients cross the
+    dispatch/combine autograd boundaries.
+    """
+
+    recv_x, _cumsum, ctx = token_pre_dispatch_no_permute(
+        buffer=buffer,
+        hidden_states=hidden_states,
+        routing_weights=routing_weights,
+        selected_experts=selected_experts,
+        num_experts=num_experts,
+        complete_backward_device_boundary=complete_backward_device_boundary,
+        backward_trace_label=backward_trace_label,
+        backward_layer_dependency=backward_layer_dependency,
+        backward_shared_dependency=backward_shared_dependency,
+    )
+    if ctx.recv_topk_idx is None or ctx.recv_topk_weights is None:
+        raise RuntimeError("DeepEP native dispatch did not preserve receive top-k metadata")
+    return recv_x, ctx.recv_topk_idx, ctx.recv_topk_weights, ctx
 
 
 def tokens_post_combine(
@@ -936,6 +1180,19 @@ def tokens_post_combine(
         return _tokens_post_combine_profiled(buffer, expert_output, ctx, async_combine)
 
     return _FusedUnpermuteAndCombine.apply(expert_output, buffer, ctx, async_combine)
+
+
+def tokens_post_combine_native(
+    buffer: DeepEPBuffer,
+    recv_output: torch.Tensor,
+    ctx: DispatchContext,
+    async_combine: bool = False,
+) -> torch.Tensor:
+    """Combine native runner output in the original DeepEP receive layout."""
+
+    if async_combine and not _allow_unsafe_async_combine():
+        async_combine = False
+    return _FusedNativeReceiveCombine.apply(recv_output, buffer, ctx, async_combine)
 
 
 # ---------------------------------------------------------------------------

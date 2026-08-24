@@ -53,6 +53,15 @@ def _assert_build_foundation_model_rejects_train_router_for_deepseek():
         build_foundation_model(_tiny_config(), train_router=True)
 
 
+def test_build_foundation_model_rejects_unwired_exact_deepep(monkeypatch):
+    with pytest.raises(ValueError, match="model-declared BF16 native DeepEP"):
+        build_foundation_model(
+            _tiny_config(),
+            deepep_native_exact=True,
+            ep_dispatch="deepep",
+        )
+
+
 def test_deepseek_training_and_parallelization_admission_policy(monkeypatch):
     _assert_build_foundation_model_rejects_train_router_for_deepseek()
 

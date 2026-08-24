@@ -200,6 +200,57 @@ def test_compute_micro_batch_loss_dispatches_drgrpo_and_filters_loss_inputs():
     assert metric_ops is None
 
 
+def test_exact_dsv4_drgrpo_uses_only_independently_computed_model_values(monkeypatch):
+    runner = object.__new__(ModelRunner)
+    runner.model = _TinyModel()
+    runner.model.config = SimpleNamespace(_dsv4_flash_exact_mode=True)
+    runner.ce_mode = "eager"
+    runner.lm_head_fp32 = False
+
+    def invalid_replay(**_kwargs):
+        raise AssertionError("DR-GRPO must differentiate the independent trainer forward")
+
+    monkeypatch.setattr(runner, "_compute_decode_cache_micro_batch_loss", invalid_replay)
+    micro_batch = {
+        "input_ids": torch.tensor([[1, 2, 3]]),
+        "target_tokens": torch.tensor([[2, 3, 4]]),
+        "old_logprobs": torch.zeros((1, 3)),
+        "advantages": torch.ones((1, 3)),
+    }
+
+    loss, per_token_outputs, metrics, _metric_ops, _outputs = runner._compute_micro_batch_loss(
+        micro_batch,
+        "drgrpo",
+        {"beta": 0.0, "return_per_token": True},
+    )
+
+    assert not torch.equal(per_token_outputs["logprobs"], micro_batch["old_logprobs"])
+    assert not any("surrogate" in name or "external_value" in name for name in metrics)
+    loss.backward()
+    assert runner.model.embed.weight.grad is not None
+    assert runner.model.lm_head.weight.grad is not None
+
+
+def test_drgrpo_rejects_external_exact_value_injection():
+    runner = object.__new__(ModelRunner)
+    runner.model = _TinyModel()
+    runner.model.config = SimpleNamespace(_dsv4_flash_exact_mode=True)
+    runner.ce_mode = "eager"
+    runner.lm_head_fp32 = False
+    with pytest.raises(ValueError, match="is not a valid training input"):
+        runner._compute_micro_batch_loss(
+            {
+                "input_ids": torch.tensor([[1, 2, 3]]),
+                "target_tokens": torch.tensor([[2, 3, 4]]),
+                "old_logprobs": torch.tensor([[-1.0, -1.5, -2.0]]),
+                "exact_value_logprobs": torch.tensor([[-1.0, -1.5, -2.0]]),
+                "advantages": torch.ones((1, 3)),
+            },
+            "drgrpo",
+            {"beta": 0.0, "return_per_token": True},
+        )
+
+
 def test_compute_micro_batch_loss_drgrpo_accepts_legacy_logprobs_key():
     runner = object.__new__(ModelRunner)
     runner.model = _TinyModel()
@@ -481,3 +532,47 @@ def test_forward_backward_dispatches_drgrpo_through_standard_loop(monkeypatch):
     assert result["model_id"] == "policy-a"
     assert runner.global_forward_backward_step == 8
     assert runner._routing_handler.calls == [(micro_batches, None, None)]
+
+
+def test_dsv4_gradient_metrics_measure_staged_optimizer_numerators_and_frozen_routers() -> None:
+    class _Dsv4TinyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.config = SimpleNamespace(_dsv4_flash_exact_active_lora=True)
+            self.lora_A = torch.nn.Parameter(torch.ones(2))
+            self.lora_B = torch.nn.Parameter(torch.ones(2))
+            self.mlp = torch.nn.Module()
+            self.mlp.gate = torch.nn.Linear(2, 2, bias=False)
+            self.mlp.gate.weight.requires_grad_(False)
+
+    planned = [SimpleNamespace(fqn=f"layer.{index}.lora_A") for index in range(948)]
+    scratch = SimpleNamespace(
+        capture_open=True,
+        capture_staged=True,
+        staged_parameter_fqns=("layer.0.lora_A", "layer.1.lora_A"),
+        staged_numerators={
+            "layer.0.lora_A": torch.tensor([3.0, 4.0]),
+            "layer.1.lora_A": torch.tensor([0.0, 0.0]),
+        },
+    )
+    state = SimpleNamespace(
+        gradient_ownership_plan=SimpleNamespace(parameters=planned),
+        gradient_scratch=scratch,
+    )
+    runner = object.__new__(ModelRunner)
+    runner.model = _Dsv4TinyModel()
+    runner.model_parts = None
+    runner.pp_enabled = False
+    runner._adapter_manager = SimpleNamespace(get_adapter_state=lambda _model_id: state)
+
+    metrics = runner._collect_dsv4_adapter_gradient_metrics("default")
+
+    assert metrics["dsv4_grad_norm"] == pytest.approx(5.0)
+    assert metrics["dsv4_grad_nonzero_count"] == 2
+    assert metrics["dsv4_grad_nonfinite_count"] == 0
+    assert metrics["dsv4_grad_planned_factor_count_min"] == 948
+    assert metrics["dsv4_grad_staged_factor_count_min"] == 2
+    assert metrics["dsv4_grad_trainable_non_lora_count"] == 0
+    assert metrics["dsv4_router_tensor_count_min"] == 1
+    assert metrics["dsv4_router_requires_grad_count"] == 0
+    assert metrics["dsv4_router_grad_present_count"] == 0

@@ -800,6 +800,7 @@ def _build_dsv4_moe_runner_config(
     hidden_size: int,
     intermediate_size: int,
     top_k: int,
+    no_combine: bool = False,
 ) -> object:
     """Freeze the trainer-side serving runner contract for exact DSV4."""
     return config_cls(
@@ -815,6 +816,7 @@ def _build_dsv4_moe_runner_config(
         routed_scaling_factor=1.5,
         swiglu_limit=10.0,
         inplace=False,
+        no_combine=no_combine,
         dsv4_exact_mode=True,
     )
 
@@ -830,6 +832,8 @@ def _dsv4_native_mxfp4_forward(
     down_a: torch.Tensor,
     down_b: torch.Tensor,
     experts,
+    *,
+    no_combine: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig  # noqa: PLC0415
     from sglang.srt.layers.moe.moe_runner.runner import MoeRunner  # noqa: PLC0415
@@ -886,6 +890,7 @@ def _dsv4_native_mxfp4_forward(
         hidden_size=payload.hidden_size,
         intermediate_size=payload.intermediate_size,
         top_k=selected_experts.shape[1],
+        no_combine=no_combine,
     )
     dispatch = StandardDispatchOutput(
         hidden_states=run_hidden_states,
@@ -922,6 +927,7 @@ def _dsv4_native_mxfp4_forward(
             clamp_limit=10.0,
             expert_map=expert_map,
             global_num_experts=256,
+            no_combine=no_combine,
         )
         # This branch is an explicitly opt-in diagnostic control.  Surface an
         # asynchronous Marlin fault at its own call boundary instead of at an
@@ -973,6 +979,7 @@ class _Dsv4NativeMxfp4RoutedFunction(torch.autograd.Function):
         down_b,
         experts,
         lora_live,
+        return_routes,
     ):
         factors = (gate_a, gate_b, up_a, up_b, down_a, down_b)
         # The gather-aware exact lane sets ``lora_live`` on every EP rank so
@@ -985,9 +992,11 @@ class _Dsv4NativeMxfp4RoutedFunction(torch.autograd.Function):
             selected_experts,
             *effective,
             experts,
+            no_combine=return_routes,
         )
         ctx.experts = experts
         ctx.lora_live = lora_live
+        ctx.return_routes = return_routes
         ctx.save_for_backward(
             hidden_states.detach(),
             routing_weights.detach(),
@@ -1020,6 +1029,7 @@ class _Dsv4NativeMxfp4RoutedFunction(torch.autograd.Function):
         ) = ctx.saved_tensors
         payload = ctx.experts.native_mxfp4_payload
         lora_live = ctx.lora_live
+        return_routes = ctx.return_routes
         need_x, need_r = ctx.needs_input_grad[:2]
         factor_needs = ctx.needs_input_grad[3:9]
         grad_x = torch.zeros_like(hidden_states) if need_x else None
@@ -1038,7 +1048,7 @@ class _Dsv4NativeMxfp4RoutedFunction(torch.autograd.Function):
                     continue
                 token_ids, slot_ids = positions[:, 0], positions[:, 1]
                 x = hidden_states[token_ids].detach().requires_grad_(need_x)
-                weight = routing_weights[token_ids, slot_ids].detach().requires_grad_(need_r)
+                weight = routing_weights[token_ids, slot_ids].detach().requires_grad_(need_r and not return_routes)
                 effective = [
                     (master[expert_idx].detach() if lora_live else torch.zeros_like(master[expert_idx]))
                     .to(torch.bfloat16)
@@ -1063,13 +1073,18 @@ class _Dsv4NativeMxfp4RoutedFunction(torch.autograd.Function):
                 activated = torch.nn.functional.silu(gate) * up
                 down = torch.nn.functional.linear(activated, w2)
                 down = down + (activated @ effective[4]) @ effective[5]
-                weighted = (down.float() * weight.float().unsqueeze(-1)).to(torch.bfloat16)
+                if return_routes:
+                    expert_value = down.to(torch.bfloat16)
+                    expert_grad_output = grad_output[token_ids, slot_ids]
+                else:
+                    expert_value = (down.float() * weight.float().unsqueeze(-1)).to(torch.bfloat16)
+                    expert_grad_output = grad_output[token_ids]
                 targets = []
                 target_roles = []
                 if need_x:
                     targets.append(x)
                     target_roles.append(("x", None))
-                if need_r:
+                if need_r and not return_routes:
                     targets.append(weight)
                     target_roles.append(("r", None))
                 for factor_idx, (factor, needed) in enumerate(zip(effective, factor_targets)):
@@ -1077,9 +1092,9 @@ class _Dsv4NativeMxfp4RoutedFunction(torch.autograd.Function):
                         targets.append(factor)
                         target_roles.append(("factor", factor_idx))
                 grads = torch.autograd.grad(
-                    weighted,
+                    expert_value,
                     targets,
-                    grad_outputs=grad_output[token_ids],
+                    grad_outputs=expert_grad_output,
                     allow_unused=False,
                 )
                 for role, grad in zip(target_roles, grads):
@@ -1096,7 +1111,59 @@ class _Dsv4NativeMxfp4RoutedFunction(torch.autograd.Function):
             *factor_grads,
             None,
             None,
+            None,
         )
+
+
+class _Dsv4NativeMxfp4ZeroRows(torch.autograd.Function):
+    """Keep empty DeepEP receives in the active-LoRA autograd program."""
+
+    @staticmethod
+    def forward(
+        ctx,
+        hidden_states,
+        routing_weights,
+        selected_experts,
+        gate_a,
+        gate_b,
+        up_a,
+        up_b,
+        down_a,
+        down_b,
+        experts,
+        lora_live,
+        return_routes,
+    ):
+        del experts, lora_live
+        ctx.save_for_backward(
+            hidden_states,
+            routing_weights,
+            gate_a,
+            gate_b,
+            up_a,
+            up_b,
+            down_a,
+            down_b,
+        )
+        if return_routes:
+            return hidden_states.new_zeros(
+                hidden_states.shape[0],
+                selected_experts.shape[1],
+                hidden_states.shape[1],
+            )
+        return hidden_states.new_zeros(hidden_states.shape)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        del grad_output
+        hidden_states, routing_weights, *factors = ctx.saved_tensors
+        grad_hidden = torch.zeros_like(hidden_states) if ctx.needs_input_grad[0] else None
+        grad_routing = torch.zeros_like(routing_weights) if ctx.needs_input_grad[1] else None
+        factor_grads = [
+            torch.zeros_like(factor) if ctx.needs_input_grad[index] else None
+            for index, factor in enumerate(factors, start=3)
+        ]
+        return grad_hidden, grad_routing, None, *factor_grads, None, None, None
 
 
 def dsv4_native_mxfp4_routed_partial(
@@ -1106,12 +1173,15 @@ def dsv4_native_mxfp4_routed_partial(
     experts,
     *,
     lora_live: bool = True,
+    return_routes: bool = False,
 ) -> torch.Tensor:
     """Literal local MXFP4-Marlin routed partial with trainable rank-one LoRA.
 
     Gather-aware serving installs rank-major LoRA metadata on every EP rank,
     so the exact caller keeps ``lora_live`` enabled for every local expert-bank
     partial.  Passing ``False`` remains the explicit base-only program.
+    ``return_routes=True`` exposes unweighted BF16 ``[rows, topk, hidden]``
+    expert values; the shared native layer then owns FP32 weighting/reduction.
     """
 
     if (experts.active_r, experts.active_lora_alpha, experts._active_scaling()) != (
@@ -1123,6 +1193,16 @@ def dsv4_native_mxfp4_routed_partial(
     factors = []
     for projection in ("gate_proj", "up_proj", "down_proj"):
         factors.extend(experts._active_lora_views(projection))
+    if hidden_states.shape[0] == 0:
+        return _Dsv4NativeMxfp4ZeroRows.apply(
+            hidden_states,
+            routing_weights,
+            selected_experts,
+            *factors,
+            experts,
+            lora_live,
+            return_routes,
+        )
     return _Dsv4NativeMxfp4RoutedFunction.apply(
         hidden_states,
         routing_weights,
@@ -1130,6 +1210,7 @@ def dsv4_native_mxfp4_routed_partial(
         *factors,
         experts,
         lora_live,
+        return_routes,
     )
 
 

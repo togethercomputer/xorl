@@ -11,6 +11,7 @@ from xorl.distributed.canonical_moe import CanonicalMoEGraphMetadata
 from xorl.models.transformers.glm5.exact_shared_expert_qlora import (
     GLM52_EXACT_TP16_SHARED_EXPERT_QLORA_CONTRACT_VERSION,
     Glm52ExactTP16SharedExpertBlockFP8QLoRA,
+    _Glm52ExactTP16SharedExpertAllContributorsFunction,
 )
 from xorl.ops.fused_silu_and_mul import exact_fp32_silu_and_mul
 
@@ -284,6 +285,87 @@ def _assert_shared_expert_native_base_views_use_output_rows_and_input_columns() 
     assert torch.equal(actual.down_scales[:, 0], down_scales[:, ordinal])
 
 
+def test_shared_expert_runtime_contract_fails_before_sglang_kernel_import() -> None:
+    module = Glm52ExactTP16SharedExpertBlockFP8QLoRA(device="cpu")
+    with pytest.raises(TypeError, match="contributor_ordinal must be an integer"):
+        module(torch.zeros(1, 6144, dtype=torch.bfloat16), contributor_ordinal=True)
+    with pytest.raises(ValueError, match=r"must be in \[0, 16\)"):
+        module(torch.zeros(1, 6144, dtype=torch.bfloat16), contributor_ordinal=16)
+    with pytest.raises(TypeError, match="requires BF16 activations"):
+        module(torch.zeros(1, 6144), contributor_ordinal=0)
+    with pytest.raises(ValueError, match="input width"):
+        module(torch.zeros(1, 128, dtype=torch.bfloat16), contributor_ordinal=0)
+    with pytest.raises(ValueError, match="contiguous sampler-layout"):
+        module(torch.zeros(6144, 2, dtype=torch.bfloat16).transpose(0, 1), contributor_ordinal=0)
+    with pytest.raises(RuntimeError, match="requires CUDA"):
+        module(torch.zeros(1, 6144, dtype=torch.bfloat16), contributor_ordinal=0)
+    with pytest.raises(RuntimeError, match="cannot run independently"):
+        module.gate_proj(torch.zeros(1, 6144, dtype=torch.bfloat16))
+    with pytest.raises(RuntimeError, match="cannot bypass active LoRA"):
+        module.gate_proj.forward_partition(
+            torch.zeros(1, 6144, dtype=torch.bfloat16),
+            output_range=(0, 128),
+        )
+
+    module.tp_size = 8
+    with pytest.raises(RuntimeError, match="runtime contract was mutated"):
+        module(torch.zeros(1, 6144, dtype=torch.bfloat16), contributor_ordinal=0)
+    module.tp_size = 16
+    module.gate_proj.lora_A = nn.Parameter(module.gate_proj.lora_A.to(torch.bfloat16))
+    with pytest.raises(TypeError, match="gate_proj.lora_A must remain FP32"):
+        module(torch.zeros(1, 6144, dtype=torch.bfloat16), contributor_ordinal=0)
+
+
+def test_all_contributor_custom_function_stacks_values_and_accumulates_vjps() -> None:
+    class FakeSharedRoot:
+        tp_size = 4
+        hidden_size = 3
+
+        def _exact_forward_value(self, input, *effective, contributor_ordinal):
+            assert all(factor.dtype is torch.bfloat16 for factor in effective)
+            ordinal = contributor_ordinal + 1
+            return SimpleNamespace(
+                output=input + ordinal,
+                gate_up=input + 2 * ordinal,
+                activated=input + 3 * ordinal,
+            )
+
+        def _surrogate_vjp(
+            self,
+            input,
+            *args,
+            contributor_ordinal,
+            needs_input_grad,
+        ):
+            effective = args[:6]
+            grad_output = args[-1]
+            scale = contributor_ordinal + 1
+            gradients = [grad_output * scale]
+            gradients.extend(
+                torch.full_like(factor, scale, dtype=torch.float32) if needed else None
+                for factor, needed in zip(effective, needs_input_grad[1:], strict=True)
+            )
+            return tuple(gradients)
+
+    input = torch.zeros((2, 3), dtype=torch.bfloat16, requires_grad=True)
+    factors = [torch.ones((1, 1), dtype=torch.float32, requires_grad=True) for _ in range(6)]
+    output = _Glm52ExactTP16SharedExpertAllContributorsFunction.apply(
+        input,
+        *factors,
+        FakeSharedRoot(),
+    )
+
+    assert output.shape == (4, 2, 3)
+    for ordinal in range(4):
+        assert torch.equal(output[ordinal], torch.full_like(input, ordinal + 1))
+    output.backward(torch.ones_like(output))
+    assert torch.equal(input.grad, torch.full_like(input, 10))
+    for factor in factors:
+        assert factor.grad is not None
+        assert factor.grad.dtype is torch.float32
+        assert torch.equal(factor.grad, torch.full_like(factor, 10))
+
+
 def _manual_local_vjp(
     module: Glm52ExactTP16SharedExpertBlockFP8QLoRA,
     input: torch.Tensor,
@@ -498,6 +580,11 @@ def test_official_shared_expert_actual_operands_fold_and_surrogate_vjp() -> None
             [module(fold_input, contributor_ordinal=rank) for rank in range(16)],
             dim=0,
         )
+        all_contributor_partials = module(fold_input, all_contributors=True)
+    assert torch.equal(
+        all_contributor_partials.view(torch.uint8),
+        partials.view(torch.uint8),
+    )
     metadata = CanonicalMoEGraphMetadata.build(
         torch.tensor([0], dtype=torch.int64, device=device),
         torch.tensor([0], dtype=torch.int64, device=device),

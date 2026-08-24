@@ -296,6 +296,7 @@ def test_exact_dsv4_checkpointing_does_not_attach_or_activate_routing_replay():
 
     cfg = _tiny_config(num_hash_layers=1)
     cfg._dsv4_flash_exact_mode = True
+    cfg._ep_dispatch = "deepep"
     block = DeepseekV4MoE(cfg, layer_id=0)
     block._routing_replay = RoutingReplay()  # Simulate stale state from a prior enable call.
     container = nn.Module()
@@ -417,6 +418,7 @@ def test_exact_native_mlp_lora_is_live_on_every_ep_partial(monkeypatch, ep_rank)
         shared_experts=object(),
         routed_scaling_factor=1.5,
         _capture_diagnostic_component=lambda *_args: None,
+        _maybe_capture_native_moe_output=lambda *_args: None,
         route=lambda hidden_states, input_ids=None: (
             torch.ones(hidden_states.shape[0], 6),
             torch.zeros(hidden_states.shape[0], 6, dtype=torch.int32),
@@ -480,6 +482,243 @@ def test_exact_native_mlp_lora_is_live_on_every_ep_partial(monkeypatch, ep_rank)
 
     assert output.shape == (1, 1, 4)
     assert observed == {"routed": True, "shared": True}
+
+
+def test_dsv4_moe_program_resolves_native_deepep_without_feature_menu():
+    from xorl.models.transformers.deepseek_v4.moe_program import (
+        DSV4_DEEPEP_NATIVE_EXACT_V1,
+        resolve_dsv4_moe_numerical_program,
+    )
+
+    assert (
+        resolve_dsv4_moe_numerical_program(
+            exact=True,
+            ep_dispatch="deepep",
+            deepep_native_exact=True,
+        )
+        == DSV4_DEEPEP_NATIVE_EXACT_V1
+    )
+    assert (
+        resolve_dsv4_moe_numerical_program(
+            exact=False,
+            ep_dispatch="alltoall",
+            deepep_native_exact=False,
+        )
+        is None
+    )
+    with pytest.raises(ValueError, match="retired post-expert diagnostic"):
+        resolve_dsv4_moe_numerical_program(
+            exact=True,
+            ep_dispatch="alltoall",
+            deepep_native_exact=False,
+        )
+
+
+def test_dsv4_native_deepep_program_rejects_non_deepep_dispatch():
+    from xorl.models.transformers.deepseek_v4.modeling_deepseek_v4 import DeepseekV4MoE
+    from xorl.models.transformers.deepseek_v4.moe_program import DSV4_DEEPEP_NATIVE_EXACT_V1
+
+    cfg = _tiny_config()
+    cfg._dsv4_flash_exact_mode = True
+    cfg._dsv4_moe_numerical_program = DSV4_DEEPEP_NATIVE_EXACT_V1
+    cfg._ep_dispatch = "alltoall"
+    with pytest.raises(RuntimeError, match="requires ep_dispatch='deepep'"):
+        DeepseekV4MoE(cfg, layer_id=0)
+
+
+def test_dsv4_native_deepep_consumes_transport_receive_layout(monkeypatch):
+    from types import SimpleNamespace
+
+    import xorl.distributed.moe.deepep_native_exact as native_exact_module
+    import xorl.distributed.parallel_state as parallel_state_module
+    import xorl.models.transformers.deepseek_v4.native_payload as payload_module
+    from xorl.models.transformers.deepseek_v4.modeling_deepseek_v4 import DeepseekV4MoE
+
+    observed = {}
+
+    class _RecordingExperts:
+        deepep_buffer_size_gb = 2.0
+        deepep_num_sms = 20
+        native_mxfp4_payload = SimpleNamespace(w13_weight=torch.empty(32, 1, 1))
+
+        def __call__(self, hidden_states, routing_weights, selected_experts, **kwargs):
+            observed["recv_hidden"] = hidden_states.clone()
+            observed["recv_weights"] = routing_weights.clone()
+            observed["recv_global_ids"] = selected_experts.clone()
+            observed["expert_kwargs"] = kwargs
+            return hidden_states + 3
+
+    parallel_state = SimpleNamespace(
+        ep_enabled=True,
+        ep_group=object(),
+        ep_size=8,
+        ep_rank=3,
+        tp_size=1,
+    )
+    monkeypatch.setattr(parallel_state_module, "get_parallel_state", lambda: parallel_state)
+    recv_hidden = torch.tensor([[5.0, 6.0, 7.0, 8.0]])
+    recv_local_ids = torch.tensor([[0, -1]], dtype=torch.int32)
+    recv_weights = torch.tensor([[0.75, 0.0]], dtype=torch.float32)
+
+    def _native_program(hidden_states, routing_weights, selected_experts, **kwargs):
+        observed["program_args"] = (hidden_states, routing_weights, selected_experts)
+        observed["program_kwargs"] = kwargs
+        local_leaf = kwargs["runner"](recv_hidden, recv_weights, recv_local_ids)
+        observed["local_leaf"] = local_leaf
+        return local_leaf - 1
+
+    monkeypatch.setattr(
+        native_exact_module,
+        "native_dispatch_runner_combine",
+        _native_program,
+    )
+
+    def _shared(hidden_states, _module, **kwargs):
+        observed["shared_kwargs"] = kwargs
+        return torch.zeros_like(hidden_states)
+
+    monkeypatch.setattr(payload_module, "dsv4_native_shared_expert_tp_partial", _shared)
+    monkeypatch.setattr(
+        payload_module,
+        "dsv4_join_routed_shared_partial",
+        lambda routed, shared, **_kwargs: routed + shared,
+    )
+
+    fake_moe = SimpleNamespace(
+        is_hash_layer=False,
+        layer_id=0,
+        num_experts=256,
+        top_k=2,
+        train_router=False,
+        experts=_RecordingExperts(),
+        shared_experts=object(),
+        routed_scaling_factor=1.5,
+        _capture_diagnostic_component=lambda *_args: None,
+        _maybe_capture_native_moe_output=lambda *_args: None,
+        route=lambda hidden_states, input_ids=None: (
+            torch.tensor([[0.75, 0.25]], dtype=torch.float32),
+            torch.tensor([[96, 129]], dtype=torch.int32),
+            torch.zeros(hidden_states.shape[0], 256),
+        ),
+    )
+    hidden = torch.tensor([[[1.0, 2.0, 3.0, 4.0], [9.0, 9.0, 9.0, 9.0]]])
+    output, logits = DeepseekV4MoE._forward_deepep_native_exact(
+        fake_moe,
+        hidden,
+        torch.tensor([[7, 8]]),
+        live_token_count=1,
+    )
+
+    assert torch.equal(observed["program_args"][0], hidden.reshape(-1, 4)[:1])
+    assert "runner_output_layout" not in observed["program_kwargs"]
+    assert torch.equal(observed["recv_global_ids"], torch.tensor([[96, -1]], dtype=torch.int32))
+    assert observed["expert_kwargs"] == {
+        "dsv4_exact_native": True,
+        "dsv4_exact_lora_live": True,
+        "dsv4_exact_return_routes": False,
+    }
+    assert observed["local_leaf"].shape == (1, 4)
+    assert observed["shared_kwargs"]["tp_rank"] == 0
+    assert observed["shared_kwargs"]["tp_size"] == 1
+    assert torch.equal(output[0, 0], recv_hidden[0] + 2)
+    assert torch.equal(output[0, 1], torch.zeros(4))
+    assert logits.shape == (2, 256)
+
+
+def test_dsv4_native_expert_adapter_exposes_unweighted_route_layout(monkeypatch):
+    from types import SimpleNamespace
+
+    import xorl.models.transformers.deepseek_v4.native_payload as payload_module
+
+    factors = {
+        projection: (
+            torch.ones((1, 1, 1), requires_grad=True),
+            torch.ones((1, 1, 1), requires_grad=True),
+        )
+        for projection in ("gate_proj", "up_proj", "down_proj")
+    }
+
+    class _Experts:
+        active_r = 1
+        active_lora_alpha = 1
+        native_mxfp4_payload = SimpleNamespace(w13_weight=torch.empty((1, 1, 1)))
+
+        @staticmethod
+        def _active_scaling():
+            return 1.0
+
+        @staticmethod
+        def _active_lora_views(projection):
+            return factors[projection]
+
+    observed = {}
+
+    def fake_forward(
+        hidden_states,
+        routing_weights,
+        selected_experts,
+        *args,
+        no_combine=False,
+    ):
+        observed["no_combine"] = no_combine
+        observed["weights"] = routing_weights
+        experts = args[-1]
+        assert isinstance(experts, _Experts)
+        routes = hidden_states.unsqueeze(1).expand(-1, selected_experts.shape[1], -1).contiguous()
+        return routes, selected_experts.to(torch.int32)
+
+    monkeypatch.setattr(payload_module, "_dsv4_native_mxfp4_forward", fake_forward)
+    hidden = torch.tensor([[1.0, 2.0]], dtype=torch.bfloat16)
+    weights = torch.tensor([[0.75, 0.25]], dtype=torch.float32)
+    selected = torch.tensor([[0, -1]], dtype=torch.int32)
+
+    routes = payload_module.dsv4_native_mxfp4_routed_partial(
+        hidden,
+        weights,
+        selected,
+        _Experts(),
+        return_routes=True,
+    )
+
+    assert observed["no_combine"] is True
+    assert observed["weights"] is weights
+    assert routes.shape == (1, 2, 2)
+    assert routes.dtype is torch.bfloat16
+
+
+def test_dsv4_native_expert_adapter_defines_empty_route_layout():
+    from types import SimpleNamespace
+
+    import xorl.models.transformers.deepseek_v4.native_payload as payload_module
+
+    factors = {
+        projection: (torch.empty((1, 1, 1)), torch.empty((1, 1, 1)))
+        for projection in ("gate_proj", "up_proj", "down_proj")
+    }
+
+    class _Experts:
+        active_r = 1
+        active_lora_alpha = 1
+        native_mxfp4_payload = SimpleNamespace(w13_weight=torch.empty((1, 1, 1)))
+
+        @staticmethod
+        def _active_scaling():
+            return 1.0
+
+        @staticmethod
+        def _active_lora_views(projection):
+            return factors[projection]
+
+    routes = payload_module.dsv4_native_mxfp4_routed_partial(
+        torch.empty((0, 4), dtype=torch.bfloat16),
+        torch.empty((0, 6), dtype=torch.float32),
+        torch.empty((0, 6), dtype=torch.int32),
+        _Experts(),
+        return_routes=True,
+    )
+
+    assert routes.shape == (0, 6, 4)
+    assert routes.dtype is torch.bfloat16
 
 
 # ---------------------------------------------------------------------------

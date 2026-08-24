@@ -308,6 +308,20 @@ def test_for_causal_lm_forward_backward():
         assert grads[name].grad is None, f"{name} unexpectedly received a gradient"
 
 
+def test_for_causal_lm_propagates_hidden_states():
+    from xorl.models.transformers.deepseek_v4 import DeepseekV4ForCausalLM  # noqa: PLC0415
+
+    cfg = _tiny_config(num_hidden_layers=2, compress_ratios=[0, 0])
+    model = _make_model(cfg, DeepseekV4ForCausalLM)
+    input_ids = torch.randint(0, cfg.vocab_size, (1, cfg.sliding_window), dtype=torch.long)
+
+    outputs = model(input_ids=input_ids, output_hidden_states=True)
+
+    assert outputs.hidden_states is not None
+    assert len(outputs.hidden_states) == cfg.num_hidden_layers + 1
+    assert outputs.hidden_states[0].shape == (1, cfg.sliding_window, cfg.hc_mult, cfg.hidden_size)
+
+
 def test_for_causal_lm_with_hash_layer():
     """First layer is hash-routed; verify input_ids threads through correctly."""
     from xorl.models.transformers.deepseek_v4 import DeepseekV4ForCausalLM  # noqa: PLC0415
@@ -460,3 +474,96 @@ def test_outer_gradient_checkpointing_wraps_decoder_layers():
     assert out.shape == (1, cfg.sliding_window, cfg.hidden_size)
     assert len(calls) == cfg.num_hidden_layers
     assert all(call_kwargs["input_ids"] is input_ids for _, _, call_kwargs in calls)
+
+
+def test_exact_residual_capture_selects_live_position_before_packed_padding(tmp_path, monkeypatch):
+    from xorl.models.transformers.deepseek_v4 import DeepseekV4Model  # noqa: PLC0415
+
+    model = DeepseekV4Model.__new__(DeepseekV4Model)
+    nn.Module.__init__(model)
+    monkeypatch.setenv("XORL_DSV4_TRAINER_LAYER_CAPTURE_DIR", str(tmp_path))
+    monkeypatch.setenv("XORL_DSV4_TRAINER_LAYER_CAPTURE_POSITION", "64")
+    hidden = torch.arange(3 * 2 * 4, dtype=torch.bfloat16).reshape(1, 3, 2, 4)
+    positions = torch.tensor([[63, 64, 65, 0, 0]])
+    input_ids = torch.tensor([[11, 107413, 13, 0, 0]])
+
+    model._maybe_capture_exact_residual_row(
+        layer_id=-1,
+        hidden_states=hidden,
+        position_ids=positions,
+        input_ids=input_ids,
+    )
+
+    [capture_path] = list(tmp_path.glob("*.pt"))
+    payload = torch.load(capture_path, map_location="cpu", weights_only=True)
+    assert payload["schema"] == "xorl.dsv4_trainer_layer_output.v1"
+    assert payload["layer"] == -1
+    assert payload["position"] == 64
+    assert payload["token_id"] == 107413
+    torch.testing.assert_close(payload["hidden"], hidden[:, 1])
+
+    # A later decode request no longer contains position 64. Once the full
+    # forward captured this layer, the one-shot hook must remain inert.
+    model._maybe_capture_exact_residual_row(
+        layer_id=-1,
+        hidden_states=hidden[:, :1],
+        position_ids=torch.tensor([[66]]),
+        input_ids=torch.tensor([[17]]),
+    )
+    assert list(tmp_path.glob("*.pt")) == [capture_path]
+
+
+def test_exact_component_capture_selects_owner_token_and_skips_dummy_rank(tmp_path, monkeypatch):
+    from xorl.models.transformers.deepseek_v4.modeling_deepseek_v4 import (  # noqa: PLC0415
+        DeepseekV4DecoderLayer,
+    )
+
+    monkeypatch.setenv("XORL_DSV4_TRAINER_COMPONENT_CAPTURE_DIR", str(tmp_path))
+    monkeypatch.setenv("XORL_DSV4_COMPONENT_CAPTURE_LAYER", "2")
+    monkeypatch.setenv("XORL_DSV4_COMPONENT_CAPTURE_TOKEN_ID", "107413")
+    hidden = torch.arange(3 * 4 * 5, dtype=torch.bfloat16).reshape(1, 3, 4, 5)
+    input_ids = torch.tensor([[11, 107413, 13, 0, 0]])
+
+    owner = DeepseekV4DecoderLayer.__new__(DeepseekV4DecoderLayer)
+    nn.Module.__init__(owner)
+    owner.layer_id = 2
+    owner._maybe_capture_exact_component("layer_input", hidden, input_ids, live_token_count=3)
+
+    dummy = DeepseekV4DecoderLayer.__new__(DeepseekV4DecoderLayer)
+    nn.Module.__init__(dummy)
+    dummy.layer_id = 2
+    dummy._maybe_capture_exact_component("layer_input", hidden, input_ids, live_token_count=0)
+
+    [capture_path] = list(tmp_path.glob("*.pt"))
+    payload = torch.load(capture_path, map_location="cpu", weights_only=True)
+    assert payload["schema"] == "xorl.dsv4_trainer_component.v1"
+    assert payload["component"] == "layer_input"
+    assert payload["token_id"] == 107413
+    torch.testing.assert_close(payload["value"], hidden[:, 1])
+
+
+def test_exact_attention_component_capture_selects_position(tmp_path, monkeypatch):
+    from xorl.models.transformers.deepseek_v4.modeling_deepseek_v4 import (  # noqa: PLC0415
+        DeepSeekV4Attention,
+    )
+
+    monkeypatch.setenv("XORL_DSV4_TRAINER_ATTENTION_CAPTURE_DIR", str(tmp_path))
+    monkeypatch.setenv("XORL_DSV4_ATTENTION_CAPTURE_LAYER", "2")
+    monkeypatch.setenv("XORL_DSV4_ATTENTION_CAPTURE_POSITION", "64")
+    attention = DeepSeekV4Attention.__new__(DeepSeekV4Attention)
+    nn.Module.__init__(attention)
+    attention.layer_id = 2
+    value = torch.arange(3 * 4 * 5, dtype=torch.bfloat16).reshape(1, 3, 4, 5)
+
+    attention._maybe_capture_exact_attention_component(
+        "q_pre_attention",
+        value,
+        torch.tensor([63, 64, 65]),
+    )
+
+    [capture_path] = list(tmp_path.glob("*.pt"))
+    payload = torch.load(capture_path, map_location="cpu", weights_only=True)
+    assert payload["schema"] == "xorl.dsv4_trainer_attention_component.v1"
+    assert payload["component"] == "q_pre_attention"
+    assert payload["position"] == 64
+    torch.testing.assert_close(payload["value"], value[:, 1])

@@ -18,7 +18,12 @@ def _exact_attention_module():
 def _cache_state(num_tokens: int, ratio: int):
     exact_attention = _exact_attention_module()
     state = exact_attention.Dsv4DecodeCarryState()
-    state.kvcache = exact_attention._ensure_paged_kvcache(None, num_tokens, 128, torch.device("cpu"))
+    state.kvcache = exact_attention._ensure_paged_kvcache(
+        None,
+        num_tokens,
+        exact_attention._SERVING_SWA_PAGE_SIZE,
+        torch.device("cpu"),
+    )
     state.num_tokens = num_tokens
     if ratio:
         state.num_compressed = num_tokens // ratio
@@ -31,14 +36,50 @@ def _cache_state(num_tokens: int, ratio: int):
     return state
 
 
-def _install_fake_flash_mla(monkeypatch, implementation):
+def _install_fake_flash_mla(monkeypatch, implementation, scheduler=None):
     package = types.ModuleType("sgl_kernel")
     module = types.ModuleType("sgl_kernel.flash_mla")
     module.flash_mla_with_kvcache = implementation
-    module.get_mla_metadata = lambda: (object(), None)
+    module.get_mla_metadata = lambda: (
+        object() if scheduler is None else scheduler,
+        None,
+    )
     package.flash_mla = module
     monkeypatch.setitem(sys.modules, "sgl_kernel", package)
     monkeypatch.setitem(sys.modules, "sgl_kernel.flash_mla", module)
+
+
+@pytest.mark.cpu
+@pytest.mark.parametrize(
+    ("page_size", "expected_pages"),
+    [(256, 4), (64, 33), (2, 33)],
+)
+def test_serving_cache_extent_preserves_qualified_sampler_pool_shape(page_size, expected_pages):
+    exact_attention = _exact_attention_module()
+    cache = exact_attention._ensure_paged_kvcache(None, 1, page_size, torch.device("cpu"))
+    assert cache.shape == (expected_pages, exact_attention._flashmla_page_bytes(page_size))
+
+
+@pytest.mark.cpu
+def test_operator_capture_extracts_split_plane_flashmla_rows():
+    exact_attention = _exact_attention_module()
+    page_size = 64
+    storage = exact_attention._ensure_paged_kvcache(None, 1, page_size, torch.device("cpu"))
+    reference = page_size + 5
+    storage[1, 5 * 576 : 6 * 576] = 17
+    storage[1, page_size * 576 + 5 * 8 : page_size * 576 + 6 * 8] = 29
+    kernel_view = exact_attention._paged_cache_kernel_view(storage, page_size)
+
+    references, rows = exact_attention._referenced_cache_rows(
+        kernel_view,
+        torch.tensor([[[reference]]], dtype=torch.int32),
+        torch.tensor([1], dtype=torch.int32),
+    )
+
+    assert references.tolist() == [reference]
+    assert rows.shape == (1, 584)
+    assert (rows[0, :576] == 17).all()
+    assert (rows[0, 576:] == 29).all()
 
 
 @pytest.mark.cpu
@@ -89,7 +130,13 @@ def test_serving_rows_dispatch_literal_m1_with_causal_metadata(
         assert call["q"].shape == (1, 1, 64, 512)
         assert torch.equal(call["q"], q[:, row : row + 1])
         swa_length = min(position + 1, 128)
-        expected_swa = list(range(position, position - swa_length, -1))
+        expected_swa = list(
+            range(
+                exact_attention._SERVING_SWA_PAGE_SIZE + position,
+                exact_attention._SERVING_SWA_PAGE_SIZE + position - swa_length,
+                -1,
+            )
+        )
         actual_swa = call["indices"][0, 0]
         assert actual_swa[:swa_length].tolist() == expected_swa
         assert (actual_swa[swa_length:] == -1).all()
@@ -98,11 +145,74 @@ def test_serving_rows_dispatch_literal_m1_with_causal_metadata(
             blocks = expected_blocks[row]
             actual_extra = call["extra_indices_in_kvcache"][0, 0]
             assert call["extra_indices_in_kvcache"].shape == (1, 1, 512 if ratio == 4 else 64)
-            assert actual_extra[:blocks].tolist() == list(range(blocks))
+            extra_page_size = 256 // ratio
+            assert actual_extra[:blocks].tolist() == list(range(extra_page_size, extra_page_size + blocks))
             assert (actual_extra[blocks:] == -1).all()
             assert call["extra_topk_length"].tolist() == [max(blocks, 1)]
         else:
             assert "extra_indices_in_kvcache" not in call
+
+
+@pytest.mark.cpu
+def test_exact_trainer_rejects_non_fixed_k2_flashmla_scheduler(monkeypatch):
+    exact_attention = _exact_attention_module()
+
+    def fake_flash_mla_with_kvcache(**kwargs):
+        return kwargs["q"].clone(), torch.empty(0)
+
+    scheduler = types.SimpleNamespace(num_splits=torch.tensor([0, 3]))
+    _install_fake_flash_mla(
+        monkeypatch,
+        fake_flash_mla_with_kvcache,
+        scheduler=scheduler,
+    )
+    state = _cache_state(65, 4)
+
+    with pytest.raises(RuntimeError, match="fixed-K2"):
+        exact_attention._serving_decode_attention(
+            torch.zeros((1, 1, 64, 512), dtype=torch.bfloat16),
+            state,
+            64,
+            4,
+            torch.zeros(64),
+            512**-0.5,
+        )
+
+
+@pytest.mark.cpu
+def test_operator_capture_records_semantic_cache_rows(tmp_path, monkeypatch):
+    exact_attention = _exact_attention_module()
+
+    def fake_flash_mla_with_kvcache(**kwargs):
+        return kwargs["q"].clone(), torch.empty(0)
+
+    _install_fake_flash_mla(monkeypatch, fake_flash_mla_with_kvcache)
+    monkeypatch.setenv("XORL_DSV4_TRAINER_OPERATOR_CAPTURE_DIR", str(tmp_path))
+    monkeypatch.setenv("XORL_DSV4_OPERATOR_CAPTURE_LAYER", "2")
+    monkeypatch.setenv("XORL_DSV4_OPERATOR_CAPTURE_POSITIONS", "63,64")
+    exact_attention._CAPTURED_OPERATOR_INPUTS.clear()
+    state = _cache_state(65, 4)
+    q = torch.zeros((1, 1, 64, 512), dtype=torch.bfloat16)
+
+    with exact_attention.exact_attention_layer(2):
+        exact_attention._serving_decode_attention(
+            q,
+            state,
+            64,
+            4,
+            torch.zeros(64),
+            512**-0.5,
+        )
+
+    [capture_path] = list(tmp_path.glob("*.pt"))
+    payload = torch.load(capture_path, map_location="cpu", weights_only=True)
+    assert payload["schema"] == "xorl.dsv4_trainer_flashmla_operator_capture.v2"
+    assert payload["layer"] == 2
+    assert payload["position"] == 64
+    assert payload["raw_topk_length"].tolist() == [65]
+    assert payload["raw_referenced_cache_rows"].shape[0] == 65
+    assert payload["extra_topk_length"].tolist() == [16]
+    assert payload["extra_referenced_cache_rows"].shape[0] == 16
 
 
 @pytest.mark.cpu
@@ -143,21 +253,27 @@ def test_serving_row_excludes_future_raw_and_compressed_cache_bytes(monkeypatch,
 
     _install_fake_flash_mla(monkeypatch, fake_flash_mla_with_kvcache)
     state = _cache_state(num_tokens, ratio)
-    raw = exact_attention._paged_cache_kernel_view(state.kvcache, 128)
+    raw_page_size = exact_attention._SERVING_SWA_PAGE_SIZE
+    assert raw_page_size == 256
+    raw = exact_attention._paged_cache_kernel_view(state.kvcache, raw_page_size)
+    assert raw.dtype == torch.float8_e4m3fn
+    raw_storage = raw.view(torch.uint8)
     raw_values = torch.arange(1, num_tokens + 1, dtype=torch.int64).remainder(251).to(torch.uint8)
-    raw[
-        torch.arange(num_tokens) // 128,
-        torch.arange(num_tokens) % 128,
+    raw_storage[
+        (raw_page_size + torch.arange(num_tokens)) // raw_page_size,
+        (raw_page_size + torch.arange(num_tokens)) % raw_page_size,
         0,
         0,
     ] = raw_values
     if ratio:
         extra_page_size = 256 // ratio
         extra = exact_attention._paged_cache_kernel_view(state.compressed_kvcache, extra_page_size)
+        assert extra.dtype == torch.float8_e4m3fn
+        extra_storage = extra.view(torch.uint8)
         extra_locs = torch.arange(state.num_compressed)
-        extra[
-            extra_locs // extra_page_size,
-            extra_locs % extra_page_size,
+        extra_storage[
+            (extra_page_size + extra_locs) // extra_page_size,
+            (extra_page_size + extra_locs) % extra_page_size,
             0,
             0,
         ] = torch.arange(1, state.num_compressed + 1, dtype=torch.uint8)
@@ -165,11 +281,13 @@ def test_serving_row_excludes_future_raw_and_compressed_cache_bytes(monkeypatch,
     q = torch.zeros((1, 1, 64, 512), dtype=torch.bfloat16)
     before = exact_attention._serving_decode_attention(q, state, position, ratio, torch.zeros(64), 512**-0.5)
     future_raw = torch.arange(position + 1, num_tokens)
-    raw[future_raw // 128, future_raw % 128, 0, 0] = 251
+    future_raw = raw_page_size + future_raw
+    raw_storage[future_raw // raw_page_size, future_raw % raw_page_size, 0, 0] = 251
     if ratio:
         first_future_block = (position + 1) // ratio
         future_extra = torch.arange(first_future_block, state.num_compressed)
-        extra[
+        future_extra = extra_page_size + future_extra
+        extra_storage[
             future_extra // extra_page_size,
             future_extra % extra_page_size,
             0,
@@ -185,8 +303,8 @@ def test_serving_row_excludes_future_raw_and_compressed_cache_bytes(monkeypatch,
     )
     assert torch.equal(before, after_future_mutation)
 
-    page, slot = divmod(position, 128)
-    raw[page, slot, 0, 0] = (int(raw[page, slot, 0, 0]) + 17) % 251
+    page, slot = divmod(raw_page_size + position, raw_page_size)
+    raw_storage[page, slot, 0, 0] = (int(raw_storage[page, slot, 0, 0]) + 17) % 251
     after_visible_mutation = exact_attention._serving_decode_attention(
         q,
         state,
@@ -299,7 +417,7 @@ def test_c0_full_batch_materializes_one_independent_cache_per_request(monkeypatc
 @pytest.mark.gpu
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 @pytest.mark.parametrize("ratio", [0, 4, 128])
-def test_full_sequence_surrogate_backward_is_finite_and_reaches_prior_kv(monkeypatch, ratio):
+def test_full_sequence_custom_vjp_is_finite_and_reaches_prior_kv(monkeypatch, ratio):
     exact_attention = _exact_attention_module()
 
     def fake_raw_store(kv, _weight, _freqs, _eps, state, _offset, *, dequantize):

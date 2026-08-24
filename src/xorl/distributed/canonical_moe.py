@@ -1069,12 +1069,9 @@ def _canonical_moe_reduce(
         element_size=contribution.tensor.element_size(),
     )
     if transport is CanonicalMoETransport.PACKED_EP16_V2:
-        # Dense-v1 chunks the 16x-expanded owner slots to bound its allocation.
-        # Packed-v2's full-capacity send is already only one payload tensor, and
-        # coalescing here is required because GLM gathers CP shards in
-        # source-grouped order: an arbitrary subrange need not contain a
-        # balanced number of logical owners even though the complete capacity
-        # does. Keep one equal-split A2A over the complete logical row set.
+        # Dense-v1 chunks the contributor-expanded owner slots to bound its
+        # allocation. The sparse transports send at most one payload tensor;
+        # coalescing also preserves the complete owner-row layout.
         assert effective_chunk_rows == contribution.metadata.capacity
 
     tensor = _CanonicalMoEReduce.apply(

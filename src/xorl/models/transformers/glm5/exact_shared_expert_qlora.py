@@ -232,6 +232,118 @@ class _Glm52ExactTP16SharedExpertFunction(torch.autograd.Function):
         return (*gradients, None, None)
 
 
+class _Glm52ExactTP16SharedExpertAllContributorsFunction(torch.autograd.Function):
+    """Emit every physical TP16 leaf from one FSDP-root invocation.
+
+    Native DeepEP already returns the routed result on the owning CP rank.  A
+    second distributed shared-expert program is unnecessary: while this root
+    is materialized, the owner can execute the same sixteen physical sampler
+    shards over its local rows and canonical-fold their BF16 leaves locally.
+    Keeping the loop inside one custom Function is important because the
+    shared-expert root, rather than its projection children, owns the FSDP
+    unshard/reshard boundary.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        input: Tensor,
+        gate_A: Tensor,
+        gate_B: Tensor,
+        up_A: Tensor,
+        up_B: Tensor,
+        down_A: Tensor,
+        down_B: Tensor,
+        module,
+    ) -> Tensor:
+        effective = tuple(
+            factor.to(torch.bfloat16).contiguous() for factor in (gate_A, gate_B, up_A, up_B, down_A, down_B)
+        )
+        values = [
+            module._exact_forward_value(input, *effective, contributor_ordinal=ordinal)
+            for ordinal in range(module.tp_size)
+        ]
+        output = torch.stack(
+            [value.output.view(*input.shape[:-1], module.hidden_size) for value in values],
+            dim=0,
+        )
+        expected_shape = (module.tp_size, *input.shape[:-1], module.hidden_size)
+        if output.dtype is not torch.bfloat16:
+            raise TypeError(f"GLM-5.2 exact TP16 shared-expert leaves have {output.dtype}, expected torch.bfloat16")
+        if tuple(output.shape) != expected_shape:
+            raise RuntimeError(
+                f"GLM-5.2 exact TP16 shared-expert leaf shape {tuple(output.shape)} does not match {expected_shape}"
+            )
+
+        ctx.module = module
+        # Masters retain normal autograd version checks across the optimizer
+        # boundary; exact intermediates are stacked in immutable TP ordinal
+        # order for the staged surrogate VJP.
+        ctx.save_for_backward(
+            input.detach(),
+            *effective,
+            gate_A,
+            gate_B,
+            up_A,
+            up_B,
+            down_A,
+            down_B,
+            torch.stack([value.gate_up for value in values], dim=0),
+            torch.stack([value.activated for value in values], dim=0),
+        )
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: Tensor):
+        (
+            input,
+            effective_gate_A,
+            effective_gate_B,
+            effective_up_A,
+            effective_up_B,
+            effective_down_A,
+            effective_down_B,
+            _gate_A_master,
+            _gate_B_master,
+            _up_A_master,
+            _up_B_master,
+            _down_A_master,
+            _down_B_master,
+            exact_gate_up,
+            exact_activated,
+        ) = ctx.saved_tensors
+        accumulated: list[Tensor | None] = [None] * 7
+        for ordinal in range(ctx.module.tp_size):
+            gradients = ctx.module._surrogate_vjp(
+                input,
+                effective_gate_A,
+                effective_gate_B,
+                effective_up_A,
+                effective_up_B,
+                effective_down_A,
+                effective_down_B,
+                exact_gate_up[ordinal],
+                exact_activated[ordinal],
+                grad_output[ordinal],
+                contributor_ordinal=ordinal,
+                needs_input_grad=ctx.needs_input_grad[:7],
+            )
+            for index, gradient in enumerate(gradients):
+                if gradient is None:
+                    continue
+                if accumulated[index] is None:
+                    accumulated[index] = gradient.float()
+                else:
+                    accumulated[index] = accumulated[index] + gradient.float()
+
+        # Input is the only low-precision differentiable operand.  Contributor
+        # VJPs accumulate in FP32 and cross that BF16 boundary exactly once;
+        # all six logical factor gradients remain FP32 masters.
+        if accumulated[0] is not None:
+            accumulated[0] = accumulated[0].to(input.dtype)
+        return (*accumulated, None)
+
+
 class Glm52ExactTP16SharedExpertBlockFP8QLoRA(nn.Module):
     """Produce one unreduced sampler-equivalent GLM-5.2 shared-expert partial."""
 
@@ -713,7 +825,29 @@ class Glm52ExactTP16SharedExpertBlockFP8QLoRA(nn.Module):
 
         return grad_input, grad_gate_A, grad_gate_B, grad_up_A, grad_up_B, grad_down_A, grad_down_B
 
-    def forward(self, input: Tensor, *, contributor_ordinal: int) -> Tensor:
+    def forward(
+        self,
+        input: Tensor,
+        *,
+        contributor_ordinal: int | None = None,
+        all_contributors: bool = False,
+    ) -> Tensor:
+        if all_contributors:
+            if contributor_ordinal is not None:
+                raise ValueError("GLM-5.2 shared expert cannot select one contributor while all_contributors=True")
+            self._validate_engaged_contract(input, 0)
+            return _Glm52ExactTP16SharedExpertAllContributorsFunction.apply(
+                input,
+                self.gate_proj.lora_A,
+                self.gate_proj.lora_B,
+                self.up_proj.lora_A,
+                self.up_proj.lora_B,
+                self.down_proj.lora_A,
+                self.down_proj.lora_B,
+                self,
+            )
+        if contributor_ordinal is None:
+            raise TypeError("GLM-5.2 shared expert requires contributor_ordinal unless all_contributors=True")
         ordinal = self._validate_engaged_contract(input, contributor_ordinal)
         return _Glm52ExactTP16SharedExpertFunction.apply(
             input,

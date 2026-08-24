@@ -351,6 +351,10 @@ def test_sync_source_adapter_extraction_and_inference_layout_policy(monkeypatch,
     assert handler._prepare_lora_adapter_for_sync(None) == "current-adapter"
     assert trainer.adapter_manager.synced == ["policy-b", "current-adapter"]
 
+    trainer.lora_config = {"lora_serving_mode": "separate"}
+    with pytest.raises(RuntimeError, match="publishes A/B factors"):
+        handler._prepare_lora_adapter_for_sync("policy-a")
+
     _assert_extract_params_for_sync_policy()
     _assert_unfuse_for_inference_layout_policy()
     with monkeypatch.context() as case_patch:
@@ -994,6 +998,109 @@ def _assert_gated_experts_keep_three_projections():
         ctx["local_experts"]["up_proj"],
         wrapper.experts.gate_up_proj.data[..., 5:].to(torch.bfloat16),
     )
+
+
+def test_collect_ep_moe_data_separate_mode_omits_frozen_expert_base():
+    from xorl.models.layers.moe.lora import MoEExpertsLoRA
+
+    class Wrapper(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            base = MoEExperts(
+                num_experts=2,
+                hidden_dim=3,
+                intermediate_size=5,
+                hidden_act="silu",
+                moe_implementation="eager",
+                gated=True,
+            )
+            self.experts = MoEExpertsLoRA.from_module(
+                base,
+                r=2,
+                lora_alpha=2,
+                target_modules=["gate_proj", "up_proj", "down_proj"],
+                hybrid_shared=True,
+            )
+
+    wrapper = Wrapper()
+    experts = wrapper.experts
+    torch.nn.init.normal_(experts.gate_up_proj)
+    torch.nn.init.normal_(experts.down_proj)
+    with torch.no_grad():
+        for name, parameter in experts.named_parameters():
+            if "lora_B" in name:
+                parameter.fill_(0.25)
+    experts.exact_merged_forward = True
+    experts.lora_serving_mode = "separate"
+
+    handler = WeightSyncHandler(rank=0, world_size=1, trainer=None)
+    contexts = handler._collect_ep_moe_data(wrapper, "(root)", None)
+
+    # Separate mode publishes routed-expert LoRA factors separately.  The base
+    # checkpoint is immutable, so no per-expert HF keys may reach SGLang's
+    # online loader (whose active-LoRA wrapper nests the base FusedMoE).  The
+    # skip-only context must suppress the ordinary dense extraction path while
+    # producing no EP transfer context.
+    assert contexts == [
+        {
+            "type": "frozen_active_lora_base",
+            "prefix": "experts",
+            "local_experts": None,
+        }
+    ]
+    prefixes, transferable = handler._split_ep_moe_contexts_for_sync(contexts, "(root)")
+    assert prefixes == {"experts"}
+    assert transferable == []
+    extracted = handler._extract_params_for_sync(
+        wrapper,
+        "(root)",
+        object,
+        skip_moe_prefixes=prefixes,
+    )
+    assert extracted == []
+
+
+def test_collect_ep_moe_data_separate_mode_omits_metadata_only_context():
+    from xorl.models.layers.moe.lora import MoEExpertsLoRA
+
+    base = MoEExperts(
+        num_experts=2,
+        hidden_dim=3,
+        intermediate_size=5,
+        hidden_act="silu",
+        moe_implementation="eager",
+        gated=True,
+    )
+    wrapper = torch.nn.Module()
+    wrapper.experts = MoEExpertsLoRA.from_module(
+        base,
+        r=2,
+        lora_alpha=2,
+        target_modules=["gate_proj", "up_proj", "down_proj"],
+        hybrid_shared=True,
+    )
+    wrapper.experts.lora_serving_mode = "separate"
+
+    handler = WeightSyncHandler(rank=1, world_size=8, trainer=None)
+    contexts = handler._collect_ep_moe_data(
+        wrapper,
+        "model.layers.0.mlp",
+        None,
+        collect_tensors=False,
+    )
+    assert contexts == [
+        {
+            "type": "frozen_active_lora_base",
+            "prefix": "model.layers.0.mlp.experts",
+            "local_experts": None,
+        }
+    ]
+    prefixes, transferable = handler._split_ep_moe_contexts_for_sync(
+        contexts,
+        "model.layers.0.mlp",
+    )
+    assert prefixes == {"experts"}
+    assert transferable == []
 
 
 def _assert_compile_wrapper_name_normalization_policy():

@@ -24,6 +24,8 @@ class TinyTrunkModel(nn.Module):
             nn.ModuleDict(
                 {
                     "q_proj": nn.Linear(16, 16, bias=False, dtype=torch.bfloat16),
+                    "k_proj": nn.Linear(16, 16, bias=False, dtype=torch.bfloat16),
+                    "v_proj": nn.Linear(16, 16, bias=False, dtype=torch.bfloat16),
                     "o_proj": nn.Linear(16, 16, bias=False, dtype=torch.bfloat16),
                     "gate_proj": nn.Linear(16, 32, bias=False, dtype=torch.bfloat16),
                     "up_proj": nn.Linear(16, 32, bias=False, dtype=torch.bfloat16),
@@ -42,6 +44,15 @@ class ExactTinyTrunkModel(TinyTrunkModel):
         return wrap_trunk_linears_batch_invariant(self)
 
 
+class NativeExactTinyTrunkModel(TinyTrunkModel):
+    def _apply_deepep_native_exact(self):
+        from xorl.models.transformers.qwen3_moe.modeling_qwen3_moe import (
+            _apply_qwen3_deepep_native_exact,
+        )
+
+        return _apply_qwen3_deepep_native_exact(self)
+
+
 @pytest.fixture(autouse=True)
 def _reset_contract_state():
     yield
@@ -57,6 +68,7 @@ def _build(
     server_training=False,
     freeze_router=False,
     enable_lora=False,
+    lora_serving_mode=None,
 ):
     def fake_parallelize(model, **_kwargs):
         captured["wrapped_at_parallelize"] = sum(
@@ -82,11 +94,10 @@ def _build(
         server_training=server_training,
         freeze_router=freeze_router,
         enable_lora=enable_lora,
+        lora_serving_mode=lora_serving_mode,
         lora_rank=2,
         lora_alpha=4,
-        # TinyTrunkModel has no k_proj/v_proj, and injection rejects a target that
-        # matches nothing, so request only the projections the fixture defines.
-        lora_target_modules=["q_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+        lora_target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
     )
 
 
@@ -95,7 +106,7 @@ def test_exact_server_model_wraps_trunk_linears_before_parallelize(monkeypatch):
     result = _build(monkeypatch, captured, model=ExactTinyTrunkModel(), server_training=True)
 
     assert captured["server_training_at_build"] is True
-    assert captured["wrapped_at_parallelize"] == 10, "wrap must land before parallelization (pre-FSDP2)"
+    assert captured["wrapped_at_parallelize"] == 14, "wrap must land before parallelization (pre-FSDP2)"
     assert not getattr(result.model.lm_head, "_xorl_bi_trunk_wrapped", False)
     assert is_trunk_linear_contract_enabled()
 
@@ -146,14 +157,51 @@ def test_dense_qwen_exact_program_is_reinstalled_after_lora_replacement(monkeypa
     wrap_trunk_linears_batch_invariant(model)
     result = _build(monkeypatch, captured, model=model, server_training=True, enable_lora=True)
 
-    assert captured["wrapped_at_parallelize"] == 10
+    assert captured["wrapped_at_parallelize"] == 14
     assert bi_families_v2.families_v2_enabled() is True
     for layer in result.model.layers:
-        for name in ("q_proj", "o_proj", "gate_proj", "up_proj", "down_proj"):
+        for name in ("q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"):
             module = layer[name]
             assert type(module) is LoraLinear
             assert module.exact_merged_forward is True
             assert module._xorl_bi_trunk_wrapped is True
+
+
+def test_qwen3_moe_native_deepep_installs_exact_program_before_parallelize(monkeypatch):
+    captured = {}
+    model = NativeExactTinyTrunkModel()
+    model.config = SimpleNamespace(model_type="qwen3_moe", _deepep_native_exact=True)
+    monkeypatch.setenv("XORL_FAMILIES_V2", "0")
+
+    _build(monkeypatch, captured, model=model, server_training=True)
+
+    assert captured["wrapped_at_parallelize"] == 14
+    assert bi_families_v2.families_v2_enabled() is True
+
+
+@pytest.mark.parametrize("lora_serving_mode", ["merged", "separate"])
+def test_qwen3_moe_native_deepep_installs_selected_lora_program(monkeypatch, lora_serving_mode):
+    captured = {}
+    model = NativeExactTinyTrunkModel()
+    model.config = SimpleNamespace(
+        model_type="qwen3_moe",
+        _deepep_native_exact=True,
+        _lora_serving_mode=lora_serving_mode,
+    )
+
+    result = _build(
+        monkeypatch,
+        captured,
+        model=model,
+        server_training=True,
+        enable_lora=True,
+        lora_serving_mode=lora_serving_mode,
+    )
+
+    for layer in result.model.layers:
+        for module in layer.values():
+            assert module.lora_serving_mode == lora_serving_mode
+            assert module.exact_merged_forward is True
 
 
 def test_ordinary_model_restores_nonexact_family_selection(monkeypatch):

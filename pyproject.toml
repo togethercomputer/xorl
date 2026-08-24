@@ -49,14 +49,15 @@ dependencies = [
   # P2P / Mooncake weight sync
   "mooncake-transfer-engine==0.3.9",
   "xorl-client @ git+https://github.com/togethercomputer/xorl-client.git@2a3a60a783c98e2a8ff722bad06dab18caee350c",
-  # PyTorch 2.11 with its CUDA 13 runtime dependencies. These versions match
-  # the checked-in xorl-sglang package metadata, so xorl, xorl-client, and the
-  # xorl-sglang submodule (including its compiled sglang-kernel extension) all
-  # run in this one environment.
-  "torch==2.11.0",
-  "torchvision==0.26.0",
-  "triton==3.6.0",
+  # Four-model zero-K3 qualification used this exact PyTorch/CUDA profile.
+  # Keep these pins aligned with the checked-in xorl-sglang metadata and the
+  # DeepEP release lock below.
+  "torch @ https://download.pytorch.org/whl/cu132/torch-2.12.1%2Bcu132-cp312-cp312-manylinux_2_28_x86_64.whl",
+  "torchvision @ https://download.pytorch.org/whl/cu132/torchvision-0.27.1%2Bcu132-cp312-cp312-manylinux_2_28_x86_64.whl",
+  "triton @ https://download.pytorch.org/whl/triton-3.7.1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl",
   "flash-attn-4==4.0.0b19",
+  "deep-ep @ https://github.com/togethercomputer/xorl-wheels/releases/download/deepep_sglang_kernel_torch212_cu132_sm90_723b8b3/deep_ep-1.2.1%2B65538ab.xorl.c85744ca7250-cp312-cp312-linux_x86_64.whl#sha256=f30485d585a4cd935f44ffadd276d7ea8603a919cff60302bbb40ded344cdccb",
+  "sglang-kernel @ https://github.com/togethercomputer/xorl-wheels/releases/download/deepep_sglang_kernel_torch212_cu132_sm90_723b8b3/sglang_kernel-0.4.5%2Bxorl.torch212.cu132.sm90-cp312-cp312-linux_x86_64.whl#sha256=f02e35414c18fd311ce29b7d27c9a07678f3932a9be3cabfec8d322f7b738f21",
   # Resolved to the checked-in fork by [tool.uv.sources] below.
   "sglang[all]",
   # TileLang kernels — used by DeepSeek-V4 sparse MLA, DSA indexer, FP8

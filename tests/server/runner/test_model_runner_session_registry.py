@@ -87,6 +87,12 @@ class _TinyModule(torch.nn.Module):
         self.param = torch.nn.Parameter(torch.tensor([2.0]))
 
 
+class Glm5TopkRouter(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.tensor([[1.0, 2.0]]))
+
+
 class _FakeOptimizer:
     def __init__(self) -> None:
         self.param_groups = [{"lr": 0.1}]
@@ -111,6 +117,77 @@ def _build_runner() -> ModelRunner:
     runner.global_step = 0
     runner.global_forward_backward_step = 0
     return runner
+
+
+def test_exact_glm52_router_session_is_single_tenant():
+    runner = _build_runner()
+    runner._adapter_manager = None
+    runner._glm52_exact_router_single_tenant = True
+    runner._active_session_id = "default"
+
+    result = ModelRunner.register_session(runner, "default", _session_spec(0.05), materialize=True)
+    assert result["materialized"] is True
+
+    with pytest.raises(ValueError, match="single-tenant"):
+        ModelRunner.register_session(runner, "policy-b", _session_spec(0.05), materialize=True)
+
+
+def test_exact_glm52_shared_optimizer_is_rebuilt_after_adapter_preparation(monkeypatch):
+    runner = _build_runner()
+    calls = []
+
+    class _Manager:
+        publisher = object()
+
+        def has_adapter(self, model_id):
+            return model_id == "default"
+
+        def prepare_forward(self, model_id):
+            calls.append(("prepare", model_id))
+
+        def make_live_model_lora_publisher(self):
+            return self.publisher
+
+    runner._adapter_manager = _Manager()
+    runner._checkpoint_mgr = SimpleNamespace(optimizer="stale", _adapter_manager=runner._adapter_manager)
+    runner.model = _TinyModule()
+    runner.optimizer = "stale"
+
+    monkeypatch.setattr(model_runner_module, "get_parallel_state", lambda: SimpleNamespace(ep_enabled=True))
+    monkeypatch.setattr(model_runner_module, "refresh_ep_param_groups", lambda model: calls.append(("refresh", model)))
+
+    def _rebuild():
+        calls.append(("rebuild", None))
+        runner.optimizer = "current"
+
+    runner._initialize_optimizer = _rebuild
+    ModelRunner._promote_exact_glm52_default_adapter_to_shared_optimizer(runner)
+
+    assert calls == [("prepare", "default"), ("refresh", runner.model), ("rebuild", None)]
+    assert runner.optimizer == "current"
+    assert runner._checkpoint_mgr.optimizer == "current"
+    assert runner._adapter_manager is None
+    assert runner._checkpoint_mgr._adapter_manager is None
+    assert runner._checkpoint_mgr._detached_adapter_publisher is _Manager.publisher
+    assert runner._active_session_id == "default"
+
+
+def test_exact_glm52_router_step_receipt_proves_parameter_movement():
+    runner = _build_runner()
+    runner.model = torch.nn.Module()
+    runner.model.router = Glm5TopkRouter()
+    runner.optimizer = torch.optim.SGD(runner.model.parameters(), lr=0.25)
+    runner.model.router.weight.grad = torch.ones_like(runner.model.router.weight)
+
+    snapshots = ModelRunner._snapshot_glm52_router_weights_for_step(runner)
+    runner.optimizer.step()
+    metrics = ModelRunner._collect_glm52_router_update_metrics(runner, snapshots)
+
+    assert metrics == {
+        "router_update_tensor_count": 1,
+        "router_update_changed_tensor_count": 1,
+        "router_update_changed_element_count": 2,
+    }
 
 
 def test_lora_session_registry_syncs_after_optimizer_checkpoint_load_and_kill(monkeypatch, tmp_path):

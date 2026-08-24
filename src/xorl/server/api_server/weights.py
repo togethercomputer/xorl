@@ -716,6 +716,7 @@ class WeightsMixin:
             model_config = self.model_configs.get(request.model_id, {})
             lora_config = model_config.get("lora_config") or {}
             is_lora = _model_config_is_lora(model_config, default=self.default_session_spec is not None)
+            lora_serving_mode = lora_config.get("lora_serving_mode")
             if is_lora:
                 merge_lora_interval = int(
                     (getattr(self, "server_lora_config", {}) or {}).get(
@@ -727,7 +728,20 @@ class WeightsMixin:
             else:
                 merge_lora_interval = 0
 
-            if is_lora and merge_lora_interval == 0:
+            if lora_serving_mode == "separate" and merge_lora_interval:
+                raise ValueError("lora_serving_mode='separate' cannot publish periodically merged base weights")
+            if lora_serving_mode == "merged":
+                raise ValueError(
+                    "lora_serving_mode='merged' must publish the live canonical W+sBA "
+                    "payload through weight synchronization; save_weights_for_sampler "
+                    "does not materialize a folded full-model snapshot"
+                )
+            publish_separate = is_lora and (
+                lora_serving_mode == "separate" or (lora_serving_mode is None and merge_lora_interval == 0)
+            )
+            publish_merged = is_lora and (lora_serving_mode is None and merge_lora_interval > 0)
+
+            if publish_separate:
                 # LoRA with no merge: base weights unchanged, save adapter only
                 engine_request = OrchestratorRequest(
                     operation="save_lora_only",
@@ -756,7 +770,7 @@ class WeightsMixin:
             )
 
             # For LoRA with merge_interval > 0, also save LoRA weights for training recovery
-            if is_lora and merge_lora_interval > 0:
+            if publish_merged:
                 lora_save_path = os.path.join(save_path, "lora")
                 lora_request = OrchestratorRequest(
                     operation="save_lora_only",
@@ -769,7 +783,7 @@ class WeightsMixin:
 
             # Extract results
             result = output.outputs[0] if output.outputs else {}
-            saved_path = result.get("lora_path", save_path) if (is_lora and merge_lora_interval == 0) else save_path
+            saved_path = result.get("lora_path", save_path) if publish_separate else save_path
 
             # Validate model_id for xorl_client URI
             model_id = validate_model_id(request.model_id)
@@ -777,9 +791,9 @@ class WeightsMixin:
             # Build xorl:// URI for the saved checkpoint
             xorl_uri = self._to_xorl_uri(model_id, request.name, "sampler_weights")
 
-            if is_lora and merge_lora_interval == 0:
+            if publish_separate:
                 save_format = "PEFT LoRA"
-            elif is_lora and merge_lora_interval > 0:
+            elif publish_merged:
                 save_format = "safetensors (full weights) + PEFT LoRA"
             else:
                 save_format = "safetensors (full weights)"

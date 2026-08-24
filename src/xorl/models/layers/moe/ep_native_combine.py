@@ -42,8 +42,13 @@ fold implemented by both sides, not against a model-family registry.
 
 from __future__ import annotations
 
+import logging
+
 import torch
 import torch.distributed as dist
+
+
+logger = logging.getLogger(__name__)
 
 
 def validate_native_ep_combine_size(ep_size: int) -> None:
@@ -66,11 +71,27 @@ class _AllGatherSumBackward(torch.autograd.Function):
     Every rank's partial depends on every gathered row, so the gather's
     backward must SUM the per-rank contributions (unlike the CP helpers, whose
     backward slices). The reduce-scatter is stock NCCL — backward carries no
-    bitwise contract.
+    bitwise contract. ``backward_dependency`` is deliberately unused in the
+    forward and has no gradient.  When supplied, its autograd edge makes the
+    dependency's producer wait until this gather's complete consumer branch
+    (including the reduce-scatter) has completed in backward.  GLM-5.2 uses
+    that ordering edge plus an explicit CUDA completion boundary to keep c10d
+    and DeepEP collectives in the same device order on every rank without
+    adding arithmetic to either branch.
     """
 
     @staticmethod
-    def forward(ctx, x: torch.Tensor, group, padded_rows: int) -> torch.Tensor:
+    def forward(
+        ctx,
+        x: torch.Tensor,
+        group,
+        padded_rows: int,
+        backward_dependency: torch.Tensor | None,
+        backward_trace_label: str | None,
+    ) -> torch.Tensor:
+        ctx.complete_dependency_boundary = backward_dependency is not None
+        ctx.backward_trace_label = backward_trace_label
+        del backward_dependency
         ctx.group = group
         ctx.local_rows = x.shape[0]
         ctx.padded_rows = int(padded_rows)
@@ -81,17 +102,61 @@ class _AllGatherSumBackward(torch.autograd.Function):
         x = _pad_rows(x, ctx.padded_rows).contiguous()
         world_size = dist.get_world_size(group)
         out = torch.empty((world_size * ctx.padded_rows, *x.shape[1:]), dtype=x.dtype, device=x.device)
+        from xorl.distributed.moe.deepep import _trace_deepep_boundary  # noqa: PLC0415
+
+        _trace_deepep_boundary(
+            -1,
+            "shared_all_gather_forward",
+            "enter",
+            trace_label=ctx.backward_trace_label,
+        )
         dist.all_gather_into_tensor(out, x, group=group)
+        _trace_deepep_boundary(
+            -1,
+            "shared_all_gather_forward",
+            "exit",
+            trace_label=ctx.backward_trace_label,
+        )
         return out
 
     @staticmethod
     def backward(ctx, grad_output):
+        from xorl.distributed.moe.deepep import _trace_deepep_boundary  # noqa: PLC0415
+
         grad_output = grad_output.contiguous()
         grad_local_padded = torch.empty(
             (ctx.padded_rows, *grad_output.shape[1:]), dtype=grad_output.dtype, device=grad_output.device
         )
+        _trace_deepep_boundary(
+            -1,
+            "shared_reduce_scatter_backward",
+            "enter",
+            trace_label=ctx.backward_trace_label,
+        )
         dist.reduce_scatter_tensor(grad_local_padded, grad_output, op=dist.ReduceOp.SUM, group=ctx.group)
-        return grad_local_padded[: ctx.local_rows], None, None
+        _trace_deepep_boundary(
+            -1,
+            "shared_reduce_scatter_backward",
+            "api_return",
+            trace_label=ctx.backward_trace_label,
+        )
+        if ctx.complete_dependency_boundary and grad_local_padded.is_cuda:
+            # ProcessGroupNCCL and normal-mode DeepEP use independent private
+            # communication streams.  Merely ordering their autograd nodes (or
+            # recording a current-stream event) does not prove that the NCCL
+            # stream has completed before DeepEP starts spinning in its global
+            # barrier.  Complete the shared branch here; only then does this
+            # Function return the undefined dependency gradient that makes the
+            # routed DeepEP producer eligible.  This is synchronization only:
+            # no value is read, communicated again, or added to any gradient.
+            torch.cuda.current_stream(grad_local_padded.device).synchronize()
+        _trace_deepep_boundary(
+            -1,
+            "shared_reduce_scatter_backward",
+            "device_complete",
+            trace_label=ctx.backward_trace_label,
+        )
+        return grad_local_padded[: ctx.local_rows], None, None, None, None
 
 
 def _pad_rows(x: torch.Tensor, padded_rows: int, *, value: int | float = 0) -> torch.Tensor:
@@ -109,17 +174,35 @@ def max_rows_for_ep_combine(local_rows: int, device: torch.device, group) -> int
     return int(rows.item())
 
 
-def gather_tokens_for_ep_combine(x: torch.Tensor, group, padded_rows: int | None = None) -> torch.Tensor:
+def gather_tokens_for_ep_combine(
+    x: torch.Tensor,
+    group,
+    padded_rows: int | None = None,
+    *,
+    backward_dependency: torch.Tensor | None = None,
+    backward_trace_label: str | None = None,
+) -> torch.Tensor:
     """Autograd token gather with EP-uniform row padding.
 
     Dispatcher DP slices can contain different packed sequence lengths. Native
     EP still needs every expert rank to see every slice, so shorter ranks are
     padded to the negotiated maximum before the equal-count NCCL gather. The
     caller slices the final folded result back to its original row count.
+
+    ``backward_dependency`` changes only backward scheduling/synchronization:
+    this gather's CUDA work completes before the dependency's producer
+    backward is eligible.  No dependency value is read, communicated, or
+    added to the gradient.
     """
     if padded_rows is None:
         padded_rows = max_rows_for_ep_combine(x.shape[0], x.device, group)
-    return _AllGatherSumBackward.apply(x, group, padded_rows)
+    return _AllGatherSumBackward.apply(
+        x,
+        group,
+        padded_rows,
+        backward_dependency,
+        backward_trace_label,
+    )
 
 
 def gather_ids_for_ep_combine(ids: torch.Tensor, group, padded_rows: int | None = None) -> torch.Tensor:
@@ -190,7 +273,11 @@ def sglang_fused_gate_sigmoid_mul_add(
     return _SGLangFusedGateSigmoidMulAdd.apply(hidden_states, gate_weight, shared_output, routed_output)
 
 
-def exchange_and_canonical_fold(partial: torch.Tensor, group, ep_size: int) -> torch.Tensor:
+def exchange_and_canonical_fold(
+    partial: torch.Tensor,
+    group,
+    ep_size: int,
+) -> torch.Tensor:
     """RAW BF16 partial exchange + the serving canonical FP64 contributor fold.
 
     ``partial`` is this rank's [n*T, H] contribution for ALL gathered tokens.
@@ -215,6 +302,7 @@ def exchange_and_canonical_fold(partial: torch.Tensor, group, ep_size: int) -> t
         raise TypeError("Native EP canonical combine requires BF16 partials")
     if partial.shape[0] % ep_size:
         raise ValueError("Native EP canonical combine rows must be divisible by EP size")
+
     exchanged = _AllToAll.apply(group, partial.contiguous(), None, None)  # [n*T, H], segment s from rank s
     rows = exchanged.shape[0] // ep_size
     logical_sources = exchanged.reshape(ep_size, rows, *exchanged.shape[1:])

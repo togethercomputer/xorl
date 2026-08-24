@@ -11,6 +11,7 @@ from torch import nn
 
 from xorl.distributed.parallel_state import get_parallel_state
 from xorl.lora.modules.linear import LoraLinear
+from xorl.models.exact_contract import glm52_exact_active_lora_enabled
 from xorl.models.layers.moe.experts import MoEExperts
 from xorl.models.transformers.glm5.exact_absorbed_kv_b_qlora import (
     Glm52ExactTP1AbsorbedKvBBlockFP8QLoRA,
@@ -177,9 +178,9 @@ def _validate_official_config(config) -> dict:
             exact_lm_head_component,
         )
     )
-    required_ep_dispatch = "alltoall" if exact_component_enabled else "deepep"
-    if getattr(config, "_ep_dispatch", None) != required_ep_dispatch:
-        raise ValueError(f"GLM-5.2 block-FP8 QLoRA requires ep_dispatch={required_ep_dispatch!r}")
+    admitted_ep_dispatches = {"alltoall", "deepep"} if exact_component_enabled else {"deepep"}
+    if getattr(config, "_ep_dispatch", None) not in admitted_ep_dispatches:
+        raise ValueError(f"GLM-5.2 block-FP8 QLoRA requires ep_dispatch in {sorted(admitted_ep_dispatches)!r}")
     if exact_dense_component and getattr(config, "hidden_act", None) != "silu":
         raise ValueError("GLM-5.2 exact active-LoRA dense component requires hidden_act='silu'")
     if exact_attention_component and not getattr(config, "_sparse_mla_enabled", False):
@@ -450,6 +451,25 @@ def _replace_exact_routed_target(
         hidden_act=config.hidden_act,
         device=original.gate_up_proj.device,
     )
+    # The replacement happens after ``Glm5MoEBlock`` has attached runtime
+    # DeepEP configuration to the original expert bank.  Preserve those
+    # non-parameter attributes explicitly: composable FSDP changes the
+    # replacement's dynamic type but does not synthesize missing attributes.
+    replacement.deepep_buffer_size_gb = getattr(
+        original,
+        "deepep_buffer_size_gb",
+        getattr(config, "_deepep_buffer_size_gb", 2.0),
+    )
+    replacement.deepep_num_sms = getattr(
+        original,
+        "deepep_num_sms",
+        getattr(config, "_deepep_num_sms", 20),
+    )
+    replacement.deepep_async_combine = getattr(
+        original,
+        "deepep_async_combine",
+        getattr(config, "_deepep_async_combine", False),
+    )
     replacement._source_fqn = target.name
     replacement._source_quant_format = "block_fp8"
     _set_submodule(model, target.name, replacement)
@@ -705,12 +725,22 @@ def _validate_constructed_model(model: nn.Module, inventory: Glm52AdapterInvento
                 f"GLM-5.2 QLoRA indexer weights_proj for layer {layer_idx} must remain an ordinary BF16 linear"
             )
 
+    expected_router_names = (
+        {f"model.layers.{layer_idx}.mlp.gate.weight" for layer_idx in range(3, 78)}
+        if bool(getattr(model.config, "train_router", False))
+        else set()
+    )
+    expected_trainable = inventory.factor_names | expected_router_names
     trainable = {name for name, parameter in model.named_parameters() if parameter.requires_grad}
-    if trainable != inventory.factor_names:
+    if trainable != expected_trainable:
         raise RuntimeError(
-            "GLM-5.2 QLoRA trainable factor set mismatch: "
-            f"missing={sorted(inventory.factor_names - trainable)} extra={sorted(trainable - inventory.factor_names)}"
+            "GLM-5.2 QLoRA trainable parameter set mismatch: "
+            f"missing={sorted(expected_trainable - trainable)} extra={sorted(trainable - expected_trainable)}"
         )
+    for name in expected_router_names:
+        parameter = dict(model.named_parameters())[name]
+        if parameter.dtype is not torch.bfloat16:
+            raise TypeError(f"GLM-5.2 exact QLoRA router {name} must retain its BF16 serving weight")
     trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     if len({id(parameter) for parameter in trainable_parameters}) != len(trainable_parameters):
         raise RuntimeError("GLM-5.2 QLoRA trainable factor set contains aliased Parameter identities")
@@ -869,6 +899,19 @@ def prepare_glm52_block_fp8_qlora(
     # checkpoint-native FP8 q/k projections without exposing the scoring-only
     # native module to any differentiable policy-bearing path.
     replace_glm52_native_fp8_modules(model, quantization_config)
+
+    # Exact active-LoRA router training deliberately optimizes the checkpoint
+    # BF16 gate weight itself.  The BI router consumes those literal bytes in
+    # both engines; the analytic routing-weight surrogate supplies the gradient
+    # without changing the decision-time forward values.
+    if bool(getattr(config, "train_router", False)):
+        if not glm52_exact_active_lora_enabled(config):
+            raise ValueError("GLM-5.2 QLoRA router training requires the complete exact active-LoRA contract")
+        for layer_idx in range(3, 78):
+            gate = model.get_submodule(f"model.layers.{layer_idx}.mlp.gate")
+            if not isinstance(getattr(gate, "weight", None), nn.Parameter):
+                raise TypeError(f"GLM-5.2 layer {layer_idx} router gate has no trainable weight Parameter")
+            gate.weight.requires_grad_(True)
 
     inventory = Glm52AdapterInventory(targets=targets, factors=_build_factor_inventory(model, targets))
     _validate_constructed_model(model, inventory)

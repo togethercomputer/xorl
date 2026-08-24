@@ -6,7 +6,7 @@ builds its model directly and shares the individual helpers here instead.
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Optional, Set
+from typing import Any, Callable, List, Literal, Optional, Set
 
 import torch
 import torch.nn as nn
@@ -23,7 +23,11 @@ from xorl.models.transformers.deepseek_v3.support import (
     freeze_deepseek_v3_router_parameters,
     validate_deepseek_v3_training_mode,
 )
-from xorl.models.transformers.glm5.support import is_glm5_config, validate_glm5_training_mode
+from xorl.models.transformers.glm5.support import (
+    is_glm5_config,
+    validate_glm5_training_mode,
+    validate_glm52_local_router_inventory,
+)
 from xorl.qlora import (
     detect_prequantized_block_fp8,
     detect_prequantized_nvfp4,
@@ -205,11 +209,13 @@ def build_training_model(
     deepep_buffer_size_gb: float = 2.0,
     deepep_num_sms: int = 20,
     deepep_async_combine: bool = False,
+    deepep_native_exact: bool = False,
     alltoall_combine_hidden_chunk_size: int = 0,
     init_device: str = "meta",
     merge_qkv: bool = True,
     # --- LoRA ---
     enable_lora: bool = False,
+    lora_serving_mode: Optional[Literal["merged", "separate"]] = None,
     lora_rank: int = 32,
     lora_alpha: int = 16,
     lora_b_init_std: float = 0.0,
@@ -318,6 +324,21 @@ def build_training_model(
     Returns a :class:`TrainingModelResult` with model, config, PP state, etc.
     """
 
+    if deepep_native_exact and expert_parallel_size <= 1:
+        raise ValueError(
+            "deepep_native_exact requires expert_parallel_size > 1; EP1 bypasses "
+            "DeepEP and cannot satisfy the native exact training contract"
+        )
+
+    if (
+        deepep_native_exact
+        and enable_gradient_checkpointing
+        and gradient_checkpointing_method in (None, "recompute_full_layer")
+    ):
+        # Keep the contract safe for direct API callers that do not construct
+        # a ServerArguments object first.
+        gradient_checkpointing_method = "recompute_before_dispatch"
+
     if server_training and pp_virtual_stages > 1:
         raise NotImplementedError(
             "Server training does not yet support pipeline_parallel_virtual_stages > 1: "
@@ -391,6 +412,7 @@ def build_training_model(
         deepep_buffer_size_gb=deepep_buffer_size_gb,
         deepep_num_sms=deepep_num_sms,
         deepep_async_combine=deepep_async_combine,
+        deepep_native_exact=deepep_native_exact,
         alltoall_combine_hidden_chunk_size=alltoall_combine_hidden_chunk_size,
         router_fp32=router_fp32,
         lm_head_fp32=lm_head_fp32,
@@ -405,6 +427,7 @@ def build_training_model(
         flash_attention_deterministic=flash_attention_deterministic,
         server_training=server_training,
         enable_lora=enable_lora,
+        lora_serving_mode=lora_serving_mode,
         block_fp8_qlora_training=block_fp8_qlora_training,
         glm52_fullparam_fp8_training=glm52_fullparam_fp8_training,
         lora_rank=lora_rank,
@@ -636,6 +659,18 @@ def build_training_model(
             "Exact dense Qwen3 trainer path reinstalled after projection replacement"
             + (f": {pattern}" if pattern else " (existing wrappers retained)")
         )
+    elif getattr(model.config, "_deepep_native_exact", False):
+        apply_native_exact = getattr(model, "_apply_deepep_native_exact", None)
+        if callable(apply_native_exact):
+            wrapped = apply_native_exact()
+        else:
+            wrapped = {}
+        pattern = ", ".join(f"{name}x{count}" for name, count in sorted(wrapped.items()))
+        if wrapped:
+            logger.info_rank0(
+                "Model-declared native DeepEP exact trainer program: "
+                f"wrapped {sum(wrapped.values())} trunk linears" + (f"; {pattern}" if pattern else "")
+            )
 
     apply_exact_qwen = getattr(model, "_apply_qwen35_gdn_exact", None)
     if server_training and callable(apply_exact_qwen):
@@ -694,6 +729,8 @@ def build_training_model(
         moe_grad_reduce_mode=moe_grad_reduce_mode,
         fsdp_sharded_lm_head_loss=fsdp_sharded_lm_head_loss,
         fsdp_reduce_dtype=fsdp_reduce_dtype,
+        enable_lora=enable_lora,
+        enable_qlora=enable_qlora,
         skip_param_upcast=should_skip_generic_param_upcast(
             enable_lora=enable_lora,
             enable_qlora=enable_qlora,
@@ -730,10 +767,26 @@ def build_training_model(
     # ------------------------------------------------------------------
     if enable_qlora:
         # After QLoRA quantization, freeze everything except LoRA
+        keep_exact_glm52_routers = bool(
+            getattr(model.config, "train_router", False) and glm52_exact_active_lora_enabled(model.config)
+        )
+        retained_router_count = 0
         for part in all_parts:
             for name, param in part.named_parameters():
-                if "lora_A" not in name and "lora_B" not in name:
+                is_exact_glm52_router = keep_exact_glm52_routers and name.endswith("mlp.gate.weight")
+                if is_exact_glm52_router:
+                    param.requires_grad_(True)
+                    retained_router_count += 1
+                elif "lora_A" not in name and "lora_B" not in name:
                     param.requires_grad = False
+        if keep_exact_glm52_routers:
+            validate_glm52_local_router_inventory(
+                all_parts,
+                retained_router_count=retained_router_count,
+            )
+            logger.info_rank0(
+                f"Retained {retained_router_count} post-FSDP BF16 router weights for exact GLM-5.2 QLoRA training"
+            )
         helper.print_device_mem_info("VRAM usage after QLoRA quantization")
     elif enable_lora:
         for part in all_parts:

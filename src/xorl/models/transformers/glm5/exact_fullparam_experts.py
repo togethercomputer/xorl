@@ -591,23 +591,10 @@ class Glm52FullParamBlockFP8RoutedExperts(Glm52NativeBlockFP8Experts):
         ):
             raise RuntimeError("GLM-5.2 full-param expert caches and activations must share one CUDA device")
 
-        from xorl.models.layers.moe.experts import MoEExperts  # noqa: PLC0415
-        from xorl.ops.moe.sglang_fused_moe_strided import fused_experts_impl_strided  # noqa: PLC0415
-
-        MoEExperts._ensure_sglang_server_args()
-        return fused_experts_impl_strided(
-            hidden.contiguous(),
-            self.gate_up_proj.transpose(1, 2),
-            self.down_proj.transpose(1, 2),
+        return self._sglang_ep_native_routed_value(
+            hidden,
             routing,
             local_ids,
-            activation="silu",
-            is_gated=True,
-            use_fp8_w8a8=True,
-            w1_scale=self.gate_up_weight_scale_inv.transpose(1, 2),
-            w2_scale=self.down_weight_scale_inv.transpose(1, 2),
-            block_shape=[128, 128],
-            filter_expert=True,
             routed_scaling_factor=routed_scaling_factor,
         )
 

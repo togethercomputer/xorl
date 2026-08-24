@@ -94,7 +94,7 @@ def test_glm52_exact_attention_component_rejects_nonpositive_rank_or_alpha_befor
     ("override", "message"),
     (
         ({"_glm52_exact_active_lora_dense_component": False}, "exact active-LoRA dense component"),
-        ({"_ep_dispatch": "deepep"}, "ep_dispatch='alltoall'"),
+        ({"_ep_dispatch": "unsupported"}, "ep_dispatch in"),
         ({"_sparse_mla_enabled": False}, "requires sparse_mla_enabled=true"),
     ),
 )

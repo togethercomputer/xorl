@@ -34,7 +34,9 @@ def __getattr__(name):
         "DEEPEP_AVAILABLE",
         "token_pre_dispatch",
         "token_pre_dispatch_no_permute",
+        "token_pre_dispatch_native",
         "tokens_post_combine",
+        "tokens_post_combine_native",
         "get_default_buffer",
         "destroy_default_buffer",
     ):
@@ -44,8 +46,10 @@ def __getattr__(name):
             destroy_default_buffer,
             get_default_buffer,
             token_pre_dispatch,
+            token_pre_dispatch_native,
             token_pre_dispatch_no_permute,
             tokens_post_combine,
+            tokens_post_combine_native,
         )
 
         globals().update(
@@ -54,7 +58,9 @@ def __getattr__(name):
                 "DEEPEP_AVAILABLE": DEEPEP_AVAILABLE,
                 "token_pre_dispatch": token_pre_dispatch,
                 "token_pre_dispatch_no_permute": token_pre_dispatch_no_permute,
+                "token_pre_dispatch_native": token_pre_dispatch_native,
                 "tokens_post_combine": tokens_post_combine,
+                "tokens_post_combine_native": tokens_post_combine_native,
                 "get_default_buffer": get_default_buffer,
                 "destroy_default_buffer": destroy_default_buffer,
             }
@@ -76,7 +82,9 @@ __all__ = [
     "DEEPEP_AVAILABLE",
     "token_pre_dispatch",
     "token_pre_dispatch_no_permute",
+    "token_pre_dispatch_native",
     "tokens_post_combine",
+    "tokens_post_combine_native",
     "get_default_buffer",
     "destroy_default_buffer",
 ]

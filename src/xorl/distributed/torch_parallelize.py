@@ -170,6 +170,65 @@ def _fsdp_kwargs_for_module(fsdp_kwargs: dict, module: nn.Module) -> dict:
     return module_kwargs
 
 
+def _fully_shard_declared_mixed_dtype_unit(
+    module: nn.Module,
+    *,
+    compute_kwargs: dict,
+    full_precision_kwargs: dict,
+) -> list[nn.Module]:
+    """Split a declared composite into dtype-uniform FSDP groups.
+
+    A declaring module owns only the named full-precision parameters directly;
+    its child modules own the lower-precision compute parameters.  Grouping the
+    children in one FSDP call preserves communication coalescing, while wrapping
+    the parent afterwards claims only its direct FP32 leaves.  Both groups stay
+    sharded and receive normal FSDP gradient reduction, and parameter FQNs do not
+    change.
+
+    Returns representatives in forward-prefetch order.  Modules passed together
+    to ``fully_shard`` share one FSDP state, so one child is sufficient to
+    identify the compute group.
+    """
+
+    declared_names = tuple(getattr(module, "fsdp_full_precision_parameter_names", ()))
+    if not declared_names:
+        return []
+    if len(set(declared_names)) != len(declared_names):
+        raise ValueError(
+            f"{type(module).__name__}.fsdp_full_precision_parameter_names contains duplicates: {declared_names!r}"
+        )
+
+    direct_parameters = dict(module.named_parameters(recurse=False))
+    missing = [name for name in declared_names if name not in direct_parameters]
+    undeclared = [name for name in direct_parameters if name not in declared_names]
+    if missing or undeclared:
+        raise ValueError(
+            f"{type(module).__name__} must own exactly its declared full-precision parameters directly; "
+            f"missing={missing}, undeclared={undeclared}"
+        )
+
+    full_precision_parameters = [direct_parameters[name] for name in declared_names]
+    full_precision_dtypes = {parameter.dtype for parameter in full_precision_parameters}
+    if full_precision_dtypes != {torch.float32}:
+        raise TypeError(
+            f"{type(module).__name__} declared full-precision parameters must be FP32; got {full_precision_dtypes}"
+        )
+
+    children = list(module.children())
+    compute_parameters = [parameter for child in children for parameter in child.parameters()]
+    if not children or not compute_parameters:
+        raise ValueError(f"{type(module).__name__} declared a mixed-dtype FSDP split without child compute parameters")
+    compute_dtypes = {parameter.dtype for parameter in compute_parameters if parameter.is_floating_point()}
+    if compute_dtypes != {torch.bfloat16}:
+        raise TypeError(
+            f"{type(module).__name__} declared compute parameters must be uniformly BF16; got {compute_dtypes}"
+        )
+
+    fully_shard(children, **compute_kwargs)
+    fully_shard(module, **full_precision_kwargs)
+    return [module, children[0]]
+
+
 def _expert_fsdp_kwargs_for_module(expert_fsdp_kwargs: dict, experts_mod: nn.Module) -> dict:
     """Keep frozen byte-packed expert state sharded without numerically casting it."""
 
@@ -496,6 +555,12 @@ def parallelize_model_fsdp2(
     #      (e.g., some models requires MoE TopK gate layer to have parameters in higher FP32 precision in forward).
     fsdp_wrapped_experts: List["nn.Module"] = []
     preserve_dsv4_fp32 = bool(getattr(model.config, "_dsv4_flash_exact_mode", False))
+    split_qwen35_full_weight_gdn = bool(
+        getattr(model.config, "_qwen35_exact_contract", False)
+        and not kwargs.get("enable_lora", False)
+        and not kwargs.get("enable_qlora", False)
+    )
+    split_qwen35_gdn_count = 0
     for layer_fqn, layer_mod, experts_mod in layer_pairs:
         # register all the FSDPModule inside this decoder layer for the convenience of manual prefetching configuration
         layer_mod._fsdp_modules = []
@@ -514,6 +579,32 @@ def parallelize_model_fsdp2(
                 # but then they will need to be initialized separately
                 fully_shard(sub_mod, **fsdp_kwargs_without_mp)
                 layer_mod._fsdp_modules.append(sub_mod)
+
+        if split_qwen35_full_weight_gdn:
+            declared_units = [
+                submodule
+                for submodule in layer_mod.modules()
+                if getattr(submodule, "fsdp_full_precision_parameter_names", ())
+            ]
+            if len(declared_units) > 1:
+                raise RuntimeError(
+                    f"{layer_fqn} contains multiple declared mixed-dtype FSDP units; "
+                    "nested or repeated declarations are not admitted"
+                )
+            if declared_units:
+                compute_kwargs = dict(fsdp_kwargs)
+                if enable_mixed_precision:
+                    compute_kwargs["mp_policy"] = decoder_mp_policy
+                layer_mod._fsdp_modules.extend(
+                    reversed(
+                        _fully_shard_declared_mixed_dtype_unit(
+                            declared_units[0],
+                            compute_kwargs=compute_kwargs,
+                            full_precision_kwargs=fsdp_kwargs_without_mp,
+                        )
+                    )
+                )
+                split_qwen35_gdn_count += 1
 
         # shard everything else in the decoder layer
         # If experts_mod has _skip_fsdp, exclude its params from the parent FSDP unit
@@ -545,6 +636,17 @@ def parallelize_model_fsdp2(
         fully_shard(layer_mod, **layer_fsdp_kwargs)
         layer_mod._fsdp_modules.append(layer_mod)
         logger.debug_rank0(f"{layer_fqn=}, {layer_mod._fsdp_modules=}")
+    if split_qwen35_full_weight_gdn:
+        expected_gdn_count = sum(bool(getattr(layer_mod, "linear_attn", None)) for _, layer_mod, _ in layer_pairs)
+        if split_qwen35_gdn_count != expected_gdn_count:
+            raise RuntimeError(
+                "Exact full-weight Qwen3.5 FSDP dtype split did not cover every GDN layer: "
+                f"wrapped={split_qwen35_gdn_count}, expected={expected_gdn_count}"
+            )
+        logger.info_rank0(
+            "Exact full-weight Qwen3.5 FSDP dtype split engaged: "
+            f"{split_qwen35_gdn_count} GDN units with BF16 compute parameters and FP32 A_log/dt_bias"
+        )
     # Torchtitan optimization: group norm + lm_head into a single FSDP unit
     # with reshard_after_forward=False. When norm.forward() runs inside
     # the base model, FSDP all-gathers both norm and lm_head weights.
@@ -864,6 +966,19 @@ def _build_ep_param_groups(model: "nn.Module") -> None:
         f"{len(ep_replicated_params)} replicated EP params, "
         f"{len(ep_replicated_gradient_sync_params)} requiring EP gradient sync"
     )
+
+
+def refresh_ep_param_groups(model: "nn.Module") -> None:
+    """Rebind EP parameter groups after a model-wide materialization.
+
+    ``Module.to_empty`` may replace Parameter objects.  Any optimizer or EP
+    ownership groups built before that transition consequently refer to stale
+    meta tensors even though ``model.parameters()`` is fully materialized.
+    Rebuild from the preserved FQN placement contract before constructing the
+    post-restore optimizer.
+    """
+
+    _build_ep_param_groups(model)
 
 
 def build_parallelize_model(

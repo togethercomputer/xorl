@@ -708,6 +708,7 @@ def test_exact_layout_is_threaded_through_interleaved_checkpoint_microbatches(mo
 
     cfg = _tiny_config(compress_ratios=[0])
     cfg._dsv4_flash_exact_mode = True
+    cfg._ep_dispatch = "deepep"
     model = DeepseekV4Model(cfg, moe_implementation="eager")
     recorder = _RecordingLayer()
     model.layers = nn.ModuleList([recorder])

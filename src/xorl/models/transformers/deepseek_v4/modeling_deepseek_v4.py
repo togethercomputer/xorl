@@ -29,6 +29,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from transformers.utils import logging
 
 from xorl.distributed.canonical_moe import LogicalRowOwnership
 from xorl.distributed.parallel_state import get_parallel_state
@@ -42,6 +43,9 @@ from xorl.models.layers.moe.routing_replay import get_replay_stage
 from xorl.models.layers.normalization import RMSNorm
 from xorl.models.module_utils import DEFAULT_GRADIENT_CHECKPOINTING_METHOD
 from xorl.models.outputs import MoeCausalLMOutput, MoeModelOutput
+from xorl.models.transformers.deepseek_v4.moe_program import (
+    DSV4_DEEPEP_NATIVE_EXACT_V1,
+)
 from xorl.ops.dsv4.attention_core import dense_attn_torch, sparse_attn_tilelang, sparse_attn_torch
 from xorl.ops.dsv4.compressor import DeepSeekV4Compressor
 from xorl.ops.dsv4.cp_utils import (
@@ -54,7 +58,7 @@ from xorl.ops.dsv4.cp_utils import (
     get_q_positions_for_cp,
     get_window_topk_idxs_cp,
 )
-from xorl.ops.dsv4.hyper_connection import DeepSeekV4HyperConnectionUtil
+from xorl.ops.dsv4.hyper_connection import DeepSeekV4HyperConnectionUtil, ExactMhcReplaySegment
 from xorl.ops.dsv4.qat import fp8_simulate_qat
 from xorl.ops.dsv4.rope import apply_rotary_emb, wrapped_precompute_freqs_cis
 from xorl.ops.dsv4.utils import dsv4_kv_qat_enabled
@@ -73,6 +77,124 @@ from xorl.ops.dsv4.v4_indexer import V4Indexer
 # value.
 _ATTN_IMPL_ENV = "XORL_DSV4_SPARSE_ATTN_IMPL"
 _ATTN_IMPL_CHOICES = {"tilelang", "sparse", "dense"}
+logger = logging.get_logger(__name__)
+
+
+def _build_serving_mhc_segments(
+    *,
+    compute_rows: int,
+    sample_lengths: list[int],
+    sampler_prefill_lengths: torch.Tensor | None,
+) -> tuple[int, ...] | None:
+    """Map packed requests to serving's one-prefill-then-M=1 row program."""
+
+    if sampler_prefill_lengths is None:
+        return None
+    if sampler_prefill_lengths.ndim != 1 or sampler_prefill_lengths.dtype not in (torch.int32, torch.int64):
+        raise ValueError("DSV4 sampler_prefill_lengths must be a rank-one integer tensor")
+    prefill_lengths = [int(value) for value in sampler_prefill_lengths.detach().cpu().tolist()]
+    if not sample_lengths:
+        # Dispatcher-created exact-mode dummy ranks own no request rows. Their
+        # padded activations are excluded before attention/MoE ownership, so no
+        # serving segmentation is needed for their dead storage.
+        return None
+    if len(prefill_lengths) != len(sample_lengths):
+        raise ValueError(
+            "DSV4 serving MHC replay needs one prefill boundary per packed request: "
+            f"prefills={prefill_lengths} sample_lengths={sample_lengths}"
+        )
+    live_rows = sum(sample_lengths)
+    if live_rows > compute_rows:
+        raise ValueError(f"DSV4 packed requests contain {live_rows} live rows but only {compute_rows} compute rows")
+
+    segments: list[int] = []
+    for sample_length, prefill_length in zip(sample_lengths, prefill_lengths, strict=True):
+        if sample_length <= 0 or prefill_length <= 0 or prefill_length > sample_length:
+            raise ValueError(
+                "DSV4 serving MHC replay requires 0 < prefill <= sample length, got "
+                f"prefill={prefill_length} sample_length={sample_length}"
+            )
+        segments.append(prefill_length)
+        segments.extend([1] * (sample_length - prefill_length))
+    if live_rows < compute_rows:
+        segments.append(compute_rows - live_rows)
+    return tuple(segments)
+
+
+def _build_cp_serving_mhc_segments(
+    *,
+    layout: Dsv4ExactCPLayout,
+    sampler_prefill_lengths: torch.Tensor | None,
+) -> tuple[ExactMhcReplaySegment, ...] | None:
+    """Build global-serving-size MHC calls projected onto local CP rows."""
+
+    if sampler_prefill_lengths is None or layout.local_live_count == 0:
+        return None
+    if sampler_prefill_lengths.ndim != 1 or sampler_prefill_lengths.dtype not in (torch.int32, torch.int64):
+        raise ValueError("DSV4 sampler_prefill_lengths must be a rank-one integer tensor")
+    prefill_lengths = [int(value) for value in sampler_prefill_lengths.detach().cpu().tolist()]
+    if tuple(layout.request_ids) != tuple(range(len(prefill_lengths))):
+        raise ValueError(
+            "DSV4 CP serving MHC replay needs one boundary for every packed request id: "
+            f"request_ids={layout.request_ids} prefills={prefill_lengths}"
+        )
+
+    global_request_lengths = {
+        request_id: int(rows.numel())
+        for request_id, rows in zip(layout.request_ids, layout.global_request_row_indices, strict=True)
+    }
+    for request_id, prefill_length in enumerate(prefill_lengths):
+        sample_length = global_request_lengths[request_id]
+        if prefill_length <= 0 or prefill_length > sample_length:
+            raise ValueError(
+                "DSV4 serving MHC replay requires 0 < prefill <= sample length, got "
+                f"request={request_id} prefill={prefill_length} sample_length={sample_length}"
+            )
+
+    segments: list[ExactMhcReplaySegment] = []
+    for request_id, local_rows_tensor in zip(
+        layout.request_ids,
+        layout.local_request_row_indices,
+        strict=True,
+    ):
+        local_rows = [int(value) for value in local_rows_tensor.detach().cpu().tolist()]
+        local_positions = [
+            int(value)
+            for value in layout.local_request_positions.index_select(0, local_rows_tensor).detach().cpu().tolist()
+        ]
+        prefill_rows = tuple(
+            row
+            for row, position in zip(local_rows, local_positions, strict=True)
+            if position < prefill_lengths[request_id]
+        )
+        prefill_positions = tuple(position for position in local_positions if position < prefill_lengths[request_id])
+        if prefill_rows:
+            segments.append(
+                ExactMhcReplaySegment(
+                    launch_rows=prefill_lengths[request_id],
+                    source_rows=prefill_rows,
+                    launch_positions=prefill_positions,
+                )
+            )
+        for row, position in zip(local_rows, local_positions, strict=True):
+            if position >= prefill_lengths[request_id]:
+                segments.append(
+                    ExactMhcReplaySegment(
+                        launch_rows=1,
+                        source_rows=(row,),
+                        launch_positions=(0,),
+                    )
+                )
+    if layout.local_live_count < layout.compute_rows:
+        padding_rows = tuple(range(layout.local_live_count, layout.compute_rows))
+        segments.append(
+            ExactMhcReplaySegment(
+                launch_rows=len(padding_rows),
+                source_rows=padding_rows,
+                launch_positions=tuple(range(len(padding_rows))),
+            )
+        )
+    return tuple(segments)
 
 
 def _move_preserved_param(
@@ -355,6 +477,61 @@ class DeepSeekV4Attention(nn.Module):
         if callable(capture):
             capture(name, value)
 
+    def _maybe_capture_exact_attention_component(
+        self,
+        name: str,
+        value: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        """Persist one raw trainer attention boundary for operator localization."""
+
+        capture_dir = os.environ.get("XORL_DSV4_TRAINER_ATTENTION_CAPTURE_DIR", "").strip()
+        raw_layer = os.environ.get("XORL_DSV4_ATTENTION_CAPTURE_LAYER", "").strip()
+        raw_position = os.environ.get("XORL_DSV4_ATTENTION_CAPTURE_POSITION", "").strip()
+        raw_rank = os.environ.get("XORL_DSV4_ATTENTION_CAPTURE_GLOBAL_RANK", "0").strip()
+        if not capture_dir or not raw_layer or not raw_position:
+            return
+        capture_layers = {int(layer.strip()) for layer in raw_layer.split(",") if layer.strip()}
+        if self.layer_id not in capture_layers:
+            return
+        global_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        if global_rank != int(raw_rank):
+            return
+        capture_key = (self.layer_id, name)
+        captured = self.__dict__.setdefault("_xorl_dsv4_captured_attention_components", set())
+        if capture_key in captured:
+            return
+        flat_positions = positions.detach().reshape(-1)
+        target_position = int(raw_position)
+        matching = (flat_positions == target_position).nonzero(as_tuple=True)[0]
+        rows = value.reshape(-1, *value.shape[2:]) if value.ndim >= 3 else value
+        if matching.numel() == 0:
+            return
+        if matching.numel() != 1 or rows.shape[0] != flat_positions.numel():
+            raise RuntimeError(
+                f"DSV4 trainer attention component {name} cannot align value and positions: "
+                f"value={tuple(value.shape)} positions={tuple(flat_positions.shape)} "
+                f"matches={matching.numel()}"
+            )
+        captured.add(capture_key)
+        os.makedirs(capture_dir, exist_ok=True)
+        output_path = os.path.join(
+            capture_dir,
+            f"rank{global_rank:05d}.layer{self.layer_id:03d}.{name}.position{target_position:05d}.pt",
+        )
+        torch.save(
+            {
+                "schema": "xorl.dsv4_trainer_attention_component.v1",
+                "global_rank": global_rank,
+                "layer": self.layer_id,
+                "component": name,
+                "position": target_position,
+                "source_shape": tuple(value.shape),
+                "value": rows.index_select(0, matching).detach().cpu(),
+            },
+            output_path,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -427,6 +604,18 @@ class DeepSeekV4Attention(nn.Module):
             q_positions = get_q_positions_for_cp(
                 seqlen_local, cp_size=self.cp_size, cp_group=self.cp_group, device=x.device
             )
+        capture_positions = (
+            (
+                torch.arange(
+                    carry_offset,
+                    carry_offset + seqlen_local,
+                    dtype=torch.int64,
+                    device=x.device,
+                )
+            )
+            if carry_offset is not None
+            else q_positions
+        )
         # SGLang's DSV4 CP path shards queries for execution, but explicitly
         # all-gathers and reranges BF16 KV plus compressor scores back into
         # logical token order before the cache/compressor kernels.  The trainer
@@ -482,6 +671,7 @@ class DeepSeekV4Attention(nn.Module):
             apply_rotary_emb(q[..., -rd:], freqs_cis)
         validate_lora_metadata("Q projection and RoPE")
         self._capture_diagnostic_component("q", q)
+        self._maybe_capture_exact_attention_component("q_pre_attention", q, capture_positions)
 
         # ---------------- KV (single shared stream) ----------------
         kv_pre_norm = self.wkv(x)
@@ -529,39 +719,47 @@ class DeepSeekV4Attention(nn.Module):
                         request_x = x.index_select(1, local_rows) if ratio else None
 
                     if ratio == 0:
-                        from xorl.ops.dsv4.exact_attention import exact_c0_attention  # noqa: PLC0415
-
-                        request_o = exact_c0_attention(
-                            request_q,
-                            request_kv,
-                            self.kv_norm.weight,
-                            self.attn_sink,
-                            request_freqs,
-                            self.eps,
-                            self.softmax_scale,
-                            query_positions=request_positions,
-                            kv_preprocessed=False,
+                        from xorl.ops.dsv4.exact_attention import (  # noqa: PLC0415
+                            exact_attention_layer,
+                            exact_c0_attention,
                         )
+
+                        with exact_attention_layer(self.layer_id):
+                            request_o = exact_c0_attention(
+                                request_q,
+                                request_kv,
+                                self.kv_norm.weight,
+                                self.attn_sink,
+                                request_freqs,
+                                self.eps,
+                                self.softmax_scale,
+                                query_positions=request_positions,
+                                kv_preprocessed=False,
+                            )
                     else:
-                        from xorl.ops.dsv4.exact_attention import exact_compressed_attention  # noqa: PLC0415
-
-                        request_o = exact_compressed_attention(
-                            request_q,
-                            request_kv,
-                            request_x,
-                            self.kv_norm.weight,
-                            self.attn_sink,
-                            request_freqs,
-                            self.compressor.wkv.weight,
-                            self.compressor.wgate.weight,
-                            self.compressor.ape,
-                            self.compressor.norm.weight,
-                            self.eps,
-                            self.softmax_scale,
-                            ratio,
-                            query_positions=request_positions,
-                            kv_preprocessed=False,
+                        from xorl.ops.dsv4.exact_attention import (  # noqa: PLC0415
+                            exact_attention_layer,
+                            exact_compressed_attention,
                         )
+
+                        with exact_attention_layer(self.layer_id):
+                            request_o = exact_compressed_attention(
+                                request_q,
+                                request_kv,
+                                request_x,
+                                self.kv_norm.weight,
+                                self.attn_sink,
+                                request_freqs,
+                                self.compressor.wkv.weight,
+                                self.compressor.wgate.weight,
+                                self.compressor.ape,
+                                self.compressor.norm.weight,
+                                self.eps,
+                                self.softmax_scale,
+                                ratio,
+                                query_positions=request_positions,
+                                kv_preprocessed=False,
+                            )
                     o = o.index_copy(1, local_rows, request_o)
             else:
                 exact_kv_pre_norm = kv_pre_norm
@@ -571,43 +769,51 @@ class DeepSeekV4Attention(nn.Module):
                     if ratio:
                         exact_x = all_gather_cp(exact_x, dim=1, cp_group=self.cp_group)
                 if ratio == 0:
-                    from xorl.ops.dsv4.exact_attention import exact_c0_attention  # noqa: PLC0415
-
-                    o = exact_c0_attention(
-                        q,
-                        exact_kv_pre_norm,
-                        self.kv_norm.weight,
-                        self.attn_sink,
-                        exact_kv_freqs_cis,
-                        self.eps,
-                        self.softmax_scale,
-                        carry_state=carry_state,
-                        position_offset=carry_offset or 0,
-                        query_positions=exact_query_positions,
-                        kv_preprocessed=False,
+                    from xorl.ops.dsv4.exact_attention import (  # noqa: PLC0415
+                        exact_attention_layer,
+                        exact_c0_attention,
                     )
+
+                    with exact_attention_layer(self.layer_id):
+                        o = exact_c0_attention(
+                            q,
+                            exact_kv_pre_norm,
+                            self.kv_norm.weight,
+                            self.attn_sink,
+                            exact_kv_freqs_cis,
+                            self.eps,
+                            self.softmax_scale,
+                            carry_state=carry_state,
+                            position_offset=carry_offset or 0,
+                            query_positions=exact_query_positions,
+                            kv_preprocessed=False,
+                        )
                 else:
-                    from xorl.ops.dsv4.exact_attention import exact_compressed_attention  # noqa: PLC0415
-
-                    o = exact_compressed_attention(
-                        q,
-                        exact_kv_pre_norm,
-                        exact_x,
-                        self.kv_norm.weight,
-                        self.attn_sink,
-                        exact_kv_freqs_cis,
-                        self.compressor.wkv.weight,
-                        self.compressor.wgate.weight,
-                        self.compressor.ape,
-                        self.compressor.norm.weight,
-                        self.eps,
-                        self.softmax_scale,
-                        ratio,
-                        carry_state=carry_state,
-                        position_offset=carry_offset or 0,
-                        query_positions=exact_query_positions,
-                        kv_preprocessed=False,
+                    from xorl.ops.dsv4.exact_attention import (  # noqa: PLC0415
+                        exact_attention_layer,
+                        exact_compressed_attention,
                     )
+
+                    with exact_attention_layer(self.layer_id):
+                        o = exact_compressed_attention(
+                            q,
+                            exact_kv_pre_norm,
+                            exact_x,
+                            self.kv_norm.weight,
+                            self.attn_sink,
+                            exact_kv_freqs_cis,
+                            self.compressor.wkv.weight,
+                            self.compressor.wgate.weight,
+                            self.compressor.ape,
+                            self.compressor.norm.weight,
+                            self.eps,
+                            self.softmax_scale,
+                            ratio,
+                            carry_state=carry_state,
+                            position_offset=carry_offset or 0,
+                            query_positions=exact_query_positions,
+                            kv_preprocessed=False,
+                        )
             kv_vanilla = None
         else:
             kv_vanilla = self.kv_norm(kv_pre_norm)  # [B, S, D]
@@ -666,6 +872,7 @@ class DeepSeekV4Attention(nn.Module):
                 o = dense_attn_torch(q, kv, attn_sink, topk_idxs, self.softmax_scale)
         validate_lora_metadata("attention core")
         self._capture_diagnostic_component("attn_output", o)
+        self._maybe_capture_exact_attention_component("attention_core_output", o, capture_positions)
 
         # Inverse RoPE on the rope slice of the output.
         if self._exact_attention:
@@ -676,10 +883,12 @@ class DeepSeekV4Attention(nn.Module):
             apply_rotary_emb(o[..., -rd:], freqs_cis, inverse=True)
         validate_lora_metadata("inverse RoPE")
         self._capture_diagnostic_component("attn_output_gated", o)
+        self._maybe_capture_exact_attention_component("attention_inverse_output", o, capture_positions)
 
         # ---------------- Grouped output projection ----------------
         # o : [B, S, H, D] -> [B, S, n_local_groups, n_heads*D / n_local_groups]
         o = o.view(bsz, seqlen_local, self.n_local_groups, -1)
+        self._maybe_capture_exact_attention_component("wo_a_input", o, capture_positions)
         native_wo_a_payload = self.wo_a._modules.get("native_base_payload")
         if native_wo_a_payload is not None:
             from .native_payload import dsv4_native_grouped_wo_a  # noqa: PLC0415
@@ -716,8 +925,11 @@ class DeepSeekV4Attention(nn.Module):
             delta = torch.einsum("bsgr,gor->bsgo", mid, lora_B_g) * self.wo_a.scaling
             o_base = o_base + delta.to(o_base.dtype)
         self._capture_diagnostic_component("o_proj_output", o_base)
+        self._maybe_capture_exact_attention_component("wo_a_output", o_base, capture_positions)
 
-        return self.wo_b(o_base.flatten(2))
+        output = self.wo_b(o_base.flatten(2))
+        self._maybe_capture_exact_attention_component("attention_output", output, capture_positions)
+        return output
 
 
 class DeepseekV4MLP(nn.Module):
@@ -796,12 +1008,24 @@ class DeepseekV4MoE(MoEBlock):
         self.is_hash_layer = layer_id < int(config.num_hash_layers)
         self.routed_scaling_factor = float(config.routed_scaling_factor)
         self._dsv4_exact_native = bool(getattr(config, "_dsv4_flash_exact_mode", False))
+        self._dsv4_moe_numerical_program = getattr(
+            config,
+            "_dsv4_moe_numerical_program",
+            DSV4_DEEPEP_NATIVE_EXACT_V1 if self._dsv4_exact_native else None,
+        )
+        self._dsv4_deepep_native = self._dsv4_moe_numerical_program == DSV4_DEEPEP_NATIVE_EXACT_V1
         self.experts.ep_dispatch = getattr(config, "_ep_dispatch", "alltoall")
         self.experts.deepep_buffer_size_gb = getattr(config, "_deepep_buffer_size_gb", 2.0)
         self.experts.deepep_num_sms = getattr(config, "_deepep_num_sms", 20)
         self.experts.deepep_async_combine = getattr(config, "_deepep_async_combine", False)
         self.experts.alltoall_combine_hidden_chunk_size = getattr(config, "_alltoall_combine_hidden_chunk_size", 0)
         self.experts.expert_lora_semantics = DSV4_CLAMPED_SWIGLU_LORA_PROGRAM
+        if self._dsv4_deepep_native and self.experts.ep_dispatch != "deepep":
+            raise RuntimeError(
+                f"{DSV4_DEEPEP_NATIVE_EXACT_V1} requires ep_dispatch='deepep'; got {self.experts.ep_dispatch!r}"
+            )
+        if self._dsv4_exact_native and self._dsv4_moe_numerical_program != DSV4_DEEPEP_NATIVE_EXACT_V1:
+            raise RuntimeError(f"Unknown exact DSV4 MoE numerical program: {self._dsv4_moe_numerical_program!r}")
 
         # Replace the parent's softmax router with our V4 one.
         self.router = TopKRouter(
@@ -847,6 +1071,57 @@ class DeepseekV4MoE(MoEBlock):
         capture = self.__dict__.get("_diagnostic_capture_component")
         if callable(capture):
             capture(name, value)
+
+    def _maybe_capture_native_moe_output(
+        self,
+        name: str,
+        value: torch.Tensor,
+        input_ids: torch.Tensor | None,
+    ) -> None:
+        """Persist one owner-token value around the routed/shared MoE join."""
+
+        capture_dir = os.environ.get("XORL_DSV4_TRAINER_MOE_CAPTURE_DIR", "").strip()
+        raw_layer = os.environ.get("XORL_DSV4_MOE_CAPTURE_LAYER", "").strip()
+        raw_token = os.environ.get("XORL_DSV4_MOE_CAPTURE_TOKEN_ID", "").strip()
+        if not capture_dir or not raw_layer or not raw_token or input_ids is None:
+            return
+        capture_layers = {int(layer.strip()) for layer in raw_layer.split(",") if layer.strip()}
+        if self.layer_id not in capture_layers:
+            return
+        capture_key = (self.layer_id, name)
+        captured = self.__dict__.setdefault("_xorl_dsv4_captured_moe_outputs", set())
+        if capture_key in captured:
+            return
+        flat_ids = input_ids.detach().reshape(-1)
+        target_token = int(raw_token)
+        matching = (flat_ids == target_token).nonzero(as_tuple=True)[0]
+        if matching.numel() == 0:
+            return
+        if matching.numel() != 1 or value.shape[0] != flat_ids.numel():
+            raise RuntimeError(
+                f"DSV4 trainer MoE capture {name} cannot align value and ids: "
+                f"value={tuple(value.shape)} ids={tuple(flat_ids.shape)} "
+                f"matches={matching.numel()}"
+            )
+        captured.add(capture_key)
+        global_rank = dist.get_rank() if dist.is_initialized() else 0
+        os.makedirs(capture_dir, exist_ok=True)
+        torch.save(
+            {
+                "schema": "xorl.dsv4_trainer_moe_output.v1",
+                "global_rank": global_rank,
+                "layer": self.layer_id,
+                "component": name,
+                "token_id": target_token,
+                "row_index": int(matching.item()),
+                "source_shape": tuple(value.shape),
+                "value": value.index_select(0, matching).detach().cpu(),
+            },
+            os.path.join(
+                capture_dir,
+                f"rank{global_rank:05d}.layer{self.layer_id:03d}.{name}.token{target_token:06d}.pt",
+            ),
+        )
 
     def route(self, hidden_states: torch.Tensor, input_ids: torch.Tensor | None = None):
         """V4-specific route: passes ``expert_bias`` / ``tid2eid`` / ``input_ids``
@@ -1059,6 +1334,8 @@ class DeepseekV4MoE(MoEBlock):
         Returns:
             ``(output [batch, seqlen, hidden_size], router_logits [N, num_experts])``.
         """
+        if self._dsv4_deepep_native:
+            return self._forward_deepep_native_exact(hidden_states, input_ids, live_token_count)
         if self._dsv4_exact_native:
             return self._forward_exact_native(hidden_states, input_ids, live_token_count)
 
@@ -1077,6 +1354,153 @@ class DeepseekV4MoE(MoEBlock):
 
         final_hidden_states = final_hidden_states.reshape(batch_size, sequence_length, hidden_dim)
         return final_hidden_states, router_logits
+
+    def _forward_deepep_native_exact(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        live_token_count: int | None,
+    ):
+        """Thin DSV4 adapter for the shared native DeepEP exact program.
+
+        DSV4 owns only routing, contiguous expert ownership, its MXFP4-Marlin
+        active-LoRA runner, and the replicated shared expert.  The reusable
+        layer owns dispatch receipts, runner-output validation, FP32 local
+        route reduction, BF16 communication leaves, handle combine, FP64 fold,
+        and reverse communication.
+        """
+
+        from xorl.distributed.moe.deepep_native_exact import (  # noqa: PLC0415
+            canonicalize_native_routing_metadata,
+            native_dispatch_runner_combine,
+        )
+        from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
+        from xorl.models.transformers.deepseek_v4.native_payload import (  # noqa: PLC0415
+            dsv4_join_routed_shared_partial,
+            dsv4_native_shared_expert_tp_partial,
+        )
+
+        batch_size, sequence_length, hidden_dim = hidden_states.shape
+        local_hidden = hidden_states.reshape(-1, hidden_dim)
+        local_rows = local_hidden.shape[0]
+        live_token_count = local_rows if live_token_count is None else int(live_token_count)
+        if not 0 <= live_token_count <= local_rows:
+            raise ValueError(
+                f"Native DSV4 DeepEP live token count {live_token_count} is outside packed row count {local_rows}"
+            )
+        parallel_state = get_parallel_state()
+        if int(parallel_state.tp_size) != 1:
+            raise RuntimeError(f"{DSV4_DEEPEP_NATIVE_EXACT_V1} requires stage-local body TP1")
+        if not parallel_state.ep_enabled or int(parallel_state.ep_size) != 8:
+            raise RuntimeError(f"{DSV4_DEEPEP_NATIVE_EXACT_V1} requires EP8")
+        if parallel_state.ep_group is None:
+            raise RuntimeError(f"{DSV4_DEEPEP_NATIVE_EXACT_V1} requires a stage-local EP process group")
+        if self.train_router:
+            raise RuntimeError(f"{DSV4_DEEPEP_NATIVE_EXACT_V1} requires a frozen router")
+        if self.shared_experts is None:
+            raise RuntimeError(f"{DSV4_DEEPEP_NATIVE_EXACT_V1} requires the official shared expert")
+
+        live_hidden = local_hidden[:live_token_count]
+        live_ids = None if input_ids is None else input_ids.reshape(-1)[:live_token_count]
+        if live_token_count:
+            routing_weights, selected_experts, router_logits = self.route(
+                live_hidden,
+                input_ids=live_ids,
+            )
+        else:
+            router_logits = local_hidden.new_zeros((0, self.num_experts), dtype=torch.float32)
+            routing_weights = local_hidden.new_zeros((0, self.top_k), dtype=torch.float32)
+            selected_experts = torch.empty(
+                (0, self.top_k),
+                dtype=torch.int32,
+                device=local_hidden.device,
+            )
+        self._capture_diagnostic_component("moe_native_deepep_input", live_hidden)
+        self._capture_diagnostic_component("moe_native_deepep_router_logits", router_logits)
+        self._capture_diagnostic_component("moe_native_deepep_topk_ids", selected_experts)
+        routing_weights = canonicalize_native_routing_metadata(routing_weights)
+        self._capture_diagnostic_component("moe_native_deepep_topk_weights", routing_weights)
+        self._maybe_capture_native_moe_output("topk_ids", selected_experts, live_ids)
+        self._maybe_capture_native_moe_output("topk_weights", routing_weights, live_ids)
+
+        payload = self.experts.native_mxfp4_payload
+        local_experts = int(payload.w13_weight.shape[0])
+        if local_experts * int(parallel_state.ep_size) != self.num_experts:
+            raise RuntimeError(
+                f"Native DSV4 DeepEP expert ownership is not contiguous EP8: "
+                f"local={local_experts}, global={self.num_experts}"
+            )
+        local_start = int(parallel_state.ep_rank) * local_experts
+
+        def run_local_leaf(recv_hidden, recv_weights, recv_local_ids):
+            valid = recv_local_ids >= 0
+            recv_global_ids = torch.where(
+                valid,
+                recv_local_ids.to(torch.int64) + local_start,
+                torch.full_like(recv_local_ids, -1, dtype=torch.int64),
+            ).to(torch.int32)
+            self._capture_diagnostic_component("moe_native_deepep_recv_hidden", recv_hidden)
+            self._capture_diagnostic_component("moe_native_deepep_recv_local_ids", recv_local_ids)
+            self._capture_diagnostic_component("moe_native_deepep_recv_weights", recv_weights)
+            local_leaf = self.experts(
+                recv_hidden,
+                recv_weights,
+                recv_global_ids,
+                dsv4_exact_native=True,
+                dsv4_exact_lora_live=True,
+                dsv4_exact_return_routes=False,
+            )
+            self._capture_diagnostic_component("moe_native_deepep_recv_leaf", local_leaf)
+            return local_leaf
+
+        routed_local = native_dispatch_runner_combine(
+            live_hidden,
+            routing_weights,
+            selected_experts,
+            ep_group=parallel_state.ep_group,
+            num_experts=self.num_experts,
+            num_local_experts=local_experts,
+            buffer_size_gb=self.experts.deepep_buffer_size_gb,
+            num_sms=self.experts.deepep_num_sms,
+            runner=run_local_leaf,
+        )
+        self._maybe_capture_native_moe_output("routed_output", routed_local, live_ids)
+        self._capture_diagnostic_component("moe_native_deepep_combined_routed", routed_local)
+        if routed_local.shape != live_hidden.shape:
+            raise RuntimeError(
+                "Native DSV4 DeepEP combine returned the wrong owner shape: "
+                f"got {tuple(routed_local.shape)}, expected {tuple(live_hidden.shape)}"
+            )
+
+        shared_local = (
+            dsv4_native_shared_expert_tp_partial(
+                live_hidden,
+                self.shared_experts,
+                tp_rank=0,
+                tp_size=1,
+                diagnostic_capture=self._capture_diagnostic_component,
+                lora_live=True,
+            )
+            if live_token_count
+            else live_hidden * 0.0
+        )
+        self._maybe_capture_native_moe_output("shared_output", shared_local, live_ids)
+        combined = dsv4_join_routed_shared_partial(
+            routed_local,
+            shared_local,
+            routed_scaling_factor=self.routed_scaling_factor,
+        )
+        self._maybe_capture_native_moe_output("joined_output", combined, live_ids)
+        self._capture_diagnostic_component("moe_native_deepep_output", combined)
+        padded = torch.cat((combined, local_hidden[live_token_count:] * 0.0), dim=0)
+        padded_logits = torch.cat(
+            (
+                router_logits,
+                router_logits.new_zeros((local_rows - live_token_count, self.num_experts)),
+            ),
+            dim=0,
+        )
+        return padded.reshape(batch_size, sequence_length, hidden_dim), padded_logits
 
     def _forward_exact_native(
         self,
@@ -1307,6 +1731,75 @@ class DeepseekV4DecoderLayer(nn.Module):
         if callable(capture):
             capture(name, value)
 
+    def _maybe_capture_exact_component(
+        self,
+        name: str,
+        value: torch.Tensor,
+        input_ids: torch.Tensor | None,
+        live_token_count: int | None,
+    ) -> None:
+        """Persist a raw owner-token component for cross-engine localization."""
+
+        capture_dir = os.environ.get("XORL_DSV4_TRAINER_COMPONENT_CAPTURE_DIR", "").strip()
+        raw_layer = os.environ.get("XORL_DSV4_COMPONENT_CAPTURE_LAYER", "").strip()
+        raw_token = os.environ.get("XORL_DSV4_COMPONENT_CAPTURE_TOKEN_ID", "").strip()
+        if not capture_dir or not raw_layer or not raw_token or input_ids is None:
+            return
+        capture_layers = {int(layer.strip()) for layer in raw_layer.split(",") if layer.strip()}
+        if self.layer_id not in capture_layers:
+            return
+        capture_key = (self.layer_id, name)
+        captured = self.__dict__.setdefault("_xorl_dsv4_captured_components", set())
+        if capture_key in captured:
+            return
+        if value.ndim == 4:
+            rows = value.reshape(-1, value.shape[-2], value.shape[-1])
+        elif value.ndim == 3:
+            rows = value.reshape(-1, value.shape[-1])
+        else:
+            raise RuntimeError(f"DSV4 trainer component {name} has unsupported shape {tuple(value.shape)}")
+        live_rows = rows.shape[0] if live_token_count is None else int(live_token_count)
+        if not 0 <= live_rows <= rows.shape[0]:
+            raise RuntimeError(
+                f"DSV4 trainer component {name} has invalid live row count {live_rows} for {rows.shape[0]} storage rows"
+            )
+        if live_rows == 0:
+            return
+        flat_input_ids = input_ids.detach().reshape(-1)
+        if flat_input_ids.numel() < live_rows:
+            raise RuntimeError(
+                f"DSV4 trainer component {name} has fewer token ids than live rows: "
+                f"ids={flat_input_ids.numel()} rows={live_rows}"
+            )
+        live_input_ids = flat_input_ids[:live_rows]
+        target_token = int(raw_token)
+        matching = (live_input_ids == target_token).nonzero(as_tuple=True)[0]
+        if matching.numel() == 0:
+            return
+        if matching.numel() != 1:
+            raise RuntimeError(
+                f"DSV4 trainer component {name} requires one token {target_token}, got {matching.numel()}"
+            )
+        captured.add(capture_key)
+        global_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        os.makedirs(capture_dir, exist_ok=True)
+        output_path = os.path.join(
+            capture_dir,
+            f"rank{global_rank:05d}.layer{self.layer_id:03d}.{name}.token{target_token:06d}.pt",
+        )
+        torch.save(
+            {
+                "schema": "xorl.dsv4_trainer_component.v1",
+                "global_rank": global_rank,
+                "layer": self.layer_id,
+                "component": name,
+                "token_id": target_token,
+                "source_shape": tuple(value.shape),
+                "value": rows.index_select(0, matching).detach().cpu(),
+            },
+            output_path,
+        )
+
     def forward(
         self,
         hidden_states_4d: torch.Tensor,
@@ -1315,6 +1808,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         live_token_count: int | None = None,
         exact_cp_layout: Dsv4ExactCPLayout | None = None,
         decode_carry_offset: int | None = None,
+        serving_mhc_segments: tuple[int | ExactMhcReplaySegment, ...] | None = None,
     ) -> torch.Tensor:
         """Run the layer.
 
@@ -1326,6 +1820,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         Returns:
             ``[batch, seqlen, hc_mult, hidden_size]``.
         """
+        self._maybe_capture_exact_component("layer_input", hidden_states_4d, input_ids, live_token_count)
         # ---- Attention sublayer ----
         if self._exact_mhc:
             h3d, post, comb = self.hc_util.layer_pre_norm_exact(
@@ -1334,6 +1829,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_attn_scale,
                 self.hc_attn_base,
                 self.input_layernorm.weight,
+                serving_segments=serving_mhc_segments,
             )
         else:
             h3d, post, comb = self.hc_util.layer_pre(
@@ -1341,13 +1837,16 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             h3d = self.input_layernorm(h3d)
         self._capture_diagnostic_component("input_norm", h3d)
+        self._maybe_capture_exact_component("attention_input", h3d, input_ids, live_token_count)
         attn_out = self.self_attn(
             h3d,
             exact_cp_layout=exact_cp_layout,
             decode_carry_offset=decode_carry_offset,
         )
+        self._maybe_capture_exact_component("attention_output", attn_out, input_ids, live_token_count)
         post_fn = self.hc_util.layer_post_exact if self._exact_mhc else self.hc_util.layer_post
         hidden_states_4d = post_fn(attn_out, hidden_states_4d, post, comb)
+        self._maybe_capture_exact_component("post_attention_residual", hidden_states_4d, input_ids, live_token_count)
 
         # ---- MoE / FFN sublayer ----
         if self._exact_mhc:
@@ -1357,6 +1856,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_ffn_scale,
                 self.hc_ffn_base,
                 self.post_attention_layernorm.weight,
+                serving_segments=serving_mhc_segments,
             )
         else:
             h3d, post, comb = self.hc_util.layer_pre(
@@ -1364,11 +1864,13 @@ class DeepseekV4DecoderLayer(nn.Module):
             )
             h3d = self.post_attention_layernorm(h3d)
         self._capture_diagnostic_component("post_attention_norm", h3d)
+        self._maybe_capture_exact_component("ffn_input", h3d, input_ids, live_token_count)
         ffn_out, router_logits = self.mlp(
             h3d,
             input_ids=input_ids,
             live_token_count=live_token_count,
         )
+        self._maybe_capture_exact_component("ffn_output", ffn_out, input_ids, live_token_count)
         if os.environ.get("XORL_DSV4_DIAGNOSTIC_BASE_MARLIN") == "1":
             from .native_payload import _validate_all_single_adapter_batch_infos  # noqa: PLC0415
 
@@ -1377,6 +1879,7 @@ class DeepseekV4DecoderLayer(nn.Module):
                 where=f"layer {self.layer_id} MoE module return",
             )
         hidden_states_4d = post_fn(ffn_out, hidden_states_4d, post, comb)
+        self._maybe_capture_exact_component("layer_output", hidden_states_4d, input_ids, live_token_count)
         if os.environ.get("XORL_DSV4_DIAGNOSTIC_BASE_MARLIN") == "1":
             _validate_all_single_adapter_batch_infos(
                 h3d.device.index,
@@ -1694,6 +2197,82 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
         if callable(capture):
             capture(name, value)
 
+    def _maybe_capture_exact_residual_row(
+        self,
+        *,
+        layer_id: int,
+        hidden_states: torch.Tensor,
+        position_ids: torch.Tensor | None,
+        input_ids: torch.Tensor | None,
+    ) -> None:
+        """Persist one trainer residual row for sampler/trainer localization.
+
+        This cold-path hook is inert unless both trainer-specific capture
+        environment variables are set. Position selection happens before any
+        token-diagnostic unpacking so packed rows cannot be misattributed.
+        """
+
+        capture_dir = os.environ.get("XORL_DSV4_TRAINER_LAYER_CAPTURE_DIR", "").strip()
+        raw_position = os.environ.get("XORL_DSV4_TRAINER_LAYER_CAPTURE_POSITION", "").strip()
+        if not capture_dir or not raw_position or position_ids is None:
+            return
+        target_position = int(raw_position)
+        captured = self.__dict__.setdefault("_xorl_dsv4_captured_layer_positions", set())
+        capture_key = (target_position, int(layer_id))
+        if capture_key in captured:
+            return
+        if hidden_states.ndim != 4:
+            raise RuntimeError(
+                "DSV4 trainer layer capture expects the four-dimensional MHC residual: "
+                f"hidden={tuple(hidden_states.shape)}"
+            )
+        hidden_rows = hidden_states.reshape(
+            -1,
+            hidden_states.shape[-2],
+            hidden_states.shape[-1],
+        )
+        storage_positions = position_ids.detach().reshape(-1)
+        compute_row_count = hidden_rows.shape[0]
+        if storage_positions.numel() < compute_row_count:
+            raise RuntimeError(
+                "DSV4 trainer layer capture has fewer positions than live residual rows: "
+                f"hidden={tuple(hidden_states.shape)} positions={tuple(storage_positions.shape)}"
+            )
+        # Exact packed execution compacts live rows into the storage prefix and
+        # leaves the remaining positions as transport padding. Select only the
+        # positions that still have corresponding residual rows.
+        flat_positions = storage_positions[:compute_row_count]
+        matching = (flat_positions == target_position).nonzero(as_tuple=True)[0]
+        if matching.numel() != 1:
+            raise RuntimeError(
+                "DSV4 trainer layer capture requires exactly one matching packed row: "
+                f"position={target_position} matches={matching.numel()}"
+            )
+        row = hidden_rows.index_select(0, matching).detach().cpu()
+        captured.add(capture_key)
+        global_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        token_id = None
+        if input_ids is not None and input_ids.numel() >= compute_row_count:
+            live_input_ids = input_ids.detach().reshape(-1)[:compute_row_count]
+            token_id = int(live_input_ids.index_select(0, matching).item())
+        os.makedirs(capture_dir, exist_ok=True)
+        output_path = os.path.join(
+            capture_dir,
+            f"rank{global_rank:05d}.layer{int(layer_id):03d}.position{target_position:05d}.pt",
+        )
+        torch.save(
+            {
+                "schema": "xorl.dsv4_trainer_layer_output.v1",
+                "global_rank": global_rank,
+                "layer": int(layer_id),
+                "position": target_position,
+                "token_id": token_id,
+                "source_shape": tuple(hidden_states.shape),
+                "hidden": row,
+            },
+            output_path,
+        )
+
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -1711,12 +2290,14 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
         """
         pp_stage_is_first = kwargs.pop("_pp_stage_is_first", None)
         pp_stage_is_last = kwargs.pop("_pp_stage_is_last", None)
+        output_hidden_states = bool(kwargs.pop("output_hidden_states", False))
         if (pp_stage_is_first is None) != (pp_stage_is_last is None):
             raise ValueError("DeepSeek-V4 pipeline stage flags must be supplied together")
         is_pipeline_stage = pp_stage_is_first is not None
         incoming_hyperconnection_state = bool(is_pipeline_stage and not pp_stage_is_first)
         decode_cache_carry = False
         carry_position_offset = 0
+        serving_mhc_segments = None
         if getattr(self.config, "_dsv4_flash_exact_mode", False):
             decode_cache_carry = bool(kwargs.pop("decode_cache_carry", False))
             if decode_cache_carry:
@@ -1755,6 +2336,7 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
             cp_live_mask = kwargs.pop("_cp_live_mask", None)
             sample_lengths = kwargs.pop("_r3_sample_lengths", None)
             num_samples = kwargs.pop("num_samples", None)
+            sampler_prefill_lengths = kwargs.pop("sampler_prefill_lengths", None)
             if isinstance(sample_lengths, torch.Tensor):
                 sample_lengths = sample_lengths.detach().cpu().reshape(-1).tolist()
             if not decode_cache_carry:
@@ -1845,8 +2427,38 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
                         )
                     compact_ids = input_ids.index_select(1, exact_cp_layout.local_storage_indices)
                     input_ids = F.pad(compact_ids, (0, compute_rows - live_token_count), value=0)
+                if int(parallel_state.cp_size) != 1:
+                    serving_mhc_segments = _build_cp_serving_mhc_segments(
+                        layout=exact_cp_layout,
+                        sampler_prefill_lengths=sampler_prefill_lengths,
+                    )
+                else:
+                    serving_mhc_segments = _build_serving_mhc_segments(
+                        compute_rows=int(hidden_states.shape[1]),
+                        sample_lengths=(
+                            [int(length) for length in sample_lengths]
+                            if sample_lengths is not None
+                            else ([int(hidden_states.shape[1])] if num_samples is None or int(num_samples) > 0 else [])
+                        ),
+                        sampler_prefill_lengths=sampler_prefill_lengths,
+                    )
+                if serving_mhc_segments is not None and not getattr(self, "_serving_mhc_engagement_logged", False):
+                    logger.info(
+                        "Exact DSV4 serving-segment MHC ENGAGED: requests=%s prefill_lengths=%s "
+                        "compute_rows=%s segment_count=%s",
+                        sample_lengths,
+                        sampler_prefill_lengths.detach().cpu().tolist(),
+                        hidden_states.shape[1],
+                        len(serving_mhc_segments),
+                    )
+                    self._serving_mhc_engagement_logged = True
             else:
-                live_token_count = packed_sequence_length
+                # Decode-cache replay keeps every EP rank in the same sequence
+                # of collectives, but idle ranks must contribute zero rows just
+                # as they do in serving.  The scorer supplies ``num_samples=0``
+                # on dispatcher-created dummy batches.
+                live_token_count = 0 if num_samples is not None and int(num_samples) == 0 else packed_sequence_length
+        capture_position_ids = position_ids
         del position_ids
         del kwargs
 
@@ -1857,6 +2469,13 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
         h4d = (
             hidden_states if incoming_hyperconnection_state else self.hc_util.block_expand(hidden_states)
         )  # [B, S, hc_mult, H]
+        self._maybe_capture_exact_residual_row(
+            layer_id=-1,
+            hidden_states=h4d,
+            position_ids=capture_position_ids,
+            input_ids=input_ids,
+        )
+        all_hidden_states = [h4d] if output_hidden_states else None
 
         use_outer_checkpoint = (
             self.gradient_checkpointing
@@ -1875,6 +2494,7 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
                     live_token_count=live_token_count,
                     exact_cp_layout=exact_cp_layout,
                     decode_carry_offset=(carry_position_offset if decode_cache_carry else None),
+                    serving_mhc_segments=serving_mhc_segments,
                 )
             else:
                 layer_outputs = layer(
@@ -1884,6 +2504,7 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
                     live_token_count=live_token_count,
                     exact_cp_layout=exact_cp_layout,
                     decode_carry_offset=(carry_position_offset if decode_cache_carry else None),
+                    serving_mhc_segments=serving_mhc_segments,
                 )
 
             if os.environ.get("XORL_DSV4_DIAGNOSTIC_BASE_MARLIN") == "1":
@@ -1907,6 +2528,14 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
                 all_router_logits.append(router_logits)
             else:
                 h4d = layer_outputs
+            self._maybe_capture_exact_residual_row(
+                layer_id=layer.layer_id,
+                hidden_states=h4d,
+                position_ids=capture_position_ids,
+                input_ids=input_ids,
+            )
+            if all_hidden_states is not None:
+                all_hidden_states.append(h4d)
 
         if is_pipeline_stage and not pp_stage_is_last:
             # Preserve the live multi-stream residual state across the PP wire.
@@ -1924,6 +2553,7 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
                 h4d = F.pad(h4d, (0, 0, 0, 0, 0, transport_padding))
             return MoeModelOutput(
                 last_hidden_state=h4d,
+                hidden_states=tuple(all_hidden_states) if all_hidden_states is not None else None,
                 router_logits=tuple(all_router_logits) if all_router_logits is not None else None,
             )
 
@@ -1937,12 +2567,22 @@ class DeepseekV4Model(DeepseekV4PreTrainedModel):
             h3d = storage_h3d.index_copy(1, exact_cp_layout.local_storage_indices, live_h3d)
         return MoeModelOutput(
             last_hidden_state=h3d,
+            hidden_states=tuple(all_hidden_states) if all_hidden_states is not None else None,
             router_logits=tuple(all_router_logits) if all_router_logits is not None else None,
         )
 
 
 class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel):
     """Causal-LM head wrapping :class:`DeepseekV4Model`."""
+
+    deepep_native_exact_capability = {
+        "produces_local_leaf": True,
+        "wire_dtype": "bf16",
+        "uses_dispatch_handle": True,
+        "supported_ep_sizes": (8,),
+        "local_leaf_program": "dsv4_mxfp4_marlin",
+        "lora_serving_modes": ("separate",),
+    }
 
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     # Keep the generic alias while the exact DSV4 PP path uses the explicit
@@ -2032,7 +2672,11 @@ class DeepseekV4ForCausalLM(DeepseekV4PreTrainedModel):
             output_router_logits=output_router_logits,
             **kwargs,
         )
-        return MoeCausalLMOutput(last_hidden_state=outputs.last_hidden_state, router_logits=outputs.router_logits)
+        return MoeCausalLMOutput(
+            last_hidden_state=outputs.last_hidden_state,
+            hidden_states=outputs.hidden_states,
+            router_logits=outputs.router_logits,
+        )
 
     def get_parallel_plan(self):
         """EP plan for the routed-expert weights. Consumed by

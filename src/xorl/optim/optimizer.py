@@ -70,11 +70,30 @@ def _make_param_groups_for_subset(
     decayed = [p for p in params if name_by_param.get(p) in decay_param_names]
     undecayed = [p for p in params if name_by_param.get(p) not in decay_param_names]
     groups: List[Dict[str, Any]] = []
-    if decayed:
-        groups.append({"params": decayed, "weight_decay": weight_decay})
-    if undecayed:
-        groups.append({"params": undecayed, "weight_decay": 0.0})
+    for candidates, group_weight_decay in ((decayed, weight_decay), (undecayed, 0.0)):
+        for homogeneous in _split_dtensor_parameter_groups(candidates):
+            groups.append({"params": homogeneous, "weight_decay": group_weight_decay})
     return groups
+
+
+def _split_dtensor_parameter_groups(params: Iterable[torch.nn.Parameter]) -> List[List[torch.nn.Parameter]]:
+    """Keep fused optimizer calls homogeneous in Tensor representation.
+
+    PyTorch's fused AdamW dispatch cannot accept ordinary ``Tensor`` and
+    ``DTensor`` parameters in the same call.  Exact MoE QLoRA legitimately
+    combines unwrapped expert factors with FSDP-managed projection/router
+    factors, so split only mixed lists while preserving the historical single
+    group for homogeneous callers.
+    """
+
+    params = list(params)
+    if not params:
+        return []
+    dtensors = [parameter for parameter in params if isinstance(parameter, DTensor)]
+    local_tensors = [parameter for parameter in params if not isinstance(parameter, DTensor)]
+    if not dtensors or not local_tensors:
+        return [params]
+    return [dtensors, local_tensors]
 
 
 # adapted from https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/trainer_pt_utils.py#L1123

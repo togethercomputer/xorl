@@ -404,11 +404,16 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
         )
         self.config = config
         self.layer_idx = layer_idx
-        self._native_ep_combine = bool(getattr(config, "_qwen35_exact_contract", False))
+        self.deepep_native_exact = bool(getattr(config, "_deepep_native_exact", False))
+        self._native_ep_combine = bool(
+            getattr(config, "_qwen35_exact_contract", False) and not self.deepep_native_exact
+        )
         self.experts.ep_dispatch = getattr(config, "_ep_dispatch", "alltoall")
         self.experts.deepep_buffer_size_gb = getattr(config, "_deepep_buffer_size_gb", 2.0)
         self.experts.deepep_num_sms = getattr(config, "_deepep_num_sms", 20)
         self.experts.deepep_async_combine = getattr(config, "_deepep_async_combine", False)
+        self.experts.deepep_native_exact = self.deepep_native_exact
+        self.experts.lora_serving_mode = getattr(config, "_lora_serving_mode", None)
         self.experts.alltoall_combine_hidden_chunk_size = getattr(config, "_alltoall_combine_hidden_chunk_size", 0)
         self.shared_expert = Qwen3_5MoeMLP(config, intermediate_size=config.shared_expert_intermediate_size)
         self.shared_expert_gate = nn.Linear(config.hidden_size, 1, bias=False)
@@ -558,6 +563,10 @@ class Qwen3_5MoeSparseMoeBlock(MoEBlock):
             routing_weights, selected_experts, router_logits = self.route(hidden_states.view(-1, hidden_dim))
             out = self._ep_combine_native(hidden_states, routing_weights, selected_experts)
             return out, router_logits
+        # Native DeepEP owns the routed-expert transport and canonical fold.
+        # Qwen3.5's replicated shared expert remains model-specific and is
+        # joined once, after that fold, on the original token owner. This is
+        # the same thin composition used by serving's DeepEP path.
         expert_output, router_logits = super().forward(hidden_states)
         return expert_output + self._shared_expert(hidden_states), router_logits
 
@@ -918,6 +927,14 @@ class Qwen3_5MoeModel(Qwen3_5MoePreTrainedModel):
 
 
 class Qwen3_5MoeForCausalLM(Qwen3_5MoePreTrainedModel):
+    deepep_native_exact_capability = {
+        "produces_local_leaf": True,
+        "wire_dtype": "bf16",
+        "uses_dispatch_handle": True,
+        "supported_ep_sizes": (2, 4, 8, 16),
+        "local_leaf_program": "fused_no_combine_false",
+        "lora_serving_modes": ("merged", "separate"),
+    }
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
     _tp_plan = parallelize.MODEL_TP_PLAN

@@ -164,6 +164,7 @@ def exchange_variable_and_canonical_fold(
     if partial.shape[0] != total_rows:
         raise ValueError(f"Partial rows {partial.shape[0]} do not match live row total {total_rows}")
     local_rows = row_counts[source_ordinal]
+
     exchanged = _AllToAll.apply(
         group,
         partial.contiguous(),

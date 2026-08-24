@@ -182,6 +182,8 @@ def test_removed_field_inventory_allows_unrelated_unknown_fields():
         ("fp8_cfg", {"enabled": True}),
         ("externalize_r3_payloads", True),
         ("keep_r3_payloads", True),
+        ("deepep_native_lora_mode", "separate"),
+        ("deepep_native_combine_mode", "deterministic"),
     ),
 )
 def test_removed_training_aliases_are_absent_from_server_arguments_schema(field_name, value):
@@ -193,6 +195,29 @@ def test_removed_training_aliases_are_absent_from_server_arguments_schema(field_
 def test_server_arguments_config_does_not_emit_removed_training_aliases():
     config = ServerArguments(model_path="Qwen/Qwen3-8B").to_config_dict()
     assert {"fp8_cfg", "externalize_r3_payloads", "keep_r3_payloads"}.isdisjoint(config["train"])
+
+
+def test_server_arguments_propagates_native_deepep_modes():
+    config = ServerArguments(
+        model_path="Qwen/Qwen3.5-35B-A3B",
+        deepep_native_exact=True,
+        expert_parallel_size=2,
+        enable_lora=True,
+        lora_serving_mode="separate",
+    ).to_config_dict()
+
+    assert config["model"]["deepep_native_exact"] is True
+    assert config["lora"]["lora_serving_mode"] == "separate"
+    assert config["train"]["gradient_checkpointing_method"] == "recompute_before_dispatch"
+
+
+def test_server_arguments_reject_native_deepep_at_ep1():
+    with pytest.raises(ValueError, match="expert_parallel_size > 1"):
+        ServerArguments(
+            model_path="Qwen/Qwen3.5-35B-A3B",
+            deepep_native_exact=True,
+            expert_parallel_size=1,
+        )
 
 
 _SHIPPED_EXACT_QWEN35_MOE_LORA_CONFIG = "examples/server/configs/lora/qwen3_5_35b_a3b_lora.yaml"
@@ -798,6 +823,19 @@ def test_load_server_arguments_admits_any_positive_exact_glm52_rank(tmp_path, ra
     assert args.lm_head_tensor_parallel_size == 16
     assert args.fsdp_sharded_lm_head_loss is True
     assert args.get_total_gpus() == 16
+
+
+def test_load_server_arguments_admits_exact_glm52_router_training(tmp_path):
+    payload = _exact_glm52_rank1_server_config(tmp_path)
+    payload["model"]["train_router"] = True
+    payload["train"]["freeze_router"] = False
+    config_path = tmp_path / "server_config.yaml"
+    config_path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+
+    args = load_server_arguments(str(config_path))
+
+    assert args.train_router is True
+    assert args.freeze_router is False
 
 
 def test_load_server_arguments_admits_dp_owned_exact_glm52_row(tmp_path):

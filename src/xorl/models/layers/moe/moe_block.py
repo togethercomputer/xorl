@@ -141,6 +141,7 @@ class MoEBlock(nn.Module):
         activation_native: bool = False,
         swiglu_limit: float = 0.0,
         exact_batch_invariant_router: bool = False,
+        exact_router_weights_fp32: bool = False,
     ):
         super().__init__()
         self.num_experts = num_experts
@@ -151,6 +152,7 @@ class MoEBlock(nn.Module):
         self.train_router = train_router
         self.record_routing_weights = record_routing_weights
         self.swiglu_limit = float(swiglu_limit)
+        self.deepep_native_exact = False
 
         # Gate linear — directly on this module for checkpoint path ``mlp.gate.weight``
         self.gate = nn.Linear(hidden_size, num_experts, bias=False)
@@ -161,6 +163,7 @@ class MoEBlock(nn.Module):
             top_k,
             norm_topk_prob,
             exact_batch_invariant=exact_batch_invariant_router,
+            exact_weights_fp32=exact_router_weights_fp32,
         )
         self._exact_batch_invariant_router = exact_batch_invariant_router
 
@@ -185,7 +188,11 @@ class MoEBlock(nn.Module):
     def supports_routing_replay(self) -> bool:
         """Whether this block's route program can replay cached decisions."""
 
-        return True
+        return not bool(
+            self.deepep_native_exact
+            or getattr(getattr(self, "config", None), "_deepep_native_exact", False)
+            or getattr(self.experts, "deepep_native_exact", False)
+        )
 
     def _capture_diagnostic_component(self, name: str, tensor: torch.Tensor) -> None:
         capture = getattr(self, "_diagnostic_capture_component", None)
@@ -335,12 +342,21 @@ class MoEBlock(nn.Module):
             - router_logits: ``(num_tokens, num_experts)``
         """
         # Route (optionally upcast to fp32 for numerical alignment with SGLang)
+        native_deepep_exact = bool(
+            self.deepep_native_exact
+            or getattr(getattr(self, "config", None), "_deepep_native_exact", False)
+            or getattr(self.experts, "deepep_native_exact", False)
+        )
         router_fp32 = (
             getattr(self, "config", None) is not None
             and getattr(self.config, "_router_fp32", False)
             or _router_fp32_layers_enabled(getattr(self, "layer_idx", None))
         )
-        if self._exact_batch_invariant_router or _moe_bi_router_enabled(getattr(self, "config", None)):
+        if (
+            native_deepep_exact
+            or self._exact_batch_invariant_router
+            or _moe_bi_router_enabled(getattr(self, "config", None))
+        ):
             router_logits = self._bi_router_logits(hidden_states)
         elif router_fp32 and not hasattr(self.gate, "fp8_block_size"):
             router_logits = F.linear(hidden_states.float(), self.gate.weight.float())
@@ -360,6 +376,11 @@ class MoEBlock(nn.Module):
         # This matches Megatron's approach: scores.gather(1, top_indices).
         stage = get_replay_stage()
         replay = self._routing_replay
+
+        if native_deepep_exact and stage is not None:
+            raise RuntimeError(
+                "deepep_native_exact requires independently recomputed routing; routing replay is forbidden"
+            )
 
         if stage is not None and replay is not None:
             if stage == "record":
@@ -398,11 +419,26 @@ class MoEBlock(nn.Module):
                     if cached_weights is not None:
                         routing_weights = cached_weights.to(hidden_states.dtype)
         else:
-            # No replay active: use standard router
-            routing_weights, selected_experts = self.router(router_logits, hidden_states.dtype)
+            if native_deepep_exact:
+                from xorl.distributed.moe.deepep_native_exact import (  # noqa: PLC0415
+                    native_exact_router_topk,
+                )
+
+                routing_weights, selected_experts = native_exact_router_topk(
+                    router_logits,
+                    top_k=self.top_k,
+                    renormalize=self.router.norm_topk_prob,
+                )
+            else:
+                # No replay active: use the model router.
+                routing_weights, selected_experts = self.router(router_logits, hidden_states.dtype)
 
         forced_selected_experts = getattr(self, "_diagnostic_forced_selected_experts", None)
         if forced_selected_experts is not None:
+            if native_deepep_exact:
+                raise RuntimeError(
+                    "deepep_native_exact requires independently recomputed routing; forced routing is forbidden"
+                )
             forced_selected_experts = forced_selected_experts.to(
                 device=selected_experts.device,
                 dtype=selected_experts.dtype,

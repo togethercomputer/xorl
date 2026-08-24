@@ -8,6 +8,7 @@ import pytest
 import torch
 import torch.nn as nn
 
+from xorl.models.exact_contract import set_glm52_exact_active_lora
 from xorl.server.runner.adapters.manager import LoRAAdapterManager
 from xorl.server.session_spec import normalize_session_spec
 
@@ -121,6 +122,21 @@ def _build_checkpoint_manager() -> CheckpointManager:
     manager.lora_config = {"enable_lora": True}
     manager._adapter_manager = _FakeAdapterManager()
     return manager
+
+
+def test_detached_single_tenant_publication_uses_live_pp_publisher() -> None:
+    manager = object.__new__(CheckpointManager)
+    manager._adapter_manager = None
+    expected = {"model.layers.7.self_attn.q_proj.lora_A": torch.ones(2, 3)}
+
+    class _Publisher:
+        def materialize_live_model_logical_state_dict(self, *, destination_rank):
+            assert destination_rank == 0
+            return expected
+
+    manager._detached_adapter_publisher = _Publisher()
+
+    assert manager._gather_adapter_lora_params("default") is expected
 
 
 def _build_fast_save_manager(tmp_path: Path) -> CheckpointManager:
@@ -409,6 +425,68 @@ def test_moe_lora_save_uses_collective_gather_even_with_adapter_manager(monkeypa
     assert captured["r"] == 4
 
 
+def test_glm52_active_lora_save_publishes_frozen_router_bundle(monkeypatch, tmp_path):
+    manager = _build_fast_save_manager(tmp_path)
+    manager.global_step = 0
+    manager._adapter_manager.get_adapter_state("policy-a").global_step = 7
+    manager.model.exact_component = _ExactActiveLoRAComponent()
+    manager.model.config = type(
+        "Config",
+        (),
+        {
+            "train_router": False,
+            "first_k_dense_replace": 3,
+            "num_hidden_layers": 5,
+        },
+    )()
+
+    router_state = {
+        "layer.3.weight": torch.ones(2, 2, dtype=torch.bfloat16),
+        "layer.4.weight": torch.full((2, 2), 2, dtype=torch.bfloat16),
+    }
+    calls = {}
+
+    def _gather_router(model, *, destination_rank):
+        calls["gather"] = (model, destination_rank)
+        return router_state
+
+    def _save_router(directory, state, *, weight_step, expected_layer_ids):
+        calls["save"] = (directory, state, weight_step, expected_layer_ids)
+        return {
+            "schema": "xorl.glm52_router_bundle.v1",
+            "tensor_file": "xorl_router/xorl_glm52_router.safetensors",
+            "sha256": "a" * 64,
+            "router_count": 2,
+            "layer_ids": [3, 4],
+            "weight_step": weight_step,
+        }
+
+    monkeypatch.setattr(_MODULE, "gather_glm52_router_weights_across_ranks", _gather_router)
+    monkeypatch.setattr(_MODULE, "save_glm52_router_bundle", _save_router)
+    monkeypatch.setattr(
+        _MODULE,
+        "mark_adapter_config_with_glm52_router_bundle",
+        lambda directory, manifest: calls.setdefault("mark", (directory, manifest)),
+    )
+
+    export_dir = tmp_path / "glm52-export"
+    manager._save_lora_weights(str(export_dir), "policy-a")
+
+    assert calls["gather"] == (manager.model, 0)
+    assert calls["save"] == (str(export_dir), router_state, 7, [3, 4])
+    assert calls["mark"][0] == str(export_dir)
+    assert calls["mark"][1]["router_count"] == 2
+
+
+def test_glm52_active_lora_publication_uses_replicated_config_stamp_on_dense_stage():
+    manager = object.__new__(CheckpointManager)
+    manager.model = nn.Sequential(nn.Linear(2, 2))
+    manager.model.config = type("Config", (), {})()
+    set_glm52_exact_active_lora(manager.model.config, enabled=True)
+
+    assert manager._has_glm52_exact_active_lora()
+
+
 def test_moe_lora_save_uses_resolved_target_modules_for_detection(monkeypatch, tmp_path):
     manager = _build_checkpoint_manager()
 
@@ -449,6 +527,7 @@ def test_lora_save_forwards_export_format(monkeypatch, tmp_path):
     manager = object.__new__(CheckpointManager)
     manager.rank = 0
     manager.local_rank = 0
+    manager.global_step = 0
     manager.model = nn.Module()
     manager.model_config = {"model_path": "Qwen/Qwen3-8B"}
     manager._adapter_manager = None

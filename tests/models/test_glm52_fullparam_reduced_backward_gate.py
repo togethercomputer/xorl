@@ -77,10 +77,11 @@ def _single_contributor_experts_with_shared(
     routing_weights: torch.Tensor,
     selected_experts: torch.Tensor,
     absolute_positions: torch.Tensor | None = None,
+    backward_layer_dependency: torch.Tensor | None = None,
 ):
     """EP1 projection of the canonical dispatch through the REAL partial seams."""
 
-    del absolute_positions
+    del absolute_positions, backward_layer_dependency
     batch_size, seq_len, hidden_dim = hidden_states.shape
     flat = hidden_states.reshape(-1, hidden_dim)
     rows = flat.shape[0]

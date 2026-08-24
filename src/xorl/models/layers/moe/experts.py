@@ -425,19 +425,25 @@ class _SglangFusedExpertsTrainFunction(torch.autograd.Function):
             moe_index_compute,
         )
 
-        output = _sglang_fused_experts_kernel_call(
-            hidden_flat,
-            gate_up_proj,
-            down_proj,
-            routing_flat,
-            selected_flat,
-            fused_experts_impl,
-            activation,
-            swiglu_limit,
-            gate_up_bias=None,
-            weight_cache=weight_cache,
-            filter_expert=filter_expert,
-        )
+        if hidden_flat.shape[0] == 0 and filter_expert:
+            # DeepEP may deliver no rows to an expert rank for a small batch.
+            # The fused runner has no M=0 launch; the combined local leaf is
+            # the empty BF16 [rows, hidden] tensor.
+            output = hidden_flat.clone()
+        else:
+            output = _sglang_fused_experts_kernel_call(
+                hidden_flat,
+                gate_up_proj,
+                down_proj,
+                routing_flat,
+                selected_flat,
+                fused_experts_impl,
+                activation,
+                swiglu_limit,
+                gate_up_bias=None,
+                weight_cache=weight_cache,
+                filter_expert=filter_expert,
+            )
         # Save the xorl scatter bookkeeping alongside the inputs (mirrors the
         # stock TritonMoeExpertsFunction contract): moe_index_compute uses
         # relaxed atomics, so the intra-expert row permutation is only
@@ -526,7 +532,7 @@ class _SglangFusedExpertsTrainFunction(torch.autograd.Function):
             # Every slot masked (no local pairs): the kernel produced zeros, so
             # all grads are exactly zero (materialized to keep grad reduction
             # uniform across EP ranks).
-            return (
+            grads = (
                 torch.zeros_like(hidden_states),  # hidden_flat
                 torch.zeros_like(gate_weights) if ctx.needs_input_grad[1] else None,  # routing_flat
                 None,  # selected_flat
@@ -540,6 +546,7 @@ class _SglangFusedExpertsTrainFunction(torch.autograd.Function):
                 None,  # weight_cache
                 None,  # filter_expert
             )
+            return grads[: len(ctx.needs_input_grad)]
 
         # Recompute the cheap xorl-forward intermediates the stock backward
         # consumes (scatter + gate/up grouped GEMM) from the bookkeeping saved
@@ -669,7 +676,7 @@ class _SglangFusedExpertsTrainFunction(torch.autograd.Function):
             num_slots = int(scatter_index.shape[1])
         grad_hidden_states = grad_pair_rows.reshape(hidden_states.shape[0], num_slots, -1).sum(dim=1)
 
-        return (
+        grads = (
             grad_hidden_states,  # hidden_flat
             grad_gate_weight,  # routing_flat
             None,  # selected_flat
@@ -683,6 +690,7 @@ class _SglangFusedExpertsTrainFunction(torch.autograd.Function):
             None,  # weight_cache
             None,  # filter_expert
         )
+        return grads[: len(ctx.needs_input_grad)]
 
 
 def _sglang_fused_experts_ep_kernel_call(
@@ -1607,6 +1615,11 @@ class MoEExperts(nn.Module):
         self.deepep_buffer_size_gb: float = 2.0
         self.deepep_num_sms: int = 20
         self.deepep_async_combine: bool = False
+        # Versioned real-dispatch exact path. Model adapters may only turn this
+        # on after construction; the shared layer owns dispatch receipt
+        # validation, local serving-kernel execution, BF16 transport, FP64 fold,
+        # and backward communication.
+        self.deepep_native_exact: bool = False
         self.fp8_training_enabled: bool = False
         self.fp8_training_grouped_backend: str = "triton_grouped"
         self.fp8_training_block_size: int = 128
@@ -2423,6 +2436,8 @@ class MoEExperts(nn.Module):
         hidden_states: torch.Tensor,
         routing_weights: torch.Tensor,
         selected_experts: torch.Tensor,
+        *,
+        local_expert_ids: bool = False,
     ) -> torch.Tensor:
         """K3 parity mode: run SGLang's serving MoE kernel (``fused_experts_impl``).
 
@@ -2479,6 +2494,11 @@ class MoEExperts(nn.Module):
                 weight_cache = {}
                 self._sglang_fused_weight_cache = weight_cache
 
+        # Real DeepEP normal dispatch returns rank-local ids with ``-1`` in
+        # slots owned by other ranks.  The same serving kernel accepts that
+        # layout through filter_expert=True; its backward must histogram only
+        # the local weight slice, not the model-global expert count.
+        kernel_num_experts = int(self.gate_up_proj.shape[0]) if local_expert_ids else int(self.num_experts)
         needs_grad = torch.is_grad_enabled() and (
             hidden_flat.requires_grad
             or routing_flat.requires_grad
@@ -2505,22 +2525,27 @@ class MoEExperts(nn.Module):
                 activation,
                 self.hidden_act,
                 self.swiglu_limit,
-                self.num_experts,
+                kernel_num_experts,
                 weight_cache,
+                local_expert_ids,
             )
         else:
-            output = _sglang_fused_experts_kernel_call(
-                hidden_flat,
-                self.gate_up_proj,
-                self.down_proj,
-                routing_flat,
-                selected_flat,
-                fused_experts_impl,
-                activation,
-                self.swiglu_limit,
-                self.gate_up_bias,
-                weight_cache=weight_cache,
-            )
+            if local_expert_ids and hidden_flat.shape[0] == 0:
+                output = hidden_flat.clone()
+            else:
+                output = _sglang_fused_experts_kernel_call(
+                    hidden_flat,
+                    self.gate_up_proj,
+                    self.down_proj,
+                    routing_flat,
+                    selected_flat,
+                    fused_experts_impl,
+                    activation,
+                    self.swiglu_limit,
+                    self.gate_up_bias,
+                    weight_cache=weight_cache,
+                    filter_expert=local_expert_ids,
+                )
         return output.reshape(original_shape)
 
     def sglang_fused_experts_auto_supported(self) -> bool:
@@ -2974,6 +2999,14 @@ class MoEExperts(nn.Module):
         or ``"deepep"``). Compute backend by ``self.moe_implementation``.
         """
 
+        if self.deepep_native_exact:
+            return self._deepep_native_exact_forward(
+                hidden_states,
+                routing_weights,
+                selected_experts,
+                parallel_state,
+            )
+
         if self.moe_implementation not in EP_EXPERT_COMPUTE:
             raise ValueError(
                 f"moe_implementation={self.moe_implementation!r} does not support "
@@ -3221,6 +3254,54 @@ class MoEExperts(nn.Module):
                 quack_deepep_no_permute=False,
             )
         return result
+
+    def _deepep_native_exact_forward(
+        self,
+        hidden_states: torch.Tensor,
+        routing_weights: torch.Tensor,
+        selected_experts: torch.Tensor,
+        parallel_state,
+    ) -> torch.Tensor:
+        """Real top-k DeepEP dispatch + local serving runner + canonical fold.
+
+        The model adapter only opts into this shared program.  All numerical
+        and communication boundaries live here so Qwen/DeepSeek adapters do
+        not grow independent implementations.
+        """
+
+        from xorl.distributed.moe.deepep_native_exact import (  # noqa: PLC0415
+            canonicalize_native_routing_metadata,
+            native_dispatch_runner_combine,
+        )
+
+        if self.ep_dispatch != "deepep":
+            raise RuntimeError("deepep_native_exact requires ep_dispatch='deepep'")
+        if self.deepep_async_combine:
+            raise RuntimeError("deepep_native_exact owns the immediate FP64 fold and rejects async combine")
+        if self.fp8_training_enabled:
+            raise RuntimeError("deepep_native_exact currently admits BF16 expert execution only")
+        if hidden_states.dtype is not torch.bfloat16:
+            raise RuntimeError(f"deepep_native_exact requires BF16 dispatch values, got {hidden_states.dtype}")
+        routing_weights = canonicalize_native_routing_metadata(routing_weights)
+        if self.gate_up_bias is not None or self.down_bias is not None or not self.gated:
+            raise NotImplementedError("deepep_native_exact currently admits bias-free gated experts")
+        num_local_experts = int(self.gate_up_proj.shape[0])
+        return native_dispatch_runner_combine(
+            hidden_states,
+            routing_weights,
+            selected_experts,
+            ep_group=parallel_state.ep_group,
+            num_experts=int(self.num_experts),
+            num_local_experts=num_local_experts,
+            buffer_size_gb=self.deepep_buffer_size_gb,
+            num_sms=self.deepep_num_sms,
+            runner=lambda hidden, weights, ids: self.sglang_fused_experts_forward(
+                hidden,
+                weights,
+                ids,
+                local_expert_ids=True,
+            ),
+        )
 
     def _emit_deepep_parity_diagnostic(
         self,

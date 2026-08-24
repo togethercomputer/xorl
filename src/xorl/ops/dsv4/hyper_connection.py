@@ -13,6 +13,7 @@ only through the residual streams, not through the mixer.
 """
 
 import os
+from dataclasses import dataclass
 
 import einops
 import torch
@@ -28,6 +29,22 @@ from torch import Tensor
 
 _HYPER_CONNECTION_MIXER_NO_GRAD = True
 _DEFAULT_HC_CHUNK_TOKENS = 1024
+
+
+@dataclass(frozen=True)
+class ExactMhcReplaySegment:
+    """One serving-sized MHC launch projected onto this rank's local rows.
+
+    ``launch_rows`` preserves the serving launch geometry (and therefore its
+    TF32 split count). ``source_rows`` names compact trainer rows, while
+    ``launch_positions`` places those rows at their positions in the serving
+    launch. Rows owned by other CP ranks are zero placeholders; MHC pre-norm
+    has no cross-token arithmetic, so they cannot affect selected local rows.
+    """
+
+    launch_rows: int
+    source_rows: tuple[int, ...]
+    launch_positions: tuple[int, ...]
 
 
 def _exact_mhc_pre_norm_forward(
@@ -425,7 +442,102 @@ class DeepSeekV4HyperConnectionUtil:
         hc_scale: Tensor,
         hc_base: Tensor,
         norm_weight: Tensor,
+        serving_segments: tuple[int | ExactMhcReplaySegment, ...] | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
+        if serving_segments is not None:
+            if hidden_states.ndim != 4:
+                raise ValueError(
+                    "DSV4 serving-segment MHC replay requires [B, S, hc, H] residuals, "
+                    f"got {tuple(hidden_states.shape)}"
+                )
+            compute_rows = hidden_states.shape[1]
+            layer_inputs = []
+            posts = []
+            combs = []
+            source_order: list[int] = []
+            start = 0
+            for segment in serving_segments:
+                if isinstance(segment, int):
+                    if segment <= 0:
+                        raise ValueError(f"DSV4 serving MHC segments must be positive, got {serving_segments}")
+                    end = start + segment
+                    source_rows = tuple(range(start, end))
+                    launch_positions = tuple(range(segment))
+                    launch_residual = hidden_states[:, start:end]
+                    start = end
+                else:
+                    if segment.launch_rows <= 0:
+                        raise ValueError(f"DSV4 serving MHC launch rows must be positive, got {segment}")
+                    source_rows = segment.source_rows
+                    launch_positions = segment.launch_positions
+                    if not source_rows or len(source_rows) != len(launch_positions):
+                        raise ValueError(
+                            "DSV4 CP serving MHC segments require equally sized nonempty source and launch rows, "
+                            f"got {segment}"
+                        )
+                    if len(set(source_rows)) != len(source_rows) or any(
+                        row < 0 or row >= compute_rows for row in source_rows
+                    ):
+                        raise ValueError(f"DSV4 CP serving MHC source rows are invalid: {segment}")
+                    if len(set(launch_positions)) != len(launch_positions) or any(
+                        row < 0 or row >= segment.launch_rows for row in launch_positions
+                    ):
+                        raise ValueError(f"DSV4 CP serving MHC launch positions are invalid: {segment}")
+                    source_index = torch.tensor(source_rows, dtype=torch.long, device=hidden_states.device)
+                    launch_index = torch.tensor(launch_positions, dtype=torch.long, device=hidden_states.device)
+                    local_residual = hidden_states.index_select(1, source_index)
+                    launch_residual = hidden_states.new_zeros(
+                        hidden_states.shape[0],
+                        segment.launch_rows,
+                        *hidden_states.shape[2:],
+                    ).index_copy(1, launch_index, local_residual)
+
+                layer_input, post, comb = _ExactMhcPreNorm.apply(
+                    launch_residual,
+                    hc_fn,
+                    hc_scale,
+                    hc_base,
+                    norm_weight,
+                    self.norm_eps,
+                    self.hc_eps,
+                    self.hc_sinkhorn_iters,
+                )
+                if not isinstance(segment, int):
+                    launch_index = torch.tensor(
+                        launch_positions,
+                        dtype=torch.long,
+                        device=hidden_states.device,
+                    )
+                    layer_input = layer_input.index_select(1, launch_index)
+                    post = post.index_select(1, launch_index)
+                    comb = comb.index_select(1, launch_index)
+                layer_inputs.append(layer_input)
+                posts.append(post)
+                combs.append(comb)
+                source_order.extend(source_rows)
+
+            if sorted(source_order) != list(range(compute_rows)):
+                raise ValueError(
+                    "DSV4 serving MHC segments must cover the compute rows exactly once: "
+                    f"source_rows={source_order} rows={compute_rows}"
+                )
+            layer_input = torch.cat(layer_inputs, dim=1)
+            post = torch.cat(posts, dim=1)
+            comb = torch.cat(combs, dim=1)
+            if source_order != list(range(compute_rows)):
+                restore_order = torch.tensor(
+                    sorted(range(compute_rows), key=source_order.__getitem__),
+                    dtype=torch.long,
+                    device=hidden_states.device,
+                )
+                layer_input = layer_input.index_select(1, restore_order)
+                post = post.index_select(1, restore_order)
+                comb = comb.index_select(1, restore_order)
+            return (
+                layer_input,
+                post,
+                comb,
+            )
         return _ExactMhcPreNorm.apply(
             hidden_states,
             hc_fn,

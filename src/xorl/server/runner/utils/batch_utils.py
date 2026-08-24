@@ -28,6 +28,7 @@ PACKED_ROW_BATCH_METADATA_KEYS = {
     "packed_row_source_num_samples",
     "packed_row_source_request_ids",
     "packed_row_source_token_spans",
+    "sampler_prefill_lengths",
     "_r3_sample_lengths",
     "_shifted",
     "cu_seq_lens_q",
@@ -82,10 +83,16 @@ def can_batch_packed_rows(rows: list[Dict[str, Any]]) -> tuple[bool, set[str]]:
     first_keys = packed_row_sequence_keys(rows[0])
     if first_keys is None:
         return False, set()
+    first_has_sampler_boundaries = _complete_sampler_prefill_lengths(rows[0]) is not None
     scalar_keys = set(rows[0]) - first_keys - PACKED_ROW_BATCH_METADATA_KEYS
     for row in rows[1:]:
         row_keys = packed_row_sequence_keys(row)
         if row_keys != first_keys:
+            return False, set()
+        if (_complete_sampler_prefill_lengths(row) is not None) != first_has_sampler_boundaries:
+            # Do not recombine an HF-format row with an already-shifted RL row.
+            # Exact DSV4 relies on complete boundaries to replay the sampler's
+            # per-request prefill/decode MHC arithmetic.
             return False, set()
         if set(row) - row_keys - PACKED_ROW_BATCH_METADATA_KEYS != scalar_keys:
             return False, set()
@@ -112,6 +119,23 @@ def _coerce_source_list(value: Any) -> list[Any] | None:
     if not isinstance(value, list):
         return None
     return value
+
+
+def _complete_sampler_prefill_lengths(row: Dict[str, Any]) -> list[int] | None:
+    """Return row boundaries only when every packed request has one."""
+
+    sample_lengths = _coerce_source_list(row.get("_r3_sample_lengths"))
+    prefill_lengths = _coerce_source_list(row.get("sampler_prefill_lengths"))
+    if not sample_lengths or not prefill_lengths or len(prefill_lengths) != len(sample_lengths):
+        return None
+    normalized_samples = [_coerce_int(length, 0) for length in sample_lengths]
+    normalized_prefills = [_coerce_int(length, 0) for length in prefill_lengths]
+    if any(
+        sample_length <= 0 or prefill_length <= 0 or prefill_length > sample_length
+        for sample_length, prefill_length in zip(normalized_samples, normalized_prefills, strict=True)
+    ):
+        return None
+    return normalized_prefills
 
 
 def _row_token_len(row: Dict[str, Any]) -> int:
@@ -206,6 +230,9 @@ def merge_packed_row_group(rows: list[Dict[str, Any]], batch_id: int, sequence_k
         "packed_row_source_group_size": len(source_batch_ids),
         "_r3_sample_lengths": [length for row in rows for length in row.get("_r3_sample_lengths", [])],
     }
+    boundary_rows = [_complete_sampler_prefill_lengths(row) for row in rows]
+    if all(boundaries is not None for boundaries in boundary_rows):
+        merged["sampler_prefill_lengths"] = [length for boundaries in boundary_rows for length in boundaries]
     if "_shifted" in rows[0]:
         merged["_shifted"] = all(bool(row.get("_shifted", False)) for row in rows)
 

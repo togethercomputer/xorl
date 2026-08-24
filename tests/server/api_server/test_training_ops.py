@@ -124,6 +124,8 @@ async def test_forward_response_info_and_profile_metrics():
                     "executor_total_s": 0.92,
                     "forward_compute_time": 0.35,
                     "backward_compute_time": 0.45,
+                    "dsv4_grad_norm": 3.25,
+                    "dsv4_router_grad_present_count": 0,
                 }
             ]
         )
@@ -151,3 +153,5 @@ async def test_forward_response_info_and_profile_metrics():
     assert response.metrics["executor_total_s"] == pytest.approx(0.92)
     assert response.metrics["backward_compute_time"] == pytest.approx(0.45)
     assert response.metrics["forward_compute_time"] == pytest.approx(0.35)
+    assert response.metrics["dsv4_grad_norm:mean"] == pytest.approx(3.25)
+    assert response.metrics["dsv4_router_grad_present_count:mean"] == 0

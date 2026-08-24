@@ -47,7 +47,11 @@ def test_dsv4_pp_storage_alignment_covers_unequal_owner_planes(monkeypatch):
         {
             "input_ids": torch.arange(8).view(1, -1),
             "labels": torch.arange(8).view(1, -1),
+            "target_tokens": torch.arange(8).view(1, -1),
+            "old_logprobs": torch.arange(8, dtype=torch.float32).view(1, -1),
+            "advantages": torch.ones((1, 8), dtype=torch.float32),
             "position_ids": torch.arange(16).view(1, -1),
+            "attention_mask": torch.ones((1, 16), dtype=torch.long),
             "cu_seq_lens_q": torch.tensor([0, 16], dtype=torch.int32),
             "cu_seq_lens_k": torch.tensor([0, 16], dtype=torch.int32),
             "max_length_q": 16,
@@ -63,10 +67,15 @@ def test_dsv4_pp_storage_alignment_covers_unequal_owner_planes(monkeypatch):
     assert align_dsv4_pp_storage_rows(micro_batches, cp_size=2) == 12
     batch = micro_batches[0]
     assert batch["input_ids"].shape == (1, 12)
+    assert batch["target_tokens"].shape == (1, 12)
+    assert batch["target_tokens"][0, 8:].tolist() == [IGNORE_INDEX] * 4
+    torch.testing.assert_close(batch["old_logprobs"][0, 8:], torch.zeros(4))
+    torch.testing.assert_close(batch["advantages"][0, 8:], torch.zeros(4))
     assert batch["_cp_live_mask"].shape == (1, 12)
     assert torch.count_nonzero(batch["_cp_live_mask"]) == 6
     assert batch["_r3_sample_lengths"] is sample_lengths
     assert batch["position_ids"].shape == (1, 24)
+    assert batch["attention_mask"].shape == (1, 24)
     assert int(batch["cu_seq_lens_q"][-1]) == 24
     assert int(batch["cu_seq_lens_k"][-1]) == 24
 
@@ -263,6 +272,12 @@ def test_pp_padding_uses_exact_sampling_transform_identities():
         {
             "input_ids": torch.tensor([[7, 8]], dtype=torch.int64),
             "labels": torch.tensor([[8, 9]], dtype=torch.int64),
+            "target_tokens": torch.tensor([[8, 9]], dtype=torch.int64),
+            "logprobs": torch.tensor([[-1.0, -2.0]], dtype=torch.float32),
+            "old_logprobs": torch.tensor([[-1.0, -2.0]], dtype=torch.float32),
+            "ref_logprobs": torch.tensor([[-1.5, -2.5]], dtype=torch.float32),
+            "rollout_logprobs": torch.tensor([[-1.0, -2.0]], dtype=torch.float32),
+            "advantages": torch.tensor([[0.25, -0.5]], dtype=torch.float32),
             "logprob_temperatures": torch.tensor([[0.7, 1.3]], dtype=torch.float32),
             "logprob_top_ks": torch.tensor([[4, 9]], dtype=torch.int64),
             "logprob_top_ps": torch.tensor([[0.8, 0.9]], dtype=torch.float32),
@@ -275,10 +290,25 @@ def test_pp_padding_uses_exact_sampling_transform_identities():
     batch = micro_batches[0]
     assert batch["input_ids"].tolist() == [[7, 8, 0, 0]]
     assert batch["labels"].tolist() == [[8, 9, IGNORE_INDEX, IGNORE_INDEX]]
+    assert batch["target_tokens"].tolist() == [[8, 9, IGNORE_INDEX, IGNORE_INDEX]]
+    for key in ("logprobs", "old_logprobs", "ref_logprobs", "rollout_logprobs", "advantages"):
+        torch.testing.assert_close(batch[key][:, 2:], torch.zeros((1, 2)))
     torch.testing.assert_close(batch["logprob_temperatures"], torch.tensor([[0.7, 1.3, 1.0, 1.0]]))
     assert batch["logprob_top_ks"].tolist() == [[4, 9, 1 << 30, 1 << 30]]
     torch.testing.assert_close(batch["logprob_top_ps"], torch.tensor([[0.8, 0.9, 1.0, 1.0]]))
     torch.testing.assert_close(batch["logprob_min_ps"], torch.tensor([[0.1, 0.2, 0.0, 0.0]]))
+
+
+def test_pp_padding_rejects_misaligned_objective_rows():
+    micro_batches = [
+        {
+            "input_ids": torch.tensor([[7, 8]], dtype=torch.int64),
+            "target_tokens": torch.tensor([[8]], dtype=torch.int64),
+        }
+    ]
+
+    with pytest.raises(ValueError, match="target_tokens.*1 rows.*input_ids.*2"):
+        pad_micro_batches_for_pp(micro_batches, sample_packing_sequence_len=4)
 
 
 def test_pp_chunked_ce_matches_eager_loss_and_grad(monkeypatch):

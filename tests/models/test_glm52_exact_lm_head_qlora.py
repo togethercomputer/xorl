@@ -157,6 +157,28 @@ def _assert_operand_contract_is_official_local_bf16_rank_one_and_stride_exact() 
             token_ids,
             require_cuda=False,
         )
+    weight.requires_grad_(False)
+
+    detached_A = lora_A.detach()
+    detached_B = lora_B.detach()
+    with pytest.raises(RuntimeError, match="factor masters must both be trainable"):
+        component._validate_operands(
+            hidden,
+            weight,
+            detached_A,
+            detached_B,
+            token_ids,
+            require_cuda=False,
+        )
+    component._validate_operands(
+        hidden,
+        weight,
+        detached_A,
+        detached_B,
+        token_ids,
+        require_cuda=False,
+        require_factor_grad=False,
+    )
 
 
 def _assert_cpu_rejection_happens_before_sglang_import_or_group_use() -> None:

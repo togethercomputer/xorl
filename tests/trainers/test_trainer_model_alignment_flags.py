@@ -82,6 +82,7 @@ def _trainer_args():
             enable_lora=False,
             enable_qlora=False,
             unfuse_for_lora=False,
+            lora_serving_mode=None,
             lora_rank=16,
             lora_alpha=16,
         ),

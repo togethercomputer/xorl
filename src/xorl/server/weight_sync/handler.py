@@ -467,6 +467,17 @@ class WeightSyncHandler:
             logger.debug("Rank %d: [WeightSync] failed to clear abort marker %s: %s", self.rank, abort_path, e)
 
     def _prepare_lora_adapter_for_sync(self, model_id: Optional[str]) -> Optional[str]:
+        lora_config = getattr(self.trainer, "lora_config", {}) or {}
+        lora_serving_mode = lora_config.get("lora_serving_mode")
+        if lora_serving_mode == "separate":
+            raise RuntimeError(
+                "lora_serving_mode='separate' publishes A/B factors and cannot use "
+                "merged full-weight synchronization; publish the adapter checkpoint "
+                "and load it as an active sampler adapter"
+            )
+        if lora_serving_mode not in {None, "merged"}:
+            raise ValueError(f"Unknown lora_serving_mode {lora_serving_mode!r}")
+
         adapter_manager = getattr(self.trainer, "adapter_manager", None)
         if adapter_manager is None:
             return None
@@ -1538,17 +1549,15 @@ class WeightSyncHandler:
                         if _ws_timings:
                             _t_ep_collect = time.perf_counter()
 
-                        # EP MoE prefixes to skip in extraction
-                        ep_moe_prefixes = set()
-                        for ctx in ep_moe_contexts:
-                            p = ctx["prefix"]
-                            if mod_name != "(root)":
-                                if p == mod_name:
-                                    ep_moe_prefixes.add("")
-                                elif p.startswith(mod_name + "."):
-                                    ep_moe_prefixes.add(p[len(mod_name) + 1 :])
-                            else:
-                                ep_moe_prefixes.add(p)
+                        # EP contexts serve two distinct purposes: they identify
+                        # parameters the ordinary dense extractor must skip, and
+                        # (usually) carry expert tensors for the EP transfer path.
+                        # Separate active-LoRA uses skip-only contexts because its
+                        # frozen expert bases must be omitted from both paths.
+                        ep_moe_prefixes, ep_moe_contexts = self._split_ep_moe_contexts_for_sync(
+                            ep_moe_contexts,
+                            mod_name,
+                        )
 
                         if _stage_leader or _extract_dense_on_sender:
                             t_phase = time.perf_counter()
@@ -2178,6 +2187,30 @@ class WeightSyncHandler:
     # EP MoE data collection (all ranks, during unshard)
     # ========================================================================
 
+    @staticmethod
+    def _split_ep_moe_contexts_for_sync(
+        contexts: List[Dict[str, Any]],
+        mod_name: str,
+    ) -> Tuple[set, List[Dict[str, Any]]]:
+        """Return dense-extractor skip prefixes and transferable EP contexts."""
+
+        prefixes = set()
+        transferable = []
+        for ctx in contexts:
+            prefix = ctx["prefix"]
+            if mod_name != "(root)":
+                if prefix == mod_name:
+                    prefixes.add("")
+                elif prefix.startswith(mod_name + "."):
+                    prefixes.add(prefix[len(mod_name) + 1 :])
+            else:
+                prefixes.add(prefix)
+
+            if ctx.get("type") != "frozen_active_lora_base":
+                transferable.append(ctx)
+
+        return prefixes, transferable
+
     def _collect_ep_moe_data(
         self,
         fsdp_mod,
@@ -2218,6 +2251,39 @@ class WeightSyncHandler:
             if not isinstance(mod, (MoEExperts, MoEExpertsLoRA)):
                 continue
 
+            if mname:
+                full_prefix = f"{mod_name}.{mname}" if mod_name != "(root)" else mname
+            else:
+                full_prefix = mod_name
+
+            if isinstance(mod, MoEExpertsLoRA):
+                lora_serving_mode = getattr(mod, "lora_serving_mode", None)
+                if lora_serving_mode == "separate":
+                    # The active-LoRA sampler starts from the same immutable base
+                    # checkpoint as the trainer.  Routed-expert base parameters are
+                    # frozen by LoRA training, so publishing them is redundant.  It
+                    # is also invalid after SGLang wraps FusedMoE for active LoRA:
+                    # the base parameters then live below ``experts.base_layer``
+                    # while the generic Qwen online loader targets
+                    # ``experts.w13_weight`` / ``experts.w2_weight``.
+                    #
+                    # Keep a skip-only context so the ordinary dense extractor
+                    # also omits these parameters.  This context is removed
+                    # before the EP transfer loop by
+                    # _split_ep_moe_contexts_for_sync.
+                    contexts.append(
+                        {
+                            "type": "frozen_active_lora_base",
+                            "prefix": full_prefix,
+                            "local_experts": None,
+                        }
+                    )
+                    continue
+                if lora_serving_mode != "merged":
+                    raise ValueError(
+                        f"Unknown LoRA serving mode {lora_serving_mode!r} while collecting {mod_name}.{mname}"
+                    )
+
             # Get expert params — after unshard they may be plain tensors or DTensors
             gate_up = getattr(mod, "gate_up_proj", None)
             if isinstance(gate_up, torch.nn.Parameter):
@@ -2233,11 +2299,6 @@ class WeightSyncHandler:
             # Accessing ``gate_proj`` on such a module raises AttributeError.
             gated = getattr(mod, "gated", True)
             proj_names = ("gate_proj", "up_proj", "down_proj") if gated else ("up_proj", "down_proj")
-
-            if mname:
-                full_prefix = f"{mod_name}.{mname}" if mod_name != "(root)" else mname
-            else:
-                full_prefix = mod_name
 
             if not collect_tensors:
                 contexts.append(

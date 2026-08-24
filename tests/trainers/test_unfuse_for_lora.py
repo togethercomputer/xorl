@@ -248,6 +248,7 @@ class TestTrainerOrdering:
                 enable_lora=True,
                 enable_qlora=False,
                 unfuse_for_lora=True,
+                lora_serving_mode=None,
                 lora_rank=2,
                 lora_alpha=2,
             ),

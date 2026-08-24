@@ -84,7 +84,12 @@ The default install already includes `xorl-client` from its public repository. T
 pip install -e submodules/xorl-client
 ```
 
-The default profile is a single combined environment: `pyproject.toml` pins the PyTorch 2.11/CUDA 13 stack (Triton 3.6.0, FlashAttention 4) that the checked-in xorl-sglang revision — including its compiled `sglang-kernel` extension — is built against, so XoRL, xorl-client, and xorl-sglang all install into the one `uv sync` environment. The xorl-sglang submodule must be checked out for the install to resolve.
+The default profile is a single combined environment: `pyproject.toml` pins
+PyTorch 2.12.1+cu132, Triton 3.7.1, FlashAttention 4, and the matching DeepEP
+and `sglang-kernel` release wheels used by the checked-in xorl-sglang revision.
+XoRL, xorl-client, and xorl-sglang therefore install into one `uv sync`
+environment. The xorl-sglang submodule must be checked out for the install to
+resolve.
 
 See the [installation guide](https://togethercomputer.github.io/xorl/getting-started/installation/) for full setup including optional dependencies (DeepEP, Flash Attention).
 

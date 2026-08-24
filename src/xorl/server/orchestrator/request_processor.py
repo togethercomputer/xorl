@@ -931,9 +931,9 @@ class RequestProcessor:
                     }
                 )
 
-            # Add loss-specific metrics (IS/KL divergence, OPD KL stats, ratio stats, etc.)
+            # Add loss-specific and exact-gradient qualification metrics.
             for key in result:
-                if key.startswith(("is_", "opd_")):
+                if key.startswith(("is_", "opd_", "router_grad_", "router_update_", "dsv4_")):
                     output_dict[key] = result[key]
                 elif key.startswith(FORWARD_BACKWARD_RESULT_PREFIXES):
                     output_dict[key] = result[key]
@@ -962,7 +962,11 @@ class RequestProcessor:
 
             # Unpack per-token outputs if present (tinker API compatibility)
             if "packed_logprobs" in result and "packed_position_ids" in result:
-                output_dict["per_sample_outputs"] = self._unpack_per_sample_outputs(result, batches)
+                packed_outputs = self._unpack_per_sample_outputs(result, batches)
+                output_dict["per_sample_outputs"] = self._restore_datum_order(
+                    packed_outputs,
+                    datum_order,
+                )
 
             output = OrchestratorOutputs(
                 request_id=request.request_id,
@@ -1048,6 +1052,22 @@ class RequestProcessor:
                     teacher_ids = teacher_ids[0]
                 teacher_id = teacher_ids[0]
         return int(teacher_id) if teacher_id is not None else 0
+
+    @staticmethod
+    def _restore_datum_order(outputs: list, datum_order: list[int]) -> list:
+        """Restore packer-ordered per-sample outputs to surviving input order."""
+
+        if len(outputs) != len(datum_order):
+            raise RuntimeError(
+                "Per-sample output count does not match the packer datum order: "
+                f"outputs={len(outputs)}, datum_order={len(datum_order)}"
+            )
+        if len(set(datum_order)) != len(datum_order):
+            raise RuntimeError(f"Packer datum order contains duplicate input indices: {datum_order}")
+        if any(not isinstance(index, int) or index < 0 for index in datum_order):
+            raise RuntimeError(f"Packer datum order contains invalid input indices: {datum_order}")
+
+        return [output for _, output in sorted(zip(datum_order, outputs, strict=True))]
 
     @staticmethod
     def _unpack_per_sample_outputs(result: Dict, batches: list) -> list:
@@ -1228,6 +1248,9 @@ class RequestProcessor:
             for key in ("optim_step_time", "optim_empty_cache_skipped", "glm52_fullparam_publish"):
                 if key in result:
                     output_dict[key] = result[key]
+            for key, value in result.items():
+                if key.startswith("router_update_"):
+                    output_dict[key] = value
             if result.get("auto_loaded"):
                 output_dict["auto_loaded"] = True
                 output_dict["auto_load_path"] = result.get("auto_load_path")

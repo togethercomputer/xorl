@@ -44,6 +44,13 @@ def _sglang_compatible_beta_gate(b_input: torch.Tensor) -> torch.Tensor:
 
 
 class GatedDeltaNet(nn.Module):
+    # SGLang evaluates the decay/time-step terms from FP32 parameter leaves,
+    # while every projection in this module remains a BF16 compute parameter.
+    # FSDP2 requires one original dtype per trainable parameter group, so the
+    # parallelizer uses this declaration to give the direct parameters their
+    # own tiny full-precision FSDP unit without changing checkpoint FQNs.
+    fsdp_full_precision_parameter_names = ("A_log", "dt_bias")
+
     def __init__(
         self,
         hidden_size: int = 2048,

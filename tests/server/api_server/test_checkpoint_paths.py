@@ -362,17 +362,16 @@ class TestSamplerWeightsAndAdapterTracking:
         assert self.server.loaded_sampling_loras == {}
 
         self._assert_sampling_adapter_reconciliation_and_session_tracking_policy()
-        self._assert_save_weights_for_sampler_uses_normalized_lora_session_spec()
+        self._assert_save_weights_for_sampler_respects_lora_serving_mode()
 
-    def _assert_save_weights_for_sampler_uses_normalized_lora_session_spec(self):
-        """Normalized session specs should still export adapter-only sampler weights."""
+    def _assert_save_weights_for_sampler_respects_lora_serving_mode(self):
+        """Sampler publication must use the explicitly selected LoRA contract."""
         self.server._running = True
         self.server.orchestrator_client = MagicMock()
         self.server.orchestrator_client.send_request = AsyncMock(return_value=AsyncMock())
-        self.server.model_configs["adapter-run"] = {
+        common_config = {
             "base_model": "Qwen/Qwen3-8B",
             "is_lora": True,
-            "lora_config": {"lora_rank": 8, "lora_alpha": 16},
             "optimizer_config": {
                 "type": "signsgd",
                 "learning_rate": 2e-4,
@@ -381,6 +380,14 @@ class TestSamplerWeightsAndAdapterTracking:
                 "betas": None,
                 "eps": None,
                 "optimizer_kwargs": {},
+            },
+        }
+        self.server.model_configs["adapter-run"] = {
+            **common_config,
+            "lora_config": {
+                "lora_rank": 8,
+                "lora_alpha": 16,
+                "lora_serving_mode": "separate",
             },
         }
 
@@ -398,6 +405,24 @@ class TestSamplerWeightsAndAdapterTracking:
         assert request.operation == "save_lora_only"
         assert request.payload.lora_path.endswith("sampler_weights/adapter-export")
         assert response.path == "xorl://adapter-run/sampler_weights/adapter-export"
+
+        self.server.orchestrator_client.send_request.reset_mock()
+        self.server.model_configs["merged-run"] = {
+            **common_config,
+            "lora_config": {
+                "lora_rank": 8,
+                "lora_alpha": 16,
+                "lora_serving_mode": "merged",
+            },
+        }
+        with pytest.raises(HTTPException, match="does not materialize a folded") as exc_info:
+            asyncio.run(
+                self.server.save_weights_for_sampler(
+                    SaveWeightsForSamplerRequest(model_id="merged-run", name="merged-export")
+                )
+            )
+        assert exc_info.value.status_code == 500
+        self.server.orchestrator_client.send_request.assert_not_awaited()
 
     def _assert_sampling_adapter_reconciliation_and_session_tracking_policy(self):
         """Stale tracked adapters should not force a bogus unload before loading a fresh adapter."""

@@ -51,6 +51,13 @@ class MultiHeadAttention(nn.Module):
     # Overridable hooks
     # ------------------------------------------------------------------ #
 
+    def _capture_diagnostic_component(self, name: str, value: torch.Tensor) -> None:
+        """Expose exact-attention operands to the runner's cold diagnostic path."""
+
+        capture = self.__dict__.get("_diagnostic_capture_component")
+        if callable(capture):
+            capture(name, value)
+
     def _init_sliding_window(self, config):
         """Override in subclasses for model-specific sliding window logic."""
         return getattr(config, "sliding_window", None)
@@ -80,6 +87,7 @@ class MultiHeadAttention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
+        self._capture_diagnostic_component("attention_input", hidden_states)
         if hasattr(self, "qkv_proj"):
             qkv = project_fused_linear_with_lora(
                 self,
@@ -88,6 +96,7 @@ class MultiHeadAttention(nn.Module):
                 projection_names=("q_proj", "k_proj", "v_proj"),
                 projection_sizes=(self.q_dim, self.kv_dim, self.kv_dim),
             )
+            self._capture_diagnostic_component("qkv", qkv)
             q, k, v = qkv.split([self.q_dim, self.kv_dim, self.kv_dim], dim=-1)
         else:
             q = self.q_proj(hidden_states)
@@ -95,12 +104,19 @@ class MultiHeadAttention(nn.Module):
             v = self.v_proj(hidden_states)
         q = q.view(hidden_shape)
         k = k.view(hidden_shape)
+        self._capture_diagnostic_component("q_pre_qk_norm", q)
+        self._capture_diagnostic_component("k_pre_qk_norm", k)
         if self._use_qk_norm:
             q = self.q_norm(q)
             k = self.k_norm(k)
+        self._capture_diagnostic_component("q_post_qk_norm", q)
+        self._capture_diagnostic_component("k_post_qk_norm", k)
         v = v.view(hidden_shape)
+        self._capture_diagnostic_component("v", v)
 
         cos, sin = position_embeddings
+        self._capture_diagnostic_component("rope_cos", cos)
+        self._capture_diagnostic_component("rope_sin", sin)
         q, k = apply_rotary_pos_emb(
             q,
             k,
@@ -114,6 +130,8 @@ class MultiHeadAttention(nn.Module):
             q = q.to(torch.bfloat16)
             k = k.to(torch.bfloat16)
 
+        self._capture_diagnostic_component("q", q)
+        self._capture_diagnostic_component("k", k)
         return q, k, v
 
     def _project_output(self, attn_output: torch.Tensor) -> torch.Tensor:
@@ -121,8 +139,11 @@ class MultiHeadAttention(nn.Module):
 
         Override for different attention variants (e.g. Multi-head Latent Attention).
         """
+        self._capture_diagnostic_component("attn_output", attn_output)
         attn_output = attn_output.reshape(*attn_output.shape[:-2], -1).contiguous()
-        return self.o_proj(attn_output)
+        output = self.o_proj(attn_output)
+        self._capture_diagnostic_component("o_proj_output", output)
+        return output
 
     def _append_past_key_values(
         self,

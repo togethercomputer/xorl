@@ -128,6 +128,27 @@ def test_physical_pp_dispatcher_fails_when_schedule_skips_or_mixes_ids():
     assert not dispatcher.active
 
 
+def test_physical_pp_terminal_objective_rejects_storage_row_mismatch(monkeypatch):
+    monkeypatch.setattr(
+        model_runner_module,
+        "get_parallel_state",
+        lambda: SimpleNamespace(tp_enabled=False, cp_enabled=False, lm_head_tp_group=None),
+    )
+    runner = _runner()
+    micro_batch = _micro_batch()
+    micro_batch["target_tokens"] = micro_batch["target_tokens"][:, :2]
+    metadata = model_runner_module._PhysicalPPMicrobatchObjective(
+        microbatch_id=0,
+        micro_batch=micro_batch,
+        loss_fn="drgrpo",
+        loss_fn_params={},
+        model_id="policy-a",
+    )
+
+    with pytest.raises(ValueError, match=r"target_tokens.*\(1, 2\).*terminal hidden.*\(1, 4\)"):
+        runner._compute_pp_terminal_objective(torch.randn(1, 4, 8), metadata)
+
+
 def test_physical_pp_rejects_only_intermediate_capture_objectives():
     ModelRunner._validate_physical_pp_objective("opd_loss", {})
     with pytest.raises(NotImplementedError, match="OPRD/intermediate-layer"):

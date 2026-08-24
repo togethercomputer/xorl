@@ -61,6 +61,7 @@ from xorl.distributed.pipeline_parallel import (
     stage_ids_for_rank,
 )
 from xorl.distributed.sequence_parallel.data import gather_outputs
+from xorl.distributed.torch_parallelize import refresh_ep_param_groups
 from xorl.lora import LoraLinear
 from xorl.lora.expert_adapter_contract import (
     ExpertAdapterFactorOwnership,
@@ -69,9 +70,13 @@ from xorl.lora.expert_adapter_contract import (
 )
 from xorl.lora.fold import invalidate_lora_merged_weight_caches, lora_merged_forward_enabled
 from xorl.models import resolve_cross_entropy_mode
+from xorl.models.exact_contract import glm52_exact_active_lora_enabled
 from xorl.models.layers.moe.routing_replay import set_replay_stage
 from xorl.models.transformers.deepseek_v3.support import deepseek_v3_default_lora_targets
-from xorl.models.transformers.deepseek_v4.exact_contract import DSV4_FLASH_REQUIRED_TARGET_MODULES
+from xorl.models.transformers.deepseek_v4.exact_contract import (
+    DSV4_FLASH_LOGICAL_FACTOR_COUNT,
+    DSV4_FLASH_REQUIRED_TARGET_MODULES,
+)
 from xorl.models.transformers.glm5.index_share import IndexShareMode
 from xorl.models.transformers.glm5.support import glm5_default_lora_targets
 from xorl.ops.batch_invariant_ops import enable_batch_invariant_mode, get_batch_invariant_ops
@@ -697,6 +702,11 @@ class ModelRunner:
         self._initialize_checkpointer()
         self._checkpoint_mgr = self._build_checkpoint_manager()
         self._restore_initial_base_checkpoint()
+        self._glm52_exact_router_single_tenant = bool(
+            self.lora_config.get("enable_lora", False)
+            and bool(getattr(self.model.config, "train_router", False))
+            and glm52_exact_active_lora_enabled(self.model.config)
+        )
         if enable_full_determinism:
             # Enabling deterministic algorithms before Kimi DCP/meta materialization
             # makes startup pathologically slow; training and adapter init happen below.
@@ -730,7 +740,24 @@ class ModelRunner:
                 lora_config=self.lora_config,
             )
             self._initialize_default_lora_adapter()
-            logger.info("Multi-adapter manager initialized with default adapter")
+            if self._glm52_exact_router_single_tenant:
+                # The manager is used once to materialize the deterministic
+                # default adapter into the post-DCP model.  Router weights are
+                # shared base parameters, so retaining per-adapter optimizer
+                # state would update LoRA factors while silently omitting the
+                # routers.  From this point the ordinary shared optimizer owns
+                # both sets of model Parameters as one single-tenant unit.
+                # Adapter registration owns compact slot tensors; copy the
+                # deterministic default state into the live model before the
+                # manager is detached.  DCP ``to_empty`` may also have replaced
+                # every Parameter object, so both the EP groups and optimizer
+                # constructed before restore must be rebound to current model
+                # identities.  The pre-restore optimizer has never stepped and
+                # the admitted base checkpoint intentionally has no optimizer
+                # payload, so discarding it here loses no state.
+                self._promote_exact_glm52_default_adapter_to_shared_optimizer()
+            else:
+                logger.info("Multi-adapter manager initialized with default adapter")
 
         # Initialize tokenizer for sampling (only on rank 0)
         if self.rank == 0:
@@ -808,6 +835,17 @@ class ModelRunner:
         initialize_fresh: bool = True,
     ) -> Dict[str, Any]:
         """Register a normalized session runtime spec on this worker."""
+        if getattr(self, "_glm52_exact_router_single_tenant", False) and self._adapter_manager is None:
+            self._validate_single_tenant(model_id)
+            if model_id != "default":
+                raise ValueError("Exact GLM-5.2 train_router QLoRA is single-tenant and admits only model_id='default'")
+            return {
+                "model_id": model_id,
+                "registered": True,
+                "materialized": True,
+                "message": "Exact GLM-5.2 router and adapter factors use the shared single-tenant optimizer.",
+            }
+
         if not self.lora_enabled:
             # Full-weight mode remains effectively single-tenant; keep the API
             # tolerant of create_model but don't install heterogeneous runtime state.
@@ -868,6 +906,25 @@ class ModelRunner:
         )
         self._adapter_manager.current_adapter_id = "default"
         self._checkpoint_mgr._adapter_manager = self._adapter_manager
+
+    def _promote_exact_glm52_default_adapter_to_shared_optimizer(self) -> None:
+        """Bind current post-DCP model parameters to the exact single-tenant optimizer."""
+
+        if self._adapter_manager is None or not self._adapter_manager.has_adapter("default"):
+            raise RuntimeError("Exact GLM-5.2 shared optimizer requires a materialized default adapter")
+        self._adapter_manager.prepare_forward("default")
+        if get_parallel_state().ep_enabled:
+            refresh_ep_param_groups(self.model)
+        self._initialize_optimizer()
+        self._checkpoint_mgr.optimizer = self.optimizer
+        self._checkpoint_mgr._detached_adapter_publisher = self._adapter_manager.make_live_model_lora_publisher()
+        self._adapter_manager = None
+        self._checkpoint_mgr._adapter_manager = None
+        self._active_session_id = "default"
+        logger.info(
+            "Exact GLM-5.2 train_router lane selected single-tenant shared optimizer "
+            "after deterministic default-adapter materialization and post-DCP parameter rebinding"
+        )
 
     @staticmethod
     def _adapter_gradient_hash(payload: Any) -> str:
@@ -1373,7 +1430,7 @@ class ModelRunner:
         Raises:
             ValueError: If a different session is already active.
         """
-        if self.lora_enabled:
+        if self.lora_enabled and not getattr(self, "_glm52_exact_router_single_tenant", False):
             return  # Multi-tenant allowed for LoRA mode
 
         if self._active_session_id is None:
@@ -1381,7 +1438,7 @@ class ModelRunner:
             logger.info(f"Full-weights session started: {model_id}")
         elif self._active_session_id != model_id:
             raise ValueError(
-                f"Full-weights mode is single-tenant. Active session: {self._active_session_id}, "
+                f"Shared-optimizer mode is single-tenant. Active session: {self._active_session_id}, "
                 f"requested: {model_id}. Call /api/v1/kill_session first to start a new session."
             )
 
@@ -1575,10 +1632,12 @@ class ModelRunner:
             deepep_buffer_size_gb=self.model_config.get("deepep_buffer_size_gb", 2.0),
             deepep_num_sms=self.model_config.get("deepep_num_sms", 20),
             deepep_async_combine=self.model_config.get("deepep_async_combine", False),
+            deepep_native_exact=self.model_config.get("deepep_native_exact", False),
             alltoall_combine_hidden_chunk_size=self.model_config.get("alltoall_combine_hidden_chunk_size", 0),
             init_device=self.train_config.get("init_device", "cpu"),
             merge_qkv=self.model_config.get("merge_qkv", True),
             enable_lora=lora_enabled,
+            lora_serving_mode=self.lora_config.get("lora_serving_mode"),
             lora_rank=self.lora_config.get("max_lora_rank", self.lora_config.get("lora_rank", 32)),
             lora_alpha=self.lora_config.get("lora_alpha", 16),
             lora_b_init_std=self.lora_config.get("lora_b_init_std", 0.0),
@@ -1984,6 +2043,7 @@ class ModelRunner:
             rank=self.rank,
             local_rank=self.local_rank,
             adapter_manager=adapter_manager,
+            model_parts=self.model_parts if self.pp_enabled else None,
         )
 
     def _load_initial_checkpoint(self) -> None:
@@ -2575,12 +2635,18 @@ class ModelRunner:
             "moe_native_gathered_routing": 81,
             "moe_native_gathered_ids": 82,
             "moe_native_local_ids": 83,
+            "moe_native_recv_hidden": 80,
+            "moe_native_recv_weights": 81,
+            "moe_native_recv_local_ids": 82,
+            "moe_native_expert_start": 83,
+            "moe_native_recv_leaf": 84,
             "moe_native_routed": 84,
             "moe_native_shared_gate_value": 85,
             "moe_native_shared_gate_up": 86,
             "moe_native_shared_act": 87,
             "moe_native_shared_down": 88,
             "moe_native_local_partial": 89,
+            "moe_native_shared_folded": 89,
             "moe_native_combined": 90,
             "gdn_q_input": 60,
             "gdn_k_input": 61,
@@ -2625,7 +2691,18 @@ class ModelRunner:
                         "capture_index": len(captures),
                         "layer": layer_idx,
                         "name": name,
-                        "order": component_order[name],
+                        "order": (
+                            83
+                            if name.startswith(
+                                (
+                                    "moe_native_gate_up_packed_local_",
+                                    "moe_native_gate_up_scale_local_",
+                                    "moe_native_down_packed_local_",
+                                    "moe_native_down_scale_local_",
+                                )
+                            )
+                            else component_order[name]
+                        ),
                         "tensor": snapshot,
                     }
                 )
@@ -3193,7 +3270,15 @@ class ModelRunner:
                     for _ in range(valid_indices.shape[0])
                 ]
                 for layer_index, layer_hidden in enumerate(all_hidden_states):
-                    layer_flat = layer_hidden.reshape(-1, layer_hidden.shape[-1])
+                    if layer_hidden.numel() % labels_flat.numel() != 0:
+                        raise ValueError(
+                            "diagnostic hidden-state rows do not align with labels: "
+                            f"hidden={tuple(layer_hidden.shape)} labels={tuple(labels.shape)}"
+                        )
+                    # DSV4's residual stream is [B, S, hc_mult, H] between
+                    # decoder layers. Treat hc_mult*H as one feature vector so
+                    # each label position still maps to exactly one hidden row.
+                    layer_flat = layer_hidden.reshape(labels_flat.numel(), -1)
                     rows = layer_flat[valid_indices].float()
                     row_mean = rows.mean(dim=-1)
                     row_std = rows.std(dim=-1, unbiased=False)
@@ -3275,6 +3360,71 @@ class ModelRunner:
                 diagnostics["hidden_component_summaries"] = per_token_component_summaries
 
         return diagnostics
+
+    @staticmethod
+    def _compute_hidden_state_diagnostics(
+        *,
+        all_hidden_states: tuple[torch.Tensor, ...],
+        labels: torch.Tensor,
+        hidden_sample_count: int = 8,
+        hidden_sample_indices: Any = None,
+    ) -> dict[str, Any]:
+        """Summarize hidden rows without requiring a materialized global lm head."""
+
+        labels_flat = labels.reshape(-1)
+        valid_indices = (labels_flat != IGNORE_INDEX).nonzero(as_tuple=True)[0]
+        if valid_indices.numel() == 0:
+            return {"valid_positions": [], "hidden_state_summaries": []}
+        if not all_hidden_states:
+            raise ValueError("hidden-state diagnostics require at least one hidden-state tensor")
+        sample_indices = ModelRunner._build_diagnostic_sample_indices(
+            hidden_dim=all_hidden_states[-1].shape[-1],
+            hidden_sample_count=hidden_sample_count,
+            hidden_sample_indices=hidden_sample_indices,
+            device=all_hidden_states[-1].device,
+        )
+        per_token_summaries = [
+            {
+                "layer_count": len(all_hidden_states),
+                "sample_indices": sample_indices.cpu().tolist(),
+                "layers": [],
+            }
+            for _ in range(valid_indices.shape[0])
+        ]
+        for layer_index, layer_hidden in enumerate(all_hidden_states):
+            if layer_hidden.numel() % labels_flat.numel() != 0:
+                raise ValueError(
+                    "diagnostic hidden-state rows do not align with labels: "
+                    f"hidden={tuple(layer_hidden.shape)} labels={tuple(labels.shape)}"
+                )
+            layer_flat = layer_hidden.reshape(labels_flat.numel(), -1)
+            rows = layer_flat[valid_indices].float()
+            row_mean = rows.mean(dim=-1)
+            row_std = rows.std(dim=-1, unbiased=False)
+            row_rms = torch.sqrt(torch.mean(rows * rows, dim=-1))
+            row_max_abs = rows.abs().amax(dim=-1)
+            row_min = rows.amin(dim=-1)
+            row_max = rows.amax(dim=-1)
+            sampled_values = (
+                rows[:, sample_indices] if sample_indices.numel() > 0 else rows.new_empty((rows.shape[0], 0))
+            )
+            for token_index, summary in enumerate(per_token_summaries):
+                summary["layers"].append(
+                    {
+                        "index": layer_index,
+                        "mean": float(row_mean[token_index].item()),
+                        "std": float(row_std[token_index].item()),
+                        "rms": float(row_rms[token_index].item()),
+                        "max_abs": float(row_max_abs[token_index].item()),
+                        "min": float(row_min[token_index].item()),
+                        "max": float(row_max[token_index].item()),
+                        "sample_values": sampled_values[token_index].cpu().tolist(),
+                    }
+                )
+        return {
+            "valid_positions": valid_indices.cpu().tolist(),
+            "hidden_state_summaries": per_token_summaries,
+        }
 
     @staticmethod
     def _teacher_cache_dtype(dtype_name: str) -> torch.dtype:
@@ -6033,7 +6183,7 @@ class ModelRunner:
                             layer_hidden.new_zeros(
                                 input_ids.shape[0],
                                 input_ids.shape[1],
-                                layer_hidden.shape[-1],
+                                *layer_hidden.shape[2:],
                             )
                             for layer_hidden in segment_hidden_states
                         ]
@@ -6043,7 +6193,7 @@ class ModelRunner:
                             f"{len(segment_hidden_states)} != {len(all_hidden_states)}"
                         )
                     for layer_index, layer_hidden in enumerate(segment_hidden_states):
-                        all_hidden_states[layer_index][:, start:end, :] = layer_hidden
+                        all_hidden_states[layer_index][:, start:end, ...] = layer_hidden
         finally:
             self._clear_diagnostic_decode_cache(self.model)
             if was_training:
@@ -6084,7 +6234,17 @@ class ModelRunner:
                 "diagnostic_decode_cache diagnostic_topk requires return_per_token=True; skipping token diagnostics"
             )
         elif diagnostic_topk > 0 and loss_tp_group is not None:
-            logger.warning("diagnostic_decode_cache diagnostic_topk is not supported with vocab-parallel lm_head")
+            logger.warning(
+                "diagnostic_decode_cache top-k logits are unavailable with vocab-parallel lm_head; "
+                "emitting hidden-state summaries only"
+            )
+            if diagnostic_hidden_states:
+                per_token_outputs["token_diagnostics"] = self._compute_hidden_state_diagnostics(
+                    all_hidden_states=(tuple(all_hidden_states) if all_hidden_states is not None else (hidden_states,)),
+                    labels=labels,
+                    hidden_sample_count=diagnostic_hidden_sample_count,
+                    hidden_sample_indices=diagnostic_hidden_sample_indices,
+                )
         elif diagnostic_topk > 0:
             token_diagnostics = self._compute_token_diagnostics(
                 hidden_states=hidden_states,
@@ -6204,6 +6364,12 @@ class ModelRunner:
                 reference_path=diagnostic_moe_routing_reference_path,
                 layer_indices=diagnostic_moe_routing_reference_layers,
                 force_weights=diagnostic_moe_routing_reference_weights,
+            )
+
+        if "exact_value_logprobs" in micro_batch:
+            raise ValueError(
+                "exact_value_logprobs is not a valid training input: exact policy values must be "
+                "independently recomputed by the differentiated trainer program"
             )
 
         if bool(params.get("diagnostic_decode_cache", False)):
@@ -6364,7 +6530,21 @@ class ModelRunner:
                     "diagnostic_topk requires return_per_token=True for per-sample unpacking; skipping diagnostics"
                 )
             elif diagnostic_topk > 0 and loss_tp_group is not None:
-                logger.warning("diagnostic_topk is not supported with vocab-parallel lm_head; skipping diagnostics")
+                logger.warning(
+                    "diagnostic top-k logits are unavailable with vocab-parallel lm_head; "
+                    "emitting hidden-state summaries only"
+                )
+                if diagnostic_hidden_states:
+                    per_token_outputs["token_diagnostics"] = self._compute_hidden_state_diagnostics(
+                        all_hidden_states=(
+                            tuple(diagnostic_all_hidden_states)
+                            if diagnostic_all_hidden_states is not None
+                            else (hidden_states,)
+                        ),
+                        labels=labels,
+                        hidden_sample_count=diagnostic_hidden_sample_count,
+                        hidden_sample_indices=diagnostic_hidden_sample_indices,
+                    )
             elif diagnostic_topk > 0:
                 token_diagnostics = self._compute_token_diagnostics(
                     hidden_states=hidden_states,
@@ -6495,7 +6675,6 @@ class ModelRunner:
                 per_token_outputs["loss"] = _result.per_token_loss
             is_metrics = dict(_result.metrics or {})
             is_metrics.setdefault("valid_tokens", int((target_tokens != IGNORE_INDEX).sum().item()))
-
         elif loss_fn == "policy_loss":
             target_tokens = micro_batch.get("target_tokens", micro_batch.get("labels"))
             old_logprobs = micro_batch["logprobs"]
@@ -7388,6 +7567,27 @@ class ModelRunner:
             key: value.to(terminal_hidden.device, non_blocking=True) if isinstance(value, torch.Tensor) else value
             for key, value in metadata.micro_batch.items()
         }
+        terminal_token_shape = terminal_hidden.shape[:-1]
+        for key in (
+            "labels",
+            "target_tokens",
+            "logprobs",
+            "old_logprobs",
+            "ref_logprobs",
+            "rollout_logprobs",
+            "advantages",
+            "weights",
+            "logprob_temperatures",
+            "logprob_top_ks",
+            "logprob_top_ps",
+            "logprob_min_ps",
+        ):
+            value = micro_batch.get(key)
+            if isinstance(value, torch.Tensor) and value.shape != terminal_token_shape:
+                raise ValueError(
+                    f"Physical PP terminal field {key!r} has shape {tuple(value.shape)}, "
+                    f"but terminal hidden rows have shape {tuple(terminal_token_shape)}"
+                )
         last_part = self._pp_last_stage_part()
         if last_part is None or getattr(last_part, "lm_head", None) is None:
             raise RuntimeError("Physical PP terminal objective requires the local terminal lm_head")
@@ -8190,6 +8390,8 @@ class ModelRunner:
         """
         self._check_not_sleeping("forward_backward")
         params = loss_fn_params or {}
+        if bool(getattr(self.model.config, "train_router", False)):
+            self._reset_glm52_router_gradient_evidence()
 
         # Defragment GPU memory at the top of every forward_backward call by default.
         # After weight-sync + optim_step from the previous step the CUDA
@@ -8485,6 +8687,12 @@ class ModelRunner:
                 stage="after_efsdp_reduce_scatter",
             )
 
+        if bool(getattr(self.model.config, "_dsv4_flash_exact_active_lora", False)):
+            result.update(self._collect_dsv4_adapter_gradient_metrics(model_id))
+
+        if bool(getattr(self.model.config, "train_router", False)):
+            result.update(self._collect_glm52_router_gradient_metrics())
+
         # Get step counter (use adapter manager if available, else global)
         if self._adapter_manager is not None:
             current_step = self._adapter_manager.get_adapter_state(model_id).global_forward_backward_step
@@ -8548,6 +8756,293 @@ class ModelRunner:
         )
 
         return result
+
+    def _collect_dsv4_adapter_gradient_metrics(self, model_id: str) -> Dict[str, Any]:
+        """Inspect the authoritative DSV4 adapter numerators before commit.
+
+        Multi-adapter LoRA does not optimize ``Parameter.grad`` directly.  The
+        adapter ownership finalizer first validates and packs each local shard
+        into staged FP32 numerator tensors; those are the values consumed by
+        ``LoRAAdapterManager.optim_step`` after the distributed completion
+        rendezvous.  Qualification must therefore measure this staged image,
+        while separately proving that every DSV4 router remains frozen and has
+        no gradient.
+        """
+
+        if self._adapter_manager is None:
+            raise RuntimeError("Exact DSV4 active-LoRA gradient evidence requires the adapter manager")
+        state = self._adapter_manager.get_adapter_state(model_id)
+        plan = state.gradient_ownership_plan
+        scratch = state.gradient_scratch
+        if plan is None or not scratch.capture_open or not scratch.capture_staged:
+            raise RuntimeError("Exact DSV4 gradient evidence requires a fully staged adapter capture")
+
+        planned_names = tuple(item.fqn for item in plan.parameters)
+        non_lora_planned = [name for name in planned_names if "lora_A" not in name and "lora_B" not in name]
+        if len(planned_names) != DSV4_FLASH_LOGICAL_FACTOR_COUNT or non_lora_planned:
+            raise RuntimeError(
+                "Exact DSV4 optimizer ownership must contain exactly the complete "
+                f"{DSV4_FLASH_LOGICAL_FACTOR_COUNT}-factor LoRA inventory; "
+                f"actual={len(planned_names)} non_lora={non_lora_planned[:8]}"
+            )
+        staged_names = set(scratch.staged_parameter_fqns)
+        if staged_names != set(scratch.staged_numerators):
+            raise RuntimeError("Exact DSV4 staged gradient names and numerator tensors disagree")
+        if staged_names - set(planned_names):
+            raise RuntimeError("Exact DSV4 staged gradients contain parameters outside the ownership plan")
+
+        local_sum_sq = 0.0
+        local_elements = local_nonzero = local_nonfinite = 0
+        metric_device: torch.device | None = None
+        for numerator in scratch.staged_numerators.values():
+            values = numerator.detach().float()
+            metric_device = values.device
+            local_elements += values.numel()
+            finite = torch.isfinite(values)
+            local_nonfinite += int((~finite).sum().item())
+            finite_values = values[finite]
+            local_nonzero += int(torch.count_nonzero(finite_values).item())
+            local_sum_sq += float(torch.sum(finite_values * finite_values, dtype=torch.float64).item())
+
+        router_count = router_requires_grad = router_grad_present = 0
+        router_grad_nonzero = router_grad_nonfinite = 0
+        trainable_non_lora = 0
+        seen_parameters: set[int] = set()
+        model_parts = self.model_parts if self.pp_enabled else [self.model]
+        for part in model_parts:
+            for name, parameter in part.named_parameters():
+                if id(parameter) in seen_parameters:
+                    continue
+                seen_parameters.add(id(parameter))
+                is_lora = "lora_A" in name or "lora_B" in name
+                if parameter.requires_grad and not is_lora:
+                    trainable_non_lora += 1
+                if not name.endswith("mlp.gate.weight"):
+                    continue
+                router_count += 1
+                router_requires_grad += int(parameter.requires_grad)
+                gradient = parameter.grad
+                if gradient is None:
+                    continue
+                router_grad_present += 1
+                to_local = getattr(gradient, "to_local", None)
+                if callable(to_local):
+                    gradient = to_local()
+                wait = getattr(gradient, "wait", None)
+                if callable(wait):
+                    gradient = wait()
+                values = gradient.detach().float()
+                metric_device = metric_device or values.device
+                finite = torch.isfinite(values)
+                router_grad_nonfinite += int((~finite).sum().item())
+                router_grad_nonzero += int(torch.count_nonzero(values[finite]).item())
+
+        device = metric_device or torch.device(get_device_type())
+        summed = torch.tensor(
+            [
+                local_sum_sq,
+                local_elements,
+                local_nonzero,
+                local_nonfinite,
+                len(staged_names),
+                trainable_non_lora,
+                router_requires_grad,
+                router_grad_present,
+                router_grad_nonzero,
+                router_grad_nonfinite,
+            ],
+            dtype=torch.float64,
+            device=device,
+        )
+        extrema = torch.tensor(
+            [len(planned_names), len(staged_names), router_count],
+            dtype=torch.float64,
+            device=device,
+        )
+        minimum = extrema.clone()
+        maximum = extrema.clone()
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(summed, op=dist.ReduceOp.SUM)
+            dist.all_reduce(minimum, op=dist.ReduceOp.MIN)
+            dist.all_reduce(maximum, op=dist.ReduceOp.MAX)
+        (
+            sum_sq,
+            elements,
+            nonzero,
+            nonfinite,
+            staged_total,
+            trainable_non_lora_total,
+            router_requires_grad_total,
+            router_grad_present_total,
+            router_grad_nonzero_total,
+            router_grad_nonfinite_total,
+        ) = summed.cpu().tolist()
+        planned_min, staged_min, router_min = minimum.cpu().tolist()
+        planned_max, staged_max, router_max = maximum.cpu().tolist()
+        metrics = {
+            "dsv4_grad_norm": math.sqrt(sum_sq),
+            "dsv4_grad_element_count": int(elements),
+            "dsv4_grad_nonzero_count": int(nonzero),
+            "dsv4_grad_nonfinite_count": int(nonfinite),
+            "dsv4_grad_staged_factor_count_total": int(staged_total),
+            "dsv4_grad_planned_factor_count_min": int(planned_min),
+            "dsv4_grad_planned_factor_count_max": int(planned_max),
+            "dsv4_grad_staged_factor_count_min": int(staged_min),
+            "dsv4_grad_staged_factor_count_max": int(staged_max),
+            "dsv4_grad_trainable_non_lora_count": int(trainable_non_lora_total),
+            "dsv4_router_tensor_count_min": int(router_min),
+            "dsv4_router_tensor_count_max": int(router_max),
+            "dsv4_router_requires_grad_count": int(router_requires_grad_total),
+            "dsv4_router_grad_present_count": int(router_grad_present_total),
+            "dsv4_router_grad_nonzero_count": int(router_grad_nonzero_total),
+            "dsv4_router_grad_nonfinite_count": int(router_grad_nonfinite_total),
+        }
+        logger.info("DSV4 authoritative adapter gradient evidence: %s", metrics)
+        return metrics
+
+    def _collect_glm52_router_gradient_metrics(self) -> Dict[str, Any]:
+        """Return rank-aggregated evidence for exact GLM router gradients.
+
+        This intentionally observes the post-backward, post-eFSDP-reduction
+        gradient without mutating it.  The metrics make a cluster gate prove
+        that all 75 sparse-layer gates participated and that their gradients
+        are finite and nonzero; a global aggregate prevents rank-0-only false
+        confidence.
+        """
+
+        local_tensors = local_missing = local_nonfinite = 0
+        local_elements = local_nonzero = 0
+        local_sum_sq = 0.0
+        metric_device: torch.device | None = None
+        seen_parameters: set[int] = set()
+        for module in self.model.modules():
+            if type(module).__name__ != "Glm5TopkRouter":
+                continue
+            parameter = getattr(module, "weight", None)
+            if not isinstance(parameter, torch.Tensor) or id(parameter) in seen_parameters:
+                continue
+            seen_parameters.add(id(parameter))
+            local_tensors += 1
+            evidence = getattr(module, "_gradient_evidence", None)
+            if evidence is not None:
+                local_sum_sq += float(evidence["sum_sq"].item())
+                local_nonfinite += int(evidence["nonfinite"].item())
+                local_nonzero += int(evidence["nonzero"].item())
+                local_elements += int(evidence["elements"])
+                metric_device = evidence["sum_sq"].device
+                continue
+            gradient = parameter.grad
+            if gradient is None:
+                local_missing += 1
+                continue
+            to_local = getattr(gradient, "to_local", None)
+            if callable(to_local):
+                gradient = to_local()
+            wait = getattr(gradient, "wait", None)
+            if callable(wait):
+                gradient = wait()
+            values = gradient.detach().float()
+            metric_device = values.device
+            local_elements += values.numel()
+            finite = torch.isfinite(values)
+            local_nonfinite += int((~finite).sum().item())
+            finite_values = values[finite]
+            local_nonzero += int(torch.count_nonzero(finite_values).item())
+            local_sum_sq += float(torch.sum(finite_values * finite_values, dtype=torch.float64).item())
+
+        device = metric_device or torch.device(get_device_type())
+        aggregate = torch.tensor(
+            [local_sum_sq, local_tensors, local_missing, local_nonfinite, local_elements, local_nonzero],
+            dtype=torch.float64,
+            device=device,
+        )
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(aggregate, op=dist.ReduceOp.SUM)
+        sum_sq, tensors, missing, nonfinite, elements, nonzero = aggregate.cpu().tolist()
+        metrics = {
+            "router_grad_norm": math.sqrt(sum_sq),
+            "router_grad_tensor_count": int(tensors),
+            "router_grad_missing_count": int(missing),
+            "router_grad_nonfinite_count": int(nonfinite),
+            "router_grad_element_count": int(elements),
+            "router_grad_nonzero_count": int(nonzero),
+        }
+        logger.info("GLM-5.2 router gradient evidence: %s", metrics)
+        return metrics
+
+    def _reset_glm52_router_gradient_evidence(self) -> None:
+        count = 0
+        for module in self.model.modules():
+            reset = getattr(module, "reset_gradient_evidence", None)
+            if type(module).__name__ == "Glm5TopkRouter" and callable(reset):
+                reset()
+                count += 1
+        if count == 0:
+            raise RuntimeError("train_router=True but no GLM-5.2 router modules were found to arm gradient evidence")
+
+    def _snapshot_glm52_router_weights_for_step(self) -> list[tuple[nn.Module, torch.Tensor]]:
+        """Capture definitive pre-step router bytes for the single-tenant gate."""
+
+        optimizer_parameter_ids = {
+            id(parameter) for group in self.optimizer.param_groups for parameter in group.get("params", ())
+        }
+        snapshots: list[tuple[nn.Module, torch.Tensor]] = []
+        for module in self.model.modules():
+            if type(module).__name__ != "Glm5TopkRouter":
+                continue
+            parameter = module.weight
+            if id(parameter) not in optimizer_parameter_ids:
+                raise RuntimeError("A trainable GLM-5.2 router is absent from the shared optimizer")
+            gradient = parameter.grad
+            if gradient is None:
+                raise RuntimeError("A trainable GLM-5.2 router has no gradient at the optimizer boundary")
+            value = parameter.detach()
+            to_local = getattr(value, "to_local", None)
+            if callable(to_local):
+                value = to_local()
+            snapshots.append((module, value.to(device="cpu", copy=True)))
+        if not snapshots:
+            raise RuntimeError("No GLM-5.2 router weights were found at the shared optimizer boundary")
+        return snapshots
+
+    def _collect_glm52_router_update_metrics(
+        self,
+        snapshots: list[tuple[nn.Module, torch.Tensor]],
+    ) -> Dict[str, Any]:
+        """Compare post-step router bytes with the pre-step CPU receipts."""
+
+        local_tensors = len(snapshots)
+        local_changed_tensors = 0
+        local_changed_elements = 0
+        metric_device: torch.device | None = None
+        for module, before in snapshots:
+            after = module.weight.detach()
+            to_local = getattr(after, "to_local", None)
+            if callable(to_local):
+                after = to_local()
+            metric_device = after.device
+            after_cpu = after.to(device="cpu")
+            changed = torch.ne(after_cpu, before)
+            changed_elements = int(torch.count_nonzero(changed).item())
+            local_changed_elements += changed_elements
+            local_changed_tensors += int(changed_elements > 0)
+
+        device = metric_device or torch.device(get_device_type())
+        aggregate = torch.tensor(
+            [local_tensors, local_changed_tensors, local_changed_elements],
+            dtype=torch.int64,
+            device=device,
+        )
+        if dist.is_available() and dist.is_initialized():
+            dist.all_reduce(aggregate, op=dist.ReduceOp.SUM)
+        tensors, changed_tensors, changed_elements = aggregate.cpu().tolist()
+        metrics = {
+            "router_update_tensor_count": int(tensors),
+            "router_update_changed_tensor_count": int(changed_tensors),
+            "router_update_changed_element_count": int(changed_elements),
+        }
+        logger.info("GLM-5.2 router optimizer movement evidence: %s", metrics)
+        return metrics
 
     def _reshard_exact_forward_only_lm_head(self) -> None:
         """Restore FP32 masters after the external no-grad vocab projection."""
@@ -8708,6 +9203,7 @@ class ModelRunner:
         adapter_mutated = False
         glm52_fullparam_mutation_started = False
         glm52_fullparam_publish_receipt = None
+        glm52_router_update_metrics = None
         capture_config = dict(sparse_delta_capture or {})
         capture_snapshots: dict[str, torch.Tensor] | None = None
         capture_snapshot_s = 0.0
@@ -8815,6 +9311,11 @@ class ModelRunner:
                 pp_enabled=self.pp_enabled,
                 pp_group=ps.pp_group if self.pp_enabled else None,
             )
+            router_step_snapshots = (
+                self._snapshot_glm52_router_weights_for_step()
+                if getattr(self, "_glm52_exact_router_single_tenant", False)
+                else None
+            )
 
             # Once an optimizer kernel has been launched, any exception may
             # follow a partial mutation.  The exact full-parameter lane must
@@ -8827,6 +9328,8 @@ class ModelRunner:
                 # Python reaches zero_grad/empty_cache. Synchronize before releasing
                 # grad storage to avoid allocator reuse while those kernels are live.
                 synchronize()
+                if router_step_snapshots is not None:
+                    glm52_router_update_metrics = self._collect_glm52_router_update_metrics(router_step_snapshots)
                 for part in self.model_parts if self.pp_enabled else [self.model]:
                     invalidate_lora_merged_weight_caches(part)
                 try:
@@ -8889,6 +9392,8 @@ class ModelRunner:
             }
             if glm52_fullparam_publish_receipt is not None:
                 result["glm52_fullparam_publish"] = glm52_fullparam_publish_receipt
+            if glm52_router_update_metrics is not None:
+                result.update(glm52_router_update_metrics)
             if capture_snapshots is not None:
                 capture_result = write_sparse_source_delta_rank(
                     model=self.model,

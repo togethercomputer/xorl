@@ -777,6 +777,7 @@ class Glm52ExactTP16LmHeadSelectedLogprob(nn.Module):
         temperature: Tensor | None = None,
         *,
         require_cuda: bool,
+        require_factor_grad: bool = True,
     ) -> None:
         for name, value in (
             ("hidden_states", hidden_states),
@@ -828,7 +829,7 @@ class Glm52ExactTP16LmHeadSelectedLogprob(nn.Module):
             )
         if local_weight.requires_grad:
             raise RuntimeError("GLM-5.2 exact LM-head base weight must remain frozen")
-        if not lora_A.requires_grad or not local_lora_B.requires_grad:
+        if require_factor_grad and (not lora_A.requires_grad or not local_lora_B.requires_grad):
             raise RuntimeError("GLM-5.2 exact LM-head A and B factor masters must both be trainable")
 
         expected_strides = {
@@ -1230,6 +1231,7 @@ class Glm52ExactTP16LmHeadSelectedLogprob(nn.Module):
             token_ids,
             temperature,
             require_cuda=True,
+            require_factor_grad=torch.is_grad_enabled(),
         )
         self._validate_tp_group()
         return _Glm52ExactTP16LmHeadFunction.apply(
@@ -1263,6 +1265,7 @@ class Glm52ExactTP16LmHeadSelectedLogprob(nn.Module):
             local_token_ids,
             local_temperature,
             require_cuda=True,
+            require_factor_grad=torch.is_grad_enabled(),
         )
         self._validate_tp_group()
         return _Glm52ExactDistributedTP16LmHeadFunction.apply(
@@ -1315,6 +1318,8 @@ def glm52_exact_lm_head_per_token_ce(
 
     if not is_glm52_exact_tp16_lm_head(lm_head):
         raise TypeError("glm52_exact_lm_head_per_token_ce requires the constructed exact GLM-5.2 lm_head")
+    if not lm_head.lora_A.requires_grad or not lm_head.lora_B.requires_grad:
+        raise RuntimeError("GLM-5.2 exact LM-head A and B logical factor masters must both be trainable")
     if ce_mode != "bi_fused":
         raise NotImplementedError("The GLM-5.2 exact active-LoRA lm_head requires ce_mode='bi_fused'")
     if not lm_head_fp32:

@@ -3,9 +3,181 @@
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Any, Iterator
 
 import torch
 from torch import Tensor
+
+
+_ACTIVE_ATTENTION_LAYER: ContextVar[int | None] = ContextVar(
+    "xorl_dsv4_exact_attention_layer",
+    default=None,
+)
+_CAPTURED_OPERATOR_INPUTS: set[tuple[int, int, int]] = set()
+
+
+@contextmanager
+def exact_attention_layer(layer_id: int) -> Iterator[None]:
+    """Associate a literal attention invocation with its model layer.
+
+    The context is used only by the opt-in operator-localization capture.  It
+    does not alter the serving-value forward or its VJP.
+    """
+
+    token = _ACTIVE_ATTENTION_LAYER.set(int(layer_id))
+    try:
+        yield
+    finally:
+        _ACTIVE_ATTENTION_LAYER.reset(token)
+
+
+def _scheduler_snapshot(metadata: Any) -> dict[str, Any]:
+    config = getattr(metadata, "config", None)
+    config_snapshot = None
+    if config is not None:
+        config_snapshot = {
+            name: getattr(config, name)
+            for name in (
+                "b",
+                "s_q",
+                "h_q",
+                "page_block_size",
+                "h_k",
+                "causal",
+                "is_fp8_kvcache",
+                "topk",
+                "extra_page_block_size",
+                "extra_topk",
+            )
+        }
+    return {
+        "have_initialized": bool(getattr(metadata, "have_initialized", False)),
+        "config": config_snapshot,
+        "tile_scheduler_metadata": (
+            metadata.tile_scheduler_metadata.detach().cpu().clone()
+            if isinstance(getattr(metadata, "tile_scheduler_metadata", None), Tensor)
+            else None
+        ),
+        "num_splits": (
+            metadata.num_splits.detach().cpu().clone()
+            if isinstance(getattr(metadata, "num_splits", None), Tensor)
+            else None
+        ),
+    }
+
+
+def _referenced_cache_rows(
+    cache: Tensor,
+    indices: Tensor,
+    topk_length: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Gather packed FlashMLA rows in the semantic sparse-decode order.
+
+    FlashMLA does not store each 584-byte token contiguously.  A page contains
+    all 576-byte FP8-nope/BF16-RoPE payloads first, followed by an 8-byte scale
+    row for every token.  Reinterpreting the kernel view as flat 584-byte rows
+    crosses those planes and manufactures cache differences.
+    """
+
+    length = int(topk_length.reshape(-1)[0].item())
+    references = indices.reshape(-1, indices.shape[-1])[0, :length]
+    page_size = cache.shape[1]
+    valid = references[(references >= 0) & (references < cache.shape[0] * page_size)].to(torch.int64)
+    if not valid.numel():
+        return references.detach().cpu().clone(), torch.empty((0, _SERVING_SLOT_BYTES), dtype=torch.uint8)
+
+    cache_bytes = cache.detach().view(torch.uint8)
+    page_stride = cache_bytes.stride(0)
+    page_storage = cache_bytes.as_strided(
+        (cache.shape[0], page_stride),
+        (page_stride, 1),
+    )
+    pages = torch.div(valid, page_size, rounding_mode="floor")
+    offsets = torch.remainder(valid, page_size)
+    payload_offsets = offsets[:, None] * 576 + torch.arange(576, device=cache.device)
+    scale_offsets = page_size * 576 + offsets[:, None] * 8 + torch.arange(8, device=cache.device)
+    rows = torch.cat(
+        (
+            page_storage[pages[:, None], payload_offsets],
+            page_storage[pages[:, None], scale_offsets],
+        ),
+        dim=1,
+    )
+    return references.detach().cpu().clone(), rows.detach().cpu().clone()
+
+
+def _maybe_capture_operator_inputs(
+    *,
+    position: int,
+    ratio: int,
+    q: Tensor,
+    attn_sink: Tensor,
+    k_cache: Tensor,
+    indices: Tensor,
+    topk_length: Tensor,
+    extra_k_cache: Tensor | None,
+    extra_indices: Tensor | None,
+    extra_topk_length: Tensor | None,
+    scheduler_before: dict[str, Any],
+    scheduler_after: Any,
+    output: Tensor,
+) -> None:
+    capture_dir = os.environ.get("XORL_DSV4_TRAINER_OPERATOR_CAPTURE_DIR", "").strip()
+    raw_layer = os.environ.get("XORL_DSV4_OPERATOR_CAPTURE_LAYER", "").strip()
+    raw_positions = os.environ.get("XORL_DSV4_OPERATOR_CAPTURE_POSITIONS", "").strip()
+    layer_id = _ACTIVE_ATTENTION_LAYER.get()
+    if not capture_dir or not raw_layer or not raw_positions or layer_id is None:
+        return
+    if layer_id != int(raw_layer):
+        return
+    target_positions = {int(item.strip()) for item in raw_positions.split(",") if item.strip()}
+    if position not in target_positions:
+        return
+    global_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    capture_key = (global_rank, layer_id, position)
+    if capture_key in _CAPTURED_OPERATOR_INPUTS:
+        return
+
+    raw_references, raw_rows = _referenced_cache_rows(k_cache, indices, topk_length)
+    extra_references = None
+    extra_rows = None
+    if extra_k_cache is not None and extra_indices is not None and extra_topk_length is not None:
+        extra_references, extra_rows = _referenced_cache_rows(
+            extra_k_cache,
+            extra_indices,
+            extra_topk_length,
+        )
+    _CAPTURED_OPERATOR_INPUTS.add(capture_key)
+    os.makedirs(capture_dir, exist_ok=True)
+    torch.save(
+        {
+            "schema": "xorl.dsv4_trainer_flashmla_operator_capture.v2",
+            "engine": "trainer",
+            "global_rank": global_rank,
+            "layer": layer_id,
+            "position": position,
+            "ratio": ratio,
+            "q": q.detach().cpu().clone(),
+            "attn_sink": attn_sink.detach().cpu().clone(),
+            "raw_indices": indices.detach().cpu().clone(),
+            "raw_topk_length": topk_length.detach().cpu().clone(),
+            "raw_references": raw_references,
+            "raw_referenced_cache_rows": raw_rows,
+            "extra_indices": extra_indices.detach().cpu().clone() if extra_indices is not None else None,
+            "extra_topk_length": (extra_topk_length.detach().cpu().clone() if extra_topk_length is not None else None),
+            "extra_references": extra_references,
+            "extra_referenced_cache_rows": extra_rows,
+            "scheduler_before": scheduler_before,
+            "scheduler_after": _scheduler_snapshot(scheduler_after),
+            "output": output.detach().cpu().clone(),
+        },
+        os.path.join(
+            capture_dir,
+            f"rank{global_rank:05d}.layer{layer_id:03d}.position{position:05d}.pt",
+        ),
+    )
 
 
 def _validate_dsv4_lora_metadata(tensor: Tensor, *, where: str) -> None:
@@ -22,11 +194,24 @@ def _positions(batch_size: int, sequence_length: int, device: torch.device, offs
     return torch.arange(offset, offset + sequence_length, dtype=torch.int64, device=device).repeat(batch_size)
 
 
-# Serving's SWA KV pool pages tokens in blocks of the sliding window (the
-# DeepseekV4AttnBackend asserts ``swa_page_size == SWA_WINDOW == 128``). The
-# decode kernel's tile schedule keys on this page-block size, so the carried
-# raw cache must use it for byte parity.
-_SERVING_SWA_PAGE_SIZE = 128
+# Serving keeps a logical 128-token SWA window inside a 256-token physical KV
+# page.  ``_build_dsv4_kv_pool`` requires the CUDA SWA pool page size to be 256,
+# while ``DeepseekV4AttnBackend`` independently fixes ``SWA_WINDOW`` at 128.
+# FlashMLA's tile schedule keys on the physical cache shape, so the trainer's
+# carried raw cache must preserve the 256-token page geometry even though every
+# query exposes at most 128 logical SWA indices.
+_SERVING_SWA_PAGE_SIZE = 256
+# The qualified eager sampler uses ``max_total_tokens=8192`` with DP2/CP4 and
+# materializes these per-rank DSV4 pools (recorded in its startup log as
+# swa_size=768, c4_size=2048, c128_size=64).  FlashMLA receives the complete
+# cache tensors and its dynamic split schedule is sensitive to their physical
+# extent, so a short trainer replay must retain the same pool shape rather than
+# shrinking each cache to the request length.
+_SERVING_CACHE_CAPACITY_BY_PAGE_SIZE = {
+    256: 768,
+    64: 2048,
+    2: 64,
+}
 # One cache slot is 584 bytes: 448 FP8 nope + 128 BF16 rope + 8 scale bytes.
 _SERVING_SLOT_BYTES = 584
 
@@ -65,13 +250,19 @@ def _flashmla_page_bytes(page_size: int) -> int:
 def _ensure_paged_kvcache(cache: Tensor | None, num_slots: int, page_size: int, device: torch.device) -> Tensor:
     """Grow (never shrink) a paged FlashMLA FP8 cache to hold ``num_slots``.
 
+    Serving's paged allocator reserves physical page zero for dummy/padded
+    writes and allocates real request tokens from page one.  Preserve that
+    address space here because FlashMLA's tile scheduler consumes the physical
+    indices, not just their page-relative offsets.
+
     Pages are zero-filled like serving's pool allocation (``create_buffer``
     uses ``torch.zeros``): the decode kernel's masked lanes still read cache
     bytes behind invalid indices, and non-zero garbage there perturbs the
     online-softmax max by a few ULPs.
     """
 
-    num_pages = max((num_slots + page_size - 1) // page_size, 1)
+    num_slots = max(num_slots, _SERVING_CACHE_CAPACITY_BY_PAGE_SIZE.get(page_size, num_slots))
+    num_pages = 1 + (num_slots + page_size - 1) // page_size
     page_bytes = _flashmla_page_bytes(page_size)
     if cache is None:
         return torch.zeros((num_pages, page_bytes), dtype=torch.uint8, device=device)
@@ -93,7 +284,13 @@ def _window_indices_for_positions(positions: Tensor) -> Tensor:
 def _paged_cache_kernel_view(cache: Tensor, page_size: int) -> Tensor:
     """View a paged FP8 cache the way serving hands it to the decode kernel."""
 
-    return cache[:, : page_size * _SERVING_SLOT_BYTES].view(cache.shape[0], page_size, 1, _SERVING_SLOT_BYTES)
+    if cache.dtype != torch.uint8:
+        raise TypeError(f"packed DSV4 cache storage must be uint8, got {cache.dtype}")
+    return (
+        cache[:, : page_size * _SERVING_SLOT_BYTES]
+        .view(torch.float8_e4m3fn)
+        .view(cache.shape[0], page_size, 1, _SERVING_SLOT_BYTES)
+    )
 
 
 def _serving_decode_attention(
@@ -126,6 +323,7 @@ def _serving_decode_attention(
     # by a few ULPs on some heads.
     window_offsets = position - torch.arange(128, dtype=torch.int32, device=device)
     swa_indices = window_offsets.masked_fill(window_offsets < 0, -1).view(1, 1, 128)
+    swa_indices = torch.where(swa_indices >= 0, swa_indices + _SERVING_SWA_PAGE_SIZE, swa_indices)
     swa_topk_length = torch.clamp(positions + 1, max=128).to(torch.int32)
     extra_kwargs = {}
     if position < 0 or position >= carry_state.num_tokens:
@@ -153,25 +351,57 @@ def _serving_decode_attention(
             )
         extra_indices = torch.full((1, 1, width), -1, dtype=torch.int32, device=device)
         if blocks:
-            extra_indices[0, 0, :blocks] = torch.arange(blocks, dtype=torch.int32, device=device)
+            extra_page_size = 256 // ratio
+            extra_indices[0, 0, :blocks] = extra_page_size + torch.arange(
+                blocks,
+                dtype=torch.int32,
+                device=device,
+            )
         extra_kwargs = {
             "extra_k_cache": _paged_cache_kernel_view(carry_state.compressed_kvcache, 256 // ratio),
             "extra_indices_in_kvcache": extra_indices,
             "extra_topk_length": torch.tensor([max(blocks, 1)], dtype=torch.int32, device=device),
         }
+    scheduler = get_mla_metadata()[0]
+    scheduler_before = _scheduler_snapshot(scheduler)
+    k_cache = _paged_cache_kernel_view(carry_state.kvcache, _SERVING_SWA_PAGE_SIZE)
     output, _ = flash_mla_with_kvcache(
         q=q.contiguous().view(1, 1, 64, 512),
-        k_cache=_paged_cache_kernel_view(carry_state.kvcache, _SERVING_SWA_PAGE_SIZE),
+        k_cache=k_cache,
         head_dim_v=512,
         block_table=None,
         cache_seqlens=None,
-        tile_scheduler_metadata=get_mla_metadata()[0],
+        tile_scheduler_metadata=scheduler,
         softmax_scale=softmax_scale,
         is_fp8_kvcache=True,
         indices=swa_indices,
         attn_sink=attn_sink,
         topk_length=swa_topk_length,
         **extra_kwargs,
+    )
+    num_splits = getattr(scheduler, "num_splits", None)
+    if isinstance(num_splits, Tensor) and int(num_splits.reshape(-1)[-1].item()) > 2:
+        raise RuntimeError(
+            "DSV4 exact trainer attention requires the qualified MODEL1 fixed-K2 "
+            "FlashMLA runtime used by serving; the loaded operator selected "
+            f"num_splits={num_splits.detach().cpu().tolist()} at position={position}, "
+            f"C{ratio}. Put the qualified DSV4 runtime overlay before the generic "
+            "sglang-kernel package on PYTHONPATH."
+        )
+    _maybe_capture_operator_inputs(
+        position=position,
+        ratio=ratio,
+        q=q.contiguous().view(1, 1, 64, 512),
+        attn_sink=attn_sink,
+        k_cache=k_cache,
+        indices=swa_indices,
+        topk_length=swa_topk_length,
+        extra_k_cache=extra_kwargs.get("extra_k_cache"),
+        extra_indices=extra_kwargs.get("extra_indices_in_kvcache"),
+        extra_topk_length=extra_kwargs.get("extra_topk_length"),
+        scheduler_before=scheduler_before,
+        scheduler_after=scheduler,
+        output=output,
     )
     return output.view(1, 1, 64, 512)
 
@@ -253,7 +483,7 @@ def _store_raw_kv_carry(
         eps=eps,
         freqs_cis=freqs_cis,
         positions=positions,
-        out_loc=positions.to(torch.int32),
+        out_loc=positions.to(torch.int32) + page_size,
         kvcache=carry_state.kvcache,
         page_size=page_size,
     )
@@ -264,7 +494,7 @@ def _store_raw_kv_carry(
         dequantize_k_cache_paged,
     )
 
-    all_locs = torch.arange(total_tokens, dtype=torch.int32, device=kv_input.device)
+    all_locs = page_size + torch.arange(total_tokens, dtype=torch.int32, device=kv_input.device)
     return dequantize_k_cache_paged(carry_state.kvcache, all_locs, page_size).view(total_tokens, 512)
 
 
@@ -294,7 +524,7 @@ def _store_preprocessed_kv_carry(
     fused_store_cache(
         input=kv.contiguous().view(-1, 512),
         cache=carry_state.kvcache,
-        indices=positions.to(torch.int32),
+        indices=positions.to(torch.int32) + page_size,
         page_size=page_size,
         type="flashmla",
     )
@@ -305,7 +535,7 @@ def _store_preprocessed_kv_carry(
         dequantize_k_cache_paged,
     )
 
-    all_locs = torch.arange(total_tokens, dtype=torch.int32, device=kv.device)
+    all_locs = page_size + torch.arange(total_tokens, dtype=torch.int32, device=kv.device)
     return dequantize_k_cache_paged(carry_state.kvcache, all_locs, page_size).view(total_tokens, 512)
 
 
@@ -347,8 +577,8 @@ class _ExactQNormRope(torch.autograd.Function):
             q = q_input.detach().requires_grad_(True)
             q_float = q.float()
             normalized = q_float * torch.rsqrt(q_float.square().mean(-1, keepdim=True) + ctx.eps)
-            surrogate = _apply_rope_torch(normalized.to(q.dtype), freqs_cis, positions, inverse=False)
-            grad_q = torch.autograd.grad(surrogate, q, grad_output, create_graph=False)[0]
+            vjp_replay = _apply_rope_torch(normalized.to(q.dtype), freqs_cis, positions, inverse=False)
+            grad_q = torch.autograd.grad(vjp_replay, q, grad_output, create_graph=False)[0]
         return grad_q, None, None, None
 
 
@@ -388,8 +618,8 @@ class _ExactKVNormRope(torch.autograd.Function):
         kv_input, kv_norm_weight, freqs_cis, positions = ctx.saved_tensors
         with torch.enable_grad():
             kv = kv_input.detach().requires_grad_(True)
-            surrogate = _kv_norm_rope_torch(kv, kv_norm_weight, freqs_cis, positions, ctx.eps)
-            grad_kv = torch.autograd.grad(surrogate, kv, grad_output, create_graph=False)[0]
+            vjp_replay = _kv_norm_rope_torch(kv, kv_norm_weight, freqs_cis, positions, ctx.eps)
+            grad_kv = torch.autograd.grad(vjp_replay, kv, grad_output, create_graph=False)[0]
         return grad_kv, None, None, None
 
 
@@ -426,11 +656,9 @@ def _native_swa_kv(kv_input: Tensor, kv_norm_weight: Tensor, freqs_cis: Tensor, 
     positions = _positions(batch_size, sequence_length, kv_input.device)
     kv_flat = kv_input.contiguous().view(-1, 512)
     num_tokens = kv_flat.shape[0]
-    page_size = 256
-    page_bytes = ((584 * page_size + 575) // 576) * 576
-    num_pages = (num_tokens + page_size - 1) // page_size
-    kvcache = torch.empty((num_pages, page_bytes), dtype=torch.uint8, device=kv_input.device)
-    out_loc = torch.arange(num_tokens, dtype=torch.int32, device=kv_input.device)
+    page_size = _SERVING_SWA_PAGE_SIZE
+    kvcache = _ensure_paged_kvcache(None, num_tokens, page_size, kv_input.device)
+    out_loc = page_size + torch.arange(num_tokens, dtype=torch.int32, device=kv_input.device)
     fused_k_norm_rope_flashmla(
         kv=kv_flat,
         kv_weight=kv_norm_weight,
@@ -459,13 +687,8 @@ def _native_swa_kv_from_bf16(kv: Tensor) -> Tensor:
     kv_flat = kv.contiguous().view(-1, 512)
     num_tokens = kv_flat.shape[0]
     page_size = _SERVING_SWA_PAGE_SIZE
-    num_pages = max((num_tokens + page_size - 1) // page_size, 1)
-    kvcache = torch.zeros(
-        (num_pages, _flashmla_page_bytes(page_size)),
-        dtype=torch.uint8,
-        device=kv.device,
-    )
-    out_loc = torch.arange(num_tokens, dtype=torch.int32, device=kv.device)
+    kvcache = _ensure_paged_kvcache(None, num_tokens, page_size, kv.device)
+    out_loc = page_size + torch.arange(num_tokens, dtype=torch.int32, device=kv.device)
     fused_store_cache(
         input=kv_flat,
         cache=kvcache,
@@ -581,7 +804,7 @@ def _serving_compressed_decode_step(
     )
     at_block_boundary = seq_len % ratio == 0
     out_loc = torch.tensor(
-        [seq_len // ratio - 1 if at_block_boundary else 0],
+        [page_size + seq_len // ratio - 1 if at_block_boundary else 0],
         dtype=torch.int64,
         device=x.device,
     )
@@ -602,7 +825,11 @@ def _serving_compressed_decode_step(
         carry_state.num_compressed = seq_len // ratio
     if carry_state.num_compressed == 0:
         return x.new_empty((0, 512))
-    compressed_locs = torch.arange(carry_state.num_compressed, dtype=torch.int32, device=x.device)
+    compressed_locs = page_size + torch.arange(
+        carry_state.num_compressed,
+        dtype=torch.int32,
+        device=x.device,
+    )
     output = dequantize_k_cache_paged(carry_state.compressed_kvcache, compressed_locs, page_size).view(
         carry_state.num_compressed, 512
     )
@@ -688,13 +915,11 @@ def _serving_compressed_kv(
         carry_state.num_compressed = num_compressed
         kvcache = carry_state.compressed_kvcache
     else:
-        page_bytes = _flashmla_page_bytes(page_size)
-        num_pages = (num_compressed + page_size - 1) // page_size
-        kvcache = torch.empty((num_pages, page_bytes), dtype=torch.uint8, device=x.device)
+        kvcache = _ensure_paged_kvcache(None, num_compressed, page_size, x.device)
     out_loc = torch.zeros(sequence_length, dtype=torch.int64, device=x.device)
     if num_compressed:
         endpoints = torch.arange(ratio - 1, sequence_length, ratio, device=x.device)
-        out_loc[endpoints] = torch.arange(num_compressed, dtype=torch.int64, device=x.device)
+        out_loc[endpoints] = page_size + torch.arange(num_compressed, dtype=torch.int64, device=x.device)
     compress_norm_rope_store(
         compressed,
         plan,
@@ -714,7 +939,7 @@ def _serving_compressed_kv(
         dequantize_k_cache_paged,
     )
 
-    compressed_locs = torch.arange(num_compressed, dtype=torch.int32, device=x.device)
+    compressed_locs = page_size + torch.arange(num_compressed, dtype=torch.int32, device=x.device)
     output = dequantize_k_cache_paged(kvcache, compressed_locs, page_size).view(num_compressed, 512)
     _validate_dsv4_lora_metadata(x, where=f"C{ratio} compressor cache dequantize")
     return output
@@ -778,7 +1003,7 @@ def _hybrid_indices_for_positions(positions: Tensor, ratio: int, compressed_capa
     return indices, lengths
 
 
-def _compress_surrogate(
+def _compress_vjp_replay(
     x: Tensor,
     wkv_weight: Tensor,
     wgate_weight: Tensor,
@@ -788,7 +1013,7 @@ def _compress_surrogate(
     eps: float,
     ratio: int,
 ) -> Tensor:
-    """Differentiable compressor surrogate for the literal serving VJP."""
+    """Recompute the compressor formula used by the literal serving VJP."""
 
     batch_size, sequence_length, _ = x.shape
     groups = sequence_length // ratio
@@ -953,9 +1178,9 @@ class _ExactC0Attention(torch.autograd.Function):
                 kv_input = kv_saved.detach().requires_grad_(True)
                 kv_segment = _kv_norm_rope_torch(kv_input, weight, freqs_cis, positions, ctx.eps)
                 kv = torch.cat((prefix.to(kv_segment.dtype).unsqueeze(0), kv_segment), dim=1)
-                surrogate = sparse_attn_torch(q, kv, attn_sink, indices, ctx.softmax_scale)
+                vjp_replay = sparse_attn_torch(q, kv, attn_sink, indices, ctx.softmax_scale)
                 grad_q, grad_kv = torch.autograd.grad(
-                    surrogate,
+                    vjp_replay,
                     (q, kv_input),
                     grad_output,
                     create_graph=False,
@@ -973,9 +1198,9 @@ class _ExactC0Attention(torch.autograd.Function):
                 if ctx.kv_preprocessed
                 else _kv_norm_rope_torch(kv_input, weight, freqs_cis, kv_positions, ctx.eps)
             )
-            surrogate = sparse_attn_torch(q, kv, attn_sink, indices, ctx.softmax_scale)
+            vjp_replay = sparse_attn_torch(q, kv, attn_sink, indices, ctx.softmax_scale)
             grad_q, grad_kv = torch.autograd.grad(
-                surrogate,
+                vjp_replay,
                 (q, kv_input),
                 grad_output,
                 create_graph=False,
@@ -1244,7 +1469,7 @@ class _ExactHybridAttention(torch.autograd.Function):
                 kv_input = kv_saved.detach().requires_grad_(True)
                 kv_segment = _kv_norm_rope_torch(kv_input, kv_norm_weight, freqs_cis, positions, ctx.eps)
                 kv = torch.cat((kv_constant.to(kv_segment.dtype).unsqueeze(0), kv_segment), dim=1)
-                surrogate = sparse_attn_torch(
+                vjp_replay = sparse_attn_torch(
                     q,
                     kv,
                     attn_sink,
@@ -1252,7 +1477,7 @@ class _ExactHybridAttention(torch.autograd.Function):
                     ctx.softmax_scale,
                 )
                 grad_q, grad_kv = torch.autograd.grad(
-                    surrogate,
+                    vjp_replay,
                     (q, kv_input),
                     grad_output,
                     create_graph=False,
@@ -1305,7 +1530,7 @@ class _ExactHybridAttention(torch.autograd.Function):
                 if ctx.kv_preprocessed
                 else _kv_norm_rope_torch(kv_input, kv_norm_weight, freqs_cis, kv_positions, ctx.eps)
             )
-            compressed = _compress_surrogate(
+            compressed = _compress_vjp_replay(
                 x,
                 compressor_wkv_weight,
                 compressor_wgate_weight,
@@ -1324,7 +1549,7 @@ class _ExactHybridAttention(torch.autograd.Function):
                     dim=0,
                 )
             kv = torch.cat((compressed, vanilla[0]), dim=0).unsqueeze(0)
-            surrogate = sparse_attn_torch(
+            vjp_replay = sparse_attn_torch(
                 q,
                 kv,
                 attn_sink,
@@ -1332,7 +1557,7 @@ class _ExactHybridAttention(torch.autograd.Function):
                 ctx.softmax_scale,
             )
             grad_q, grad_kv, grad_x = torch.autograd.grad(
-                surrogate,
+                vjp_replay,
                 (q, kv_input, x),
                 grad_output,
                 create_graph=False,

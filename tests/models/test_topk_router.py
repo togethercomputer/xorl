@@ -21,6 +21,25 @@ from xorl.models.layers.moe.moe_block import MoEBlock, _router_fp32_layers_enabl
 from xorl.models.layers.moe.router import TopKRouter
 
 
+def test_native_exact_router_retains_fp32_metadata_after_fixed_renorm():
+    router = TopKRouter(
+        num_experts=4,
+        top_k=2,
+        norm_topk_prob=True,
+        exact_batch_invariant=True,
+        exact_weights_fp32=True,
+    )
+    logits = torch.tensor([[1.0, 3.0, 2.0, -1.0]], dtype=torch.float32)
+
+    weights, ids = router(logits, torch.bfloat16)
+
+    assert weights.dtype is torch.float32
+    assert ids.tolist() == [[1, 2]]
+    expected_scores = torch.softmax(logits, dim=1).gather(1, ids)
+    expected_denom = expected_scores[:, 0] + expected_scores[:, 1]
+    assert torch.equal(weights, expected_scores / expected_denom.unsqueeze(-1))
+
+
 pytestmark = pytest.mark.cpu
 
 

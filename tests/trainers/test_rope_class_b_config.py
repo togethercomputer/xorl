@@ -402,6 +402,18 @@ def test_exact_qwen35_moe_admits_structural_defaults():
     )
 
 
+def test_exact_qwen35_moe_admits_shared_native_deepep_program():
+    config = _exact_qwen35_moe_config()
+    config._qwen35_exact_contract = True
+    _validate_exact_qwen35_moe_program(
+        config,
+        moe_implementation="triton",
+        ep_dispatch="deepep",
+        deepep_async_combine=False,
+        deepep_native_exact=True,
+    )
+
+
 def test_exact_glm52_model_scope_accepts_only_official_geometry():
     _validate_canonical_glm52_model_scope(_exact_glm52_config())
     config = _exact_glm52_config()

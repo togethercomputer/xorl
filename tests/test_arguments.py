@@ -70,6 +70,8 @@ def test_parse_args_optimizer_packing_and_numeric_policy(tmp_path, monkeypatch):
         assert args.model.activation_native is True
         assert args.model.rope_native is True
         assert args.model.attention_cast_bf16 is True
+        assert args.model.deepep_native_exact is False
+        assert args.lora.lora_serving_mode is None
 
     muon_root = tmp_path / "muon"
     muon_root.mkdir()
@@ -170,12 +172,69 @@ def _assert_parse_args_checkpoint_policy(tmp_path, monkeypatch):
     assert args.train.gradient_checkpointing_method == "recompute_before_dispatch"
     assert args.train.moe_recomputed is False
 
+    native_config_path = tmp_path / "native-exact-default.yaml"
+    native_config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {
+                    "model_path": "Qwen/Qwen3-8B",
+                    "deepep_native_exact": True,
+                },
+                "data": {
+                    "datasets": [{"path": "dummy", "type": "tokenized"}],
+                },
+                "train": {
+                    "init_device": "meta",
+                    "output_dir": str(tmp_path / "native-outputs"),
+                    "expert_parallel_size": 2,
+                    "use_wandb": False,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(sys, "argv", ["train.py", str(native_config_path)])
+    native_args = parse_args(Arguments)
+
+    assert native_args.train.gradient_checkpointing_method == "recompute_before_dispatch"
+    assert native_args.train.moe_recomputed is False
+
     auto_root = tmp_path / "auto-checkpoint"
     auto_root.mkdir()
     _assert_parse_args_resolves_auto_checkpoint_before_validation(auto_root, monkeypatch)
     optimizer_root = tmp_path / "load-optimizer"
     optimizer_root.mkdir()
     _assert_parse_args_load_optimizer_flag(optimizer_root, monkeypatch)
+
+
+def test_native_exact_training_rejects_ep1(tmp_path, monkeypatch):
+    config_path = tmp_path / "native-exact-ep1.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "model": {
+                    "model_path": "Qwen/Qwen3-8B",
+                    "deepep_native_exact": True,
+                },
+                "data": {"datasets": [{"path": "dummy", "type": "tokenized"}]},
+                "train": {
+                    "init_device": "meta",
+                    "output_dir": str(tmp_path / "outputs"),
+                    "expert_parallel_size": 1,
+                    "use_wandb": False,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    monkeypatch.setenv("LOCAL_WORLD_SIZE", "1")
+    monkeypatch.setenv("RANK", "0")
+    monkeypatch.setenv("LOCAL_RANK", "0")
+    monkeypatch.setattr(sys, "argv", ["train.py", str(config_path)])
+
+    with pytest.raises(ValueError, match="expert_parallel_size > 1"):
+        parse_args(Arguments)
 
 
 def _assert_parse_args_low_precision_configuration_policy(tmp_path, monkeypatch):
