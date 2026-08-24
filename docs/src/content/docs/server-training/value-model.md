@@ -73,4 +73,16 @@ ev = explained_variance(
 )
 ```
 
-The paper's frozen-attention critic corresponds to restricting the critic's trainable modules to MLP/MoE projections; per-session target masking is tracked as a follow-up — today `lora_target_modules` applies substrate-wide.
+## Frozen-attention critic
+
+The paper's frozen-attention critic (its strongest ablation) is a per-session option — it constrains only the critic, not the policy sessions sharing the substrate:
+
+```python
+critic = svc.create_lora_training_client(
+    BASE_MODEL,
+    model_id="critic",
+    frozen_module_patterns=["q_proj", "k_proj", "v_proj", "o_proj"],
+)
+```
+
+Patterns are substring matches against adapter parameter names. Matching factors keep their zero-delta initialization for this session: they are skipped at gradient staging and their optimizer state never moves, so the critic trains only its MLP factors and the value head.
