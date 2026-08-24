@@ -19,7 +19,10 @@ from xorl.models.transformers.glm5.qlora import (
     GLM52_QLORA_ROUTED_BANK_COUNT,
     prepare_glm52_block_fp8_qlora,
 )
-from xorl.models.transformers.glm5.support import validate_glm5_training_mode
+from xorl.models.transformers.glm5.support import (
+    validate_glm5_training_mode,
+    validate_glm52_local_router_inventory,
+)
 from xorl.ops.block_fp8_native import NativeBlockFP8Linear
 from xorl.qlora.modules.block_fp8_linear import BlockFP8QLoRALinear
 from xorl.qlora.modules.moe_experts import BlockFP8QLoRAMoeExperts
@@ -230,7 +233,7 @@ def test_glm52_qlora_rejects_missing_official_indexer_exclusion_before_adapteriz
     ("override", "message"),
     [
         ({"_moe_implementation": "eager"}, "moe_implementation='triton'"),
-        ({"_ep_dispatch": "alltoall"}, "ep_dispatch='deepep'"),
+        ({"_ep_dispatch": "alltoall"}, r"ep_dispatch in \['deepep'\]"),
         ({"_glm52_exact_contract": True}, "cannot use the scoring-only exact contract"),
         ({"_glm52_block_fp8_qlora": False}, "block_fp8_qlora_training=true"),
     ],
@@ -292,22 +295,34 @@ def test_glm5_training_mode_uses_alltoall_only_for_complete_exact_active_lora() 
         moe_hybrid_shared_lora=True,
     )
 
-    with pytest.raises(ValueError, match="ep_dispatch='deepep'.*requires 'alltoall'"):
-        validate_glm5_training_mode(
-            config,
-            enable_qlora=True,
-            freeze_router=True,
-            merge_qkv=True,
-            block_fp8_qlora_training=True,
-            quant_format="block_fp8",
-            quant_group_size=128,
-            moe_implementation="triton",
-            ep_dispatch="deepep",
-            moe_hybrid_shared_lora=True,
-        )
+    validate_glm5_training_mode(
+        config,
+        enable_qlora=True,
+        freeze_router=True,
+        merge_qkv=True,
+        block_fp8_qlora_training=True,
+        quant_format="block_fp8",
+        quant_group_size=128,
+        moe_implementation="triton",
+        ep_dispatch="deepep",
+        moe_hybrid_shared_lora=True,
+    )
 
 
 def test_block_fp8_qlora_scale_storage_covers_partial_edge_tiles() -> None:
     module = BlockFP8QLoRALinear(6144, 576, r=4, lora_alpha=4, device=torch.device("meta"))
 
     assert module.weight_block_scales.shape == (5, 192)
+
+
+def test_router_inventory_allows_dense_only_pipeline_stage_and_checks_sparse_stage() -> None:
+    class Glm5MoEBlock(nn.Module):
+        pass
+
+    dense_stage = nn.Sequential(nn.Linear(2, 2))
+    sparse_stage = nn.Sequential(Glm5MoEBlock(), Glm5MoEBlock())
+
+    assert validate_glm52_local_router_inventory(dense_stage, retained_router_count=0) == 0
+    assert validate_glm52_local_router_inventory(sparse_stage, retained_router_count=2) == 2
+    with pytest.raises(RuntimeError, match="retained=0, expected=2"):
+        validate_glm52_local_router_inventory(sparse_stage, retained_router_count=0)

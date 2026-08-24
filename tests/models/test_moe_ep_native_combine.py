@@ -122,7 +122,7 @@ def test_qwen35_exchange_fails_closed_before_transport(monkeypatch, partial, ep_
     assert not called
 
 
-def _qwen_block(*, exact: bool = False):
+def _qwen_block(*, exact: bool = False, native_deepep: bool = False):
     from transformers import PretrainedConfig  # noqa: PLC0415
 
     from xorl.models.transformers.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeSparseMoeBlock  # noqa: PLC0415
@@ -137,6 +137,8 @@ def _qwen_block(*, exact: bool = False):
         shared_expert_intermediate_size=24,
         train_router=False,
         _qwen35_exact_contract=exact,
+        _deepep_native_exact=native_deepep,
+        _ep_dispatch="deepep" if native_deepep else "alltoall",
     )
     return Qwen3_5MoeSparseMoeBlock(cfg, moe_implementation="eager", layer_idx=0).to(torch.bfloat16)
 
@@ -155,6 +157,16 @@ def test_exact_native_combine_is_structural():
     assert blk._native_ep_combine
     assert blk._exact_batch_invariant_router
     assert blk.router._exact_batch_invariant
+
+
+def test_qwen35_native_deepep_selects_shared_transport_and_thin_shared_join():
+    blk = _qwen_block(exact=True, native_deepep=True)
+
+    assert blk.deepep_native_exact
+    assert blk.experts.deepep_native_exact
+    assert blk.experts.ep_dispatch == "deepep"
+    assert not blk._native_ep_combine
+    assert not blk.supports_routing_replay()
 
 
 def test_native_routed_partial_enters_through_module_call(monkeypatch):
@@ -209,6 +221,106 @@ def test_variable_row_token_gather_unpads_backward(monkeypatch):
     assert torch.equal(gathered[2], torch.zeros(2))
     gathered.sum().backward()
     assert torch.equal(x.grad, torch.full_like(x, 2.0))
+
+
+def test_token_gather_orders_backward_before_dependency_producer(monkeypatch):
+    """The shared c10d branch must queue before its routed DeepEP sibling."""
+    import xorl.models.layers.moe.ep_native_combine as combine  # noqa: PLC0415
+
+    events = []
+
+    class RoutedBoundary(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, value):
+            return value.clone()
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            events.append("routed")
+            return grad_output
+
+    monkeypatch.setattr(combine.dist, "get_world_size", lambda _group: 1)
+    monkeypatch.setattr(
+        combine.dist,
+        "all_gather_into_tensor",
+        lambda output, local, group=None: output.copy_(local),
+    )
+
+    def fake_reduce_scatter(output, grad, op=None, group=None):
+        del op, group
+        events.append("shared")
+        output.copy_(grad)
+
+    monkeypatch.setattr(combine.dist, "reduce_scatter_tensor", fake_reduce_scatter)
+
+    x = torch.tensor([[1.0, 2.0]], requires_grad=True)
+    routed = RoutedBoundary.apply(x)
+    gathered = gather_tokens_for_ep_combine(
+        x,
+        group=None,
+        padded_rows=1,
+        backward_dependency=routed,
+    )
+    (gathered.sum() + routed.sum()).backward()
+
+    assert events == ["shared", "routed"]
+    assert torch.equal(x.grad, torch.full_like(x, 2.0))
+
+
+def test_shared_then_routed_dependency_holds_transformer_residual(monkeypatch):
+    """Do not release an earlier layer through the residual bypass."""
+    import xorl.models.layers.moe.ep_native_combine as combine  # noqa: PLC0415
+
+    events = []
+
+    class ResidualBoundary(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, value):
+            return value.clone()
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            events.append("residual")
+            return grad_output
+
+    class RoutedBoundary(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, value, backward_layer_dependency):
+            del backward_layer_dependency
+            return value.clone()
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            events.append("routed")
+            return grad_output, None
+
+    monkeypatch.setattr(combine.dist, "get_world_size", lambda _group: 1)
+    monkeypatch.setattr(
+        combine.dist,
+        "all_gather_into_tensor",
+        lambda output, local, group=None: output.copy_(local),
+    )
+
+    def fake_reduce_scatter(output, grad, op=None, group=None):
+        del op, group
+        events.append("shared")
+        output.copy_(grad)
+
+    monkeypatch.setattr(combine.dist, "reduce_scatter_tensor", fake_reduce_scatter)
+
+    x = torch.tensor([[1.0, 2.0]], requires_grad=True)
+    residual = ResidualBoundary.apply(x)
+    routed = RoutedBoundary.apply(x, residual)
+    gathered = gather_tokens_for_ep_combine(
+        x,
+        group=None,
+        padded_rows=1,
+        backward_dependency=routed,
+    )
+    (gathered.sum() + routed.sum() + residual.sum()).backward()
+
+    assert events == ["shared", "routed", "residual"]
+    assert torch.equal(x.grad, torch.full_like(x, 3.0))
 
 
 def test_variable_row_id_gather_uses_invalid_padding(monkeypatch):

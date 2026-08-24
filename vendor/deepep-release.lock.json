@@ -1,0 +1,32 @@
+{
+  "schema": "xorl.deepep_release_lock.v2",
+  "release_repository": "https://github.com/togethercomputer/xorl-wheels",
+  "release_tag": "deepep_sglang_kernel_torch212_cu132_sm90_723b8b3",
+  "source": {
+    "xorl_wheels_commit": "723b8b394519cc3d39274480a82933322b2bc037",
+    "deepep_commit": "65538abaaec51d5a06b92a96f874b3f9274ebdc8",
+    "deepep_tree": "54927caff5e877b9b390729258086e3d679f760f",
+    "url": "https://github.com/togethercomputer/xorl-wheels/releases/download/deepep_sglang_kernel_torch212_cu132_sm90_723b8b3/deep_ep-1.2.1%2B65538ab.xorl.c85744ca7250.tar.gz",
+    "sha256": "1c191d78d0132049ac6caa988266d2fa4502d78a26735d65bd46b5fa18ee5f77"
+  },
+  "wheel": {
+    "package": "deep-ep==1.2.1+65538ab.xorl.c85744ca7250",
+    "url": "https://github.com/togethercomputer/xorl-wheels/releases/download/deepep_sglang_kernel_torch212_cu132_sm90_723b8b3/deep_ep-1.2.1%2B65538ab.xorl.c85744ca7250-cp312-cp312-linux_x86_64.whl",
+    "sha256": "f30485d585a4cd935f44ffadd276d7ea8603a919cff60302bbb40ded344cdccb",
+    "extension_sha256": "1233ae5405e2a10439f331b07cb221697a451cd3c8a2c28bccddf7d209551e59",
+    "python_abi": "cp312-cp312-linux_x86_64",
+    "torch": "2.12.1+cu132",
+    "torch_cuda_runtime": "13.2",
+    "build_cuda_toolkit": "13.2",
+    "gpu_arch": "sm90"
+  },
+  "contract": {
+    "deterministic_mode": "explicit_opt_in",
+    "protocol": "deepep_deterministic_hierarchical_bf16_v2",
+    "supported_ep": [2, 4, 8, 16],
+    "model_route_wire_dtype": "bfloat16",
+    "receiver_weight_modes": ["unit", "fp32"],
+    "fold": "tree8_fp64_bf16_node_leaf_then_ascending_node_fp64_fold",
+    "cross_mode": "normal_equals_low_latency_byte_for_byte"
+  }
+}

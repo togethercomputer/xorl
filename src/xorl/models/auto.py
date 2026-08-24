@@ -27,14 +27,18 @@ from .layers.attention import get_attention_fn
 from .layers.normalization import set_rmsnorm_mode
 from .layers.rope import set_rope_class_b, set_rope_native
 from .loader import ModelLoader, get_loader
+from .registry import ModelRegistry
 from .transformers.deepseek_v3.configuration_deepseek_v3 import DeepseekV3Config
-from .transformers.deepseek_v3.support import validate_deepseek_v3_router_settings
+from .transformers.deepseek_v3.support import (
+    validate_deepseek_v3_router_settings,
+)
 from .transformers.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
 from .transformers.deepseek_v4.exact_contract import (
     is_dsv4_flash_config,
     validate_dsv4_flash_adapter_program,
     validate_dsv4_flash_official_geometry,
 )
+from .transformers.deepseek_v4.moe_program import resolve_dsv4_moe_numerical_program
 from .transformers.glm4_moe.configuration_glm4_moe import Glm4MoeConfig
 from .transformers.glm5.configuration_glm5 import Glm5Config
 from .transformers.glm5.exact_lora_contract import glm52_exact_lora_scaling
@@ -174,6 +178,29 @@ def _get_architectures(config: "PretrainedConfig") -> set[str]:
     if isinstance(architectures, list):
         return set(architectures)
     return {architectures}
+
+
+def resolve_deepep_native_exact_capability(config: "PretrainedConfig") -> Optional[dict[str, Any]]:
+    """Resolve the exact DeepEP contract declared by the registered model class."""
+
+    architectures = getattr(config, "architectures", None)
+    if isinstance(architectures, str):
+        architectures = [architectures]
+    for architecture in architectures or ():
+        if architecture not in ModelRegistry.supported_models:
+            continue
+        model_cls = ModelRegistry.get_model_cls_from_model_arch(architecture)
+        capability = getattr(model_cls, "deepep_native_exact_capability", None)
+        if capability is None:
+            return None
+        if (
+            not capability.get("produces_local_leaf")
+            or capability.get("wire_dtype") != "bf16"
+            or not capability.get("uses_dispatch_handle")
+        ):
+            raise ValueError(f"{architecture} declares an incomplete native DeepEP local-leaf contract: {capability!r}")
+        return dict(capability)
+    return None
 
 
 def _is_gpt_oss_config(config: "PretrainedConfig") -> bool:
@@ -495,14 +522,16 @@ def _validate_exact_qwen35_moe_program(
     moe_implementation: Optional[str],
     ep_dispatch: str,
     deepep_async_combine: bool,
+    deepep_native_exact: bool = False,
 ) -> None:
     if not (_is_exact_qwen35(config) and _is_qwen35_moe(config)):
         return
     incompatible = []
     if moe_implementation not in (None, "triton"):
         incompatible.append(f"moe_implementation={moe_implementation!r} (requires 'triton')")
-    if ep_dispatch != "alltoall":
-        incompatible.append(f"ep_dispatch={ep_dispatch!r} (requires 'alltoall')")
+    required_dispatch = "deepep" if deepep_native_exact else "alltoall"
+    if ep_dispatch != required_dispatch:
+        incompatible.append(f"ep_dispatch={ep_dispatch!r} (requires {required_dispatch!r})")
     if deepep_async_combine:
         incompatible.append("deepep_async_combine=True (requires False)")
     if incompatible:
@@ -800,6 +829,7 @@ def build_foundation_model(
     deepep_buffer_size_gb: float = 2.0,
     deepep_num_sms: int = 20,
     deepep_async_combine: bool = False,
+    deepep_native_exact: bool = False,
     alltoall_combine_hidden_chunk_size: int = 0,
     router_fp32: Optional[bool] = None,
     lm_head_fp32: Optional[bool] = None,
@@ -816,6 +846,7 @@ def build_foundation_model(
     flash_attention_deterministic: bool = False,
     server_training: bool = False,
     enable_lora: bool = False,
+    lora_serving_mode: Optional[Literal["merged", "separate"]] = None,
     block_fp8_qlora_training: bool = False,
     glm52_fullparam_fp8_training: bool = False,
     lora_rank: Optional[int] = None,
@@ -853,7 +884,9 @@ def build_foundation_model(
         raise ValueError(
             "glm52_fullparam_fp8_training and block_fp8_qlora_training are mutually exclusive training lanes"
         )
-    exact_active_lora = bool(server_training and glm52_model and block_fp8_qlora_training and ep_dispatch == "alltoall")
+    exact_active_lora = bool(
+        server_training and glm52_model and block_fp8_qlora_training and ep_dispatch in {"alltoall", "deepep"}
+    )
     if exact_active_lora:
         glm52_exact_lora_scaling(lora_rank, lora_alpha)
     # Training lanes select the same exact value family through their own
@@ -883,6 +916,11 @@ def build_foundation_model(
     dsv4_flash_exact = bool(server_training and is_dsv4_flash_config(config))
     config._dsv4_flash_exact_mode = dsv4_flash_exact
     config._dsv4_flash_exact_active_lora = bool(dsv4_flash_exact and enable_lora)
+    config._dsv4_moe_numerical_program = resolve_dsv4_moe_numerical_program(
+        exact=dsv4_flash_exact,
+        ep_dispatch=ep_dispatch,
+        deepep_native_exact=deepep_native_exact,
+    )
     if dsv4_flash_exact:
         validate_dsv4_flash_official_geometry(config)
         if not enable_lora:
@@ -906,14 +944,15 @@ def build_foundation_model(
         incompatible = []
         if moe_implementation not in (None, "triton"):
             incompatible.append(f"moe_implementation={moe_implementation!r} (requires 'triton')")
-        if ep_dispatch != "alltoall":
-            incompatible.append(f"ep_dispatch={ep_dispatch!r} (requires 'alltoall')")
         if deepep_async_combine:
             incompatible.append("deepep_async_combine=True (requires False)")
         if incompatible:
             raise ValueError(
                 "The DSV4-Flash exact RCA lane rejects incompatible trainer runtime choices: " + ", ".join(incompatible)
             )
+        logger.info_rank0(
+            f"DSV4 MoE numerical program: {config._dsv4_moe_numerical_program} (ep_dispatch={ep_dispatch})"
+        )
 
     # Family-neutral exact-contract keys, stamped once at model resolution so
     # downstream contract sites key off the resolved program rather than
@@ -934,6 +973,7 @@ def build_foundation_model(
         moe_implementation=moe_implementation,
         ep_dispatch=ep_dispatch,
         deepep_async_combine=deepep_async_combine,
+        deepep_native_exact=deepep_native_exact,
     )
     numerical_program = resolve_model_numerical_program(
         config,
@@ -997,12 +1037,48 @@ def build_foundation_model(
             "Set train_router=False or use ep_dispatch='alltoall'."
         )
 
+    deepep_capability = resolve_deepep_native_exact_capability(config)
+    if deepep_native_exact:
+        incompatible = []
+        if deepep_capability is None:
+            incompatible.append("a model-declared BF16 native DeepEP local-leaf capability")
+        if ep_dispatch != "deepep":
+            incompatible.append("ep_dispatch='deepep'")
+        if train_router:
+            incompatible.append("train_router=False")
+        if deepep_async_combine:
+            incompatible.append("deepep_async_combine=False")
+        if torch_dtype != "bfloat16":
+            incompatible.append("torch_dtype='bfloat16'")
+        if moe_implementation not in (None, "triton"):
+            incompatible.append("moe_implementation='triton'")
+        if enable_lora and lora_serving_mode is not None:
+            supported_lora_modes = set(deepep_capability.get("lora_serving_modes", ())) if deepep_capability else set()
+            if lora_serving_mode not in supported_lora_modes:
+                incompatible.append(
+                    f"lora_serving_mode in {sorted(supported_lora_modes)!r} (got {lora_serving_mode!r})"
+                )
+        if incompatible:
+            raise ValueError(
+                "deepep_native_exact rejects this unqualified configuration; requires " + ", ".join(incompatible)
+            )
+
+    if lora_serving_mode not in {None, "merged", "separate"}:
+        raise ValueError("lora_serving_mode must be 'merged' or 'separate'")
+    if deepep_native_exact and enable_lora and lora_serving_mode is None:
+        raise ValueError("Exact LoRA requires explicit lora_serving_mode='merged' or 'separate'")
+    if not enable_lora and lora_serving_mode is not None:
+        raise ValueError("lora_serving_mode requires enable_lora=True")
+
     config._ep_dispatch = ep_dispatch
     config.train_router = train_router
     config.record_routing_weights = record_routing_weights
     config._deepep_buffer_size_gb = deepep_buffer_size_gb
     config._deepep_num_sms = deepep_num_sms
     config._deepep_async_combine = deepep_async_combine
+    config._deepep_native_exact = bool(deepep_native_exact)
+    config._deepep_native_exact_capability = deepep_capability
+    config._lora_serving_mode = lora_serving_mode
     config._alltoall_combine_hidden_chunk_size = alltoall_combine_hidden_chunk_size
     config._router_fp32 = router_fp32
     config._lm_head_fp32 = lm_head_fp32
@@ -1030,6 +1106,13 @@ def build_foundation_model(
         # otherwise wedges the gang at the first MoE dispatch, minutes later.
         ep_state = get_parallel_state()
         if ep_state.ep_enabled:
+            if deepep_native_exact:
+                supported_ep_sizes = set(deepep_capability.get("supported_ep_sizes", ()))
+                if ep_state.ep_size not in supported_ep_sizes:
+                    raise ValueError(
+                        "deepep_native_exact model capability supports EP sizes "
+                        f"{sorted(supported_ep_sizes)}, got EP{ep_state.ep_size}"
+                    )
             from ..distributed.moe.deepep import preflight_internode_transport  # noqa: PLC0415
 
             preflight_internode_transport(
@@ -1037,10 +1120,12 @@ def build_foundation_model(
                 hidden_dim=getattr(config, "hidden_size", 0) or 2048,
                 buffer_size_gb=deepep_buffer_size_gb,
                 num_sms=deepep_num_sms,
+                buffer_hidden_bytes=((getattr(config, "hidden_size", 0) or 2048) * 2 if deepep_native_exact else None),
             )
         logger.info_rank0(
             f"DeepEP dispatch enabled (buffer={deepep_buffer_size_gb} GB, "
-            f"num_sms={deepep_num_sms}, async_combine={deepep_async_combine})"
+            f"num_sms={deepep_num_sms}, async_combine={deepep_async_combine}, "
+            f"native_exact={deepep_native_exact})"
         )
 
     # Validate attention implementation for packed sequences with FlashAttention kwargs

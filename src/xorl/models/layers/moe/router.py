@@ -128,6 +128,7 @@ class TopKRouter(nn.Module):
         topk_method: str | None = None,
         routed_scaling_factor: float | None = None,
         exact_batch_invariant: bool = False,
+        exact_weights_fp32: bool = False,
         exact_sqrtsoftplus_serving: bool = False,
     ):
         super().__init__()
@@ -152,6 +153,7 @@ class TopKRouter(nn.Module):
         self.topk_method = topk_method
         self.routed_scaling_factor = routed_scaling_factor
         self._exact_batch_invariant = exact_batch_invariant
+        self._exact_weights_fp32 = exact_weights_fp32
         self._exact_sqrtsoftplus_serving = exact_sqrtsoftplus_serving
         # Exact model programs are structural and must not be redirected by
         # process-wide diagnostic environment variables.
@@ -251,7 +253,11 @@ class TopKRouter(nn.Module):
             # sum(dim=-1) reduction is build-dependent; see bi_router_topk_weights).
             from xorl.ops.batch_invariant_ops import bi_router_topk_weights  # noqa: PLC0415
 
-            routing_weights = bi_router_topk_weights(routing_weights, self.norm_topk_prob, input_dtype)
+            routing_weights = bi_router_topk_weights(
+                routing_weights,
+                self.norm_topk_prob,
+                torch.float32 if self._exact_weights_fp32 else input_dtype,
+            )
         else:
             if self.norm_topk_prob:
                 routing_weights /= routing_weights.sum(dim=-1, keepdim=True)

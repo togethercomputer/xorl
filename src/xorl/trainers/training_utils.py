@@ -610,10 +610,26 @@ def pad_micro_batches_for_pp(
     if pad_to_multiple_of > 1 and target_sharded % pad_to_multiple_of != 0:
         target_sharded = ((target_sharded + pad_to_multiple_of - 1) // pad_to_multiple_of) * pad_to_multiple_of
 
+    # Every field here is storage-row aligned with input_ids after the
+    # sequence-shard collator.  PP padding must extend the whole objective,
+    # not only the model inputs: otherwise the terminal hidden state and the
+    # loss tensors describe different programs.
     _PAD_VALUES = {
-        "input_ids": 0,
         "labels": IGNORE_INDEX,
-        "attention_mask": 0,
+        "target_tokens": IGNORE_INDEX,
+        "logprobs": 0.0,
+        "old_logprobs": 0.0,
+        "ref_logprobs": 0.0,
+        "rollout_logprobs": 0.0,
+        "advantages": 0.0,
+        "weights": 0.0,
+        "teacher_ids": 0,
+        "teacher_cache_indices": 0,
+        "teacher_cache_local_indices": 0,
+        "teacher_weights": 0.0,
+        "hidden_match_weights": 0.0,
+        "opd_region_ids": 0,
+        "opd_sample_ok": 0,
         # Exact sampling-transform metadata must pad with the mathematical
         # identity so PP's fixed communication shape cannot change scoring.
         "logprob_temperatures": 1.0,
@@ -634,11 +650,35 @@ def pad_micro_batches_for_pp(
 
             for key, pad_value in _PAD_VALUES.items():
                 if key in mb and isinstance(mb[key], torch.Tensor):
+                    if mb[key].shape[-1] != ids_len:
+                        raise ValueError(
+                            f"PP token-aligned field {key!r} has {mb[key].shape[-1]} rows, but input_ids has {ids_len}"
+                        )
                     mb[key] = F.pad(mb[key], (0, pad_tokens), value=pad_value)
 
-            if "position_ids" in mb and isinstance(mb["position_ids"], torch.Tensor):
-                scale = mb["position_ids"].shape[-1] // ids_len if ids_len > 0 else 1
-                mb["position_ids"] = F.pad(mb["position_ids"], (0, pad_tokens * scale), value=0)
+            teacher_hidden = mb.get("teacher_hidden_states")
+            if isinstance(teacher_hidden, torch.Tensor):
+                if teacher_hidden.ndim != 3 or teacher_hidden.shape[1] != ids_len:
+                    raise ValueError(
+                        "PP token-aligned field 'teacher_hidden_states' must have shape "
+                        f"[batch, {ids_len}, hidden], got {tuple(teacher_hidden.shape)}"
+                    )
+                mb["teacher_hidden_states"] = F.pad(teacher_hidden, (0, 0, 0, pad_tokens), value=0.0)
+
+            # The sequence-shard collator retains these in the full CP domain,
+            # unlike token objectives and input_ids, which are CP-local.
+            for key in ("position_ids", "attention_mask"):
+                value = mb.get(key)
+                if isinstance(value, torch.Tensor):
+                    if ids_len <= 0 or value.shape[-1] % ids_len != 0:
+                        raise ValueError(
+                            f"PP full-domain field {key!r} has {value.shape[-1]} rows, "
+                            f"which is not an integer multiple of input_ids rows {ids_len}"
+                        )
+                    scale = value.shape[-1] // ids_len
+                    mb[key] = F.pad(value, (0, pad_tokens * scale), value=0)
+
+            mb["input_ids"] = F.pad(mb["input_ids"], (0, pad_tokens), value=0)
 
         for key in ("cu_seq_lens_q", "cu_seq_lens_k"):
             if key in mb and isinstance(mb[key], torch.Tensor):

@@ -121,10 +121,7 @@ def _exact_routed_runner(tmp_path, monkeypatch):
 def _assert_exact_routed_ownership_guard_rejects_invalid_runtime_ownership(tmp_path, monkeypatch) -> None:
     runner, _manager, model = _exact_routed_runner(tmp_path, monkeypatch)
 
-    with pytest.raises(AdapterGradientOwnershipError, match="requires managed FSDP ownership"):
-        runner._compile_registered_adapter_gradient_ownership("policy")
-
-    model.experts.ep_dispatch = "deepep"
-
-    with pytest.raises(AdapterGradientOwnershipError, match="exact EP16 alltoall routed lane"):
-        runner._compile_registered_adapter_gradient_ownership("policy")
+    for ep_dispatch in ("alltoall", "deepep"):
+        model.experts.ep_dispatch = ep_dispatch
+        with pytest.raises(AdapterGradientOwnershipError, match="requires managed FSDP ownership"):
+            runner._compile_registered_adapter_gradient_ownership("policy")

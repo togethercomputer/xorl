@@ -528,6 +528,13 @@ class ModelArguments:
         default=False,
         metadata={"help": "Enable async combine for DeepEP (overlap combine with next layer's compute)."},
     )
+    deepep_native_exact: bool = field(
+        default=False,
+        metadata={
+            "help": "Use the versioned real-dispatch DeepEP exact program: BF16 rank leaves "
+            "and the deterministic hierarchical receiver fold. Requires a frozen router."
+        },
+    )
     alltoall_combine_hidden_chunk_size: int = field(
         default=0,
         metadata={
@@ -1235,7 +1242,10 @@ class TrainingArguments:
         Used to decide whether routing replay is needed with EP: replay is only
         required when the MoE forward (including EP all-to-all) is recomputed.
         """
-        return self.gradient_checkpointing_method in (None, "recompute_full_layer")
+        return self.enable_gradient_checkpointing and self.gradient_checkpointing_method in (
+            None,
+            "recompute_full_layer",
+        )
 
     enable_full_shard: bool = field(
         default=True,
@@ -1865,6 +1875,14 @@ class LoRAArguments:
         default=False,
         metadata={"help": "Enable LoRA fine-tuning"},
     )
+    lora_serving_mode: Optional[Literal["merged", "separate"]] = field(
+        default=None,
+        metadata={
+            "help": "Exact train/serve LoRA contract. 'merged' publishes W+sBA and "
+            "serves without an active adapter; 'separate' publishes A/B factors and "
+            "serves through active-LoRA kernels. Required with deepep_native_exact LoRA."
+        },
+    )
     lora_rank: int = field(
         default=16,
         metadata={"help": "LoRA rank"},
@@ -2378,11 +2396,32 @@ class Arguments:
     def __post_init__(self):
         from xorl.qarl import qarl_unsupported_scope_reason  # noqa: PLC0415
 
+        if self.model.deepep_native_exact and self.train.expert_parallel_size <= 1:
+            raise ValueError("model.deepep_native_exact requires train.expert_parallel_size > 1; EP1 bypasses DeepEP")
+
+        if self.lora.lora_serving_mode not in {None, "merged", "separate"}:
+            raise ValueError("lora.lora_serving_mode must be 'merged' or 'separate'")
+        if self.model.deepep_native_exact and self.lora.enable_lora and self.lora.lora_serving_mode is None:
+            raise ValueError("Exact LoRA requires explicit lora.lora_serving_mode='merged' or 'separate'")
+        if not self.lora.enable_lora and self.lora.lora_serving_mode is not None:
+            raise ValueError("lora.lora_serving_mode requires lora.enable_lora=True")
+
+        if (
+            self.model.deepep_native_exact
+            and self.train.enable_gradient_checkpointing
+            and self.train.gradient_checkpointing_method == "recompute_full_layer"
+        ):
+            # Native exact owns live DeepEP dispatch/combine and recomputes its
+            # router independently. Checkpoint only the pre-dispatch trunk so
+            # backward never enters the process-wide routing-replay program.
+            self.train.gradient_checkpointing_method = "recompute_before_dispatch"
+
         if self.train.enable_fp8_training and (self.lora.enable_lora or self.lora.enable_qlora):
             raise ValueError("enable_fp8_training is a full-weight mode and cannot be combined with LoRA or QLoRA")
         if self.train.enable_qarl and (self.lora.enable_lora or self.lora.enable_qlora):
             raise ValueError("enable_qarl is a full-weight mode and cannot be combined with LoRA or QLoRA")
         if self.lora.block_fp8_qlora_training:
+            exact_active_lora = self.model.ep_dispatch == "alltoall"
             requirements = {
                 "lora.enable_lora": (self.lora.enable_lora, True),
                 "lora.enable_qlora": (self.lora.enable_qlora, True),
@@ -2390,8 +2429,10 @@ class Arguments:
                 "lora.quant_group_size": (self.lora.quant_group_size, 128),
                 "lora.moe_hybrid_shared_lora": (self.lora.moe_hybrid_shared_lora, True),
                 "model.moe_implementation": (self.model.moe_implementation, "triton"),
-                "model.ep_dispatch": (self.model.ep_dispatch, "deepep"),
-                "model.freeze_router": (self.model.freeze_router, True),
+                "model.ep_dispatch": (
+                    self.model.ep_dispatch,
+                    "alltoall" if exact_active_lora else "deepep",
+                ),
                 "model.merge_qkv": (self.model.merge_qkv, True),
             }
             mismatches = [
@@ -2401,6 +2442,13 @@ class Arguments:
             ]
             if mismatches:
                 raise ValueError("GLM-5.2 block-FP8 QLoRA rejects unsupported configuration: " + ", ".join(mismatches))
+            if exact_active_lora:
+                if self.model.train_router == self.model.freeze_router:
+                    raise ValueError(
+                        "GLM-5.2 exact block-FP8 QLoRA requires train_router and freeze_router to be complementary"
+                    )
+            elif self.model.train_router or not self.model.freeze_router:
+                raise ValueError("GLM-5.2 non-exact block-FP8 QLoRA requires train_router=False and freeze_router=True")
             if self.lora.lora_target_modules is not None or self.lora.lora_target_manifest is not None:
                 raise ValueError("GLM-5.2 block-FP8 QLoRA uses its complete deterministic target set")
             if self.lora.exclude_modules is not None:

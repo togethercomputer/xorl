@@ -103,6 +103,7 @@ def _mix_sampler_index_k_preparation(
     eps: float,
     position_embeddings: tuple[torch.Tensor, torch.Tensor],
     sampler_prefill_lengths: torch.Tensor | None,
+    sample_lengths: list[int] | tuple[int, ...] | torch.Tensor | None = None,
     *,
     query_offset: int,
     interleaved: bool,
@@ -112,45 +113,107 @@ def _mix_sampler_index_k_preparation(
 
     if sampler_prefill_lengths is None:
         return split_prepared_key
-    if sampler_prefill_lengths.ndim != 1 or sampler_prefill_lengths.numel() != raw_key.shape[0]:
-        raise ValueError(
-            "GLM-5.2 sampler_prefill_lengths must contain one boundary per batch row, "
-            f"got {tuple(sampler_prefill_lengths.shape)} for batch={raw_key.shape[0]}"
-        )
+    if sampler_prefill_lengths.ndim != 1:
+        raise ValueError("GLM-5.2 sampler_prefill_lengths must be a rank-one tensor")
     if sampler_prefill_lengths.dtype not in (torch.int32, torch.int64):
         raise TypeError("GLM-5.2 sampler_prefill_lengths must be an integer tensor")
     if query_offset < 0:
         raise ValueError(f"GLM-5.2 exact indexer query_offset must be nonnegative, got {query_offset}")
 
+    if isinstance(sample_lengths, torch.Tensor):
+        sample_lengths = sample_lengths.detach().cpu().reshape(-1).tolist()
+    if sample_lengths is not None:
+        sample_lengths = [int(length) for length in sample_lengths]
+        if raw_key.shape[0] != 1:
+            raise ValueError(
+                f"GLM-5.2 packed sampler metadata requires one packed batch row, got batch={raw_key.shape[0]}"
+            )
+        if len(sample_lengths) != sampler_prefill_lengths.numel():
+            raise ValueError(
+                "GLM-5.2 sampler metadata requires one prefill boundary per packed request: "
+                f"prefills={sampler_prefill_lengths.numel()} sample_lengths={sample_lengths}"
+            )
+        if any(length <= 0 for length in sample_lengths):
+            raise ValueError(f"GLM-5.2 packed request lengths must be positive, got {sample_lengths}")
+    elif sampler_prefill_lengths.numel() != raw_key.shape[0]:
+        raise ValueError(
+            "GLM-5.2 sampler_prefill_lengths must contain one boundary per batch row when "
+            "packed request lengths are absent, "
+            f"got {tuple(sampler_prefill_lengths.shape)} for batch={raw_key.shape[0]}"
+        )
+
     cos, sin = position_embeddings
-    mixed_rows = []
     local_length = raw_key.shape[1]
-    for batch_index in range(raw_key.shape[0]):
-        prefill_length = int(sampler_prefill_lengths[batch_index].item())
-        if prefill_length <= 0:
-            raise ValueError(f"GLM-5.2 sampler prefill length must be positive, got {prefill_length}")
-        suffix_start = min(max(prefill_length - query_offset, 0), local_length)
-        if suffix_start == local_length:
-            mixed_rows.append(split_prepared_key[batch_index : batch_index + 1])
-            continue
+
+    def _mix_slice(batch_index: int, local_start: int, local_end: int, prefill_end: int) -> torch.Tensor:
+        split_slice = split_prepared_key[batch_index : batch_index + 1, local_start:local_end]
+        suffix_start = min(max(prefill_end - query_offset, local_start), local_end)
+        if suffix_start == local_end:
+            return split_slice
         fused_suffix = _fused_sampler_index_k_prepare(
-            raw_key[batch_index : batch_index + 1, suffix_start:],
+            raw_key[batch_index : batch_index + 1, suffix_start:local_end],
             norm_weight,
             norm_bias,
             eps,
             (
-                cos[batch_index : batch_index + 1, suffix_start:],
-                sin[batch_index : batch_index + 1, suffix_start:],
+                cos[batch_index : batch_index + 1, suffix_start:local_end],
+                sin[batch_index : batch_index + 1, suffix_start:local_end],
             ),
             interleaved=interleaved,
             _native_kernel_for_testing=_native_kernel_for_testing,
         )
-        mixed_rows.append(
-            torch.cat(
-                (split_prepared_key[batch_index : batch_index + 1, :suffix_start], fused_suffix),
-                dim=1,
+        return torch.cat((split_slice[:, : suffix_start - local_start], fused_suffix), dim=1)
+
+    if sample_lengths is not None:
+        mixed_slices = []
+        request_start = 0
+        local_global_start = query_offset
+        local_global_end = query_offset + local_length
+        for sample_length, prefill_value in zip(
+            sample_lengths,
+            sampler_prefill_lengths.detach().cpu().tolist(),
+            strict=True,
+        ):
+            prefill_length = int(prefill_value)
+            request_end = request_start + sample_length
+            if prefill_length <= 0 or prefill_length > sample_length:
+                raise ValueError(
+                    "GLM-5.2 sampler prefill length must satisfy 0 < prefill <= request length, "
+                    f"got prefill={prefill_length} request_length={sample_length}"
+                )
+            overlap_start = max(request_start, local_global_start)
+            overlap_end = min(request_end, local_global_end)
+            if overlap_start < overlap_end:
+                local_start = overlap_start - local_global_start
+                local_end = overlap_end - local_global_start
+                mixed_slices.append(
+                    _mix_slice(
+                        0,
+                        local_start,
+                        local_end,
+                        request_start + prefill_length,
+                    )
+                )
+            request_start = request_end
+        if request_start < local_global_end:
+            padding_start = max(request_start - local_global_start, 0)
+            mixed_slices.append(split_prepared_key[:, padding_start:])
+        if not mixed_slices:
+            return split_prepared_key
+        mixed = torch.cat(mixed_slices, dim=1)
+        if mixed.shape[1] != local_length:
+            raise ValueError(
+                "GLM-5.2 packed request lengths do not cover the local indexer rows: "
+                f"sample_lengths={sample_lengths} query_offset={query_offset} local_length={local_length}"
             )
-        )
+        return mixed
+
+    mixed_rows = []
+    for batch_index in range(raw_key.shape[0]):
+        prefill_length = int(sampler_prefill_lengths[batch_index].item())
+        if prefill_length <= 0:
+            raise ValueError(f"GLM-5.2 sampler prefill length must be positive, got {prefill_length}")
+        mixed_rows.append(_mix_slice(batch_index, 0, local_length, prefill_length))
     return torch.cat(mixed_rows, dim=0)
 
 
@@ -251,6 +314,7 @@ class Glm5DsaIndexer(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         *,
         sampler_prefill_lengths: torch.Tensor | None = None,
+        sample_lengths: list[int] | tuple[int, ...] | torch.Tensor | None = None,
         query_offset: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Compute index_query, index_key, head_weights.
@@ -347,6 +411,7 @@ class Glm5DsaIndexer(nn.Module):
                 self.k_norm.eps,
                 position_embeddings,
                 sampler_prefill_lengths,
+                sample_lengths,
                 query_offset=query_offset,
                 interleaved=getattr(self.config, "indexer_rope_interleave", True),
             )
@@ -650,6 +715,7 @@ class Glm5DsaIndexer(nn.Module):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None = None,
         sampler_prefill_lengths: torch.Tensor | None = None,
+        sample_lengths: list[int] | tuple[int, ...] | torch.Tensor | None = None,
     ) -> torch.Tensor:
         """One-shot indexer: project + score + top-k.
 
@@ -665,6 +731,7 @@ class Glm5DsaIndexer(nn.Module):
                 q_compressed,
                 position_embeddings,
                 sampler_prefill_lengths=sampler_prefill_lengths,
+                sample_lengths=sample_lengths,
             )
             return self.select_topk(index_q, index_k, head_weights, attention_mask)
 

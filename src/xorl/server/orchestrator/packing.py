@@ -334,6 +334,61 @@ def apply_advantages_to_labels(
     return labels_tensor.tolist()
 
 
+def derive_sampler_prefill_length(
+    raw_target_tokens: List[int],
+    *,
+    weights: Optional[List[float]],
+    advantages: Optional[List[float]],
+    sample_idx: int,
+) -> int:
+    """Recover the sampler's prefill/decode boundary before loss masking.
+
+    Shifted RL payloads may retain ordinary token IDs in every target slot, so
+    ``IGNORE_INDEX`` alone is not a structural action marker. Binary ``weights``
+    are authoritative when present. Advantages also carry the prompt mask when
+    they contain a live action. An all-zero trajectory may fall back only to an
+    explicit raw ``IGNORE_INDEX`` prompt mask; ordinary target IDs are
+    ambiguous and fail closed.
+    """
+
+    seq_len = len(raw_target_tokens)
+    if weights is not None:
+        if len(weights) != seq_len:
+            raise ValueError(
+                f"Sample {sample_idx}: weights length ({len(weights)}) doesn't match target_tokens length ({seq_len})"
+            )
+        first_action = next(
+            (index for index, weight in enumerate(weights) if weight != 0),
+            None,
+        )
+        return first_action + 1 if first_action is not None else seq_len
+
+    if advantages is not None:
+        if len(advantages) != seq_len:
+            raise ValueError(
+                f"Sample {sample_idx}: advantages length ({len(advantages)}) "
+                f"doesn't match target_tokens length ({seq_len})"
+            )
+        first_action = next(
+            (index for index, advantage in enumerate(advantages) if advantage != 0),
+            None,
+        )
+        if first_action is not None:
+            return first_action + 1
+        if all(target != IGNORE_INDEX for target in raw_target_tokens):
+            raise ValueError(
+                f"Sample {sample_idx}: cannot infer the sampler prefill boundary "
+                "from ordinary target tokens and all-zero advantages; provide "
+                "an explicit weights/action mask"
+            )
+
+    first_sampled_target = next(
+        (index for index, target in enumerate(raw_target_tokens) if target != IGNORE_INDEX),
+        None,
+    )
+    return first_sampled_target + 1 if first_sampled_target is not None else seq_len
+
+
 def apply_loss_masks_to_target_tokens(
     target_tokens: Any,
     *,
@@ -673,9 +728,28 @@ class SequentialPacker(Packer):
         # Phase 3: build a packed micro-batch per (non-empty) bin.
         micro_batches: List[Dict[str, Any]] = []
         datum_order: List[int] = []
+        homogeneous_bins: List[List[_MeasuredSample]] = []
         for bin_samples in bins:
             if not bin_samples:
                 continue
+            # A shifted RL request needs per-request sampler boundaries for
+            # exact DSV4 MHC replay, whereas an HF-format request intentionally
+            # has no such side channel. Never combine the two arithmetic
+            # contracts in one packed row. Split only at format transitions so
+            # arrival order and each strategy's bin assignment stay stable.
+            current_run: List[_MeasuredSample] = []
+            current_has_boundary: Optional[bool] = None
+            for sample in bin_samples:
+                has_boundary = self._has_sampler_boundary(sample.datum)
+                if current_run and has_boundary != current_has_boundary:
+                    homogeneous_bins.append(current_run)
+                    current_run = []
+                current_run.append(sample)
+                current_has_boundary = has_boundary
+            if current_run:
+                homogeneous_bins.append(current_run)
+
+        for bin_samples in homogeneous_bins:
             current_batch = self._create_empty_packed_batch(request_id, batch_id=len(micro_batches))
             for sample in bin_samples:
                 self._add_sample_to_packed_batch(current_batch, sample.datum, sample.orig_idx)
@@ -709,6 +783,19 @@ class SequentialPacker(Packer):
         if not isinstance(input_ids, list):
             input_ids = input_ids.tolist() if hasattr(input_ids, "tolist") else list(input_ids)
         return input_ids
+
+    @classmethod
+    def _has_sampler_boundary(cls, datum: Dict[str, Any]) -> bool:
+        """Return whether ``datum`` is an already-shifted RL request."""
+
+        input_ids = cls._extract_input_ids(datum)
+        loss_inputs = datum.get("loss_fn_inputs")
+        target_tokens = loss_inputs.get("target_tokens") if isinstance(loss_inputs, dict) else None
+        if "target_tokens" in datum:
+            target_tokens = datum["target_tokens"]
+        if input_ids is None or target_tokens is None:
+            return False
+        return len(input_ids) == len(target_tokens)
 
     def _measure_and_filter(
         self,
@@ -952,6 +1039,7 @@ class SequentialPacker(Packer):
             "batch_id": batch_id,
             "_num_samples": 0,  # Internal counter, removed in finalization
             "_r3_sample_lengths": [],
+            "_sampler_prefill_lengths_complete": True,
         }
 
     def _add_sample_to_packed_batch(
@@ -1035,6 +1123,24 @@ class SequentialPacker(Packer):
         # HF format: len(input_ids) == len(labels) but need shifting
         is_already_shifted = "target_tokens" in flattened_datum and len(input_ids) == len(labels)
 
+        sampler_prefill_length = None
+        if is_already_shifted:
+            # Preserve the sampler's arithmetic boundary before loss masks can
+            # replace generated targets with IGNORE_INDEX. The exact DSV4
+            # trainer uses this per-request metadata to replay one prefill
+            # segment followed by M=1 decode segments inside a packed row.
+            raw_target_tokens = flattened_datum["target_tokens"]
+            if not isinstance(raw_target_tokens, list):
+                raw_target_tokens = (
+                    raw_target_tokens.tolist() if hasattr(raw_target_tokens, "tolist") else list(raw_target_tokens)
+                )
+            sampler_prefill_length = derive_sampler_prefill_length(
+                raw_target_tokens,
+                weights=weights,
+                advantages=advantages,
+                sample_idx=sample_idx,
+            )
+
         if not is_already_shifted and len(input_ids) == len(labels):
             # HF format: shift tokens here
             # input_ids[:-1] predicts labels[1:]
@@ -1072,6 +1178,16 @@ class SequentialPacker(Packer):
 
         seq_len = len(input_ids)
         batch["_r3_sample_lengths"].append(seq_len)
+        if sampler_prefill_length is None:
+            # MHC replay metadata is useful only when it describes every
+            # request in the packed row. A mixed HF/shifted batch therefore
+            # carries no boundary side channel rather than a shorter one.
+            batch["_sampler_prefill_lengths_complete"] = False
+            batch.pop("sampler_prefill_lengths", None)
+        elif batch["_sampler_prefill_lengths_complete"]:
+            # One scalar boundary per packed request. Unlike token-aligned
+            # fields this list must remain rank one after finalization.
+            batch.setdefault("sampler_prefill_lengths", []).append(sampler_prefill_length)
 
         # Concatenate input_ids to flat list
         batch["input_ids"].extend(input_ids)
@@ -1227,6 +1343,7 @@ class SequentialPacker(Packer):
         # Store num_samples for reference and remove internal counter
         num_samples = batch.pop("_num_samples")
         batch["num_samples"] = num_samples
+        batch.pop("_sampler_prefill_lengths_complete", None)
         # Drop OPRD internal accumulators (ints) so they never reach the model forward
         # as stray kwargs; the offsets they tracked are already baked into the fields.
         batch.pop("_oprd_cum_teacher_len", None)
@@ -1242,6 +1359,7 @@ class SequentialPacker(Packer):
                 "batch_id",
                 "num_samples",
                 "_r3_sample_lengths",
+                "sampler_prefill_lengths",
             ]:
                 if isinstance(value, list) and len(value) == len(batch["input_ids"][0]):
                     batch[key] = [value]
@@ -1268,6 +1386,7 @@ class SequentialPacker(Packer):
                         "num_samples",
                         "_shifted",
                         "_r3_sample_lengths",
+                        "sampler_prefill_lengths",
                     ):
                         continue
                     if isinstance(value, list) and len(value) == 1 and isinstance(value[0], list):
@@ -1389,12 +1508,12 @@ class SequentialPacker(Packer):
                 raw_target_tokens = (
                     raw_target_tokens.tolist() if hasattr(raw_target_tokens, "tolist") else list(raw_target_tokens)
                 )
-            first_sampled_target = next(
-                (index for index, target in enumerate(raw_target_tokens) if target != IGNORE_INDEX),
-                None,
+            sampler_prefill_length = derive_sampler_prefill_length(
+                raw_target_tokens,
+                weights=weights,
+                advantages=advantages,
+                sample_idx=sample_idx,
             )
-            if first_sampled_target is not None:
-                sampler_prefill_length = first_sampled_target + 1
         if labels and not is_already_shifted and len(input_ids) == len(labels):
             logger.warning(
                 "Sample %s has labels with the same length as input_ids; treating it as HF-format data "

@@ -11,7 +11,10 @@ from torch import nn
 import xorl.models.transformers.glm5.exact_lm_head_qlora as exact_lm_head_impl
 from xorl.distributed.torch_parallelize import _exact_lm_head_replicated_params
 from xorl.models.module_utils import get_lm_head_weight
-from xorl.models.transformers.glm5.exact_lm_head_qlora import Glm52ExactTP16LmHeadLoraLinear
+from xorl.models.transformers.glm5.exact_lm_head_qlora import (
+    Glm52ExactTP16LmHeadLoraLinear,
+    Glm52ExactTP16LmHeadSelectedLogprob,
+)
 from xorl.ops.loss.per_token_ce import compute_per_token_ce
 from xorl.server.runner.model_runner import ModelRunner
 from xorl.trainers.training_utils import make_pp_loss_fn
@@ -185,6 +188,34 @@ def test_exact_head_fsdp_ignores_only_replicated_a() -> None:
     lm_head._glm52_exact_replicated_parameter_names = ("lora_A", "lora_B")
     with pytest.raises(RuntimeError, match="declare only lora_A"):
         _exact_lm_head_replicated_params(lm_head)
+
+
+def test_exact_head_rejects_frozen_logical_factor_before_local_view_conversion() -> None:
+    lm_head = _tiny_exact_head()
+    lm_head._glm52_exact_selected_logprob = Glm52ExactTP16LmHeadSelectedLogprob(
+        tp_rank=0,
+        vocab_start=0,
+        vocab_end=9_680,
+        padded_vocab_start=0,
+        padded_vocab_end=9_680,
+    )
+    lm_head.lora_B.requires_grad_(False)
+
+    with pytest.raises(RuntimeError, match="logical factor masters must both be trainable"):
+        exact_lm_head_impl.glm52_exact_lm_head_per_token_ce(
+            torch.zeros((1, 4), dtype=torch.bfloat16),
+            lm_head.weight,
+            torch.tensor([0], dtype=torch.int64),
+            lm_head=lm_head,
+            ignore_index=-100,
+            ce_mode="bi_fused",
+            lm_head_fp32=True,
+            logprob_temperature=1.0,
+            logprob_top_ks=None,
+            logprob_top_ps=None,
+            logprob_min_ps=None,
+            tp_group=None,
+        )
 
 
 def test_pp_exact_head_loss_matches_dispatcher_value_and_gradients(monkeypatch: pytest.MonkeyPatch) -> None:

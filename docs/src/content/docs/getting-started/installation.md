@@ -13,9 +13,9 @@ XoRL ships a single combined dependency profile:
 
 | Manifest | PyTorch / CUDA runtime | Triton | Attention stack | Use it for |
 |---|---|---|---|---|
-| `pyproject.toml` | 2.11.0 / CUDA 13 | 3.6.0 | FlashAttention 4 (`4.0.0b19`) | Local training, the XoRL training server, and the pinned xorl-sglang submodule, all in one environment |
+| `pyproject.toml` | 2.12.1 / CUDA 13.2 | 3.7.1 | FlashAttention 4 (`4.0.0b19`) | Local training, the XoRL training server, the pinned xorl-sglang submodule, and DeepEP, all in one environment |
 
-The PyTorch 2.11 pins match the checked-in xorl-sglang package metadata, so its compiled `sglang-kernel` extension loads in the same environment. Do not upgrade or mix the pinned Torch, Triton, or attention packages independently.
+The PyTorch 2.12.1+cu132 pins match the checked-in xorl-sglang package metadata and the pinned DeepEP wheel. Do not upgrade or mix the pinned Torch, Triton, DeepEP, or attention packages independently.
 
 ## Clone the repo
 
@@ -66,19 +66,40 @@ The default XoRL dependency set already installs `xorl-client` from its public r
 pip install -e submodules/xorl-client
 ```
 
-xorl-sglang installs into the same environment as XoRL: the default profile pins the PyTorch 2.11 stack its compiled `sglang-kernel` extension is built against, and the install steps above already include it (uv via `[tool.uv.sources]`, conda via the explicit editable install).
+xorl-sglang installs into the same environment as XoRL: the default profile pins the PyTorch 2.12.1+cu132 stack its compiled extensions and DeepEP wheel target, and the install steps above already include it (uv via `[tool.uv.sources]`, conda via the explicit editable install).
 
 ## Verify Installation
 
 ```bash
 python -c "import torch, triton, xorl, sglang; print(torch.__version__, triton.__version__, xorl.__version__)"
 python -c "from flash_attn.cute import flash_attn_func; print('FlashAttention 4 ok')"
-python -c "import sgl_kernel; print('sglang-kernel ok')"
+python - <<'PY'
+import torch
+from sgl_kernel import moe_sum_reduce
+
+x = torch.arange(2 * 4 * 16, device="cuda", dtype=torch.bfloat16).reshape(2, 4, 16)
+out = torch.empty((2, 16), device="cuda", dtype=torch.bfloat16)
+moe_sum_reduce(x, out, 1.0)
+torch.cuda.synchronize()
+torch.testing.assert_close(out, x.float().sum(dim=1).to(torch.bfloat16), rtol=0, atol=0)
+print("sglang-kernel MoE GPU operation ok")
+PY
 ```
 
-## DeepEP Install (Optional)
+## DeepEP Backend
 
-DeepEP is a GPU-resident MoE dispatch backend. It uses high-speed GPU interconnects within a node and NVSHMEM/GPUDirect RDMA for supported multi-node deployments. It is only required when using `ep_dispatch: deepep`; the default `ep_dispatch: alltoall` works without it. Install it from [DeepSeek's DeepEP repository](https://github.com/deepseek-ai/DeepEP), then verify it separately with `python -c "import deep_ep; print('DeepEP ok')"`.
+DeepEP is a GPU-resident MoE dispatch backend. It uses high-speed GPU interconnects within a node and NVSHMEM/GPUDirect RDMA for supported multi-node deployments. It is only required when using `ep_dispatch: deepep`; the default `ep_dispatch: alltoall` works without it.
+
+The default XoRL profile installs the pinned wheel for Python 3.12 and PyTorch 2.12.1+cu132. Verify it after the main installation:
+
+```bash
+python -c "import deep_ep; print('DeepEP ok')"
+```
+
+The wheel URLs, source revisions, and hashes are recorded in
+`vendor/deepep-release.lock.json` and
+`vendor/sglang-kernel-release.lock.json`. Ordinary DeepEP retains stock reduction.
+Setting `deepep_native_exact=true` selects deterministic hierarchical combine.
 
 ### Multi-node prerequisites
 

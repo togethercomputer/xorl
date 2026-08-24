@@ -288,6 +288,113 @@ def test_packing_disabled_derives_sampler_boundaries_before_advantage_masking():
     assert batches[0]["target_tokens"] == [[IGNORE_INDEX] * 4]
 
 
+@pytest.mark.parametrize("enable_packing", [False, True])
+@pytest.mark.parametrize("mask_name", ["weights", "advantages"])
+def test_sampler_boundary_uses_action_mask_when_targets_are_ordinary_ids(enable_packing, mask_name):
+    packer = SequentialPacker(
+        enable_packing=enable_packing,
+        log_stats=False,
+        pad_to_multiple_of=1,
+    )
+    datum = {
+        "input_ids": [11, 12, 13, 21],
+        "target_tokens": [12, 13, 21, 22],
+        mask_name: [0.0, 0.0, 1.0, 1.0],
+    }
+
+    batch = packer.pack([datum], max_seq_len=16, request_id=f"ordinary-targets-{mask_name}")[0]
+
+    assert batch["sampler_prefill_lengths"] == [3]
+    assert batch["labels"] == [[IGNORE_INDEX, IGNORE_INDEX, 21, 22]]
+
+
+@pytest.mark.parametrize("enable_packing", [False, True])
+def test_sampler_boundary_rejects_ambiguous_all_zero_advantages(enable_packing):
+    packer = SequentialPacker(
+        enable_packing=enable_packing,
+        log_stats=False,
+        pad_to_multiple_of=1,
+    )
+    datum = {
+        "input_ids": [11, 12, 13, 21],
+        "target_tokens": [12, 13, 21, 22],
+        "advantages": [0.0, 0.0, 0.0, 0.0],
+    }
+
+    with pytest.raises(ValueError, match="cannot infer the sampler prefill boundary"):
+        packer.pack([datum], max_seq_len=16, request_id="ambiguous-boundary")
+
+
+def test_packing_disabled_emits_full_boundary_for_prompt_only_shifted_request():
+    packer = SequentialPacker(enable_packing=False, log_stats=False, pad_to_multiple_of=1)
+
+    batch = packer.pack(
+        [{"input_ids": [11, 12, 13], "target_tokens": [IGNORE_INDEX] * 3}],
+        max_seq_len=16,
+        request_id="prompt-only-boundary",
+    )[0]
+
+    assert batch["sampler_prefill_lengths"] == [3]
+
+
+def test_packing_enabled_preserves_one_sampler_boundary_per_request():
+    packer = SequentialPacker(enable_packing=True, log_stats=False, pad_to_multiple_of=8)
+    data = [
+        {
+            "model_input": {"input_ids": [11, 12, 13, 21]},
+            "loss_fn_inputs": {
+                "target_tokens": [IGNORE_INDEX, IGNORE_INDEX, 21, 22],
+                "advantages": [0.0, 0.0, 0.0, 0.0],
+            },
+        },
+        {
+            "model_input": {"input_ids": [31, 41]},
+            "loss_fn_inputs": {
+                "target_tokens": [41, 42],
+                "advantages": [1.0, 1.0],
+            },
+        },
+    ]
+
+    batches = packer.pack(data, max_seq_len=16, request_id="test-packed-sampler-boundaries")
+
+    assert len(batches) == 1
+    batch = batches[0]
+    assert batch["_r3_sample_lengths"] == [4, 2]
+    assert batch["sampler_prefill_lengths"] == [3, 1]
+    assert batch["labels"][0][:4] == [IGNORE_INDEX] * 4
+    assert len(batch["input_ids"][0]) == 8
+
+
+def test_packing_enabled_emits_full_boundary_for_prompt_only_shifted_request():
+    packer = SequentialPacker(enable_packing=True, log_stats=False, pad_to_multiple_of=1)
+    data = [
+        {"input_ids": [11, 12, 13], "target_tokens": [IGNORE_INDEX] * 3},
+        {"input_ids": [21, 22], "target_tokens": [IGNORE_INDEX, 23]},
+    ]
+
+    batch = packer.pack(data, max_seq_len=16, request_id="prompt-only-boundary")[0]
+
+    assert batch["_r3_sample_lengths"] == [3, 2]
+    assert batch["sampler_prefill_lengths"] == [3, 2]
+
+
+def test_packing_enabled_splits_mixed_sampler_boundary_contracts():
+    packer = SequentialPacker(enable_packing=True, log_stats=False, pad_to_multiple_of=1)
+    data = [
+        {"input_ids": [11, 12, 13], "labels": [12, 13, 14]},
+        {"input_ids": [21, 22], "target_tokens": [IGNORE_INDEX, 23]},
+    ]
+
+    batches = packer.pack(data, max_seq_len=16, request_id="mixed-boundaries")
+
+    assert len(batches) == 2
+    assert batches[0]["_r3_sample_lengths"] == [2]
+    assert "sampler_prefill_lengths" not in batches[0]
+    assert batches[1]["_r3_sample_lengths"] == [2]
+    assert batches[1]["sampler_prefill_lengths"] == [2]
+
+
 def test_packing_disabled_warns_on_hf_shift(monkeypatch):
     """HF labels should warn when shifted in the non-packed path."""
     packer = SequentialPacker(enable_packing=False, log_stats=False, pad_to_multiple_of=1)

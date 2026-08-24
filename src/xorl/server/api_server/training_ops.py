@@ -315,7 +315,7 @@ class TrainingOpsMixin:
 
             # Debug: Log what we got from the engine
             logger.debug(f"API Server: Received result from engine, keys: {list(result.keys())}")
-            loss_metrics = {k: v for k, v in result.items() if k.startswith(("is_", "opd_"))}
+            loss_metrics = {k: v for k, v in result.items() if k.startswith(("is_", "opd_", "router_grad_", "dsv4_"))}
             if loss_metrics:
                 logger.debug(f"API Server: loss metrics present in result: {list(loss_metrics.keys())}")
             else:
@@ -338,7 +338,7 @@ class TrainingOpsMixin:
 
             # Add loss-specific metrics if present (already have name:reduction format)
             for key, value in result.items():
-                if key.startswith(("is_", "opd_")):
+                if key.startswith(("is_", "opd_", "router_grad_", "router_update_", "dsv4_")):
                     # Ensure colon format for tinker compatibility
                     metrics[key if ":" in key else f"{key}:mean"] = value
                 elif key in (
@@ -347,6 +347,10 @@ class TrainingOpsMixin:
                     "teacher_hidden_cache_write_s",
                 ):
                     metrics[key] = value
+
+            for key, value in result.items():
+                if key.startswith("router_grad_"):
+                    metrics[f"is_{key}:mean"] = value
                 elif (
                     key.startswith("executor_")
                     or key in PROFILE_TIMING_METRIC_KEYS
@@ -440,7 +444,7 @@ class TrainingOpsMixin:
                 "execution_time": result.get("execution_time", 0.0),
             }
             for key, value in result.items():
-                if key.startswith(("is_", "opd_")):
+                if key.startswith(("is_", "opd_", "router_grad_", "dsv4_")):
                     metrics[key if ":" in key else f"{key}:mean"] = value
                 elif key in (
                     "teacher_prefill_tokens",
@@ -558,6 +562,9 @@ class TrainingOpsMixin:
             for key in ("optim_step_time", "optim_empty_cache_skipped", "glm52_fullparam_publish"):
                 if key in result:
                     metrics[key] = result[key]
+            for key, value in result.items():
+                if key.startswith("router_update_"):
+                    metrics[key] = value
 
             return OptimStepResponse(
                 metrics=metrics,

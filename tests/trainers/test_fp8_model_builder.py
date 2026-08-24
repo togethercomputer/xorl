@@ -16,6 +16,16 @@ from xorl.trainers.model_builder import (
 pytestmark = [pytest.mark.cpu]
 
 
+def test_build_training_model_rejects_native_exact_without_ep():
+    with pytest.raises(ValueError, match="expert_parallel_size > 1"):
+        build_training_model(
+            config_path="unused",
+            weights_path="unused",
+            deepep_native_exact=True,
+            expert_parallel_size=1,
+        )
+
+
 class TinyDenseMoEModel(nn.Module):
     _no_split_modules = []
 
@@ -134,6 +144,126 @@ def _assert_build_training_model_applies_full_model_fp8_training(monkeypatch):
     assert type(result.model.gate).__name__ == "FP8Linear"
     assert type(result.model.lm_head).__name__ == "FP8Linear"
     assert all(param.requires_grad for param in result.model.parameters())
+
+
+def test_build_training_model_threads_sharded_lm_head_loss_to_parallelize(monkeypatch):
+    captured = {}
+
+    def fake_build_foundation_model(**_kwargs):
+        return TinyDenseOnlyModel()
+
+    def fake_parallelize(model, **kwargs):
+        captured.update(kwargs)
+        return model
+
+    monkeypatch.setattr("xorl.trainers.model_builder.build_foundation_model", fake_build_foundation_model)
+    monkeypatch.setattr("xorl.trainers.model_builder._parallelize", fake_parallelize)
+    monkeypatch.setattr("xorl.trainers.model_builder.helper.print_device_mem_info", lambda *args, **kwargs: None)
+
+    build_training_model(
+        config_path="unused",
+        weights_path="unused",
+        fsdp_sharded_lm_head_loss=True,
+        enable_mixed_precision=False,
+        enable_gradient_checkpointing=False,
+    )
+
+    assert captured["fsdp_sharded_lm_head_loss"] is True
+
+
+def test_build_training_model_threads_glm52_block_fp8_qlora_mode(monkeypatch):
+    captured = {}
+    inventory = object()
+
+    def fake_build_foundation_model(**kwargs):
+        captured["foundation_flag"] = kwargs["block_fp8_qlora_training"]
+        captured["foundation_rank"] = kwargs["lora_rank"]
+        captured["foundation_alpha"] = kwargs["lora_alpha"]
+        return TinyDenseOnlyModel()
+
+    def fake_inject_qlora(model, **kwargs):
+        captured["inject_flag"] = kwargs["block_fp8_qlora_training"]
+        captured["quant_format"] = kwargs["quant_format"]
+        captured["quant_group_size"] = kwargs["quant_group_size"]
+        model._glm52_adapter_inventory = inventory
+        return True, "block_fp8", set()
+
+    monkeypatch.setattr("xorl.trainers.model_builder.build_foundation_model", fake_build_foundation_model)
+    monkeypatch.setattr("xorl.trainers.model_builder._inject_qlora", fake_inject_qlora)
+    monkeypatch.setattr("xorl.trainers.model_builder._deferred_qlora_quantize", lambda *args, **kwargs: None)
+    monkeypatch.setattr("xorl.trainers.model_builder._parallelize", lambda model, **_kwargs: model)
+    monkeypatch.setattr("xorl.trainers.model_builder.helper.print_device_mem_info", lambda *args, **kwargs: None)
+
+    result = build_training_model(
+        config_path="unused",
+        weights_path="unused",
+        moe_implementation="triton",
+        ep_dispatch="deepep",
+        enable_lora=True,
+        enable_qlora=True,
+        block_fp8_qlora_training=True,
+        quant_format="block_fp8",
+        quant_group_size=128,
+        moe_hybrid_shared_lora=True,
+        freeze_router=True,
+        enable_mixed_precision=False,
+        enable_gradient_checkpointing=False,
+    )
+
+    assert captured == {
+        "foundation_flag": True,
+        "foundation_rank": 32,
+        "foundation_alpha": 16,
+        "inject_flag": True,
+        "quant_format": "block_fp8",
+        "quant_group_size": 128,
+    }
+    assert result.glm52_adapter_inventory is inventory
+
+
+def test_build_training_model_retains_exact_glm52_router_after_post_fsdp_qlora_freeze(monkeypatch):
+    inventory = object()
+
+    def fake_build_foundation_model(**_kwargs):
+        model = TinyDenseOnlyModel()
+        model.config.train_router = True
+        # Match the production local-router inventory seam, which counts
+        # sparse blocks rather than arbitrary modules that happen to own a gate.
+        model.mlp = type("Glm5MoEBlock", (nn.Module,), {})()
+        model.mlp.gate = nn.Linear(16, 2, bias=False)
+        return model
+
+    def fake_inject_qlora(model, **_kwargs):
+        model.proj.register_parameter("lora_A", nn.Parameter(model.proj.weight.new_zeros((1, 16))))
+        model._glm52_adapter_inventory = inventory
+        return True, "block_fp8", set()
+
+    monkeypatch.setattr("xorl.trainers.model_builder.build_foundation_model", fake_build_foundation_model)
+    monkeypatch.setattr("xorl.trainers.model_builder._inject_qlora", fake_inject_qlora)
+    monkeypatch.setattr("xorl.trainers.model_builder._deferred_qlora_quantize", lambda *args, **kwargs: None)
+    monkeypatch.setattr("xorl.trainers.model_builder._parallelize", lambda model, **_kwargs: model)
+    monkeypatch.setattr("xorl.trainers.model_builder.glm52_exact_active_lora_enabled", lambda _config: True)
+    monkeypatch.setattr("xorl.trainers.model_builder.helper.print_device_mem_info", lambda *args, **kwargs: None)
+
+    result = build_training_model(
+        config_path="unused",
+        weights_path="unused",
+        moe_implementation="triton",
+        ep_dispatch="deepep",
+        enable_lora=True,
+        enable_qlora=True,
+        block_fp8_qlora_training=True,
+        quant_format="block_fp8",
+        quant_group_size=128,
+        moe_hybrid_shared_lora=True,
+        freeze_router=False,
+        enable_mixed_precision=False,
+        enable_gradient_checkpointing=False,
+    )
+
+    assert result.model.mlp.gate.weight.requires_grad
+    assert result.model.proj.lora_A.requires_grad
+    assert not result.model.proj.weight.requires_grad
 
 
 def _assert_build_training_model_rejects_glm52_block_fp8_mode_without_qlora():

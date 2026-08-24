@@ -77,7 +77,12 @@ def _apply_qwen35_gdn_exact(model: torch.nn.Module) -> dict[str, int]:
         # switch), so propagate it to every injected adapter before the trunk
         # wrapper validates and composes with those modules.
         if isinstance(module, LoraModule):
+            lora_mode = getattr(config, "_lora_serving_mode", None)
+            # Active serving reconstructs this same canonical folded trunk
+            # program from A/B; publication mode does not select a different
+            # trainer arithmetic path.
             module.exact_merged_forward = True
+            module.lora_serving_mode = lora_mode
         if hasattr(module, "rmsnorm_family"):
             norm_modules.append(module)
             if module.rmsnorm_family != rmsnorm_family:
@@ -87,7 +92,14 @@ def _apply_qwen35_gdn_exact(model: torch.nn.Module) -> dict[str, int]:
                     f"{type(module).__qualname__}."
                 )
         if hasattr(module, "_native_ep_combine"):
-            module._native_ep_combine = is_moe
+            # The legacy exact Qwen3.5 implementation owns an all-to-all
+            # exchange in the model block. Shared
+            # native DeepEP owns dispatch, original-handle combines, and the
+            # canonical fold inside the routed-expert layer instead.  Preserve
+            # that ownership decision after LoRA injection; re-enabling the
+            # model-local exchange here would silently route a native launch
+            # back through the oracle during the final pre-FSDP hook.
+            module._native_ep_combine = bool(is_moe and not getattr(config, "_deepep_native_exact", False))
         if hasattr(module, "_exact_batch_invariant_router"):
             module._exact_batch_invariant_router = is_moe
             module.router._exact_batch_invariant = is_moe

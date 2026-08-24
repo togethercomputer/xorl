@@ -57,6 +57,72 @@ from .common import split_gate_up_proj
 logger = logging.get_logger(__name__)
 
 
+class _SglangNativeLoRAHooksTrainFunction(torch.autograd.Function):
+    """Keep the literal serving-hook value path separate from its VJP.
+
+    The forward is SGLang's ordinary base/hook/activation/hook/combine
+    sequence.  Backward reuses XoRL's existing trainable fused-MoE surrogate,
+    so changing the value path does not discard hidden, router, or adapter
+    gradients.
+    """
+
+    @staticmethod
+    def forward(
+        ctx,
+        hidden: torch.Tensor,
+        routing: torch.Tensor,
+        local_ids: torch.Tensor,
+        gate_A: torch.Tensor,
+        gate_B: torch.Tensor,
+        up_A: torch.Tensor,
+        up_B: torch.Tensor,
+        down_A: torch.Tensor,
+        down_B: torch.Tensor,
+        module,
+    ) -> torch.Tensor:
+        effective = tuple(
+            factor.to(torch.bfloat16).contiguous() for factor in (gate_A, gate_B, up_A, up_B, down_A, down_B)
+        )
+        output = module._sglang_native_lora_hook_value(
+            hidden,
+            routing,
+            local_ids,
+            *effective,
+        )
+        expected = (hidden.shape[0], module.hidden_dim)
+        if output.dtype is not torch.bfloat16 or tuple(output.shape) != expected:
+            raise RuntimeError(
+                "Native Qwen MoE-LoRA hook output contract mismatch: "
+                f"got {output.dtype} {tuple(output.shape)}, expected torch.bfloat16 {expected}"
+            )
+        ctx.module = module
+        ctx.save_for_backward(
+            hidden.detach(),
+            routing.detach(),
+            local_ids,
+            gate_A,
+            gate_B,
+            up_A,
+            up_B,
+            down_A,
+            down_B,
+        )
+        return output
+
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        hidden, routing, local_ids, *factors = ctx.saved_tensors
+        gradients = ctx.module._sglang_native_lora_hook_surrogate_vjp(
+            hidden,
+            routing,
+            local_ids,
+            *factors,
+            grad_output=grad_output,
+            needs_input_grad=ctx.needs_input_grad,
+        )
+        return gradients[0], gradients[1], None, *gradients[2:], None
+
+
 @dataclass
 class MoELoRAConfig:
     """Configuration for MoE LoRA adapters."""
@@ -155,7 +221,9 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         swiglu_limit: float = 0.0,
     ):
         super().__init__()
+        self.num_global_experts = int(num_experts)
         self.num_experts = num_local_experts if num_local_experts is not None else num_experts
+        self.num_local_experts = int(self.num_experts)
         self.hidden_dim = hidden_dim
         self.intermediate_size = intermediate_size
         self.hidden_act = hidden_act
@@ -245,6 +313,8 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         self.deepep_buffer_size_gb: float = 2.0
         self.deepep_num_sms: int = 20
         self.deepep_async_combine: bool = False
+        self.deepep_native_exact: bool = False
+        self.lora_serving_mode: str | None = None
         self.alltoall_combine_hidden_chunk_size: int = 0
 
     @property
@@ -626,15 +696,66 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         routing_flat: torch.Tensor,
         local_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """LoRA-aware local partial for the native EP canonical-combine lane.
+        """Literal SGLang active-LoRA local leaf for native exact EP.
 
-        The native combine enters through ``Module.__call__`` so FSDP
-        materializes this rank's expert slice. Fold the active LoRA factors
-        into that slice with the same canonical arithmetic used by weight
-        sync, then run the masked serving kernel (``-1`` means non-local).
-        Forward bits therefore remain the serving bytes while the custom
-        folded-weight autograd sends gradients into the low-rank factors.
+        The base weights stay unmerged.  SGLang's ordinary MoE-LoRA hooks add
+        gate/up deltas before SwiGLU and down deltas before its fused
+        ``no_combine=False`` route fold.  A zero LoRA-B therefore still
+        constructs and executes the same hooks as a live adapter; only their
+        numerical delta is zero.
         """
+        from .experts import moe_sglang_fused_experts_weight_mode  # noqa: PLC0415
+
+        if not lora_merged_forward_enabled(self):
+            raise NotImplementedError(
+                "Native EP combine on LoRA-adapted experts requires the exact LoRA execution contract"
+            )
+        mode = getattr(self, "lora_serving_mode", None)
+        if mode == "merged":
+            return self._sglang_ep_native_merged_partial(
+                hidden_flat,
+                routing_flat,
+                local_ids,
+            )
+        if mode != "separate":
+            raise ValueError(f"Unknown LoRA serving mode {mode!r}")
+        if not self.lora_config.hybrid_shared:
+            raise NotImplementedError("Native exact MoE-LoRA hooks currently require hybrid shared-outer factors")
+        if self.hidden_act not in {"silu", "gelu_tanh"} or self.swiglu_limit != 0.0:
+            raise NotImplementedError("LoRA native EP combine supports gated silu/gelu_tanh without swiglu_limit only")
+        if moe_sglang_fused_experts_weight_mode() == "cached":
+            raise NotImplementedError(
+                "Native exact MoE-LoRA hooks do not compose with WEIGHT_MODE=cached; use strided/transient."
+            )
+        factors = tuple(
+            value
+            for projection in ("gate_proj", "up_proj", "down_proj")
+            for value in self._active_lora_views(projection)
+        )
+        if self._merged_lora_needs_grad(hidden_flat, routing_flat):
+            return _SglangNativeLoRAHooksTrainFunction.apply(
+                hidden_flat,
+                routing_flat,
+                local_ids,
+                *factors,
+                self,
+            )
+        effective = tuple(factor.to(torch.bfloat16).contiguous() for factor in factors)
+        return self._sglang_native_lora_hook_value(
+            hidden_flat,
+            routing_flat,
+            local_ids,
+            *effective,
+        )
+
+    def _sglang_ep_native_merged_partial(
+        self,
+        hidden_flat: torch.Tensor,
+        routing_flat: torch.Tensor,
+        local_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Existing canonical folded-weight native local leaf."""
+
         from .experts import (  # noqa: PLC0415
             MoEExperts,
             _sglang_fused_experts_kernel_call,
@@ -642,21 +763,13 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
             moe_sglang_fused_experts_weight_mode,
         )
 
-        if not lora_merged_forward_enabled(self):
-            raise NotImplementedError(
-                "Native EP combine on LoRA-adapted experts requires canonical merged-LoRA execution"
-            )
-        if self.hidden_act not in {"silu", "gelu_tanh"} or self.swiglu_limit != 0.0:
-            raise NotImplementedError("LoRA native EP combine supports gated silu/gelu_tanh without swiglu_limit only")
         if moe_sglang_fused_experts_weight_mode() == "cached":
             raise NotImplementedError(
                 "Canonical merged-LoRA execution does not compose with WEIGHT_MODE=cached; use strided/transient."
             )
-
         fused_experts_impl = MoEExperts._load_sglang_fused_experts_impl()
         activation = "gelu" if self.hidden_act == "gelu_tanh" else self.hidden_act
         e_local = int(self.gate_up_proj.shape[0])
-
         if self._merged_lora_needs_grad(hidden_flat, routing_flat):
             gate_up_w, down_w = self._merged_trainable_weights()
             return _SglangFusedExpertsTrainFunction.apply(
@@ -673,8 +786,9 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
                 None,
                 True,
             )
-
         gate_up_f, down_f = self._merged_weights()
+        if hidden_flat.shape[0] == 0:
+            return hidden_flat.clone()
         return _sglang_fused_experts_kernel_call(
             hidden_flat,
             gate_up_f,
@@ -689,6 +803,212 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
             filter_expert=True,
         )
 
+    def _sglang_native_lora_physical_buffers(
+        self,
+        gate_A: torch.Tensor,
+        gate_B: torch.Tensor,
+        up_A: torch.Tensor,
+        up_B: torch.Tensor,
+        down_A: torch.Tensor,
+        down_B: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Build the one-adapter SGLang shared-outer memory-pool views."""
+
+        scaling = self._active_scaling()
+        return {
+            "gate_up_lora_a_weights": torch.cat((gate_A.transpose(1, 2), up_A.transpose(1, 2)), dim=1)
+            .unsqueeze(0)
+            .contiguous(),
+            "gate_up_lora_b_weights": (scaling * torch.cat((gate_B.transpose(1, 2), up_B.transpose(1, 2)), dim=1))
+            .unsqueeze(0)
+            .to(torch.bfloat16)
+            .contiguous(),
+            "down_lora_a_weights": down_A.transpose(1, 2).unsqueeze(0).contiguous(),
+            "down_lora_b_weights": (scaling * down_B.transpose(1, 2)).unsqueeze(0).to(torch.bfloat16).contiguous(),
+        }
+
+    def _sglang_native_lora_info(self, rows: int, physical: dict[str, torch.Tensor]):
+        try:
+            from sglang.srt.lora.lora_moe_runners import LoRAInfo  # noqa: PLC0415
+        except Exception as exc:
+            raise RuntimeError("Pinned SGLang MoE-LoRA hooks are required") from exc
+
+        device = physical["gate_up_lora_a_weights"].device
+        return LoRAInfo(
+            **physical,
+            seg_indptr=torch.tensor([0, rows], dtype=torch.int32, device=device),
+            req_to_lora=torch.zeros(1, dtype=torch.int32, device=device),
+            lora_ranks=torch.tensor([self.active_r], dtype=torch.int32, device=device),
+            adapter_enabled=torch.ones(1, dtype=torch.int32, device=device),
+            token_lora_mapping=torch.zeros(rows, dtype=torch.int32, device=device),
+            max_lora_rank=self.active_r,
+            num_experts=self.num_global_experts,
+            has_active_lora=True,
+            single_adapter_id=0,
+            experts_shared_outer_loras=True,
+            cg_buffers=None,
+            fully_sharded=False,
+            tp_size=1,
+            tp_rank=0,
+            hidden_size=self.hidden_dim,
+            lora_use_virtual_experts=False,
+        )
+
+    def _sglang_native_lora_hook_value(
+        self,
+        hidden: torch.Tensor,
+        routing: torch.Tensor,
+        local_ids: torch.Tensor,
+        gate_A: torch.Tensor,
+        gate_B: torch.Tensor,
+        up_A: torch.Tensor,
+        up_B: torch.Tensor,
+        down_A: torch.Tensor,
+        down_B: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run SGLang's literal base/hook/activation/hook/fold sequence."""
+
+        from .experts import MoEExperts  # noqa: PLC0415
+
+        try:
+            from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (  # noqa: PLC0415
+                _fused_moe_kernel_sequence,
+                _prepare_fused_moe_run,
+            )
+            from sglang.srt.lora.lora_moe_runners import build_lora_hooks  # noqa: PLC0415
+        except Exception as exc:
+            raise RuntimeError("Pinned SGLang MoE-LoRA hook runner is required") from exc
+
+        if hidden.shape[0] == 0:
+            return hidden.clone()
+        physical = self._sglang_native_lora_physical_buffers(gate_A, gate_B, up_A, up_B, down_A, down_B)
+        MoEExperts._ensure_sglang_server_args()
+        w1 = self.gate_up_proj.transpose(1, 2)
+        w2 = self.down_proj.transpose(1, 2)
+        local_ids = local_ids.contiguous()
+        routing = routing.to(torch.float32).contiguous()
+        config, down_config, down_tma, sorted_ids, expert_ids, padded = _prepare_fused_moe_run(
+            hidden,
+            w1,
+            w2,
+            local_ids,
+            use_fp8_w8a8=False,
+            use_int8_w8a8=False,
+            use_int8_w8a16=False,
+            use_int4_w4a16=False,
+            per_channel_quant=False,
+            block_shape=None,
+        )
+        hooks = build_lora_hooks(
+            hidden,
+            self._sglang_native_lora_info(hidden.shape[0], physical),
+            local_ids,
+            mul_routed_weight=True,
+        )
+        return _fused_moe_kernel_sequence(
+            hidden,
+            w1,
+            w2,
+            routing,
+            local_ids,
+            sorted_ids,
+            expert_ids,
+            padded,
+            config,
+            down_config,
+            down_tma,
+            b1=None,
+            b2=None,
+            use_fp8_w8a8=False,
+            use_int8_w8a8=False,
+            use_int8_w8a16=False,
+            use_int4_w4a16=False,
+            per_channel_quant=False,
+            w1_scale=None,
+            w2_scale=None,
+            w1_zp=None,
+            w2_zp=None,
+            a1_scale=None,
+            a2_scale=None,
+            block_shape=None,
+            activation=("gelu" if self.hidden_act == "gelu_tanh" else self.hidden_act),
+            is_gated=True,
+            no_combine=False,
+            inplace=False,
+            apply_router_weight_on_input=False,
+            routed_scaling_factor=None,
+            gemm1_alpha=None,
+            gemm1_limit=None,
+            filter_expert=True,
+            hooks=hooks,
+            swiglu_limit=None,
+            gate_up_interleaved=False,
+            a1_q=None,
+        )
+
+    def _sglang_native_lora_hook_surrogate_vjp(
+        self,
+        hidden: torch.Tensor,
+        routing: torch.Tensor,
+        local_ids: torch.Tensor,
+        gate_A: torch.Tensor,
+        gate_B: torch.Tensor,
+        up_A: torch.Tensor,
+        up_B: torch.Tensor,
+        down_A: torch.Tensor,
+        down_B: torch.Tensor,
+        *,
+        grad_output: torch.Tensor,
+        needs_input_grad: tuple[bool, ...],
+    ) -> tuple[torch.Tensor | None, ...]:
+        """VJP through the existing folded-weight training surrogate."""
+
+        from .experts import (  # noqa: PLC0415
+            MoEExperts,
+            _SglangFusedExpertsTrainFunction,
+        )
+
+        needs = (needs_input_grad[0], needs_input_grad[1], *needs_input_grad[3:9])
+        if not any(needs):
+            return (None,) * 8
+        values = (hidden, routing, gate_A, gate_B, up_A, up_B, down_A, down_B)
+        with torch.enable_grad():
+            references = [value.detach().requires_grad_(needed) for value, needed in zip(values, needs, strict=True)]
+            hidden_ref, routing_ref, gate_A_ref, gate_B_ref, up_A_ref, up_B_ref, down_A_ref, down_B_ref = references
+            scaling = self._active_scaling()
+            inter = self.intermediate_size
+            gate = canonical_lora_fold_gkn(self.gate_up_proj[..., :inter], gate_A_ref, gate_B_ref, scaling)
+            up = canonical_lora_fold_gkn(self.gate_up_proj[..., inter:], up_A_ref, up_B_ref, scaling)
+            down = canonical_lora_fold_gkn(self.down_proj, down_A_ref, down_B_ref, scaling)
+            output = _SglangFusedExpertsTrainFunction.apply(
+                hidden_ref,
+                routing_ref,
+                local_ids,
+                torch.cat((gate, up), dim=-1),
+                down,
+                MoEExperts._load_sglang_fused_experts_impl(),
+                ("gelu" if self.hidden_act == "gelu_tanh" else self.hidden_act),
+                self.hidden_act,
+                self.swiglu_limit,
+                # ParallelPlan/FSDP may shard the expert tensors after this
+                # module is constructed.  In that case the construction-time
+                # attribute still names the global expert count, while the
+                # physical weight leading dimension is the authoritative
+                # local grouped-GEMM count.
+                int(self.gate_up_proj.shape[0]),
+                None,
+                True,
+            )
+            requested = [value for value, needed in zip(references, needs, strict=True) if needed]
+            computed = torch.autograd.grad(
+                output,
+                requested,
+                grad_outputs=grad_output,
+                allow_unused=False,
+            )
+        iterator = iter(computed)
+        return tuple(next(iterator) if needed else None for needed in needs)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -698,6 +1018,7 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         sglang_ep_native_local_ids: torch.Tensor = None,
         dsv4_exact_native: bool = False,
         dsv4_exact_lora_live: bool = True,
+        dsv4_exact_return_routes: bool = False,
     ) -> torch.Tensor:
         """Forward pass with LoRA.
 
@@ -717,6 +1038,7 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
                 selected_experts,
                 self,
                 lora_live=dsv4_exact_lora_live,
+                return_routes=dsv4_exact_return_routes,
             )
 
         if sglang_ep_native_local_ids is not None:
@@ -776,6 +1098,30 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         lane automatically.
         """
         from .experts import _moe_sglang_fused_experts_env_state  # noqa: PLC0415
+
+        if self.deepep_native_exact:
+            from xorl.distributed.moe.deepep_native_exact import (  # noqa: PLC0415
+                canonicalize_native_routing_metadata,
+                native_dispatch_runner_combine,
+            )
+
+            if self.ep_dispatch != "deepep" or self.deepep_async_combine:
+                raise RuntimeError("LoRA native DeepEP exact requires synchronous ep_dispatch='deepep'")
+            # The exact router stores coefficients at BF16 precision.  DeepEP
+            # exposes its routing-metadata ABI as FP32, so widen those stored
+            # BF16 values without introducing any additional information.
+            routing_weights = canonicalize_native_routing_metadata(routing_weights)
+            return native_dispatch_runner_combine(
+                hidden_states,
+                routing_weights,
+                selected_experts,
+                ep_group=parallel_state.ep_group,
+                num_experts=self.num_global_experts,
+                num_local_experts=int(self.gate_up_proj.shape[0]),
+                buffer_size_gb=self.deepep_buffer_size_gb,
+                num_sms=self.deepep_num_sms,
+                runner=self.sglang_ep_native_routed_partial,
+            )
 
         explicit_sglang_fused = _moe_sglang_fused_experts_env_state()
         if explicit_sglang_fused is True:
@@ -969,6 +1315,8 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         lora_experts.deepep_buffer_size_gb = getattr(module, "deepep_buffer_size_gb", 2.0)
         lora_experts.deepep_num_sms = getattr(module, "deepep_num_sms", 20)
         lora_experts.deepep_async_combine = getattr(module, "deepep_async_combine", False)
+        lora_experts.deepep_native_exact = getattr(module, "deepep_native_exact", False)
+        lora_experts.lora_serving_mode = getattr(module, "lora_serving_mode", None)
         lora_experts.alltoall_combine_hidden_chunk_size = getattr(module, "alltoall_combine_hidden_chunk_size", 0)
         lora_experts.swiglu_limit = float(getattr(module, "swiglu_limit", 0.0))
         if hasattr(module, "expert_lora_semantics"):
@@ -1036,6 +1384,8 @@ def inject_lora_into_experts(
     lora_experts.deepep_buffer_size_gb = getattr(block.experts, "deepep_buffer_size_gb", 2.0)
     lora_experts.deepep_num_sms = getattr(block.experts, "deepep_num_sms", 20)
     lora_experts.deepep_async_combine = getattr(block.experts, "deepep_async_combine", False)
+    lora_experts.deepep_native_exact = getattr(block.experts, "deepep_native_exact", False)
+    lora_experts.lora_serving_mode = getattr(block.experts, "lora_serving_mode", None)
     lora_experts.alltoall_combine_hidden_chunk_size = getattr(block.experts, "alltoall_combine_hidden_chunk_size", 0)
     lora_experts.swiglu_limit = float(getattr(block.experts, "swiglu_limit", 0.0))
     if hasattr(block.experts, "expert_lora_semantics"):

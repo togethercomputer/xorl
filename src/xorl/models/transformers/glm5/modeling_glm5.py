@@ -15,6 +15,7 @@ from xorl.distributed.canonical_moe import (
     LogicalRowOwnership,
     OutputDistribution,
     ParallelPlan,
+    canonical_moe_fold_fp64_v3,
     canonical_moe_leaf_fp32_v1,
     canonical_moe_reduce_cp_sharded_v3,
     canonical_moe_reduce_fp64_v3,
@@ -38,6 +39,7 @@ from xorl.models.layers.attention import is_flash_attention, update_causal_mask
 from xorl.models.layers.attention.backend import ATTENTION_FUNCTIONS
 from xorl.models.layers.attention.backend.eager import eager_attention_forward
 from xorl.models.layers.moe import MoEBlock
+from xorl.models.layers.moe.backend import zero_token_lora_output
 from xorl.models.layers.moe.experts import MoEExperts
 from xorl.models.layers.moe.moe_block import _BIRouterGemm, _moe_bi_router_enabled
 from xorl.models.layers.moe.routing_replay import get_replay_stage
@@ -76,6 +78,8 @@ from xorl.utils import logging
 
 logger = logging.get_logger(__name__)
 GLM52_LOCAL_PARTIAL_POLICY = "glm52_routed_final_scaled_then_shared_ep_slice_fp32_then_bf16_v3"
+GLM52_NATIVE_SHARED_PARTIAL_POLICY = "glm52_native_deepep_shared_tp_slice_fp32_then_bf16_v1"
+_glm52_native_deepep_engagement_logged = False
 
 
 def _glm52_serving_grouped_topk(
@@ -155,6 +159,46 @@ class Glm5TopkRouter(nn.Module):
         self.hidden_size = config.hidden_size
         self.weight = nn.Parameter(torch.empty(config.n_routed_experts, config.hidden_size))
         self.register_buffer("e_score_correction_bias", torch.zeros(config.n_routed_experts))
+        self._gradient_evidence_parameter_id: int | None = None
+        self._gradient_evidence_hook_handle = None
+        self._gradient_evidence: dict[str, torch.Tensor | int] | None = None
+
+    def reset_gradient_evidence(self) -> None:
+        """Arm a hook on the current post-FSDP router Parameter."""
+
+        self._gradient_evidence = None
+        if not self.weight.requires_grad:
+            return
+        if self._gradient_evidence_parameter_id == id(self.weight):
+            return
+        self._gradient_evidence_hook_handle = self.weight.register_hook(self._capture_gradient_evidence)
+        self._gradient_evidence_parameter_id = id(self.weight)
+
+    def _capture_gradient_evidence(self, gradient: torch.Tensor) -> torch.Tensor:
+        local = gradient
+        to_local = getattr(local, "to_local", None)
+        if callable(to_local):
+            local = to_local()
+        wait = getattr(local, "wait", None)
+        if callable(wait):
+            local = wait()
+        values = local.detach().float()
+        finite = torch.isfinite(values)
+        finite_values = values.masked_select(finite)
+        evidence = {
+            "sum_sq": torch.sum(finite_values * finite_values, dtype=torch.float64),
+            "nonfinite": torch.count_nonzero(~finite),
+            "nonzero": torch.count_nonzero(finite_values),
+            "elements": values.numel(),
+        }
+        previous = self._gradient_evidence
+        if previous is not None:
+            evidence["sum_sq"] = evidence["sum_sq"] + previous["sum_sq"]
+            evidence["nonfinite"] = evidence["nonfinite"] + previous["nonfinite"]
+            evidence["nonzero"] = evidence["nonzero"] + previous["nonzero"]
+            evidence["elements"] = int(evidence["elements"]) + int(previous["elements"])
+        self._gradient_evidence = evidence
+        return gradient
 
     def _apply(self, fn, recurse: bool = True):
         correction_bias = self._buffers.pop("e_score_correction_bias")
@@ -596,6 +640,7 @@ class Glm5Attention(Glm5MlaAttention):
         attention_mask: torch.Tensor | None,
         index_share_context: IndexShareContext | None = None,
         sampler_prefill_lengths: torch.Tensor | None = None,
+        _r3_sample_lengths: list[int] | tuple[int, ...] | torch.Tensor | None = None,
         **_kwargs,
     ) -> tuple[torch.Tensor, None]:
         ps = get_parallel_state()
@@ -609,6 +654,7 @@ class Glm5Attention(Glm5MlaAttention):
                     position_embeddings,
                     attention_mask,
                     sampler_prefill_lengths=sampler_prefill_lengths,
+                    sample_lengths=_r3_sample_lengths,
                 ),
                 index_share_context,
             )
@@ -637,6 +683,7 @@ class Glm5Attention(Glm5MlaAttention):
                     q_compressed,
                     position_embeddings,
                     sampler_prefill_lengths=sampler_prefill_lengths,
+                    sample_lengths=_r3_sample_lengths,
                     query_offset=query_offset,
                 )
                 full_index_k = self._gather_ulysses_sequence_no_grad(local_index_k, group)
@@ -781,6 +828,7 @@ class Glm5MoEBlock(MoEBlock):
         self.experts.deepep_buffer_size_gb = getattr(config, "_deepep_buffer_size_gb", 2.0)
         self.experts.deepep_num_sms = getattr(config, "_deepep_num_sms", 20)
         self.experts.deepep_async_combine = getattr(config, "_deepep_async_combine", False)
+        self.deepep_native_exact = bool(getattr(config, "_deepep_native_exact", False))
         self.n_group = config.n_group
         self.topk_group = config.topk_group
         self.norm_topk_prob = config.norm_topk_prob
@@ -804,6 +852,15 @@ class Glm5MoEBlock(MoEBlock):
             selectable_experts = self.topk_group * (self.num_experts // self.n_group)
             if not 1 <= self.top_k <= selectable_experts:
                 raise ValueError("GLM-5.2 canonical routing top_k exceeds the selected expert groups")
+        if self.deepep_native_exact:
+            if self.canonical_contract_version is None:
+                raise RuntimeError("GLM-5.2 native DeepEP requires the canonical exact contract")
+            if self.experts.ep_dispatch != "deepep":
+                raise RuntimeError("GLM-5.2 native DeepEP requires ep_dispatch='deepep'")
+            if self.train_router:
+                raise RuntimeError("GLM-5.2 native DeepEP v1 requires a frozen router")
+            if self.experts.deepep_async_combine:
+                raise RuntimeError("GLM-5.2 native DeepEP owns the immediate FP64 fold")
 
     def route(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         flat_hidden_states = hidden_states.view(-1, hidden_states.shape[-1])
@@ -812,6 +869,8 @@ class Glm5MoEBlock(MoEBlock):
 
         if self.canonical_contract_version is not None and not _moe_bi_router_enabled(self.config):
             raise RuntimeError("GLM-5.2 canonical MoE requires its model-level exact router declaration")
+        if self.train_router and torch.is_grad_enabled() and not self.gate.weight.requires_grad:
+            raise RuntimeError("GLM-5.2 trainable router weight lost requires_grad before the BI router GEMM")
         router_logits = self.gate(flat_hidden_states)
 
         if stage is not None and replay is not None:
@@ -871,26 +930,28 @@ class Glm5MoEBlock(MoEBlock):
             )
 
         ep_dispatch = getattr(self.experts, "ep_dispatch", "alltoall")
-        if self.train_router and ep_dispatch == "deepep":
+        if self.canonical_contract_version is None and self.train_router and ep_dispatch == "deepep":
             raise AssertionError(
                 "train_router=True is not supported with ep_dispatch='deepep'. "
                 "DeepEP cannot propagate gradients through routing weights. "
                 "Set train_router=False or switch to ep_dispatch='alltoall'."
             )
-        if getattr(self.gate, "_glm52_exact_fullparam_component", False):
+        if getattr(self.gate, "_glm52_exact_fullparam_component", False) or (
+            self.canonical_contract_version is not None and self.train_router
+        ):
             # Full-param mode trains routers: their only gradient
             # path is the combine multiply, so the routing weights must carry
             # a gradient into the router logits.  The serving top-k programs
             # are gradient-opaque, so the values are kept verbatim and the
             # gradient is supplied by the trainer-owned regather surrogate.
-            if ep_dispatch == "deepep":
+            if self.canonical_contract_version is None and ep_dispatch == "deepep":
                 raise AssertionError("GLM-5.2 full-param router training is not supported with ep_dispatch='deepep'")
             from xorl.models.transformers.glm5.exact_fullparam_fp8 import (  # noqa: PLC0415
-                glm52_fullparam_routing_weights_with_grad,
+                glm52_routing_weights_with_grad,
             )
 
             canonical = self.canonical_contract_version is not None
-            routing_weights = glm52_fullparam_routing_weights_with_grad(
+            routing_weights = glm52_routing_weights_with_grad(
                 router_logits,
                 routing_weights,
                 selected_experts,
@@ -900,9 +961,14 @@ class Glm5MoEBlock(MoEBlock):
                 renormalize=True if canonical else bool(self.norm_topk_prob),
                 scale=1.0 if canonical else float(self.routed_scaling_factor),
             )
+            if self.train_router and torch.is_grad_enabled() and not routing_weights.requires_grad:
+                raise RuntimeError("GLM-5.2 router surrogate failed to attach routing-weight autograd")
         elif not self.train_router:
             routing_weights = routing_weights.detach()
 
+        self._capture_diagnostic_component("moe_router_logits", router_logits)
+        self._capture_diagnostic_component("moe_topk_ids", selected_experts)
+        self._capture_diagnostic_component("moe_topk_weights", routing_weights)
         return routing_weights, selected_experts, router_logits
 
     def _route_tokens_to_experts(
@@ -969,16 +1035,21 @@ class Glm5MoEBlock(MoEBlock):
         routing_weights: torch.Tensor,
         selected_experts: torch.Tensor,
         absolute_positions: torch.Tensor | None = None,
+        backward_layer_dependency: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        self._capture_diagnostic_component("moe_input", hidden_states)
         if self.canonical_contract_version is not None:
             if absolute_positions is None:
                 raise RuntimeError("GLM-5.2 canonical MoE execution requires explicit absolute positions")
-            return self._canonical_ep_forward(
+            output = self._canonical_ep_forward(
                 hidden_states,
                 routing_weights,
                 selected_experts,
                 absolute_positions,
+                backward_layer_dependency,
             )
+            self._capture_diagnostic_component("moe_experts_output", output)
+            return output
 
         residuals = hidden_states
         batch_size, sequence_length, hidden_dim = hidden_states.shape
@@ -992,7 +1063,9 @@ class Glm5MoEBlock(MoEBlock):
         expert_output = expert_output.view(batch_size, sequence_length, hidden_dim)
         shared_output = self.shared_experts(residuals)
         sync_pending_combine()
-        return expert_output + shared_output
+        output = expert_output + shared_output
+        self._capture_diagnostic_component("moe_experts_output", output)
+        return output
 
     def _canonical_expert_slice(self, ep_rank: int, ep_size: int) -> tuple[int, int]:
         """Resolve this rank's contiguous expert slice for the canonical dispatch.
@@ -1054,7 +1127,7 @@ class Glm5MoEBlock(MoEBlock):
         self,
         gathered: torch.Tensor,
         gathered_routing: torch.Tensor,
-        gathered_ids: torch.Tensor,
+        gathered_ids: torch.Tensor | None,
         local_ids: torch.Tensor,
     ) -> torch.Tensor:
         if not isinstance(self.experts, Glm52NativeBlockFP8Experts):
@@ -1063,7 +1136,7 @@ class Glm5MoEBlock(MoEBlock):
             "sglang_ep_native_local_ids": local_ids,
             "routed_scaling_factor": self.routed_scaling_factor,
         }
-        if isinstance(self.experts, Glm52ExactEP16BlockFP8QLoRARoutedExperts):
+        if isinstance(self.experts, Glm52ExactEP16BlockFP8QLoRARoutedExperts) and gathered_ids is not None:
             kwargs["selected_experts"] = gathered_ids
         return self.experts(gathered, gathered_routing, **kwargs).to(torch.bfloat16)
 
@@ -1116,12 +1189,164 @@ class Glm5MoEBlock(MoEBlock):
             self.shared_experts.down_proj.weight[:, shard_start:shard_end],
         ).to(torch.bfloat16)
 
+    def _native_shared_local_fold(
+        self,
+        flat: torch.Tensor,
+        valid_rows: torch.Tensor,
+    ) -> torch.Tensor:
+        """Execute and FP64-fold all sampler TP16 shared leaves locally."""
+
+        if not isinstance(self.shared_experts, Glm52ExactTP16SharedExpertBlockFP8QLoRA):
+            raise RuntimeError(
+                "GLM-5.2 native DeepEP requires the exact active-LoRA shared-expert root "
+                "to produce all TP16 leaves locally"
+            )
+        # Invoke the root through nn.Module.__call__: its FSDP hooks must
+        # materialize all six logical FP32 factor masters exactly once around
+        # the complete TP16 leaf program.
+        shared_leaves = self.shared_experts(flat, all_contributors=True)
+        self._capture_diagnostic_component("moe_native_shared_down", shared_leaves)
+        shared_folded = canonical_moe_fold_fp64_v3(shared_leaves)
+        shared_folded = torch.where(
+            valid_rows[:, None],
+            shared_folded,
+            torch.zeros_like(shared_folded),
+        )
+        self._capture_diagnostic_component("moe_native_shared_folded", shared_folded)
+        return shared_folded
+
+    def _native_deepep_routed_local(
+        self,
+        flat: torch.Tensor,
+        routing_weights: torch.Tensor,
+        selected_experts: torch.Tensor,
+        valid_rows: torch.Tensor,
+        *,
+        ep_rank: int,
+        ep_size: int,
+        ep_group,
+        backward_layer_dependency: torch.Tensor | None = None,
+        backward_shared_dependency: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run only GLM's routed branch through the original DeepEP handle.
+
+        GLM's TP16 shared expert is a separate arithmetic owner.  It remains on
+        the canonical BF16-leaf/FP64-fold path below; folding it into the
+        routed payload would either replicate the shared branch or silently
+        change its TP16 reduction tree.
+        """
+
+        from xorl.distributed.moe.deepep_native_exact import (  # noqa: PLC0415
+            canonicalize_native_routing_metadata,
+            native_dispatch_runner_combine,
+        )
+
+        if self.train_router:
+            raise RuntimeError("GLM-5.2 native DeepEP v1 requires a frozen router")
+        live_indices = torch.nonzero(valid_rows, as_tuple=False).flatten()
+        live_hidden = flat.index_select(0, live_indices)
+        live_routing = canonicalize_native_routing_metadata(routing_weights.index_select(0, live_indices))
+        live_ids = selected_experts.index_select(0, live_indices)
+        num_local_experts, expert_start = self._canonical_expert_slice(ep_rank, ep_size)
+
+        def run_local_leaf(recv_hidden, recv_weights, recv_local_ids):
+            # A rank may own no route for this dispatch.  The fused GLM expert
+            # runner intentionally rejects zero rows, while DeepEP considers
+            # an empty receive batch valid.  Keep the empty BF16 leaf connected
+            # to every active factor: bypassing the expert module here would
+            # leave ``parameter.grad is None`` on only the empty owner and make
+            # the public adapter-gradient collective rank-asymmetric.
+            if recv_hidden.shape[0] == 0:
+                factors = tuple(getattr(self.experts, name) for name in self.experts.logical_factor_names)
+                return zero_token_lora_output(
+                    recv_hidden,
+                    recv_hidden.shape[1],
+                    *factors,
+                )
+
+            # The diagnostic seam is absent in normal training.  When a
+            # component capture is installed, retain the real DeepEP receive
+            # receipt and only the expert rows it actually selected.  This
+            # distinguishes transport/id remapping from a loaded-weight or
+            # fused-kernel mismatch without dumping the full 256-expert bank.
+            diagnostic_capture = getattr(self, "_diagnostic_capture_component", None)
+            if callable(diagnostic_capture):
+                self._capture_diagnostic_component("moe_native_recv_hidden", recv_hidden)
+                self._capture_diagnostic_component("moe_native_recv_weights", recv_weights)
+                self._capture_diagnostic_component("moe_native_recv_local_ids", recv_local_ids)
+                self._capture_diagnostic_component(
+                    "moe_native_expert_start",
+                    torch.tensor([expert_start], dtype=torch.int64, device=recv_hidden.device),
+                )
+                local_ids = torch.unique(recv_local_ids[recv_local_ids >= 0]).tolist()
+                for local_id in local_ids:
+                    local_id = int(local_id)
+                    self._capture_diagnostic_component(
+                        f"moe_native_gate_up_packed_local_{local_id}",
+                        self.experts.gate_up_packed_weight_f32[local_id],
+                    )
+                    self._capture_diagnostic_component(
+                        f"moe_native_gate_up_scale_local_{local_id}",
+                        self.experts.gate_up_weight_scale_inv[local_id],
+                    )
+                    self._capture_diagnostic_component(
+                        f"moe_native_down_packed_local_{local_id}",
+                        self.experts.down_packed_weight_f32[local_id],
+                    )
+                    self._capture_diagnostic_component(
+                        f"moe_native_down_scale_local_{local_id}",
+                        self.experts.down_weight_scale_inv[local_id],
+                    )
+
+            # DeepEP already maps every valid slot into this owner's local
+            # [0, num_local_experts) range and marks all other top-k slots -1.
+            # Do not reconstruct global IDs here: the QLoRA bank's optional
+            # global-ID argument has a stricter no-sentinel contract intended
+            # for the all-gather path.  The native path is fully identified by
+            # the validated local IDs and does not need that redundant input.
+            local_leaf = self._canonical_routed_local_partial(
+                recv_hidden,
+                recv_weights,
+                None,
+                recv_local_ids,
+            )
+            self._capture_diagnostic_component("moe_native_recv_leaf", local_leaf)
+            return local_leaf
+
+        live_routed = native_dispatch_runner_combine(
+            live_hidden,
+            live_routing,
+            live_ids,
+            ep_group=ep_group,
+            num_experts=self.num_experts,
+            num_local_experts=num_local_experts,
+            buffer_size_gb=self.experts.deepep_buffer_size_gb,
+            num_sms=self.experts.deepep_num_sms,
+            runner=run_local_leaf,
+            backward_layer_dependency=backward_layer_dependency,
+            backward_shared_dependency=backward_shared_dependency,
+            backward_trace_label=f"glm52_layer_{getattr(self, 'layer_idx', 'unknown')}",
+            complete_backward_device_boundary=True,
+        )
+        routed = flat * 0.0
+        if live_indices.numel():
+            routed = routed.index_copy(0, live_indices, live_routed)
+        else:
+            # The empty result still owns DeepEP reverse-dispatch and expert
+            # factor autograd edges. Keep them in the graph so every EP rank
+            # enters the same backward collectives as its non-empty peers.
+            routed = routed + live_routed.sum() * 0.0
+        routed = routed.to(torch.bfloat16)
+        self._capture_diagnostic_component("moe_native_routed", routed)
+        return routed
+
     def _canonical_ep_forward(
         self,
         hidden_states: torch.Tensor,
         routing_weights: torch.Tensor,
         selected_experts: torch.Tensor,
         absolute_positions: torch.Tensor,
+        backward_layer_dependency: torch.Tensor | None = None,
     ) -> torch.Tensor:
         from xorl.models.layers.moe.ep_native_combine import (  # noqa: PLC0415
             gather_ids_for_ep_combine,
@@ -1158,8 +1383,6 @@ class Glm5MoEBlock(MoEBlock):
                     )
         elif ps.sp_group is not None:
             raise RuntimeError("GLM-5.2 CP1 rows must not have a sequence-parallel process group")
-        if self.experts.ep_dispatch == "deepep":
-            raise RuntimeError("GLM-5.2 canonical MoE canonical path does not support DeepEP")
         if hidden_states.dtype is not torch.bfloat16:
             raise TypeError("GLM-5.2 canonical local partials require BF16 hidden states")
         if self.config.hidden_act != "silu":
@@ -1175,32 +1398,92 @@ class Glm5MoEBlock(MoEBlock):
             )
 
         group = ps.ep_group
-        padded_rows = max_rows_for_ep_combine(local_rows, flat.device, group)
-        gathered = gather_tokens_for_ep_combine(flat, group, padded_rows)
-        gathered_routing = gather_tokens_for_ep_combine(routing_weights.reshape(local_rows, -1), group, padded_rows)
-        gathered_ids = gather_ids_for_ep_combine(selected_experts.reshape(local_rows, -1), group, padded_rows)
-        gathered_positions = gather_ids_for_ep_combine(local_positions[:, None], group, padded_rows).squeeze(-1)
         local_valid = LogicalRowOwnership.valid_positions(local_positions).to(torch.int32)[:, None]
-        gathered_valid = gather_ids_for_ep_combine(local_valid, group, padded_rows).squeeze(-1) > 0
-
         ep_rank = dist.get_rank(group)
         if ep_rank != ownership.source_ordinal:
             raise RuntimeError(
                 "GLM-5.2 EP rank order does not match the DP-major/CP-minor row layout: "
                 f"ep_rank={ep_rank}, source_ordinal={ownership.source_ordinal}"
             )
-        local_experts, expert_start = self._canonical_expert_slice(ep_rank, ps.ep_size)
-        local_ids = torch.where(
-            (gathered_ids >= expert_start) & (gathered_ids < expert_start + local_experts),
-            gathered_ids - expert_start,
-            gathered_ids.new_full((), -1),
-        ).to(torch.int32)
-        routed = self._canonical_routed_local_partial(gathered, gathered_routing, gathered_ids, local_ids)
+
+        native_routed_local = None
+        if self.deepep_native_exact:
+            # Build the local shared value first, then make it (and the
+            # transformer residual) ordering operands of the routed dispatch.
+            # Their values do not enter DeepEP.  In backward, both edges are
+            # released only after the routed terminal reverse-combine reaches
+            # device completion, so shared-root FSDP cannot overlap it.
+            shared_folded = self._native_shared_local_fold(
+                flat,
+                local_valid.squeeze(-1).to(torch.bool),
+            )
+            native_routed_local = self._native_deepep_routed_local(
+                flat,
+                routing_weights.reshape(local_rows, -1),
+                selected_experts.reshape(local_rows, -1),
+                local_valid.squeeze(-1) > 0,
+                ep_rank=ep_rank,
+                ep_size=ps.ep_size,
+                ep_group=group,
+                backward_layer_dependency=backward_layer_dependency,
+                backward_shared_dependency=shared_folded,
+            )
+            local_canonical = canonical_moe_leaf_fp32_v1(
+                shared_folded,
+                native_routed_local,
+            )
+            self._capture_diagnostic_component("moe_native_combined", local_canonical)
+            global _glm52_native_deepep_engagement_logged
+            if not _glm52_native_deepep_engagement_logged:
+                logger.info(
+                    "GLM-5.2 trainer native DeepEP split ENGAGED: "
+                    "routed=native_deepep_original_handle wire_dtype=bf16 "
+                    "routed_fold=canonical_moe_fold_fp64_v3 "
+                    "shared=local_tp16_bf16_leaves_fp64_v3 "
+                    "shared_internal_collectives=none "
+                    "join=canonical_moe_leaf_fp32_v1 "
+                    "backward=routed_terminal_before_shared_and_residual_v6"
+                )
+                _glm52_native_deepep_engagement_logged = True
+            return local_canonical.reshape(batch_size, sequence_length, hidden_dim)
+
+        padded_rows = max_rows_for_ep_combine(local_rows, flat.device, group)
+
+        gathered = gather_tokens_for_ep_combine(
+            flat,
+            group,
+            padded_rows,
+        )
+        gathered_routing = None
+        gathered_ids = None
+        if not self.deepep_native_exact:
+            gathered_routing = gather_tokens_for_ep_combine(routing_weights.reshape(local_rows, -1), group, padded_rows)
+            if self.train_router and torch.is_grad_enabled() and not gathered_routing.requires_grad:
+                raise RuntimeError("GLM-5.2 EP routing gather severed router autograd")
+            gathered_ids = gather_ids_for_ep_combine(selected_experts.reshape(local_rows, -1), group, padded_rows)
+        gathered_positions = gather_ids_for_ep_combine(local_positions[:, None], group, padded_rows).squeeze(-1)
+        gathered_valid = gather_ids_for_ep_combine(local_valid, group, padded_rows).squeeze(-1) > 0
+
+        if self.deepep_native_exact:
+            routed = gathered * 0.0
+        else:
+            assert gathered_routing is not None and gathered_ids is not None
+            local_experts, expert_start = self._canonical_expert_slice(ep_rank, ps.ep_size)
+            local_ids = torch.where(
+                (gathered_ids >= expert_start) & (gathered_ids < expert_start + local_experts),
+                gathered_ids - expert_start,
+                gathered_ids.new_full((), -1),
+            ).to(torch.int32)
+            self.experts._require_routing_grad = bool(self.train_router and torch.is_grad_enabled())
+            routed = self._canonical_routed_local_partial(gathered, gathered_routing, gathered_ids, local_ids)
+            if self.train_router and torch.is_grad_enabled() and not routed.requires_grad:
+                raise RuntimeError("GLM-5.2 exact routed expert output severed router autograd")
         shared = self._canonical_shared_local_partial(
             gathered,
             contributor_ordinal=ep_rank,
             contributor_count=ps.ep_size,
         )
+        self._capture_diagnostic_component("moe_native_shared_down", shared)
         local_partial = canonical_moe_leaf_fp32_v1(shared, routed)
 
         capacity = int(getattr(self.config, "_glm52_canonical_moe_capacity", local_partial.shape[0]))
@@ -1231,7 +1514,11 @@ class Glm5MoEBlock(MoEBlock):
             capacity=capacity,
             valid_rows=int(gathered_valid.sum().item()),
         )
-        contribution = LocalMoEContribution(local_partial, metadata, GLM52_LOCAL_PARTIAL_POLICY)
+        contribution = LocalMoEContribution(
+            local_partial,
+            metadata,
+            (GLM52_NATIVE_SHARED_PARTIAL_POLICY if self.deepep_native_exact else GLM52_LOCAL_PARTIAL_POLICY),
+        )
         ep_mesh = ps.ep_fsdp_device_mesh
         ep_dim = tuple(ep_mesh.mesh_dim_names).index("ep")
         combine_groups = tuple(
@@ -1310,6 +1597,7 @@ class Glm5MoEBlock(MoEBlock):
         hidden_states: torch.Tensor,
         *,
         absolute_positions: torch.Tensor | None = None,
+        backward_layer_dependency: torch.Tensor | None = None,
     ):
         routing_weights, selected_experts, router_logits = self.route(hidden_states)
         hidden_states = self.forward_experts_with_shared(
@@ -1317,6 +1605,7 @@ class Glm5MoEBlock(MoEBlock):
             routing_weights,
             selected_experts,
             absolute_positions,
+            backward_layer_dependency,
         )
         return hidden_states, router_logits
 
@@ -1455,6 +1744,7 @@ class Glm5DecoderLayer(nn.Module):
                 routing_weights,
                 selected_experts,
                 local_absolute_positions,
+                residual,
             )
         elif _selective:
             hidden_states, residual, self_attn_weights = self._gradient_checkpointing_func(
@@ -1467,7 +1757,14 @@ class Glm5DecoderLayer(nn.Module):
             )
             hidden_states = self.mlp(
                 hidden_states,
-                **({"absolute_positions": local_absolute_positions} if isinstance(self.mlp, Glm5MoEBlock) else {}),
+                **(
+                    {
+                        "absolute_positions": local_absolute_positions,
+                        "backward_layer_dependency": residual,
+                    }
+                    if isinstance(self.mlp, Glm5MoEBlock)
+                    else {}
+                ),
             )
             if isinstance(hidden_states, tuple):
                 hidden_states, router_logits = hidden_states
@@ -1483,7 +1780,14 @@ class Glm5DecoderLayer(nn.Module):
             )
             hidden_states = self.mlp(
                 hidden_states,
-                **({"absolute_positions": local_absolute_positions} if isinstance(self.mlp, Glm5MoEBlock) else {}),
+                **(
+                    {
+                        "absolute_positions": local_absolute_positions,
+                        "backward_layer_dependency": residual,
+                    }
+                    if isinstance(self.mlp, Glm5MoEBlock)
+                    else {}
+                ),
             )
             if isinstance(hidden_states, tuple):
                 hidden_states, router_logits = hidden_states
@@ -1791,6 +2095,14 @@ class Glm5Model(Glm5PreTrainedModel):
 
 
 class Glm5ForCausalLM(Glm5PreTrainedModel):
+    deepep_native_exact_capability = {
+        "produces_local_leaf": True,
+        "wire_dtype": "bf16",
+        "uses_dispatch_handle": True,
+        "supported_ep_sizes": (2, 4, 8, 16),
+        "local_leaf_program": "glm52_scaled",
+        "lora_serving_modes": ("separate",),
+    }
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
     _tp_plan = parallelize.MODEL_TP_PLAN

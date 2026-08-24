@@ -11,6 +11,8 @@ skipped: the GDN kernel chain has no serving-side contract), as do the MoE
 router gate (contracted separately by the exact model program) and lm_head/embed.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -82,6 +84,39 @@ def test_exact_qwen_hook_enables_merged_lora_before_trunk_wrap():
         set_trunk_linear_contract(False)
 
 
+def test_exact_qwen_hook_preserves_native_deepep_transport_ownership(monkeypatch):
+    class NativeBlock(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self._native_ep_combine = True
+            self.deepep_native_exact = True
+
+    class ResolvedNorm(torch.nn.Module):
+        rmsnorm_family = "v2"
+
+    model = torch.nn.Module()
+    model.config = SimpleNamespace(
+        model_type="xorl_qwen3_5_moe",
+        _qwen35_rmsnorm_family="v2",
+        _rmsnorm_mode="sglang_fused",
+        _deepep_native_exact=True,
+    )
+    model.block = NativeBlock()
+    model.norm = ResolvedNorm()
+    model.q_proj = torch.nn.Linear(8, 8, bias=False, dtype=torch.bfloat16)
+
+    monkeypatch.setattr(
+        "xorl.distributed.parallel_state.get_parallel_state",
+        lambda: SimpleNamespace(ep_enabled=True, ep_size=8),
+    )
+    try:
+        _apply_qwen35_gdn_exact(model)
+        assert model.block.deepep_native_exact
+        assert not model.block._native_ep_combine
+    finally:
+        set_trunk_linear_contract(False)
+
+
 def test_qwen3_5_hybrid_trunk_wrap_selection():
     model = _build()
     try:
@@ -111,11 +146,25 @@ def test_qwen3_5_hybrid_trunk_wrap_selection():
             return getattr(module, "_xorl_bi_trunk_wrapped", False)
 
         # Full-attention projections wrap.
-        assert all(_is_wrapped(m) for m in (full_attn.q_proj, full_attn.k_proj, full_attn.v_proj, full_attn.o_proj))
+        assert all(
+            _is_wrapped(m)
+            for m in (
+                full_attn.q_proj,
+                full_attn.k_proj,
+                full_attn.v_proj,
+                full_attn.o_proj,
+            )
+        )
         # Linear-attention q/k/v/o_proj ALSO wrap (same leaf names) — audit fact,
         # not a contract guarantee: the GDN kernel chain is uncontracted.
         assert all(
-            _is_wrapped(m) for m in (linear_attn.q_proj, linear_attn.k_proj, linear_attn.v_proj, linear_attn.o_proj)
+            _is_wrapped(m)
+            for m in (
+                linear_attn.q_proj,
+                linear_attn.k_proj,
+                linear_attn.v_proj,
+                linear_attn.o_proj,
+            )
         )
         # GDN a/b/g projections and short convolutions are silently skipped.
         assert not _is_wrapped(linear_attn.a_proj)
@@ -141,11 +190,15 @@ def test_qwen3_5_hybrid_trunk_wrap_selection():
 
 @requires_cuda
 @pytest.mark.gpu
-def test_qwen3_5_full_attn_forward_runs_under_trunk_wrap():
+def test_qwen3_5_full_attn_forward_runs_under_trunk_wrap(monkeypatch):
     """Wrapped full-attention + shared-expert + dense projections must run the
     bf16 contract GEMM end-to-end (the runtime guard raises on any non-bf16
     operand)."""
     torch.manual_seed(1)
+    # This test isolates the trunk-linear contract. The local fused-expert
+    # kernel has its own parity tests and can leave asynchronous CUDA failures
+    # indistinguishable from a trunk projection failure here.
+    monkeypatch.setenv("XORL_MOE_SGLANG_FUSED_EXPERTS", "0")
     config = _hybrid_config(layer_types=["full_attention", "full_attention"], _moe_implementation="eager")
     model = Qwen3_5MoeForCausalLM(config).to(device="cuda", dtype=torch.bfloat16).eval()
     try:

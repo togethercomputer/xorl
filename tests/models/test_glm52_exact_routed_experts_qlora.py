@@ -195,13 +195,14 @@ def test_routed_bank_topology_remap_and_physical_buffer_policy() -> None:
         )
     with pytest.raises(ValueError, match="MoE-TP1"):
         Glm52ExactEP16BlockFP8QLoRARoutedExperts(_HIDDEN, _INTERMEDIATE, ep_rank=0, moe_tp_size=2)
-    with pytest.raises(ValueError, match="DeepEP is not admitted"):
-        Glm52ExactEP16BlockFP8QLoRARoutedExperts(
-            _HIDDEN,
-            _INTERMEDIATE,
-            ep_rank=0,
-            ep_dispatch="deepep",
-        )
+    deepep = Glm52ExactEP16BlockFP8QLoRARoutedExperts(
+        _HIDDEN,
+        _INTERMEDIATE,
+        ep_rank=0,
+        ep_dispatch="deepep",
+        device="meta",
+    )
+    assert deepep.expert_adapter_gradient_contract.factor_layout == "gkn_gate_up_down"
     with pytest.raises(ValueError, match=r"in \[0, 15\]"):
         Glm52ExactEP16BlockFP8QLoRARoutedExperts(_HIDDEN, _INTERMEDIATE, ep_rank=16)
     module.set_runtime_lora_config(1, 1)
@@ -294,6 +295,73 @@ def _assert_post_ep_owner_local_factor_banks_produce_same_views() -> None:
     assert global_buffers.keys() == local_buffers.keys()
     for name in global_buffers:
         assert torch.equal(global_buffers[name], local_buffers[name]), name
+
+
+def test_sampler_value_requests_fused_combined_leaf(monkeypatch) -> None:
+    import sys
+    from types import ModuleType, SimpleNamespace
+
+    from xorl.models.transformers.glm5 import exact_routed_experts_qlora as qlora_module
+
+    module = _module(0)
+    hidden = torch.ones((2, _HIDDEN), dtype=torch.bfloat16)
+    routing = torch.tensor([[0.25, 0.5], [0.75, 0.125]], dtype=torch.float32)
+    local_ids = torch.tensor([[0, -1], [1, 2]], dtype=torch.int32)
+    fused_leaf = torch.tensor([[0.5] * _HIDDEN, [4.0] * _HIDDEN], dtype=torch.bfloat16)
+    observed = {}
+
+    monkeypatch.setattr(qlora_module.MoEExperts, "_ensure_sglang_server_args", lambda: None)
+
+    def fake_prepare(*_args, **_kwargs):
+        return (
+            {},
+            None,
+            False,
+            torch.empty(0, dtype=torch.int32),
+            torch.empty(0, dtype=torch.int32),
+            torch.tensor(0, dtype=torch.int32),
+        )
+
+    def fake_build_lora_hooks(*_args, **kwargs):
+        observed["mul_routed_weight"] = kwargs.get("mul_routed_weight", True)
+        return SimpleNamespace(after_gate_up=None, after_down=None)
+
+    def fake_kernel_sequence(*_args, **kwargs):
+        observed["no_combine"] = kwargs["no_combine"]
+        observed["routed_scaling_factor"] = kwargs["routed_scaling_factor"]
+        return fused_leaf
+
+    fake_fused_moe = ModuleType("sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe")
+    fake_fused_moe._prepare_fused_moe_run = fake_prepare
+    fake_fused_moe._fused_moe_kernel_sequence = fake_kernel_sequence
+    monkeypatch.setitem(
+        sys.modules,
+        "sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe",
+        fake_fused_moe,
+    )
+
+    fake_lora_module = ModuleType("sglang.srt.lora.lora_moe_runners")
+    fake_lora_module.LoRAInfo = lambda **kwargs: SimpleNamespace(**kwargs)
+    fake_lora_module.build_lora_hooks = fake_build_lora_hooks
+    monkeypatch.setitem(sys.modules, "sglang.srt.lora.lora_moe_runners", fake_lora_module)
+    factors = tuple(
+        getattr(module, name).detach().to(torch.bfloat16).contiguous() for name in module.logical_factor_names
+    )
+    actual, trace = module._sampler_value(
+        hidden,
+        routing,
+        local_ids,
+        *factors,
+        routed_scaling_factor=2.0,
+        capture_trace=False,
+    )
+    assert trace is None
+    assert observed == {
+        "mul_routed_weight": True,
+        "no_combine": False,
+        "routed_scaling_factor": 2.0,
+    }
+    assert actual is fused_leaf
 
 
 @pytest.mark.gpu

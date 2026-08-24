@@ -7,6 +7,7 @@ import torch
 from torch.distributed._tensor import Replicate, Shard
 
 from tests.models.test_glm52_qlora import _meta_model, _official_config
+from xorl.models.exact_contract import set_glm52_exact_active_lora
 from xorl.models.transformers.glm5.exact_lm_head_qlora import (
     Glm52ExactTP16LmHeadLoraLinear,
     Glm52ExactTP16LmHeadSelectedLogprob,
@@ -189,6 +190,72 @@ def test_glm52_exact_moe_construction_preserves_complete_global_inventory_and_so
         }
 
 
+def test_glm52_exact_qlora_router_training_admits_only_the_75_bf16_gate_weights(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_exact_world16_rank7(monkeypatch)
+    config = _exact_moe_config()
+    config._glm52_exact_active_lora_lm_head_component = True
+    config.train_router = True
+    model = _meta_model(config)
+
+    inventory = prepare_glm52_block_fp8_qlora(model, config, adapter_rank=1, adapter_alpha=1)
+
+    router_names = {f"model.layers.{layer_idx}.mlp.gate.weight" for layer_idx in range(3, 78)}
+    trainable = {name: parameter for name, parameter in model.named_parameters() if parameter.requires_grad}
+    assert set(trainable) == inventory.factor_names | router_names
+    assert all(trainable[name].dtype is torch.bfloat16 for name in router_names)
+    assert all(trainable[name].dtype is torch.float32 for name in inventory.factor_names)
+
+
+def test_glm52_exact_moe_construction_admits_deepep_sparse_leaf_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_ep16_rank7(monkeypatch)
+    config = _exact_moe_config()
+    config._ep_dispatch = "deepep"
+    config._deepep_buffer_size_gb = 1.25
+    config._deepep_num_sms = 24
+    config._deepep_async_combine = True
+    model = _meta_model(config)
+
+    prepare_glm52_block_fp8_qlora(model, config, adapter_rank=1, adapter_alpha=1)
+
+    routed = model.get_submodule("model.layers.3.mlp.experts")
+    assert type(routed) is Glm52ExactEP16BlockFP8QLoRARoutedExperts
+    assert routed.ep_dispatch == "deepep"
+    assert routed.deepep_buffer_size_gb == pytest.approx(1.25)
+    assert routed.deepep_num_sms == 24
+    assert routed.deepep_async_combine is True
+    assert routed.expert_adapter_gradient_contract.factor_layout == "gkn_gate_up_down"
+
+
+def test_glm52_exact_moe_construction_admits_native_deepep_split_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_exact_world16_rank7(monkeypatch)
+    config = _exact_moe_config()
+    config._ep_dispatch = "deepep"
+    config._deepep_native_exact = True
+    config._deepep_buffer_size_gb = 1.5
+    config._deepep_num_sms = 24
+    config._deepep_async_combine = False
+    config.train_router = False
+    set_glm52_exact_active_lora(config, enabled=True)
+    model = _meta_model(config)
+
+    prepare_glm52_block_fp8_qlora(model, config, adapter_rank=1, adapter_alpha=1)
+
+    block = model.get_submodule("model.layers.3.mlp")
+    routed = block.experts
+    assert block.deepep_native_exact is True
+    assert type(routed) is Glm52ExactEP16BlockFP8QLoRARoutedExperts
+    assert routed.ep_dispatch == "deepep"
+    assert routed.deepep_buffer_size_gb == pytest.approx(1.5)
+    assert routed.deepep_num_sms == 24
+    assert routed.deepep_async_combine is False
+
+
 def test_glm52_exact_moe_post_ep_layout_preserves_factor_fqns_and_owner_logical_shapes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -297,7 +364,6 @@ def test_glm52_complete_exact_construction_attaches_only_selected_logprob_lm_hea
             "requires the exact active-LoRA routed-expert component",
         ),
         ({"_sparse_mla_enabled": False}, "requires sparse_mla_enabled=true"),
-        ({"_ep_dispatch": "deepep"}, "requires ep_dispatch='alltoall'"),
     ),
 )
 def test_glm52_exact_moe_construction_rejects_incomplete_dependency_flags_before_mutation(

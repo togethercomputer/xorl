@@ -14,8 +14,13 @@ DeepEP is a GPU-resident expert-parallel dispatch backend. It uses GPU interconn
 ## Installation
 
 ```bash
-pip install deep_ep-*.whl   # use a wheel compatible with the selected CUDA/PyTorch profile
+pip install -e . -e "submodules/xorl-sglang/python[all]"
 ```
+
+The default dependency profile installs the wheel pinned by
+`vendor/deepep-release.lock.json` for Python 3.12 and PyTorch 2.12.1+cu132.
+Deterministic hierarchical combine remains an explicit exactness-mode
+selection; the installed wheel retains stock DeepEP reduction as its default.
 
 Verify:
 ```python

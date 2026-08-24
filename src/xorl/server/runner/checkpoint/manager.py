@@ -16,7 +16,7 @@ import os
 import shutil
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 
 import torch
 import torch.distributed as dist
@@ -36,12 +36,19 @@ from xorl.models.exact_contract import (
     contains_dsv4_exact_active_lora_component,
     contains_glm52_exact_active_lora_component,
     contains_glm52_fullparam_component,
+    glm52_exact_active_lora_enabled,
 )
 from xorl.server.runner.adapters.manager import (
+    LocalModelPartsView,
     adapter_gradient_ownership_checkpoint_metadata,
     save_adapter_optimizer_shards,
 )
 from xorl.server.session_spec import write_session_spec
+from xorl.server.weight_sync.glm52_router_bundle import (
+    gather_glm52_router_weights_across_ranks,
+    mark_adapter_config_with_glm52_router_bundle,
+    save_glm52_router_bundle,
+)
 from xorl.utils import helper
 from xorl.utils.device import get_device_type
 
@@ -67,8 +74,13 @@ class CheckpointManager:
         rank: int,
         local_rank: int,
         adapter_manager=None,
+        model_parts: Optional[Sequence[nn.Module]] = None,
     ):
         self.model = model
+        self.model_parts = tuple(model_parts) if model_parts is not None else (model,)
+        self._local_model_view = (
+            self.model_parts[0] if len(self.model_parts) == 1 else LocalModelPartsView(self.model_parts)
+        )
         self.optimizer = optimizer
         self.Checkpointer = checkpointer
         self.lora_config = lora_config
@@ -77,6 +89,10 @@ class CheckpointManager:
         self.rank = rank
         self.local_rank = local_rank
         self._adapter_manager = adapter_manager
+        # The exact single-tenant GLM lane detaches adapter switching after
+        # promotion, but retains a lightweight PP topology publisher for the
+        # optimizer-owned live model factors.
+        self._detached_adapter_publisher = None
 
         # These will be set/updated by ModelRunner
         self.global_step = 0
@@ -88,6 +104,17 @@ class CheckpointManager:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _model_view_for_local_parts(self):
+        return getattr(self, "_local_model_view", self.model)
+
+    def _has_glm52_exact_active_lora(self) -> bool:
+        # Config is replicated across PP stages, whereas value components are
+        # intentionally absent from dense-only stages.  Use the replicated
+        # contract stamp to keep publication collectives rank-symmetric.
+        return glm52_exact_active_lora_enabled(getattr(self.model, "config", None)) or (
+            contains_glm52_exact_active_lora_component(self._model_view_for_local_parts())
+        )
 
     def _get_lora_save_config(self):
         """Get target_modules and lora_alpha for PEFT-format saving.
@@ -259,9 +286,12 @@ class CheckpointManager:
 
     def _gather_adapter_lora_params(self, model_id: str) -> Dict[str, torch.Tensor]:
         """Collectively reconstruct full active logical tensors on rank 0."""
-        if self._adapter_manager is None:
-            return get_lora_state_dict(self.model)
-        return self._adapter_manager.materialize_logical_state_dict(model_id, destination_rank=0)
+        if self._adapter_manager is not None:
+            return self._adapter_manager.materialize_logical_state_dict(model_id, destination_rank=0)
+        publisher = getattr(self, "_detached_adapter_publisher", None)
+        if publisher is not None:
+            return publisher.materialize_live_model_logical_state_dict(destination_rank=0)
+        return get_lora_state_dict(self.model)
 
     def _adapter_publication_error(self, model_id: str, *, strict: bool) -> Optional[str]:
         if self._adapter_manager is None:
@@ -295,7 +325,7 @@ class CheckpointManager:
                 f"{operation} cannot materialize a merged/full-weight snapshot. Export all 948 factors "
                 "as dsv4_expert_banks and load a fresh sampler adapter version."
             )
-        if contains_glm52_exact_active_lora_component(self.model):
+        if self._has_glm52_exact_active_lora():
             raise RuntimeError(
                 "GLM-5.2 exact active-LoRA composites require factor-only adapter publication; "
                 f"{operation} cannot materialize a merged/full-weight snapshot. Export the complete 1,700-factor "
@@ -379,11 +409,24 @@ class CheckpointManager:
         # Ensure adapter weights are synced to model
         if self._adapter_manager is not None:
             self._adapter_manager.switch_adapter(model_id, auto_register=True)
+            publication_step = self._adapter_manager.get_global_step(model_id)
+        else:
+            publication_step = self.global_step
 
         # Always reconstruct logical tensors through the model's EP+FSDP path;
         # adapter optimizer slots are rank-local and are never PEFT payloads.
         logger.info(f"Rank {self.rank}: Using collective topology-aware LoRA weight gathering")
         lora_state_dict = self._gather_adapter_lora_params(model_id)
+        exact_glm52_router_state = None
+        # The router is part of GLM-5.2's trainer/sampler numerical identity
+        # even when it is frozen.  ``train_router`` controls gradients, not
+        # publication: an exact active-LoRA sampler must receive the trainer's
+        # router values at every published weight version.
+        if self._has_glm52_exact_active_lora():
+            exact_glm52_router_state = gather_glm52_router_weights_across_ranks(
+                self._model_view_for_local_parts(),
+                destination_rank=0,
+            )
 
         # Only rank 0 writes files
         if self.rank == 0:
@@ -413,11 +456,25 @@ class CheckpointManager:
                 lora_export_format=lora_export_format,
                 preserve_lora_dtype=preserve_lora_dtype,
             )
+            if exact_glm52_router_state is not None:
+                manifest = save_glm52_router_bundle(
+                    save_path,
+                    exact_glm52_router_state,
+                    weight_step=publication_step,
+                    expected_layer_ids=list(
+                        range(
+                            int(getattr(self.model.config, "first_k_dense_replace")),
+                            int(getattr(self.model.config, "num_hidden_layers")),
+                        )
+                    ),
+                )
+                mark_adapter_config_with_glm52_router_bundle(save_path, manifest)
             if adapter_session_spec is not None:
                 write_session_spec(save_path, adapter_session_spec)
 
         # Cleanup
         del lora_state_dict
+        del exact_glm52_router_state
         gc.collect()
         torch.cuda.empty_cache()
 

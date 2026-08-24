@@ -543,11 +543,17 @@ def test_canonical_combine_over_real_deepep_normal():
 
 
 def test_canonical_combine_over_real_deepep_q397b_geometry():
-    """Exercise 512 experts and top-10 routing (K < EP at EP32)."""
+    """Exercise 512 experts and top-10 routing (K < EP at EP32).
+
+    DeepEP's normal dispatch supports at most 128 local experts, so the
+    512-expert geometry cannot be projected below EP4.  Keep the ordinary
+    256-expert gate above runnable at EP2, but require a valid topology for
+    this model-specific gate instead of failing inside the CUDA kernel.
+    """
     pytest.importorskip("deep_ep")
     pytest.importorskip("nvidia.nvshmem")
     _launch(
-        _required_gpus(),
+        max(_required_gpus(), 4),
         {"XORL_TEST_DEEPEP_CC_EXPERTS": "512", "XORL_TEST_DEEPEP_CC_TOPK": "10"},
     )
 

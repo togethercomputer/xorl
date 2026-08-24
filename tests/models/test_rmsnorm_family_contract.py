@@ -220,6 +220,48 @@ def _assert_qwen3_moe_norm_family_declaration_policy():
     assert final_norm.family_values == [None]
 
 
+def test_shared_attention_exposes_cold_path_component_diagnostics():
+    cfg = Qwen3Config(
+        hidden_size=64,
+        intermediate_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        num_hidden_layers=1,
+        _attn_implementation="eager",
+    )
+    attn = MultiHeadAttention(cfg, layer_idx=0)
+    captured = {}
+    attn._diagnostic_capture_component = lambda name, value: captured.setdefault(name, value.detach().clone())
+
+    hidden = torch.randn(1, 3, 64)
+    cos = torch.ones(1, 3, 16)
+    sin = torch.zeros(1, 3, 16)
+    q, k, v = attn._project_qkv(hidden, (cos, sin))
+    output = attn._project_output(torch.randn(1, 3, 4, 16))
+
+    assert {
+        "attention_input",
+        "qkv",
+        "q_pre_qk_norm",
+        "k_pre_qk_norm",
+        "q_post_qk_norm",
+        "k_post_qk_norm",
+        "v",
+        "rope_cos",
+        "rope_sin",
+        "q",
+        "k",
+        "attn_output",
+        "o_proj_output",
+    } == set(captured)
+    torch.testing.assert_close(captured["attention_input"], hidden)
+    torch.testing.assert_close(captured["q"], q)
+    torch.testing.assert_close(captured["k"], k)
+    torch.testing.assert_close(captured["v"], v)
+    torch.testing.assert_close(captured["o_proj_output"], output)
+
+
 # --------------------------------------------------------------------------- #
 # Loud tripwire for undeclared parity-lane calls.
 # --------------------------------------------------------------------------- #

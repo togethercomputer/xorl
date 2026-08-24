@@ -159,6 +159,11 @@ async def test_forward_backward_preserves_runner_result_fields(processor):
     result = {
         "backward_compute_time": 0.75,
         "forward_compute_time": 0.5,
+        "router_grad_norm": 1.5,
+        "router_grad_tensor_count": 1200,
+        "dsv4_grad_norm": 3.25,
+        "dsv4_grad_staged_factor_count_min": 948,
+        "dsv4_router_grad_present_count": 0,
         "total_loss": 0.5,
         "global_valid_tokens": 2,
         "forward_backward_time": 1.25,
@@ -178,12 +183,57 @@ async def test_forward_backward_preserves_runner_result_fields(processor):
     assert output.outputs[0]["backward_compute_time"] == pytest.approx(0.75)
     assert output.outputs[0]["forward_compute_time"] == pytest.approx(0.5)
     assert output.outputs[0]["forward_backward_time"] == pytest.approx(1.25)
+    assert output.outputs[0]["router_grad_norm"] == pytest.approx(1.5)
+    assert output.outputs[0]["router_grad_tensor_count"] == 1200
+    assert output.outputs[0]["dsv4_grad_norm"] == pytest.approx(3.25)
+    assert output.outputs[0]["dsv4_grad_staged_factor_count_min"] == 948
+    assert output.outputs[0]["dsv4_router_grad_present_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_optim_step_preserves_router_update_receipt(processor):
+    processor.backend.optim_step = AsyncMock(
+        return_value={
+            "grad_norm": 2.0,
+            "step": 1,
+            "router_update_tensor_count": 1200,
+            "router_update_changed_tensor_count": 1200,
+            "router_update_changed_element_count": 4096,
+        }
+    )
+    request = OrchestratorRequest(
+        request_id="req-router-update",
+        request_type=RequestType.ADD,
+        operation="optim_step",
+        payload=OptimStepData(model_id="default", lr=1e-4),
+    )
+
+    output = await processor.execute_optim_step(request)
+
+    assert output.outputs[0]["router_update_tensor_count"] == 1200
+    assert output.outputs[0]["router_update_changed_tensor_count"] == 1200
+    assert output.outputs[0]["router_update_changed_element_count"] == 4096
 
 
 def test_teacher_sort_key_reads_nested_loss_inputs():
     assert RequestProcessor._teacher_sort_key({"loss_fn_inputs": {"teacher_id": 3}}) == 3
     assert RequestProcessor._teacher_sort_key({"loss_fn_inputs": {"teacher_ids": [[2, 2, 2]]}}) == 2
     assert RequestProcessor._teacher_sort_key({"teacher_id": 1, "loss_fn_inputs": {"teacher_id": 4}}) == 1
+
+
+def test_restore_datum_order_inverts_balanced_dp_packer_order():
+    outputs = [{"case": name} for name in ("long", "medium", "short")]
+
+    restored = RequestProcessor._restore_datum_order(outputs, [2, 0, 1])
+
+    assert [output["case"] for output in restored] == ["medium", "short", "long"]
+
+
+def test_restore_datum_order_rejects_cardinality_and_duplicate_indices():
+    with pytest.raises(RuntimeError, match="output count"):
+        RequestProcessor._restore_datum_order([{"case": "only"}], [1, 0])
+    with pytest.raises(RuntimeError, match="duplicate"):
+        RequestProcessor._restore_datum_order([{"case": "a"}, {"case": "b"}], [0, 0])
 
 
 @pytest.mark.asyncio
@@ -565,6 +615,60 @@ async def test_model_pass_mooncake_payloads_follow_packer_datum_order(monkeypatc
         assert [item.tolist() for item in loaded] == [routed_experts[2], routed_experts[0]]
     finally:
         await exec.stop()
+
+
+@pytest.mark.asyncio
+async def test_model_pass_outputs_restore_packer_datum_order(monkeypatch):
+    backend = DummyBackend()
+    exec = RequestProcessor(backend=backend, sample_packing_sequence_len=100)
+
+    def _pack_samples(*args, **kwargs):
+        del args, kwargs
+        return (
+            [
+                {
+                    "input_ids": [[1, 2, 3, 4]],
+                    "labels": [[2, 3, 4, 5]],
+                    "position_ids": [[0, 1, 0, 1]],
+                    "request_id": "req-output-order",
+                    "batch_id": 0,
+                    "num_samples": 2,
+                }
+            ],
+            [1, 0],
+        )
+
+    monkeypatch.setattr(request_processor_module, "pack_samples", _pack_samples)
+    await exec.start()
+    try:
+        exec.backend.forward = AsyncMock(
+            return_value={
+                "total_loss": 0.0,
+                "global_valid_tokens": 4,
+                "packed_logprobs": [[10.0, 11.0, 20.0, 21.0]],
+                "packed_position_ids": [[0, 1, 0, 1]],
+            }
+        )
+        request = OrchestratorRequest(
+            request_id="req-output-order",
+            request_type=RequestType.ADD,
+            operation="forward",
+            payload=ModelPassData(
+                data=[
+                    {"input_ids": [1, 2], "labels": [2, 3]},
+                    {"input_ids": [3, 4], "labels": [4, 5]},
+                ]
+            ),
+        )
+
+        output = await exec.execute_forward(request)
+    finally:
+        await exec.stop()
+
+    assert output.outputs[0]["per_sample_outputs"] == [
+        {"logprobs": [20.0, 21.0]},
+        {"logprobs": [10.0, 11.0]},
+    ]
 
 
 @pytest.mark.asyncio
@@ -1085,6 +1189,7 @@ async def test_packed_row_batching_groups_single_row_packed_batches():
     assert batch["input_ids"][0] == [1, 2, 3, 4, 5, 6, 7, 8, 9]
     assert batch["position_ids"][0] == [0, 1, 2, 0, 1, 2, 0, 1, 2]
     assert batch["cu_seq_lens_q"] == [0, 3, 6, 9]
+    assert batch["sampler_prefill_lengths"] == [1, 1, 1]
     assert batch["num_samples"] == 3
     assert output.outputs[0]["executor_original_batches"] == 2
     assert output.outputs[0]["executor_batches"] == 1

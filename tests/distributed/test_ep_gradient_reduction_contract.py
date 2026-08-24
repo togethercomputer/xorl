@@ -12,7 +12,7 @@ from torch.distributed.tensor import Replicate
 
 from xorl.distributed.ep_gradients import synchronize_replicated_gradient_parameters
 from xorl.distributed.gradient_reduction import GradientReductionDomain
-from xorl.distributed.torch_parallelize import _build_ep_param_groups
+from xorl.distributed.torch_parallelize import _build_ep_param_groups, refresh_ep_param_groups
 from xorl.models.layers.moe.backend import ep_lora_gradient_reduction_domain
 
 
@@ -34,6 +34,31 @@ def test_gradient_reduction_domain_admission_policy():
 
     with pytest.raises(ValueError, match="Unknown gradient reduction domain"):
         _build_ep_param_groups(model)
+
+
+def test_refresh_ep_param_groups_rebinds_replaced_parameter_identity():
+    model = nn.Module()
+    shared = nn.Module()
+    shared._skip_fsdp = True
+    original = nn.Parameter(torch.empty(1, device="meta"))
+    shared.weight = original
+    model.shared = shared
+    model._fqn2spec_info = {
+        "shared.weight": SimpleNamespace(
+            placement=Replicate(),
+            gradient_reduction=GradientReductionDomain.EP_SUM,
+        )
+    }
+
+    _build_ep_param_groups(model)
+    assert model._ep_param_groups["ep_replicated_gradient_sync"] == [original]
+
+    replacement = nn.Parameter(torch.ones(1))
+    shared.weight = replacement
+    refresh_ep_param_groups(model)
+
+    assert model._ep_param_groups["ep_replicated_gradient_sync"] == [replacement]
+    assert all(parameter is not original for parameter in model._ep_param_groups["ep_replicated_gradient_sync"])
 
 
 def test_real_two_rank_backend_contracts():

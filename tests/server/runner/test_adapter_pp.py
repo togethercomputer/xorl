@@ -104,6 +104,22 @@ def test_pp1_publication_keeps_direct_path(monkeypatch) -> None:
     assert manager.materialize_logical_state_dict("policy", destination_rank=0) is state
 
 
+def test_live_model_publication_does_not_restore_stale_adapter_slots(monkeypatch) -> None:
+    manager = _bare_manager(pp_size=1, stage_group=object())
+    live_state = {"lm_head.lora_B": torch.tensor([[7.0]], dtype=torch.float32)}
+    manager.prepare_forward = lambda _model_id: pytest.fail(
+        "detached publication must not overwrite shared-optimizer updates"
+    )
+    monkeypatch.setattr("xorl.lora.utils.get_lora_state_dict", lambda _model: live_state)
+    monkeypatch.setattr(manager_impl, "_optimizer_shard_rank_world", lambda: (0, 1))
+
+    publisher = manager.make_live_model_lora_publisher()
+    published = publisher.materialize_live_model_logical_state_dict(destination_rank=0)
+
+    assert published is live_state
+    assert not hasattr(publisher, "adapters")
+
+
 def test_pp_load_filters_a_combined_checkpoint_to_the_local_stage() -> None:
     local_name = "model.layers.7.self_attn.q_proj.lora_A"
     other_stage_name = "model.layers.1.self_attn.q_proj.lora_A"

@@ -7,6 +7,8 @@ byte-consistency helper. Cross-engine bitwise gates (trainer merged forward vs
 sglang postfold serving) live in experiments/k3_tests/lora_path_xengine.py.
 """
 
+import sys
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -352,6 +354,7 @@ class TestMoEExpertsLoRAMerged:
             mod.down_proj.normal_(std=0.02)
             for proj in ("gate_proj", "up_proj", "down_proj"):
                 getattr(mod, f"{proj}_lora_B").normal_(std=0.02)
+        mod.lora_serving_mode = "merged"
         return mod
 
     def _assert_merged_weight_and_cache_policy(self):
@@ -420,13 +423,55 @@ class TestMoEExpertsLoRAMerged:
 
         self._assert_native_ep_no_grad_uses_canonical_fold_and_filter(monkeypatch)
 
+    def test_native_deepep_widens_only_bf16_routing_metadata(self, monkeypatch):
+        import xorl.distributed.moe.deepep_native_exact as native_exact
+
+        mod = self._module()
+        mod.exact_merged_forward = True
+        mod.deepep_native_exact = True
+        mod.ep_dispatch = "deepep"
+        mod.deepep_async_combine = False
+        mod.deepep_buffer_size_gb = 2.0
+        mod.deepep_num_sms = 20
+        hidden = torch.randn(3, H).to(torch.bfloat16)
+        routing_bf16 = torch.rand(3, 2).to(torch.bfloat16)
+        selected = torch.randint(0, E, (3, 2))
+        expected = torch.randn_like(hidden)
+        captured = {}
+
+        def fake_program(got_hidden, got_routing, got_selected, **kwargs):
+            captured.update(
+                hidden=got_hidden,
+                routing=got_routing,
+                selected=got_selected,
+                kwargs=kwargs,
+            )
+            return expected
+
+        monkeypatch.setattr(native_exact, "native_dispatch_runner_combine", fake_program)
+        got = mod._ep_forward(
+            hidden,
+            routing_bf16,
+            selected,
+            SimpleNamespace(ep_group=object()),
+        )
+
+        assert got is expected
+        assert captured["hidden"] is hidden
+        assert captured["selected"] is selected
+        assert captured["routing"].dtype is torch.float32
+        assert torch.equal(
+            captured["routing"],
+            routing_bf16.to(torch.float32),
+        )
+
     def _assert_native_ep_no_grad_uses_canonical_fold_and_filter(self, monkeypatch):
         mod = self._module()
         mod.exact_merged_forward = True
         hidden = torch.randn(3, H).to(torch.bfloat16)
-        routing = torch.rand(3, 2).to(torch.bfloat16)
+        routing = torch.rand(3, 2).to(torch.float32)
         local_ids = torch.tensor([[0, -1], [1, -1], [-1, 2]], dtype=torch.int32)
-        expected = torch.randn_like(hidden)
+        expected = torch.randn(3, H, dtype=torch.bfloat16)
         gate_up_f, down_f = mod._merged_weights()
         captured = {}
 
@@ -462,7 +507,8 @@ class TestMoEExpertsLoRAMerged:
         ):
             got = mod.sglang_ep_native_routed_partial(hidden, routing, local_ids)
 
-        assert got is expected
+        assert got.dtype is torch.bfloat16
+        assert torch.equal(got, expected)
         assert captured == {
             "hidden": hidden,
             "gate_up": gate_up_f,
@@ -472,6 +518,166 @@ class TestMoEExpertsLoRAMerged:
             "weight_cache": None,
             "filter_expert": True,
         }
+
+    def test_native_ep_trainable_path_requests_fused_local_combine(self):
+        mod = self._module()
+        mod.exact_merged_forward = True
+        hidden = torch.randn(3, H).to(torch.bfloat16)
+        routing = torch.rand(3, 2).to(torch.float32)
+        local_ids = torch.tensor([[0, -1], [1, -1], [-1, 2]], dtype=torch.int32)
+        expected = torch.randn_like(hidden)
+
+        with (
+            patch("xorl.models.layers.moe.experts.MoEExperts._load_sglang_fused_experts_impl", return_value=object()),
+            patch(
+                "xorl.models.layers.moe.experts._SglangFusedExpertsTrainFunction.apply",
+                return_value=expected,
+            ) as apply,
+        ):
+            got = mod.sglang_ep_native_routed_partial(hidden, routing, local_ids)
+
+        assert got is expected
+        assert apply.call_args.args[-1] is True
+
+    def test_native_ep_separate_mode_is_distinct_from_merged(self, monkeypatch):
+        mod = self._module()
+        mod.exact_merged_forward = True
+        mod.lora_serving_mode = "separate"
+        hidden = torch.randn(3, H).to(torch.bfloat16)
+        routing = torch.rand(3, 2).to(torch.float32)
+        local_ids = torch.tensor([[0, -1], [1, -1], [-1, 2]], dtype=torch.int32)
+        expected = torch.randn_like(hidden)
+        captured = {}
+
+        def hook_value(got_hidden, got_routing, got_ids, *factors):
+            captured.update(
+                hidden=got_hidden,
+                routing=got_routing,
+                ids=got_ids,
+                factors=factors,
+            )
+            return expected
+
+        monkeypatch.setattr(mod, "_sglang_native_lora_hook_value", hook_value)
+        monkeypatch.setattr(
+            mod,
+            "_merged_weights",
+            lambda: pytest.fail("separate mode must not fold LoRA into base weights"),
+        )
+        with torch.no_grad():
+            got = mod.sglang_ep_native_routed_partial(hidden, routing, local_ids)
+
+        assert got is expected
+        assert captured["hidden"] is hidden
+        assert captured["routing"] is routing
+        assert captured["ids"] is local_ids
+        assert len(captured["factors"]) == 6
+        assert all(factor.dtype is torch.bfloat16 for factor in captured["factors"])
+
+    def test_separate_zero_b_still_builds_active_shared_outer_info(self, monkeypatch):
+        mod = self._module()
+        mod.lora_serving_mode = "separate"
+        monkeypatch.setitem(
+            sys.modules,
+            "sglang.srt.lora.lora_moe_runners",
+            SimpleNamespace(LoRAInfo=SimpleNamespace),
+        )
+        with torch.no_grad():
+            for projection in ("gate_proj", "up_proj", "down_proj"):
+                getattr(mod, f"{projection}_lora_B").zero_()
+        factors = tuple(
+            value.to(torch.bfloat16)
+            for projection in ("gate_proj", "up_proj", "down_proj")
+            for value in mod._active_lora_views(projection)
+        )
+        physical = mod._sglang_native_lora_physical_buffers(*factors)
+        info = mod._sglang_native_lora_info(3, physical)
+
+        assert physical["gate_up_lora_a_weights"].shape == (1, 1, 2 * R, H)
+        assert physical["gate_up_lora_b_weights"].shape == (1, E, 2 * I, R)
+        assert physical["down_lora_a_weights"].shape == (1, E, R, I)
+        assert physical["down_lora_b_weights"].shape == (1, 1, H, R)
+        assert torch.count_nonzero(physical["gate_up_lora_b_weights"]) == 0
+        assert torch.count_nonzero(physical["down_lora_b_weights"]) == 0
+        assert info.has_active_lora is True
+        assert info.experts_shared_outer_loras is True
+        assert info.adapter_enabled.tolist() == [1]
+
+    def test_native_ep_separate_trainable_path_uses_value_surrogate_boundary(self):
+        mod = self._module()
+        mod.exact_merged_forward = True
+        mod.lora_serving_mode = "separate"
+        hidden = torch.randn(3, H).to(torch.bfloat16)
+        routing = torch.rand(3, 2).to(torch.float32)
+        local_ids = torch.tensor([[0, -1], [1, -1], [-1, 2]], dtype=torch.int32)
+        expected = torch.randn_like(hidden)
+
+        with patch(
+            "xorl.models.layers.moe.lora._SglangNativeLoRAHooksTrainFunction.apply",
+            return_value=expected,
+        ) as apply:
+            got = mod.sglang_ep_native_routed_partial(hidden, routing, local_ids)
+
+        assert got is expected
+        assert apply.call_args.args[:3] == (hidden, routing, local_ids)
+        assert apply.call_args.args[-1] is mod
+
+    def test_separate_surrogate_uses_post_shard_physical_expert_count(self):
+        mod = self._module()
+        # Qwen constructs a global expert bank and ParallelPlan/FSDP shards
+        # its tensors afterwards.  Preserve the stale construction attribute
+        # while presenting the two-expert physical tensors seen by each rank.
+        local_experts = E // 2
+        with torch.no_grad():
+            mod.gate_up_proj = torch.nn.Parameter(
+                mod.gate_up_proj[:local_experts].detach().clone(), requires_grad=False
+            )
+            mod.down_proj = torch.nn.Parameter(mod.down_proj[:local_experts].detach().clone(), requires_grad=False)
+            for name in ("gate_proj_lora_B", "up_proj_lora_B", "down_proj_lora_A"):
+                value = getattr(mod, name)
+                setattr(
+                    mod,
+                    name,
+                    torch.nn.Parameter(value[:local_experts].detach().clone()),
+                )
+        assert mod.num_local_experts == E
+        assert mod.gate_up_proj.shape[0] == local_experts
+
+        hidden = torch.randn(3, H, dtype=torch.bfloat16, requires_grad=True)
+        routing = torch.rand(3, 2, dtype=torch.float32, requires_grad=True)
+        local_ids = torch.tensor([[0, -1], [1, -1], [-1, 0]], dtype=torch.int32)
+        factors = tuple(
+            value
+            for projection in ("gate_proj", "up_proj", "down_proj")
+            for value in mod._active_lora_views(projection)
+        )
+        needs_input_grad = (True, True, False, True, True, True, True, True, True, False)
+
+        def fake_grad(_output, inputs, **_kwargs):
+            return tuple(torch.zeros_like(value) for value in inputs)
+
+        with (
+            patch(
+                "xorl.models.layers.moe.experts.MoEExperts._load_sglang_fused_experts_impl",
+                return_value=object(),
+            ),
+            patch(
+                "xorl.models.layers.moe.experts._SglangFusedExpertsTrainFunction.apply",
+                return_value=torch.zeros_like(hidden, requires_grad=True),
+            ) as apply,
+            patch("torch.autograd.grad", side_effect=fake_grad),
+        ):
+            mod._sglang_native_lora_hook_surrogate_vjp(
+                hidden,
+                routing,
+                local_ids,
+                *factors,
+                grad_output=torch.ones_like(hidden),
+                needs_input_grad=needs_input_grad,
+            )
+
+        assert apply.call_args.args[9] == local_experts
+        assert apply.call_args.args[11] is True
 
 
 class TestTrunkWrapComposition:

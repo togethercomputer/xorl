@@ -775,8 +775,25 @@ def _assert_rank_local_row_batching_and_provenance_policy(monkeypatch):
     assert my_batches[0]["packed_row_source_num_samples"] == [1, 1]
     assert my_batches[0]["packed_row_source_token_spans"] == [[0, 2], [2, 4]]
     assert my_batches[0]["packed_row_source_group_size"] == 2
+    assert "sampler_prefill_lengths" not in my_batches[0]
 
     _assert_unmerged_rows_record_source_provenance()
+
+
+def test_packed_row_batching_keeps_only_complete_sampler_boundaries():
+    first = _batch(10)
+    second = _batch(20)
+    first.update(_r3_sample_lengths=[2], sampler_prefill_lengths=[1])
+    second.update(_r3_sample_lengths=[2], sampler_prefill_lengths=[2])
+
+    complete = batch_packed_rows([first, second], row_batch_size=2)[0]
+    assert complete["sampler_prefill_lengths"] == [1, 2]
+
+    second.pop("sampler_prefill_lengths")
+    mixed_contracts = batch_packed_rows([first, second], row_batch_size=2)
+    assert len(mixed_contracts) == 2
+    assert mixed_contracts[0]["sampler_prefill_lengths"] == [1]
+    assert "sampler_prefill_lengths" not in mixed_contracts[1]
 
 
 def _assert_unmerged_rows_record_source_provenance():

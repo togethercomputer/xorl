@@ -4,12 +4,14 @@ import pytest
 import torch
 from torch import nn
 
+import xorl.distributed.torch_parallelize as torch_parallelize
 from xorl.distributed.torch_parallelize import (
     _coerce_optional_bool_config,
     _configure_manual_fsdp_prefetch,
     _exact_lm_head_replicated_params,
     _expert_mixed_precision_policy,
     _fsdp_kwargs_for_module,
+    _fully_shard_declared_mixed_dtype_unit,
     _resolve_fsdp_reduce_dtype,
     _sequence_parallel_fully_folded_into_fsdp,
     _topmost_modules_matching,
@@ -64,6 +66,57 @@ def test_explicit_full_precision_module_drops_only_its_fsdp_mp_policy() -> None:
     }
     assert _fsdp_kwargs_for_module(original, nn.Module()) == original
     assert original["mp_policy"] is policy
+
+
+def test_declared_mixed_dtype_unit_forms_two_sharded_groups_without_renaming(monkeypatch) -> None:
+    class _DeclaredComposite(nn.Module):
+        fsdp_full_precision_parameter_names = ("A_log", "dt_bias")
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.A_log = nn.Parameter(torch.zeros(4, dtype=torch.float32))
+            self.dt_bias = nn.Parameter(torch.ones(4, dtype=torch.float32))
+            self.q_proj = nn.Linear(4, 4, bias=False, dtype=torch.bfloat16)
+            self.o_proj = nn.Linear(4, 4, bias=False, dtype=torch.bfloat16)
+
+    module = _DeclaredComposite()
+    parameter_names_before = tuple(dict(module.named_parameters()))
+    calls = []
+
+    def fake_fully_shard(target, **kwargs) -> None:
+        calls.append((target, kwargs))
+
+    monkeypatch.setattr(torch_parallelize, "fully_shard", fake_fully_shard)
+    compute_kwargs = {"mesh": "mesh", "mp_policy": "bf16"}
+    full_precision_kwargs = {"mesh": "mesh"}
+
+    representatives = _fully_shard_declared_mixed_dtype_unit(
+        module,
+        compute_kwargs=compute_kwargs,
+        full_precision_kwargs=full_precision_kwargs,
+    )
+
+    assert calls == [([module.q_proj, module.o_proj], compute_kwargs), (module, full_precision_kwargs)]
+    assert representatives == [module, module.q_proj]
+    assert tuple(dict(module.named_parameters())) == parameter_names_before
+
+
+def test_declared_mixed_dtype_unit_rejects_non_bf16_compute_parameters(monkeypatch) -> None:
+    class _BadComposite(nn.Module):
+        fsdp_full_precision_parameter_names = ("state",)
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.state = nn.Parameter(torch.zeros(4, dtype=torch.float32))
+            self.proj = nn.Linear(4, 4, bias=False, dtype=torch.float32)
+
+    monkeypatch.setattr(torch_parallelize, "fully_shard", lambda *_args, **_kwargs: None)
+    with pytest.raises(TypeError, match="compute parameters must be uniformly BF16"):
+        _fully_shard_declared_mixed_dtype_unit(
+            _BadComposite(),
+            compute_kwargs={},
+            full_precision_kwargs={},
+        )
 
 
 def test_dsv4_exact_lm_head_replicates_only_fp32_a() -> None:

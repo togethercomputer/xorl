@@ -221,6 +221,41 @@ def test_compute_token_diagnostics_reports_hidden_state_summaries():
     assert summary["layers"][1]["mean"] == pytest.approx(7.0)
 
 
+def test_compute_token_diagnostics_summarizes_dsv4_hyperconnection_rows():
+    hidden_states = torch.tensor([[[1.0, 2.0], [3.0, 4.0]]])
+    hyperconnection_states = torch.tensor([[[[1.0, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]]])
+    labels = torch.tensor([[IGNORE_INDEX, 1]])
+
+    out = ModelRunner._compute_token_diagnostics(
+        hidden_states,
+        torch.eye(2),
+        labels,
+        topk=1,
+        all_hidden_states=(hyperconnection_states,),
+        hidden_sample_count=2,
+    )
+
+    layer = out["hidden_state_summaries"][0]["layers"][0]
+    assert layer["mean"] == pytest.approx(6.5)
+    assert layer["sample_values"] == pytest.approx([5.0, 6.0])
+
+
+def test_compute_hidden_state_diagnostics_does_not_require_lm_head():
+    labels = torch.tensor([[IGNORE_INDEX, 7]])
+    residual = torch.tensor([[[[1.0, 2.0], [3.0, 4.0]], [[5.0, 6.0], [7.0, 8.0]]]])
+
+    out = ModelRunner._compute_hidden_state_diagnostics(
+        all_hidden_states=(residual,),
+        labels=labels,
+        hidden_sample_count=2,
+    )
+
+    assert out["valid_positions"] == [1]
+    layer = out["hidden_state_summaries"][0]["layers"][0]
+    assert layer["mean"] == pytest.approx(6.5)
+    assert layer["sample_values"] == pytest.approx([5.0, 6.0])
+
+
 def test_compute_token_diagnostics_uses_explicit_hidden_sample_indices():
     hidden_states = torch.tensor([[[1.0, 2.0, 3.0], [4.0, 6.0, 8.0]]])
     weight = torch.eye(3)
@@ -502,7 +537,14 @@ def test_hidden_component_hooks_accept_native_moe_operand_components():
         def forward(self, hidden_states):
             capture = self._diagnostic_capture_component
             capture("moe_native_gathered_input", hidden_states)
+            capture("moe_native_recv_hidden", hidden_states)
+            capture("moe_native_recv_weights", hidden_states[..., :1])
+            capture("moe_native_recv_local_ids", torch.zeros_like(hidden_states[..., :1], dtype=torch.long))
+            capture("moe_native_expert_start", torch.tensor([0], device=hidden_states.device))
+            capture("moe_native_gate_up_packed_local_0", hidden_states + 0.25)
+            capture("moe_native_recv_leaf", hidden_states + 0.75)
             capture("moe_native_local_partial", hidden_states + 1.0)
+            capture("moe_native_shared_folded", hidden_states + 1.5)
             capture("moe_native_combined", hidden_states + 2.0)
             return hidden_states + 2.0
 
@@ -537,7 +579,14 @@ def test_hidden_component_hooks_accept_native_moe_operand_components():
 
     by_name = {capture["name"]: capture for capture in captures}
     assert by_name["moe_native_gathered_input"]["order"] == 80
+    assert by_name["moe_native_recv_hidden"]["order"] == 80
+    assert by_name["moe_native_recv_weights"]["order"] == 81
+    assert by_name["moe_native_recv_local_ids"]["order"] == 82
+    assert by_name["moe_native_expert_start"]["order"] == 83
+    assert by_name["moe_native_gate_up_packed_local_0"]["order"] == 83
+    assert by_name["moe_native_recv_leaf"]["order"] == 84
     assert by_name["moe_native_local_partial"]["order"] == 89
+    assert by_name["moe_native_shared_folded"]["order"] == 89
     assert by_name["moe_native_combined"]["order"] == 90
     torch.testing.assert_close(by_name["moe_native_local_partial"]["tensor"], hidden_states + 1.0)
 

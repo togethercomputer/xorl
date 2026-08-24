@@ -68,6 +68,37 @@ __all__ = [
 ]
 
 
+def _deepcopy_pipeline_model(model: nn.Module) -> nn.Module:
+    """Clone a model while preserving its rank-local process-group handles.
+
+    Exact attention and vocabulary-head modules bind their CP/TP groups during
+    construction.  ``ProcessGroup`` objects are immutable rank-local runtime
+    handles and cannot be pickled, so a plain ``copy.deepcopy`` fails before
+    PP pruning.  Seeding the deepcopy memo keeps only those handles shared;
+    parameters, buffers, modules, and ordinary Python state are still cloned.
+    """
+
+    memo: dict[int, object] = {}
+    for module in model.modules():
+        for value in vars(module).values():
+            if isinstance(value, torch.distributed.ProcessGroup):
+                memo[id(value)] = value
+    cloned = copy.deepcopy(model, memo)
+
+    # ``nn.Parameter.__deepcopy__`` clones tensor storage and requires-grad but
+    # intentionally drops the parameter's Python ``__dict__``. XoRL records
+    # numerical/ownership contracts there (for example ``_keep_fp32`` and
+    # ``spec_info``), so silently losing it changes the PP program. Reattach
+    # the rank-local metadata to the already-cloned parameter objects by FQN.
+    source_parameters = dict(model.named_parameters(remove_duplicate=False))
+    cloned_parameters = dict(cloned.named_parameters(remove_duplicate=False))
+    if source_parameters.keys() != cloned_parameters.keys():
+        raise RuntimeError("pipeline deepcopy changed the model parameter inventory")
+    for name, source_parameter in source_parameters.items():
+        cloned_parameters[name].__dict__.update(source_parameter.__dict__)
+    return cloned
+
+
 def generate_llm_fqn_from_layer_ranges(
     layer_ranges,
     *,
@@ -640,7 +671,7 @@ def pipeline_module_split(
     stages, model_parts = [], []
     for stage_idx in stage_ids:
         module_names = module_names_per_stage[stage_idx]
-        model = copy.deepcopy(whole_model)
+        model = _deepcopy_pipeline_model(whole_model)
         fqns_to_keep = set(module_names) | always_keep
 
         # Recursive pruning handles nested HF model structures
@@ -707,7 +738,29 @@ def build_pp_stage(
     dummy forward would otherwise run the intra-stage CP collectives, which
     deadlock against the cross-stage shape-exchange P2P. Output shapes are
     derivable from (mbs, seq_len, hidden/vocab), so the forward is unnecessary.
+
+    Manual ``PipelineStage`` treats the supplied examples as the authoritative
+    static autograd metadata.  Activation examples are usually created with
+    ``torch.empty(..., device="meta")``, whose default ``requires_grad=False``
+    would make received activations leaf tensors that never accumulate the
+    gradient to send to the preceding stage.  Mark the differentiable sides of
+    each inter-stage boundary explicitly; root token IDs remain integral and
+    non-differentiable.
     """
+    if stage_index > 0 and input_args is not None:
+        input_args = tuple(
+            value.requires_grad_(True)
+            if isinstance(value, torch.Tensor) and (value.is_floating_point() or value.is_complex())
+            else value
+            for value in input_args
+        )
+    if stage_index < num_stages - 1 and output_args is not None:
+        output_args = tuple(
+            value.requires_grad_(True)
+            if isinstance(value, torch.Tensor) and (value.is_floating_point() or value.is_complex())
+            else value
+            for value in output_args
+        )
     return PipelineStage(
         model_part,
         stage_index,

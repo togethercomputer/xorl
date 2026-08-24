@@ -1,3 +1,4 @@
+import math
 from types import MethodType, SimpleNamespace
 
 import pytest
@@ -913,6 +914,73 @@ def test_sampler_index_k_preparation_uses_split_prompt_and_fused_decode_suffix()
 
 
 @pytest.mark.cpu
+def test_sampler_index_k_preparation_is_segment_aware_for_packed_requests():
+    split = torch.full((1, 9, 128), 7, dtype=torch.bfloat16)
+    raw = torch.zeros_like(split)
+    weight = torch.ones((128,), dtype=torch.float32)
+    bias = torch.zeros((128,), dtype=torch.float32)
+    cos = torch.ones((1, 9, 64), dtype=torch.float32)
+    sin = torch.zeros_like(cos)
+    calls = []
+
+    def mark_fused_suffix(key, _weight, _bias, _eps, _cache, _positions):
+        calls.append(key.shape[0])
+        return torch.full_like(key, 11)
+
+    mixed = _mix_sampler_index_k_preparation(
+        split,
+        raw,
+        weight,
+        bias,
+        1e-6,
+        (cos, sin),
+        torch.tensor([3, 2], dtype=torch.int64),
+        [5, 4],
+        query_offset=0,
+        interleaved=True,
+        _native_kernel_for_testing=mark_fused_suffix,
+    )
+
+    assert calls == [2, 2]
+    assert torch.equal(mixed[:, :3], split[:, :3])
+    assert torch.equal(mixed[:, 3:5], torch.full_like(mixed[:, 3:5], 11))
+    assert torch.equal(mixed[:, 5:7], split[:, 5:7])
+    assert torch.equal(mixed[:, 7:], torch.full_like(mixed[:, 7:], 11))
+
+
+@pytest.mark.cpu
+def test_sampler_index_k_preparation_intersects_packed_segments_with_cp_shard():
+    split = torch.full((1, 4, 128), 7, dtype=torch.bfloat16)
+    raw = torch.zeros_like(split)
+    cos = torch.ones((1, 4, 64), dtype=torch.float32)
+    sin = torch.zeros_like(cos)
+    calls = []
+
+    def mark_fused_suffix(key, *_args):
+        calls.append(key.shape[0])
+        return torch.full_like(key, 11)
+
+    mixed = _mix_sampler_index_k_preparation(
+        split,
+        raw,
+        torch.ones((128,), dtype=torch.float32),
+        torch.zeros((128,), dtype=torch.float32),
+        1e-6,
+        (cos, sin),
+        torch.tensor([3, 2], dtype=torch.int64),
+        [5, 4],
+        query_offset=4,
+        interleaved=True,
+        _native_kernel_for_testing=mark_fused_suffix,
+    )
+
+    assert calls == [1, 1]
+    assert torch.equal(mixed[:, :1], torch.full_like(mixed[:, :1], 11))
+    assert torch.equal(mixed[:, 1:3], split[:, 1:3])
+    assert torch.equal(mixed[:, 3:], torch.full_like(mixed[:, 3:], 11))
+
+
+@pytest.mark.cpu
 def test_sampler_index_k_preparation_maps_4096_boundary_across_cp16():
     local_length = 260
     split = torch.zeros((1, local_length, 128), dtype=torch.bfloat16)
@@ -1144,6 +1212,7 @@ def test_correction_bias_stays_fp32_and_checkpoint_ingestion_fails_closed():
 def test_canonical_moe_checkpoint_replay_preserves_serving_routing_bytes_and_router_gradients(monkeypatch):
     config = _small_glm_config()
     config._glm52_exact_contract = True
+    config.train_router = True
     config.routed_scaling_factor = 3.25
     block = Glm5MoEBlock(config, layer_idx=1)
     container = nn.Module()
@@ -1157,7 +1226,6 @@ def test_canonical_moe_checkpoint_replay_preserves_serving_routing_bytes_and_rou
         handler,
     )
     monkeypatch.setattr(block._routing_replay, "_target_device", lambda: torch.device("cpu"))
-    block.gate._glm52_exact_fullparam_component = True
     with torch.no_grad():
         block.gate.weight.copy_(torch.linspace(-0.1, 0.1, block.gate.weight.numel()).reshape_as(block.gate.weight))
 
@@ -1194,6 +1262,17 @@ def test_canonical_moe_checkpoint_replay_preserves_serving_routing_bytes_and_rou
     original_hidden = torch.randn(2, config.hidden_size, dtype=torch.bfloat16)
     recompute_hidden = torch.randn_like(original_hidden)
     try:
+        # Exact replay qualification begins with a forward-only request.  A
+        # trainable router must preserve the serving bytes in that no-grad
+        # phase without requiring an autograd edge that PyTorch suppresses by
+        # contract.
+        with torch.no_grad():
+            forward_only_weights, forward_only_ids, _ = block.route(original_hidden)
+        assert not forward_only_weights.requires_grad
+        assert torch.equal(forward_only_weights.view(torch.uint8), serving_weights.view(torch.uint8))
+        assert torch.equal(forward_only_ids, serving_ids)
+        topk_calls.clear()
+
         set_replay_stage("record")
         recorded_weights, recorded_ids, _ = block.route(original_hidden)
         assert len(topk_calls) == 1
@@ -1237,6 +1316,26 @@ def test_canonical_moe_checkpoint_replay_preserves_serving_routing_bytes_and_rou
     finally:
         set_replay_stage(None)
         RoutingReplay.clear_all()
+
+
+@pytest.mark.cpu
+def test_model_runner_collects_glm_router_gradient_evidence_by_module_identity():
+    config = _small_glm_config()
+    model = nn.Module()
+    model.config = config
+    model.router = Glm5TopkRouter(config)
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.model = model
+    runner._reset_glm52_router_gradient_evidence()
+    model.router(torch.ones(1, config.hidden_size)).sum().backward()
+
+    metrics = runner._collect_glm52_router_gradient_metrics()
+
+    assert metrics["router_grad_tensor_count"] == 1
+    assert metrics["router_grad_missing_count"] == 0
+    assert metrics["router_grad_nonfinite_count"] == 0
+    assert metrics["router_grad_nonzero_count"] == model.router.weight.numel()
+    assert metrics["router_grad_norm"] == pytest.approx(math.sqrt(model.router.weight.numel()))
 
 
 @pytest.mark.cpu
@@ -1413,9 +1512,11 @@ def _bind_semantic_canonicalizers(model, boundaries, *, serving: bool, skip_laye
             routing_weights,
             selected_experts,
             absolute_positions,
+            backward_layer_dependency=None,
             *,
             _layer_id=layer_id,
         ):
+            del backward_layer_dependency
             partials = _semantic_rank_partials(self, hidden_states, routing_weights, selected_experts)
             rows = hidden_states.shape[0] * hidden_states.shape[1]
             metadata = CanonicalMoEGraphMetadata.build(

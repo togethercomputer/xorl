@@ -369,12 +369,17 @@ class Qwen3MoeSparseMoeBlock(MoEBlock):
             moe_implementation="eager",
             train_router=getattr(config, "train_router", False),
             activation_native=getattr(config, "_activation_native", False),
+            exact_batch_invariant_router=bool(getattr(config, "_deepep_native_exact", False)),
+            exact_router_weights_fp32=bool(getattr(config, "_deepep_native_exact", False)),
         )
         self.config = config
+        self.deepep_native_exact = bool(getattr(config, "_deepep_native_exact", False))
         self.experts.ep_dispatch = getattr(config, "_ep_dispatch", "alltoall")
         self.experts.deepep_buffer_size_gb = getattr(config, "_deepep_buffer_size_gb", 2.0)
         self.experts.deepep_num_sms = getattr(config, "_deepep_num_sms", 20)
         self.experts.deepep_async_combine = getattr(config, "_deepep_async_combine", False)
+        self.experts.deepep_native_exact = getattr(config, "_deepep_native_exact", False)
+        self.experts.lora_serving_mode = getattr(config, "_lora_serving_mode", None)
         self.experts.alltoall_combine_hidden_chunk_size = getattr(config, "_alltoall_combine_hidden_chunk_size", 0)
 
 
@@ -392,12 +397,17 @@ class Qwen3MoeSparseTritonMoeBlock(MoEBlock):
             moe_implementation="triton",
             train_router=getattr(config, "train_router", False),
             activation_native=getattr(config, "_activation_native", False),
+            exact_batch_invariant_router=bool(getattr(config, "_deepep_native_exact", False)),
+            exact_router_weights_fp32=bool(getattr(config, "_deepep_native_exact", False)),
         )
         self.config = config
+        self.deepep_native_exact = bool(getattr(config, "_deepep_native_exact", False))
         self.experts.ep_dispatch = getattr(config, "_ep_dispatch", "alltoall")
         self.experts.deepep_buffer_size_gb = getattr(config, "_deepep_buffer_size_gb", 2.0)
         self.experts.deepep_num_sms = getattr(config, "_deepep_num_sms", 20)
         self.experts.deepep_async_combine = getattr(config, "_deepep_async_combine", False)
+        self.experts.deepep_native_exact = getattr(config, "_deepep_native_exact", False)
+        self.experts.lora_serving_mode = getattr(config, "_lora_serving_mode", None)
         self.experts.alltoall_combine_hidden_chunk_size = getattr(config, "_alltoall_combine_hidden_chunk_size", 0)
 
 
@@ -415,12 +425,17 @@ class Qwen3MoeSparseQuackMoeBlock(MoEBlock):
             moe_implementation="quack",
             train_router=getattr(config, "train_router", False),
             activation_native=getattr(config, "_activation_native", False),
+            exact_batch_invariant_router=bool(getattr(config, "_deepep_native_exact", False)),
+            exact_router_weights_fp32=bool(getattr(config, "_deepep_native_exact", False)),
         )
         self.config = config
+        self.deepep_native_exact = bool(getattr(config, "_deepep_native_exact", False))
         self.experts.ep_dispatch = getattr(config, "_ep_dispatch", "alltoall")
         self.experts.deepep_buffer_size_gb = getattr(config, "_deepep_buffer_size_gb", 2.0)
         self.experts.deepep_num_sms = getattr(config, "_deepep_num_sms", 20)
         self.experts.deepep_async_combine = getattr(config, "_deepep_async_combine", False)
+        self.experts.deepep_native_exact = getattr(config, "_deepep_native_exact", False)
+        self.experts.lora_serving_mode = getattr(config, "_lora_serving_mode", None)
         self.experts.alltoall_combine_hidden_chunk_size = getattr(config, "_alltoall_combine_hidden_chunk_size", 0)
 
 
@@ -438,12 +453,17 @@ class Qwen3MoeSparseNativeMoeBlock(MoEBlock):
             moe_implementation="native",
             train_router=getattr(config, "train_router", False),
             activation_native=getattr(config, "_activation_native", False),
+            exact_batch_invariant_router=bool(getattr(config, "_deepep_native_exact", False)),
+            exact_router_weights_fp32=bool(getattr(config, "_deepep_native_exact", False)),
         )
         self.config = config
+        self.deepep_native_exact = bool(getattr(config, "_deepep_native_exact", False))
         self.experts.ep_dispatch = getattr(config, "_ep_dispatch", "alltoall")
         self.experts.deepep_buffer_size_gb = getattr(config, "_deepep_buffer_size_gb", 2.0)
         self.experts.deepep_num_sms = getattr(config, "_deepep_num_sms", 20)
         self.experts.deepep_async_combine = getattr(config, "_deepep_async_combine", False)
+        self.experts.deepep_native_exact = getattr(config, "_deepep_native_exact", False)
+        self.experts.lora_serving_mode = getattr(config, "_lora_serving_mode", None)
         self.experts.alltoall_combine_hidden_chunk_size = getattr(config, "_alltoall_combine_hidden_chunk_size", 0)
 
 
@@ -883,7 +903,38 @@ class Qwen3MoeModel(Qwen3MoePreTrainedModel):
 class KwargsForCausalLM(AttentionKwargs): ...
 
 
+def _apply_qwen3_deepep_native_exact(model: nn.Module) -> dict[str, int]:
+    """Install the Qwen3-local arithmetic behind its exact DeepEP capability."""
+
+    from xorl.lora.modules.base import LoraModule  # noqa: PLC0415
+    from xorl.ops.batch_invariant_ops import (  # noqa: PLC0415
+        wrap_trunk_linears_batch_invariant,
+    )
+    from xorl.ops.bi_families_v2 import (  # noqa: PLC0415
+        _select_qwen3_dense_families_v2,
+    )
+
+    lora_mode = getattr(model.config, "_lora_serving_mode", None)
+    for module in model.modules():
+        if isinstance(module, LoraModule):
+            # Both publication modes train through the same canonical folded
+            # trunk weight. In separate mode, active sampler LoRA reproduces
+            # that fold from the transported factors.
+            module.exact_merged_forward = True
+            module.lora_serving_mode = lora_mode
+    _select_qwen3_dense_families_v2()
+    return wrap_trunk_linears_batch_invariant(model)
+
+
 class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel):
+    deepep_native_exact_capability = {
+        "produces_local_leaf": True,
+        "wire_dtype": "bf16",
+        "uses_dispatch_handle": True,
+        "supported_ep_sizes": (2, 4, 8, 16),
+        "local_leaf_program": "fused_no_combine_false",
+        "lora_serving_modes": ("merged", "separate"),
+    }
     _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
@@ -904,6 +955,9 @@ class Qwen3MoeForCausalLM(Qwen3MoePreTrainedModel):
     def unfuse_for_tp(self):
         """Unfuse fused projections for tensor parallelism compatibility."""
         parallelize.unfuse_for_tp(self)
+
+    def _apply_deepep_native_exact(self) -> dict[str, int]:
+        return _apply_qwen3_deepep_native_exact(self)
 
     def get_input_embeddings(self):
         return self.model.embed_tokens

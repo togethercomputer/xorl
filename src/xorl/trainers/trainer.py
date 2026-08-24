@@ -49,7 +49,7 @@ from xorl.models import (
     save_model_weights,
 )
 from xorl.models.checkpoint_handlers.buffers import get_prequantized_exclude_modules
-from xorl.models.exact_contract import exact_gdn_cp_alignment_required
+from xorl.models.exact_contract import exact_gdn_cp_alignment_required, glm52_exact_active_lora_enabled
 from xorl.models.layers.moe.aux_loss import LoadBalancingBuffer, global_load_balancing_loss_func
 from xorl.models.layers.moe.routing_replay import RoutingReplay, set_replay_stage
 from xorl.models.module_utils import compute_loss
@@ -58,7 +58,10 @@ from xorl.models.transformers.deepseek_v3.support import (
     validate_deepseek_v3_training_mode,
 )
 from xorl.models.transformers.glm5.index_share import IndexShareMode
-from xorl.models.transformers.glm5.support import validate_glm5_training_mode
+from xorl.models.transformers.glm5.support import (
+    validate_glm5_training_mode,
+    validate_glm52_local_router_inventory,
+)
 from xorl.optim import build_lr_scheduler, build_optimizer
 from xorl.qlora import (
     detect_prequantized_block_fp8,
@@ -706,6 +709,7 @@ class Trainer:
             deepep_buffer_size_gb=args.model.deepep_buffer_size_gb,
             deepep_num_sms=args.model.deepep_num_sms,
             deepep_async_combine=args.model.deepep_async_combine,
+            deepep_native_exact=getattr(args.model, "deepep_native_exact", False),
             router_fp32=args.model.router_fp32,
             lm_head_fp32=args.model.lm_head_fp32,
             alltoall_combine_hidden_chunk_size=args.model.alltoall_combine_hidden_chunk_size,
@@ -721,6 +725,7 @@ class Trainer:
             block_fp8_qlora_training=getattr(args.lora, "block_fp8_qlora_training", False),
             lora_rank=args.lora.lora_rank,
             lora_alpha=args.lora.lora_alpha,
+            lora_serving_mode=args.lora.lora_serving_mode,
             init_device=args.train.init_device,
             pipeline_parallel_virtual_stages=args.train.pipeline_parallel_virtual_stages,
             pipeline_parallel_input_weight=args.train.pipeline_parallel_input_weight,
@@ -1039,6 +1044,30 @@ class Trainer:
                 for name, param in part.named_parameters():
                     if "lora_A" not in name and "lora_B" not in name:
                         param.requires_grad = False
+
+        # The complete GLM-5.2 exact QLoRA lane trains the checkpoint-native
+        # BF16 sparse routers in addition to the adapter factors.  Deferred
+        # QLoRA freezing runs after FSDP and historically froze these weights
+        # again, leaving the optimizer inventory looking plausible while the
+        # grad-enabled router GEMM received a non-differentiable tensor.
+        if (
+            args.lora.enable_qlora
+            and bool(getattr(self.model.config, "train_router", False))
+            and glm52_exact_active_lora_enabled(self.model.config)
+        ):
+            retained_router_count = 0
+            for part in self._all_model_parts():
+                for name, param in part.named_parameters():
+                    if name.endswith("mlp.gate.weight"):
+                        param.requires_grad_(True)
+                        retained_router_count += 1
+            validate_glm52_local_router_inventory(
+                self._all_model_parts(),
+                retained_router_count=retained_router_count,
+            )
+            logger.info_rank0(
+                f"Retained {retained_router_count} post-FSDP BF16 router weights for exact GLM-5.2 QLoRA training"
+            )
 
         if args.model.freeze_router:
             frozen = 0

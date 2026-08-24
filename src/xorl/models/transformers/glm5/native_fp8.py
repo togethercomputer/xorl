@@ -34,6 +34,57 @@ _EXPERT_PAIR_KEY = re.compile(
 )
 
 
+def reduce_glm52_no_combine_routes(
+    routed_values: torch.Tensor,
+    routing_weights: torch.Tensor,
+    local_ids: torch.Tensor,
+    *,
+    routed_scaling_factor: float,
+) -> torch.Tensor:
+    """Reduce communicated BF16 route rows in GLM-5.2's FP32 local program."""
+
+    if routed_values.ndim != 3 or routed_values.dtype is not torch.bfloat16:
+        raise TypeError(
+            "GLM-5.2 no-combine values must be BF16 [rows, topk, hidden], "
+            f"got {routed_values.dtype} {tuple(routed_values.shape)}"
+        )
+    route_shape = tuple(routed_values.shape[:2])
+    if routing_weights.dtype is not torch.float32 or tuple(routing_weights.shape) != route_shape:
+        raise TypeError(
+            "GLM-5.2 no-combine routing weights must be FP32 [rows, topk], "
+            f"got {routing_weights.dtype} {tuple(routing_weights.shape)}"
+        )
+    if local_ids.dtype is not torch.int32 or tuple(local_ids.shape) != route_shape:
+        raise TypeError(
+            f"GLM-5.2 no-combine local ids must be int32 [rows, topk], got {local_ids.dtype} {tuple(local_ids.shape)}"
+        )
+    if not bool(torch.all(torch.isfinite(routing_weights))):
+        raise ValueError("GLM-5.2 no-combine routing weights contain non-finite values")
+    routed_scaling_factor = float(routed_scaling_factor)
+    if not math.isfinite(routed_scaling_factor) or routed_scaling_factor <= 0:
+        raise ValueError("GLM-5.2 routed scaling factor must be finite and positive")
+
+    # -1 routes are absent on this owner.  Mask before multiplying so a stale
+    # or diagnostic payload in a filtered slot can never enter the reduction.
+    valid_routes = local_ids >= 0
+    safe_values = torch.where(
+        valid_routes.unsqueeze(-1),
+        routed_values,
+        torch.zeros((), dtype=torch.bfloat16, device=routed_values.device),
+    )
+    weights = torch.where(
+        valid_routes,
+        routing_weights,
+        torch.zeros((), dtype=torch.float32, device=routing_weights.device),
+    )
+    reduced = torch.sum(
+        safe_values.to(torch.float32) * weights.unsqueeze(-1),
+        dim=1,
+        dtype=torch.float32,
+    )
+    return reduced.mul(routed_scaling_factor).to(torch.bfloat16)
+
+
 def validate_glm52_native_fp8_config(quantization_config: Mapping | None) -> dict:
     """Validate and normalize the exact official block-FP8 contract."""
 
@@ -409,7 +460,7 @@ class Glm52NativeBlockFP8Experts(nn.Module):
         from xorl.ops.moe.sglang_fused_moe_strided import fused_experts_impl_strided  # noqa: PLC0415
 
         MoEExperts._ensure_sglang_server_args()
-        output = fused_experts_impl_strided(
+        return fused_experts_impl_strided(
             hidden_flat.contiguous(),
             self.gate_up_proj.transpose(1, 2),
             self.down_proj.transpose(1, 2),
@@ -422,9 +473,9 @@ class Glm52NativeBlockFP8Experts(nn.Module):
             w2_scale=self.down_weight_scale_inv.transpose(1, 2),
             block_shape=[128, 128],
             filter_expert=True,
+            no_combine=False,
             routed_scaling_factor=routed_scaling_factor,
         )
-        return output
 
     def _dequantized_cached_experts(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Dequantize the stored bytes into [E, N, K] BF16 banks (LoRA-surrogate treatment)."""

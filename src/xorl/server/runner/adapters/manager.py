@@ -209,6 +209,25 @@ class LocalModelPartsView:
         raise AttributeError("Local model parts do not expose get_parallel_plan")
 
 
+@dataclass(frozen=True)
+class LiveModelLoRAPublisher:
+    """Minimal PP topology retained after a single-tenant manager detaches."""
+
+    model: Any
+    pipeline_parallel_size: int
+    adapter_process_group: Any
+
+    def materialize_live_model_logical_state_dict(self, *, destination_rank: int = 0) -> Dict[str, torch.Tensor]:
+        from xorl.lora.utils import get_lora_state_dict  # noqa: PLC0415
+
+        return _gather_pipeline_stage_state(
+            get_lora_state_dict(self.model),
+            pipeline_parallel_size=self.pipeline_parallel_size,
+            adapter_process_group=self.adapter_process_group,
+            destination_rank=destination_rank,
+        )
+
+
 def _parameter_layout_tensor(param: Any) -> Any:
     """Return the tensor carrying a Parameter's static layout metadata."""
 
@@ -314,6 +333,46 @@ def _optimizer_shard_rank_world() -> Tuple[int, int]:
     if torch.distributed.is_available() and torch.distributed.is_initialized():
         return torch.distributed.get_rank(), torch.distributed.get_world_size()
     return 0, 1
+
+
+def _gather_pipeline_stage_state(
+    local_stage_state: Dict[str, torch.Tensor],
+    *,
+    pipeline_parallel_size: int,
+    adapter_process_group: Any,
+    destination_rank: int,
+) -> Dict[str, torch.Tensor]:
+    """Collect one live logical state per PP stage on ``destination_rank``."""
+
+    rank, world = _optimizer_shard_rank_world()
+    if world == 1 or pipeline_parallel_size <= 1:
+        return local_stage_state if rank == destination_rank else {}
+
+    if adapter_process_group is None:
+        raise RuntimeError("Pipeline adapter publication requires the live stage-local owner group")
+    stage_ranks = tuple(int(member) for member in torch.distributed.get_process_group_ranks(adapter_process_group))
+    if not stage_ranks or rank not in stage_ranks:
+        raise RuntimeError("Current rank is absent from its pipeline-stage adapter owner group")
+    stage_payload = local_stage_state if rank == stage_ranks[0] else None
+    gathered = [None] * world if rank == destination_rank else None
+    torch.distributed.gather_object(
+        stage_payload,
+        object_gather_list=gathered,
+        dst=destination_rank,
+    )
+    if rank != destination_rank:
+        return {}
+
+    merged: Dict[str, torch.Tensor] = {}
+    assert gathered is not None
+    for payload in gathered:
+        if payload is None:
+            continue
+        for name, tensor in payload.items():
+            if name in merged:
+                raise RuntimeError(f"Pipeline adapter publication produced duplicate parameter {name!r}")
+            merged[name] = tensor
+    return merged
 
 
 def _adapter_layout_world_identity(adapter_state: "AdapterState") -> Tuple[int, Tuple[int, ...]]:
@@ -3121,43 +3180,54 @@ class LoRAAdapterManager:
                     return layout
             raise KeyError(f"No adapter layout for {fqn!r}") from None
 
+    def _gather_pipeline_stage_state(
+        self,
+        local_stage_state: Dict[str, torch.Tensor],
+        *,
+        destination_rank: int,
+    ) -> Dict[str, torch.Tensor]:
+        """Collect one live logical state per PP stage on ``destination_rank``."""
+
+        return _gather_pipeline_stage_state(
+            local_stage_state,
+            pipeline_parallel_size=self._pipeline_parallel_size,
+            adapter_process_group=self._adapter_process_group,
+            destination_rank=destination_rank,
+        )
+
+    def make_live_model_lora_publisher(self) -> LiveModelLoRAPublisher:
+        """Detach only the live model view and PP publication topology."""
+
+        return LiveModelLoRAPublisher(
+            model=self.model,
+            pipeline_parallel_size=self._pipeline_parallel_size,
+            adapter_process_group=self._adapter_process_group,
+        )
+
     def materialize_logical_state_dict(self, model_id: str, *, destination_rank: int = 0) -> Dict[str, torch.Tensor]:
         """Collectively reconstruct every PP stage's active logical weights."""
 
         self.prepare_forward(model_id)
+        return self.materialize_live_model_logical_state_dict(destination_rank=destination_rank)
+
+    def materialize_live_model_logical_state_dict(self, *, destination_rank: int = 0) -> Dict[str, torch.Tensor]:
+        """Publish current live factors without restoring compact adapter slots.
+
+        The exact GLM-5.2 train-router lane detaches the multi-adapter optimizer
+        after materializing its single default adapter.  Its shared optimizer
+        then updates the live model parameters, so calling ``prepare_forward``
+        during publication would overwrite those updates with stale compact
+        slots. This path treats the live model as source of truth while using
+        the manager's PP owner topology.
+        """
+
         from xorl.lora.utils import get_lora_state_dict  # noqa: PLC0415
 
         local_stage_state = get_lora_state_dict(self.model)
-        rank, world = _optimizer_shard_rank_world()
-        if world == 1 or self._pipeline_parallel_size <= 1:
-            return local_stage_state if rank == destination_rank else {}
-
-        stage_group = self._adapter_process_group
-        if stage_group is None:
-            raise RuntimeError("Pipeline adapter publication requires the live stage-local owner group")
-        stage_ranks = tuple(int(member) for member in torch.distributed.get_process_group_ranks(stage_group))
-        if not stage_ranks or rank not in stage_ranks:
-            raise RuntimeError("Current rank is absent from its pipeline-stage adapter owner group")
-        stage_payload = local_stage_state if rank == stage_ranks[0] else None
-        gathered = [None] * world if rank == destination_rank else None
-        torch.distributed.gather_object(
-            stage_payload,
-            object_gather_list=gathered,
-            dst=destination_rank,
+        return self._gather_pipeline_stage_state(
+            local_stage_state,
+            destination_rank=destination_rank,
         )
-        if rank != destination_rank:
-            return {}
-
-        merged: Dict[str, torch.Tensor] = {}
-        assert gathered is not None
-        for payload in gathered:
-            if payload is None:
-                continue
-            for name, tensor in payload.items():
-                if name in merged:
-                    raise RuntimeError(f"Pipeline adapter publication produced duplicate parameter {name!r}")
-                merged[name] = tensor
-        return merged
 
     def load_logical_state_dict(self, model_id: str, state_dict: Dict[str, torch.Tensor]) -> None:
         """Pack full active logical tensors into this rank's local adapter slots."""

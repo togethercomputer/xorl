@@ -127,6 +127,13 @@ class ServerArguments:
         default=False, metadata={"help": "Enable async combine for DeepEP (overlap combine with next layer's compute)."}
     )
 
+    deepep_native_exact: bool = field(
+        default=False,
+        metadata={
+            "help": "Use the versioned real-dispatch DeepEP BF16 transport plus deterministic hierarchical fold."
+        },
+    )
+
     alltoall_combine_hidden_chunk_size: int = field(
         default=0,
         metadata={
@@ -1045,6 +1052,13 @@ class ServerArguments:
     # ========================================================================
 
     enable_lora: bool = field(default=False, metadata={"help": "Enable LoRA adapters for training"})
+    lora_serving_mode: Optional[Literal["merged", "separate"]] = field(
+        default=None,
+        metadata={
+            "help": "Exact train/serve LoRA contract. 'merged' publishes W+sBA with no "
+            "sampler adapter; 'separate' publishes A/B factors for active-LoRA serving."
+        },
+    )
 
     lora_rank: int = field(default=32, metadata={"help": "LoRA rank (r parameter)"})
 
@@ -1224,6 +1238,25 @@ class ServerArguments:
         """Validate and set defaults."""
         from xorl.fp8_training.config_compat import normalize_fp8_training_config  # noqa: PLC0415
 
+        if self.deepep_native_exact and self.expert_parallel_size <= 1:
+            raise ValueError("deepep_native_exact requires expert_parallel_size > 1; EP1 bypasses DeepEP")
+
+        if self.lora_serving_mode not in {None, "merged", "separate"}:
+            raise ValueError("lora_serving_mode must be 'merged' or 'separate'")
+        if self.deepep_native_exact and self.enable_lora and self.lora_serving_mode is None:
+            raise ValueError("Exact LoRA requires explicit lora_serving_mode='merged' or 'separate'")
+        if not self.enable_lora and self.lora_serving_mode is not None:
+            raise ValueError("lora_serving_mode requires enable_lora=True")
+
+        if (
+            self.deepep_native_exact
+            and self.enable_gradient_checkpointing
+            and self.gradient_checkpointing_method in (None, "recompute_full_layer")
+        ):
+            # Native exact dispatch/combine cannot be re-entered under the
+            # routing-replay stage installed by full-layer checkpointing.
+            self.gradient_checkpointing_method = "recompute_before_dispatch"
+
         if isinstance(self.max_grad_norm, bool):
             raise ValueError("max_grad_norm must be a finite number; use a value <= 0 to disable clipping")
         try:
@@ -1350,7 +1383,6 @@ class ServerArguments:
                 "moe_hybrid_shared_lora": (self.moe_hybrid_shared_lora, True),
                 "moe_implementation": (self.moe_implementation, "triton"),
                 "ep_dispatch": (self.ep_dispatch, "alltoall" if exact_active_lora else "deepep"),
-                "freeze_router": (self.freeze_router, True),
                 "merge_qkv": (self.merge_qkv, True),
                 "lora_export_format": (self.lora_export_format, "sglang_shared_outer"),
             }
@@ -1367,6 +1399,13 @@ class ServerArguments:
             ]
             if mismatches:
                 raise ValueError("GLM-5.2 block-FP8 QLoRA rejects unsupported configuration: " + ", ".join(mismatches))
+            if exact_active_lora:
+                if self.train_router == self.freeze_router:
+                    raise ValueError(
+                        "GLM-5.2 exact block-FP8 QLoRA requires train_router and freeze_router to be complementary"
+                    )
+            elif self.train_router or not self.freeze_router:
+                raise ValueError("GLM-5.2 non-exact block-FP8 QLoRA requires train_router=False and freeze_router=True")
             if self.lora_target_modules is not None or self.lora_target_manifest is not None:
                 raise ValueError("GLM-5.2 block-FP8 QLoRA uses its complete deterministic target set")
             if self.qlora_exclude_modules is not None:
@@ -1485,6 +1524,7 @@ class ServerArguments:
                 "deepep_buffer_size_gb": self.deepep_buffer_size_gb,
                 "deepep_num_sms": self.deepep_num_sms,
                 "deepep_async_combine": self.deepep_async_combine,
+                "deepep_native_exact": self.deepep_native_exact,
                 "alltoall_combine_hidden_chunk_size": self.alltoall_combine_hidden_chunk_size,
                 "foundation": self.foundation,
                 "encoders": self.encoders,
@@ -1621,6 +1661,7 @@ class ServerArguments:
             },
             "lora": {
                 "enable_lora": self.enable_lora,
+                "lora_serving_mode": self.lora_serving_mode,
                 "lora_rank": self.lora_rank,
                 "max_lora_rank": self.max_lora_rank,
                 "lora_alpha": self.lora_alpha,

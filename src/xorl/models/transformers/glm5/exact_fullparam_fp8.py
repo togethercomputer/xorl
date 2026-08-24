@@ -940,7 +940,7 @@ class _Glm52FullParamRoutingWeightsSurrogate(torch.autograd.Function):
         return grad_logits.to(router_logits.dtype), None, None, None, None
 
 
-def glm52_fullparam_routing_weights_with_grad(
+def glm52_routing_weights_with_grad(
     router_logits: Tensor,
     serving_weights: Tensor,
     selected_experts: Tensor,
@@ -954,7 +954,7 @@ def glm52_fullparam_routing_weights_with_grad(
     if not _routing_surrogate_engagement_logged:
         _routing_surrogate_engagement_logged = True
         logger.info(
-            "GLM-5.2 full-param routing-weight surrogate engaged: contract=%s "
+            "GLM-5.2 exact routing-weight surrogate engaged: contract=%s "
             "(forward = serving values verbatim; backward = analytic regather vjp "
             "sigmoid-gather%s x%.6g into the router logits)",
             GLM52_FULLPARAM_ROUTING_SURROGATE_CONTRACT_VERSION,
@@ -970,6 +970,11 @@ def glm52_fullparam_routing_weights_with_grad(
     )
 
 
+# Compatibility name for the full-parameter admission/tests.  The surrogate
+# is contract-owned by exact routing rather than by one optimizer mode.
+glm52_fullparam_routing_weights_with_grad = glm52_routing_weights_with_grad
+
+
 __all__ = [
     "GLM52_EXACT_FULLPARAM_ROUTER_CONTRACT_VERSION",
     "GLM52_EXACT_TP1_FULLPARAM_FP8_CONTRACT_VERSION",
@@ -978,6 +983,7 @@ __all__ = [
     "Glm52ExactFullParamRouterWeight",
     "Glm52ExactTP1BlockFP8FullParamLinear",
     "Glm52FullParamDenseMLP",
+    "glm52_routing_weights_with_grad",
     "glm52_fullparam_routing_weights_with_grad",
     "quantize_expert_masters_to_serving_bytes",
     "quantize_master_to_serving_bytes",

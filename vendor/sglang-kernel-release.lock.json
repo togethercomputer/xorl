@@ -1,0 +1,23 @@
+{
+  "schema": "xorl.sglang_kernel_release_lock.v1",
+  "release_repository": "https://github.com/togethercomputer/xorl-wheels",
+  "release_tag": "deepep_sglang_kernel_torch212_cu132_sm90_723b8b3",
+  "source": {
+    "xorl_wheels_commit": "723b8b394519cc3d39274480a82933322b2bc037",
+    "sglang_commit": "65d5a0ec2596d314fbcd88bf179d2ea912aaaa02",
+    "sglang_aot_tree": "5dea732d55c9f413ea698054342a56e6df4356d1",
+    "url": "https://github.com/togethercomputer/xorl-wheels/releases/download/deepep_sglang_kernel_torch212_cu132_sm90_723b8b3/sglang_kernel-0.4.5%2Bxorl.torch212.cu132.sm90.tar.gz",
+    "sha256": "d0934b3871805c1c9233f0e6437b85cc04ecd459cbfb3452cefd20d5ab23ca88"
+  },
+  "wheel": {
+    "package": "sglang-kernel==0.4.5+xorl.torch212.cu132.sm90",
+    "url": "https://github.com/togethercomputer/xorl-wheels/releases/download/deepep_sglang_kernel_torch212_cu132_sm90_723b8b3/sglang_kernel-0.4.5%2Bxorl.torch212.cu132.sm90-cp312-cp312-linux_x86_64.whl",
+    "sha256": "f02e35414c18fd311ce29b7d27c9a07678f3932a9be3cabfec8d322f7b738f21",
+    "python_abi": "cp312-cp312-linux_x86_64",
+    "torch": "2.12.1+cu132",
+    "torch_cuda_runtime": "13.2",
+    "build_cuda_toolkit": "13.2",
+    "gpu_arch": "sm90",
+    "full_fa3": true
+  }
+}

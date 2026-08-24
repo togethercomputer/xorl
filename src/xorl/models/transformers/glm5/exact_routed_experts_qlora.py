@@ -127,6 +127,8 @@ class _Glm52ExactEP16RoutedQLoRAFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output: Tensor):
+        if getattr(ctx.module, "_require_routing_grad", False) and not ctx.needs_input_grad[1]:
+            raise RuntimeError("GLM-5.2 exact routed expert backward received a detached routing tensor")
         saved = ctx.saved_tensors
         hidden, routing, local_ids = saved[:3]
         effective = saved[3:9]
@@ -188,10 +190,10 @@ class Glm52ExactEP16BlockFP8QLoRARoutedExperts(Glm52NativeBlockFP8Experts):
             or self.moe_tp_size != 1
             or self.active_r != self.r
             or self.active_lora_alpha != self.lora_alpha
-            or self.ep_dispatch != "alltoall"
+            or self.ep_dispatch not in {"alltoall", "deepep"}
             or self.hybrid_shared is not True
         ):
-            raise ValueError("exact EP16 alltoall routed lane geometry no longer matches its declared contract")
+            raise ValueError("exact EP16 routed lane geometry no longer matches its declared contract")
         roles = ("gate_proj", "up_proj", "down_proj")
         return ExpertAdapterGradientContract(
             backend=replace(
@@ -247,8 +249,8 @@ class Glm52ExactEP16BlockFP8QLoRARoutedExperts(Glm52NativeBlockFP8Experts):
             )
         if moe_tp_size != 1:
             raise ValueError(f"GLM-5.2 routed experts admit only effective MoE-TP1, got TP{moe_tp_size}")
-        if ep_dispatch != "alltoall":
-            raise ValueError(f"GLM-5.2 exact routed experts reject ep_dispatch={ep_dispatch!r}; DeepEP is not admitted")
+        if ep_dispatch not in {"alltoall", "deepep"}:
+            raise ValueError(f"GLM-5.2 exact routed experts reject ep_dispatch={ep_dispatch!r}")
         if not isinstance(ep_rank, int) or isinstance(ep_rank, bool) or not 0 <= ep_rank < ep_size:
             raise ValueError(f"GLM-5.2 routed expert owner must be in [0, 15], got {ep_rank!r}")
 
@@ -268,7 +270,7 @@ class Glm52ExactEP16BlockFP8QLoRARoutedExperts(Glm52NativeBlockFP8Experts):
         self.ep_rank = ep_rank
         self.expert_offset = ep_rank * self.num_local_experts
         self.moe_tp_size = 1
-        self.ep_dispatch = "alltoall"
+        self.ep_dispatch = ep_dispatch
         self.r = self.active_r = r
         self.lora_alpha = self.active_lora_alpha = lora_alpha
         self.scaling = scaling
@@ -387,8 +389,8 @@ class Glm52ExactEP16BlockFP8QLoRARoutedExperts(Glm52NativeBlockFP8Experts):
         )
 
     def _validate_runtime_contract(self, hidden: Tensor, routing: Tensor, local_ids: Tensor) -> None:
-        if self.ep_dispatch == "deepep" or self.ep_dispatch != "alltoall":
-            raise RuntimeError("GLM-5.2 exact routed experts require canonical alltoall and reject DeepEP")
+        if self.ep_dispatch not in {"alltoall", "deepep"}:
+            raise RuntimeError("GLM-5.2 exact routed experts require an admitted canonical leaf transport")
         if (self.num_experts, self.ep_size, self.num_local_experts, self.moe_tp_size) != (256, 16, 16, 1):
             raise RuntimeError("GLM-5.2 exact routed EP16/MoE-TP1 topology was mutated")
         if (

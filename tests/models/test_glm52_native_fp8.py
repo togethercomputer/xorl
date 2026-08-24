@@ -13,6 +13,7 @@ from xorl.models.transformers.glm5.native_fp8 import (
     NativeBlockFP8ExpertPairBuffer,
     NativeBlockFP8PairBuffer,
     native_fp8_dense_source_map,
+    reduce_glm52_no_combine_routes,
     validate_glm52_native_fp8_config,
 )
 from xorl.ops.block_fp8_native import NativeBlockFP8Linear, unpack_float32_as_fp8
@@ -289,6 +290,45 @@ def test_glm_expert_state_is_frozen_exact_and_scoring_only():
         module(hidden.detach(), routing, sglang_ep_native_local_ids=local_ids)
     with pytest.raises(RuntimeError, match="canonical rank-local"):
         module(hidden.detach(), routing)
+
+
+def test_glm_no_combine_reducer_keeps_bf16_wire_and_fp32_local_sum():
+    routed_values = torch.tensor(
+        [
+            [[1.0, 2.0], [4.0, 8.0], [float("nan"), float("nan")]],
+            [[0.5, -1.0], [2.0, 3.0], [8.0, -4.0]],
+        ],
+        dtype=torch.bfloat16,
+    )
+    routing = torch.tensor([[0.25, 0.5, 1000.0], [0.125, 0.25, 0.5]], dtype=torch.float32)
+    local_ids = torch.tensor([[0, 1, -1], [2, -1, 3]], dtype=torch.int32)
+
+    actual = reduce_glm52_no_combine_routes(
+        routed_values,
+        routing,
+        local_ids,
+        routed_scaling_factor=2.0,
+    )
+    safe = torch.where((local_ids >= 0).unsqueeze(-1), routed_values, torch.zeros_like(routed_values))
+    weights = torch.where(local_ids >= 0, routing, torch.zeros_like(routing))
+    expected = (safe.float() * weights.unsqueeze(-1)).sum(dim=1).mul(2.0).to(torch.bfloat16)
+
+    assert actual.dtype is torch.bfloat16
+    assert torch.equal(actual, expected)
+    assert bool(torch.all(torch.isfinite(actual)))
+
+
+def test_glm_no_combine_reducer_rejects_wider_wire_values():
+    routes = torch.zeros((1, 2, 4), dtype=torch.float32)
+    routing = torch.ones((1, 2), dtype=torch.float32)
+    local_ids = torch.zeros((1, 2), dtype=torch.int32)
+    with pytest.raises(TypeError, match="must be BF16"):
+        reduce_glm52_no_combine_routes(
+            routes,
+            routing,
+            local_ids,
+            routed_scaling_factor=1.0,
+        )
 
 
 def test_expert_pair_buffer_fuses_local_gate_up_down_bytes_and_scales():
