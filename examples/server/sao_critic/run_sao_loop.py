@@ -85,9 +85,9 @@ def main():
             critic.optim_step(critic_adam).result()
             metrics = fb.metrics
             ev = explained_variance(
-                value_error_sq_mean=metrics.get("is_value_error_sq_mean", float("nan")),
-                return_mean=metrics.get("is_return_mean", float("nan")),
-                return_sq_mean=metrics.get("is_return_sq_mean", float("nan")),
+                value_error_sq_mean=metrics.get("is_value_error_sq_mean:mean", float("nan")),
+                return_mean=metrics.get("is_return_mean:mean", float("nan")),
+                return_sq_mean=metrics.get("is_return_sq_mean:mean", float("nan")),
             )
 
         # 4) Policy step. With real rollouts, ``logprobs`` are the sampler's

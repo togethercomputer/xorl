@@ -67,9 +67,9 @@ Explained variance is the paper's key critic diagnostic (it should climb toward 
 
 ```python
 ev = explained_variance(
-    value_error_sq_mean=metrics["is_value_error_sq_mean"],
-    return_mean=metrics["is_return_mean"],
-    return_sq_mean=metrics["is_return_sq_mean"],
+    value_error_sq_mean=metrics["is_value_error_sq_mean:mean"],
+    return_mean=metrics["is_return_mean:mean"],
+    return_sq_mean=metrics["is_return_sq_mean:mean"],
 )
 ```
 
