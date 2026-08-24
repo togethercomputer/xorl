@@ -447,24 +447,30 @@ def _sp_allreduce_kl_metrics(
 
 
 class _SumGradAcrossRanks(torch.autograd.Function):
-    """Identity forward; all-reduce(SUM) the gradient across all ranks.
+    """Identity forward; all-reduce(SUM) the gradient over the given group.
 
     Used for the directly-consumed value-head weight: every rank's local loss
     share depends on the full replicated weight, but backward on a rank can
     only produce that rank's contribution. Summing the upstream weight
     gradient makes the sharded factor gradients complete, matching the
     raw-sum loss contract (normalization happens once at optim_step).
+
+    The group must be exactly the ranks that hold shards of the head AND see
+    distinct data — the mesh the head is sharded on. Ranks OUTSIDE that mesh
+    (e.g. expert-parallel replicas with dp=1) compute identical full-batch
+    gradients that must NOT be summed.
     """
 
     @staticmethod
-    def forward(ctx, tensor: torch.Tensor) -> torch.Tensor:
+    def forward(ctx, tensor: torch.Tensor, group) -> torch.Tensor:
+        ctx.group = group
         return tensor
 
     @staticmethod
-    def backward(ctx, grad: torch.Tensor) -> torch.Tensor:
+    def backward(ctx, grad: torch.Tensor):
         grad = grad.contiguous()
-        dist.all_reduce(grad, op=dist.ReduceOp.SUM)
-        return grad
+        dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=ctx.group)
+        return grad, None
 
 
 class ModelRunner:
@@ -2183,9 +2189,11 @@ class ModelRunner:
             )
         delta = value_head.get_delta_weight()
         if isinstance(delta, DTensor):
+            mesh = delta.device_mesh
+            group = mesh.get_group() if mesh.ndim == 1 else mesh._flatten().get_group()
             delta = delta.full_tensor()
-            if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
-                delta = _SumGradAcrossRanks.apply(delta)
+            if dist.is_available() and dist.is_initialized() and dist.get_world_size(group) > 1:
+                delta = _SumGradAcrossRanks.apply(delta, group)
         return delta
 
     @staticmethod
