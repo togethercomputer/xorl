@@ -626,15 +626,20 @@ def parallelize_model_fsdp2(
             fully_shard(lm_head_mod, **fsdp_kwargs)
             logger.info_rank0("Using FSDP-sharded lm_head loss over the FSDP group.")
     elif not pp_enabled and fsdp_kwargs.get("reshard_after_forward", True) is not False:
-        # A scalar value head (critic) is consumed like lm_head: the loss reads
-        # its weight AFTER the model forward, so it must live in the same
-        # stay-gathered unit that norm.forward() unshards.
-        value_head_mod = getattr(model, "value_head", None)
-        last_modules = [m for m in [norm_mod, lm_head_mod, value_head_mod] if m is not None]
+        last_modules = [m for m in [norm_mod, lm_head_mod] if m is not None]
         if last_modules:
             last_fsdp_kwargs = dict(fsdp_kwargs)
             last_fsdp_kwargs["reshard_after_forward"] = False
             fully_shard(last_modules, **last_fsdp_kwargs)
+
+    # A scalar value head (critic) gets its own FSDP unit whose forward is
+    # never invoked: its parameters therefore remain sharded DTensors at all
+    # times (stable for adapter layout validation across forward-only ops),
+    # and the loss consumes the folded LoRA delta through the direct-DTensor
+    # lane (full_tensor of a Partial matmul), like direct lm-head factors.
+    value_head_mod = getattr(model, "value_head", None)
+    if value_head_mod is not None and not pp_enabled:
+        fully_shard(value_head_mod, **fsdp_kwargs)
 
     # shard root model
     # Collect all _skip_fsdp experts params so they're also ignored by the

@@ -1,8 +1,9 @@
 import math
+import random
 
 import pytest
 
-from xorl.rl import compute_skip_observation_gae
+from xorl.rl import compute_skip_observation_gae, explained_variance
 
 
 pytestmark = pytest.mark.cpu
@@ -89,3 +90,37 @@ def test_length_mismatch_raises():
         compute_skip_observation_gae([0.0], [0.0, 0.0])
     with pytest.raises(ValueError, match="action_mask"):
         compute_skip_observation_gae([0.0, 0.0], [0.0, 0.0], [1])
+
+
+def test_explained_variance_matches_direct_computation():
+    rng = random.Random(3)
+    returns = [rng.gauss(0.5, 1.3) for _ in range(500)]
+    values = [r + rng.gauss(0.0, 0.4) for r in returns]  # decent critic
+    n = len(returns)
+    mean_r = sum(returns) / n
+    var_r = sum((r - mean_r) ** 2 for r in returns) / n
+    mse = sum((v - r) ** 2 for v, r in zip(values, returns)) / n
+    direct = 1.0 - mse / var_r
+
+    ev = explained_variance(
+        value_error_sq_mean=mse,
+        return_mean=mean_r,
+        return_sq_mean=sum(r * r for r in returns) / n,
+    )
+    assert math.isclose(ev, direct, rel_tol=1e-9)
+    assert 0.5 < ev < 1.0
+
+
+def test_explained_variance_perfect_and_mean_critic():
+    returns = [0.0, 1.0, 2.0, 3.0]
+    mean_r = 1.5
+    sq_mean = sum(r * r for r in returns) / 4
+    # Perfect critic: zero error -> EV = 1.
+    assert explained_variance(0.0, mean_r, sq_mean) == pytest.approx(1.0)
+    # Mean-predicting critic: error variance == return variance -> EV = 0.
+    var_r = sq_mean - mean_r**2
+    assert explained_variance(var_r, mean_r, sq_mean) == pytest.approx(0.0)
+
+
+def test_explained_variance_undefined_for_constant_returns():
+    assert math.isnan(explained_variance(0.1, 1.0, 1.0))

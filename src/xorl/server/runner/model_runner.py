@@ -446,6 +446,27 @@ def _sp_allreduce_kl_metrics(
     return metrics
 
 
+class _SumGradAcrossRanks(torch.autograd.Function):
+    """Identity forward; all-reduce(SUM) the gradient across all ranks.
+
+    Used for the directly-consumed value-head weight: every rank's local loss
+    share depends on the full replicated weight, but backward on a rank can
+    only produce that rank's contribution. Summing the upstream weight
+    gradient makes the sharded factor gradients complete, matching the
+    raw-sum loss contract (normalization happens once at optim_step).
+    """
+
+    @staticmethod
+    def forward(ctx, tensor: torch.Tensor) -> torch.Tensor:
+        return tensor
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor) -> torch.Tensor:
+        grad = grad.contiguous()
+        dist.all_reduce(grad, op=dist.ReduceOp.SUM)
+        return grad
+
+
 class ModelRunner:
     """
     ModelRunner handles model operations on distributed GPUs using xorl infrastructure.
@@ -1191,6 +1212,7 @@ class ModelRunner:
         output_group_size = len(local_group_memberships.get("output_projection_replica", (0,)))
         declarations: dict[str, ParameterOwnershipDeclaration] = {}
         guard_payloads: dict[str, dict[str, Any]] = {}
+        session_frozen_fqns = self._adapter_manager.frozen_parameter_fqns(state.session_spec)
         for name, layout in state.tensor_layouts.items():
             parameter = named_parameters[name]
             if id(parameter) in direct_parameter_ids:
@@ -1324,10 +1346,12 @@ class ModelRunner:
             guard_payload.update(expert_guard_by_parameter_id.get(id(parameter), {}))
             guard_payload.update(exact_lm_head_guard_by_parameter_id.get(id(parameter), {}))
             guard_payloads[name] = guard_payload
-            # Policy-loss steps never touch the value head, so its factors may
-            # legitimately have no gradient; every other adapter factor keeps
-            # the strict presence contract.
+            # Two classes of factors may legitimately lack a gradient: the
+            # value head during policy-loss steps, and factors the session
+            # explicitly froze via frozen_module_patterns. Everything else
+            # keeps the strict presence contract.
             is_value_head_param = name.startswith("value_head.") or ".value_head." in name
+            authorized_zero = is_value_head_param or name in session_frozen_fqns
             declarations[name] = ParameterOwnershipDeclaration(
                 topology=topology,
                 producer=producer,
@@ -1336,7 +1360,7 @@ class ModelRunner:
                 capture_domains=tuple(capture),
                 pending_domains=tuple(pending),
                 presence=GradientPresencePolicy.AUTHORIZED_ZERO
-                if is_value_head_param
+                if authorized_zero
                 else GradientPresencePolicy.REQUIRED_IF_ACTIVE,
                 config_guard_fingerprint=self._adapter_gradient_hash(guard_payload),
                 config_guard_fields=tuple(sorted(guard_payload.items())),
@@ -2132,19 +2156,37 @@ class ModelRunner:
         return self._get_effective_lm_head_weight_for(self.model.lm_head)
 
     def _get_effective_value_head_weight(self):
-        """Get the scalar value head's weight, merging its LoRA delta.
+        """Get the scalar value head's effective weight (its folded LoRA delta).
 
-        The value head is a LoRA module with a zero frozen base weight, so the
-        effective weight IS the folded adapter delta; consuming it here (like
-        the lm_head weight) routes gradients through the same direct-output-
-        projection ownership lane.
+        The value head has a zero, frozen base weight by contract, so the
+        effective weight IS the adapter delta ``B[:, :r] @ A[:r] * (alpha/r)``.
+        Its FSDP unit never runs a forward, so the factors are sharded
+        DTensors: the delta matmul contracts over the sharded rank dim into a
+        Partial placement, and ``full_tensor()`` materializes the replicated
+        weight while keeping autograd routed back into the sharded factors —
+        the direct-output-projection ownership lane completes those Partial
+        gradients at capture time.
+
+        Each rank's loss is a distinct share of the global raw-sum objective,
+        but both factor shards influence every rank's loss through the
+        replicated weight. A rank can only differentiate its own shard, so
+        the upstream weight gradient must be summed across ranks BEFORE it
+        reaches the factors (the FSDP post-backward hook does this for
+        module-managed adapters; direct consumption owns it here).
         """
+        from torch.distributed.tensor import DTensor  # noqa: PLC0415
+
         value_head = getattr(self.model, "value_head", None)
         if value_head is None:
             raise ValueError(
                 "value_loss/value_prediction require a value head; start the server with enable_value_head=true"
             )
-        return self._get_effective_lm_head_weight_for(value_head)
+        delta = value_head.get_delta_weight()
+        if isinstance(delta, DTensor):
+            delta = delta.full_tensor()
+            if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+                delta = _SumGradAcrossRanks.apply(delta)
+        return delta
 
     @staticmethod
     def _get_effective_lm_head_weight_for(lm_head):

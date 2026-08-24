@@ -50,6 +50,7 @@ export default defineConfig({
               ],
             },
             { label: "Inference: xorl-sglang", slug: "server-training/sglang" },
+            { label: "Value-Model (Critic) Training", slug: "server-training/value-model" },
             {
               label: "Client SDK (xorl-client)",
               collapsed: true,

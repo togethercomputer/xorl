@@ -22,6 +22,7 @@ scale.
 
 from __future__ import annotations
 
+import math
 from typing import List, Optional, Sequence, Tuple
 
 
@@ -78,3 +79,27 @@ def compute_skip_observation_gae(
         next_value = float(values[t])
 
     return advantages, returns
+
+
+def explained_variance(
+    value_error_sq_mean: float,
+    return_mean: float,
+    return_sq_mean: float,
+) -> float:
+    """Critic explained variance from the ``value_loss`` moment metrics.
+
+    ``EV = 1 - E[(R - V)^2] / Var(R)`` with ``Var(R) = E[R^2] - E[R]^2``.
+    The three inputs are exactly the (globally normalized) ``value_error_sq_mean``,
+    ``return_mean``, and ``return_sq_mean`` metrics a ``value_loss``
+    forward_backward reports, so EV composes correctly across micro-batches
+    and ranks. EV is the paper's key critic-health diagnostic (SAO Fig. 4a):
+    it should climb toward 1.0 as the critic converges; near 0 the critic is
+    no better than predicting the mean return.
+
+    Returns NaN when the return distribution is (numerically) constant, where
+    explained variance is undefined.
+    """
+    return_variance = return_sq_mean - return_mean * return_mean
+    if not math.isfinite(return_variance) or return_variance <= 1e-12:
+        return float("nan")
+    return 1.0 - value_error_sq_mean / return_variance
