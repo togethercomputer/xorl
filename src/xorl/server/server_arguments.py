@@ -18,6 +18,9 @@ import yaml
 from xorl.ops.loss import CrossEntropyMode
 
 
+GLM52_LORA_SCOPE_CHOICES = ("all", "moe", "shared_experts", "routed_experts")
+
+
 @dataclass
 class ServerArguments:
     """
@@ -1120,6 +1123,20 @@ class ServerArguments:
         default=False, metadata={"help": "Enable QLoRA (quantized LoRA) for memory-efficient training"}
     )
 
+    glm52_lora_scope: str = field(
+        default="all",
+        metadata={
+            "help": (
+                "Which GLM-5.2 modules receive LoRA factors. 'all' (default) is the complete "
+                "deterministic inventory and the only scope qualified for train/serve bit-exactness. "
+                "'moe' trains shared + routed experts, 'shared_experts' and 'routed_experts' isolate one "
+                "each. Scope selects which factors TRAIN, not which modules are adapted: the complete "
+                "exact family is always built so gradients can flow through every region, and "
+                "out-of-scope factors are frozen with lora_B == 0 so they never affect the forward."
+            )
+        },
+    )
+
     block_fp8_qlora_training: bool = field(
         default=False,
         metadata={
@@ -1367,8 +1384,22 @@ class ServerArguments:
             ]
             if mismatches:
                 raise ValueError("GLM-5.2 block-FP8 QLoRA rejects unsupported configuration: " + ", ".join(mismatches))
+            if self.glm52_lora_scope not in GLM52_LORA_SCOPE_CHOICES:
+                raise ValueError(
+                    f"glm52_lora_scope must be one of {GLM52_LORA_SCOPE_CHOICES}, got {self.glm52_lora_scope!r}"
+                )
+            if self.glm52_lora_scope != "all" and self.ep_dispatch != "alltoall":
+                # Scope only narrows WHICH FACTORS TRAIN. The complete exact
+                # family is still constructed, so the exact transport applies.
+                raise ValueError(
+                    f"glm52_lora_scope={self.glm52_lora_scope!r} still builds the complete exact family and "
+                    f"requires ep_dispatch='alltoall', got {self.ep_dispatch!r}"
+                )
             if self.lora_target_modules is not None or self.lora_target_manifest is not None:
-                raise ValueError("GLM-5.2 block-FP8 QLoRA uses its complete deterministic target set")
+                raise ValueError(
+                    "GLM-5.2 block-FP8 QLoRA uses its deterministic target set; "
+                    "select a subset with glm52_lora_scope instead"
+                )
             if self.qlora_exclude_modules is not None:
                 raise ValueError("GLM-5.2 block-FP8 QLoRA derives checkpoint exclusions and rejects user overrides")
             if self.merge_lora_interval:
@@ -1633,6 +1664,7 @@ class ServerArguments:
                 "lora_export_format": self.lora_export_format,
                 "enable_qlora": self.enable_qlora,
                 "block_fp8_qlora_training": self.block_fp8_qlora_training,
+                "glm52_lora_scope": self.glm52_lora_scope,
                 "quant_format": self.quant_format,
                 "quant_group_size": self.quant_group_size,
                 "exclude_modules": self.qlora_exclude_modules,

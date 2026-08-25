@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections import Counter
 from dataclasses import dataclass
 
@@ -38,6 +39,9 @@ from xorl.qlora.modules.block_fp8_linear import BlockFP8QLoRALinear
 from xorl.qlora.modules.moe_experts import BlockFP8QLoRAMoeExperts
 
 
+logger = logging.getLogger(__name__)
+
+
 GLM52_QLORA_ORDINARY_TARGET_COUNT = 625
 GLM52_QLORA_QUANTIZED_LINEAR_COUNT = 624
 GLM52_QLORA_ROUTED_BANK_COUNT = 75
@@ -52,6 +56,52 @@ _ATTENTION_TARGETS = (
     "o_proj",
 )
 _MLP_TARGETS = ("gate_proj", "up_proj", "down_proj")
+
+# Adapted-target scopes. "all" is the complete deterministic inventory and the
+# ONLY scope docs/k3/LORA_CONTRACT.md qualifies for train/serve bit-exactness.
+# The narrower scopes exist to isolate where MoE learning happens; they select a
+# different target universe, so the exact active-LoRA family is refused for them
+# (see auto.py) and they run the ordinary block-FP8 lane. Modules left out of the
+# target list are converted to frozen native FP8 by replace_glm52_native_fp8_modules.
+GLM52_LORA_SCOPES = ("all", "moe", "shared_experts", "routed_experts")
+
+
+def glm52_scoped_factor_names(inventory: "Glm52AdapterInventory", scope: str) -> set[str]:
+    """Factor names a scope leaves trainable."""
+    return {factor.name for factor in inventory.factors if glm52_scope_admits(scope, factor.role)}
+
+
+def apply_glm52_lora_scope(model: nn.Module, inventory: "Glm52AdapterInventory", scope: str) -> int:
+    """Freeze every factor outside ``scope``; return how many were frozen.
+
+    The complete adapter inventory is always constructed: NativeBlockFP8Linear is
+    forward-only ("phase-one forward is scoring-only; activation backward
+    requires a validated kernel"), so any region left unadapted would block
+    gradients from reaching adapted regions downstream of it. Keeping every exact
+    module and freezing the factors instead gives a working backward everywhere,
+    while a frozen pair keeps lora_B == 0 and so contributes nothing to the
+    forward.
+    """
+    trainable = glm52_scoped_factor_names(inventory, scope)
+    frozen = 0
+    for name, parameter in model.named_parameters():
+        if name in inventory.factor_names and name not in trainable:
+            parameter.requires_grad = False
+            frozen += 1
+    return frozen
+
+
+def glm52_scope_admits(scope: str, role: str) -> bool:
+    """Return whether a target role belongs to the selected scope."""
+    if scope == "all":
+        return True
+    if scope == "moe":
+        return role.startswith("shared_expert.") or role == "routed_expert"
+    if scope == "shared_experts":
+        return role.startswith("shared_expert.")
+    if scope == "routed_experts":
+        return role == "routed_expert"
+    raise ValueError(f"Unknown GLM-5.2 LoRA scope: {scope!r} (expected one of {GLM52_LORA_SCOPES})")
 _EXPERT_FACTORS = (
     "gate_proj_lora_A",
     "gate_proj_lora_B",
@@ -154,20 +204,25 @@ def _validate_official_config(config) -> dict:
     exact_shared_component = bool(getattr(config, "_glm52_exact_active_lora_shared_expert_component", False))
     exact_routed_component = bool(getattr(config, "_glm52_exact_active_lora_routed_expert_component", False))
     exact_lm_head_component = bool(getattr(config, "_glm52_exact_active_lora_lm_head_component", False))
-    if exact_attention_component and not exact_dense_component:
-        raise ValueError("GLM-5.2 exact active-LoRA attention component requires the exact active-LoRA dense component")
-    if exact_shared_component and not exact_attention_component:
-        raise ValueError(
-            "GLM-5.2 exact active-LoRA shared-expert component requires the exact active-LoRA attention component"
-        )
-    if exact_routed_component and not exact_shared_component:
-        raise ValueError(
-            "GLM-5.2 exact active-LoRA routed-expert component requires the exact active-LoRA shared-expert component"
-        )
-    if exact_lm_head_component and not exact_routed_component:
-        raise ValueError(
-            "GLM-5.2 exact active-LoRA lm-head component requires the exact active-LoRA routed-expert component"
-        )
+    # The complete family is one indivisible value program, so its components are
+    # strictly nested: no member may be enabled without its predecessors.
+    if True:
+        if exact_attention_component and not exact_dense_component:
+            raise ValueError(
+                "GLM-5.2 exact active-LoRA attention component requires the exact active-LoRA dense component"
+            )
+        if exact_shared_component and not exact_attention_component:
+            raise ValueError(
+                "GLM-5.2 exact active-LoRA shared-expert component requires the exact active-LoRA attention component"
+            )
+        if exact_routed_component and not exact_shared_component:
+            raise ValueError(
+                "GLM-5.2 exact active-LoRA routed-expert component requires the exact active-LoRA shared-expert component"
+            )
+        if exact_lm_head_component and not exact_routed_component:
+            raise ValueError(
+                "GLM-5.2 exact active-LoRA lm-head component requires the exact active-LoRA routed-expert component"
+            )
     exact_component_enabled = any(
         (
             exact_dense_component,
@@ -294,6 +349,7 @@ def _expected_targets(model: nn.Module, config) -> tuple[Glm52AdapterTarget, ...
     if lm_head.weight.dtype is not torch.bfloat16:
         raise TypeError(f"GLM-5.2 QLoRA lm_head base must remain BF16, got {lm_head.weight.dtype}")
     targets.append(Glm52AdapterTarget("lm_head", "output.lm_head", "bf16_linear", *lm_head_shape))
+
     return tuple(targets)
 
 
@@ -575,6 +631,9 @@ def _build_factor_inventory(
 
 
 def _validate_constructed_model(model: nn.Module, inventory: Glm52AdapterInventory) -> None:
+    # Bound first: both the native-FP8 check and the geometry assertions below
+    # branch on it.
+    scope = str(getattr(model.config, "_glm52_lora_scope", "all") or "all")
     expected_quantized = {target.name for target in inventory.targets if target.kind == "block_fp8_linear"}
     expected_heads = {target.name for target in inventory.targets if target.kind == "bf16_linear"}
     expected_banks = {target.name for target in inventory.targets if target.kind == "block_fp8_routed_bank"}
@@ -685,6 +744,8 @@ def _validate_constructed_model(model: nn.Module, inventory: Glm52AdapterInvento
         and not isinstance(module, (Glm52ExactTP1DenseMLP, Glm52ExactTP1AbsorbedKvBBlockFP8QLoRA))
         and not any(name.startswith(f"{root}.") for root in expected_exact_shared_roots)
     }
+    # Every non-indexer module is adapted in every scope, so the native-FP8 set is
+    # exactly the DSA selector projections.
     if actual_native_indexers != expected_native_indexers:
         raise RuntimeError(
             "GLM-5.2 QLoRA frozen native indexer set mismatch: "
@@ -696,20 +757,16 @@ def _validate_constructed_model(model: nn.Module, inventory: Glm52AdapterInvento
             "GLM-5.2 QLoRA requires exactly "
             f"{GLM52_FROZEN_NATIVE_INDEXER_PROJECTION_COUNT} frozen native indexer projections"
         )
-    for layer_idx, indexer_type in enumerate(_official_indexer_schedule()):
-        if indexer_type != "full":
-            continue
-        weights_proj = model.get_submodule(f"model.layers.{layer_idx}.self_attn.indexer.weights_proj")
-        if type(weights_proj) is not nn.Linear or weights_proj.weight.dtype is not torch.bfloat16:
-            raise RuntimeError(
-                f"GLM-5.2 QLoRA indexer weights_proj for layer {layer_idx} must remain an ordinary BF16 linear"
-            )
 
+    # Scope selects WHICH FACTORS TRAIN, not which modules exist: every region
+    # keeps its exact adapter module so gradients can flow through it. Frozen
+    # factors keep lora_B == 0, so they contribute nothing to the forward.
+    expected_trainable = glm52_scoped_factor_names(inventory, scope)
     trainable = {name for name, parameter in model.named_parameters() if parameter.requires_grad}
-    if trainable != inventory.factor_names:
+    if trainable != expected_trainable:
         raise RuntimeError(
-            "GLM-5.2 QLoRA trainable factor set mismatch: "
-            f"missing={sorted(inventory.factor_names - trainable)} extra={sorted(trainable - inventory.factor_names)}"
+            f"GLM-5.2 QLoRA trainable factor set mismatch under scope {scope!r}: "
+            f"missing={sorted(expected_trainable - trainable)} extra={sorted(trainable - expected_trainable)}"
         )
     trainable_parameters = [parameter for parameter in model.parameters() if parameter.requires_grad]
     if len({id(parameter) for parameter in trainable_parameters}) != len(trainable_parameters):
@@ -871,12 +928,25 @@ def prepare_glm52_block_fp8_qlora(
     replace_glm52_native_fp8_modules(model, quantization_config)
 
     inventory = Glm52AdapterInventory(targets=targets, factors=_build_factor_inventory(model, targets))
+    scope = str(getattr(config, "_glm52_lora_scope", "all") or "all")
+    if scope not in GLM52_LORA_SCOPES:
+        raise ValueError(f"Unknown GLM-5.2 LoRA scope: {scope!r} (expected one of {GLM52_LORA_SCOPES})")
+    frozen = apply_glm52_lora_scope(model, inventory, scope)
+    if scope != "all":
+        logger.info(
+            f"GLM-5.2 LoRA scope {scope!r}: froze {frozen} of {len(inventory.factors)} factors; "
+            f"{len(inventory.factors) - frozen} remain trainable"
+        )
     _validate_constructed_model(model, inventory)
     model._glm52_adapter_inventory = inventory
     return inventory
 
 
 __all__ = [
+    "GLM52_LORA_SCOPES",
+    "apply_glm52_lora_scope",
+    "glm52_scope_admits",
+    "glm52_scoped_factor_names",
     "GLM52_FROZEN_NATIVE_INDEXER_PROJECTION_COUNT",
     "GLM52_QLORA_FACTOR_COUNT",
     "GLM52_QLORA_ORDINARY_TARGET_COUNT",

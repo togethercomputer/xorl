@@ -57,6 +57,21 @@ Trainer-only autograd supplies activation and factor gradients from the
 effective BF16 factor values. It is a checked straight-through treatment of the
 frozen quantized base, not a derivative of FP8 quantization.
 
+## Adapted-target scope (GLM-5.2)
+
+`glm52_lora_scope` (`all` | `moe` | `shared_experts` | `routed_experts`) selects
+which factors **train**, never which modules are adapted. The complete family is
+always constructed: `NativeBlockFP8Linear` implements no activation backward, so
+a region left unadapted would block gradients from reaching adapted regions
+downstream of it. Out-of-scope factors are frozen with `lora_B == 0`, so the
+forward program is identical for every scope and step one reproduces the
+frozen-base loss exactly.
+
+Only `all` at rank 1, alpha 1 is the qualified configuration. Narrowed scopes
+run the same forward but train a different parameter set, so they carry no
+bit-exactness claim; the exported adapter still contains the full inventory,
+with untrained factors stored as zeros.
+
 ## Unsupported inheritance
 
 Neither lane implicitly covers multiple simultaneously active adapters,

@@ -2596,7 +2596,12 @@ class LoRAAdapterManager:
         for item in plan.parameters:
             parameter = named_parameters[item.fqn]
             if parameter.grad is None:
-                if item.requires_local_gradient:
+                # A frozen factor legitimately produces no gradient. glm52_lora_scope
+                # builds the complete adapter inventory -- every region needs a module
+                # with a working backward -- and then freezes the factors outside the
+                # scope, so "absent" is only a fault for a factor that is supposed to
+                # be learning.
+                if item.requires_local_gradient and parameter.requires_grad:
                     raise AdapterGradientOwnershipError(f"Required adapter gradient is absent for {item.fqn!r}")
                 continue
             local_gradient = self._capture_local_gradient(state, item, parameter)
@@ -2640,8 +2645,14 @@ class LoRAAdapterManager:
             raise AdapterGradientOwnershipError("Staged gradient denominator must be finite and positive")
         if scratch.staged_numerator_scale is None or not math.isfinite(scratch.staged_numerator_scale):
             raise AdapterGradientOwnershipError("Staged gradient numerator scale is missing or nonfinite")
+        frozen_fqns = {
+            canonical_parameter_name(name)
+            for name, parameter in self.model.named_parameters()
+            if not parameter.requires_grad
+        }
         for fqn, item in item_by_fqn.items():
-            if item.requires_local_gradient and fqn not in staged_set:
+            # Frozen factors (glm52_lora_scope) stage nothing by design.
+            if item.requires_local_gradient and fqn not in staged_set and fqn not in frozen_fqns:
                 raise AdapterGradientOwnershipError(f"Required staged adapter gradient is absent for {fqn!r}")
             if fqn not in staged_set:
                 continue
@@ -2842,10 +2853,16 @@ class LoRAAdapterManager:
             raise AdapterGradientOwnershipError("Compiled producer and captured gradient source disagree")
         scratch_by_fqn = {canonical_parameter_name(name): tensor for name, tensor in scratch.numerators.items()}
         local_by_fqn = {canonical_parameter_name(name): parameter for name, parameter in state.local_params.items()}
+        frozen_fqns = {
+            canonical_parameter_name(name)
+            for name, parameter in self.model.named_parameters()
+            if not parameter.requires_grad
+        }
         for item in plan.parameters:
             numerator = scratch_by_fqn.get(item.fqn)
             if numerator is None:
-                if item.requires_local_gradient:
+                # Frozen factors (glm52_lora_scope) produce no numerator by design.
+                if item.requires_local_gradient and item.fqn not in frozen_fqns:
                     raise AdapterGradientOwnershipError(f"Required numerator is absent for {item.fqn!r}")
                 continue
             if tuple(numerator.shape) != tuple(local_by_fqn[item.fqn].shape):
