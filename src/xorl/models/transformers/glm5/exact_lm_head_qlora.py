@@ -22,8 +22,6 @@ straight-through surrogate, not the derivative of the literal BF16 stores.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from functools import lru_cache
-from typing import Any
 
 import torch
 import torch.distributed as dist
@@ -31,14 +29,33 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from xorl.lora.modules.linear import LoraLinear
+from xorl.models.transformers.exact_lm_head_shared import (
+    REPLICATED_ROW_PLAN,
+    ExactHeadRowPlan,
+    ExactLmHeadFunction,
+    check_exact_head_tp_group,
+    exact_lora_local_logits,
+    filtered_surrogate_local_grad_logits,
+    require_equal_nonzero_row_count,
+    surrogate_local_grad_logits,
+)
+from xorl.models.transformers.exact_lm_head_shared import (
+    all_reduce_sum_fp32 as _all_reduce_sum_fp32,
+)
+from xorl.models.transformers.exact_lm_head_shared import (
+    rank_order_row_all_gather as _rank_order_row_all_gather,
+)
+from xorl.models.transformers.exact_lm_head_shared import (
+    rank_order_vocab_all_gather as _rank_order_vocab_all_gather,
+)
 from xorl.models.transformers.glm5.exact_lora_contract import glm52_exact_lora_scaling
 from xorl.ops.bi_families_v2 import exact_temperature_scale_fp32_logits
 from xorl.ops.exact_sampling_transforms import (
-    EXACT_FILTER_ROW_CHUNK,
-    exact_sampling_identity_rows,
-    exact_sampling_support,
-    exact_selected_logprob_from_support,
-    exact_selected_logprob_partitioned_from_support,
+    normalize_temperature_rows,
+    score_with_sampling_transforms,
+)
+from xorl.ops.exact_sampling_transforms import (
+    validate_temperature_rows as _validate_temperature_rows,
 )
 
 
@@ -122,158 +139,22 @@ def glm52_lm_head_shard(tp_rank: int) -> Glm52LmHeadShard:
     return shard
 
 
-@lru_cache(maxsize=64)
-def _single_adapter_lm_head_batch_info(device_index: int, rows: int, rank: int = 1, scaling: float = 1.0) -> Any:
-    """One active exact adapter, in the metadata format used by S4."""
-
-    from sglang.srt.lora.utils import LoRABatchInfo  # noqa: PLC0415
-
-    device = torch.device("cuda", device_index)
-    return LoRABatchInfo(
-        use_cuda_graph=False,
-        bs=1,
-        num_segments=1,
-        seg_indptr=torch.tensor([0, rows], dtype=torch.int32, device=device),
-        weight_indices=torch.zeros(1, dtype=torch.int32, device=device),
-        lora_ranks=torch.full((1,), rank, dtype=torch.int32, device=device),
-        scalings=torch.full((1,), scaling, dtype=torch.float32, device=device),
-        max_len=rows,
-        seg_lens=torch.tensor([rows], dtype=torch.int32, device=device),
-        permutation=None,
-        expected_tokens=rows,
-        has_active_lora=True,
-    )
-
-
-def _rank_order_vocab_from_stacked(
-    stacked_logits: Tensor,
-    *,
-    expected_world_size: int,
-    expected_local_vocab_size: int,
-) -> Tensor:
-    """Apply SGLang's ``[rank,row,vocab] -> [row,rank*vocab]`` order."""
-
-    expected_shape_tail = (expected_local_vocab_size,)
-    if stacked_logits.ndim != 3 or stacked_logits.shape[0] != expected_world_size:
-        raise ValueError(
-            "Rank-stacked LM-head logits must be [world, rows, local_vocab], got "
-            f"{tuple(stacked_logits.shape)} for world={expected_world_size}"
-        )
-    if tuple(stacked_logits.shape[-1:]) != expected_shape_tail:
-        raise ValueError(
-            f"Rank-stacked local vocabulary width must be {expected_local_vocab_size}, got {stacked_logits.shape[-1]}"
-        )
-    if stacked_logits.dtype is not torch.float32:
-        raise TypeError(f"Rank-stacked LM-head logits must be FP32, got {stacked_logits.dtype}")
-    if not stacked_logits.is_contiguous():
-        raise ValueError("Rank-stacked LM-head logits must be contiguous in collective rank order")
-    rows = stacked_logits.shape[1]
-    return stacked_logits.permute(1, 0, 2).reshape(rows, expected_world_size * expected_local_vocab_size)
-
-
-def _rank_order_vocab_all_gather(
-    local_logits: Tensor,
-    tp_group: dist.ProcessGroup,
-    *,
-    expected_world_size: int,
-    expected_local_vocab_size: int,
-) -> Tensor:
-    """Match S4's concat-style ``all_gather(..., dim=-1)`` byte order."""
-
-    if not dist.is_initialized():
-        raise RuntimeError("Rank-order LM-head all-gather requires initialized torch.distributed")
-    if dist.get_world_size(tp_group) != expected_world_size:
-        raise RuntimeError(
-            f"LM-head all-gather expected world size {expected_world_size}, got {dist.get_world_size(tp_group)}"
-        )
-    if local_logits.ndim != 2 or tuple(local_logits.shape[1:]) != (expected_local_vocab_size,):
-        raise ValueError(
-            f"Local LM-head logits must be [rows, {expected_local_vocab_size}], got {tuple(local_logits.shape)}"
-        )
-    if local_logits.dtype is not torch.float32 or not local_logits.is_contiguous():
-        raise ValueError("Local LM-head logits must be contiguous FP32 before the rank-order gather")
-
-    rows = local_logits.shape[0]
-    gathered = torch.empty(
-        (expected_world_size * rows, expected_local_vocab_size),
-        dtype=torch.float32,
-        device=local_logits.device,
-    )
-    dist.all_gather_into_tensor(gathered, local_logits, group=tp_group)
-    return _rank_order_vocab_from_stacked(
-        gathered.view(expected_world_size, rows, expected_local_vocab_size),
-        expected_world_size=expected_world_size,
-        expected_local_vocab_size=expected_local_vocab_size,
-    )
-
-
-def _all_reduce_sum_fp32(value: Tensor, group: dist.ProcessGroup) -> Tensor:
-    """In-place logical-owner sum used by the hidden/A surrogate gradients."""
-
-    if value.dtype is not torch.float32 or not value.is_contiguous():
-        raise ValueError("GLM-5.2 LM-head surrogate reductions require contiguous FP32 tensors")
-    dist.all_reduce(value, op=dist.ReduceOp.SUM, group=group)
-    return value
-
-
-def _rank_order_row_all_gather(value: Tensor, group: dist.ProcessGroup) -> Tensor:
-    """Gather equal-shaped local row blocks in process-group rank order."""
-
-    if not dist.is_initialized():
-        raise RuntimeError("Rank-order LM-head row gathering requires initialized torch.distributed")
-    if value.ndim == 0:
-        raise ValueError("Rank-order LM-head row gathering requires at least one dimension")
-    if not value.is_contiguous():
-        raise ValueError("Rank-order LM-head row gathering requires a contiguous tensor")
-    world_size = dist.get_world_size(group)
-    gathered = torch.empty(
-        (world_size * value.shape[0], *value.shape[1:]),
-        dtype=value.dtype,
-        device=value.device,
-    )
-    dist.all_gather_into_tensor(gathered, value, group=group)
-    return gathered
-
-
 def _require_equal_nonzero_row_count(value: Tensor, group: dist.ProcessGroup) -> None:
     """Fail before payload collectives when TP16 source-row shapes diverge."""
 
-    local_rows = torch.tensor([value.shape[0]], dtype=torch.int64, device=value.device)
-    world_size = dist.get_world_size(group)
-    gathered_rows = torch.empty(world_size, dtype=torch.int64, device=value.device)
-    dist.all_gather_into_tensor(gathered_rows, local_rows, group=group)
-    if bool((gathered_rows <= 0).any().item()):
-        raise ValueError("The exact GLM-5.2 lm head requires at least one source row on every TP16 rank")
-    if bool((gathered_rows != gathered_rows[0]).any().item()):
-        raise ValueError(
-            "The exact GLM-5.2 lm head requires equal source-row counts across TP16, got "
-            f"{gathered_rows.cpu().tolist()}"
-        )
+    require_equal_nonzero_row_count(value, group, program="The exact GLM-5.2 lm head")
 
 
-def _validate_temperature_rows(
-    temperature: Tensor | None,
-    *,
-    rows: int,
-    device: torch.device,
-) -> Tensor | None:
-    if temperature is None:
-        return None
-    if temperature.dtype is not torch.float32:
-        raise TypeError(f"GLM-5.2 exact temperature must be FP32, got {temperature.dtype}")
-    if temperature.device != device or tuple(temperature.shape) != (rows,):
-        raise ValueError(
-            "GLM-5.2 exact temperature must be row-aligned on the head device, got "
-            f"shape={tuple(temperature.shape)} device={temperature.device}"
-        )
-    if not temperature.is_contiguous() or temperature.requires_grad:
-        raise ValueError("GLM-5.2 exact temperature must be contiguous sampling metadata")
-    if temperature.device.type != "meta":
-        torch._assert_async(
-            (torch.isfinite(temperature) & (temperature > 0)).all(),
-            "GLM-5.2 exact temperature must contain finite values > 0",
-        )
-    return temperature
+def _distributed_row_plan(local_hidden: Tensor, group: dist.ProcessGroup) -> ExactHeadRowPlan:
+    """Equal rank-order row blocks: every TP16 rank contributes the same count."""
+
+    _require_equal_nonzero_row_count(local_hidden, group)
+    local_rows = local_hidden.shape[0]
+    source_rank = dist.get_rank(group)
+    return ExactHeadRowPlan(
+        lambda value: _rank_order_row_all_gather(value, group),
+        lambda value: value.narrow(0, source_rank * local_rows, local_rows),
+    )
 
 
 def _local_qlora_surrogate_logits(
@@ -354,301 +235,6 @@ def _local_qlora_surrogate_vjp(
     return grad_hidden, by_label.get("A"), by_label.get("B")
 
 
-def _selected_logprob_reference_grad(
-    full_logits: Tensor,
-    token_ids: Tensor,
-    grad_logprob: Tensor,
-    temperature: Tensor | None,
-) -> Tensor:
-    """Differentiate the standalone FP32 QLoRA log-softmax reference."""
-
-    with torch.enable_grad(), torch.autocast(device_type=full_logits.device.type, enabled=False):
-        logits = full_logits.detach().requires_grad_(True)
-        score_logits = logits if temperature is None else logits * (1.0 / temperature).unsqueeze(1)
-        selected = F.log_softmax(score_logits, dim=-1).gather(1, token_ids.unsqueeze(1)).squeeze(1)
-        (grad_logits,) = torch.autograd.grad(selected, logits, grad_outputs=grad_logprob.float())
-    return grad_logits.contiguous()
-
-
-def _selected_logprob_reference_grad_filtered(
-    full_logits: Tensor,
-    token_ids: Tensor,
-    grad_logprob: Tensor,
-    temperature: Tensor | None,
-    support: Tensor,
-) -> Tensor:
-    """Differentiate over the exact support chosen by the value forward."""
-
-    with torch.enable_grad(), torch.autocast(device_type=full_logits.device.type, enabled=False):
-        logits = full_logits.detach().requires_grad_(True)
-        score_logits = logits if temperature is None else logits * (1.0 / temperature).unsqueeze(1)
-        selected, _, _ = exact_selected_logprob_from_support(score_logits, token_ids, support)
-        (grad_logits,) = torch.autograd.grad(selected, logits, grad_outputs=grad_logprob.float())
-    return grad_logits.contiguous()
-
-
-def _selected_logprob_reference_grad_partitioned(
-    full_logits: Tensor,
-    token_ids: Tensor,
-    grad_logprob: Tensor,
-    temperature: Tensor | None,
-    support: Tensor,
-    identity_rows: Tensor,
-) -> Tensor:
-    native_grad = _selected_logprob_reference_grad(
-        full_logits,
-        token_ids,
-        grad_logprob,
-        temperature,
-    )
-    filtered_grad = _selected_logprob_reference_grad_filtered(
-        full_logits,
-        token_ids,
-        grad_logprob,
-        temperature,
-        support,
-    )
-    return torch.where(identity_rows.unsqueeze(1), native_grad, filtered_grad).contiguous()
-
-
-class _Glm52ExactTP16LmHeadFunction(torch.autograd.Function):
-    """Own the literal forward and delegate only the VJP to the QLoRA oracle."""
-
-    @staticmethod
-    def forward(
-        ctx,
-        hidden_states: Tensor,
-        local_weight: Tensor,
-        lora_A: Tensor,
-        local_lora_B: Tensor,
-        token_ids: Tensor,
-        temperature: Tensor | None,
-        sampling_transforms: tuple[Tensor | None, Tensor | None, Tensor | None] | Glm52ExactTP16LmHeadSelectedLogprob,
-        component: Glm52ExactTP16LmHeadSelectedLogprob | None = None,
-    ) -> Tensor:
-        legacy_call = component is None
-        if legacy_call:
-            component = sampling_transforms
-            sampling_transforms = (None, None, None)
-        ctx.legacy_call = legacy_call
-        effective_A = lora_A.to(torch.bfloat16).contiguous()
-        effective_B = local_lora_B.to(torch.bfloat16).contiguous()
-        has_sampling_filter = sampling_transforms[0] is not None
-        if not has_sampling_filter:
-            logprob = component._exact_forward_value(
-                hidden_states, local_weight, effective_A, effective_B, token_ids, temperature
-            )
-        else:
-            logprob = component._exact_forward_value_filtered(
-                hidden_states,
-                local_weight,
-                effective_A,
-                effective_B,
-                token_ids,
-                temperature,
-                sampling_transforms,
-            )
-        if logprob.dtype is not torch.float32 or tuple(logprob.shape) != tuple(token_ids.shape):
-            raise RuntimeError(
-                "GLM-5.2 exact TP16 LM head returned an invalid selected-logprob tensor: "
-                f"dtype={logprob.dtype}, shape={tuple(logprob.shape)}, expected FP32 {tuple(token_ids.shape)}"
-            )
-        ctx.set_materialize_grads(False)
-        ctx.component = component
-        ctx.has_sampling_filter = has_sampling_filter
-        # local_weight and the masters are also version-counter sentinels.
-        ctx.save_for_backward(
-            hidden_states.detach(),
-            local_weight,
-            effective_A,
-            effective_B,
-            token_ids,
-            temperature
-            if temperature is not None
-            else torch.empty((0,), dtype=torch.float32, device=hidden_states.device),
-            lora_A,
-            local_lora_B,
-            *sampling_transforms,
-        )
-        return logprob
-
-    @staticmethod
-    def backward(ctx, grad_logprob: Tensor | None):
-        (
-            hidden_states,
-            local_weight,
-            effective_A,
-            effective_B,
-            token_ids,
-            stored_temperature,
-            _lora_A_master,
-            _local_lora_B_master,
-            top_ks,
-            top_ps,
-            min_ps,
-        ) = ctx.saved_tensors
-        if grad_logprob is None:
-            result = (None, None, None, None, None, None, None, None)
-            return result[:-1] if ctx.legacy_call else result
-        temperature = None if stored_temperature.numel() == 0 else stored_temperature
-        vjp = ctx.component._surrogate_vjp_filtered if ctx.has_sampling_filter else ctx.component._surrogate_vjp
-        args = (
-            hidden_states,
-            local_weight,
-            effective_A,
-            effective_B,
-            token_ids,
-            grad_logprob,
-            temperature,
-        )
-        if ctx.has_sampling_filter:
-            args = (*args, (top_ks, top_ps, min_ps))
-        grad_hidden, grad_A, grad_B = vjp(
-            *args,
-            needs_input_grad=(ctx.needs_input_grad[0], ctx.needs_input_grad[2], ctx.needs_input_grad[3]),
-        )
-        result = (grad_hidden, None, grad_A, grad_B, None, None, None, None)
-        return result[:-1] if ctx.legacy_call else result
-
-
-class _Glm52ExactDistributedTP16LmHeadFunction(torch.autograd.Function):
-    """Bridge rank-local training rows to the replicated TP16 head program.
-
-    The lm-head-only TP group is carved from CP or DP ranks, so its members may
-    own different token rows.  Forward gathers those row blocks before running
-    the literal TP16 selected-logprob program.  The function returns only the
-    caller's rank-local rows.  Backward gathers the downstream rank-local RL
-    gradients, applies the component's declared hybrid VJP to the identical
-    global row block on every vocabulary rank, and returns only the caller's
-    hidden-state slice.
-    """
-
-    @staticmethod
-    def forward(
-        ctx,
-        local_hidden_states: Tensor,
-        local_weight: Tensor,
-        lora_A: Tensor,
-        local_lora_B: Tensor,
-        local_token_ids: Tensor,
-        local_temperature: Tensor | None,
-        local_sampling_transforms: tuple[Tensor | None, Tensor | None, Tensor | None]
-        | Glm52ExactTP16LmHeadSelectedLogprob,
-        component: Glm52ExactTP16LmHeadSelectedLogprob | None = None,
-    ) -> Tensor:
-        legacy_call = component is None
-        if legacy_call:
-            component = local_sampling_transforms
-            local_sampling_transforms = (None, None, None)
-        ctx.legacy_call = legacy_call
-        group = component._validate_tp_group()
-        _require_equal_nonzero_row_count(local_hidden_states, group)
-        effective_A = lora_A.to(torch.bfloat16).contiguous()
-        effective_B = local_lora_B.to(torch.bfloat16).contiguous()
-        gathered_hidden = _rank_order_row_all_gather(local_hidden_states, group)
-        gathered_token_ids = _rank_order_row_all_gather(local_token_ids, group)
-        gathered_temperature = (
-            None if local_temperature is None else _rank_order_row_all_gather(local_temperature, group)
-        )
-        gathered_sampling_transforms = tuple(
-            None if value is None else _rank_order_row_all_gather(value, group) for value in local_sampling_transforms
-        )
-        has_sampling_filter = gathered_sampling_transforms[0] is not None
-        if not has_sampling_filter:
-            gathered_logprob = component._exact_forward_value(
-                gathered_hidden,
-                local_weight,
-                effective_A,
-                effective_B,
-                gathered_token_ids,
-                gathered_temperature,
-            )
-        else:
-            gathered_logprob = component._exact_forward_value_filtered(
-                gathered_hidden,
-                local_weight,
-                effective_A,
-                effective_B,
-                gathered_token_ids,
-                gathered_temperature,
-                gathered_sampling_transforms,
-            )
-        local_rows = local_hidden_states.shape[0]
-        source_rank = dist.get_rank(group)
-        local_logprob = gathered_logprob.narrow(0, source_rank * local_rows, local_rows).contiguous()
-        if local_logprob.dtype is not torch.float32 or tuple(local_logprob.shape) != tuple(local_token_ids.shape):
-            raise RuntimeError(
-                "GLM-5.2 distributed exact LM head returned an invalid local logprob tensor: "
-                f"dtype={local_logprob.dtype}, shape={tuple(local_logprob.shape)}"
-            )
-
-        ctx.set_materialize_grads(False)
-        ctx.component = component
-        ctx.local_rows = local_rows
-        ctx.source_rank = source_rank
-        ctx.has_sampling_filter = has_sampling_filter
-        ctx.save_for_backward(
-            gathered_hidden,
-            local_weight,
-            effective_A,
-            effective_B,
-            gathered_token_ids,
-            gathered_temperature
-            if gathered_temperature is not None
-            else torch.empty((0,), dtype=torch.float32, device=local_hidden_states.device),
-            lora_A,
-            local_lora_B,
-            *gathered_sampling_transforms,
-        )
-        return local_logprob
-
-    @staticmethod
-    def backward(ctx, grad_local_logprob: Tensor | None):
-        (
-            gathered_hidden,
-            local_weight,
-            effective_A,
-            effective_B,
-            gathered_token_ids,
-            stored_temperature,
-            _lora_A_master,
-            _local_lora_B_master,
-            top_ks,
-            top_ps,
-            min_ps,
-        ) = ctx.saved_tensors
-        if grad_local_logprob is None:
-            result = (None, None, None, None, None, None, None, None)
-            return result[:-1] if ctx.legacy_call else result
-        temperature = None if stored_temperature.numel() == 0 else stored_temperature
-        group = ctx.component._validate_tp_group()
-        gathered_grad_logprob = _rank_order_row_all_gather(grad_local_logprob.float().contiguous(), group)
-        vjp = ctx.component._surrogate_vjp_filtered if ctx.has_sampling_filter else ctx.component._surrogate_vjp
-        args = (
-            gathered_hidden,
-            local_weight,
-            effective_A,
-            effective_B,
-            gathered_token_ids,
-            gathered_grad_logprob,
-            temperature,
-        )
-        if ctx.has_sampling_filter:
-            args = (*args, (top_ks, top_ps, min_ps))
-        grad_hidden, grad_A, grad_B = vjp(
-            *args,
-            needs_input_grad=(ctx.needs_input_grad[0], ctx.needs_input_grad[2], ctx.needs_input_grad[3]),
-        )
-        if grad_hidden is not None:
-            grad_hidden = grad_hidden.narrow(
-                0,
-                ctx.source_rank * ctx.local_rows,
-                ctx.local_rows,
-            ).contiguous()
-        result = (grad_hidden, None, grad_A, grad_B, None, None, None, None)
-        return result[:-1] if ctx.legacy_call else result
-
-
 class Glm52ExactTP16LmHeadLoraLinear(LoraLinear):
     """Logical full head whose only admitted value path is selected logprob."""
 
@@ -685,6 +271,8 @@ class Glm52ExactTP16LmHeadSelectedLogprob(nn.Module):
 
     contract_version = GLM52_EXACT_TP16_LM_HEAD_CONTRACT_VERSION
     _glm52_exact_active_lora_component = True
+    #: The pinned value program scores FP32 logits from the TP16 gather.
+    logprob_dtype = torch.float32
 
     def __init__(
         self,
@@ -740,24 +328,17 @@ class Glm52ExactTP16LmHeadSelectedLogprob(nn.Module):
             raise RuntimeError("GLM-5.2 exact LM head has no bound TP process group")
         if not dist.is_initialized():
             raise RuntimeError("GLM-5.2 exact LM head requires initialized torch.distributed")
-        world_size = dist.get_world_size(group)
-        group_rank = dist.get_rank(group)
-        group_ranks = tuple(dist.get_process_group_ranks(group))
-        if world_size != GLM52_LM_HEAD_TP_SIZE:
-            raise RuntimeError(f"GLM-5.2 exact LM head requires TP16, got TP{world_size}")
-        if group_ranks != self.expected_group_ranks:
-            raise RuntimeError(
-                "GLM-5.2 exact LM-head gather order must match its stage-local TP16 group; "
-                f"expected {self.expected_group_ranks}, got {group_ranks}"
-            )
-        if group_rank != self.shard.tp_rank or dist.get_rank() != group_ranks[self.shard.tp_rank]:
-            raise RuntimeError(
-                "GLM-5.2 exact LM-head shard/group rank mismatch: "
-                f"shard_rank={self.shard.tp_rank}, group_rank={group_rank}, global_rank={dist.get_rank()}"
-            )
-        backend = str(dist.get_backend(group)).lower()
-        if backend != "nccl":
-            raise RuntimeError(f"GLM-5.2 exact LM-head production group must use NCCL, got {backend}")
+        check_exact_head_tp_group(
+            program="GLM-5.2 exact LM-head",
+            world_size=dist.get_world_size(group),
+            group_rank=dist.get_rank(group),
+            global_rank=dist.get_rank(),
+            group_ranks=tuple(dist.get_process_group_ranks(group)),
+            backend=str(dist.get_backend(group)).lower(),
+            expected_world_size=GLM52_LM_HEAD_TP_SIZE,
+            expected_ranks=self.expected_group_ranks,
+            shard_rank=self.shard.tp_rank,
+        )
         return group
 
     @staticmethod
@@ -901,8 +482,6 @@ class Glm52ExactTP16LmHeadSelectedLogprob(nn.Module):
             raise ValueError("Exact local LM-head operands must be contiguous")
 
         try:
-            from sglang.kernels.ops.gemm.sgemm_lora_a import sgemm_lora_a_fwd  # noqa: PLC0415
-            from sglang.kernels.ops.gemm.sgemm_lora_b import sgemm_lora_b_fwd  # noqa: PLC0415
             from sglang.srt.batch_invariant_ops import head_v2_full_logits_with_lse  # noqa: PLC0415
         except Exception as exc:
             raise RuntimeError("Pinned exact v2 batch-invariant and LoRA kernels are required") from exc
@@ -914,24 +493,14 @@ class Glm52ExactTP16LmHeadSelectedLogprob(nn.Module):
             GLM52_LM_HEAD_LOCAL_VOCAB_SIZE,
         ):
             raise RuntimeError("Pinned exact v2 base LM-head kernel returned an invalid local-logit buffer")
-        batch_info = _single_adapter_lm_head_batch_info(hidden_2d.device.index, rows, self.max_lora_rank, self.scaling)
-        lora_a_output = sgemm_lora_a_fwd(hidden_2d, effective_A.unsqueeze(0), batch_info)
-        if lora_a_output.dtype is not torch.bfloat16 or tuple(lora_a_output.shape) != (
-            rows,
-            self.max_lora_rank,
-        ):
-            raise RuntimeError("Pinned exact A SGEMM did not produce the required BF16 rank store")
-        output = sgemm_lora_b_fwd(
-            lora_a_output,
-            effective_B.unsqueeze(0),
-            batch_info,
-            base_output=base_logits,
+        return exact_lora_local_logits(
+            hidden_2d,
+            effective_A,
+            effective_B,
+            base_logits=base_logits,
+            rank=self.max_lora_rank,
+            scaling=self.scaling,
         )
-        if output.data_ptr() != base_logits.data_ptr():
-            raise RuntimeError("Pinned exact B SGEMM did not perform the required in-place base+delta store")
-        if output.dtype is not torch.float32 or not output.is_contiguous():
-            raise RuntimeError("Pinned exact B SGEMM did not preserve the contiguous FP32 local-logit buffer")
-        return output
 
     @staticmethod
     def _selected_logprob_from_gathered(
@@ -973,29 +542,18 @@ class Glm52ExactTP16LmHeadSelectedLogprob(nn.Module):
         top_ks, top_ps, min_ps = sampling_transforms
         if top_ks is None or top_ps is None or min_ps is None:
             raise ValueError("filtered GLM exact scoring requires complete row metadata")
-        support = exact_sampling_support(
-            score_logits,
-            top_ks,
-            top_ps,
-            min_ps,
-        )
-        identity_rows = exact_sampling_identity_rows(
-            top_ks,
-            top_ps,
-            min_ps,
-            vocab_size=score_logits.shape[1],
-        )
         try:
             from sglang.srt.batch_invariant_ops import (  # noqa: PLC0415
                 head_v2_selected_logprob_from_logits,
             )
         except Exception as exc:
             raise RuntimeError("Pinned exact v2 selected-logprob tail is required") from exc
-        logprob, _, _ = exact_selected_logprob_partitioned_from_support(
+        logprob, _, _ = score_with_sampling_transforms(
             score_logits,
             token_ids,
-            support,
-            identity_rows,
+            top_ks,
+            top_ps,
+            min_ps,
             lambda native_logits, native_ids: head_v2_selected_logprob_from_logits(
                 native_logits,
                 native_ids,
@@ -1063,6 +621,26 @@ class Glm52ExactTP16LmHeadSelectedLogprob(nn.Module):
         )
         return logprob.view_as(token_ids)
 
+    def _reference_full_logits_fn(self, local_weight, effective_A, effective_B, group):
+        """The differentiable QLoRA reference, gathered in serving byte order."""
+
+        def reference_full_logits(hidden_chunk: Tensor) -> Tensor:
+            local_reference_logits = _local_qlora_surrogate_logits(
+                hidden_chunk,
+                local_weight,
+                effective_A,
+                effective_B,
+                self.scaling,
+            ).contiguous()
+            return _rank_order_vocab_all_gather(
+                local_reference_logits,
+                group,
+                expected_world_size=GLM52_LM_HEAD_TP_SIZE,
+                expected_local_vocab_size=GLM52_LM_HEAD_LOCAL_VOCAB_SIZE,
+            )
+
+        return reference_full_logits
+
     def _surrogate_vjp(
         self,
         hidden_states: Tensor,
@@ -1084,27 +662,14 @@ class Glm52ExactTP16LmHeadSelectedLogprob(nn.Module):
             rows=rows,
             device=hidden_states.device,
         )
-        with torch.no_grad(), torch.autocast(device_type=hidden_states.device.type, enabled=False):
-            local_reference_logits = _local_qlora_surrogate_logits(
-                hidden_2d,
-                local_weight,
-                effective_A,
-                effective_B,
-                self.scaling,
-            ).contiguous()
-            full_reference_logits = _rank_order_vocab_all_gather(
-                local_reference_logits,
-                group,
-                expected_world_size=GLM52_LM_HEAD_TP_SIZE,
-                expected_local_vocab_size=GLM52_LM_HEAD_LOCAL_VOCAB_SIZE,
-            )
-        full_grad_logits = _selected_logprob_reference_grad(
-            full_reference_logits,
+        local_grad_logits = surrogate_local_grad_logits(
+            hidden_2d,
             token_ids_1d,
             grad_logprob.reshape(rows),
             temperature_1d,
+            reference_full_logits_fn=self._reference_full_logits_fn(local_weight, effective_A, effective_B, group),
+            local_vocab_slice=slice(self.shard.vocab_start, self.shard.vocab_end),
         )
-        local_grad_logits = full_grad_logits[:, self.shard.vocab_start : self.shard.vocab_end].contiguous()
         grad_hidden, grad_A, grad_B = _local_qlora_surrogate_vjp(
             hidden_2d,
             local_weight,
@@ -1138,65 +703,30 @@ class Glm52ExactTP16LmHeadSelectedLogprob(nn.Module):
         hidden_2d = hidden_states.view(rows, GLM52_LM_HEAD_HIDDEN_SIZE)
         token_ids_1d = token_ids.view(rows)
         temperature_1d = _validate_temperature_rows(temperature, rows=rows, device=hidden_states.device)
-        top_ks, top_ps, min_ps = sampling_transforms
-        if top_ks is None or top_ps is None or min_ps is None:
-            raise ValueError("filtered GLM exact VJP requires complete row metadata")
-        grad_logprob_1d = grad_logprob.reshape(rows)
-        local_grad_logits = torch.empty(
-            (rows, GLM52_LM_HEAD_LOCAL_VOCAB_SIZE),
-            dtype=torch.float32,
-            device=hidden_states.device,
-        )
-        for start in range(0, rows, EXACT_FILTER_ROW_CHUNK):
-            end = min(start + EXACT_FILTER_ROW_CHUNK, rows)
-            hidden_chunk = hidden_2d[start:end]
-            temperature_chunk = None if temperature_1d is None else temperature_1d[start:end]
-            chunk_transforms = (top_ks[start:end], top_ps[start:end], min_ps[start:end])
-            with torch.no_grad(), torch.autocast(device_type=hidden_states.device.type, enabled=False):
-                exact_local_logits = self._exact_local_logits(
-                    hidden_chunk,
-                    local_weight,
-                    effective_A,
-                    effective_B,
-                )
-                exact_full_logits = _rank_order_vocab_all_gather(
-                    exact_local_logits,
-                    group,
-                    expected_world_size=GLM52_LM_HEAD_TP_SIZE,
-                    expected_local_vocab_size=GLM52_LM_HEAD_LOCAL_VOCAB_SIZE,
-                )
-                exact_score_logits = (
-                    exact_full_logits
-                    if temperature_chunk is None
-                    else exact_temperature_scale_fp32_logits(exact_full_logits, temperature_chunk)
-                )
-                support = exact_sampling_support(exact_score_logits, *chunk_transforms)
-                identity_rows = exact_sampling_identity_rows(
-                    *chunk_transforms,
-                    vocab_size=exact_score_logits.shape[1],
-                )
-                local_reference_logits = _local_qlora_surrogate_logits(
-                    hidden_chunk,
-                    local_weight,
-                    effective_A,
-                    effective_B,
-                    self.scaling,
-                ).contiguous()
-                full_reference_logits = _rank_order_vocab_all_gather(
-                    local_reference_logits,
-                    group,
-                    expected_world_size=GLM52_LM_HEAD_TP_SIZE,
-                    expected_local_vocab_size=GLM52_LM_HEAD_LOCAL_VOCAB_SIZE,
-                )
-            full_grad_logits = _selected_logprob_reference_grad_partitioned(
-                full_reference_logits,
-                token_ids_1d[start:end],
-                grad_logprob_1d[start:end],
-                temperature_chunk,
-                support,
-                identity_rows,
+
+        def _exact_score_logits(hidden_chunk: Tensor, temperature_chunk: Tensor | None) -> Tensor:
+            exact_local_logits = self._exact_local_logits(hidden_chunk, local_weight, effective_A, effective_B)
+            exact_full_logits = _rank_order_vocab_all_gather(
+                exact_local_logits,
+                group,
+                expected_world_size=GLM52_LM_HEAD_TP_SIZE,
+                expected_local_vocab_size=GLM52_LM_HEAD_LOCAL_VOCAB_SIZE,
             )
-            local_grad_logits[start:end] = full_grad_logits[:, self.shard.vocab_start : self.shard.vocab_end]
+            if temperature_chunk is None:
+                return exact_full_logits
+            return exact_temperature_scale_fp32_logits(exact_full_logits, temperature_chunk)
+
+        local_grad_logits = filtered_surrogate_local_grad_logits(
+            hidden_2d,
+            token_ids_1d,
+            grad_logprob.reshape(rows),
+            temperature_1d,
+            sampling_transforms,
+            exact_score_logits_fn=_exact_score_logits,
+            reference_full_logits_fn=self._reference_full_logits_fn(local_weight, effective_A, effective_B, group),
+            local_vocab_slice=slice(self.shard.vocab_start, self.shard.vocab_end),
+            local_vocab_size=GLM52_LM_HEAD_LOCAL_VOCAB_SIZE,
+        )
         grad_hidden, grad_A, grad_B = _local_qlora_surrogate_vjp(
             hidden_2d,
             local_weight,
@@ -1232,7 +762,7 @@ class Glm52ExactTP16LmHeadSelectedLogprob(nn.Module):
             require_cuda=True,
         )
         self._validate_tp_group()
-        return _Glm52ExactTP16LmHeadFunction.apply(
+        return ExactLmHeadFunction.apply(
             hidden_states,
             local_weight,
             lora_A,
@@ -1240,6 +770,7 @@ class Glm52ExactTP16LmHeadSelectedLogprob(nn.Module):
             token_ids,
             temperature,
             sampling_transforms,
+            REPLICATED_ROW_PLAN,
             self,
         )
 
@@ -1264,8 +795,8 @@ class Glm52ExactTP16LmHeadSelectedLogprob(nn.Module):
             local_temperature,
             require_cuda=True,
         )
-        self._validate_tp_group()
-        return _Glm52ExactDistributedTP16LmHeadFunction.apply(
+        row_plan = _distributed_row_plan(local_hidden_states, self._validate_tp_group())
+        return ExactLmHeadFunction.apply(
             local_hidden_states,
             local_weight,
             lora_A,
@@ -1273,6 +804,7 @@ class Glm52ExactTP16LmHeadSelectedLogprob(nn.Module):
             local_token_ids,
             local_temperature,
             local_sampling_transforms,
+            row_plan,
             self,
         )
 
@@ -1344,21 +876,11 @@ def glm52_exact_lm_head_per_token_ce(
     local_lora_B = _plain_local(lm_head.lora_B)
     valid = labels_flat != int(ignore_index)
     safe_labels = torch.where(valid, labels_flat, torch.zeros_like(labels_flat))
-    if isinstance(logprob_temperature, Tensor):
-        temperature_rows = _validate_temperature_rows(
-            logprob_temperature,
-            rows=hidden_states_flat.shape[0],
-            device=hidden_states_flat.device,
-        )
-    elif float(logprob_temperature) == 1.0:
-        temperature_rows = None
-    else:
-        temperature_rows = torch.full(
-            (hidden_states_flat.shape[0],),
-            float(logprob_temperature),
-            dtype=torch.float32,
-            device=hidden_states_flat.device,
-        )
+    temperature_rows = normalize_temperature_rows(
+        logprob_temperature,
+        rows=hidden_states_flat.shape[0],
+        device=hidden_states_flat.device,
+    )
     ce_chunks: list[Tensor] = []
     for start in range(0, hidden_states_flat.shape[0], GLM52_EXACT_LM_HEAD_LOCAL_CHUNK_ROWS):
         end = min(start + GLM52_EXACT_LM_HEAD_LOCAL_CHUNK_ROWS, hidden_states_flat.shape[0])
