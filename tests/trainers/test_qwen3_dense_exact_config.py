@@ -192,9 +192,7 @@ def test_dense_qwen3_mlp_dispatches_one_round_swiglu():
     assert exact_mlp._exact_one_round
     gate_up = torch.randn(2, 32, dtype=torch.bfloat16)
     # dispatch identity: the exact path routes through the one-round program
-    assert torch.equal(
-        exact_mlp._fused_act(gate_up), exact_fp32_silu_and_mul(gate_up)
-    )
+    assert torch.equal(exact_mlp._fused_act(gate_up), exact_fp32_silu_and_mul(gate_up))
 
     legacy_config = _config(hidden_size=8, intermediate_size=16)
     legacy_mlp = Qwen3MLP(legacy_config)

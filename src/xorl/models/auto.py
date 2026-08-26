@@ -793,10 +793,7 @@ def _resolve_exact_one_round_swiglu(config) -> bool:
     return (
         bool(getattr(config, "_qwen35_exact_contract", False))
         or bool(getattr(config, "_qwen3_dense_exact_contract", False))
-        or (
-            getattr(config, "_exact_contract_family", None)
-            == EXACT_CONTRACT_FAMILY_GLM52
-        )
+        or (getattr(config, "_exact_contract_family", None) == EXACT_CONTRACT_FAMILY_GLM52)
     )
 
 
