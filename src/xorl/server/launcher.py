@@ -46,6 +46,7 @@ from xorl.server.orchestrator.orchestrator import Orchestrator
 from xorl.server.removed_config import reject_removed_configuration_fields
 from xorl.server.server_arguments import ServerArguments
 from xorl.server.session_spec import build_default_session_spec
+from xorl.server.train_serve_profile import expand_train_serve_profile
 from xorl.server.utils.network import read_address_file
 
 
@@ -513,6 +514,11 @@ def load_server_arguments(config_path: str, overrides: Optional[Dict[str, any]] 
                 logger.info(f"  CLI override: {key} = {value}")
             else:
                 logger.warning(f"  Unknown override key ignored: {key}")
+
+    # Expand the train/serve profile while explicit keys are still
+    # distinguishable from dataclass defaults (pins fill or fail-fast,
+    # aligned defaults fill only).
+    filtered_config = expand_train_serve_profile(filtered_config, context=f"server config {config_path!r}")
 
     logger.info(f"Loaded ServerArguments from: {config_path}")
     logger.info(f"  model_path: {filtered_config.get('model_path', 'N/A')}")

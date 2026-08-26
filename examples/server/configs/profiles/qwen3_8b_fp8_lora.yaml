@@ -1,0 +1,54 @@
+# Qwen3-8B FP8-base + LoRA training via the train/serve alignment profile.
+#
+# train_serve_profile: fp8_lora is an FP8 (block e4m3) FROZEN BASE with bf16
+# LoRA ADAPTER weights — base quantization, not adapter quantization. It
+# derives enable_qlora=true, enable_lora=true, quant_format=block_fp8 and
+# quant_group_size=128 on the trainer, and requires the paired receiver to
+# serve an FP8-quantized base (--quantization fp8, or an FP8 checkpoint)
+# with the LoRA pool enabled; /add_inference_endpoint fails fast otherwise.
+# The trainer loads the same pre-quantized FP8 checkpoint the receiver
+# serves (HF fp8_e4m3fn format). Derive the receiver launch flags:
+#   python -m xorl.server.train_serve_profile examples/server/configs/profiles/qwen3_8b_fp8_lora.yaml
+
+train_serve_profile: fp8_lora
+lora_rank: 32
+# Fused projection names: QLoRA adapters attach to the fused base modules;
+# SGLang accepts the same fused names in --lora-target-modules.
+lora_target_modules: ["qkv_proj", "o_proj", "gate_up_proj", "down_proj"]
+
+# Model Configuration
+model_path: Qwen/Qwen3-8B-FP8
+tokenizer_path: Qwen/Qwen3-8B-FP8
+attn_implementation: flash_attention_3
+
+# Parallelism Configuration
+data_parallel_mode: fsdp2
+ulysses_parallel_size: 1
+data_parallel_replicate_size: 1
+data_parallel_shard_size: 4
+
+# Memory & Performance
+enable_mixed_precision: true
+enable_gradient_checkpointing: true
+enable_full_shard: true
+enable_activation_offload: false
+init_device: meta
+
+# Checkpointing
+output_dir: outputs/Qwen3-8B-server-profile-fp8-lora
+load_checkpoint_path: ""
+ckpt_manager: dcp
+
+# Logging
+log_level: INFO
+
+# Worker Configuration
+worker_connection_timeout: 60.0
+worker_max_retries: 3
+
+# Data Processing Configuration
+sample_packing_sequence_len: 128000
+enable_packing: true
+
+skip_initial_checkpoint: true
+ce_mode: compiled

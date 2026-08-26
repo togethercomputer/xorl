@@ -203,3 +203,39 @@ ZMQ communication between the launcher, workers, and API server.
 |---|---|---|
 | `sync_inference_method` | `nccl_broadcast` | Method for pushing updated weights to the inference endpoint after each step. The pinned xorl-sglang revision supports `nccl_broadcast` (two-phase distributed receive) and `p2p` (Mooncake RDMA writes). XoRL also accepts `sparse_delta`, but that mode is not usable with the pinned receiver because `/update_weights_from_sparse_delta` is absent. |
 | `receiver_kv_cache_dtype` | `null` | Expected receiver KV-cache dtype: `auto`, `fp8`, or `fp8_e4m3`. Validates registered endpoint metadata; it does not configure SGLang itself. |
+
+---
+
+## Train/serve profile
+
+| Field | Default | Description |
+|---|---|---|
+| `train_serve_profile` | `null` | Named train/serve mode: `full`, `lora`, or `fp8_lora`. Selects the trainer and receiver combination once; pinned trainer fields are derived when unset and rejected (all conflicts listed) when explicitly contradicted, and registered inference endpoints are validated against the profile at `/add_inference_endpoint`. `null` keeps the historical unprofiled behavior. |
+
+A profile is a single declaration of what the base weights and adapters are on
+both sides of the trainer/receiver pair. `fp8_lora` means an **FP8 (block
+e4m3) frozen base with bf16 LoRA adapter weights** — base quantization, not
+adapter quantization; no profile quantizes the adapters themselves.
+
+Derived trainer fields per profile — *pinned* fields are derived when unset
+and rejected when contradicted; *filled* fields are aligned defaults that
+explicit values always override:
+
+| Profile | Pinned | Filled |
+|---|---|---|
+| `full` | `enable_lora=false`, `enable_qlora=false`, `block_fp8_qlora_training=false`, `unfuse_for_lora=false`, `enable_fp8_training=false`, `enable_qarl=false` | — |
+| `lora` | `enable_lora=true`, `enable_qlora=false`, `block_fp8_qlora_training=false`, `enable_fp8_training=false`, `enable_qarl=false` | `unfuse_for_lora=true`, `lora_alpha=32` |
+| `fp8_lora` | `enable_lora=true`, `enable_qlora=true`, `quant_format=block_fp8`, `unfuse_for_lora=false`, `enable_fp8_training=false`, `enable_qarl=false` | `quant_group_size=128`, `lora_alpha=32` |
+
+Receiver requirements enforced when an SGLang endpoint is registered:
+
+| Profile | Receiver base | Receiver LoRA pool |
+|---|---|---|
+| `full` | unquantized (bf16) | must be disabled |
+| `lora` | unquantized (bf16) | `--enable-lora`, `max_lora_rank` ≥ trainer `max_lora_rank` |
+| `fp8_lora` | FP8-quantized (`--quantization fp8` or an FP8 checkpoint) | `--enable-lora`, `max_lora_rank` ≥ trainer `max_lora_rank` |
+
+`python -m xorl.server.train_serve_profile <config.yaml> [--tp-size N]` prints
+the matching `sglang.launch_server` command for the profile. Example configs:
+`examples/server/configs/profiles/qwen3_8b_{full,lora,fp8_lora}.yaml`. See
+[SGLang integration](/server-training/sglang/) for the launch-flag mapping.

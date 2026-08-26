@@ -1041,6 +1041,24 @@ class ServerArguments:
     )
 
     # ========================================================================
+    # Train/serve alignment profile
+    # ========================================================================
+
+    train_serve_profile: Optional[Literal["full", "lora", "fp8_lora"]] = field(
+        default=None,
+        metadata={
+            "help": "Named train/serve mode that derives and validates the paired trainer and SGLang-receiver "
+            "settings in one place: 'full' (bf16 full-weight), 'lora' (bf16 base + bf16 LoRA adapters), "
+            "'fp8_lora' (FP8 block-quantized frozen base + bf16 LoRA adapters, i.e. block_fp8 QLoRA). "
+            "Pinned fields (enable_lora/enable_qlora/quant_format/...) are derived when unset and rejected "
+            "when explicitly contradicted; registered inference endpoints are validated against the profile "
+            "(receiver quantization, --enable-lora, --max-lora-rank). "
+            "See xorl.server.train_serve_profile; 'python -m xorl.server.train_serve_profile <config.yaml>' "
+            "prints the paired SGLang launch command. Unset keeps the historical unprofiled behavior."
+        },
+    )
+
+    # ========================================================================
     # LoRA Configuration
     # ========================================================================
 
@@ -1232,6 +1250,14 @@ class ServerArguments:
             raise ValueError("max_grad_norm must be a finite number; use a value <= 0 to disable clipping") from error
         if not math.isfinite(self.max_grad_norm):
             raise ValueError("max_grad_norm must be a finite number; use a value <= 0 to disable clipping")
+        from xorl.server.train_serve_profile import (  # noqa: PLC0415
+            resolve_profile,
+            validate_train_serve_profile_invariants,
+        )
+
+        resolved_profile = resolve_profile(self.train_serve_profile)
+        self.train_serve_profile = resolved_profile.name if resolved_profile is not None else None
+        validate_train_serve_profile_invariants(self)
         if self.unfuse_for_lora and not self.enable_lora:
             raise ValueError("unfuse_for_lora requires enable_lora=True")
         if self.unfuse_for_lora and self.enable_qlora:
@@ -1615,6 +1641,7 @@ class ServerArguments:
                 "log_level": self.log_level,
                 "sync_inference_method": self.sync_inference_method,
                 "receiver_kv_cache_dtype": self.receiver_kv_cache_dtype,
+                "train_serve_profile": self.train_serve_profile,
             },
             "data": {
                 # Empty data section - data comes from client at runtime
@@ -1810,6 +1837,12 @@ def parse_server_args() -> ServerArguments:
         raise ValueError(
             f"Unrecognized config fields: {sorted(unknown_fields)}. Check your config file for typos or removed fields."
         )
+
+    # Expand the train/serve profile while explicit keys are still
+    # distinguishable from dataclass defaults.
+    from xorl.server.train_serve_profile import expand_train_serve_profile  # noqa: PLC0415
+
+    config_data = expand_train_serve_profile(config_data, context=f"server config {config_path!r}")
 
     # Create ServerArguments
     server_args = ServerArguments(**config_data)

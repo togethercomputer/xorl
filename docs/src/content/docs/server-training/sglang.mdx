@@ -172,6 +172,39 @@ python -m sglang.launch_server \
 | `--tp-size N` | Tensor parallelism across N GPUs |
 | `--mem-fraction-static 0.88` | Fraction of GPU memory for KV cache (leave headroom for weight sync buffers) |
 
+### Deriving launch flags from a train/serve profile
+
+When the training server config sets
+[`train_serve_profile`](/config-reference/server/#trainserve-profile)
+(`full`, `lora`, or `fp8_lora`), the alignment-relevant launch flags are a
+deterministic function of that config — print them instead of hand-copying:
+
+```bash
+python -m xorl.server.train_serve_profile examples/server/configs/profiles/qwen3_8b_fp8_lora.yaml
+# python -m sglang.launch_server --model-path Qwen/Qwen3-8B-FP8 \
+#   --rl-on-policy-target xorl --enable-fp32-lm-head --tp-size 1 \
+#   --quantization fp8 --enable-lora --max-lora-rank 32 \
+#   --lora-target-modules qkv_proj o_proj gate_up_proj down_proj
+```
+
+Capacity tuning (`--port`, `--mem-fraction-static`, CUDA-graph limits) stays
+with the operator. Compatibility mapping per profile:
+
+| Profile | Trainer | Receiver flags | Weights pushed per step |
+|---|---|---|---|
+| `full` | bf16 full-weight | base flags only | full weights (`sync_inference_method`) |
+| `lora` | bf16 base + bf16 LoRA (`unfuse_for_lora=true`) | `--enable-lora --max-lora-rank R --lora-target-modules ...` | LoRA adapters (`/load_lora_adapter`) |
+| `fp8_lora` | FP8 block-e4m3 frozen base (`block_fp8` QLoRA) + bf16 LoRA | `--quantization fp8 --enable-lora --max-lora-rank R --lora-target-modules ...` | LoRA adapters (`/load_lora_adapter`); base stays frozen |
+
+`fp8_lora` quantizes the **base model**, never the adapter weights — the
+adapters remain bf16 on both sides. Trainer LoRA targets SGLang has no name
+for (e.g. Qwen3.5's GDN `g_proj`) map to `--lora-target-modules all`, a
+superset; the pushed adapters still carry the concrete module set.
+
+`/add_inference_endpoint` validates every registered receiver against the
+profile (base quantization, `--enable-lora`, `max_lora_rank`) and rejects
+mismatches before any weight sync happens.
+
 ### Wait for ready
 
 ```python

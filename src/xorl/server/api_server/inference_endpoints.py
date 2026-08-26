@@ -34,6 +34,7 @@ from xorl.server.api_server.utils import validate_model_id
 from xorl.server.protocol.api_orchestrator import OrchestratorRequest
 from xorl.server.protocol.operations import SyncWeightsData
 from xorl.server.security import build_http_endpoint_url, resolve_path_within, validate_outbound_endpoint
+from xorl.server.train_serve_profile import endpoint_profile_mismatches
 
 
 logger = logging.getLogger(__name__)
@@ -696,6 +697,26 @@ class InferenceEndpointsMixin:
                 message=kv_cache_error,
                 endpoint=None,
             )
+
+        # Validate the receiver against the train/serve profile (fail-fast:
+        # quantization, LoRA enablement, and max LoRA rank must satisfy the
+        # trainer's declared mode before the endpoint is admitted).
+        train_serve_profile = (getattr(self, "train_config", {}) or {}).get("train_serve_profile")
+        if train_serve_profile:
+            profile_mismatches = endpoint_profile_mismatches(
+                train_serve_profile,
+                getattr(self, "lora_config", {}) or {},
+                server_info,
+            )
+            if profile_mismatches:
+                return AddInferenceEndpointResponse(
+                    success=False,
+                    message=(
+                        f"Endpoint {endpoint_url} does not satisfy train_serve_profile="
+                        f"{train_serve_profile!r}: {'; '.join(profile_mismatches)}"
+                    ),
+                    endpoint=None,
+                )
 
         # Validate endpoint consistency (model_path, quantization, tp_size must match)
         if server_info is not None and self.inference_endpoints:
