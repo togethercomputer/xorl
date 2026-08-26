@@ -338,6 +338,39 @@ def test_per_row_sampling_transforms_reject_nonidentity_scalar_override():
         )
 
 
+def test_per_row_sampling_transforms_reject_malformed_metadata_host_side():
+    """Malformed replay metadata must fail the request, not the engine.
+
+    The downstream torch._assert_async checks fire as CUDA device asserts
+    that poison the whole engine process; the serving wire's top_k=-1 "all"
+    sentinel did exactly that during live transform-replay qualification.
+    """
+    with pytest.raises(ValueError, match="1 << 30"):
+        ModelRunner._resolve_logprob_sampling_transforms(
+            {"logprob_top_ks": torch.tensor([50, -1], dtype=torch.int64)},
+            {},
+        )
+    with pytest.raises(ValueError, match="logprob_top_ps"):
+        ModelRunner._resolve_logprob_sampling_transforms(
+            {"logprob_top_ps": torch.tensor([0.9, 0.0])},
+            {},
+        )
+    with pytest.raises(ValueError, match="logprob_min_ps"):
+        ModelRunner._resolve_logprob_sampling_transforms(
+            {"logprob_min_ps": torch.tensor([0.05, float("nan")])},
+            {},
+        )
+    resolved = ModelRunner._resolve_logprob_sampling_transforms(
+        {
+            "logprob_top_ks": torch.tensor([50, 1 << 30], dtype=torch.int64),
+            "logprob_top_ps": torch.tensor([0.9, 1.0]),
+            "logprob_min_ps": torch.tensor([0.05, 0.0]),
+        },
+        {},
+    )
+    assert set(resolved) == {"logprob_top_k", "logprob_top_p", "logprob_min_p"}
+
+
 def test_compute_micro_batch_loss_drgrpo_skips_returned_logprobs_when_disabled():
     runner = object.__new__(ModelRunner)
     runner.model = _TinyModel()
