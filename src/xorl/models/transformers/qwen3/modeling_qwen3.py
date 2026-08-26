@@ -30,7 +30,7 @@ from xorl.models.outputs import BaseModelOutput, CausalLMOutput
 from xorl.models.transformers.qwen3 import parallelize
 from xorl.models.transformers.qwen3.checkpoint_handler import Qwen3CheckpointHandler
 from xorl.models.transformers.qwen3.configuration_qwen3 import Qwen3Config
-from xorl.ops.fused_silu_and_mul import fused_silu_and_mul
+from xorl.ops.fused_silu_and_mul import exact_fp32_silu_and_mul, fused_silu_and_mul
 from xorl.utils import logging
 
 
@@ -48,6 +48,16 @@ class Qwen3MLP(nn.Module):
         self.down_proj = nn.Linear(self.intermediate_size, self.hidden_size, bias=False)
         self.act_fn = ACT2FN[config.hidden_act]
         self._use_fused_silu = config.hidden_act == "silu" and not getattr(config, "_activation_native", False)
+        # One-round FP32 SwiGLU is scoped to the exact contract: serving applies
+        # it universally in exact mode (SiluAndMul.forward_exact), so the exact
+        # dense Qwen3 trainer must pair with the same single-rounding program.
+        # Every other caller keeps the historical two-round bytes.
+        self._exact_one_round = bool(getattr(config, "_exact_one_round_swiglu", False))
+
+    def _fused_act(self, gate_up):
+        if self._exact_one_round:
+            return exact_fp32_silu_and_mul(gate_up)
+        return fused_silu_and_mul(gate_up)
 
     def unfuse_for_tp(self):
         """Replace fused gate_up_proj with separate gate_proj and up_proj for tensor parallelism."""
@@ -67,7 +77,7 @@ class Qwen3MLP(nn.Module):
                 projection_sizes=(self.intermediate_size, self.intermediate_size),
             )
             if self._use_fused_silu:
-                x = fused_silu_and_mul(gate_up)
+                x = self._fused_act(gate_up)
             else:
                 gate, up = gate_up.chunk(2, dim=-1)
                 x = self.act_fn(gate) * up
@@ -75,7 +85,7 @@ class Qwen3MLP(nn.Module):
             gate = self.gate_proj(x)
             up = self.up_proj(x)
             if self._use_fused_silu:
-                x = fused_silu_and_mul(torch.cat([gate, up], dim=-1))
+                x = self._fused_act(torch.cat([gate, up], dim=-1))
             else:
                 x = self.act_fn(gate) * up
         return self.down_proj(x)

@@ -782,6 +782,24 @@ def resolve_cross_entropy_mode(config: PretrainedConfig, ce_mode: Optional[str])
     return "bi_fused"
 
 
+def _resolve_exact_one_round_swiglu(config) -> bool:
+    """Whether the resolved program pairs with serving's one-round FP32 SwiGLU.
+
+    Serving applies the one-round program universally in exact mode
+    (SiluAndMul.forward_exact -> fp32_silu_and_mul), so every admitted exact
+    contract family must select it: Qwen3.5 dense/MoE, exact dense Qwen3, and
+    GLM-5.2. Non-exact models keep the historical two-round bytes.
+    """
+    return (
+        bool(getattr(config, "_qwen35_exact_contract", False))
+        or bool(getattr(config, "_qwen3_dense_exact_contract", False))
+        or (
+            getattr(config, "_exact_contract_family", None)
+            == EXACT_CONTRACT_FAMILY_GLM52
+        )
+    )
+
+
 def build_foundation_model(
     config_path: Union[str, PretrainedConfig],
     weights_path: Optional[str] = None,
@@ -924,9 +942,7 @@ def build_foundation_model(
     # every admitted contracted family pairs with it, including Qwen3.5
     # dense/MoE and GLM-5.2.
     config._exact_contract_family = resolve_exact_contract_family(config)
-    config._exact_one_round_swiglu = bool(config._qwen35_exact_contract) or (
-        config._exact_contract_family == EXACT_CONTRACT_FAMILY_GLM52
-    )
+    config._exact_one_round_swiglu = _resolve_exact_one_round_swiglu(config)
     _validate_exact_qwen35_model_scope(config)
     _validate_exact_qwen3_dense_model_scope(config)
     _validate_exact_qwen35_moe_program(

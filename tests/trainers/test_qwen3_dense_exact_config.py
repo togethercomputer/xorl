@@ -159,3 +159,53 @@ def test_dense_qwen3_accepts_transformers_v5_rope_parameters():
     config.rope_parameters = {"rope_theta": 1_000_000}
 
     _validate_exact_qwen3_dense_model_scope(config)
+
+
+def test_dense_qwen3_pairs_with_one_round_swiglu():
+    """Exact dense Qwen3 must select serving's one-round FP32 SwiGLU.
+
+    Serving applies fp32_silu_and_mul universally under a resolved exact
+    contract (SiluAndMul.forward_exact); a two-round trainer activation
+    diverges at bf16 scale in every MLP (first seen as a layer-0 MLP
+    mismatch during Qwen3-8B K3 qualification).
+    """
+    from xorl.models.auto import _resolve_exact_one_round_swiglu
+
+    dense = _config()
+    assert _resolve_exact_one_round_swiglu(dense)
+
+    generic = _config()
+    generic._qwen3_dense_exact_contract = False
+    assert not _resolve_exact_one_round_swiglu(generic)
+
+
+def test_dense_qwen3_mlp_dispatches_one_round_swiglu():
+    import torch
+    import torch.nn.functional as F
+
+    from xorl.models.transformers.qwen3.modeling_qwen3 import Qwen3MLP
+    from xorl.ops.fused_silu_and_mul import exact_fp32_silu_and_mul
+
+    exact_config = _config(hidden_size=8, intermediate_size=16)
+    exact_config._exact_one_round_swiglu = True
+    exact_mlp = Qwen3MLP(exact_config)
+    assert exact_mlp._exact_one_round
+    gate_up = torch.randn(2, 32, dtype=torch.bfloat16)
+    # dispatch identity: the exact path routes through the one-round program
+    assert torch.equal(
+        exact_mlp._fused_act(gate_up), exact_fp32_silu_and_mul(gate_up)
+    )
+
+    legacy_config = _config(hidden_size=8, intermediate_size=16)
+    legacy_mlp = Qwen3MLP(legacy_config)
+    assert not legacy_mlp._exact_one_round
+
+    # The two programs are genuinely different byte streams on bf16 inputs;
+    # this guards against either side silently collapsing into the other.
+    torch.manual_seed(0)
+    bf16 = torch.randn(64, 128, dtype=torch.bfloat16) * 3
+    gate, up = bf16.chunk(2, dim=-1)
+    one_round = (F.silu(gate.float()) * up.float()).to(torch.bfloat16)
+    two_round = (F.silu(gate.float()).to(torch.bfloat16) * up).to(torch.bfloat16)
+    assert torch.equal(exact_fp32_silu_and_mul(bf16), one_round)
+    assert not torch.equal(one_round, two_round)
