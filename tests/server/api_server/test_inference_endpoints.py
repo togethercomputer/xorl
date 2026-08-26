@@ -133,9 +133,7 @@ class TestInferenceEndpointRegistration:
             train_config={"train_serve_profile": "lora"},
             lora_config={"lora_rank": 32, "max_lora_rank": 32},
         )
-        response = asyncio.run(
-            server.add_inference_endpoint(AddInferenceEndpointRequest(host="8.8.8.8", port=30000))
-        )
+        response = asyncio.run(server.add_inference_endpoint(AddInferenceEndpointRequest(host="8.8.8.8", port=30000)))
         assert response.success is True, response.message
 
         # fp8_lora against the same bf16 receiver is rejected before admission.
@@ -145,9 +143,7 @@ class TestInferenceEndpointRegistration:
             train_config={"train_serve_profile": "fp8_lora"},
             lora_config={"lora_rank": 32, "max_lora_rank": 32},
         )
-        response = asyncio.run(
-            server.add_inference_endpoint(AddInferenceEndpointRequest(host="8.8.8.8", port=30000))
-        )
+        response = asyncio.run(server.add_inference_endpoint(AddInferenceEndpointRequest(host="8.8.8.8", port=30000)))
         assert response.success is False
         assert "train_serve_profile='fp8_lora'" in response.message
         assert "FP8-quantized base" in response.message
@@ -160,9 +156,7 @@ class TestInferenceEndpointRegistration:
             train_config={"train_serve_profile": "lora"},
             lora_config={"lora_rank": 32, "max_lora_rank": 128},
         )
-        response = asyncio.run(
-            server.add_inference_endpoint(AddInferenceEndpointRequest(host="8.8.8.8", port=30000))
-        )
+        response = asyncio.run(server.add_inference_endpoint(AddInferenceEndpointRequest(host="8.8.8.8", port=30000)))
         assert response.success is False
         assert "max_lora_rank=64 < trainer max_lora_rank=128" in response.message
 
@@ -171,9 +165,7 @@ class TestInferenceEndpointRegistration:
             engine_input_addr="tcp://127.0.0.1:17002",
             engine_output_addr="tcp://127.0.0.1:17003",
         )
-        response = asyncio.run(
-            server.add_inference_endpoint(AddInferenceEndpointRequest(host="8.8.8.8", port=30000))
-        )
+        response = asyncio.run(server.add_inference_endpoint(AddInferenceEndpointRequest(host="8.8.8.8", port=30000)))
         assert response.success is True, response.message
 
     def _assert_explicit_worker_port_is_checked(self, monkeypatch):
