@@ -405,6 +405,7 @@ def build_training_model(
         flash_attention_deterministic=flash_attention_deterministic,
         server_training=server_training,
         enable_lora=enable_lora,
+        enable_qlora=enable_qlora,
         block_fp8_qlora_training=block_fp8_qlora_training,
         glm52_fullparam_fp8_training=glm52_fullparam_fp8_training,
         lora_rank=lora_rank,

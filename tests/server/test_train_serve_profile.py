@@ -333,6 +333,30 @@ def test_fp8_lora_profile_launch_args_carry_quantization():
     assert args[args.index("--max-lora-rank") + 1] == "64"
 
 
+def test_fp8_lora_profile_launch_args_never_request_exact_serving():
+    # The exact value program is a bf16 contract; a receiver launched with
+    # --rl-on-policy-target xorl on FP8 weights fails closed at boot. The
+    # fp8_lora derivation must therefore target the stock FP8 serving path.
+    args = sglang_launch_args("fp8_lora", model_path="Qwen/Qwen3-8B-FP8", lora_config={"lora_rank": 32})
+    assert "--rl-on-policy-target" not in args
+    assert "--enable-fp32-lm-head" not in args
+    # ...while the bf16 profiles keep requesting exact serving.
+    for exact_profile in ("full", "lora"):
+        exact_args = sglang_launch_args(exact_profile, model_path="Qwen/Qwen3-8B", lora_config={"lora_rank": 32})
+        assert "--rl-on-policy-target" in exact_args and "--enable-fp32-lm-head" in exact_args
+
+
+def test_qwen_exact_contracts_disengage_under_qlora():
+    # Trainer-side pairing of the same rule: the dense-Qwen3/Qwen3.5 exact
+    # stamps must not engage for a QLoRA (quantized frozen base) run, exactly
+    # as the GLM-5.2 stamp disengages under block_fp8_qlora_training.
+    from xorl.models.auto import qwen_exact_contracts_engaged
+
+    assert qwen_exact_contracts_engaged(server_training=True, enable_qlora=False)
+    assert not qwen_exact_contracts_engaged(server_training=True, enable_qlora=True)
+    assert not qwen_exact_contracts_engaged(server_training=False, enable_qlora=False)
+
+
 def test_unsupported_trainer_targets_fall_back_to_all_sentinel():
     # Qwen3.5's GDN g_proj is not a serving-side LoRA module name.
     assert serving_lora_target_modules(["q_proj", "g_proj"]) == ["all"]

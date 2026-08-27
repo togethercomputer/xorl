@@ -217,6 +217,12 @@ both sides of the trainer/receiver pair. `fp8_lora` means an **FP8 (block
 e4m3) frozen base with bf16 LoRA adapter weights** — base quantization, not
 adapter quantization; no profile quantizes the adapters themselves.
 
+`full` and `lora` pair with XoRL exact serving (`--rl-on-policy-target xorl`,
+the bf16 K3=0 contract). `fp8_lora` pairs with the stock SGLang FP8 serving
+path: the exact program hard-rejects quantized weights at receiver boot, and
+the trainer-side Qwen exact stamps disengage under QLoRA, so FP8+LoRA has no
+bitwise trainer/serving parity guarantee.
+
 Derived trainer fields per profile — *pinned* fields are derived when unset
 and rejected when contradicted; *filled* fields are aligned defaults that
 explicit values always override:

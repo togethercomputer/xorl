@@ -182,19 +182,24 @@ deterministic function of that config — print them instead of hand-copying:
 ```bash
 python -m xorl.server.train_serve_profile examples/server/configs/profiles/qwen3_8b_fp8_lora.yaml
 # python -m sglang.launch_server --model-path Qwen/Qwen3-8B-FP8 \
-#   --rl-on-policy-target xorl --enable-fp32-lm-head --tp-size 1 \
-#   --quantization fp8 --enable-lora --max-lora-rank 32 \
+#   --tp-size 1 --quantization fp8 --enable-lora --max-lora-rank 32 \
 #   --lora-target-modules qkv_proj o_proj gate_up_proj down_proj
 ```
 
 Capacity tuning (`--port`, `--mem-fraction-static`, CUDA-graph limits) stays
 with the operator. Compatibility mapping per profile:
 
-| Profile | Trainer | Receiver flags | Weights pushed per step |
-|---|---|---|---|
-| `full` | bf16 full-weight | base flags only | full weights (`sync_inference_method`) |
-| `lora` | bf16 base + bf16 LoRA (`unfuse_for_lora=true`) | `--enable-lora --max-lora-rank R --lora-target-modules ...` | LoRA adapters (`/load_lora_adapter`) |
-| `fp8_lora` | FP8 block-e4m3 frozen base (`block_fp8` QLoRA) + bf16 LoRA | `--quantization fp8 --enable-lora --max-lora-rank R --lora-target-modules ...` | LoRA adapters (`/load_lora_adapter`); base stays frozen |
+| Profile | Trainer | Receiver flags | Serving numerics | Weight sync |
+|---|---|---|---|---|
+| `full` | bf16 full-weight | `--rl-on-policy-target xorl --enable-fp32-lm-head` | XoRL exact (K3=0 contract) | full bf16 weights (NCCL `sync_inference_weights`) |
+| `lora` | bf16 base + bf16 LoRA (`unfuse_for_lora=true`) | `--rl-on-policy-target xorl --enable-fp32-lm-head --enable-lora --max-lora-rank R --lora-target-modules ...` | XoRL exact (K3=0 contract) | merged bf16 weights (NCCL `sync_inference_weights`) |
+| `fp8_lora` | FP8 block-e4m3 frozen base (`block_fp8` QLoRA) + bf16 LoRA | `--quantization fp8 --enable-lora --max-lora-rank R --lora-target-modules ...` | stock SGLang FP8 path — **no exact contract** | merged weights re-quantized to block-FP8 in flight (NCCL `sync_inference_weights`) |
+
+The exact value program is a bf16 contract: a receiver launched with
+`--rl-on-policy-target xorl` on quantized weights fails closed at boot, and
+the trainer-side dense-Qwen3/Qwen3.5 exact stamps disengage under QLoRA
+(`xorl.models.auto.qwen_exact_contracts_engaged`), so `fp8_lora` deliberately
+derives the stock FP8 serving path and carries no bitwise parity guarantee.
 
 `fp8_lora` quantizes the **base model**, never the adapter weights — the
 adapters remain bf16 on both sides. Trainer LoRA targets SGLang has no name

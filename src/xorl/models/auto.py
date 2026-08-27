@@ -279,6 +279,20 @@ def _is_exact_qwen3_dense(config: PretrainedConfig) -> bool:
     return bool(getattr(config, "_qwen3_dense_exact_contract", False))
 
 
+def qwen_exact_contracts_engaged(*, server_training: bool, enable_qlora: bool) -> bool:
+    """Whether the Qwen3-dense / Qwen3.5 exact server-training contracts may engage.
+
+    The exact value programs pair a bf16 trainer with exact bf16 serving. A
+    QLoRA run trains adapters over a quantized frozen base, which neither side
+    of that contract admits, so the family stamps disengage and generic
+    trainer numerics apply (the GLM-5.2 stamp already disengages under its
+    block_fp8_qlora_training lane; this is the same rule for the Qwen
+    families, keyed on the generic enable_qlora flag the fp8_lora
+    train_serve_profile pins).
+    """
+    return bool(server_training and not enable_qlora)
+
+
 def _validate_exact_qwen3_dense_model_scope(config: PretrainedConfig) -> None:
     if not _is_exact_qwen3_dense(config):
         return
@@ -831,6 +845,7 @@ def build_foundation_model(
     flash_attention_deterministic: bool = False,
     server_training: bool = False,
     enable_lora: bool = False,
+    enable_qlora: bool = False,
     block_fp8_qlora_training: bool = False,
     glm52_fullparam_fp8_training: bool = False,
     lora_rank: Optional[int] = None,
@@ -889,12 +904,22 @@ def build_foundation_model(
         "qwen3_5_moe",
         "qwen3_5_moe_text",
     }
-    config._qwen35_exact_contract = bool(server_training and qwen35_model_type)
+    qwen_exact_eligible = qwen_exact_contracts_engaged(
+        server_training=server_training,
+        enable_qlora=enable_qlora,
+    )
+    config._qwen35_exact_contract = bool(qwen_exact_eligible and qwen35_model_type)
     config._qwen3_dense_exact_contract = bool(
-        server_training
+        qwen_exact_eligible
         and getattr(config, "model_type", None) == "qwen3"
         and "Qwen3ForCausalLM" in _get_architectures(config)
     )
+    if server_training and not qwen_exact_eligible and (qwen35_model_type or getattr(config, "model_type", None) == "qwen3"):
+        logger.info_rank0(
+            "Qwen exact server-training contract disengaged: enable_qlora=True trains "
+            "on a quantized base, which the bf16 exact value program does not admit; "
+            "generic trainer numerics apply."
+        )
     dsv4_flash_exact = bool(server_training and is_dsv4_flash_config(config))
     config._dsv4_flash_exact_mode = dsv4_flash_exact
     config._dsv4_flash_exact_active_lora = bool(dsv4_flash_exact and enable_lora)

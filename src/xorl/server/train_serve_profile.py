@@ -22,6 +22,14 @@ base model** (the trainer holds the frozen base as block-FP8 QLoRA, the
 receiver serves an FP8-quantized base) with **bf16 LoRA adapter weights** on
 both sides. It does not quantize the adapters themselves; no profile does.
 
+Serving numerics: ``full`` and ``lora`` pair with XoRL exact serving
+(``--rl-on-policy-target xorl``, the bf16 K3=0 contract). ``fp8_lora`` pairs
+with the stock SGLang FP8 serving path -- the exact value program hard-rejects
+quantized weights at receiver boot, and the trainer-side family exact
+contracts likewise disengage under QLoRA (see
+``xorl.models.auto.qwen_exact_contracts_engaged``); FP8+LoRA therefore has no
+bitwise trainer/serving parity guarantee.
+
 This module is imported by the config parsers and the API server; keep it
 torch-free.
 """
@@ -79,6 +87,11 @@ class TrainServeProfile:
     adapter_weight_format: Optional[str]  # "bf16" | None
     # Expected receiver base quantization (None = unquantized bf16 serving).
     serving_quantization: Optional[str]
+    # Whether the paired receiver runs XoRL exact serving (--rl-on-policy-target
+    # xorl --enable-fp32-lm-head). The exact value program is a bf16 contract:
+    # it hard-rejects quantized weights at receiver boot, so FP8-base profiles
+    # pair with the stock serving path instead (no K3=0 guarantee).
+    exact_serving: bool
     # Trainer fields the profile pins: filled when absent, a hard error when
     # explicitly set to anything else.
     pins: Mapping[str, Any]
@@ -87,7 +100,7 @@ class TrainServeProfile:
     fills: Mapping[str, Any]
 
 
-def _profile(name, description, base, adapter, serving_quant, pins, fills):
+def _profile(name, description, base, adapter, serving_quant, pins, fills, exact_serving):
     return TrainServeProfile(
         name=name,
         description=description,
@@ -95,6 +108,7 @@ def _profile(name, description, base, adapter, serving_quant, pins, fills):
         adapter_enabled=adapter,
         adapter_weight_format="bf16" if adapter else None,
         serving_quantization=serving_quant,
+        exact_serving=exact_serving,
         pins=MappingProxyType(pins),
         fills=MappingProxyType(fills),
     )
@@ -116,6 +130,7 @@ TRAIN_SERVE_PROFILES: Dict[str, TrainServeProfile] = {
             "enable_qarl": False,
         },
         fills={},
+        exact_serving=True,
     ),
     "lora": _profile(
         "lora",
@@ -139,6 +154,7 @@ TRAIN_SERVE_PROFILES: Dict[str, TrainServeProfile] = {
             # dataclass default (16) predates them.
             "lora_alpha": 32,
         },
+        exact_serving=True,
     ),
     "fp8_lora": _profile(
         "fp8_lora",
@@ -164,6 +180,10 @@ TRAIN_SERVE_PROFILES: Dict[str, TrainServeProfile] = {
             "quant_group_size": 128,
             "lora_alpha": 32,
         },
+        # FP8 block-quantized weights cannot satisfy the bf16 exact serving
+        # contract (the receiver fails closed at boot); this profile pairs
+        # with the stock SGLang FP8 serving path.
+        exact_serving=False,
     ),
 }
 
@@ -358,15 +378,10 @@ def sglang_launch_args(
     if profile is None:
         raise ValueError(f"sglang_launch_args requires a {PROFILE_FIELD}; got {profile_name!r}")
 
-    args = [
-        "--model-path",
-        model_path,
-        "--rl-on-policy-target",
-        "xorl",
-        "--enable-fp32-lm-head",
-        "--tp-size",
-        str(tp_size),
-    ]
+    args = ["--model-path", model_path]
+    if profile.exact_serving:
+        args += ["--rl-on-policy-target", "xorl", "--enable-fp32-lm-head"]
+    args += ["--tp-size", str(tp_size)]
     if profile.serving_quantization is not None:
         args += ["--quantization", profile.serving_quantization]
     if profile.adapter_enabled:

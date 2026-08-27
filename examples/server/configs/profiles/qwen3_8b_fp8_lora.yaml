@@ -7,7 +7,10 @@
 # serve an FP8-quantized base (--quantization fp8, or an FP8 checkpoint)
 # with the LoRA pool enabled; /add_inference_endpoint fails fast otherwise.
 # The trainer loads the same pre-quantized FP8 checkpoint the receiver
-# serves (HF fp8_e4m3fn format). Derive the receiver launch flags:
+# serves (HF fp8_e4m3fn format). Unlike full/lora, this profile pairs with
+# the STOCK SGLang FP8 serving path (the bf16 exact contract cannot hold on
+# quantized weights; the Qwen exact trainer stamps disengage under QLoRA).
+# Derive the receiver launch flags:
 #   python -m xorl.server.train_serve_profile examples/server/configs/profiles/qwen3_8b_fp8_lora.yaml
 
 train_serve_profile: fp8_lora
