@@ -1,0 +1,47 @@
+# Qwen3-8B full-weight training via the train/serve alignment profile.
+#
+# train_serve_profile: full pins the full-weight mode (no LoRA/QLoRA, no
+# fp8/qarl low-precision training) and requires the paired SGLang receiver
+# to serve an unquantized bf16 base with no LoRA pool. Derive the receiver
+# launch flags with:
+#   python -m xorl.server.train_serve_profile examples/server/configs/profiles/qwen3_8b_full.yaml
+
+train_serve_profile: full
+
+# Model Configuration
+model_path: Qwen/Qwen3-8B
+tokenizer_path: Qwen/Qwen3-8B
+attn_implementation: flash_attention_3
+
+# Parallelism Configuration
+data_parallel_mode: fsdp2
+ulysses_parallel_size: 1
+data_parallel_replicate_size: 1
+data_parallel_shard_size: 4
+
+# Memory & Performance
+enable_mixed_precision: true
+enable_gradient_checkpointing: true
+enable_full_shard: true
+enable_activation_offload: false
+init_device: meta
+
+# Checkpointing
+output_dir: outputs/Qwen3-8B-server-profile-full
+load_checkpoint_path: ""
+ckpt_manager: dcp
+
+# Logging
+log_level: INFO
+
+# Worker Configuration
+worker_connection_timeout: 60.0
+worker_max_retries: 3
+
+# Data Processing Configuration
+sample_packing_sequence_len: 128000
+enable_packing: true
+
+skip_initial_checkpoint: true
+# bi_fused = K3 lm-head contract CE (fp32-class, tp1, no z-loss)
+ce_mode: bi_fused

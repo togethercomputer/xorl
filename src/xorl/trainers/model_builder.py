@@ -405,6 +405,7 @@ def build_training_model(
         flash_attention_deterministic=flash_attention_deterministic,
         server_training=server_training,
         enable_lora=enable_lora,
+        enable_qlora=enable_qlora,
         block_fp8_qlora_training=block_fp8_qlora_training,
         glm52_fullparam_fp8_training=glm52_fullparam_fp8_training,
         lora_rank=lora_rank,
@@ -465,10 +466,21 @@ def build_training_model(
     )
 
     if not merge_qkv and not unfuse_for_lora:
-        for layer in model.model.layers:
-            if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "unfuse_for_tp"):
-                layer.self_attn.unfuse_for_tp()
-        logger.info_rank0("Unfused QKV projections (merge_qkv=False)")
+        # Use the model-level unfuse: it unfuses BOTH attention and MLP and
+        # sets ``_unfused_for_tp`` so the checkpoint handler skips its
+        # qkv/gate_up merges. The previous per-attention loop left that flag
+        # unset, so the loader still emitted merged ``qkv_proj`` keys that the
+        # freshly created (empty) unfused modules could never receive —
+        # silently loading garbage attention weights (issue #87).
+        if hasattr(model, "unfuse_for_tp"):
+            model.unfuse_for_tp()
+            logger.info_rank0("Unfused QKV and gate/up projections (merge_qkv=False)")
+        else:
+            for layer in model.model.layers:
+                if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "unfuse_for_tp"):
+                    layer.self_attn.unfuse_for_tp()
+            model._unfused_for_tp = True
+            logger.info_rank0("Unfused QKV projections (merge_qkv=False)")
 
     if (
         get_parallel_state().tp_enabled

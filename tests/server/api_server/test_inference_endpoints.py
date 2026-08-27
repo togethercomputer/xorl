@@ -105,6 +105,68 @@ class TestInferenceEndpointRegistration:
         self._assert_add_inference_endpoint_auto_sync_policy(monkeypatch)
         self._assert_add_inference_endpoint_fp8_kv_cache_admission_policy(monkeypatch)
         self._assert_list_inference_endpoints_accepts_v1_models_health_fallback(monkeypatch)
+        self._assert_train_serve_profile_admission_policy(monkeypatch)
+
+    def _assert_train_serve_profile_admission_policy(self, monkeypatch):
+        """A train_serve_profile on the server config gates endpoint admission."""
+        responses = {
+            "http://8.8.8.8:30000/health": FakeResponse(),
+            "http://8.8.8.8:30000/server_info": FakeResponse(
+                json_data={
+                    "model_path": None,
+                    "tp_size": 1,
+                    "quantization": None,
+                    "enable_lora": True,
+                    "max_lora_rank": 64,
+                }
+            ),
+        }
+        monkeypatch.setattr(
+            "xorl.server.api_server.inference_endpoints.httpx.AsyncClient",
+            make_async_client(responses, []),
+        )
+
+        # Matching receiver: bf16 base, LoRA pool with a sufficient rank ceiling.
+        server = APIServer(
+            engine_input_addr="tcp://127.0.0.1:17002",
+            engine_output_addr="tcp://127.0.0.1:17003",
+            train_config={"train_serve_profile": "lora"},
+            lora_config={"lora_rank": 32, "max_lora_rank": 32},
+        )
+        response = asyncio.run(server.add_inference_endpoint(AddInferenceEndpointRequest(host="8.8.8.8", port=30000)))
+        assert response.success is True, response.message
+
+        # fp8_lora against the same bf16 receiver is rejected before admission.
+        server = APIServer(
+            engine_input_addr="tcp://127.0.0.1:17002",
+            engine_output_addr="tcp://127.0.0.1:17003",
+            train_config={"train_serve_profile": "fp8_lora"},
+            lora_config={"lora_rank": 32, "max_lora_rank": 32},
+        )
+        response = asyncio.run(server.add_inference_endpoint(AddInferenceEndpointRequest(host="8.8.8.8", port=30000)))
+        assert response.success is False
+        assert "train_serve_profile='fp8_lora'" in response.message
+        assert "FP8-quantized base" in response.message
+        assert server.inference_endpoints == []
+
+        # A rank ceiling below the trainer's max_lora_rank is rejected.
+        server = APIServer(
+            engine_input_addr="tcp://127.0.0.1:17002",
+            engine_output_addr="tcp://127.0.0.1:17003",
+            train_config={"train_serve_profile": "lora"},
+            lora_config={"lora_rank": 32, "max_lora_rank": 128},
+        )
+        response = asyncio.run(server.add_inference_endpoint(AddInferenceEndpointRequest(host="8.8.8.8", port=30000)))
+        assert response.success is False
+        assert "max_lora_rank=64 < trainer max_lora_rank=128" in response.message
+
+        # Without a profile the same receiver is admitted unchanged (backward compat).
+        server = APIServer(
+            engine_input_addr="tcp://127.0.0.1:17002",
+            engine_output_addr="tcp://127.0.0.1:17003",
+        )
+        response = asyncio.run(server.add_inference_endpoint(AddInferenceEndpointRequest(host="8.8.8.8", port=30000)))
+        assert response.success is True, response.message
 
     def _assert_explicit_worker_port_is_checked(self, monkeypatch):
         calls: list[str] = []

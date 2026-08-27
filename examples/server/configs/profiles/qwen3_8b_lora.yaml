@@ -1,0 +1,51 @@
+# Qwen3-8B LoRA training via the train/serve alignment profile.
+#
+# train_serve_profile: lora derives enable_lora=true, unfuse_for_lora=true
+# (train the split projections serving applies adapters to) and
+# lora_alpha=32, and rejects contradictions (e.g. enable_qlora=true).
+# The paired receiver must serve an unquantized bf16 base with the LoRA
+# pool enabled and max_lora_rank >= the trainer rank; registration via
+# /add_inference_endpoint fails fast otherwise. Derive the launch flags:
+#   python -m xorl.server.train_serve_profile examples/server/configs/profiles/qwen3_8b_lora.yaml
+
+train_serve_profile: lora
+lora_rank: 32
+lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+# Model Configuration
+model_path: Qwen/Qwen3-8B
+tokenizer_path: Qwen/Qwen3-8B
+attn_implementation: flash_attention_3
+
+# Parallelism Configuration
+data_parallel_mode: fsdp2
+ulysses_parallel_size: 1
+data_parallel_replicate_size: 1
+data_parallel_shard_size: 4
+
+# Memory & Performance
+enable_mixed_precision: true
+enable_gradient_checkpointing: true
+enable_full_shard: true
+enable_activation_offload: false
+init_device: meta
+
+# Checkpointing
+output_dir: outputs/Qwen3-8B-server-profile-lora
+load_checkpoint_path: ""
+ckpt_manager: dcp
+
+# Logging
+log_level: INFO
+
+# Worker Configuration
+worker_connection_timeout: 60.0
+worker_max_retries: 3
+
+# Data Processing Configuration
+sample_packing_sequence_len: 128000
+enable_packing: true
+
+skip_initial_checkpoint: true
+# bi_fused = K3 lm-head contract CE (fp32-class, tp1, no z-loss)
+ce_mode: bi_fused

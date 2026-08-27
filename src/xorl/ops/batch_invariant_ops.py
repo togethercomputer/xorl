@@ -2021,6 +2021,15 @@ _TRUNK_LINEAR_NAMES = (
     # Qwen2/3.5-MoE shared-expert sigmoid gate: serving contracts it through the
     # global interpose (plain nn.Linear -> aten::mm), so the trunk lane must too.
     "shared_expert_gate",
+    # Qwen3.5 GDN projections: serving contracts these through the global
+    # interpose as well (exact Qwen3.5 interposes aten::mm for every linear).
+    # Left on cuBLAS they are row-count-dependent (split-K under ~3k rows on
+    # H100 at K=4096), which surfaced as a length-classed train/serve K3
+    # mismatch: replays longer than ~3072 tokens matched serving bitwise,
+    # shorter ones diverged at bf16 scale starting in layer 0's GDN gating.
+    "a_proj",
+    "b_proj",
+    "g_proj",
 )
 
 _TRUNK_LINEAR_CONTRACT_ACTIVE = False

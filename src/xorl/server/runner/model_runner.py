@@ -5850,6 +5850,25 @@ class ModelRunner:
                 raise ValueError(
                     f"per-row {row_name} cannot be combined with non-identity loss_fn_params.{scalar_name}"
                 )
+            # Validate host-side so malformed request metadata fails this
+            # request cleanly. The downstream torch._assert_async checks fire
+            # as CUDA device asserts, which poison the engine process (seen
+            # live with the serving wire's top_k=-1 "all" sentinel, which this
+            # replay surface deliberately does not accept: send TOP_K_ALL).
+            if row_name == "logprob_top_ks" and not bool((per_row >= 1).all().item()):
+                raise ValueError(
+                    "logprob_top_ks must contain integers >= 1; the serving "
+                    "sentinel -1 is not accepted here -- send TOP_K_ALL "
+                    "(1 << 30) for an unfiltered row"
+                )
+            if row_name == "logprob_top_ps" and not bool(
+                (torch.isfinite(per_row) & (per_row > 0.0) & (per_row <= 1.0)).all().item()
+            ):
+                raise ValueError("logprob_top_ps must contain finite values in (0, 1]")
+            if row_name == "logprob_min_ps" and not bool(
+                (torch.isfinite(per_row) & (per_row >= 0.0) & (per_row <= 1.0)).all().item()
+            ):
+                raise ValueError("logprob_min_ps must contain finite values in [0, 1]")
             resolved[scalar_name] = per_row
         return resolved
 

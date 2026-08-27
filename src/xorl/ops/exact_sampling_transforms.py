@@ -1,12 +1,31 @@
-"""The backend-independent sampling-transform program for exact RL lanes.
+"""The backend-independent sampling-transform program: XoRL's replay contract.
 
-Qwen, GLM, and DSV4 first apply their declared temperature dtype/store
-boundary, then call this module for one shared program: stable descending
-probability order (token ID breaks ties), joint top-k plus inclusive-crossing
-top-p plus min-p relative to the original row maximum, and normalization on
-exactly that support.  Serving performs per-row seeded Gumbel-max on the masked
-logits.  This is an exact-lane contract; it intentionally makes no claim about
-generic SGLang or FlashInfer filter semantics.
+This module is the single scoring program for behavior-policy replay of
+top-k/top-p/min-p-filtered rollouts.  Every lane consumes it — the exact
+value programs (Qwen, GLM, DSV4) after their declared temperature dtype/store
+boundary, ``ce_mode='bi_fused'``, and the generic modes (``eager``,
+``compiled``, ``quack_linear``, ``fused_quack``) through
+:mod:`xorl.ops.loss.sampling_transform_ce`.
+
+The pinned program (``EXACT_SAMPLING_TRANSFORM_PROGRAM``):
+
+1. temperature first, at the lane's declared dtype boundary;
+2. stable descending probability order — equal probabilities are ordered by
+   vocabulary index, so token ID breaks ties;
+3. joint top-k AND inclusive-crossing top-p (the first token that crosses the
+   threshold, via ``cumulative_probability_before <= top_p``, is kept) AND
+   min-p relative to the ORIGINAL unfiltered row maximum;
+4. ``top_p == 1.0`` is the exact mathematical identity and always yields full
+   support, even when the sorted FP32 cumulative sum overshoots 1.0
+   (``exact_sampling_identity_rows`` overrides the fixed-shape comparison);
+5. normalization on exactly that support; serving samples with per-row seeded
+   Gumbel-max on the masked logits.
+
+The tie-break rule, the inclusive crossing, and the min-p reference point are
+choices this program pins; stock SGLang/FlashInfer filter kernels do not
+guarantee them.  Exact replay therefore requires a sampler that implements
+THIS program; scoring rollouts produced by a stock filter is approximate at
+the tokens on the filter boundary.
 """
 
 from __future__ import annotations
@@ -15,6 +34,7 @@ import math
 from collections.abc import Callable
 
 import torch
+import torch.nn.functional as F
 
 
 TOP_K_ALL = 1 << 30
@@ -108,6 +128,172 @@ def normalize_exact_sampling_transforms(
     if bool(((top_ks >= TOP_K_ALL) & (top_ps == 1.0) & (min_ps == 0.0)).all().item()):
         return None, None, None
     return top_ks, top_ps, min_ps
+
+
+def validate_temperature_rows(
+    temperature: torch.Tensor | None,
+    *,
+    rows: int,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """Validate per-row FP32 temperature metadata; ``None`` passes through."""
+
+    if temperature is None:
+        return None
+    if temperature.dtype is not torch.float32:
+        raise TypeError(f"per-row logprob_temperature must be FP32, got {temperature.dtype}")
+    if temperature.device != device or tuple(temperature.shape) != (rows,):
+        raise ValueError(
+            "per-row logprob_temperature must be row-aligned on the scoring device, got "
+            f"shape={tuple(temperature.shape)} device={temperature.device}"
+        )
+    if not temperature.is_contiguous() or temperature.requires_grad:
+        raise ValueError("per-row logprob_temperature must be contiguous, non-differentiable sampling metadata")
+    if temperature.device.type != "meta":
+        torch._assert_async(
+            (torch.isfinite(temperature) & (temperature > 0)).all(),
+            "per-row logprob_temperature must contain finite values > 0",
+        )
+    return temperature
+
+
+def normalize_temperature_rows(
+    temperature: float | torch.Tensor,
+    *,
+    rows: int,
+    device: torch.device,
+) -> torch.Tensor | None:
+    """Return validated per-row FP32 temperature, or ``None`` for the identity.
+
+    A tensor is validated as-is; the scalar ``1.0`` collapses to ``None`` (the
+    explicit switch that keeps no-temperature kernels and bytes untouched);
+    any other scalar is broadcast to a per-row tensor.
+    """
+
+    if isinstance(temperature, torch.Tensor):
+        return validate_temperature_rows(temperature, rows=rows, device=device)
+    value = float(temperature)
+    if not math.isfinite(value) or value <= 0.0:
+        raise ValueError(f"logprob_temperature must be finite and > 0, got {value}")
+    if value == 1.0:
+        return None
+    return torch.full((rows,), value, dtype=torch.float32, device=device)
+
+
+def validate_sampling_transform_rows(
+    top_ks: torch.Tensor | None,
+    top_ps: torch.Tensor | None,
+    min_ps: torch.Tensor | None,
+    *,
+    rows: int,
+    device: torch.device,
+) -> SamplingTransformRows:
+    """Validate an all-or-none per-row transform triple; a None triple passes.
+
+    Row metadata that is present must be exactly row-aligned — silently
+    truncating an over-length tensor would score tokens against the wrong
+    row's filter.
+    """
+
+    none_count = (top_ks is None, top_ps is None, min_ps is None).count(True)
+    if none_count == 3:
+        return None, None, None
+    if none_count:
+        raise ValueError("sampling-transform replay requires all or none of top-k/top-p/min-p row metadata")
+    return (
+        _normalize_row_metadata(top_ks, rows=rows, device=device, dtype=torch.int64, name="logprob_top_ks"),
+        _normalize_row_metadata(top_ps, rows=rows, device=device, dtype=torch.float32, name="logprob_top_ps"),
+        _normalize_row_metadata(min_ps, rows=rows, device=device, dtype=torch.float32, name="logprob_min_ps"),
+    )
+
+
+def score_with_sampling_transforms(
+    logits: torch.Tensor,
+    token_ids: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    min_ps: torch.Tensor,
+    native_selected_score: NativeSelectedScore,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Score temperature-transformed logits under the pinned filter program.
+
+    Identity rows keep the lane's native (unfiltered) selected-score bytes;
+    filtered rows score on their exact joint support.
+    """
+
+    support = exact_sampling_support(logits, top_ks, top_ps, min_ps)
+    identity_rows = exact_sampling_identity_rows(
+        top_ks,
+        top_ps,
+        min_ps,
+        vocab_size=logits.shape[1],
+    )
+    return exact_selected_logprob_partitioned_from_support(
+        logits,
+        token_ids,
+        support,
+        identity_rows,
+        native_selected_score,
+    )
+
+
+def selected_logprob_reference_grad(
+    full_logits: torch.Tensor,
+    token_ids: torch.Tensor,
+    grad_logprob: torch.Tensor,
+    temperature: torch.Tensor | None,
+) -> torch.Tensor:
+    """Differentiate the FP32 selected log-softmax reference at the logits."""
+
+    with torch.enable_grad(), torch.autocast(device_type=full_logits.device.type, enabled=False):
+        logits = full_logits.float().detach().requires_grad_(True)
+        score_logits = logits if temperature is None else logits * (1.0 / temperature).unsqueeze(1)
+        selected = F.log_softmax(score_logits, dim=-1).gather(1, token_ids.unsqueeze(1)).squeeze(1)
+        (gradient,) = torch.autograd.grad(selected, logits, grad_outputs=grad_logprob.float())
+    return gradient.contiguous()
+
+
+def selected_logprob_reference_grad_filtered(
+    full_logits: torch.Tensor,
+    token_ids: torch.Tensor,
+    grad_logprob: torch.Tensor,
+    temperature: torch.Tensor | None,
+    support: torch.Tensor,
+) -> torch.Tensor:
+    """Differentiate over the exact support chosen by the value forward."""
+
+    with torch.enable_grad(), torch.autocast(device_type=full_logits.device.type, enabled=False):
+        logits = full_logits.float().detach().requires_grad_(True)
+        score_logits = logits if temperature is None else logits * (1.0 / temperature).unsqueeze(1)
+        selected, _, _ = exact_selected_logprob_from_support(score_logits, token_ids, support)
+        (gradient,) = torch.autograd.grad(selected, logits, grad_outputs=grad_logprob.float())
+    return gradient.contiguous()
+
+
+def selected_logprob_reference_grad_partitioned(
+    full_logits: torch.Tensor,
+    token_ids: torch.Tensor,
+    grad_logprob: torch.Tensor,
+    temperature: torch.Tensor | None,
+    support: torch.Tensor,
+    identity_rows: torch.Tensor,
+) -> torch.Tensor:
+    """Identity rows differentiate natively; filtered rows over their support."""
+
+    native_grad = selected_logprob_reference_grad(
+        full_logits,
+        token_ids,
+        grad_logprob,
+        temperature,
+    )
+    filtered_grad = selected_logprob_reference_grad_filtered(
+        full_logits,
+        token_ids,
+        grad_logprob,
+        temperature,
+        support,
+    )
+    return torch.where(identity_rows.unsqueeze(1), native_grad, filtered_grad).contiguous()
 
 
 def exact_sampling_support(
@@ -310,4 +496,11 @@ __all__ = [
     "exact_selected_logprob_partitioned_from_support",
     "exact_support_workspace_bytes",
     "normalize_exact_sampling_transforms",
+    "normalize_temperature_rows",
+    "score_with_sampling_transforms",
+    "selected_logprob_reference_grad",
+    "selected_logprob_reference_grad_filtered",
+    "selected_logprob_reference_grad_partitioned",
+    "validate_sampling_transform_rows",
+    "validate_temperature_rows",
 ]

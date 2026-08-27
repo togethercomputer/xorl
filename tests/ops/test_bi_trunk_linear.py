@@ -293,3 +293,17 @@ def test_global_interpose_allows_grad_free_inputs_in_grad_context():
     with set_batch_invariant_mode(True):
         out = x @ w
     assert torch.equal(out, matmul_persistent(x, w))
+
+
+@pytest.mark.cpu
+def test_trunk_names_cover_qwen35_gdn_projections():
+    """Serving's exact Qwen3.5 program interposes aten::mm for EVERY linear,
+    so the trainer's trunk contract must cover the GDN a/b/g projections too.
+    Left on cuBLAS they are row-count-dependent (split-K under ~3k rows on
+    H100 at K=4096), which produced a length-classed train/serve K3 mismatch
+    (Qwen3.5-9B replays <= 3072 tokens diverged from serving; longer replays
+    were bitwise-identical)."""
+    from xorl.ops.batch_invariant_ops import _TRUNK_LINEAR_NAMES
+
+    for name in ("a_proj", "b_proj", "g_proj"):
+        assert name in _TRUNK_LINEAR_NAMES
