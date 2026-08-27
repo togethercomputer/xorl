@@ -9,13 +9,13 @@ title: "Installation"
 - An NVIDIA driver compatible with the selected wheel profile
 - NVIDIA Hopper (H100/H800) or newer for Hopper-specific NVFP4, DeepEP, and tuned kernel paths
 
-XoRL pins a single dependency profile:
+XoRL ships a single combined dependency profile:
 
-| Profile | Manifest | PyTorch / CUDA runtime | Triton | Attention stack | Use it for |
-|---|---|---|---|---|---|
-| Default | `pyproject.toml` | 2.12.1 / CUDA 13.2 | 3.7.1 | FlashAttention 4 (`4.0.0b19`) | Local training and the XoRL training server |
+| Manifest | PyTorch / CUDA runtime | Triton | Attention stack | Use it for |
+|---|---|---|---|---|
+| `pyproject.toml` | 2.11.0 / CUDA 13 | 3.6.0 | FlashAttention 4 (`4.0.0b19`) | Local training, the XoRL training server, and the pinned xorl-sglang submodule, all in one environment |
 
-Use the pinned versions as they ship rather than upgrading or mixing Torch, Triton, or attention packages independently.
+The PyTorch 2.11 pins match the checked-in xorl-sglang package metadata, so its compiled `sglang-kernel` extension loads in the same environment. Do not upgrade or mix the pinned Torch, Triton, or attention packages independently.
 
 ## Clone the repo
 
@@ -39,15 +39,17 @@ uv sync
 source .venv/bin/activate
 ```
 
-`uv sync` reads `pyproject.toml` and installs all pinned dependencies into a `.venv` virtual environment.
+`uv sync` reads `pyproject.toml` and installs all pinned dependencies into a `.venv` virtual environment, resolving `sglang` to the checked-in `submodules/xorl-sglang` fork via `[tool.uv.sources]` — so the submodules must be checked out first.
 
 ## Install with conda
 
 ```bash
 conda create -n xorl python=3.12
 conda activate xorl
-pip install -e .
+pip install -e . -e "submodules/xorl-sglang/python[all]"
 ```
+
+The second editable install is required with pip/conda: pip does not read `[tool.uv.sources]`, so without it the `sglang[all]` dependency resolves to upstream SGLang on PyPI instead of the checked-in fork.
 
 ## Install submodules
 
@@ -64,16 +66,14 @@ The default XoRL dependency set already installs `xorl-client` from its public r
 pip install -e submodules/xorl-client
 ```
 
-Do not install xorl-sglang into the default PyTorch 2.12 environment. The submodule pins its own PyTorch 2.11 / CUDA 13 stack, so install it into a separate environment from the one built by `pyproject.toml`.
-
-> These submodules are only needed for **server training / online RL**. If you are only running local SFT or pretraining, you can skip this step.
-
+xorl-sglang installs into the same environment as XoRL: the default profile pins the PyTorch 2.11 stack its compiled `sglang-kernel` extension is built against, and the install steps above already include it (uv via `[tool.uv.sources]`, conda via the explicit editable install).
 
 ## Verify Installation
 
 ```bash
-python -c "import torch, triton, xorl; print(torch.__version__, triton.__version__, xorl.__version__)"
+python -c "import torch, triton, xorl, sglang; print(torch.__version__, triton.__version__, xorl.__version__)"
 python -c "from flash_attn.cute import flash_attn_func; print('FlashAttention 4 ok')"
+python -c "import sgl_kernel; print('sglang-kernel ok')"
 ```
 
 ## DeepEP Install (Optional)

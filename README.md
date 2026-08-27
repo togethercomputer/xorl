@@ -66,8 +66,10 @@ source .venv/bin/activate
 ```bash
 conda create -n xorl python=3.12
 conda activate xorl
-pip install -e .
+pip install -e . -e "submodules/xorl-sglang/python[all]"
 ```
+
+The second editable install is required with pip/conda: `pyproject.toml` depends on `sglang[all]`, and only uv resolves it to the checked-in `submodules/xorl-sglang` fork (via `[tool.uv.sources]`). Installing the submodule explicitly keeps pip from pulling upstream SGLang off PyPI.
 
 ### Submodules
 
@@ -82,15 +84,7 @@ The default install already includes `xorl-client` from its public repository. T
 pip install -e submodules/xorl-client
 ```
 
-Do not install the xorl-sglang submodule into the default PyTorch 2.12 environment. It pins PyTorch 2.11/CUDA 13 and Triton 3.6.0, so give it an environment separate from the default `.venv`:
-
-```bash
-conda create -n xorl-sglang python=3.12
-conda activate xorl-sglang
-pip install -e "submodules/xorl-sglang/python[all]"
-```
-
-> **Note:** The default profile uses PyTorch 2.12.1/CUDA 13.2 and Triton 3.7.1. Both profiles use FlashAttention 4.
+The default profile is a single combined environment: `pyproject.toml` pins the PyTorch 2.11/CUDA 13 stack (Triton 3.6.0, FlashAttention 4) that the checked-in xorl-sglang revision — including its compiled `sglang-kernel` extension — is built against, so XoRL, xorl-client, and xorl-sglang all install into the one `uv sync` environment. The xorl-sglang submodule must be checked out for the install to resolve.
 
 See the [installation guide](https://togethercomputer.github.io/xorl/getting-started/installation/) for full setup including optional dependencies (DeepEP, Flash Attention).
 

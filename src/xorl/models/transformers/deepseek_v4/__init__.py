@@ -5,11 +5,12 @@
 the global ``transformers.AutoConfig`` and ``AutoModelForCausalLM`` registries
 to map ``model_type="deepseek_v4"`` (the upstream HF Flash convention) to
 this package's ``DeepseekV4Config`` / ``DeepseekV4ForCausalLM``. The call is
-idempotent — re-imports trap the ``ValueError`` from a duplicate
-``AutoConfig.register``. The behavior can be opted out via
+idempotent — ``exist_ok=True`` makes re-imports a no-op and deliberately
+overrides the first-party ``deepseek_v4`` mapping that transformers ships
+since 5.4: XoRL's training stack depends on the vendored classes, not the
+upstream ones. The behavior can be opted out via
 ``XORL_DSV4_AUTOREGISTER=0`` for downstream consumers that import xorl
-solely to introspect classes and want the upstream registry untouched (or
-that want to defer to a future first-party ``transformers.DeepseekV4Config``).
+solely to introspect classes and want the upstream registry untouched.
 """
 
 import os
@@ -41,10 +42,14 @@ def _register_with_transformers() -> None:
     """Register DSv4 with ``transformers.AutoConfig`` / ``AutoModelForCausalLM``.
 
     The on-disk HF Flash ``config.json`` declares ``model_type =
-    "deepseek_v4"``, which transformers does not yet ship a class for.
-    Registering our vendored ``DeepseekV4Config`` + ``DeepseekV4ForCausalLM``
-    against that ``model_type`` makes ``AutoConfig.from_pretrained(snapshot)``
-    and ``AutoModelForCausalLM.from_pretrained(snapshot)`` work end-to-end.
+    "deepseek_v4"``. Registering our vendored ``DeepseekV4Config`` +
+    ``DeepseekV4ForCausalLM`` against that ``model_type`` makes
+    ``AutoConfig.from_pretrained(snapshot)`` and
+    ``AutoModelForCausalLM.from_pretrained(snapshot)`` resolve to the xorl
+    classes end-to-end. transformers ships its own ``deepseek_v4`` mapping
+    since 5.4, so the registration must override it (``exist_ok=True``):
+    silently deferring to the upstream class would hand the training stack a
+    config/model pair it was never validated against.
 
     ``DeepseekV4Config`` itself uses ``model_type = "xorl_deepseek_v4"``
     (an internal namespace to distinguish from any future upstream
@@ -55,17 +60,12 @@ def _register_with_transformers() -> None:
 
     upstream_model_type = "deepseek_v4"
 
-    # ``AutoConfig.register`` raises ``ValueError`` if the model_type is
-    # already registered — be idempotent so re-imports don't crash.
-    try:
-        AutoConfig.register(upstream_model_type, DeepseekV4Config)
-    except ValueError:
-        pass
-
-    try:
-        AutoModelForCausalLM.register(DeepseekV4Config, DeepseekV4ForCausalLM)
-    except ValueError:
-        pass
+    # ``exist_ok=True`` both keeps re-imports idempotent and overrides the
+    # first-party ``deepseek_v4`` mapping transformers ships since 5.4. A
+    # ``try/except ValueError`` here would silently lose that override and
+    # resolve snapshots to the upstream classes instead.
+    AutoConfig.register(upstream_model_type, DeepseekV4Config, exist_ok=True)
+    AutoModelForCausalLM.register(DeepseekV4Config, DeepseekV4ForCausalLM, exist_ok=True)
 
 
 if os.environ.get("XORL_DSV4_AUTOREGISTER", "1") != "0":

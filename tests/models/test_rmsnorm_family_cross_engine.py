@@ -19,6 +19,10 @@ sgl_bio = pytest.importorskip(
     "sglang.srt.batch_invariant_ops",
     reason="SGLang batch_invariant_ops not importable",
 )
+sgl_bio_v2 = pytest.importorskip(
+    "sglang.srt.batch_invariant_ops.bi_families_v2",
+    reason="SGLang bi_families_v2 not importable",
+)
 
 from xorl.models.layers.normalization import (  # noqa: E402
     RMS_NORM_FAMILY_NO_RESIDUAL,
@@ -55,24 +59,32 @@ def _xorl_module(hidden, family, weight):
 
 
 def test_rmsnorm_site_class_cross_engine_bitwise_policy():
-    """qk-norm / layer-0 input layernorm: xorl's parity-lane dispatch (native ->
-    aten::rms_norm interpose) must bit-match SGLang's residual-is-None dispatch
-    (family-1 ``rms_norm_batch_invariant``)."""
+    """qk-norm / layer-0 input layernorm: xorl's declared no-residual site
+    (``mode="sglang_fused"``) executes the v2 reduction tree and must bit-match
+    serving's v2 (``bi_families_v2.rms_norm_v2``) — the pinned SGLang revision
+    selects v2 structurally for exact-lane sites. The ``aten::rms_norm``
+    interpose remains the family-1 surface and must bit-match serving's
+    family-1 ``rms_norm_batch_invariant``."""
     for shape in SHAPES:
         x = _make(shape, 0)
         w = _make((shape[-1],), 300)
         norm = _xorl_module(shape[-1], RMS_NORM_FAMILY_NO_RESIDUAL, w)
         with set_batch_invariant_mode(True), torch.no_grad():
             xorl_out = norm(x)
-        serving_out = sgl_bio.rms_norm_batch_invariant(x, w, EPS)
-        assert torch.equal(xorl_out, serving_out), f"qk-norm {shape} diverged from serving family-1"
+        serving_v2 = sgl_bio_v2.rms_norm_v2(x, w, EPS)
+        assert torch.equal(xorl_out, serving_v2), f"qk-norm {shape} diverged from serving v2"
 
+        with set_batch_invariant_mode(True), torch.no_grad():
+            interpose_out = torch.nn.functional.rms_norm(x, (shape[-1],), w, EPS)
+        serving_out = sgl_bio.rms_norm_batch_invariant(x, w, EPS)
+        assert torch.equal(interpose_out, serving_out), f"qk-norm interpose {shape} diverged from serving family-1"
         serving_funnel = sgl_bio.bi_rms_norm(x, w, EPS, family=RMS_NORM_FAMILY_NO_RESIDUAL)
-        assert torch.equal(xorl_out, serving_funnel), f"qk-norm funnel {shape} diverged"
+        assert torch.equal(interpose_out, serving_funnel), f"qk-norm funnel {shape} diverged"
 
         if shape == SHAPES[0]:
             family2 = sgl_bio.rms_norm_residual_tree_batch_invariant(x, w, EPS)
             assert not torch.equal(serving_out, family2), "serving families agree on the seed shape; gate is vacuous"
+            assert not torch.equal(serving_v2, serving_out), "v1/v2 trees agree on the seed shape; gate is vacuous"
 
     _assert_presummed_residual_tree_site_class_bitwise()
     _assert_post_attention_residual_site_class_bitwise()
@@ -82,28 +94,30 @@ def test_rmsnorm_site_class_cross_engine_bitwise_policy():
 
 def _assert_presummed_residual_tree_site_class_bitwise():
     """Input layernorm at layer>0 / final norm: xorl normalizes the pre-summed
-    single tensor through the residual tree; SGLang fuses the add. On the same
-    summed value both must produce identical bits (gate via a zero residual and
-    via SGLang's single-tensor residual-tree kernel)."""
+    single tensor through the v2 reduction (the tree serving executes for
+    exact-lane sites); SGLang's family-2 v1 surfaces remain internally
+    consistent with each other."""
     for shape in SHAPES:
         x = _make(shape, 0)
         w = _make((shape[-1],), 300)
         norm = _xorl_module(shape[-1], RMS_NORM_FAMILY_RESIDUAL_TREE, w)
         with set_batch_invariant_mode(True), torch.no_grad():
             xorl_out = norm(x)
+        serving_v2 = sgl_bio_v2.rms_norm_v2(x, w, EPS)
+        assert torch.equal(xorl_out, serving_v2), f"pre-summed {shape} diverged from serving v2"
+
         serving_single = sgl_bio.rms_norm_residual_tree_batch_invariant(x, w, EPS)
         serving_fused, serving_residual = sgl_bio.fused_add_rms_norm_batch_invariant(x, torch.zeros_like(x), w, EPS)
         serving_funnel = sgl_bio.bi_rms_norm(x, w, EPS, family=RMS_NORM_FAMILY_RESIDUAL_TREE)
         assert torch.equal(serving_residual, x)
-        assert torch.equal(xorl_out, serving_single), f"pre-summed {shape} diverged from residual tree"
-        assert torch.equal(xorl_out, serving_fused), f"pre-summed {shape} diverged from fused-add tree"
-        assert torch.equal(xorl_out, serving_funnel), f"pre-summed funnel {shape} diverged"
+        assert torch.equal(serving_single, serving_fused), f"v1 single vs fused-add tree {shape} diverged"
+        assert torch.equal(serving_single, serving_funnel), f"v1 funnel {shape} diverged"
 
 
 def _assert_post_attention_residual_site_class_bitwise():
     """Post-attention layernorm: xorl's fused residual dispatch must bit-match
-    SGLang's fused residual dispatch, on both the normed output and the carried
-    residual stream."""
+    serving's v2 fused-residual tree, on both the normed output and the carried
+    residual stream; SGLang's v1 fused surfaces remain internally consistent."""
     for shape in SHAPES:
         x = _make(shape, 0)
         r = _make(shape, 1)
@@ -111,6 +125,10 @@ def _assert_post_attention_residual_site_class_bitwise():
         norm = _xorl_module(shape[-1], RMS_NORM_FAMILY_RESIDUAL_TREE, w)
         with set_batch_invariant_mode(True), torch.no_grad():
             xorl_out, xorl_residual = norm(x, residual=r, prenorm=True)
+        v2_out, v2_residual = sgl_bio_v2.rms_norm_v2(x, w, EPS, residual=r)
+        assert torch.equal(xorl_residual, v2_residual), f"residual carry {shape} diverged from serving v2"
+        assert torch.equal(xorl_out, v2_out), f"post-attention {shape} diverged from serving v2"
+
         serving_out, serving_residual = sgl_bio.fused_add_rms_norm_batch_invariant(x, r, w, EPS)
         funnel_out, funnel_residual = sgl_bio.bi_fused_add_rms_norm(
             x,
@@ -119,10 +137,9 @@ def _assert_post_attention_residual_site_class_bitwise():
             EPS,
             family=RMS_NORM_FAMILY_RESIDUAL_TREE,
         )
-        assert torch.equal(xorl_residual, serving_residual), f"residual carry {shape} diverged from serving"
-        assert torch.equal(xorl_out, serving_out), f"post-attention {shape} diverged from serving"
-        assert torch.equal(xorl_residual, funnel_residual), f"residual funnel carry {shape} diverged"
-        assert torch.equal(xorl_out, funnel_out), f"post-attention funnel {shape} diverged"
+        assert torch.equal(xorl_residual, serving_residual), f"residual carry {shape} diverged from v1 serving"
+        assert torch.equal(serving_out, funnel_out), f"v1 fused vs funnel {shape} diverged"
+        assert torch.equal(serving_residual, funnel_residual), f"v1 residual funnel carry {shape} diverged"
 
 
 def _assert_zero_centered_family1_twin_bitwise():

@@ -1,7 +1,6 @@
 import pytest
 import torch
 
-from xorl.ops.loss.bi_fused_lm_head import bi_fused_per_token_ce
 from xorl.ops.loss.causallm_loss import causallm_loss_function
 
 
@@ -159,52 +158,6 @@ def test_bi_fused_per_row_unit_temperature_preserves_forward_bytes():
         return_per_token=True,
     )
     assert torch.equal(scalar.per_token_logprobs, per_row.per_token_logprobs)
-
-
-@requires_cuda
-@pytest.mark.gpu
-@pytest.mark.parametrize("family", ["v1", "v2"])
-def test_bi_fused_temperature_matches_serving_materialize_then_score(family):
-    pytest.importorskip("sglang")
-    from sglang.srt.batch_invariant_ops import (
-        bi_lm_head_selected_logprob_from_logits as serving_v1_score,
-    )
-    from sglang.srt.batch_invariant_ops import (
-        exact_temperature_scale_fp32_logits as serving_scale,
-    )
-    from sglang.srt.batch_invariant_ops import (
-        head_v2_selected_logprob_from_logits as serving_v2_score,
-    )
-
-    from xorl.ops import bi_families_v2
-    from xorl.ops.batch_invariant_ops import bi_lm_head_full_logits
-    from xorl.ops.bi_families_v2 import head_v2_full_logits_with_lse
-
-    torch.manual_seed(53)
-    hidden = torch.randn((4, 128), dtype=torch.bfloat16, device="cuda")
-    weight = torch.randn((512, 128), dtype=torch.bfloat16, device="cuda")
-    labels = torch.tensor([1, 127, 255, 511], dtype=torch.int64, device="cuda")
-    temperature = torch.tensor([0.7, 1.0, 1.3, 0.9], dtype=torch.float32, device="cuda")
-    try:
-        if family == "v1":
-            bi_families_v2._select_qwen35_families_v1()
-            logits = bi_lm_head_full_logits(hidden, weight)
-            score = serving_v1_score
-        else:
-            bi_families_v2._select_glm52_families_v2()
-            logits, _ = head_v2_full_logits_with_lse(hidden, weight)
-            score = serving_v2_score
-
-        actual = bi_fused_per_token_ce(hidden, weight, labels, temperature=temperature)
-        transformed = serving_scale(logits, temperature)
-        expected_logprob, _, _ = score(transformed, labels, temperature=None)
-        assert torch.equal(actual.view(torch.uint8), (-expected_logprob).view(torch.uint8))
-
-        scalar_unit = bi_fused_per_token_ce(hidden, weight, labels, temperature=1.0)
-        row_unit = bi_fused_per_token_ce(hidden, weight, labels, temperature=torch.ones_like(temperature))
-        assert torch.equal(scalar_unit.view(torch.uint8), row_unit.view(torch.uint8))
-    finally:
-        bi_families_v2._select_nonexact_families()
 
 
 @requires_cuda

@@ -45,10 +45,10 @@ paths GLM-5 / DSv4 use, so merging it is safe for those models.
 ## 2. Install the tilelang dependency
 
 FlashQLA needs **both** the `tl_gemm` builtin (stock tilelang ≥0.1.10) **and**
-`prefer_instruction="tma"` (tile-ai/tilelang **PR #2303**, merged upstream but *post-`v0.1.10`*,
-so **not** in the PyPI `tilelang==0.1.10` wheel). We therefore pin a prebuilt wheel of stock
-upstream `tile-ai/tilelang@a8d93798` (includes #2303; no source fork) hosted on
-`togethercomputer/xorl-wheels`.
+`prefer_instruction="tma"` (tile-ai/tilelang **PR #2303**). PyPI `tilelang==0.1.11` is the
+first release carrying #2303, and `pyproject.toml` pins it (matching the pinned SGLang
+tree's own tilelang pin). The interim prebuilt `tilelang_0.1.10_cu131` wheel on
+`togethercomputer/xorl-wheels` is retired.
 
 Install the pinned project dependencies:
 
@@ -59,9 +59,7 @@ uv sync
 For an existing environment, the equivalent direct install is:
 
 ```bash
-uv pip install \
-  "tilelang @ https://github.com/togethercomputer/xorl-wheels/releases/download/tilelang_0.1.10_cu131/tilelang-0.1.10%2Bcu131.gita8d93798-cp38-abi3-linux_x86_64.whl" \
-  "apache-tvm-ffi>=0.1.10"
+uv pip install "tilelang==0.1.11" "apache-tvm-ffi==0.1.11" "z3-solver<4.16"
 ```
 
 Notes:

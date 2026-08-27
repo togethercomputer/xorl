@@ -39,6 +39,10 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           persist-credentials: false
+          # ``uv sync`` resolves sglang to the checked-in xorl-sglang submodule
+          # (see [tool.uv.sources] in pyproject.toml), so the submodule must be
+          # present before the install step.
+          submodules: true
 
       - uses: astral-sh/setup-uv@cec208311dfd045dd5311c1add060b2062131d57 # v8.0.0
         with:
@@ -50,9 +54,11 @@ jobs:
       # most of the cache's size, so warming without it would leave the shards
       # downloading the part that actually costs them.
       - name: Install dependencies
+        env:
+          SGLANG_BUILD_RUST_EXTS: none
         run: |
           uv sync --group test
-          uv pip install torch==2.12.1 torchvision==0.27.1 --index-url https://download.pytorch.org/whl/cpu --reinstall
+          uv pip install torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 "numpy<2.4" --index-url https://download.pytorch.org/whl/cpu --reinstall
 
   pre-commit:
     name: pre-commit

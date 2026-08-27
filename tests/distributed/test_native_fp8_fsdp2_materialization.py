@@ -58,7 +58,7 @@ class _NestedNativeModel(nn.Module):
 def _run_fsdp2_materialization_regression() -> None:
     # Base release only: this regression tracks torch's FSDP2/meta behaviour, not the
     # CUDA the wheel was built against, and the CPU test job installs the +cpu build.
-    assert torch.__version__.split("+")[0] == "2.12.1"
+    assert torch.__version__.split("+")[0] == "2.11.0"
     assert torch.__future__.get_swap_module_params_on_conversion() is False
     dist.init_process_group(backend="gloo")
     try:
