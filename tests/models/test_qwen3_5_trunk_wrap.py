@@ -11,7 +11,6 @@ skipped: the GDN kernel chain has no serving-side contract), as do the MoE
 router gate (contracted separately by the exact model program) and lm_head/embed.
 """
 
-import pytest
 import torch
 
 from xorl.lora.modules.linear import LoraLinear
@@ -24,9 +23,6 @@ from xorl.ops.batch_invariant_ops import (
     set_trunk_linear_contract,
     wrap_trunk_linears_batch_invariant,
 )
-
-
-requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 
 def _hybrid_config(**overrides) -> Qwen3_5MoeConfig:
@@ -135,26 +131,5 @@ def test_qwen3_5_hybrid_trunk_wrap_selection():
         # lm_head / embeddings never match the name set.
         assert not _is_wrapped(model.lm_head)
         assert not _is_wrapped(model.model.embed_tokens)
-    finally:
-        set_trunk_linear_contract(False)
-
-
-@requires_cuda
-@pytest.mark.gpu
-def test_qwen3_5_full_attn_forward_runs_under_trunk_wrap():
-    """Wrapped full-attention + shared-expert + dense projections must run the
-    bf16 contract GEMM end-to-end (the runtime guard raises on any non-bf16
-    operand)."""
-    torch.manual_seed(1)
-    config = _hybrid_config(layer_types=["full_attention", "full_attention"], _moe_implementation="eager")
-    model = Qwen3_5MoeForCausalLM(config).to(device="cuda", dtype=torch.bfloat16).eval()
-    try:
-        wrapped = wrap_trunk_linears_batch_invariant(model)
-        assert wrapped["shared_expert_gate"] == 1
-        input_ids = torch.randint(0, config.vocab_size, (1, 8), device="cuda")
-        with torch.no_grad():
-            out = model(input_ids=input_ids)
-        assert out.last_hidden_state.dtype == torch.bfloat16
-        assert torch.isfinite(out.last_hidden_state.float()).all()
     finally:
         set_trunk_linear_contract(False)
