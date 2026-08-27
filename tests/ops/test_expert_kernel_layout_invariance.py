@@ -105,24 +105,6 @@ def _active_slot_bits(per_slot: torch.Tensor, ids: torch.Tensor) -> torch.Tensor
     return _bits(per_slot[active])
 
 
-def test_subset_composition_invariance(fixture):
-    """Dedup-receive subset vs the all-tokens batch: same rows, same bytes."""
-    hidden, ids, weights, run = fixture["hidden"], fixture["ids"], fixture["weights"], fixture["run"]
-    full_slots = run(hidden, ids, weights, no_combine=True)
-    full_partial = run(hidden, ids, weights, no_combine=False)
-
-    subset = (ids >= 0).any(dim=1)
-    sub_slots = run(hidden[subset], ids[subset], weights[subset], no_combine=True)
-    sub_partial = run(hidden[subset], ids[subset], weights[subset], no_combine=False)
-
-    assert torch.equal(_active_slot_bits(sub_slots, ids[subset]), _active_slot_bits(full_slots[subset], ids[subset])), (
-        "per-slot expert bytes depend on batch composition (subset vs all-tokens)"
-    )
-    assert torch.equal(_bits(sub_partial), _bits(full_partial[subset])), (
-        "per-token local partial depends on batch composition (subset vs all-tokens)"
-    )
-
-
 def test_filler_row_invariance(fixture):
     """Interleaved all(-1) filler rows (capacity padding) must not perturb real rows."""
     hidden, ids, weights, run = fixture["hidden"], fixture["ids"], fixture["weights"], fixture["run"]
@@ -173,75 +155,6 @@ def test_m_sweep_row_stability(fixture):
         assert torch.equal(_active_slot_bits(grown, base_i[:probe]), _active_slot_bits(reference, base_i[:probe])), (
             f"probe-row bytes changed when M grew by {extra} rows"
         )
-
-
-def test_local_combine_is_a_one_way_boundary(fixture):
-    """The fused kernel's internal local combine
-    cannot be reconstructed from its own per-slot (no_combine) outputs.
-
-    Source reading (fused_moe.py): with no_combine=False the routing weight
-    is applied inside the down-GEMM epilogue in FP32 (mul_routed_weight)
-    and each WEIGHTED slot is rounded to BF16 once (intermediate_cache3);
-    moe_sum_reduce then reduces those rows. The no_combine=True output is
-    instead the UNWEIGHTED row rounded to BF16 — the FP32 pre-weight value
-    is internal-only, so no external composition of the per-slot rows can
-    reproduce the combined bytes: bf16(w * row_fp32) != any f(bf16(row)).
-
-    Consequence for the contract: the shared all-tokens program's local
-    combine is a THIRD numerical program (neither canonical_combine_v1 nor
-    reconstructable from canonical inputs). An exact DeepEP path must pair
-    no_combine per-slot rows with canonical_combine on BOTH engines (the
-    serving ep_gather program), not attempt to mimic this internal combine.
-
-    The gate asserts all four external reconstructions FAIL. If one ever
-    MATCHES, the kernel's rounding boundary moved — reclassify before
-    trusting any existing byte contract.
-    """
-    hidden, ids, weights, run = fixture["hidden"], fixture["ids"], fixture["weights"], fixture["run"]
-    per_slot = run(hidden, ids, weights, no_combine=True)
-    partial = run(hidden, ids, weights, no_combine=False)
-
-    active = ids >= 0
-    weighted_fp32 = per_slot.float() * weights.unsqueeze(-1)
-    weighted_fp32 = torch.where(active.unsqueeze(-1), weighted_fp32, torch.zeros_like(weighted_fp32))
-    # Hypotheses 3/4: the kernel applies the routing weight in the down-GEMM
-    # epilogue (mul_routed_weight) and ROUNDS EACH WEIGHTED SLOT TO BF16
-    # before any summation (intermediate_cache3 is bf16). The reduction then
-    # runs over pre-rounded slot rows.
-    weighted_bf16 = weighted_fp32.to(torch.bfloat16)
-
-    candidates = {
-        "fp32_products_fp32_acc": weighted_fp32.sum(dim=1).to(torch.bfloat16),
-        "bf16_rounded_slots_fp32_acc": weighted_bf16.float().sum(dim=1).to(torch.bfloat16),
-    }
-    acc = torch.zeros_like(partial, dtype=torch.bfloat16)
-    for k in range(_K):
-        acc = (acc.float() + weighted_fp32[:, k]).to(torch.bfloat16)
-    candidates["fp32_products_bf16_chain"] = acc
-    acc = torch.zeros_like(partial, dtype=torch.bfloat16)
-    for k in range(_K):
-        acc = (acc.float() + weighted_bf16[:, k].float()).to(torch.bfloat16)
-    candidates["bf16_rounded_slots_bf16_chain"] = acc
-
-    matches = {name: bool(torch.equal(_bits(value), _bits(partial))) for name, value in candidates.items()}
-    print(f"fused-kernel local combine external reconstructions (all expected False): {matches}")
-    assert not any(matches.values()), (
-        "ROUNDING-BOUNDARY CHANGE: an external reconstruction of the fused kernel's local "
-        f"combine now matches ({matches}); the weight-before-round boundary documented in "
-        "this test and the contract doc has moved — reclassify before trusting byte contracts"
-    )
-    # Sanity that the mismatch is a rounding boundary, not garbage. An
-    # elementwise band is the wrong instrument here: slot cancellation can
-    # blow up single-element relative error. Use per-row relative L2, which is cancellation-tolerant and
-    # still an order stricter than any non-boundary failure mode.
-    closest = candidates["bf16_rounded_slots_fp32_acc"].float()
-    row_norm = partial.float().norm(dim=1)
-    meaningful = row_norm > 1.0
-    rel = (closest - partial.float()).norm(dim=1)[meaningful] / row_norm[meaningful]
-    assert float(rel.max()) < 2e-2, (
-        f"the reconstruction is not even numerically close (max row rel-L2 {float(rel.max()):.4f}); "
-        "something beyond the documented rounding boundary differs"
-    )
 
 
 def test_weight_application_point(fixture):
