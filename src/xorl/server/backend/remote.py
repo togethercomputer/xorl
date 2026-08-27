@@ -414,7 +414,9 @@ class RemoteBackend(Backend):
                 materialize=materialize,
             ),
             request_id=request_id,
-            timeout=60.0,
+            # Rank-64 LoRA injection across a 35B-A3B MoE's expert banks takes
+            # well over a minute; match the other heavyweight operations.
+            timeout=600.0,
         )
 
     async def register_adapter(self, model_id="default", lr=1e-5, request_id=None):
