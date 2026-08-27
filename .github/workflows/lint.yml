@@ -5,7 +5,7 @@ name: Lint
 # known result. Use workflow_dispatch to run main on demand.
 on:
   pull_request:
-    branches: [main]
+    branches: [main, dev]
   workflow_dispatch:
 
 jobs:
