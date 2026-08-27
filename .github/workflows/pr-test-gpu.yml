@@ -5,7 +5,7 @@ name: GPU Tests
 # known result. Use workflow_dispatch to run main on demand.
 on:
   pull_request:
-    branches: [main]
+    branches: [main, dev]
     types: [opened, synchronize, reopened, ready_for_review]
   # Lets a maintainer run the suite on demand against main once a runner
   # exists.
