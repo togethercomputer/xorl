@@ -1461,6 +1461,11 @@ class RequestProcessor:
                     "p2p_rank_summaries": result.get("p2p_rank_summaries", []),
                     "endpoint_results": result.get("endpoint_results", []),
                     "execution_time": result.get("execution_time", 0.0),
+                    # Adapter-sync results (LoRA sessions): the API layer keys
+                    # endpoint-side /load_lora_adapter calls off these fields.
+                    "adapter_sync": result.get("adapter_sync", False),
+                    "adapter_path": result.get("adapter_path", ""),
+                    "model_id": result.get("model_id", ""),
                 }
             ]
 
