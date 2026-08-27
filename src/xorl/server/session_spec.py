@@ -110,13 +110,30 @@ def normalize_lora_runtime_config(
     lora_config = _normalize_lora_config_keys(raw_lora_config)
     server_lora_config = dict(server_lora_config or {})
 
-    for key in sorted(set(lora_config) - {"lora_rank", "lora_alpha"}):
+    # The tinker-style client SDK always includes ``dropout`` in its LoRA
+    # config payload. The server has no LoRA dropout, so 0.0 (the SDK
+    # default) is exactly the server behavior — accept it as a no-op and
+    # reject only a nonzero request.
+    dropout = lora_config.pop("dropout", None)
+    if dropout:
+        raise ValueError(f"LoRA dropout is not supported by the training server (requested dropout={dropout})")
+
+    for key in sorted(set(lora_config) - {"lora_rank", "lora_alpha", "frozen_module_patterns"}):
         server_value = server_lora_config.get(key)
         if lora_config[key] != server_value:
             raise ValueError(
-                "Per-session LoRA config may only override rank and alpha. "
+                "Per-session LoRA config may only override rank, alpha, and frozen_module_patterns. "
                 f"Unsupported override for {key!r}: {lora_config[key]!r} (server={server_value!r})."
             )
+
+    frozen_module_patterns = lora_config.get("frozen_module_patterns")
+    if frozen_module_patterns is not None:
+        if not isinstance(frozen_module_patterns, (list, tuple)) or not all(
+            isinstance(pattern, str) and pattern for pattern in frozen_module_patterns
+        ):
+            raise ValueError("frozen_module_patterns must be a list of non-empty strings")
+        # Sorted + deduped so equivalent sessions hash to identical specs.
+        frozen_module_patterns = sorted(set(frozen_module_patterns))
 
     lora_rank = int(lora_config.get("lora_rank", default_rank))
     lora_alpha = int(lora_config.get("lora_alpha", default_alpha))
@@ -131,10 +148,15 @@ def normalize_lora_runtime_config(
             "Increase server.max_lora_rank to support this session."
         )
 
-    return {
+    normalized: Dict[str, Any] = {
         "lora_rank": lora_rank,
         "lora_alpha": lora_alpha,
     }
+    # Omitted (or empty) keeps legacy session specs byte-identical, so
+    # existing checkpoints and adapter-generation hashes are unaffected.
+    if frozen_module_patterns:
+        normalized["frozen_module_patterns"] = list(frozen_module_patterns)
+    return normalized
 
 
 def normalize_optimizer_config(

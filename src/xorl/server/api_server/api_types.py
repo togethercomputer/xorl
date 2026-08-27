@@ -175,6 +175,10 @@ class LossFnOutput(BaseModel):
     loss: Optional[float] = Field(default=None, description="Loss value (for backward compatibility)")
     logprobs: Optional[TensorData] = Field(default=None, description="Per-token log probabilities")
     elementwise_loss: Optional[TensorData] = Field(default=None, description="Per-token cross entropy loss")
+    state_values: Optional[TensorData] = Field(
+        default=None,
+        description="Per-token value predictions V(s_t) from the value_loss / value_prediction loss functions",
+    )
     k3: Optional[float] = Field(default=None, description="Per-sample K3 KL divergence estimate")
     token_diagnostics: Optional[Dict[str, Any]] = Field(
         default=None,
@@ -217,6 +221,14 @@ class LoRAConfigRequest(BaseModel):
         default=None,
         validation_alias=AliasChoices("lora_alpha", "alpha"),
         description="LoRA alpha override. Accepts Tinker's alpha alias.",
+    )
+    frozen_module_patterns: Optional[List[str]] = Field(
+        default=None,
+        description=(
+            "Substring patterns of adapter modules this session must NOT train (e.g. "
+            "['q_proj', 'k_proj', 'v_proj', 'o_proj'] for a frozen-attention critic). Matching adapter "
+            "factors keep their zero-delta initialization and never receive gradient updates."
+        ),
     )
 
     @model_validator(mode="before")
@@ -262,6 +274,9 @@ class LoRARuntimeConfig(BaseModel):
 
     lora_rank: int = Field(..., description="LoRA rank")
     lora_alpha: int = Field(..., description="LoRA alpha")
+    frozen_module_patterns: Optional[List[str]] = Field(
+        default=None, description="Adapter-module substring patterns this session does not train"
+    )
 
 
 class OptimizerRuntimeConfig(BaseModel):

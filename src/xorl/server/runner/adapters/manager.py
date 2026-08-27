@@ -1197,6 +1197,36 @@ class LoRAAdapterManager:
     def _session_rank(session_spec: Dict[str, Any]) -> int:
         return int(session_spec["lora_config"]["lora_rank"])
 
+    def frozen_parameter_fqns(self, session_spec: Dict[str, Any]) -> frozenset:
+        """Adapter-factor FQNs this session must never train.
+
+        ``frozen_module_patterns`` are substring matches against the adapter
+        parameter names (e.g. ``"q_proj"`` freezes every attention query
+        factor for this session). Matching factors keep their zero-delta
+        initialization: they are skipped at gradient staging, declared
+        AUTHORIZED_ZERO in the ownership plan, and their optimizer moments
+        stay zero, so their per-session values never change.
+        """
+        patterns = tuple(session_spec.get("lora_config", {}).get("frozen_module_patterns") or ())
+        if not patterns:
+            return frozenset()
+        return frozenset(name for name in self._lora_param_names if any(pattern in name for pattern in patterns))
+
+    def _validate_frozen_module_patterns(self, session_spec: Dict[str, Any]) -> None:
+        patterns = tuple(session_spec.get("lora_config", {}).get("frozen_module_patterns") or ())
+        if not patterns:
+            return
+        unmatched = [pattern for pattern in patterns if not any(pattern in name for name in self._lora_param_names)]
+        if unmatched:
+            raise ValueError(
+                f"frozen_module_patterns {unmatched!r} match no adapter parameters; "
+                f"adapter parameter names look like: {self._lora_param_names[:6]!r}"
+            )
+        if len(self.frozen_parameter_fqns(session_spec)) == len(self._lora_param_names):
+            raise ValueError(
+                "frozen_module_patterns freeze every adapter parameter; the session would have nothing to train"
+            )
+
     @staticmethod
     def _session_alpha(session_spec: Dict[str, Any]) -> int:
         return int(session_spec["lora_config"]["lora_alpha"])
@@ -2218,6 +2248,7 @@ class LoRAAdapterManager:
 
         self._validate_exact_glm_session_contract(session_spec)
         self._validate_session_rank_against_model_capacity(session_spec)
+        self._validate_frozen_module_patterns(session_spec)
         session_rank = self._session_rank(session_spec)
         session_alpha = self._session_alpha(session_spec)
         optimizer_config = session_spec["optimizer_config"]
@@ -2591,10 +2622,17 @@ class LoRAAdapterManager:
             canonical_parameter_name(name): parameter for name, parameter in self.model.named_parameters()
         }
         layouts = {layout.fqn: layout for layout in state.tensor_layouts.values()}
+        frozen_fqns = self.frozen_parameter_fqns(state.session_spec)
         staged_fqns: list[str] = []
         staged_numerators: dict[str, torch.Tensor] = {}
         for item in plan.parameters:
             parameter = named_parameters[item.fqn]
+            if item.fqn in frozen_fqns:
+                # Session-frozen factor: the backward may have produced a
+                # gradient (the module sits in the graph), but this session
+                # never trains it. Skipping the stage leaves its numerator at
+                # zero, so the optimizer step is an exact no-op for it.
+                continue
             if parameter.grad is None:
                 if item.requires_local_gradient:
                     raise AdapterGradientOwnershipError(f"Required adapter gradient is absent for {item.fqn!r}")

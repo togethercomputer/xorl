@@ -324,7 +324,9 @@ class TrainingOpsMixin:
             # Sanitize NaN/Inf values for JSON serialization
             result = _sanitize_nan_to_zero(result)
 
-            loss_fn_outputs, loss_fn_output_type = self._build_loss_fn_outputs(result)
+            loss_fn_outputs, loss_fn_output_type = self._build_loss_fn_outputs(
+                result, loss_fn=request.forward_backward_input.loss_fn
+            )
 
             # Build metrics with tinker naming convention
             total_loss = result.get("loss", 0.0)
@@ -429,7 +431,9 @@ class TrainingOpsMixin:
             # Extract results (same format as forward_backward)
             result = _sanitize_nan_to_zero(output.outputs[0] if output.outputs else {})
 
-            loss_fn_outputs, loss_fn_output_type = self._build_loss_fn_outputs(result)
+            loss_fn_outputs, loss_fn_output_type = self._build_loss_fn_outputs(
+                result, loss_fn=request.forward_input.loss_fn
+            )
 
             total_loss = result.get("loss", 0.0)
             valid_tokens = result.get("valid_tokens", 1)

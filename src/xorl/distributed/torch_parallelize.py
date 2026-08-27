@@ -567,6 +567,10 @@ def parallelize_model_fsdp2(
     if exact_dsv4_lm_head and getattr(parallel_state, "lm_head_tp_size", 1) != 8:
         raise RuntimeError("The exact DSV4-Flash lm head requires lm_head_tensor_parallel_size=8")
     if lm_head_mod is not None and (fsdp_sharded_lm_head_loss or exact_dsv4_lm_head):
+        if getattr(model, "value_head", None) is not None:
+            raise NotImplementedError(
+                "enable_value_head is not supported with fsdp_sharded_lm_head_loss or the exact lm-head lanes"
+            )
         if parallel_state.tp_enabled:
             raise NotImplementedError("fsdp_sharded_lm_head_loss is not supported with tensor parallelism.")
         if not parallel_state.cp_enabled and not lm_head_tp:
@@ -627,6 +631,15 @@ def parallelize_model_fsdp2(
             last_fsdp_kwargs = dict(fsdp_kwargs)
             last_fsdp_kwargs["reshard_after_forward"] = False
             fully_shard(last_modules, **last_fsdp_kwargs)
+
+    # A scalar value head (critic) gets its own FSDP unit whose forward is
+    # never invoked: its parameters therefore remain sharded DTensors at all
+    # times (stable for adapter layout validation across forward-only ops),
+    # and the loss consumes the folded LoRA delta through the direct-DTensor
+    # lane (full_tensor of a Partial matmul), like direct lm-head factors.
+    value_head_mod = getattr(model, "value_head", None)
+    if value_head_mod is not None and not pp_enabled:
+        fully_shard(value_head_mod, **fsdp_kwargs)
 
     # shard root model
     # Collect all _skip_fsdp experts params so they're also ignored by the

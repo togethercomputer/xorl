@@ -87,6 +87,8 @@ from xorl.ops.loss import (
     opd_loss_function,
     opd_vocab_parallel_loss_function,
     policy_loss_function,
+    value_loss_function,
+    value_prediction_function,
 )
 from xorl.optim import build_optimizer
 from xorl.server.runner.adapters import LoRAAdapterManager
@@ -444,6 +446,33 @@ def _sp_allreduce_kl_metrics(
     return metrics
 
 
+class _SumGradAcrossRanks(torch.autograd.Function):
+    """Identity forward; all-reduce(SUM) the gradient over the given group.
+
+    Used for the directly-consumed value-head weight: every rank's local loss
+    share depends on the full replicated weight, but backward on a rank can
+    only produce that rank's contribution. Summing the upstream weight
+    gradient makes the sharded factor gradients complete, matching the
+    raw-sum loss contract (normalization happens once at optim_step).
+
+    The group must be exactly the ranks that hold shards of the head AND see
+    distinct data — the mesh the head is sharded on. Ranks OUTSIDE that mesh
+    (e.g. expert-parallel replicas with dp=1) compute identical full-batch
+    gradients that must NOT be summed.
+    """
+
+    @staticmethod
+    def forward(ctx, tensor: torch.Tensor, group) -> torch.Tensor:
+        ctx.group = group
+        return tensor
+
+    @staticmethod
+    def backward(ctx, grad: torch.Tensor):
+        grad = grad.contiguous()
+        dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=ctx.group)
+        return grad, None
+
+
 class ModelRunner:
     """
     ModelRunner handles model operations on distributed GPUs using xorl infrastructure.
@@ -520,6 +549,36 @@ class ModelRunner:
             "target_tokens",
             "logprobs",
             "advantages",
+            "_original_position_ids",
+            "rollout_logprobs",
+            "logprob_temperatures",
+            "logprob_top_ks",
+            "logprob_top_ps",
+            "logprob_min_ps",
+        },
+        "value_loss": {
+            "labels",
+            "target_tokens",
+            "weights",
+            "logprobs",
+            "advantages",
+            "returns",
+            "old_values",
+            "_original_position_ids",
+            "rollout_logprobs",
+            "logprob_temperatures",
+            "logprob_top_ks",
+            "logprob_top_ps",
+            "logprob_min_ps",
+        },
+        "value_prediction": {
+            "labels",
+            "target_tokens",
+            "weights",
+            "logprobs",
+            "advantages",
+            "returns",
+            "old_values",
             "_original_position_ids",
             "rollout_logprobs",
             "logprob_temperatures",
@@ -933,6 +992,14 @@ class ModelRunner:
             ),
             None,
         )
+        value_head = next(
+            (
+                candidate
+                for part in self._adapter_manager.model_parts
+                if (candidate := getattr(part, "value_head", None)) is not None
+            ),
+            None,
+        )
         direct_parameter_ids: set[int] = set()
         managed_fsdp_parameter_ids: set[int] = set()
         producer_by_parameter_id: dict[int, ProducerFamily] = {}
@@ -946,7 +1013,9 @@ class ModelRunner:
 
         def _walk_module_tree(module: nn.Module, *, inherited_fsdp: bool = False, direct: bool = False) -> None:
             managed_fsdp = inherited_fsdp or isinstance(module, FSDPModule)
-            direct = direct or module is lm_head
+            # The value head's weight, like lm_head's, is consumed directly by
+            # the loss instead of through the module's forward.
+            direct = direct or module is lm_head or (value_head is not None and module is value_head)
             selector = getattr(module, "adapter_gradient_producer_family", None)
             selected = selector() if callable(selector) else selector
             producer = None
@@ -1149,6 +1218,7 @@ class ModelRunner:
         output_group_size = len(local_group_memberships.get("output_projection_replica", (0,)))
         declarations: dict[str, ParameterOwnershipDeclaration] = {}
         guard_payloads: dict[str, dict[str, Any]] = {}
+        session_frozen_fqns = self._adapter_manager.frozen_parameter_fqns(state.session_spec)
         for name, layout in state.tensor_layouts.items():
             parameter = named_parameters[name]
             if id(parameter) in direct_parameter_ids:
@@ -1282,6 +1352,12 @@ class ModelRunner:
             guard_payload.update(expert_guard_by_parameter_id.get(id(parameter), {}))
             guard_payload.update(exact_lm_head_guard_by_parameter_id.get(id(parameter), {}))
             guard_payloads[name] = guard_payload
+            # Two classes of factors may legitimately lack a gradient: the
+            # value head during policy-loss steps, and factors the session
+            # explicitly froze via frozen_module_patterns. Everything else
+            # keeps the strict presence contract.
+            is_value_head_param = name.startswith("value_head.") or ".value_head." in name
+            authorized_zero = is_value_head_param or name in session_frozen_fqns
             declarations[name] = ParameterOwnershipDeclaration(
                 topology=topology,
                 producer=producer,
@@ -1289,7 +1365,9 @@ class ModelRunner:
                 completed_domains=tuple(completed),
                 capture_domains=tuple(capture),
                 pending_domains=tuple(pending),
-                presence=GradientPresencePolicy.REQUIRED_IF_ACTIVE,
+                presence=GradientPresencePolicy.AUTHORIZED_ZERO
+                if authorized_zero
+                else GradientPresencePolicy.REQUIRED_IF_ACTIVE,
                 config_guard_fingerprint=self._adapter_gradient_hash(guard_payload),
                 config_guard_fields=tuple(sorted(guard_payload.items())),
                 managed_fsdp_shard=id(parameter) in managed_fsdp_parameter_ids,
@@ -1551,6 +1629,17 @@ class ModelRunner:
         )
         construction_target_modules = None if block_fp8_qlora_training else target_modules
 
+        enable_value_head = bool(self.lora_config.get("enable_value_head", False))
+        if enable_value_head:
+            if not lora_enabled or enable_qlora:
+                raise ValueError("enable_value_head requires plain LoRA (enable_lora=true, enable_qlora=false)")
+            if target_modules is not None and "lm_head" in target_modules:
+                raise ValueError(
+                    "enable_value_head requires lm_head excluded from the LoRA targets "
+                    "(set train_unembed=false or pass explicit lora_target_modules): a value_loss backward "
+                    "produces no lm-head adapter gradients, which the gradient-ownership plan would reject"
+                )
+
         model_dtype = resolve_training_model_dtype(
             enable_lora=lora_enabled,
             enable_qlora=enable_qlora,
@@ -1587,6 +1676,7 @@ class ModelRunner:
             lora_target_manifest=self.lora_config.get("lora_target_manifest"),
             unfuse_for_lora=self.lora_config.get("unfuse_for_lora", False),
             moe_hybrid_shared_lora=self.lora_config.get("moe_hybrid_shared_lora", False),
+            enable_value_head=enable_value_head,
             enable_qlora=enable_qlora,
             block_fp8_qlora_training=block_fp8_qlora_training,
             quant_format=self.lora_config.get("quant_format", "nvfp4"),
@@ -1673,6 +1763,13 @@ class ModelRunner:
 
         self.model = result.model
         self.model_config_obj = result.model_config
+        value_head = getattr(self.model, "value_head", None)
+        if value_head is not None:
+            # The value head's frozen base weight is not part of any base-model
+            # checkpoint; whatever the load path materialized, the contract is
+            # an exactly-zero base so V(s) lives entirely in the LoRA factors.
+            with torch.no_grad():
+                value_head.weight.zero_()
         self._select_exact_dsv4_lora_export_format()
         if getattr(get_parallel_state(), "lm_head_tp_size", 1) > 1:
             sync_lm_head_tp_parameters(
@@ -2063,6 +2160,41 @@ class ModelRunner:
     def _get_effective_lm_head_weight(self):
         """Get lm_head weight, merging LoRA delta on-the-fly if needed."""
         return self._get_effective_lm_head_weight_for(self.model.lm_head)
+
+    def _get_effective_value_head_weight(self):
+        """Get the scalar value head's effective weight (its folded LoRA delta).
+
+        The value head has a zero, frozen base weight by contract, so the
+        effective weight IS the adapter delta ``B[:, :r] @ A[:r] * (alpha/r)``.
+        Its FSDP unit never runs a forward, so the factors are sharded
+        DTensors: the delta matmul contracts over the sharded rank dim into a
+        Partial placement, and ``full_tensor()`` materializes the replicated
+        weight while keeping autograd routed back into the sharded factors —
+        the direct-output-projection ownership lane completes those Partial
+        gradients at capture time.
+
+        Each rank's loss is a distinct share of the global raw-sum objective,
+        but both factor shards influence every rank's loss through the
+        replicated weight. A rank can only differentiate its own shard, so
+        the upstream weight gradient must be summed across ranks BEFORE it
+        reaches the factors (the FSDP post-backward hook does this for
+        module-managed adapters; direct consumption owns it here).
+        """
+        from torch.distributed.tensor import DTensor  # noqa: PLC0415
+
+        value_head = getattr(self.model, "value_head", None)
+        if value_head is None:
+            raise ValueError(
+                "value_loss/value_prediction require a value head; start the server with enable_value_head=true"
+            )
+        delta = value_head.get_delta_weight()
+        if isinstance(delta, DTensor):
+            mesh = delta.device_mesh
+            group = mesh.get_group() if mesh.ndim == 1 else mesh._flatten().get_group()
+            delta = delta.full_tensor()
+            if dist.is_available() and dist.is_initialized() and dist.get_world_size(group) > 1:
+                delta = _SumGradAcrossRanks.apply(delta, group)
+        return delta
 
     @staticmethod
     def _get_effective_lm_head_weight_for(lm_head):
@@ -6551,6 +6683,43 @@ class ModelRunner:
                     get_parallel_state().ulysses_group,
                     is_metric_ops,
                 )
+
+        elif loss_fn in {"value_loss", "value_prediction"}:
+            value_head_weight = self._get_effective_value_head_weight()
+            target_tokens = micro_batch.get("target_tokens", micro_batch.get("labels"))
+            if target_tokens is None:
+                raise ValueError(f"{loss_fn} requires target_tokens or labels for the valid-token mask")
+
+            if loss_fn == "value_loss":
+                returns = micro_batch.get("returns")
+                if returns is None:
+                    raise ValueError("value_loss requires per-token 'returns' in loss_fn_inputs")
+                _result = value_loss_function(
+                    hidden_states=hidden_states,
+                    weight=value_head_weight,
+                    labels=target_tokens,
+                    returns=returns,
+                    old_values=micro_batch.get("old_values"),
+                    clip_range=float(params.get("clip_range", 0.0)),
+                    vf_coef=float(params.get("vf_coef", 1.0)),
+                    loss_reducer=token_sum_reducer,
+                    metric_reducer=token_sum_reducer,
+                )
+            else:
+                _result = value_prediction_function(
+                    hidden_states=hidden_states,
+                    weight=value_head_weight,
+                    labels=target_tokens,
+                    metric_reducer=token_sum_reducer,
+                )
+            local_loss_sum = _result.loss
+            # Per-token values ride the generic per-token channel (the client
+            # reads them from loss_fn_outputs[i].logprobs).
+            per_token_outputs["logprobs"] = _result.per_token_logprobs
+            if return_per_token and _result.per_token_loss is not None:
+                per_token_outputs["loss"] = _result.per_token_loss
+            is_metrics = _result.metrics
+            is_metric_ops = _result.metric_ops
 
         elif loss_fn == "opd_loss":
             profile_loss_start = _profile_now() if profile_timings else 0.0

@@ -302,7 +302,13 @@ class TestOptimWeightsHealthAndSerialization:
         assert lora.lora_rank == 8
         assert lora.lora_alpha == 16
         assert lora.model_dump(exclude_none=True) == {"lora_rank": 8, "lora_alpha": 16}
-        assert set(LoRAConfigRequest.model_json_schema()["properties"]) == {"lora_rank", "lora_alpha"}
+        assert set(LoRAConfigRequest.model_json_schema()["properties"]) == {
+            "lora_rank",
+            "lora_alpha",
+            "frozen_module_patterns",
+        }
+        critic_lora = LoRAConfigRequest(rank=8, frozen_module_patterns=["q_proj", "k_proj"])
+        assert critic_lora.frozen_module_patterns == ["q_proj", "k_proj"]
 
         create_request = CreateModelRequest(
             model_id="session-a",

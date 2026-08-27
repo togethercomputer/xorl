@@ -279,20 +279,28 @@ class APIServer(TrainingOpsMixin, WeightsMixin, InferenceEndpointsMixin, HealthM
         return result
 
     @staticmethod
-    def _build_loss_fn_outputs(result: Dict[str, Any]):
-        """Build (loss_fn_outputs, loss_fn_output_type) from engine result."""
+    def _build_loss_fn_outputs(result: Dict[str, Any], loss_fn: Optional[str] = None):
+        """Build (loss_fn_outputs, loss_fn_output_type) from engine result.
+
+        The runner ships every per-token vector through one generic channel;
+        ``loss_fn`` names its semantics at the API boundary: for the value
+        losses the channel carries V(s_t) and is exposed as ``state_values``.
+        """
         per_sample_outputs = result.get("per_sample_outputs", [])
         per_sample_k3 = result.get("per_sample_k3", [])
+        value_output = loss_fn in {"value_loss", "value_prediction"}
 
         if per_sample_outputs:
             outputs = []
             for i, sample in enumerate(per_sample_outputs):
-                logprobs = sample.get("logprobs", [])
+                per_token = sample.get("logprobs", [])
                 elementwise_loss = sample.get("elementwise_loss", [])
                 k3_val = per_sample_k3[i] if i < len(per_sample_k3) else None
+                per_token_tensor = TensorData(data=per_token, dtype="float32", shape=[len(per_token)])
                 outputs.append(
                     LossFnOutput(
-                        logprobs=TensorData(data=logprobs, dtype="float32", shape=[len(logprobs)]),
+                        state_values=per_token_tensor if value_output else None,
+                        logprobs=None if value_output else per_token_tensor,
                         elementwise_loss=TensorData(
                             data=elementwise_loss, dtype="float32", shape=[len(elementwise_loss)]
                         ),
@@ -300,7 +308,7 @@ class APIServer(TrainingOpsMixin, WeightsMixin, InferenceEndpointsMixin, HealthM
                         token_diagnostics=sample.get("token_diagnostics"),
                     )
                 )
-            return outputs, "CrossEntropyLossReturn"
+            return outputs, "ValueOutput" if value_output else "CrossEntropyLossReturn"
 
         # When no per-sample outputs, but we have per_sample_k3, create one output per sample
         if per_sample_k3:

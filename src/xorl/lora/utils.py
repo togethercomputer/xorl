@@ -1118,6 +1118,7 @@ def save_lora_checkpoint(
     transpose_moe_lora_to_peft: bool = True,
     lora_export_format: str = "peft",
     preserve_lora_dtype: bool = False,
+    exclude_value_head: bool = False,
 ) -> str:
     """
     Save LoRA weights in PEFT-compatible format.
@@ -1150,6 +1151,10 @@ def save_lora_checkpoint(
         preserve_lora_dtype: Keep LoRA tensor dtypes in the safetensors file
             instead of exporting bf16 weights. Use this for training-resume
             checkpoints; keep the default bf16 export for inference adapters.
+        exclude_value_head: Drop ``value_head`` factors from the export. Use
+            for inference/sampler adapters — serving engines have no scalar
+            value head module and would reject the unknown target. Training
+            checkpoints must keep the factors so critic sessions resume.
 
     Returns:
         Path to saved checkpoint directory
@@ -1174,6 +1179,9 @@ def save_lora_checkpoint(
         lora_state_dict = get_lora_state_dict(model)
     else:
         lora_state_dict = slice_lora_state_dict_to_active_rank(model, lora_state_dict)
+
+    if exclude_value_head:
+        lora_state_dict = {key: value for key, value in lora_state_dict.items() if "value_head" not in key}
 
     if lora_export_format == "dsv4_expert_banks":
         from xorl.models.transformers.deepseek_v4.exact_contract import (  # noqa: PLC0415
