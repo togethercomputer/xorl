@@ -914,7 +914,11 @@ def build_foundation_model(
         and getattr(config, "model_type", None) == "qwen3"
         and "Qwen3ForCausalLM" in _get_architectures(config)
     )
-    if server_training and not qwen_exact_eligible and (qwen35_model_type or getattr(config, "model_type", None) == "qwen3"):
+    if (
+        server_training
+        and not qwen_exact_eligible
+        and (qwen35_model_type or getattr(config, "model_type", None) == "qwen3")
+    ):
         logger.info_rank0(
             "Qwen exact server-training contract disengaged: enable_qlora=True trains "
             "on a quantized base, which the bf16 exact value program does not admit; "
