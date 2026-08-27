@@ -4,3 +4,4 @@
 [submodule "submodules/xorl-sglang"]
 	path = submodules/xorl-sglang
 	url = https://github.com/togethercomputer/xorl-sglang
+	branch = dev
