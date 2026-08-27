@@ -179,24 +179,14 @@ POST /api/v1/set_sync_quantization
 
 Set `quantization` to `null` for BF16 transfer. Online quantization currently accepts the Slime/SGLang-compatible block-FP8 E4M3 format with FP32 inverse scales; unsupported INT4, AWQ, compressed-tensors, and fake-quant formats fail before transport starts. The receiver installs the transferred FP8 tensors and scale metadata rather than treating them as BF16 weights.
 
-## Sync with LoRA
+## LoRA
 
-For LoRA training, the sync publishes the **adapter**, never merged full weights:
-
-1. The engine exports the session's adapter in PEFT format
-   (`adapter_model.safetensors` + `adapter_config.json`) under
-   `<output_dir>/weight_sync_adapters/<model_id>/<weight_version>`.
-2. The API server loads it on every registered endpoint via SGLang's
-   `/load_lora_adapter` (endpoints must run `--enable-lora` with a
-   `--max-lora-rank` covering the substrate rank; registration rejects
-   endpoints that do not report LoRA support).
-3. Generation requests select the adapter by `model_id`.
-
-Merged-weight LoRA sync (`W_full = W_base + lora_B @ lora_A × scaling`
-broadcast as full weights) was removed: materializing the fold is infeasible
-at large-model scale (a 35B-A3B trainer OOMs with the base already resident),
-and it shipped full-model bytes for a ~100MB delta. Adapter transfers are
-orders of magnitude smaller and keep the sampler's base weights immutable.
+LoRA sessions do not use weight sync. Adapters are published to inference
+endpoints in PEFT format via SGLang's `/load_lora_adapter`, and endpoints for
+a LoRA training server must support LoRA (`--enable-lora`, with
+`--max-lora-rank` covering the substrate rank — registration rejects
+endpoints that do not). Weight sync's NCCL transport is dense full-weight
+only. See the [LoRA adapter docs](/adapters/lora/) for the publication flow.
 
 ## Sync with QLoRA
 
