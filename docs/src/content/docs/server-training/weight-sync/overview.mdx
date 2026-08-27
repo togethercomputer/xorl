@@ -181,11 +181,22 @@ Set `quantization` to `null` for BF16 transfer. Online quantization currently ac
 
 ## Sync with LoRA
 
-For LoRA training, the sync merges LoRA weights into the base model before broadcasting:
-- `W_full = W_base + lora_B @ lora_A × scaling`
-- The merged BF16 weight is sent to inference
+For LoRA training, the sync publishes the **adapter**, never merged full weights:
 
-The base weights on the training side are **not modified** — LoRA parameters remain separate for continued training.
+1. The engine exports the session's adapter in PEFT format
+   (`adapter_model.safetensors` + `adapter_config.json`) under
+   `<output_dir>/weight_sync_adapters/<model_id>/<weight_version>`.
+2. The API server loads it on every registered endpoint via SGLang's
+   `/load_lora_adapter` (endpoints must run `--enable-lora` with a
+   `--max-lora-rank` covering the substrate rank; registration rejects
+   endpoints that do not report LoRA support).
+3. Generation requests select the adapter by `model_id`.
+
+Merged-weight LoRA sync (`W_full = W_base + lora_B @ lora_A × scaling`
+broadcast as full weights) was removed: materializing the fold is infeasible
+at large-model scale (a 35B-A3B trainer OOMs with the base already resident),
+and it shipped full-model bytes for a ~100MB delta. Adapter transfers are
+orders of magnitude smaller and keep the sampler's base weights immutable.
 
 ## Sync with QLoRA
 
