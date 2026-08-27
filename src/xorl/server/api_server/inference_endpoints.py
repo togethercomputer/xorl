@@ -536,6 +536,13 @@ class InferenceEndpointsMixin:
             adapter_path = result.get("adapter_path", "")
             lora_name = result.get("model_id") or model_id or "default"
             try:
+                # Re-syncs publish UPDATED weights under the same name; the
+                # load helper treats "already loaded" as success, so a stale
+                # step-1 adapter would be served forever without this unload.
+                try:
+                    await self._unload_lora_on_inference_endpoints(lora_name)
+                except Exception:
+                    pass  # first sync: nothing to unload
                 await self._load_lora_on_inference_endpoints(lora_name, adapter_path)
             except HTTPException as exc:
                 return {
@@ -1069,6 +1076,10 @@ class InferenceEndpointsMixin:
                 # endpoint-side dynamic loads here (never merged collectives).
                 adapter_path = result.get("adapter_path", "")
                 lora_name = result.get("model_id") or request.model_id or "default"
+                try:
+                    await self._unload_lora_on_inference_endpoints(lora_name)
+                except Exception:
+                    pass  # first sync: nothing to unload
                 await self._load_lora_on_inference_endpoints(lora_name, adapter_path)
                 targeted = [ep for ep in self.inference_endpoints if request.pools is None or ep.pool in request.pools]
                 return SyncInferenceWeightsResponse(
