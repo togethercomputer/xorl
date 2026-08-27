@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import logging
 import socket
 from pathlib import Path
@@ -478,6 +479,7 @@ class InferenceEndpointsMixin:
         group_name: str,
         buffer_size_mb: int,
         quantization: dict | None = None,
+        model_id: str | None = None,
     ) -> Dict[str, Any]:
         """
         Internal method to sync weights to specific endpoints.
@@ -511,6 +513,7 @@ class InferenceEndpointsMixin:
                 buffer_size_mb=buffer_size_mb,
                 sync_method=self.sync_inference_method,
                 quantization=quantization,
+                model_id=model_id,
             ),
         )
 
@@ -525,6 +528,36 @@ class InferenceEndpointsMixin:
             return {"success": False, "message": f"Engine error: {output.error}"}
 
         result = output.outputs[0] if output.outputs else {}
+        if result.get("adapter_sync"):
+            # LoRA session: the engine exported a PEFT adapter instead of
+            # entering merged-weight collectives. Load it on every registered
+            # endpoint via SGLang's /load_lora_adapter (endpoints registered
+            # against a LoRA trainer are validated to support LoRA).
+            adapter_path = result.get("adapter_path", "")
+            lora_name = result.get("model_id") or model_id or "default"
+            try:
+                await self._load_lora_on_inference_endpoints(lora_name, adapter_path)
+            except HTTPException as exc:
+                return {
+                    "success": False,
+                    "message": f"adapter exported but endpoint load failed: {exc.detail}",
+                    "transfer_time": 0,
+                    "total_bytes": 0,
+                }
+            adapter_bytes = 0
+            try:
+                for root, _dirs, files in os.walk(adapter_path):
+                    adapter_bytes += sum(os.path.getsize(os.path.join(root, f)) for f in files)
+            except OSError:
+                pass
+            return {
+                "success": True,
+                "message": f"LoRA adapter '{lora_name}' loaded on all endpoints from {adapter_path}",
+                "transfer_time": result.get("transfer_time", 0),
+                "total_bytes": adapter_bytes,
+                "adapter_sync": True,
+                "adapter_path": adapter_path,
+            }
         return {
             "success": result.get("success", False),
             "message": result.get("message", ""),
@@ -719,6 +752,35 @@ class InferenceEndpointsMixin:
                         endpoint=None,
                     )
 
+        # LoRA trainers publish adapters, never merged weights: every inference
+        # endpoint must therefore support LoRA (SGLang --enable-lora) so it can
+        # apply /load_lora_adapter syncs. Reject non-LoRA endpoints up front
+        # instead of failing at the first weight sync.
+        if (self.server_lora_config or {}).get("enable_lora"):
+            endpoint_lora = getattr(server_info, "enable_lora", None) if server_info is not None else None
+            if endpoint_lora is not True:
+                return AddInferenceEndpointResponse(
+                    success=False,
+                    message=(
+                        "This training server runs LoRA sessions and syncs adapters via "
+                        "/load_lora_adapter; the endpoint does not report enable_lora=true. "
+                        "Relaunch the inference endpoint with --enable-lora (and a "
+                        "max-lora-rank covering the substrate rank)."
+                    ),
+                    endpoint=None,
+                )
+            max_rank = getattr(server_info, "max_lora_rank", None)
+            substrate_rank = (self.server_lora_config or {}).get("lora_rank")
+            if max_rank is not None and substrate_rank and int(max_rank) < int(substrate_rank):
+                return AddInferenceEndpointResponse(
+                    success=False,
+                    message=(
+                        f"Endpoint max_lora_rank={max_rank} is below the trainer's LoRA "
+                        f"substrate rank {substrate_rank}; raise --max-lora-rank."
+                    ),
+                    endpoint=None,
+                )
+
         # Determine world_size: use server_info.tp_size if available, else request.world_size
         world_size = request.world_size
         if server_info is not None and server_info.tp_size is not None and server_info.tp_size > 1:
@@ -769,6 +831,7 @@ class InferenceEndpointsMixin:
                         group_name=request.group_name,
                         buffer_size_mb=request.buffer_size_mb,
                         quantization=self._get_endpoint_quantization(),
+                        model_id=getattr(request, "model_id", None),
                     )
                     weights_synced = sync_result.get("success", False)
                     if weights_synced:
@@ -1000,6 +1063,24 @@ class InferenceEndpointsMixin:
 
             # Extract results
             result = output.outputs[0] if output.outputs else {}
+
+            if result.get("adapter_sync"):
+                # LoRA session: adapter exported by the engine; perform the
+                # endpoint-side dynamic loads here (never merged collectives).
+                adapter_path = result.get("adapter_path", "")
+                lora_name = result.get("model_id") or request.model_id or "default"
+                await self._load_lora_on_inference_endpoints(lora_name, adapter_path)
+                targeted = [ep for ep in self.inference_endpoints if request.pools is None or ep.pool in request.pools]
+                return SyncInferenceWeightsResponse(
+                    success=True,
+                    message=f"LoRA adapter '{lora_name}' loaded on {len(targeted)} endpoints from {adapter_path}",
+                    endpoints_synced=[
+                        EndpointSyncResult(host=ep.host, port=ep.port, success=True, message="adapter loaded")
+                        for ep in targeted
+                    ],
+                    transfer_time=float(result.get("transfer_time", 0) or 0),
+                    total_bytes=int(result.get("total_bytes", 0) or 0),
+                )
 
             # Build endpoint sync results
             endpoint_results = []

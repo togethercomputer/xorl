@@ -466,7 +466,22 @@ class WeightSyncHandler:
         except Exception as e:
             logger.debug("Rank %d: [WeightSync] failed to clear abort marker %s: %s", self.rank, abort_path, e)
 
-    def _prepare_lora_adapter_for_sync(self, model_id: Optional[str]) -> Optional[str]:
+    def _export_adapter_for_sync(
+        self, model_id: Optional[str], weight_version: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        """Export the session's LoRA adapter for endpoint-side dynamic loading.
+
+        LoRA weight sync publishes the ADAPTER, never merged full weights: the
+        old fold-and-broadcast path materialized ``W + (alpha/r) * B @ A`` on
+        the trainer, which is infeasible at large-model scale (a 35B-A3B
+        trainer OOMs in the fold with the base already resident) and forces
+        the sampler to receive full-model bytes for a ~100MB delta. Inference
+        endpoints are expected to support LoRA (SGLang ``--enable-lora``) and
+        load the exported PEFT adapter via ``/load_lora_adapter``; the API
+        layer performs those loads after this export returns.
+
+        Returns None for full-weight trainers (dense sync path unchanged).
+        """
         adapter_manager = getattr(self.trainer, "adapter_manager", None)
         if adapter_manager is None:
             return None
@@ -475,14 +490,14 @@ class WeightSyncHandler:
         if contains_dsv4_exact_active_lora_component(model):
             raise RuntimeError(
                 "DSV4-Flash exact active-LoRA requires complete factor-only adapter publication; "
-                "legacy merged full-weight synchronization is not admitted. Export all 948 factors "
+                "the PEFT adapter export does not cover dsv4_expert_banks. Export all 948 factors "
                 "as dsv4_expert_banks and load a fresh sampler adapter version."
             )
         if contains_glm52_exact_active_lora_component(model):
             raise RuntimeError(
                 "GLM-5.2 exact active-LoRA composites require a complete factor-only adapter synchronization "
-                "protocol, which this handler does not implement; legacy merged full-weight synchronization is "
-                "not admitted. Export all 1,700 factors and start a fresh sampler adapter lifecycle."
+                "protocol, which this handler does not implement. Export all 1,700 factors and start a "
+                "fresh sampler adapter lifecycle."
             )
 
         resolved_model_id = model_id or getattr(adapter_manager, "current_adapter_id", None) or "default"
@@ -492,13 +507,27 @@ class WeightSyncHandler:
                 raise KeyError(f"LoRA adapter for model_id={resolved_model_id!r} is not registered")
             register_adapter(resolved_model_id, lr=None)
 
-        adapter_manager.sync_weights_to_model(resolved_model_id)
+        train_config = getattr(self.trainer, "train_config", {}) or {}
+        base_dir = str(train_config.get("output_dir") or "outputs") if isinstance(train_config, dict) else "outputs"
+        version_token = _safe_abort_token(weight_version) if weight_version else "latest"
+        export_dir = os.path.join(base_dir, "weight_sync_adapters", resolved_model_id, version_token)
+
+        # Collective PEFT export (adapter_model.safetensors + adapter_config.json,
+        # the format SGLang's /load_lora_adapter consumes). All ranks participate.
+        self.trainer.save_lora_only(export_dir, model_id=resolved_model_id)
         logger.info(
-            "Rank %s: [WeightSync] Prepared LoRA adapter model_id=%s for merged weight extraction",
+            "Rank %s: [WeightSync] Exported LoRA adapter model_id=%s to %s for endpoint-side loading",
             self.rank,
             resolved_model_id,
+            export_dir,
         )
-        return resolved_model_id
+        return {
+            "success": True,
+            "adapter_sync": True,
+            "model_id": resolved_model_id,
+            "adapter_path": export_dir,
+            "message": f"adapter exported to {export_dir}; endpoints load via /load_lora_adapter",
+        }
 
     def _mark_sync_abort(self, abort_path: str, err: Exception) -> None:
         try:
@@ -804,11 +833,12 @@ class WeightSyncHandler:
         )
 
         try:
-            synced_model_id = self._prepare_lora_adapter_for_sync(model_id)
-            if synced_model_id is not None:
-                logger.info(
-                    "Rank %s: [WeightSync] Syncing merged LoRA weights for model_id=%s", self.rank, synced_model_id
-                )
+            adapter_export = self._export_adapter_for_sync(model_id, weight_version)
+            if adapter_export is not None:
+                # LoRA sessions never enter merged-weight collectives: the
+                # adapter is on disk and the API layer drives endpoint-side
+                # /load_lora_adapter calls. NCCL transport is dense-only.
+                return adapter_export
             if sparse_delta_paths:
                 if sync_method != "sparse_delta":
                     return {
