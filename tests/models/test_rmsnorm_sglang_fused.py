@@ -305,7 +305,7 @@ def _assert_fused_no_residual_backward_matches_autograd():
 
 
 # --------------------------------------------------------------------------- #
-# Trunk contract lane (XORL_BI_TRUNK_LINEAR): the no-residual dispatch (qk-norm)
+# Trunk contract lane: the no-residual dispatch (qk-norm)
 # must bit-match serving's family-1 batch-invariant kernel — which is the
 # aten::rms_norm interpose kernel, NOT the fused sglang residual tree (the two
 # disagree at 1 ulp on rare bf16 boundary values).

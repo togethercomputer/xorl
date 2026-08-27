@@ -18,13 +18,16 @@ gate.
 `bi_gemm_configs.py` contains the shared, shape-keyed table. Each entry keeps
 the dtype's pinned K tile, compares bitwise with the baseline configuration,
 and checks that an identical row keeps identical output bits across row-count
-buckets. Set `XORL_BI_GEMM_CONFIG_TABLE=0` to use the pinned baseline table.
-Launches that exceed a Triton version's shared-memory limit also fall back to
-that baseline.
+buckets. The table is the production configuration and is not user-selectable:
+the pinned baseline is retained only as an internal fallback for launches that
+exceed a Triton version's shared-memory limit.
 
 The optional Hopper DeepGEMM route is enabled only when its BF16 NN result has
-the same bits as the persistent kernel for the admitted shapes. It has a
-separate kill switch, `XORL_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM=0`.
+the same bits as the persistent kernel for the admitted shapes. It is gated in
+code by `_ENABLE_MM_DEEPGEMM` and a per-call `_deepgemm_ready()` capability
+check, not by a process variable. Exact-model activation always takes the
+admitted production route; an ambient variable cannot stand in for the bitwise
+comparison or select an order-variant fallback.
 
 ## Verification
 
@@ -36,9 +39,10 @@ pytest tests/models/test_batch_invariance_dense.py -v
 ```
 
 The first test locks the K tile, compares every tuned configuration with the
-baseline, repeats a row across M buckets, checks the DeepGEMM alternative when
-installed, and exercises both kill switches. The second test verifies the
-end-to-end batch-invariant operator surface.
+baseline, repeats a row across M buckets, exercises the wider-output store path
+including its baseline fallback, and checks the DeepGEMM alternative when
+installed. The second test verifies the end-to-end batch-invariant operator
+surface.
 
 This contract covers the forward values that enter token scoring. Training
 backward remains on the framework's ordinary differentiable path; enabling a

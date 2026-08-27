@@ -38,7 +38,7 @@ regression can make it fail. Candidate signals from automation are not evidence 
    python scripts/audit_tests.py --format json > /tmp/xorl-test-audit.json
    ```
 
-2. Review one subsystem at a time. Add the decision and evidence to `test_audit_decisions.json` before editing.
+2. Review one subsystem at a time. Record the decision and its evidence in the pull request before editing.
 3. For consolidation, map every removed assertion to its surviving behavioral test.
 4. Compare collection before and after, then run the affected surviving tests.
 5. Keep removal waves reviewable. Do not combine unrelated product changes with test cleanup.

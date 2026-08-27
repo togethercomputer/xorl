@@ -113,13 +113,7 @@ xorl-sglang is included as a git submodule under `submodules/xorl-sglang`. If yo
 pip install -e "submodules/xorl-sglang/python[all]"
 ```
 
-Or use `pyproject.sglang.toml` to install xorl, xorl-client, and xorl-sglang together with the pinned PyTorch 2.11/Transformers 5.12/FlashAttention 4 stack:
-
-```bash
-cp pyproject.sglang.toml pyproject.toml
-UV_PROJECT_ENVIRONMENT=.venv-sglang uv sync
-source .venv-sglang/bin/activate
-```
+Install it into an environment separate from the default `pyproject.toml` profile: the submodule pins PyTorch 2.11 / Transformers 5.12, which the default PyTorch 2.12 environment does not satisfy.
 
 See the [installation guide](/xorl/getting-started/installation/#install-submodules) for full details.
 

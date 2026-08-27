@@ -607,8 +607,8 @@ _INTERPOSE_GRAD_ERROR = (
     "The global interpose (XORL_BATCH_INVARIANT_MATMUL / enable_batch_invariant_mode) is "
     "inference/verification-only: the aten::rms_norm override records no autograd graph (q/k-norm "
     "gradients silently vanish) and the torch.bmm monkeypatch detaches the graph. For a training "
-    "forward on the batch-invariant contract use the module-scoped XORL_BI_TRUNK_LINEAR=1 lane "
-    "instead."
+    "forward on the batch-invariant contract use the module-scoped trunk-linear contract "
+    "(wrap_trunk_linears_batch_invariant) instead."
 )
 
 
@@ -2046,9 +2046,7 @@ class _BatchInvariantTrunkLinearFn(torch.autograd.Function):
     @staticmethod
     def forward(ctx, input, weight, bias):
         if input.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
-            raise RuntimeError(
-                f"XORL_BI_TRUNK_LINEAR contract is bf16-only; got input={input.dtype}, weight={weight.dtype}."
-            )
+            raise RuntimeError(f"Trunk-linear contract is bf16-only; got input={input.dtype}, weight={weight.dtype}.")
         ctx.save_for_backward(input, weight)
         ctx.has_bias = bias is not None
         x2d = input.reshape(-1, input.shape[-1])
@@ -2090,7 +2088,7 @@ def wrap_trunk_linears_batch_invariant(
     exactly ``torch.nn.Linear``. lm_head/embeddings never match the name set; routed MoE
     experts (FQN containing ``.experts.``) are skipped — they are contracted through the
     fused sglang expert path. LoRA/QLoRA-wrapped modules and FP8/TE/custom Linear
-    subclasses RAISE: silently skipping them would void the bitwise contract the flag
+    subclasses RAISE: silently skipping them would void the bitwise contract this lane
     promises. Idempotent (already-wrapped modules are left alone).
 
     Returns ``{leaf_name: wrapped_count}`` and arms the contract lane
@@ -2105,7 +2103,7 @@ def wrap_trunk_linears_batch_invariant(
 
     if is_batch_invariant_mode_enabled():
         raise RuntimeError(
-            "XORL_BI_TRUNK_LINEAR cannot be combined with the global batch-invariant interpose "
+            "The trunk-linear contract cannot be combined with the global batch-invariant interpose "
             "(XORL_BATCH_INVARIANT_MATMUL): the wrapped backward would silently ride the interposed "
             "aten::mm instead of cuBLAS. Pick one lane."
         )
@@ -2139,7 +2137,7 @@ def wrap_trunk_linears_batch_invariant(
             # through the folded weight, so the trunk contract composes.
             if module.weight.dtype not in (torch.bfloat16, torch.float32):
                 raise RuntimeError(
-                    f"XORL_BI_TRUNK_LINEAR: {module_name} weight is {module.weight.dtype}; the trunk "
+                    f"Trunk-linear contract: {module_name} weight is {module.weight.dtype}; the trunk "
                     "contract is bf16-only."
                 )
             if getattr(module, "_xorl_bi_trunk_wrapped", False):
@@ -2151,13 +2149,13 @@ def wrap_trunk_linears_batch_invariant(
             continue
         if isinstance(module, LoraModule):
             raise NotImplementedError(
-                f"XORL_BI_TRUNK_LINEAR: {module_name} is adapter-wrapped ({type(module).__qualname__}); "
+                f"Trunk-linear contract: {module_name} is adapter-wrapped ({type(module).__qualname__}); "
                 "the canonical merged-LoRA trunk contract composes only with a plain LoraLinear whose "
                 "model-owned exact_merged_forward property is true — enable it on that module or exclude the adapter."
             )
         if type(module) is not torch.nn.Linear:
             raise NotImplementedError(
-                f"XORL_BI_TRUNK_LINEAR: {module_name} is {type(module).__qualname__}, not a plain "
+                f"Trunk-linear contract: {module_name} is {type(module).__qualname__}, not a plain "
                 "nn.Linear; fp8/te/custom linears are outside the bf16 trunk contract."
             )
         if module.weight.dtype not in (torch.bfloat16, torch.float32):
@@ -2165,7 +2163,7 @@ def wrap_trunk_linears_batch_invariant(
             # casts it to bf16 before forward, and the runtime guard in
             # _BatchInvariantTrunkLinearFn enforces bf16 on the actual GEMM operands.
             raise RuntimeError(
-                f"XORL_BI_TRUNK_LINEAR: {module_name} weight is {module.weight.dtype}; the trunk contract is bf16-only."
+                f"Trunk-linear contract: {module_name} weight is {module.weight.dtype}; the trunk contract is bf16-only."
             )
         if getattr(module, "_xorl_bi_trunk_wrapped", False):
             already_wrapped += 1
@@ -2176,8 +2174,8 @@ def wrap_trunk_linears_batch_invariant(
 
     if not wrapped and not already_wrapped:
         raise RuntimeError(
-            "XORL_BI_TRUNK_LINEAR=1 matched no trunk linears; expected leaf names "
-            f"{sorted(names)} — wire the model's projections or drop the flag."
+            "Trunk-linear contract matched no trunk linears; expected leaf names "
+            f"{sorted(names)} — wire the model's projections or do not select the exact contract."
         )
     set_trunk_linear_contract(True)
     return wrapped

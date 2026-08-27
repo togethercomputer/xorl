@@ -550,8 +550,8 @@ def fast_zero_centered_batch_invariant_rms_norm(
     norm (qk-norm / layer-0 input norm) runs the same batch-invariant kernel the
     aten::rms_norm interpose serves, with ``1 + weight`` folded in fp32 exactly as
     :func:`native_zero_centered_rms_norm` does — so the trunk-contract lane
-    (``XORL_BI_TRUNK_LINEAR=1``) is bit-identical to the interpose lane without a
-    global interpose. Real gradients via the closed-form RMSNorm backward.
+    (see :func:`is_trunk_linear_contract_enabled`) is bit-identical to the interpose
+    lane without a global interpose. Real gradients via the closed-form RMSNorm backward.
     Falls back to the native path off CUDA."""
     if not hidden_states.is_cuda:
         return native_zero_centered_rms_norm(hidden_states, weight, variance_epsilon)

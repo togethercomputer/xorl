@@ -65,10 +65,6 @@ def _get_cuda_autotune_config():
     key=["N", "K"],
     **_AUTOTUNE_CACHE_KW,
 )
-# @pretuned(
-#     algo_key=algo_key_scaled(["total_M", "N", "K"], [5000, 1, 1], ["TRANSPOSE_A", "TRANSPOSE_B"]),
-#     fallback={"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP": 8},
-# )
 @triton.heuristics(
     values={
         "N_ALIGNED": lambda args: args["N"] % args["BLOCK_N"] == 0,
@@ -261,10 +257,6 @@ def group_gemm_same_nk(
     key=["M", "N"],
     **_AUTOTUNE_CACHE_KW,
 )
-# @pretuned(
-#     algo_key=algo_key_scaled(["M", "N", "total_K"], [1, 1, 5000], ["TRANSPOSE_A", "TRANSPOSE_B"]),
-#     fallback={"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32, "GROUP": 8},
-# )
 @triton.heuristics(
     values={
         "M_ALIGNED": lambda args: args["M"] % args["BLOCK_M"] == 0,
