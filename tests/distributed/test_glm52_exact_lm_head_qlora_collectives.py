@@ -6,9 +6,10 @@ import pytest
 import torch
 import torch.distributed as dist
 
+from xorl.models.transformers.exact_lm_head_shared import ExactLmHeadFunction
 from xorl.models.transformers.glm5.exact_lm_head_qlora import (
     _all_reduce_sum_fp32,
-    _Glm52ExactDistributedTP16LmHeadFunction,
+    _distributed_row_plan,
     _rank_order_vocab_all_gather,
     _require_equal_nonzero_row_count,
 )
@@ -85,13 +86,15 @@ def _run_collective_case() -> None:
         local_lora_B = torch.tensor([[0.75]], dtype=torch.float32, requires_grad=True)
         local_token_ids = torch.tensor([rank + 10], dtype=torch.int64)
         local_temperature = torch.tensor([0.7 + rank * 0.6], dtype=torch.float32)
-        local_logprob = _Glm52ExactDistributedTP16LmHeadFunction.apply(
+        local_logprob = ExactLmHeadFunction.apply(
             local_hidden,
             local_weight,
             lora_A,
             local_lora_B,
             local_token_ids,
             local_temperature,
+            (None, None, None),
+            _distributed_row_plan(local_hidden, group),
             _FakeDistributedComponent(),
         )
         torch.testing.assert_close(

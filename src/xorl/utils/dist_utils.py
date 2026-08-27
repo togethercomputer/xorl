@@ -24,6 +24,31 @@ def all_gather(tensor: "torch.Tensor", world_size: int) -> "torch.Tensor":
     return output_tensor.view(-1, *tensor.size()[1:])
 
 
+def gather_vocab_shards(
+    local_logits: "torch.Tensor",
+    *,
+    vocab_sizes: tuple[int, ...],
+    group: "ProcessGroup",
+) -> "torch.Tensor":
+    """Gather possibly ragged vocabulary shards in process-group rank order.
+
+    Shards are padded to the widest shard for one ``all_gather_into_tensor``
+    and reassembled as ``[rows, sum(vocab_sizes)]`` in rank order.
+    """
+
+    max_vocab = max(vocab_sizes)
+    padded = local_logits.new_zeros((local_logits.shape[0], max_vocab))
+    padded[:, : local_logits.shape[1]].copy_(local_logits)
+    world_size = dist.get_world_size(group)
+    gathered = local_logits.new_empty((world_size * local_logits.shape[0], max_vocab))
+    dist.all_gather_into_tensor(gathered, padded.contiguous(), group=group)
+    rank_major = gathered.view(world_size, local_logits.shape[0], max_vocab)
+    return torch.cat(
+        [rank_major[rank, :, :vocab_size] for rank, vocab_size in enumerate(vocab_sizes)],
+        dim=1,
+    ).contiguous()
+
+
 def all_reduce(
     data: Union[int, float, List[Union[int, float]], "torch.Tensor"],
     op: Literal["mean", "sum", "max", "min"] = "mean",

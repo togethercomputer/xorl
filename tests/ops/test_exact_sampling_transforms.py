@@ -14,8 +14,8 @@ from xorl.ops.exact_sampling_transforms import (
     exact_selected_logprob_chunked,
     exact_support_workspace_bytes,
     normalize_exact_sampling_transforms,
+    score_with_sampling_transforms,
 )
-from xorl.ops.loss.bi_fused_lm_head import _score_exact_sampling_rows
 
 
 def _rows(values):
@@ -112,7 +112,7 @@ def test_trainer_identity_score_and_vjp_are_batch_composition_invariant():
     native_grad = identity_logits.grad.detach().clone()
 
     mixed_logits = _rows([[3.0, 1.0, -2.0], [2.0, 0.0, -1.0]]).requires_grad_(True)
-    mixed_logprob, mixed_lse, _ = _score_exact_sampling_rows(
+    mixed_logprob, mixed_lse, _ = score_with_sampling_transforms(
         mixed_logits,
         torch.tensor([0, 0], dtype=torch.int64),
         torch.tensor([TOP_K_ALL, 1], dtype=torch.int64),
@@ -197,6 +197,8 @@ def test_chunked_selected_score_and_vjp_equal_direct_program():
 def test_filtered_exact_heads_do_not_save_dense_support_on_autograd_contexts():
     modules = [
         importlib.import_module("xorl.ops.loss.bi_fused_lm_head"),
+        importlib.import_module("xorl.ops.loss.sampling_transform_ce"),
+        importlib.import_module("xorl.models.transformers.exact_lm_head_shared"),
         importlib.import_module("xorl.models.transformers.glm5.exact_lm_head_qlora"),
         importlib.import_module("xorl.models.transformers.deepseek_v4.exact_lm_head"),
     ]
