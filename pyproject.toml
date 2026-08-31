@@ -145,6 +145,16 @@ where = ["src"]
 [tool.ruff]
 target-version = "py312"
 line-length = 120
+# Vendored trees and the byte-contract-gated serving copy are never linted or
+# formatted by first-party tooling (see src/xorl/ops/README.md).
+# force-exclude keeps this true even when paths are passed explicitly, which
+# is how pre-commit invokes ruff.
+force-exclude = true
+extend-exclude = [
+  "src/xorl/ops/quack",
+  "src/xorl/ops/linear_attention/flashqla",
+  "src/xorl/ops/bi_families_v2.py",
+]
 
 [tool.ruff.lint]
 ignore = ["C901", "E501", "E741", "W605", "C408"]
