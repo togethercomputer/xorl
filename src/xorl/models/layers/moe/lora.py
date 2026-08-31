@@ -235,6 +235,19 @@ class MoEExpertsLoRA(LoraModule, nn.Module):
         self._create_lora_params("up_proj", shared_exp, num_exp, r, hidden_dim, intermediate_size)
         self._create_lora_params("down_proj", num_exp, (1 if hybrid else num_exp), r, intermediate_size, hidden_dim)
 
+        # A post-EP construction creates per-expert factors at the LOCAL expert
+        # count.  Declare them already-local so ParallelPlan annotates instead
+        # of slicing them a second time — and, when ``num_local_experts == 1``,
+        # so the singleton expert axis is never misread as a shared replica.
+        if num_local_experts is not None and num_local_experts != num_experts:
+            self.num_local_experts = num_local_experts
+            self._ep_already_local_parameter_names = tuple(
+                name
+                for name, ownership in factor_ownership
+                if ownership is ExpertAdapterFactorOwnership.OWNER_SHARDED
+                and isinstance(getattr(self, name, None), nn.Parameter)
+            )
+
         # Scaling factor
         self.scaling = compute_lora_scaling(self.lora_alpha, self.r, self.use_rslora)
 
@@ -1060,6 +1073,16 @@ def inject_lora_into_experts(
             lora_experts.gate_proj.copy_(block.experts.gate_proj)
             lora_experts.up_proj.copy_(block.experts.up_proj)
         lora_experts.down_proj.copy_(block.experts.down_proj)
+
+    # The checkpoint load's EP pre-shrink records its slicing on the OWNER
+    # module; carry the record onto the replacement so EP application keeps
+    # treating the base weights as a verified no-op instead of slicing the
+    # already-local tensors a second time.
+    source_presliced = dict(getattr(block.experts, "_xorl_ep_load_presliced", None) or {})
+    if source_presliced:
+        if "gate_up_proj" not in source_presliced and "gate_proj" in source_presliced:
+            source_presliced["gate_up_proj"] = source_presliced["gate_proj"]
+        lora_experts._xorl_ep_load_presliced = source_presliced
 
     block.experts = lora_experts
 
