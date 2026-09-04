@@ -162,6 +162,46 @@ class KillSessionData:
 
 
 @dataclass
+class ZORLStartGenerationData:
+    """Payload for start_zorl_generation operations."""
+
+    model_id: str = "default"
+    num_pairs: Optional[int] = None
+    pair_seed_specs: Optional[List[Dict[str, Optional[int]]]] = None
+    materialization: Optional[Dict[str, Any]] = None
+    owner_url: Optional[str] = None
+
+
+@dataclass
+class ZORLApplyRewardsData:
+    """Payload for apply_zorl_rewards operations."""
+
+    model_id: str = "default"
+    generation_id: str = ""
+    candidate_rewards: List[Dict[str, Any]] = field(default_factory=list)
+    learning_rate: Optional[float] = None
+
+
+@dataclass
+class ZORLAbortGenerationData:
+    """Payload for abort_zorl_generation operations."""
+
+    model_id: str = "default"
+    generation_id: str = ""
+
+
+@dataclass
+class ZORLResetSessionData:
+    """Payload for reset_zorl_session operations."""
+
+    model_id: str = "default"
+    checkpoint_path: Optional[str] = None
+    a_seed: int = 0
+    a_init: str = "gaussian_jl"
+    zorl_seed: Optional[int] = None
+
+
+@dataclass
 class AbortData:
     """Payload for abort operations."""
 
@@ -192,6 +232,10 @@ OperationPayload = Union[
     RegisterSessionData,
     AdapterStateData,
     KillSessionData,
+    ZORLStartGenerationData,
+    ZORLApplyRewardsData,
+    ZORLAbortGenerationData,
+    ZORLResetSessionData,
     AbortData,
     EmptyData,
 ]
@@ -213,6 +257,10 @@ _PAYLOAD_TYPE_MAP: Dict[str, type] = {
     "save_adapter_state": AdapterStateData,
     "load_adapter_state": AdapterStateData,
     "kill_session": KillSessionData,
+    "start_zorl_generation": ZORLStartGenerationData,
+    "apply_zorl_rewards": ZORLApplyRewardsData,
+    "abort_zorl_generation": ZORLAbortGenerationData,
+    "reset_zorl_session": ZORLResetSessionData,
     "health_check": EmptyData,
     "sleep": EmptyData,
     "wake_up": EmptyData,

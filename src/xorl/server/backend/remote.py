@@ -26,6 +26,10 @@ from xorl.server.protocol.operations import (
     SaveLoraOnlyData,
     SaveStateData,
     SyncWeightsData,
+    ZORLAbortGenerationData,
+    ZORLApplyRewardsData,
+    ZORLResetSessionData,
+    ZORLStartGenerationData,
 )
 from xorl.server.protocol.orchestrator_runner import (
     RunnerAck,
@@ -465,6 +469,78 @@ class RemoteBackend(Backend):
             ),
             request_id=request_id,
             timeout=120.0,
+        )
+
+    async def start_zorl_generation(
+        self,
+        model_id="default",
+        num_pairs=None,
+        pair_seed_specs=None,
+        materialization=None,
+        owner_url=None,
+        request_id=None,
+    ):
+        return await self._execute(
+            "start_zorl_generation",
+            ZORLStartGenerationData(
+                model_id=model_id,
+                num_pairs=num_pairs,
+                pair_seed_specs=pair_seed_specs,
+                materialization=materialization,
+                owner_url=owner_url,
+            ),
+            request_id=request_id,
+            timeout=SAVE_STATE_TIMEOUT,
+        )
+
+    async def apply_zorl_rewards(
+        self,
+        model_id="default",
+        generation_id="",
+        candidate_rewards=None,
+        learning_rate=None,
+        request_id=None,
+    ):
+        return await self._execute(
+            "apply_zorl_rewards",
+            ZORLApplyRewardsData(
+                model_id=model_id,
+                generation_id=generation_id,
+                candidate_rewards=candidate_rewards or [],
+                learning_rate=learning_rate,
+            ),
+            request_id=request_id,
+            timeout=SAVE_STATE_TIMEOUT,
+        )
+
+    async def abort_zorl_generation(self, model_id="default", generation_id="", request_id=None):
+        return await self._execute(
+            "abort_zorl_generation",
+            ZORLAbortGenerationData(model_id=model_id, generation_id=generation_id),
+            request_id=request_id,
+            timeout=120.0,
+        )
+
+    async def reset_zorl_session(
+        self,
+        model_id="default",
+        checkpoint_path=None,
+        a_seed=0,
+        a_init="gaussian_jl",
+        zorl_seed=None,
+        request_id=None,
+    ):
+        return await self._execute(
+            "reset_zorl_session",
+            ZORLResetSessionData(
+                model_id=model_id,
+                checkpoint_path=checkpoint_path,
+                a_seed=int(a_seed),
+                a_init=a_init,
+                zorl_seed=zorl_seed,
+            ),
+            request_id=request_id,
+            timeout=LOAD_STATE_TIMEOUT,
         )
 
     async def health_check(self, request_id=None):

@@ -70,6 +70,10 @@ class OutputType(str, Enum):
     LOAD_ADAPTER_STATE = "load_adapter_state"
     GET_ADAPTER_INFO = "get_adapter_info"
     KILL_SESSION = "kill_session"
+    START_ZORL_GENERATION = "start_zorl_generation"
+    APPLY_ZORL_REWARDS = "apply_zorl_rewards"
+    ABORT_ZORL_GENERATION = "abort_zorl_generation"
+    RESET_ZORL_SESSION = "reset_zorl_session"
     ERROR = "error"
 
 

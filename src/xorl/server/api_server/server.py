@@ -170,6 +170,7 @@ class APIServer(TrainingOpsMixin, WeightsMixin, InferenceEndpointsMixin, HealthM
         # Maps model_id -> List of (lora_name, model_path) tuples for loaded adapters
         # Each model_id has its own set of tracked adapters to support parallel training runs
         self.loaded_sampling_loras: Dict[str, List[tuple]] = {}
+        self._sampling_loras_locks: Dict[str, asyncio.Lock] = {}
 
         # Maximum number of adapters per model_id for sampling. Default is intentionally
         # generous (was 3) because SGLang's /unload_lora_adapter has been observed to
@@ -209,6 +210,7 @@ class APIServer(TrainingOpsMixin, WeightsMixin, InferenceEndpointsMixin, HealthM
         base_model: str,
         raw_lora_config: Optional[Dict[str, Any]] = None,
         raw_optimizer_config: Optional[Dict[str, Any]] = None,
+        raw_zorl_config: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Build the normalized worker session spec for a create_model request."""
         server_lora_config = dict(self.lora_config or {})
@@ -218,6 +220,7 @@ class APIServer(TrainingOpsMixin, WeightsMixin, InferenceEndpointsMixin, HealthM
             base_model=base_model,
             raw_lora_config=raw_lora_config,
             raw_optimizer_config=raw_optimizer_config,
+            raw_zorl_config=raw_zorl_config,
             default_rank=default_rank,
             default_alpha=int(server_lora_config.get("lora_alpha", 16)),
             max_lora_rank=max_lora_rank,
@@ -227,6 +230,7 @@ class APIServer(TrainingOpsMixin, WeightsMixin, InferenceEndpointsMixin, HealthM
             default_optimizer_dtype=self.train_config.get("optimizer_dtype", "bf16"),
             default_optimizer_kwargs=self.train_config.get("optimizer_kwargs", {}),
             server_lora_config=server_lora_config,
+            default_zorl_config=(self.default_session_spec or {}).get("zorl_config"),
         )
 
     def validate_model_id(self, model_id: str) -> None:

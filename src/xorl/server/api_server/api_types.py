@@ -4,9 +4,10 @@ API Request/Response Types for REST API.
 Pydantic type definitions for FastAPI endpoints in the unified API server.
 """
 
+import math
 from typing import Any, Dict, List, Literal, Optional, Union
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_serializer, model_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, field_serializer, field_validator, model_validator
 
 from xorl.server.removed_config import reject_removed_configuration_fields
 
@@ -257,6 +258,44 @@ class OptimizerConfigRequest(BaseModel):
         return reject_removed_configuration_fields(data, context="optimizer_config")
 
 
+class ZORLConfigRequest(BaseModel):
+    """Per-session ZORL overrides accepted by create_model."""
+
+    model_config = ConfigDict(extra="allow")
+
+    enabled: Optional[bool] = Field(default=None, description="Enable ZORL for this session")
+    b_sigma: Optional[float] = Field(default=None, description="Perturbation scale applied to LoRA-B")
+    num_perturbation_pairs: Optional[int] = Field(
+        default=None,
+        description="Number of perturbation seeds per generation before antithetic expansion",
+    )
+    a_refresh_interval: Optional[int] = Field(
+        default=None,
+        description="Generations between fresh LoRA-A family refreshes (0 disables refresh)",
+    )
+    antithetic_sampling: Optional[bool] = Field(
+        default=None,
+        description="Whether each perturbation seed emits both positive and negative LoRA-B candidates",
+    )
+    a_init: Optional[Literal["gaussian_jl"]] = Field(
+        default=None,
+        description="Initialization scheme used for fresh LoRA-A families",
+    )
+    seed: Optional[int] = Field(default=None, description="Optional base RNG seed for family and perturbation planning")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_aliases(cls, data):
+        if isinstance(data, dict):
+            if "sigma" in data and "b_sigma" not in data:
+                data["b_sigma"] = data["sigma"]
+            if "refresh_interval" in data and "a_refresh_interval" not in data:
+                data["a_refresh_interval"] = data["refresh_interval"]
+            if "num_pairs" in data and "num_perturbation_pairs" not in data:
+                data["num_perturbation_pairs"] = data["num_pairs"]
+        return data
+
+
 class LoRARuntimeConfig(BaseModel):
     """Normalized LoRA runtime config returned by the API."""
 
@@ -274,6 +313,27 @@ class OptimizerRuntimeConfig(BaseModel):
     betas: Optional[List[float]] = Field(default=None, description="Adam-family beta coefficients")
     eps: Optional[float] = Field(default=None, description="Adam-family epsilon")
     optimizer_kwargs: Dict[str, Any] = Field(default_factory=dict, description="Optimizer-specific kwargs")
+
+
+class ZORLRuntimeConfig(BaseModel):
+    """Normalized ZORL runtime config returned by the API."""
+
+    enabled: bool = Field(default=True, description="Whether ZORL is enabled for the session")
+    b_sigma: float = Field(..., description="Perturbation scale applied to LoRA-B")
+    num_perturbation_pairs: int = Field(
+        ...,
+        description="Number of perturbation seeds per generation before antithetic expansion",
+    )
+    a_refresh_interval: int = Field(
+        ...,
+        description="Generations between fresh LoRA-A family refreshes (0 disables refresh)",
+    )
+    antithetic_sampling: bool = Field(
+        ...,
+        description="Whether each perturbation seed emits both positive and negative LoRA-B candidates",
+    )
+    a_init: Literal["gaussian_jl"] = Field(..., description="Initialization scheme used for fresh LoRA-A families")
+    seed: Optional[int] = Field(default=None, description="Optional base RNG seed for family and perturbation planning")
 
 
 # ============================================================================
@@ -360,6 +420,10 @@ class OptimStepRequest(BaseModel):
     )
     learning_rate: Optional[float] = Field(default=None, description="Optional per-step learning rate override")
     gradient_clip: Optional[float] = Field(default=None, description="Gradient clipping value")
+    sparse_delta_capture: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Optional trainer-side source sparse-delta capture config for this optimizer step.",
+    )
     adam_params: Optional[AdamParams] = Field(
         default=None,
         description="Legacy Tinker AdamW optimizer parameters. learning_rate/gradient_clip take precedence.",
@@ -425,6 +489,178 @@ class AbortGradientEpochResponse(BaseModel):
 # ============================================================================
 # Generation Operations
 # ============================================================================
+
+
+class ZORLGenerationMaterialization(BaseModel):
+    """Local candidate materialization policy for sharded ZORL populations."""
+
+    mode: Literal["all", "pair_shard", "pair_range", "specs", "none"] = Field(
+        default="all",
+        description=(
+            "Whether this worker exports every pair, modulo-assigned pairs, or a contiguous pair range. "
+            "'specs' (alias 'none') exports no candidate adapters; seed specs and one parent export are returned."
+        ),
+    )
+    shard_index: Optional[int] = Field(default=None, description="Shard index for pair_shard materialization")
+    num_shards: Optional[int] = Field(default=None, description="Total shards for pair_shard materialization")
+    pair_start: Optional[int] = Field(default=None, description="Inclusive pair index start for pair_range")
+    pair_end: Optional[int] = Field(default=None, description="Exclusive pair index end for pair_range")
+
+
+class ZORLPairSeedSpec(BaseModel):
+    """One persistent antithetic perturbation direction supplied by the caller."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    b_seed: int = Field(..., ge=0, description="LoRA-B noise seed shared by the antithetic pair")
+    a_seed: Optional[int] = Field(default=None, ge=0, description="LoRA-A noise seed required by fresh_ab")
+
+
+class ZORLStartGenerationRequest(BaseModel):
+    """API request for planning and exporting one ZORL generation."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    model_id: str = Field(default="default", description="Model identifier")
+    preload_sampling: bool = Field(default=False, description="Eagerly load candidates on registered samplers")
+    num_pairs: Optional[int] = Field(default=None, description="Per-generation global perturbation-pair override")
+    pair_seed_specs: Optional[List[ZORLPairSeedSpec]] = Field(
+        default=None,
+        description="Optional ordered persistent perturbation bank",
+    )
+    materialization: Optional[ZORLGenerationMaterialization] = Field(
+        default=None,
+        description="Optional local materialization policy for sharded population scoring",
+    )
+    owner_url: Optional[str] = Field(default=None, description="URL that owns locally materialized candidates")
+
+
+class ZORLCandidateInfo(BaseModel):
+    """Metadata for one ZORL candidate."""
+
+    candidate_id: str
+    perturbation_index: int
+    direction: Literal["positive", "negative"]
+    model_path: Optional[str] = None
+    lora_name: str
+    owner_url: Optional[str] = None
+    b_seed: Optional[int] = None
+    a_seed: Optional[int] = None
+    b_sigma: Optional[float] = None
+    perturbation_mode: Optional[str] = None
+    rank: Optional[int] = None
+
+
+class ZORLStartGenerationResponse(BaseModel):
+    """API response for starting a ZORL generation."""
+
+    model_id: str
+    generation_id: str
+    generation_index: int
+    family_id: str
+    family_refreshed: bool
+    b_sigma: float
+    num_pairs: int
+    global_num_pairs: Optional[int] = None
+    global_population: Optional[int] = None
+    shard_index: Optional[int] = None
+    num_shards: Optional[int] = None
+    local_num_pairs: Optional[int] = None
+    sampling_ready: bool = False
+    perturbation_mode: Optional[str] = None
+    lora_rank: Optional[int] = None
+    parent_path: Optional[str] = None
+    candidates: List[ZORLCandidateInfo]
+
+
+class ZORLCandidateReward(BaseModel):
+    """Aggregated reward signal for one ZORL candidate."""
+
+    candidate_id: str
+    reward_mean: float
+    num_rollouts: Optional[int] = None
+    zorl_score_normalization: Optional[Literal["standard", "none"]] = None
+
+    @field_validator("reward_mean")
+    @classmethod
+    def _reward_mean_must_be_finite(cls, value: float) -> float:
+        if not math.isfinite(value):
+            raise ValueError(f"reward_mean must be finite, got {value!r}")
+        return value
+
+
+class ZORLApplyRewardsRequest(BaseModel):
+    """API request for applying externally aggregated ZORL rewards."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    model_id: str = "default"
+    generation_id: str
+    learning_rate: Optional[float] = None
+    candidate_rewards: List[ZORLCandidateReward] = Field(default_factory=list)
+    sync_after_apply: bool = False
+    sync_quantization: Optional[Union[str, Dict[str, Any]]] = None
+
+
+class ZORLApplyRewardsResponse(BaseModel):
+    """API response for applying a ZORL update."""
+
+    model_id: str
+    generation_id: str
+    applied: bool
+    used_pairs: int
+    dropped_pairs: int
+    family_id: str
+    next_generation_index: int
+    deleted_candidates: int = 0
+    metrics: Dict[str, Any]
+    sync: Optional[Dict[str, Any]] = None
+
+
+class ZORLAbortGenerationRequest(BaseModel):
+    """Abort an active generation without changing the parent."""
+
+    model_config = ConfigDict(extra="ignore")
+    model_id: str = "default"
+    generation_id: str
+
+
+class ZORLAbortGenerationResponse(BaseModel):
+    success: bool
+    model_id: str
+    generation_id: str
+    deleted_candidates: int = 0
+
+
+class ZORLResetSessionRequest(BaseModel):
+    """Restore the configured base and reset one ZORL session."""
+
+    model_config = ConfigDict(extra="ignore")
+    model_id: str = "default"
+    checkpoint_path: Optional[str] = None
+    a_seed: int
+    a_init: Literal["gaussian_jl"] = "gaussian_jl"
+    zorl_seed: Optional[int] = None
+    sync_after_reset: bool = True
+    sync_quantization: Optional[Union[str, Dict[str, Any]]] = None
+
+
+class ZORLResetSessionResponse(BaseModel):
+    success: bool
+    model_id: str
+    checkpoint_path: str
+    restore_time: float
+    a_init: str
+    a_seed: int
+    zorl_seed: Optional[int] = None
+    family_id: str
+    generation: int
+    reset_sync_index: int
+    fold_optimizer_cleared: bool
+    adapter_optimizer_rebuilt: bool
+    master_dtype: str
+    fingerprint: Dict[str, Any]
+    sync: Optional[Dict[str, Any]] = None
 
 
 # ============================================================================
@@ -517,6 +753,9 @@ class WeightsInfoResponse(BaseModel):
     optimizer_config: Optional[OptimizerRuntimeConfig] = Field(
         default=None, description="Normalized optimizer runtime config for LoRA checkpoints"
     )
+    zorl_config: Optional[ZORLRuntimeConfig] = Field(
+        default=None, description="Normalized ZORL runtime config for ZORL-enabled LoRA checkpoints"
+    )
 
     @model_validator(mode="after")
     def _mirror_lora_rank(self):
@@ -537,6 +776,7 @@ class CreateModelRequest(BaseModel):
     optimizer_config: Optional[OptimizerConfigRequest] = Field(
         default=None, description="Per-session optimizer configuration"
     )
+    zorl_config: Optional[ZORLConfigRequest] = Field(default=None, description="Per-session ZORL configuration")
 
     @model_validator(mode="before")
     @classmethod
@@ -886,6 +1126,21 @@ class InferenceEndpointServerInfo(BaseModel):
     radix_cache_enabled: Optional[bool] = Field(
         default=None,
         description="Whether the endpoint serves with the radix prefix cache enabled (derived from disable_radix_cache)",
+    )
+    speculative_algorithm: Optional[str] = Field(
+        default=None, description="Speculative decoding algorithm reported by the inference server"
+    )
+    speculative_num_steps: Optional[int] = Field(
+        default=None, description="Speculative decoding steps reported by the inference server"
+    )
+    speculative_num_draft_tokens: Optional[int] = Field(
+        default=None, description="Speculative draft-token count reported by the inference server"
+    )
+    speculative_decoding_active: Optional[bool] = Field(
+        default=None,
+        description=(
+            "Whether speculative decoding is active, or None when the endpoint did not report enough runtime state"
+        ),
     )
     enable_lora: Optional[bool] = Field(default=None, description="Whether LoRA is enabled")
     max_lora_rank: Optional[int] = Field(default=None, description="Maximum LoRA rank supported")
@@ -1272,6 +1527,7 @@ FutureRetrieveResponse = Union[
     LoadWeightsResponse,
     SaveWeightsForSamplerResponse,
     CreateModelResponse,
+    ZORLResetSessionResponse,
     UnloadModelResponse,
     RequestFailedResponse,
 ]

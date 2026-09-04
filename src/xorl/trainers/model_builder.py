@@ -67,6 +67,7 @@ def resolve_training_model_dtype(
     enable_qlora: bool,
     enable_mixed_precision: bool,
     skip_param_upcast: bool = False,
+    force_fp32_master: bool = False,
 ) -> str:
     """Return the foundation-model dtype for the requested training mode.
 
@@ -75,6 +76,8 @@ def resolve_training_model_dtype(
     full-weight runs keep checkpoint-native bf16 weights and only LoRA/QLoRA
     upcasts trainable adapter weights to fp32.
     """
+    if force_fp32_master:
+        return "float32"
     if (enable_lora or enable_qlora or skip_param_upcast) and enable_mixed_precision:
         return "bfloat16"
     if enable_mixed_precision:
@@ -87,8 +90,11 @@ def should_skip_generic_param_upcast(
     enable_lora: bool,
     enable_qlora: bool,
     skip_param_upcast: bool = False,
+    force_fp32_master: bool = False,
 ) -> bool:
     """Whether the generic full-model fp32 upcast should be skipped."""
+    if force_fp32_master:
+        return False
     return enable_lora or enable_qlora or skip_param_upcast
 
 
@@ -251,6 +257,7 @@ def build_training_model(
     fsdp_sharded_lm_head_loss: bool = False,
     fsdp_reduce_dtype: str = "fp32",
     skip_param_upcast: bool = False,
+    force_fp32_master: bool = False,
     enable_fp8_training: bool = False,
     enable_qarl: bool = False,
     glm52_fullparam_fp8_training: bool = False,
@@ -698,6 +705,7 @@ def build_training_model(
             enable_lora=enable_lora,
             enable_qlora=enable_qlora,
             skip_param_upcast=skip_param_upcast,
+            force_fp32_master=force_fp32_master,
         ),
     )
 

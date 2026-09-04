@@ -1287,6 +1287,31 @@ class CheckpointManager:
         logger.info(f"Checkpoint loaded from {checkpoint_path}")
         return result
 
+    def restore_base_state(self, checkpoint_path: str) -> Dict[str, Any]:
+        """Restore the full base model from DCP while retaining live adapter objects."""
+        if not checkpoint_path or not os.path.isdir(checkpoint_path):
+            raise FileNotFoundError(f"Base DCP checkpoint does not exist: {checkpoint_path}")
+
+        start_time = time.time()
+        state = self._build_dcp_load_state(checkpoint_path, load_optimizer=False)
+        self.Checkpointer.load(checkpoint_path, state)
+        self._assert_no_model_meta_tensors(stage="post_zorl_base_restore")
+        if dist.is_available() and dist.is_initialized():
+            dist.barrier()
+        del state
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        result = {
+            "checkpoint_path": checkpoint_path,
+            "load_time": time.time() - start_time,
+            "success": True,
+            "base_only": True,
+        }
+        logger.info("Restored ZORL base model from %s in %.2fs", checkpoint_path, result["load_time"])
+        return result
+
     # ------------------------------------------------------------------
     # HuggingFace-compatible weight saving for inference / sampling
     # ------------------------------------------------------------------

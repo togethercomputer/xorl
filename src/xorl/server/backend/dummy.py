@@ -82,6 +82,7 @@ class DummyBackend(Backend):
         beta2=None,
         eps=None,
         model_id=None,
+        sparse_delta_capture=None,
         request_id=None,
     ):
         self._maybe_fail("optim_step")
@@ -158,6 +159,85 @@ class DummyBackend(Backend):
 
     async def kill_session(self, model_id="default", save_checkpoint=True, request_id=None):
         return {"success": True, "message": "dummy session killed"}
+
+    async def start_zorl_generation(
+        self,
+        model_id="default",
+        num_pairs=None,
+        pair_seed_specs=None,
+        materialization=None,
+        owner_url=None,
+        request_id=None,
+    ):
+        global_num_pairs = int(num_pairs or len(pair_seed_specs or []) or 1)
+        shard_index = int((materialization or {}).get("shard_index", 0))
+        num_shards = int((materialization or {}).get("num_shards", 1))
+        return {
+            "model_id": model_id,
+            "generation_id": f"{model_id}-family-000000-g000000",
+            "generation_index": 0,
+            "family_id": f"{model_id}-family-000000",
+            "family_refreshed": True,
+            "b_sigma": 0.01,
+            "num_pairs": global_num_pairs,
+            "global_num_pairs": global_num_pairs,
+            "global_population": 2 * global_num_pairs,
+            "shard_index": shard_index,
+            "num_shards": num_shards,
+            "local_num_pairs": 1,
+            "candidates": [],
+        }
+
+    async def apply_zorl_rewards(
+        self,
+        model_id="default",
+        generation_id="",
+        candidate_rewards=None,
+        learning_rate=None,
+        request_id=None,
+    ):
+        self._step += 1
+        return {
+            "model_id": model_id,
+            "generation_id": generation_id,
+            "applied": True,
+            "used_pairs": len(candidate_rewards or []) // 2,
+            "dropped_pairs": 0,
+            "family_id": f"{model_id}-family-000000",
+            "next_generation_index": self._step,
+            "deleted_candidates": 0,
+            "metrics": {"learning_rate": learning_rate or 1e-3, "b_sigma": 0.01},
+        }
+
+    async def abort_zorl_generation(self, model_id="default", generation_id="", request_id=None):
+        return {"success": True, "model_id": model_id, "generation_id": generation_id, "deleted_candidates": 0}
+
+    async def reset_zorl_session(
+        self,
+        model_id="default",
+        checkpoint_path=None,
+        a_seed=0,
+        a_init="gaussian_jl",
+        zorl_seed=None,
+        request_id=None,
+    ):
+        self._step = 0
+        return {
+            "success": True,
+            "model_id": model_id,
+            "checkpoint_path": checkpoint_path or "",
+            "restore_time": 0.0,
+            "a_init": a_init,
+            "a_seed": int(a_seed),
+            "zorl_seed": zorl_seed,
+            "family_id": f"{model_id}-family-000000",
+            "generation": 0,
+            "reset_sync_index": 1,
+            "fold_optimizer_cleared": True,
+            "adapter_optimizer_rebuilt": True,
+            "master_dtype": "float32",
+            "fingerprint": {"lora_b_max_abs": 0.0, "per_rank": []},
+        }
 
     async def health_check(self, request_id=None):
         return {"status": "healthy"}

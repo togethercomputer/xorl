@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable, ClassVar, Dict, FrozenSet, List, Optional, Tuple
 
@@ -133,6 +134,7 @@ class SparseDeltaTransportBackend(WeightTransportBackend):
         self._baseline_key = _endpoint_key(config, self._baseline_scope)
         self._initialized = False
         self._sequence = 0
+        self._rdma_distributor: Optional[Any] = None
         self._encode_fn: Optional[Callable[[torch.Tensor, torch.Tensor, tuple[int, ...]], Any]] = None
         self._write_packed_file: Optional[Callable[[dict[str, Any], str | Path], Path]] = None
         self._written_files: List[Path] = []
@@ -218,6 +220,11 @@ class SparseDeltaTransportBackend(WeightTransportBackend):
     def destroy(self, *, complete_receiver: bool = True) -> None:
         del complete_receiver
         self._initialized = False
+        if self._rdma_distributor is not None:
+            try:
+                self._rdma_distributor.close()
+            finally:
+                self._rdma_distributor = None
         if self._keep_files:
             return
         for path in self._written_files:
@@ -318,6 +325,179 @@ class SparseDeltaTransportBackend(WeightTransportBackend):
                 self._written_files.remove(written)
             except (OSError, ValueError):
                 logger.debug("[SparseDelta] failed to remove temporary packed file %s", written, exc_info=True)
+
+    # ------------------------------------------------------------------
+    # RDMA staging transport (Mooncake): distribute the packed payload
+    # over RDMA, then POST a staging apply instead of a file path.
+    # ------------------------------------------------------------------
+    def distribute_payload_rdma(self, payload: torch.Tensor) -> None:
+        """Phase 1+2 of the RDMA transport: prepare receiver staging buffers
+        and RDMA-write ``payload`` (CPU uint8, ideally pinned) into them.
+
+        Runs BEFORE the endpoints are paused — staging writes touch no
+        weights. Raises :class:`SparseDeltaRdmaUnavailable` when RDMA cannot
+        run at all (caller falls back to the file transport); endpoint-level
+        failures are quarantined per the P2P isolation policy.
+        """
+        from .sparse_delta_rdma import RdmaDeltaDistributor, get_sender_engine  # noqa: PLC0415
+
+        if not self._initialized:
+            raise RuntimeError("SparseDelta backend not initialized — call initialize() first")
+        be_cfg = self.config.backend_config or {}
+        engine = get_sender_engine(be_cfg)
+        max_workers = int(
+            be_cfg.get("post_workers", os.environ.get("XORL_SPARSE_DELTA_POST_WORKERS", "16"))
+        )
+        distributor = RdmaDeltaDistributor(
+            engine=engine,
+            endpoints=self.config.endpoints,
+            http_timeout_s=self._timeout_s,
+            post_workers=max_workers,
+        )
+        self._rdma_distributor = distributor
+        try:
+            distributor.prepare_staging(int(payload.numel()))
+            distributor.distribute(payload)
+        except Exception:
+            distributor.close()
+            self._rdma_distributor = None
+            raise
+        for key, value in distributor.stats.items():
+            self._stats[key] = self._stats.get(key, 0.0) + float(value)
+        self._stats["total_packed_bytes"] += float(payload.numel())
+
+    def post_staged_delta(
+        self,
+        payload: torch.Tensor,
+        *,
+        flush_cache: bool = False,
+        weight_version: Optional[str] = None,
+    ) -> None:
+        """Phase 3 of the RDMA transport: POST the staging apply to every
+        healthy endpoint (quarantined endpoints are skipped and reported in
+        ``endpoint_results``). Mirrors ``_post_delta_paths`` semantics: every
+        healthy endpoint is attempted; the first apply error is re-raised
+        after all attempts finish (so a base-version mismatch on one receiver
+        still fails the sync and triggers the force_prime convergence path).
+        """
+        distributor = getattr(self, "_rdma_distributor", None)
+        if distributor is None:
+            raise RuntimeError("post_staged_delta requires distribute_payload_rdma first")
+        be_cfg = self.config.backend_config or {}
+        compute_sha = bool(be_cfg.get("sha256", _env_bool("XORL_SPARSE_DELTA_SHA256", True)))
+        payload_sha: Optional[str] = None
+        if compute_sha:
+            t_sha = time.perf_counter()
+            payload_sha = hashlib.sha256(memoryview(payload.contiguous().numpy())).hexdigest()
+            self._stats["rdma_sha_s"] = self._stats.get("rdma_sha_s", 0.0) + (
+                time.perf_counter() - t_sha
+            )
+        nbytes = int(payload.numel())
+
+        def _apply_one(endpoint: Any) -> Dict[str, Any]:
+            body: dict[str, Any] = {
+                "staging_op": "apply",
+                "staging_nbytes": nbytes,
+                "flush_cache": flush_cache,
+            }
+            if payload_sha is not None:
+                body["delta_sha256s"] = [payload_sha]
+            if weight_version is not None:
+                body["weight_version"] = weight_version
+            if self._base_weight_version is not None:
+                body["base_weight_version"] = self._base_weight_version
+            if self._run_post_process_weights:
+                body["run_post_process_weights"] = True
+            for key in (
+                "fp8_kv_cache_enabled",
+                "fp8_kv_cache_postprocess_required",
+                "fp8_kv_cache_static_scales",
+            ):
+                if be_cfg.get(key):
+                    body[key] = True
+            url = f"http://{endpoint.host}:{endpoint.port}/update_weights_from_sparse_delta"
+            response = requests.post(url, json=body, timeout=self._timeout_s)
+            try:
+                resp_body = response.json()
+            except ValueError as exc:
+                raise RuntimeError(
+                    f"Sparse-delta staging apply returned non-JSON from "
+                    f"{endpoint.host}:{endpoint.port}: {response.text[:500]}"
+                ) from exc
+            if response.status_code >= 400 or not resp_body.get("success", False):
+                raise RuntimeError(
+                    f"Sparse-delta staging apply failed for {endpoint.host}:{endpoint.port}: "
+                    f"{resp_body.get('message', response.text[:500])}"
+                )
+            return _endpoint_delta_result(endpoint, resp_body)
+
+        healthy = set(distributor.healthy_endpoint_indices())
+        indexed = [(idx, ep) for idx, ep in enumerate(self.config.endpoints)]
+        results_by_idx: Dict[int, Dict[str, Any]] = {}
+        errors: List[Tuple[int, Exception]] = []
+
+        def _run_one(item: Tuple[int, Any]) -> None:
+            idx, endpoint = item
+            if idx not in healthy:
+                return
+            try:
+                results_by_idx[idx] = _apply_one(endpoint)
+            except Exception as exc:  # noqa: BLE001 - re-raised after the fan-out
+                errors.append((idx, exc))
+
+        max_workers = max(
+            1,
+            min(
+                int(be_cfg.get("post_workers", os.environ.get("XORL_SPARSE_DELTA_POST_WORKERS", "16"))),
+                len(indexed),
+            ),
+        )
+        t_post = time.perf_counter()
+        if max_workers == 1 or len(indexed) <= 1:
+            for item in indexed:
+                _run_one(item)
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="sparse-delta-apply") as pool:
+                list(pool.map(_run_one, indexed))
+        self._stats["post_s"] += time.perf_counter() - t_post
+
+        quarantined = distributor.failed_endpoint_errors()
+        endpoint_results: List[Dict[str, Any]] = []
+        error_by_idx = {idx: exc for idx, exc in errors}
+        for idx, endpoint in indexed:
+            if idx in results_by_idx:
+                endpoint_results.append(results_by_idx[idx])
+            else:
+                message = str(
+                    error_by_idx.get(idx)
+                    or quarantined.get(idx)
+                    or "skipped (quarantined during RDMA distribution)"
+                )
+                endpoint_results.append(
+                    {
+                        "host": endpoint.host,
+                        "port": endpoint.port,
+                        "success": False,
+                        "message": message,
+                    }
+                )
+        self.endpoint_results = endpoint_results
+        self._stats["posted_files"] += 1.0
+
+        if errors:
+            for idx, exc in errors[1:]:
+                ep = self.config.endpoints[idx]
+                logger.error(
+                    "[SparseDeltaRDMA] staging apply to %s:%s failed: %s", ep.host, ep.port, exc
+                )
+            raise errors[0][1]
+
+    def rdma_quarantined_endpoint_errors(self) -> Dict[int, str]:
+        distributor = getattr(self, "_rdma_distributor", None)
+        if distributor is None:
+            return {}
+        return distributor.failed_endpoint_errors()
+
 
     def post_packed_delta_paths(
         self,

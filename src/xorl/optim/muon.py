@@ -243,9 +243,10 @@ class Muon(TorchMuon):
             raise ValueError(
                 f"gram_newton_schulz_num_restarts must be non-negative, got {gram_newton_schulz_num_restarts}"
             )
-        if distributed_mode not in {"shard_local", "full_gradient"}:
+        if distributed_mode not in {"shard_local", "full_gradient", "full_matrix"}:
             raise ValueError(
-                f"Unsupported Muon distributed_mode: {distributed_mode!r}. Expected 'shard_local' or 'full_gradient'."
+                f"Unsupported Muon distributed_mode: {distributed_mode!r}. "
+                "Expected 'shard_local', 'full_gradient', or 'full_matrix'."
             )
         if grouped_gram_ns_fp32_byte_limit <= 0:
             raise ValueError(f"grouped_gram_ns_fp32_byte_limit must be positive, got {grouped_gram_ns_fp32_byte_limit}")
@@ -379,10 +380,13 @@ class Muon(TorchMuon):
             grad = p.grad
             is_dtensor = isinstance(grad, DTensor)
             use_full_gradient = (
-                self._distributed_mode == "full_gradient"
+                self._distributed_mode in {"full_gradient", "full_matrix"}
                 and is_dtensor
                 and any(isinstance(pl, Shard) for pl in grad.placements)
             )
+            if use_full_gradient and self._distributed_mode == "full_matrix":
+                if all(pl.dim < grad.ndim - 2 for pl in grad.placements if isinstance(pl, Shard)):
+                    use_full_gradient = False
             if is_dtensor:
                 grad_local = grad._local_tensor
                 p_local = p._local_tensor

@@ -23,6 +23,7 @@ import logging
 import os
 import socket
 import sys
+import threading
 import time
 import zlib
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
@@ -2929,3 +2930,260 @@ def _resolve_local_hostname() -> str:
     except Exception:
         pass
     return socket.gethostname()
+
+def _endpoint_error_isolation_enabled() -> bool:
+    """When on (default), a failed receiver session quarantines only its own
+    endpoint: transfers to the other endpoints proceed, the failed endpoint is
+    skipped at /complete_weights_update and reported per-endpoint. The
+    cumulative-resend / weight-version chain (see zorl_fold_sparse_delta.py)
+    converges stragglers on the next sync. The sync still fails when EVERY
+    endpoint has failed. Set XORL_P2P_ENDPOINT_ERROR_ISOLATION=0 for the
+    legacy fail-everything behavior."""
+    return _env_flag("XORL_P2P_ENDPOINT_ERROR_ISOLATION", True)
+
+
+class _EndpointFailureTracker:
+    """Thread-safe per-sync record of failed receiver sessions/endpoints.
+
+    Maps a failed Mooncake session to its owning endpoint so one dead
+    receiver can be quarantined — skipped for the remainder of the sync and
+    at /complete_weights_update — without failing the other endpoints.
+    """
+
+    def __init__(
+        self,
+        *,
+        session_to_endpoint: Dict[str, Any],
+        num_endpoints: int,
+        isolation_enabled: bool,
+    ) -> None:
+        self._lock = threading.Lock()
+        self._session_to_endpoint: Dict[str, Optional[int]] = {}
+        for sid, ep_idx in (session_to_endpoint or {}).items():
+            try:
+                self._session_to_endpoint[str(sid)] = None if ep_idx is None else int(ep_idx)
+            except (TypeError, ValueError):
+                self._session_to_endpoint[str(sid)] = None
+        self._num_endpoints = max(1, int(num_endpoints))
+        self.isolation_enabled = bool(isolation_enabled)
+        self._failed_sessions: Dict[str, str] = {}
+        self._failed_endpoints: Dict[int, str] = {}
+        self._first_error: Optional[Exception] = None
+
+    def endpoint_for_session(self, session_id: Any) -> Optional[int]:
+        if self._num_endpoints == 1:
+            return 0
+        return self._session_to_endpoint.get(str(session_id))
+
+    def is_session_failed(self, session_id: Any) -> bool:
+        sid = str(session_id)
+        ep_idx = self.endpoint_for_session(sid)
+        with self._lock:
+            if sid in self._failed_sessions:
+                return True
+            return ep_idx is not None and ep_idx in self._failed_endpoints
+
+    def mark_session_failed(self, session_id: Any, error: Exception) -> bool:
+        """Record a failed session. Returns True when the failure is isolated
+        to a known endpoint and isolation is enabled (the caller may continue
+        with the other endpoints); False when the caller must re-raise."""
+        sid = str(session_id)
+        ep_idx = self.endpoint_for_session(sid)
+        with self._lock:
+            if self._first_error is None:
+                self._first_error = error
+            self._failed_sessions[sid] = str(error)
+            if ep_idx is not None:
+                self._failed_endpoints.setdefault(ep_idx, str(error))
+        return self.isolation_enabled and ep_idx is not None
+
+    def merge_failed_endpoints(self, failed: Dict[Any, Any]) -> None:
+        """Adopt failed-endpoint records from peer sender ranks (multi-sender)."""
+        with self._lock:
+            for ep_idx, message in (failed or {}).items():
+                try:
+                    self._failed_endpoints.setdefault(int(ep_idx), str(message))
+                except (TypeError, ValueError):
+                    continue
+            if self._failed_endpoints and self._first_error is None:
+                self._first_error = RuntimeError(
+                    "[P2P] transfer failed on peer sender rank: "
+                    + "; ".join(f"endpoint {idx}: {msg}" for idx, msg in sorted(self._failed_endpoints.items()))
+                )
+
+    def failed_endpoint_errors(self) -> Dict[int, str]:
+        with self._lock:
+            return dict(self._failed_endpoints)
+
+    @property
+    def first_error(self) -> Optional[Exception]:
+        with self._lock:
+            return self._first_error
+
+    def raise_if_all_endpoints_failed(self) -> None:
+        with self._lock:
+            if self._failed_endpoints and len(self._failed_endpoints) >= self._num_endpoints:
+                error = self._first_error or RuntimeError("[P2P] transfers to every endpoint failed")
+                raise error
+
+
+def _fanout_sessions(
+    session_ids: List[str],
+    run_one: Any,
+    executor: Optional[ThreadPoolExecutor],
+    *,
+    label: str,
+) -> None:
+    """Run ``run_one(session_id)`` for every session, concurrently when an
+    executor is provided. Every session is attempted even if one raises; the
+    first error is re-raised after all sessions finish (the others logged)."""
+    if executor is None or len(session_ids) <= 1:
+        errors: List[Tuple[str, Exception]] = []
+        for sid in session_ids:
+            try:
+                run_one(sid)
+            except Exception as e:  # noqa: BLE001 - re-raised below
+                errors.append((sid, e))
+    else:
+        futures = {executor.submit(run_one, sid): sid for sid in session_ids}
+        errors = []
+        for future in as_completed(futures):
+            try:
+                future.result()
+            except Exception as e:  # noqa: BLE001 - re-raised below
+                errors.append((futures[future], e))
+    if errors:
+        for sid, err in errors[1:]:
+            logger.error("[P2P] %s to %s failed: %s", label, sid, err)
+        raise errors[0][1]
+
+
+def _run_sync_transfer_items(
+    *,
+    engine_wrapper: Any,
+    by_session: Dict[str, Tuple[List[int], List[int], List[int], Optional[List[_TransferDebugSample]]]],
+    items: List[Tuple[str, int, int]],
+    session_debug_info: Dict[str, Dict[str, Any]],
+    session_transfer_s: Dict[str, float],
+    bucket_idx: int,
+    label: str,
+    session_executor: Optional[ThreadPoolExecutor] = None,
+    failure_tracker: Optional[_EndpointFailureTracker] = None,
+) -> None:
+    max_attempts = _env_int("XORL_P2P_TRANSFER_RETRIES", 10)
+    # Group the chunked items per receiver session. Sessions are independent
+    # Mooncake peers, so they fan out concurrently on ``session_executor``;
+    # a session's own chunks stay ordered within its worker.
+    items_by_session: Dict[str, List[Tuple[int, int]]] = {}
+    for session_id, i, end in items:
+        items_by_session.setdefault(session_id, []).append((i, end))
+
+    def _run_session(session_id: str) -> None:
+        if failure_tracker is not None and failure_tracker.is_session_failed(session_id):
+            logger.warning(
+                "[P2P] skipping %s to quarantined session %s (bucket %d)", label, session_id, bucket_idx
+            )
+            return
+        src_ptrs, peer_ptrs, lengths, _ = by_session[session_id]
+        t_session = time.perf_counter()
+        try:
+            for i, end in items_by_session[session_id]:
+                last_ret = 0
+                for attempt in range(max_attempts):
+                    last_ret = engine_wrapper.batch_transfer_sync(
+                        session_id, src_ptrs[i:end], peer_ptrs[i:end], lengths[i:end]
+                    )
+                    if last_ret >= 0:
+                        break
+                    time.sleep(_retry_delay(attempt))
+                if last_ret < 0:
+                    raise RuntimeError(
+                        f"[P2P] {label} to {session_id} failed: ret={last_ret} "
+                        f"(bucket {bucket_idx}, chunk {i}..{end} of {len(src_ptrs)} buffers, "
+                        f"sizes={_chunk_sizes(by_session, session_id, i, end)}, "
+                        f"{_format_transfer_debug(_chunk_debug_sample(by_session, session_id, i, end))}, "
+                        f"session_info={session_debug_info.get(session_id)}, after {max_attempts} attempts)"
+                    )
+        except Exception as e:
+            if failure_tracker is not None and failure_tracker.mark_session_failed(session_id, e):
+                logger.error(
+                    "[P2P] quarantining receiver session %s after %s failure "
+                    "(other endpoints continue): %s",
+                    session_id,
+                    label,
+                    e,
+                )
+                return
+            raise
+        finally:
+            session_transfer_s[session_id] = session_transfer_s.get(session_id, 0.0) + (
+                time.perf_counter() - t_session
+            )
+
+    _fanout_sessions(list(items_by_session), _run_session, session_executor, label=label)
+
+
+def make_local_mooncake_engine(
+    *,
+    hostname: Optional[str] = None,
+    gpu_id: int = 0,
+    ib_device: Optional[str] = None,
+):
+    """Construct a local Mooncake TransferEngine (module-level; shared by the
+    P2P backend and the sparse-delta RDMA distributor).
+
+    Returns None when mooncake is unavailable or initialization fails.
+    """
+    try:
+        # Lazy-import: Mooncake is an optional dep; only pulled when an
+        # RDMA-based backend is actually selected.
+        from mooncake.engine import TransferEngine  # noqa: PLC0415
+    except ImportError as e:
+        logger.error(
+            "[P2P] mooncake-transfer-engine is not installed. "
+            "Install it (see https://kvcache-ai.github.io/Mooncake/getting_started/build.html) "
+            "or fall back to sync_inference_method='nccl_broadcast'."
+        )
+        logger.error(f"[P2P] underlying ImportError: {e}")
+        return None
+
+    # Reuse SGLang's Python wrapper so the engine init/handshake is
+    # identical to the receiver side. We don't depend on SGLang at
+    # runtime in xorl, but if the package is available locally we use
+    # it. Otherwise fall back to constructing TransferEngine directly.
+    hostname = hostname or _resolve_local_hostname()
+    logger.info(
+        "[P2P] local Mooncake endpoint hostname=%s gpu_id=%s ib_device=%s",
+        hostname,
+        gpu_id,
+        ib_device or "",
+    )
+    try:
+        from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (  # noqa: PLC0415
+            MooncakeTransferEngine,
+        )
+
+        engine = MooncakeTransferEngine(
+            hostname=hostname,
+            gpu_id=gpu_id,
+            ib_device=ib_device,
+        )
+        return engine
+    except ImportError:
+        logger.info(
+            "[P2P] sglang.srt.distributed.device_communicators.mooncake_transfer_engine "
+            "is not importable; using mooncake.engine.TransferEngine directly."
+        )
+        try:
+            return _DirectMooncakeTransferEngine(
+                TransferEngine,
+                hostname=hostname,
+                gpu_id=gpu_id,
+                ib_device=ib_device,
+            )
+        except Exception as e:
+            logger.error(f"[P2P] Failed to initialize direct Mooncake TransferEngine: {e}")
+            return None
+    except Exception as e:
+        logger.error(f"[P2P] Failed to initialize local MooncakeTransferEngine: {e}")
+        return None

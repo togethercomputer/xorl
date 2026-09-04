@@ -718,6 +718,10 @@ class Orchestrator:
         "load_adapter_state": "execute_load_adapter_state",
         "get_adapter_info": "execute_get_adapter_info",
         "kill_session": "execute_kill_session",
+        "start_zorl_generation": "execute_start_zorl_generation",
+        "apply_zorl_rewards": "execute_apply_zorl_rewards",
+        "abort_zorl_generation": "execute_abort_zorl_generation",
+        "reset_zorl_session": "execute_reset_zorl_session",
     }
 
     def _process_engine_step(self) -> bool:

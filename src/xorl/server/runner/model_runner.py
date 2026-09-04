@@ -68,6 +68,7 @@ from xorl.lora.expert_adapter_contract import (
     ZeroTokenGradientBehavior,
 )
 from xorl.lora.fold import invalidate_lora_merged_weight_caches, lora_merged_forward_enabled
+from xorl.lora.utils import get_lora_state_dict
 from xorl.models import resolve_cross_entropy_mode
 from xorl.models.layers.moe.routing_replay import set_replay_stage
 from xorl.models.transformers.deepseek_v3.support import deepseek_v3_default_lora_targets
@@ -121,6 +122,19 @@ from xorl.server.weight_sync.source_delta_capture import (
     snapshot_sparse_delta_tensors,
     sparse_delta_capture_enabled,
     write_sparse_source_delta_rank,
+)
+from xorl.server.zorl import (
+    ZORL_NOISE_LAYOUT_V2,
+    ZORLSessionState,
+    accumulate_zorl_fresh_ab_base_update_,
+    accumulate_zorl_fresh_ab_base_update_gemm_,
+    build_zorl_candidate_lora_state_dict,
+    build_zorl_fresh_ab_candidate_lora_state_dict,
+    build_zorl_update_from_rewards,
+    filter_zorl_materialized_candidates,
+    normalize_zorl_materialization,
+    pair_zorl_fresh_ab_lora_params,
+    zorl_noise_layout_from_env,
 )
 from xorl.trainers.model_builder import (
     build_training_model,
@@ -605,6 +619,7 @@ class ModelRunner:
         self.model_config = config.get("model", {})
         self.train_config = config.get("train", {})
         self.lora_config = config.get("lora", {})
+        self.zorl_config = config.get("zorl", {})
         self._validate_multi_adapter_lora_config()
         if self.train_config.get("load_weights_mode") == "skip" and not self.train_config.get("load_checkpoint_path"):
             raise ValueError(
@@ -652,6 +667,7 @@ class ModelRunner:
         self._adapter_manager: Optional[LoRAAdapterManager] = None
         self._lora_session_specs: Dict[str, Dict[str, Any]] = {}
         self._default_lora_session_spec: Optional[Dict[str, Any]] = None
+        self._zorl_sessions: Dict[str, ZORLSessionState] = {}
         self._checkpoint_mgr: Optional[CheckpointManager] = None
 
         # Single-tenant session tracking (for full-weights training mode)
@@ -728,9 +744,22 @@ class ModelRunner:
                 base_model=self.model_config.get("model_name") or self.model_config.get("model_path"),
                 train_config=self.train_config,
                 lora_config=self.lora_config,
+                zorl_config=self.zorl_config,
             )
             self._initialize_default_lora_adapter()
             logger.info("Multi-adapter manager initialized with default adapter")
+            if self.zorl_config.get("enabled", False) and self.zorl_config.get("perturbation_mode") == "fresh_ab":
+                default_state = self._adapter_manager.get_adapter_state("default")
+                default_modules = pair_zorl_fresh_ab_lora_params(default_state.lora_params)
+                default_resolution = self._resolve_zorl_fresh_ab_base_params(default_modules.keys())
+                default_base_params = {name: param for name, param, _slice in default_resolution.values()}
+                self._validate_zorl_fp32_master_params(default_base_params)
+                logger.info(
+                    "ZORL FP32 master initialized: logical_modules=%d base_params=%d factors=%d",
+                    len(default_resolution),
+                    len(default_base_params),
+                    len(default_state.lora_params),
+                )
 
         # Initialize tokenizer for sampling (only on rank 0)
         if self.rank == 0:
@@ -827,6 +856,11 @@ class ModelRunner:
             )
 
         self._lora_session_specs[model_id] = deepcopy(session_spec)
+        zorl_state = ZORLSessionState.from_session_spec(model_id, session_spec)
+        if zorl_state is not None:
+            self._zorl_sessions.setdefault(model_id, zorl_state)
+        else:
+            self._zorl_sessions.pop(model_id, None)
 
         materialized = False
         if materialize and self._adapter_manager is not None and not self._adapter_manager.has_adapter(model_id):
@@ -1440,6 +1474,7 @@ class ModelRunner:
             if self._adapter_manager is not None and self._adapter_manager.has_adapter(model_id):
                 self._adapter_manager.remove_adapter(model_id)
             self._lora_session_specs.pop(model_id, None)
+            self._zorl_sessions.pop(model_id, None)
 
             return {
                 "success": True,
@@ -1538,6 +1573,9 @@ class ModelRunner:
         enable_mixed_precision = self.train_config.get("enable_mixed_precision", False)
         enable_qlora = self.lora_config.get("enable_qlora", False)
         block_fp8_qlora_training = self.lora_config.get("block_fp8_qlora_training", False)
+        zorl_fp32_master = bool(self.zorl_config.get("enabled", False))
+        if zorl_fp32_master and enable_qlora:
+            raise ValueError("ZORL FP32-master mode does not support QLoRA")
 
         # The strict GLM lane owns its complete target set and must not depend
         # on permissive discovery or a remote-config lookup. Other adapter
@@ -1556,6 +1594,7 @@ class ModelRunner:
             enable_qlora=enable_qlora,
             enable_mixed_precision=enable_mixed_precision,
             skip_param_upcast=self.train_config.get("skip_param_upcast", False),
+            force_fp32_master=zorl_fp32_master,
         )
 
         pp_size = self.train_config.get("pipeline_parallel_size", 1)
@@ -1596,6 +1635,7 @@ class ModelRunner:
             enable_mixed_precision=enable_mixed_precision,
             fsdp_reduce_dtype=self.train_config.get("fsdp_reduce_dtype", "fp32"),
             skip_param_upcast=self.train_config.get("skip_param_upcast", False),
+            force_fp32_master=zorl_fp32_master,
             enable_fp8_training=self.train_config.get("enable_fp8_training", False),
             enable_qarl=self.train_config.get("enable_qarl", False),
             glm52_fullparam_fp8_training=self.train_config.get("glm52_fullparam_fp8_training", False),
@@ -9026,6 +9066,7 @@ class ModelRunner:
             raise
         self._sync_from_checkpoint_state()
         self._sync_registered_lora_session_spec(model_id)
+        self._seed_loaded_zorl_parent_family(model_id)
         return result
 
     def save_state(self, checkpoint_path, save_optimizer=True, model_id=None):
@@ -9042,6 +9083,10 @@ class ModelRunner:
             )
         result = self._checkpoint_mgr.load_state(checkpoint_path, load_optimizer, model_id)
         self._sync_from_checkpoint_state()
+        loaded_model_id = result.get("model_id", model_id)
+        if loaded_model_id is not None:
+            self._sync_registered_lora_session_spec(loaded_model_id)
+            self._seed_loaded_zorl_parent_family(loaded_model_id)
         return result
 
     def save_lora_only(self, lora_path, model_id="default"):
@@ -9150,3 +9195,1475 @@ class ModelRunner:
 
         logger.info(f"Model loaded to GPU in {result['load_time']:.2f}s")
         return result
+
+    def _seed_loaded_zorl_parent_family(self, model_id: str) -> None:
+        """Mark a loaded LoRA checkpoint as the active ZORL parent family."""
+        state = getattr(self, "_zorl_sessions", {}).get(model_id)
+        if state is None:
+            return
+        state.seed_loaded_parent_family()
+
+    def get_zorl_session_state(self, model_id: str) -> Optional[Dict[str, Any]]:
+        """Get a snapshot of the ZORL runtime state for a model_id, if enabled."""
+
+        state = getattr(self, "_zorl_sessions", {}).get(model_id)
+        if state is None:
+            return None
+        return state.snapshot()
+
+    def _require_zorl_session(self, model_id: str) -> ZORLSessionState:
+        """Return the ZORL runtime state for a session or raise."""
+        state = getattr(self, "_zorl_sessions", {}).get(model_id)
+        if state is None:
+            raise ValueError(f"Session {model_id!r} is not ZORL-enabled")
+        if self._adapter_manager is None:
+            raise RuntimeError("ZORL requires the multi-adapter LoRA manager")
+        if model_id not in self._lora_session_specs:
+            raise ValueError(f"LoRA session spec not registered for model_id={model_id}")
+        return state
+
+    def _zorl_generation_export_dir(self, generation_id: str) -> str:
+        """Return the sampler-weight export directory for one ZORL generation."""
+        return os.path.join(self.train_config.get("output_dir", "outputs"), "sampler_weights", "zorl", generation_id)
+
+    def _cleanup_zorl_generation_exports(
+        self,
+        generation_id: str,
+        *,
+        candidate_ids: Optional[set[str]] = None,
+    ) -> int:
+        """Delete exported candidate adapters for one generation on rank 0."""
+        export_dir = self._zorl_generation_export_dir(generation_id)
+        deleted = 0
+        if self.rank == 0 and os.path.isdir(export_dir):
+            if candidate_ids is None:
+                deleted = sum(1 for entry in os.scandir(export_dir) if entry.is_dir())
+                shutil.rmtree(export_dir, ignore_errors=True)
+            else:
+                for candidate_id in sorted(candidate_ids):
+                    candidate_path = os.path.join(export_dir, candidate_id)
+                    if os.path.isdir(candidate_path):
+                        shutil.rmtree(candidate_path, ignore_errors=True)
+                        deleted += 1
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            dist.barrier()
+        return deleted
+
+    @staticmethod
+    def _normalize_zorl_pair_scores(
+        raw_scores: List[float],
+        *,
+        normalization: str = "standard",
+    ) -> List[float]:
+        """Normalize pairwise reward scores with a stable z-score fallback."""
+        score_tensor = torch.tensor(raw_scores, dtype=torch.float32)
+        if score_tensor.numel() == 0:
+            raise ValueError("ZORL rewards must contain at least one valid pair score")
+
+        if normalization == "none":
+            return [float(value) for value in score_tensor.tolist()]
+        if normalization != "standard":
+            raise ValueError(f"Unsupported ZORL score normalization {normalization!r}")
+
+        if score_tensor.numel() > 1:
+            mean = score_tensor.mean()
+            std = score_tensor.std(unbiased=False)
+            if float(std.item()) > 1e-6:
+                normalized = (score_tensor - mean) / (std + 1e-6)
+            else:
+                max_abs = score_tensor.abs().max()
+                normalized = score_tensor / max_abs if float(max_abs.item()) > 0.0 else torch.zeros_like(score_tensor)
+        else:
+            max_abs = score_tensor.abs().max()
+            normalized = score_tensor / max_abs if float(max_abs.item()) > 0.0 else torch.zeros_like(score_tensor)
+
+        return [float(value) for value in normalized.tolist()]
+
+    def start_zorl_generation(
+        self,
+        model_id: str = "default",
+        *,
+        num_pairs: Optional[int] = None,
+        pair_seed_specs: Optional[List[Dict[str, Optional[int]]]] = None,
+        materialization: Optional[Dict[str, Any]] = None,
+        owner_url: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Plan one ZORL generation and export its candidate LoRA adapters."""
+        zorl_state = self._require_zorl_session(model_id)
+        self.ensure_lora_adapter(model_id, initialize_fresh=False)
+
+        start_time = time.time()
+        plan = zorl_state.begin_generation(num_pairs=num_pairs, pair_seed_specs=pair_seed_specs)
+        global_num_pairs = (
+            len(pair_seed_specs)
+            if pair_seed_specs is not None
+            else int(num_pairs if num_pairs is not None else zorl_state.config["num_perturbation_pairs"])
+        )
+        materialization_plan = normalize_zorl_materialization(materialization, num_pairs=global_num_pairs)
+        # Seed-transport mode: no candidate adapters are exported to disk; the
+        # response instead carries complete per-candidate specs (seeds/sigma/
+        # sign/mode/rank) plus ONE parent checkpoint export, and the scorer
+        # replicas materialize the candidates from the specs themselves.
+        specs_only = materialization_plan.mode == "specs"
+        local_pair_indices = materialization_plan.local_pair_indices(num_pairs=global_num_pairs)
+        local_pair_count = len(local_pair_indices)
+        local_candidates_to_export = filter_zorl_materialized_candidates(
+            plan.candidates,
+            materialization_plan,
+            num_pairs=global_num_pairs,
+        )
+        materialized_candidate_ids = {candidate.candidate_id for candidate in local_candidates_to_export}
+        export_dir = self._zorl_generation_export_dir(plan.generation_id)
+        session_spec = self.get_lora_session_spec(model_id)
+
+        try:
+            if self.rank == 0:
+                os.makedirs(export_dir, exist_ok=True)
+                if materialization_plan.mode in ("all", "specs"):
+                    shutil.rmtree(export_dir, ignore_errors=True)
+                    os.makedirs(export_dir, exist_ok=True)
+                else:
+                    for candidate_id in materialized_candidate_ids:
+                        shutil.rmtree(os.path.join(export_dir, candidate_id), ignore_errors=True)
+            if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+                dist.barrier()
+
+            if plan.family_refreshed:
+                self._adapter_manager.reinitialize_adapter_for_zorl_family(
+                    model_id,
+                    a_seed=plan.family.a_seed,
+                    a_init=plan.family.a_init,
+                )
+                self._sync_registered_lora_session_spec(model_id)
+
+            # Explicit candidate exports are serialized through
+            # ``save_lora_checkpoint``, which validates the requested alpha
+            # against the live model-side LoRA modules.  Adapter registration
+            # keeps the session weights out-of-line and does not activate its
+            # runtime rank/alpha by itself.  Activate this session before the
+            # export so the scorer and the fresh_ab fold use the same
+            # structural scaling (alpha / rank).
+            self._adapter_manager.sync_weights_to_model(model_id)
+
+            adapter_state = self._adapter_manager.get_adapter_state(model_id)
+            b_sigma = float(zorl_state.config["b_sigma"])
+            perturbation_mode = str(zorl_state.config.get("perturbation_mode", "b_only"))
+            # With EP enabled, adapter_state.lora_params are rank-local
+            # (num_local_experts per rank). Gather across EP ranks once so every
+            # candidate writes the full-expert state. This is a collective op —
+            # all ranks must call it even though only rank 0 writes files. Key
+            # off train_config.expert_parallel_size (guaranteed consistent
+            # across ranks) rather than `model._fqn2spec_info` — a rank-local
+            # attribute predicate would deadlock if any rank's check disagreed
+            # with the others.
+            model = getattr(self, "model", None)
+            ep_size = int(self.train_config.get("expert_parallel_size", 1)) if self.train_config else 1
+            has_ep = ep_size > 1 and model is not None
+            if has_ep:
+                gathered_lora = get_lora_state_dict(model)
+                # Strip FSDP/compile wrappers and map to adapter_state.lora_params keys.
+                gathered_by_key: Dict[str, torch.Tensor] = {}
+                for raw_name, tensor in gathered_lora.items():
+                    clean = raw_name.replace("_fsdp_wrapped_module.", "").replace("_orig_mod.", "")
+                    gathered_by_key[clean] = tensor
+
+                # Build nn.Parameter-like wrapper objects so build_zorl_candidate_lora_state_dict
+                # works unchanged (it accesses .data on each value).
+                class _TensorView:
+                    __slots__ = ("data", "shape")
+
+                    def __init__(self, t: torch.Tensor):
+                        self.data = t
+                        self.shape = t.shape
+
+                source_params: Dict[str, Any] = {
+                    name: _TensorView(gathered_by_key[name])
+                    for name in adapter_state.lora_params.keys()
+                    if name in gathered_by_key
+                }
+                missing = set(adapter_state.lora_params.keys()) - set(source_params.keys())
+                if missing:
+                    raise RuntimeError(
+                        f"ZORL EP gather omitted {len(missing)} adapter tensors; refusing to mix "
+                        f"logical and rank-local candidate shapes: {sorted(missing)[:3]}..."
+                    )
+            else:
+                source_params = adapter_state.lora_params
+            lora_rank = int(session_spec["lora_config"]["lora_rank"])
+
+            parent_path: Optional[str] = None
+            candidates: List[Dict[str, Any]] = []
+            if specs_only:
+                # Export the PARENT once (candidates are seed-materialized on
+                # the scorers relative to it: b_only perturbs around its
+                # LoRA-B; fresh_ab only needs its shapes/scaling).
+                parent_path = os.path.join(export_dir, "__parent__")
+                parent_state_dict = {
+                    name: param.data.detach().cpu().to(torch.float32) for name, param in source_params.items()
+                }
+                self._checkpoint_mgr.save_explicit_lora_checkpoint(
+                    parent_path,
+                    lora_state_dict=parent_state_dict,
+                    session_spec=session_spec,
+                )
+                for candidate in plan.candidates:
+                    candidates.append(
+                        {
+                            "candidate_id": candidate.candidate_id,
+                            "perturbation_index": candidate.perturbation_index,
+                            "direction": candidate.direction,
+                            "b_seed": candidate.b_seed,
+                            "a_seed": candidate.a_seed,
+                            "b_sigma": b_sigma,
+                            "perturbation_mode": perturbation_mode,
+                            "rank": lora_rank,
+                            "path": None,
+                            "owner_url": owner_url,
+                        }
+                    )
+            for candidate in local_candidates_to_export:
+                candidate_path = os.path.join(export_dir, candidate.candidate_id)
+                if perturbation_mode == "fresh_ab":
+                    # EGGROLL-style probe: candidate REPLACES the parent factors
+                    # with (A = eps_A, B = sign * sigma * eps_B); the pair shares
+                    # eps_A and the parent LoRA-B stays == 0 (its served delta is
+                    # zero — the accumulated update lives in the BASE weights).
+                    candidate_state_dict = build_zorl_fresh_ab_candidate_lora_state_dict(
+                        source_params,
+                        a_seed=int(candidate.a_seed),
+                        b_seed=candidate.b_seed,
+                        direction=candidate.direction,
+                        b_sigma=b_sigma,
+                    )
+                else:
+                    candidate_state_dict = build_zorl_candidate_lora_state_dict(
+                        source_params,
+                        b_seed=candidate.b_seed,
+                        direction=candidate.direction,
+                        b_sigma=b_sigma,
+                    )
+                self._checkpoint_mgr.save_explicit_lora_checkpoint(
+                    candidate_path,
+                    lora_state_dict=candidate_state_dict,
+                    session_spec=session_spec,
+                )
+                candidates.append(
+                    {
+                        "candidate_id": candidate.candidate_id,
+                        "perturbation_index": candidate.perturbation_index,
+                        "direction": candidate.direction,
+                        "b_seed": candidate.b_seed,
+                        "a_seed": candidate.a_seed,
+                        "b_sigma": b_sigma,
+                        "perturbation_mode": perturbation_mode,
+                        "rank": lora_rank,
+                        "path": candidate_path,
+                        "owner_url": owner_url,
+                    }
+                )
+
+            if not hasattr(self, "_zorl_generation_materialized_candidate_ids"):
+                self._zorl_generation_materialized_candidate_ids = {}
+            # specs mode stores None -> apply/abort cleanup removes the whole
+            # generation export dir (which only holds the parent checkpoint).
+            self._zorl_generation_materialized_candidate_ids[(model_id, plan.generation_id)] = (
+                None if specs_only else set(materialized_candidate_ids)
+            )
+
+            return {
+                "model_id": model_id,
+                "generation_id": plan.generation_id,
+                "generation_index": plan.generation,
+                "family_id": plan.family.family_id,
+                "family_refreshed": plan.family_refreshed,
+                "b_sigma": b_sigma,
+                "perturbation_mode": perturbation_mode,
+                "num_pairs": global_num_pairs,
+                "global_num_pairs": global_num_pairs,
+                "global_population": len(plan.candidates),
+                "materialization": {
+                    "mode": materialization_plan.mode,
+                    "shard_index": materialization_plan.shard_index,
+                    "num_shards": materialization_plan.num_shards,
+                    "pair_start": materialization_plan.pair_start,
+                    "pair_end": materialization_plan.pair_end,
+                },
+                "shard_index": materialization_plan.shard_index,
+                "num_shards": materialization_plan.num_shards,
+                "local_num_pairs": local_pair_count,
+                "lora_rank": lora_rank,
+                "parent_path": parent_path,
+                "candidates": candidates,
+                "execution_time": time.time() - start_time,
+            }
+        except Exception:
+            if (
+                zorl_state.active_generation is not None
+                and zorl_state.active_generation.generation_id == plan.generation_id
+            ):
+                zorl_state.abort_generation(plan.generation_id)
+            self._cleanup_zorl_generation_exports(
+                plan.generation_id,
+                candidate_ids=(
+                    materialized_candidate_ids if materialization_plan.mode not in ("all", "specs") else None
+                ),
+            )
+            raise
+
+    def apply_zorl_rewards(
+        self,
+        model_id: str,
+        generation_id: str,
+        candidate_rewards: List[Dict[str, Any]],
+        *,
+        learning_rate: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Apply a ZORL update from externally aggregated candidate rewards."""
+        zorl_state = self._require_zorl_session(model_id)
+        if zorl_state.active_generation is None:
+            raise ValueError(f"No active ZORL generation for model_id={model_id}")
+        if zorl_state.active_generation.generation_id != generation_id:
+            raise ValueError(
+                f"Active ZORL generation mismatch for model_id={model_id}: "
+                f"expected {zorl_state.active_generation.generation_id}, got {generation_id}"
+            )
+
+        plan = zorl_state.active_generation
+        adapter_state = self._adapter_manager.get_adapter_state(model_id)
+        reward_by_candidate = {str(item["candidate_id"]): item for item in candidate_rewards}
+        score_normalizations = {
+            str(item.get("_zorl_score_normalization") or item.get("zorl_score_normalization") or "standard")
+            for item in candidate_rewards
+        }
+        if len(score_normalizations) != 1:
+            raise ValueError(
+                "All ZORL candidate rewards in one apply call must use the same "
+                f"score normalization, got {sorted(score_normalizations)}"
+            )
+        score_normalization = next(iter(score_normalizations))
+
+        raw_pair_scores: List[float] = []
+        seed_score_pairs: List[tuple[int, Optional[int], float]] = []
+        used_pairs = 0
+        dropped_pairs = 0
+        pair_specs: Dict[int, Dict[str, Any]] = {}
+        for candidate in plan.candidates:
+            pair_specs.setdefault(candidate.perturbation_index, {})[candidate.direction] = candidate
+
+        for pair_index in sorted(pair_specs):
+            directions = pair_specs[pair_index]
+            positive = directions.get("positive")
+            negative = directions.get("negative")
+
+            positive_reward = None if positive is None else reward_by_candidate.get(positive.candidate_id)
+            negative_reward = None if negative is None else reward_by_candidate.get(negative.candidate_id)
+
+            if positive is not None and negative is not None:
+                if positive_reward is None or negative_reward is None:
+                    dropped_pairs += 1
+                    continue
+                positive_rollouts = positive_reward.get("num_rollouts")
+                negative_rollouts = negative_reward.get("num_rollouts")
+                if (
+                    positive_rollouts is not None
+                    and negative_rollouts is not None
+                    and int(positive_rollouts) != int(negative_rollouts)
+                ):
+                    dropped_pairs += 1
+                    continue
+                raw_score = float(positive_reward["reward_mean"]) - float(negative_reward["reward_mean"])
+                chosen = positive
+            elif positive_reward is not None and positive is not None:
+                raw_score = float(positive_reward["reward_mean"])
+                chosen = positive
+            elif negative_reward is not None and negative is not None:
+                raw_score = -float(negative_reward["reward_mean"])
+                chosen = negative
+            else:
+                dropped_pairs += 1
+                continue
+
+            raw_pair_scores.append(raw_score)
+            # Antithetic siblings share both seeds, so either direction's spec
+            # identifies the pair's noise draws.
+            seed_score_pairs.append(
+                (int(chosen.b_seed), None if chosen.a_seed is None else int(chosen.a_seed), raw_score)
+            )
+            used_pairs += 1
+
+        if not seed_score_pairs:
+            raise ValueError(f"No valid ZORL reward pairs for generation {generation_id}")
+
+        normalized_scores = self._normalize_zorl_pair_scores(
+            raw_pair_scores,
+            normalization=score_normalization,
+        )
+        effective_lr = (
+            float(learning_rate) if learning_rate is not None else float(self._adapter_manager.get_lr(model_id))
+        )
+        perturbation_mode = str(zorl_state.config.get("perturbation_mode", "b_only"))
+
+        if perturbation_mode == "fresh_ab":
+            # fresh_ab: the reward-weighted update is a full base-weight-shaped
+            # direction (rank <= N*r), unrepresentable in the rank-r parent.
+            # Fold it into the BASE weights through the base-model optimizer;
+            # the parent adapter (A arbitrary, B == 0) is left untouched.
+            update_norm, grad_norm = self._apply_zorl_fresh_ab_base_update(
+                model_id,
+                pair_seeds_and_scores=[
+                    (a_seed, b_seed, normalized_score)
+                    for (b_seed, a_seed, _raw_score), normalized_score in zip(
+                        seed_score_pairs, normalized_scores, strict=True
+                    )
+                ],
+                learning_rate=effective_lr,
+            )
+        else:
+            update, update_norm = build_zorl_update_from_rewards(
+                adapter_state.lora_params,
+                pair_seeds_and_scores=[
+                    (b_seed, normalized_score)
+                    for (b_seed, _a_seed, _raw_score), normalized_score in zip(
+                        seed_score_pairs, normalized_scores, strict=True
+                    )
+                ],
+            )
+
+            for param in adapter_state.lora_params.values():
+                param.grad = None
+            for name, param in adapter_state.lora_params.items():
+                if "lora_B" not in name:
+                    continue
+                param.grad = (-update[name]).to(device=param.device, dtype=param.dtype)
+
+            grad_norm = float(
+                self._adapter_manager.optim_step(model_id, effective_lr, None, accumulated_valid_tokens=0)
+            )
+            self._sync_registered_lora_session_spec(model_id)
+        zorl_state.complete_generation(generation_id)
+        materialized_ids = getattr(self, "_zorl_generation_materialized_candidate_ids", {}).pop(
+            (model_id, generation_id),
+            None,
+        )
+        deleted_candidates = self._cleanup_zorl_generation_exports(generation_id, candidate_ids=materialized_ids)
+
+        reward_values = [float(item["reward_mean"]) for item in reward_by_candidate.values()]
+        reward_tensor = torch.tensor(reward_values, dtype=torch.float32)
+        pair_score_tensor = torch.tensor(raw_pair_scores, dtype=torch.float32)
+        fold_contract = (
+            dict(getattr(self, "_zorl_fresh_ab_last_fold", {}) or {}) if perturbation_mode == "fresh_ab" else {}
+        )
+
+        return {
+            "model_id": model_id,
+            "generation_id": generation_id,
+            "applied": True,
+            "used_pairs": used_pairs,
+            "dropped_pairs": dropped_pairs,
+            "family_id": plan.family.family_id,
+            "next_generation_index": zorl_state.generation,
+            "deleted_candidates": deleted_candidates,
+            "metrics": {
+                "reward_mean": float(reward_tensor.mean().item()),
+                "reward_std": float(reward_tensor.std(unbiased=False).item()) if reward_tensor.numel() > 1 else 0.0,
+                "pair_delta_mean": float(pair_score_tensor.mean().item()),
+                "pair_delta_std": float(pair_score_tensor.std(unbiased=False).item())
+                if pair_score_tensor.numel() > 1
+                else 0.0,
+                "update_norm": float(update_norm),
+                "grad_norm": grad_norm,
+                "learning_rate": effective_lr,
+                "b_sigma": float(zorl_state.config["b_sigma"]),
+                "perturbation_mode": perturbation_mode,
+                "score_normalization": score_normalization,
+                **(
+                    {
+                        "fold_logical_modules": int(fold_contract["logical_module_count"]),
+                        "fold_base_params": int(fold_contract["base_param_count"]),
+                        "fold_factor_tensors": int(fold_contract["factor_tensor_count"]),
+                        "fold_chunks": int(fold_contract["chunk_count"]),
+                        "fold_optimizer": str(fold_contract["optimizer"]),
+                        "master_dtype": str(fold_contract["master_dtype"]),
+                        "update_rms": float(fold_contract["update_rms"]),
+                        "bf16_view_update_norm": float(fold_contract["bf16_view_update_norm"]),
+                        "bf16_view_changed_fraction": float(fold_contract["bf16_view_changed_fraction"]),
+                    }
+                    if fold_contract
+                    else {}
+                ),
+            },
+        }
+
+    def _resolve_zorl_fresh_ab_base_params(
+        self,
+        module_keys,
+    ) -> Dict[str, tuple[str, torch.nn.Parameter, Optional[tuple[int, ...]]]]:
+        """Map fresh_ab LoRA module keys onto the live base weight parameters.
+
+        Returns module_key -> (base_param_name, base_param, param_slice).
+        A two-item slice is ``(start, length)`` on the last dimension (fused
+        MoE storage); a three-item slice is ``(dim, start, length)`` (dense
+        shared-expert gate/up storage); ``None`` maps the whole parameter.
+        """
+        named_base_params: Dict[str, torch.nn.Parameter] = {}
+        for raw_name, param in self.model.named_parameters():
+            clean = raw_name.replace("_fsdp_wrapped_module.", "").replace("_orig_mod.", "")
+            named_base_params[clean] = param
+
+        resolution: Dict[str, tuple[str, torch.nn.Parameter, Optional[tuple[int, ...]]]] = {}
+        for module_key in sorted(module_keys):
+            weight_name = f"{module_key}.weight"
+            if weight_name in named_base_params:
+                # Standard LoraLinear module (attention/MLP/lm_head).
+                resolution[module_key] = (weight_name, named_base_params[weight_name], None)
+                continue
+            if module_key in named_base_params:
+                # MoE expert weight stored directly as an nn.Parameter
+                # (e.g. ``...experts.down_proj`` in (G, K, N) layout).
+                resolution[module_key] = (module_key, named_base_params[module_key], None)
+                continue
+            parent, _, leaf = module_key.rpartition(".")
+            fused_name = f"{parent}.gate_up_proj" if parent else "gate_up_proj"
+            if leaf in ("gate_proj", "up_proj") and fused_name in named_base_params:
+                # Fused MoE gate/up storage: [E, hidden, 2*intermediate] with
+                # gate occupying the first half of the last dim.
+                fused_param = named_base_params[fused_name]
+                intermediate = int(fused_param.shape[-1]) // 2
+                start = 0 if leaf == "gate_proj" else intermediate
+                resolution[module_key] = (fused_name, fused_param, (start, intermediate))
+                continue
+            fused_weight_name = f"{fused_name}.weight"
+            if leaf in ("gate_proj", "up_proj") and fused_weight_name in named_base_params:
+                # Dense/shared-expert nn.Linear storage is [2*intermediate,
+                # hidden], so gate/up occupy disjoint rows rather than the
+                # last-dimension windows used by routed expert tensors.
+                fused_param = named_base_params[fused_weight_name]
+                intermediate = int(fused_param.shape[0]) // 2
+                if int(fused_param.shape[0]) != 2 * intermediate:
+                    raise ValueError(f"Odd fused gate/up output size for {fused_weight_name!r}")
+                start = 0 if leaf == "gate_proj" else intermediate
+                resolution[module_key] = (
+                    fused_weight_name,
+                    fused_param,
+                    (0, start, intermediate),
+                )
+                continue
+            raise ValueError(
+                f"Cannot resolve base weight parameter for fresh_ab LoRA module {module_key!r} "
+                f"(tried {weight_name!r}, {module_key!r}, and fused "
+                f"{fused_name!r}/{fused_weight_name!r})"
+            )
+        return resolution
+
+    def _resolve_zorl_fresh_ab_fold_optimizer_mode(self) -> str:
+        """Which update rule the fresh_ab fold applies to G.
+
+        ``'muon'`` (default), ``'sgd'`` (raw ``lr*G``,
+        no Newton-Schulz), or ``'sgd_rms'`` (per-matrix RMS-normalized ``G``
+        at Muon's ``match_rms_adamw`` step size, so the Muon lr transfers —
+        see ``xorl.optim.scaled_sgd``). Env ``XORL_ZORL_FRESH_AB_FOLD_OPTIMIZER``
+        overrides the ``zorl_fold_optimizer`` train-config key so A/B arms are
+        env-only relaunches.
+        """
+        mode = os.environ.get("XORL_ZORL_FRESH_AB_FOLD_OPTIMIZER") or self.train_config.get(
+            "zorl_fold_optimizer", "muon"
+        )
+        mode = str(mode).strip().lower()
+        if mode not in ("muon", "sgd", "sgd_rms"):
+            raise ValueError(
+                f"Unsupported ZORL fresh_ab fold optimizer {mode!r}. Expected 'muon', 'sgd', or 'sgd_rms'."
+            )
+        return mode
+
+    def _resolve_zorl_fresh_ab_fold_momentum(
+        self, *, default_momentum: float, default_nesterov: bool
+    ) -> tuple[float, bool]:
+        """Momentum over the fold stream (one EMA update per fold, all modes).
+
+        Resolution order (momentum): env ``XORL_ZORL_FRESH_AB_FOLD_MOMENTUM``
+        > train-config ``zorl_fold_momentum`` > the muon kwargs default
+        (``muon_momentum``, itself defaulting to 0.0).
+        Nesterov mirrors it via ``XORL_ZORL_FRESH_AB_FOLD_NESTEROV`` /
+        ``zorl_fold_nesterov`` / ``muon_nesterov``.
+        """
+        raw_momentum = os.environ.get("XORL_ZORL_FRESH_AB_FOLD_MOMENTUM")
+        if raw_momentum not in (None, ""):
+            momentum = float(raw_momentum)
+        elif "zorl_fold_momentum" in self.train_config:
+            momentum = float(self.train_config["zorl_fold_momentum"])
+        else:
+            momentum = float(default_momentum)
+        if not 0.0 <= momentum < 1.0:
+            raise ValueError(f"ZORL fresh_ab fold momentum must be in [0, 1), got {momentum}")
+
+        raw_nesterov = os.environ.get("XORL_ZORL_FRESH_AB_FOLD_NESTEROV")
+        if raw_nesterov not in (None, ""):
+            nesterov = raw_nesterov.strip().lower() in ("1", "true", "yes", "on")
+        elif "zorl_fold_nesterov" in self.train_config:
+            nesterov = bool(self.train_config["zorl_fold_nesterov"])
+        else:
+            nesterov = bool(default_nesterov)
+        if nesterov and momentum == 0.0:
+            raise ValueError("ZORL fresh_ab fold nesterov=True requires momentum > 0")
+        return momentum, nesterov
+
+    def _resolve_zorl_fresh_ab_fold_momentum_dtype(self) -> Optional[torch.dtype]:
+        """Optional momentum-buffer dtype override (``fp32``/``bf16``) via env.
+
+        Buffers live on the LOCAL shard only (both Muon and ScaledSGD wrap a
+        shard-local buffer in DTensor metadata), so bf16 halves an already
+        1/world-sized state. Default ``None`` keeps each mode's existing
+        behavior (Muon: ``optimizer_dtype``, default bf16; ScaledSGD: the
+        gradient dtype, i.e. the param dtype).
+        """
+        raw = os.environ.get("XORL_ZORL_FRESH_AB_FOLD_MOMENTUM_DTYPE")
+        if raw in (None, ""):
+            return None
+        key = raw.strip().lower()
+        if key == "fp32":
+            return torch.float32
+        if key == "bf16":
+            return torch.bfloat16
+        raise ValueError(f"Unsupported XORL_ZORL_FRESH_AB_FOLD_MOMENTUM_DTYPE {raw!r}. Expected 'fp32' or 'bf16'.")
+
+    def _get_zorl_fresh_ab_base_optimizer(
+        self,
+        base_params: Dict[str, torch.nn.Parameter],
+        *,
+        lr: float,
+    ):
+        """Lazily build (and cache) the fold optimizer over the fresh_ab base weights.
+
+        Structural note: in LoRA server mode the shared ``self.optimizer`` and
+        the per-adapter optimizers only cover LoRA parameters (base params are
+        frozen and filtered out by ``build_optimizer``), so the fresh_ab fold
+        cannot reuse either. This builds a dedicated optimizer over exactly the
+        LoRA-targeted base weights.
+
+        THREE UPDATE RULES (``_resolve_zorl_fresh_ab_fold_optimizer_mode``):
+
+        ``'muon'`` (default; the ES fold recipe): full-matrix Newton-Schulz
+        (``muon_distributed_mode='full_matrix'``) and the ``match_rms_adamw``
+        lr scale (0.2*sqrt(max dim)) so Muon reuses the AdamW/GRPO learning
+        rate. ``full_matrix`` gives byte-for-the-same-math ``full_gradient``
+        updates but skips the gather + replicated NS for params whose FSDP2
+        shards only split NS batch dims — i.e. the ``Shard(0)`` expert dim of
+        the ``[E, in, out]`` MoE stacks that dominate the fold. Each rank runs
+        batched NS on just its own experts (1/world of the NS FLOPs, zero
+        allgather; NS is per-matrix so the result is exactly the full-Muon
+        update). 2D params (e.g. shared_expert projections) still take the
+        full_gradient gather. Escape hatch:
+        ``XORL_ZORL_FRESH_AB_MUON_DISTRIBUTED_MODE=full_gradient`` restores
+        the previous redundant-but-equivalent behavior.
+
+        ``'sgd'`` / ``'sgd_rms'``: no Newton-Schulz — ``xorl.optim.ScaledSGD``
+        applies raw ``lr*G`` (sgd) or the per-matrix RMS-normalized update
+        whose step size matches Muon's ``match_rms_adamw`` semantics at the
+        same lr (sgd_rms; see the ScaledSGD docstring for the exact formula).
+        Both are gather-free on every fold param (sgd_rms needs only scalar
+        norm all_reduces for matrix-dim-sharded 2D params), so the fold step
+        is strictly cheaper than the Muon path.
+
+        Momentum (``_resolve_zorl_fresh_ab_fold_momentum``) composes with all
+        three modes using the same EMA+Nesterov form (xorl Muon semantics),
+        with shard-local buffers created lazily on the first fold that uses
+        momentum > 0.
+        """
+        mode = self._resolve_zorl_fresh_ab_fold_optimizer_mode()
+        param_names = tuple(sorted(base_params))
+        cache_key = (mode, param_names)
+        cached = getattr(self, "_zorl_fresh_ab_base_optimizer", None)
+        cached_key = getattr(self, "_zorl_fresh_ab_base_optimizer_key", None)
+        if cached is not None and cached_key == cache_key:
+            return cached
+
+        optimizer_kwargs = dict(self._get_optimizer_kwargs() or {})
+        momentum, nesterov = self._resolve_zorl_fresh_ab_fold_momentum(
+            default_momentum=optimizer_kwargs.get("muon_momentum", 0.0),
+            default_nesterov=optimizer_kwargs.get("muon_nesterov", False),
+        )
+        momentum_dtype_override = self._resolve_zorl_fresh_ab_fold_momentum_dtype()
+
+        if mode == "muon":
+            optimizer_kwargs["muon_momentum"] = momentum
+            optimizer_kwargs["muon_nesterov"] = nesterov
+            optimizer_kwargs.setdefault("muon_adjust_lr_fn", "match_rms_adamw")
+            if not torch.cuda.is_available():
+                optimizer_kwargs.setdefault("muon_ns_use_quack_kernels", False)
+            optimizer_kwargs["muon_distributed_mode"] = os.environ.get(
+                "XORL_ZORL_FRESH_AB_MUON_DISTRIBUTED_MODE", "full_matrix"
+            )
+            optimizer_kwargs["muon_lr"] = float(lr)
+            if momentum_dtype_override is not None:
+                optimizer_kwargs["muon_momentum_dtype"] = momentum_dtype_override
+
+            wrapper_module = LoRAAdapterManager._build_parameter_module(base_params)
+            # The optimizer factory skips frozen params; the base weights are frozen
+            # in LoRA mode, so flip requires_grad only for the build. The optimizer
+            # itself only reads .grad, which we assign manually during the fold.
+            flipped = [param for param in base_params.values() if not param.requires_grad]
+            try:
+                for param in flipped:
+                    param.requires_grad_(True)
+                optimizer = build_optimizer(
+                    wrapper_module,
+                    lr=float(lr),
+                    weight_decay=0.0,
+                    fused=False,
+                    optimizer_type="muon",
+                    optimizer_dtype=self.train_config.get("optimizer_dtype", "bf16"),
+                    optimizer_kwargs=optimizer_kwargs,
+                )
+            finally:
+                for param in flipped:
+                    param.requires_grad_(False)
+            detail = (
+                f"{optimizer_kwargs['muon_distributed_mode']} NS, adjust_lr_fn={optimizer_kwargs['muon_adjust_lr_fn']}"
+            )
+        else:
+            from xorl.optim.optimizer import _collect_fused_gate_up_ids  # noqa: PLC0415
+            from xorl.optim.scaled_sgd import (  # noqa: PLC0415
+                SCALE_MODE_MATCH_MUON_RMS,
+                SCALE_MODE_RAW,
+                ScaledSGD,
+            )
+
+            # Fused gate_up detection runs on the same name-preserving wrapper
+            # module the muon path hands to build_optimizer.
+            wrapper_module = LoRAAdapterManager._build_parameter_module(base_params)
+            fused_gate_up_ids = _collect_fused_gate_up_ids(wrapper_module)
+            scale_mode = SCALE_MODE_RAW if mode == "sgd" else SCALE_MODE_MATCH_MUON_RMS
+            optimizer = ScaledSGD(
+                [
+                    {
+                        "params": [base_params[name] for name in param_names],
+                        "lr": float(lr),
+                        "weight_decay": 0.0,
+                        "_fused_gate_up_ids": fused_gate_up_ids,
+                    }
+                ],
+                lr=float(lr),
+                momentum=momentum,
+                nesterov=nesterov,
+                weight_decay=0.0,
+                scale_mode=scale_mode,
+                adjust_lr_fn="match_rms_adamw",
+                momentum_dtype=momentum_dtype_override,
+            )
+            detail = f"scale_mode={scale_mode}, no NS"
+
+        self._zorl_fresh_ab_base_optimizer = optimizer
+        self._zorl_fresh_ab_base_optimizer_key = cache_key
+        logger.info(
+            f"ZORL fresh_ab base optimizer initialized over {len(base_params)} base weight params "
+            f"({mode}, {detail}, momentum={momentum}, nesterov={nesterov})"
+        )
+        return optimizer
+
+    @staticmethod
+    def _zorl_master_local_tensor(param: torch.nn.Parameter) -> torch.Tensor:
+        """Return the storage-bearing local tensor for a plain tensor or DTensor."""
+        try:
+            from torch.distributed._tensor import DTensor  # noqa: PLC0415
+        except ImportError:
+            DTensor = None
+        if DTensor is not None and isinstance(param, DTensor):
+            return param._local_tensor
+        return param.data
+
+    @staticmethod
+    def _zorl_master_logical_contribution_scale(param: torch.nn.Parameter) -> float:
+        """Scale a local statistic so a world all-reduce counts each logical value once."""
+        try:
+            from torch.distributed._tensor import DTensor  # noqa: PLC0415
+        except ImportError:
+            DTensor = None
+
+        if DTensor is not None and isinstance(param, DTensor):
+            replication_factor = 1
+            for mesh_dim, placement in enumerate(param.placements):
+                if placement.is_replicate():
+                    replication_factor *= int(param.device_mesh.mesh.size(mesh_dim))
+            return 1.0 / float(replication_factor)
+
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            return 1.0 if dist.get_rank() == 0 else 0.0
+        return 1.0
+
+    def _validate_zorl_fp32_master_params(
+        self,
+        base_params: Dict[str, torch.nn.Parameter],
+    ) -> None:
+        """Fail before mutation unless every fresh_ab target has FP32 storage."""
+        wrong = []
+        for name, param in base_params.items():
+            local = self._zorl_master_local_tensor(param)
+            if param.dtype != torch.float32 or local.dtype != torch.float32:
+                wrong.append(f"{name}: global={param.dtype}, local={local.dtype}")
+        if wrong:
+            preview = "; ".join(wrong[:8])
+            raise RuntimeError(
+                "ZORL fresh_ab requires an FP32 master for every targeted base parameter; "
+                f"found {len(wrong)}/{len(base_params)} non-FP32 targets ({preview})."
+            )
+
+    def _apply_zorl_fresh_ab_base_update(
+        self,
+        model_id: str,
+        *,
+        pair_seeds_and_scores: List[tuple[int, int, float]],
+        learning_rate: float,
+    ) -> tuple[float, float]:
+        """Fold the fresh_ab reward-weighted update into the base weights, streaming.
+
+        Builds G[module] = (1/N) * sum_i z_i * scaling * (eps_B,i @ eps_A,i)
+        for every LoRA-targeted base weight, sets ``param.grad = -G`` (sliced
+        to the local DTensor shard when the base is FSDP-sharded; G itself is
+        seed-deterministic and identical on every rank), and steps the
+        dedicated fold optimizer (``_get_zorl_fresh_ab_base_optimizer``):
+
+          * mode ``muon`` (default): applied delta ``+adjusted_lr * NS(G̃)``.
+            Muon's spectrally-scaled step is its own trust region, so no
+            gradient clipping is applied (matching the sglang fresh_ab Muon
+            path).
+          * mode ``sgd``: applied delta ``+lr * G̃`` (raw, no NS, no scale
+            normalization — the lr does NOT transfer from the muon arm).
+          * mode ``sgd_rms``: per NS-granularity matrix,
+            ``+adjusted_lr * sqrt(min(A,B)) * G̃_m / ||G̃_m||_F`` — Muon's
+            match_rms_adamw step size on the raw G direction, so the muon lr
+            transfers unchanged (see ``xorl.optim.scaled_sgd``).
+
+        G̃ is G after the optional fold-stream momentum (EMA + Nesterov, one
+        update per fold, identical form in all modes). ``grad_norm`` is
+        ||G||_F (pre-momentum, mode-independent); ``update_norm`` is the norm
+        of the delta that actually lands in authoritative FP32 master storage.
+        The fold contract also reports its RMS and the corresponding rounded
+        BF16-view movement consumed by the FP8 sparse-sync path.
+
+        STREAMING FOLD (module-chunk-major, sglang dense_accum discipline):
+        the naive form of this fold holds every module's dense fp32 G on the
+        host, creating a full fp32 model copy per rank and potentially
+        exhausting host memory. Instead, base params are processed in chunks bounded by
+        ``XORL_ZORL_FRESH_AB_FOLD_CHUNK_BYTES`` (default 4GiB of full-shape
+        fp32 G); per chunk: accumulate G on the params' own device, take the
+        norm, negate, slice to the local shard, drop the full buffers, and
+        step the optimizer for just that chunk. Each param's step depends
+        only on its own grad and its own per-param optimizer state, and each
+        param carries a grad in EXACTLY ONE chunk per fold (grads are cleared
+        after every chunk step, so the other chunks' steps skip it), so
+        per-chunk ``optimizer.step()`` calls are mathematically identical to
+        one global step — including with fold-stream momentum > 0, whose
+        per-param EMA buffer is updated exactly once per fold, in the one
+        chunk step that sees the param's grad. (Per-chunk stepping is
+        REQUIRED regardless: Muon retains every stepped param's post-NS
+        update until the step ends — full-shape for matrix-dim-sharded
+        params — which at whole-model scope would itself OOM the GPU.)
+
+        MUON MODE (full_matrix): the optimizer runs NS batched over each
+        param's local expert shard for batch-dim-sharded (Shard(0)) MoE
+        stacks — exactly the full-Muon update at 1/world of the NS FLOPs
+        with zero allgather — and falls back to the full_gradient gather
+        only for matrix-dim-sharded params (the small 2D shared_expert
+        projections). See ``_get_zorl_fresh_ab_base_optimizer``.
+
+        Rough peak-memory accounting per rank, per chunk (live at peak,
+        beyond the resident model/optimizer):
+          * chunk's full-shape fp32 G buffers        <= chunk budget (GPU)
+          * one pair's eps_A + eps_B draw            ~2 x 4B/adapter-param (GPU)
+          * one module's transient dense delta       <= largest module G (GPU)
+          * during step: chunk's local-shard grads (param dtype) + Muon
+            NS transients (shard-sized for expert stacks; full-shape only
+            for matrix-dim-sharded params)           <= ~chunk budget (GPU)
+          * HOST: nothing model-scale (no CPU staging anywhere in the fold)
+        Cost of streaming: the per-seed noise layout is redrawn once per
+        (chunk, pair) to keep seed transport bit-exact — ~num_chunks x
+        num_pairs x 2 batched randn draws, seconds per generation on GPU.
+
+        Returns (update_norm, grad_norm).
+        """
+        adapter_state = self._adapter_manager.get_adapter_state(model_id)
+        session_spec = self.get_lora_session_spec(model_id)
+        lora_config = session_spec["lora_config"]
+        scaling = float(lora_config["lora_alpha"]) / float(lora_config["lora_rank"])
+        lora_params = adapter_state.lora_params
+
+        # The scorer materializes candidates from full logical LoRA factors.
+        # Adapter optimizer slots, however, are local FSDP rectangles: two
+        # factors of one dense module may be sharded along different matrix
+        # dimensions and therefore cannot be contracted in their stored
+        # shapes. Draw every factor in the scorer's logical shape. For
+        # EP-owned expert stacks, select only the EP expert slab; keep every
+        # matrix/rank dimension full because the base-gradient buffer is full
+        # over the enclosing FSDP mesh and is sharded only after the fold.
+        logical_shapes: Dict[str, tuple[int, ...]] = {}
+        local_slices: Dict[str, tuple[slice, ...]] = {}
+        tensor_layouts = getattr(adapter_state, "tensor_layouts", {})
+        model = getattr(self, "model", None)
+        spec_info_by_name = getattr(model, "_fqn2spec_info", {}) if model is not None else {}
+        for name, param in lora_params.items():
+            layout = tensor_layouts.get(name)
+            if layout is None:
+                continue
+            logical_shapes[name] = tuple(layout.logical_shape)
+            if not layout.is_ep_owned:
+                continue
+            spec_info = spec_info_by_name.get(layout.fqn) or spec_info_by_name.get(name)
+            if spec_info is None:
+                raise RuntimeError(f"Missing EP placement metadata for ZORL LoRA tensor {name}")
+            placement = getattr(spec_info, "placement", None)
+            if placement.__class__.__name__ == "Replicate":
+                continue
+            if placement.__class__.__name__ != "Shard":
+                raise RuntimeError(f"Unsupported EP LoRA placement for {name}: {placement!r}")
+            ep_dim = int(placement.dim)
+            if ep_dim < 0:
+                ep_dim += len(layout.logical_shape)
+            if ep_dim < 0 or ep_dim >= len(layout.logical_shape):
+                raise RuntimeError(f"Invalid EP LoRA shard dimension for {name}: {placement!r}")
+            slices = [slice(None)] * len(layout.logical_shape)
+            offset = int(layout.active_global_offset[ep_dim])
+            size = int(layout.active_storage_shape[ep_dim])
+            slices[ep_dim] = slice(offset, offset + size)
+            local_slices[name] = tuple(slices)
+        logger.info(
+            "ZORL fresh_ab logical fold layout: "
+            f"logical_factors={len(logical_shapes)} ep_sliced_factors={len(local_slices)}"
+        )
+
+        modules = pair_zorl_fresh_ab_lora_params(lora_params)
+        resolution = self._resolve_zorl_fresh_ab_base_params(modules.keys())
+
+        # Group LoRA module keys by their base parameter. Fused MoE gate/up
+        # modules write into disjoint last-dim windows of one param.
+        base_params: Dict[str, torch.nn.Parameter] = {}
+        param_modules: Dict[str, List[tuple[str, Optional[tuple[int, ...]]]]] = {}
+        for module_key, (param_name, param, param_slice) in resolution.items():
+            base_params[param_name] = param
+            param_modules.setdefault(param_name, []).append((module_key, param_slice))
+
+        # The ES step is deliberately sub-BF16-ULP. Keeping the authoritative
+        # weights in BF16 silently discards most of it, so refuse the fold
+        # before baseline capture, optimizer construction, or any mutation.
+        self._validate_zorl_fp32_master_params(base_params)
+
+        # Prime-lite (fold-aware sparse-delta sync): capture the quantized
+        # PRISTINE master for exactly these fold-target params BEFORE this
+        # first fold mutates them — the capture, digest-verified against the
+        # FP8-checkpoint parity overlay, replaces the sync's one-time priming
+        # full push. No-op unless
+        # XORL_SPARSE_DELTA_FOLD_PRIME_OVERLAY is set. Collective (dense
+        # full_tensor gathers) — every rank reaches this point in the fold.
+        self._maybe_capture_zorl_prefold_baseline(tuple(sorted(base_params)))
+
+        optimizer = self._get_zorl_fresh_ab_base_optimizer(base_params, lr=float(learning_rate))
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = float(learning_rate)
+
+        try:
+            from torch.distributed._tensor import DTensor  # noqa: PLC0415
+
+            from xorl.optim.muon import _shard_full_to_local  # noqa: PLC0415
+
+            has_dtensor = True
+        except ImportError:
+            has_dtensor = False
+
+        # Pack base params (sorted for cross-rank determinism: every rank must
+        # run the same chunk sequence so Muon full_gradient collectives align)
+        # into chunks bounded by the full-shape fp32 G byte budget.
+        chunk_bytes_budget = int(os.environ.get("XORL_ZORL_FRESH_AB_FOLD_CHUNK_BYTES", str(4 << 30)))
+        chunks: List[List[str]] = []
+        current: List[str] = []
+        current_bytes = 0
+        for param_name in sorted(base_params):
+            param_bytes = int(base_params[param_name].numel()) * 4
+            if current and current_bytes + param_bytes > chunk_bytes_budget:
+                chunks.append(current)
+                current, current_bytes = [], 0
+            current.append(param_name)
+            current_bytes += param_bytes
+        if current:
+            chunks.append(current)
+
+        # ||G||_F^2 accumulates on-device (fp64, per-module in sorted order —
+        # the same order and IEEE adds as the previous python-float sum, so
+        # chunked == monolithic stays exact) with a single host sync after the
+        # loop instead of one blocking .item() per module per chunk.
+        squared_norm_acc: Optional[torch.Tensor] = None
+        applied_squared_norm_acc: Optional[torch.Tensor] = None
+        bf16_view_squared_norm_acc: Optional[torch.Tensor] = None
+        logical_numel_acc: Optional[torch.Tensor] = None
+        bf16_view_changed_acc: Optional[torch.Tensor] = None
+        for chunk in chunks:
+            # (1) Full-shape fp32 G buffers for THIS chunk only, on the params'
+            # own device; per-module accumulator views alias into them.
+            buffers: Dict[str, torch.Tensor] = {}
+            accumulators: Dict[str, torch.Tensor] = {}
+            for param_name in chunk:
+                param = base_params[param_name]
+                buf = torch.zeros(tuple(param.shape), dtype=torch.float32, device=param.device)
+                buffers[param_name] = buf
+                for module_key, param_slice in param_modules[param_name]:
+                    if param_slice is None:
+                        accumulators[module_key] = buf
+                    elif len(param_slice) == 2:
+                        accumulators[module_key] = buf.narrow(-1, param_slice[0], param_slice[1])
+                    else:
+                        accumulators[module_key] = buf.narrow(param_slice[0], param_slice[1], param_slice[2])
+            noise_layout = zorl_noise_layout_from_env()
+            if noise_layout == ZORL_NOISE_LAYOUT_V2:
+                # v2 (philox_subseed_v2): per-raw-entry sub-seeded streams —
+                # zero full-layout redraws and pair-stacked tensor-core GEMMs
+                # (Triton generator when available).
+                accumulate_zorl_fresh_ab_base_update_gemm_(
+                    lora_params,
+                    accumulators,
+                    pair_seeds_and_scores=pair_seeds_and_scores,
+                    scaling=scaling,
+                    noise_layout=noise_layout,
+                    logical_shapes=logical_shapes,
+                    local_slices=local_slices,
+                )
+            else:
+                accumulate_zorl_fresh_ab_base_update_(
+                    lora_params,
+                    accumulators,
+                    pair_seeds_and_scores=pair_seeds_and_scores,
+                    scaling=scaling,
+                    logical_shapes=logical_shapes,
+                    local_slices=local_slices,
+                )
+
+            # (2) ||G||_F contribution, per module (matches the reference
+            # builder's per-module accumulation order), no host sync.
+            for module_key in sorted(accumulators):
+                view = accumulators[module_key]
+                part = torch.sum(view * view).double()
+                squared_norm_acc = part if squared_norm_acc is None else squared_norm_acc + part
+
+            # (3) grad = -G, local shard only, in param dtype. copy=True forces
+            # the grads off the full-shape buffers so (4) frees them before the
+            # optimizer's own NS transients appear.
+            for param_name in chunk:
+                param = base_params[param_name]
+                buf = buffers[param_name]
+                buf.neg_()
+                if has_dtensor and isinstance(param, DTensor):
+                    grad_local = _shard_full_to_local(buf, param.device_mesh, param.placements).to(
+                        dtype=param.dtype, copy=True
+                    )
+                    param.grad = DTensor.from_local(grad_local, param.device_mesh, param.placements, run_check=False)
+                else:
+                    param.grad = buf.to(device=param.device, dtype=param.dtype, copy=True)
+
+            # (4) Free the chunk's full G buffers, then step just this chunk
+            # (params outside the chunk have grad None and are skipped).
+            del buffers, accumulators
+
+            master_before = {
+                param_name: self._zorl_master_local_tensor(base_params[param_name]).detach().clone()
+                for param_name in chunk
+            }
+            optimizer.step()
+
+            # Measure what actually landed in authoritative FP32 storage, and
+            # separately what survives the BF16 serving view used by sparse
+            # sync before FP8 quantization. These are logical global norms:
+            # DTensor replicas are divided out before the world reduction.
+            for param_name in chunk:
+                param = base_params[param_name]
+                after = self._zorl_master_local_tensor(param).detach()
+                before = master_before[param_name]
+                contribution_scale = self._zorl_master_logical_contribution_scale(param)
+
+                delta = after - before
+                applied_part = torch.sum(delta * delta).double() * contribution_scale
+                applied_squared_norm_acc = (
+                    applied_part if applied_squared_norm_acc is None else applied_squared_norm_acc + applied_part
+                )
+
+                before_bf16 = before.to(torch.bfloat16)
+                after_bf16 = after.to(torch.bfloat16)
+                bf16_delta = after_bf16.float() - before_bf16.float()
+                bf16_part = torch.sum(bf16_delta * bf16_delta).double() * contribution_scale
+                bf16_view_squared_norm_acc = (
+                    bf16_part if bf16_view_squared_norm_acc is None else bf16_view_squared_norm_acc + bf16_part
+                )
+                changed_part = torch.count_nonzero(after_bf16 != before_bf16).double() * contribution_scale
+                bf16_view_changed_acc = (
+                    changed_part if bf16_view_changed_acc is None else bf16_view_changed_acc + changed_part
+                )
+                numel_part = torch.tensor(
+                    float(after.numel()) * contribution_scale,
+                    dtype=torch.float64,
+                    device=after.device,
+                )
+                logical_numel_acc = numel_part if logical_numel_acc is None else logical_numel_acc + numel_part
+
+                del delta, before_bf16, after_bf16, bf16_delta
+
+            del master_before
+            optimizer.zero_grad()
+            for param_name in chunk:
+                base_params[param_name].grad = None
+
+        squared_norm = float(squared_norm_acc.item()) if squared_norm_acc is not None else 0.0
+        grad_norm = math.sqrt(max(squared_norm, 0.0))
+
+        if any(
+            value is None
+            for value in (
+                applied_squared_norm_acc,
+                bf16_view_squared_norm_acc,
+                logical_numel_acc,
+                bf16_view_changed_acc,
+            )
+        ):
+            raise RuntimeError("ZORL fresh_ab produced no applied-update statistics.")
+
+        applied_stats = torch.stack(
+            (
+                applied_squared_norm_acc,
+                bf16_view_squared_norm_acc,
+                logical_numel_acc,
+                bf16_view_changed_acc,
+            )
+        )
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            dist.all_reduce(applied_stats, op=dist.ReduceOp.SUM)
+        applied_squared_norm, bf16_view_squared_norm, logical_numel, bf16_view_changed = (
+            float(value) for value in applied_stats.tolist()
+        )
+        update_norm = math.sqrt(max(applied_squared_norm, 0.0))
+        update_rms = math.sqrt(max(applied_squared_norm, 0.0) / max(logical_numel, 1.0))
+        bf16_view_update_norm = math.sqrt(max(bf16_view_squared_norm, 0.0))
+        bf16_view_changed_fraction = bf16_view_changed / max(logical_numel, 1.0)
+        if not math.isfinite(update_norm) or update_norm <= 0.0:
+            raise RuntimeError(f"ZORL fresh_ab applied update is invalid: update_norm={update_norm!r}")
+
+        # Record the fold-touched base params for the fold-aware sparse-delta
+        # weight sync (WeightSyncHandler._sync_zorl_fold_sparse_delta): after
+        # this fold, ONLY these params differ from the served weights, so the
+        # sync can restrict itself to them and byte-diff their quantized form.
+        fold_index = int(getattr(self, "_zorl_fresh_ab_fold_count", 0)) + 1
+        self._zorl_fresh_ab_fold_count = fold_index
+        self._zorl_fresh_ab_last_fold = {
+            "model_id": model_id,
+            "fold_index": fold_index,
+            "base_param_names": tuple(sorted(base_params)),
+            "logical_module_count": len(resolution),
+            "base_param_count": len(base_params),
+            "factor_tensor_count": 2 * len(resolution),
+            "chunk_count": len(chunks),
+            "optimizer": self._resolve_zorl_fresh_ab_fold_optimizer_mode(),
+            "master_dtype": "float32",
+            "grad_norm": float(grad_norm),
+            "update_norm": float(update_norm),
+            "update_rms": float(update_rms),
+            "bf16_view_update_norm": float(bf16_view_update_norm),
+            "bf16_view_changed_fraction": float(bf16_view_changed_fraction),
+        }
+
+        logger.info(
+            f"ZORL fresh_ab fold applied: model_id={model_id} modules={len(resolution)} "
+            f"base_params={len(base_params)} chunks={len(chunks)} "
+            f"optimizer={self._resolve_zorl_fresh_ab_fold_optimizer_mode()} "
+            f"grad_norm={grad_norm:.6e} update_norm={update_norm:.6e} "
+            f"update_rms={update_rms:.6e} bf16_view_update_norm={bf16_view_update_norm:.6e} "
+            f"bf16_view_changed_fraction={bf16_view_changed_fraction:.6e} lr={learning_rate:.3e}"
+        )
+        return float(update_norm), float(grad_norm)
+
+    def _zorl_prefold_all_ranks_min(self, value: int) -> int:
+        """MIN-consensus over all trainer ranks (1 only if every rank says 1)."""
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            device = (
+                torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+            )
+            flag = torch.tensor([int(value)], dtype=torch.int64, device=device)
+            dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+            return int(flag.item())
+        return int(value)
+
+    def _maybe_capture_zorl_prefold_baseline(self, base_param_names: tuple[str, ...]) -> bool:
+        """Prime-lite capture for the fold-aware sparse-delta weight sync.
+
+        Called from ``_apply_zorl_fresh_ab_base_update`` BEFORE the first
+        fold mutates the base params: quantizes the pristine master for the
+        fold-target params, verifies it byte-exactly against the FP8
+        checkpoint parity overlay (``XORL_SPARSE_DELTA_FOLD_PRIME_OVERLAY``),
+        corrects it to the receivers' load-time served bytes, and commits it
+        under ``zfsd.PRIME_LITE_SCOPE`` for the sync handler to adopt in
+        place of the one-time priming full push. Every failure path degrades
+        to a no-op (the sync then primes via the full push as before).
+
+        Choreography: the dense captures use collective ``full_tensor``
+        gathers, so participation is decided by a cross-rank consensus after
+        the rank-local prepare phase — either every rank captures or none.
+        """
+        if getattr(self, "_zorl_prefold_capture_done", False):
+            return False
+        if int(getattr(self, "_zorl_fresh_ab_fold_count", 0)) != 0:
+            self._zorl_prefold_capture_done = True
+            return False
+        from xorl.server.weight_sync import zorl_fold_sparse_delta as zfsd  # noqa: PLC0415
+
+        self._zorl_prefold_capture_done = True
+        overlay_path = zfsd.prime_lite_overlay_path()
+        started = time.perf_counter()
+        prepared = None
+        prep_error: Optional[str] = None
+        if overlay_path:
+            try:
+                overlay = zfsd.load_prime_overlay(overlay_path)
+                quantization = dict((overlay.get("meta") or {}).get("quantization") or {})
+                quantize_stack_fn, unfuse_fn, quantize_buffer_fn, block_size, mode_tag = zfsd.make_prefold_quantize_fns(
+                    self.model, quantization
+                )
+                plan = zfsd.build_fold_sync_plan(self.model, base_param_names, fold_index=0)
+                prepared = (overlay, quantize_stack_fn, unfuse_fn, quantize_buffer_fn, block_size, mode_tag, plan)
+            except Exception as exc:  # noqa: BLE001 - prime-lite must never break the fold
+                prep_error = f"{type(exc).__name__}: {exc}"
+        else:
+            prep_error = "XORL_SPARSE_DELTA_FOLD_PRIME_OVERLAY not configured"
+        # The consensus all_reduce must run UNCONDITIONALLY on every rank
+        # (even when the feature is off) so a per-rank env divergence can
+        # never strand peers in the collective.
+        if self._zorl_prefold_all_ranks_min(1 if prepared is not None else 0) == 0:
+            if overlay_path:
+                logger.warning(
+                    "ZORL prime-lite: capture skipped (%s); the first sync will prime via the full push",
+                    prep_error or "a peer rank failed to prepare",
+                )
+            return False
+        overlay, quantize_stack_fn, unfuse_fn, quantize_buffer_fn, block_size, mode_tag, plan = prepared
+        is_rank0 = not (dist.is_available() and dist.is_initialized()) or dist.get_rank() == 0
+        store = zfsd.FoldBaselineStore.for_scope(zfsd.PRIME_LITE_SCOPE)
+        ok, reason = zfsd.run_prefold_capture(
+            plan,
+            overlay,
+            store=store,
+            quantize_stack_fn=quantize_stack_fn,
+            unfuse_fn=unfuse_fn,
+            quantize_buffer_fn=quantize_buffer_fn,
+            is_rank0=is_rank0,
+            block_size=block_size,
+            quantize_mode_tag=mode_tag,
+        )
+        if self._zorl_prefold_all_ranks_min(1 if ok else 0) == 1:
+            store.commit()
+            logger.info(
+                "ZORL prime-lite: captured + verified the pre-fold quantized baseline for "
+                f"{len(plan.expert_params)} expert + {len(plan.dense_params)} dense fold params "
+                f"({mode_tag}) in {time.perf_counter() - started:.2f}s; the first fold sync will "
+                "adopt it instead of the priming full push"
+            )
+            return True
+        else:
+            store.rollback()
+            logger.warning(
+                "ZORL prime-lite: capture failed (%s); the first sync will prime via the full push",
+                reason or "on a peer rank",
+            )
+            return False
+
+    def abort_zorl_generation(self, model_id: str, generation_id: str) -> Dict[str, Any]:
+        """Abort an active ZORL generation and delete its exported candidates."""
+        zorl_state = self._require_zorl_session(model_id)
+        aborted = zorl_state.abort_generation(generation_id)
+        materialized_ids = getattr(self, "_zorl_generation_materialized_candidate_ids", {}).pop(
+            (model_id, aborted.generation_id),
+            None,
+        )
+        deleted_candidates = self._cleanup_zorl_generation_exports(
+            aborted.generation_id, candidate_ids=materialized_ids
+        )
+        return {
+            "success": True,
+            "model_id": model_id,
+            "generation_id": aborted.generation_id,
+            "deleted_candidates": deleted_candidates,
+        }
+
+    @staticmethod
+    def _zorl_sampled_tensor_digest(named_tensors: Dict[str, torch.Tensor]) -> str:
+        """Cheap deterministic fingerprint over shapes and evenly sampled values."""
+        digest = hashlib.sha256()
+        try:
+            from torch.distributed._tensor import DTensor  # noqa: PLC0415
+        except ImportError:
+            DTensor = ()  # type: ignore[assignment,misc]
+
+        for name in sorted(named_tensors):
+            tensor = named_tensors[name]
+            local = tensor.to_local() if DTensor and isinstance(tensor, DTensor) else tensor
+            flat = local.detach().reshape(-1)
+            digest.update(name.encode("utf-8"))
+            digest.update(str(tuple(tensor.shape)).encode("ascii"))
+            digest.update(str(tensor.dtype).encode("ascii"))
+            if flat.numel() == 0:
+                continue
+            count = min(64, int(flat.numel()))
+            if count == 1:
+                indices = torch.zeros(1, dtype=torch.long, device=flat.device)
+            else:
+                indices = (
+                    torch.arange(count, dtype=torch.long, device=flat.device) * (int(flat.numel()) - 1) // (count - 1)
+                )
+            sample = flat.index_select(0, indices).contiguous().cpu()
+            digest.update(sample.view(torch.uint8).numpy().tobytes())
+        return digest.hexdigest()
+
+    def _zorl_reset_fingerprint(
+        self,
+        *,
+        base_params: Dict[str, torch.nn.Parameter],
+        lora_params: Dict[str, torch.nn.Parameter],
+    ) -> Dict[str, Any]:
+        """Return rank-local sampled hashes plus the global LoRA-B zero gate."""
+        local = {
+            "rank": int(dist.get_rank()) if dist.is_available() and dist.is_initialized() else 0,
+            "base_sample_sha256": self._zorl_sampled_tensor_digest(base_params),
+            "lora_sample_sha256": self._zorl_sampled_tensor_digest(lora_params),
+        }
+        per_rank = [local]
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            per_rank = [None] * dist.get_world_size()
+            dist.all_gather_object(per_rank, local)
+
+        device = next(iter(lora_params.values())).device
+        b_max = torch.zeros(1, dtype=torch.float32, device=device)
+        for name, param in lora_params.items():
+            if "lora_B" in name and param.numel():
+                b_max = torch.maximum(b_max, param.detach().abs().max().float().reshape(1))
+        if dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
+            dist.all_reduce(b_max, op=dist.ReduceOp.MAX)
+        return {
+            "base_param_count": len(base_params),
+            "lora_tensor_count": len(lora_params),
+            "lora_b_max_abs": float(b_max.item()),
+            "per_rank": per_rank,
+        }
+
+    def reset_zorl_session(
+        self,
+        model_id: str,
+        *,
+        checkpoint_path: Optional[str] = None,
+        a_seed: int,
+        a_init: str = "gaussian_jl",
+        zorl_seed: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Restore a fresh experimental parent without restarting the PS.
+
+        This is intentionally narrow: only the configured model-only DCP may
+        be used.  It restores base weights, deterministically reinitializes A,
+        zeros B, clears both adapter and fold-optimizer state, resets ZORL
+        generation bookkeeping, and records the restored tensors as the next
+        fold-aware sparse-delta sync boundary.
+        """
+        zorl_state = self._require_zorl_session(model_id)
+        if zorl_state.active_generation is not None:
+            raise ValueError(
+                f"Cannot reset ZORL session while generation {zorl_state.active_generation.generation_id} is active"
+            )
+
+        configured_checkpoint = self.train_config.get("load_checkpoint_path")
+        resolved_checkpoint = checkpoint_path or configured_checkpoint
+        if not resolved_checkpoint:
+            raise ValueError("ZORL reset requires the server load_checkpoint_path or an explicit checkpoint_path")
+        configured_real = os.path.realpath(str(configured_checkpoint)) if configured_checkpoint else None
+        resolved_real = os.path.realpath(str(resolved_checkpoint))
+        if configured_real is not None and resolved_real != configured_real:
+            raise ValueError(
+                "ZORL reset checkpoint must equal the immutable server load_checkpoint_path: "
+                f"requested={resolved_real!r} configured={configured_real!r}"
+            )
+
+        adapter_state = self._adapter_manager.get_adapter_state(model_id)
+        modules = pair_zorl_fresh_ab_lora_params(adapter_state.lora_params)
+        resolution = self._resolve_zorl_fresh_ab_base_params(modules.keys())
+        base_params = {param_name: param for param_name, param, _slice in resolution.values()}
+        prior_fold = int(getattr(self, "_zorl_fresh_ab_fold_count", 0))
+        prior_info = dict(getattr(self, "_zorl_fresh_ab_last_fold", {}) or {})
+        reset_sync_index = max(prior_fold, int(prior_info.get("fold_index", 0))) + 1
+
+        restore = self._checkpoint_mgr.restore_base_state(resolved_real)
+        self._validate_zorl_fp32_master_params(base_params)
+        self._adapter_manager.reinitialize_adapter_for_zorl_family(
+            model_id,
+            a_seed=int(a_seed),
+            a_init=a_init,
+        )
+        adapter_state = self._adapter_manager.get_adapter_state(model_id)
+        adapter_state.global_step = 0
+        adapter_state.global_forward_backward_step = 0
+        adapter_state.last_access_time = time.time()
+        family = zorl_state.reset_runtime(a_seed=int(a_seed), a_init=a_init, zorl_seed=zorl_seed)
+
+        self._zorl_fresh_ab_base_optimizer = None
+        self._zorl_fresh_ab_base_optimizer_key = None
+        self._zorl_fresh_ab_fold_count = 0
+        from xorl.server.weight_sync import zorl_fold_sparse_delta as zfsd  # noqa: PLC0415
+
+        # Rebuild the overlay-corrected load-time FP8 target. Re-quantizing
+        # the restored BF16 master is close but not byte-identical to what the
+        # samplers booted serving, and therefore is not a scientific reset.
+        zfsd.FoldBaselineStore.for_scope(zfsd.PRIME_LITE_SCOPE).clear()
+        self._zorl_prefold_capture_done = False
+        if not self._maybe_capture_zorl_prefold_baseline(tuple(sorted(base_params))):
+            raise RuntimeError(
+                "ZORL reset could not capture the exact FP8 checkpoint target from the prime-lite overlay"
+            )
+        self._zorl_fresh_ab_last_fold = {
+            "model_id": model_id,
+            "fold_index": reset_sync_index,
+            "base_param_names": tuple(sorted(base_params)),
+            "logical_module_count": len(resolution),
+            "base_param_count": len(base_params),
+            "factor_tensor_count": len(adapter_state.lora_params),
+            "chunk_count": 0,
+            "optimizer": "reset",
+            "master_dtype": "float32",
+            "reset": True,
+        }
+        self._zorl_prefold_capture_done = True
+        materialized = getattr(self, "_zorl_generation_materialized_candidate_ids", {})
+        for key in [key for key in materialized if key[0] == model_id]:
+            materialized.pop(key, None)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        fingerprint = self._zorl_reset_fingerprint(
+            base_params=base_params,
+            lora_params=adapter_state.lora_params,
+        )
+        if fingerprint["lora_b_max_abs"] != 0.0:
+            raise RuntimeError(f"ZORL reset failed the LoRA-B zero gate: max_abs={fingerprint['lora_b_max_abs']:.6e}")
+        logger.info(
+            "ZORL session reset prepared: model_id=%s checkpoint=%s reset_sync_index=%d "
+            "a_seed=%d zorl_seed=%s base_params=%d",
+            model_id,
+            resolved_real,
+            reset_sync_index,
+            int(a_seed),
+            zorl_state.config.get("seed"),
+            len(base_params),
+        )
+        return {
+            "success": True,
+            "model_id": model_id,
+            "checkpoint_path": resolved_real,
+            "restore_time": float(restore.get("load_time", 0.0)),
+            "a_init": a_init,
+            "a_seed": int(a_seed),
+            "zorl_seed": zorl_state.config.get("seed"),
+            "family_id": family.family_id,
+            "generation": 0,
+            "reset_sync_index": reset_sync_index,
+            "fold_optimizer_cleared": True,
+            "adapter_optimizer_rebuilt": True,
+            "master_dtype": "float32",
+            "fingerprint": fingerprint,
+        }

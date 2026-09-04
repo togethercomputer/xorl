@@ -145,6 +145,32 @@ class InferenceEndpointsMixin:
             return None
         return not disabled
 
+    @classmethod
+    def _server_info_speculative_decoding_active(cls, info_data: Dict[str, Any]) -> bool | None:
+        """Return receiver runtime speculative state, failing closed when it is absent.
+
+        Current SGLang exposes its resolved ServerArgs from ``/server_info``. A
+        present null algorithm and null token/step counts therefore constitute
+        an explicit report that speculative decoding is disabled. Older
+        servers that omit all of these fields remain unknown rather than being
+        assumed safe for base-only low-precision weight sync.
+        """
+        count_keys = ("speculative_num_steps", "speculative_num_draft_tokens")
+        if any(cls._positive_int_config_value(info_data.get(key)) for key in count_keys):
+            return True
+
+        algorithm_key = "speculative_algorithm"
+        if algorithm_key in info_data:
+            algorithm = info_data.get(algorithm_key)
+            if algorithm is None:
+                return False
+            normalized = str(algorithm).strip().lower()
+            return normalized not in {"", "none", "null", "disabled", "off"}
+
+        if any(key in info_data for key in count_keys):
+            return False
+        return None
+
     @staticmethod
     def _normalize_receiver_kv_cache_dtype(value: Any) -> str | None:
         if value is None:
@@ -254,7 +280,12 @@ class InferenceEndpointsMixin:
         )
 
     @classmethod
-    def _detect_quantization_from_hf_config(cls, model_path: str) -> dict | None:
+    def _detect_quantization_from_hf_config(
+        cls,
+        model_path: str,
+        *,
+        receiver_speculative_decoding_active: bool | None = None,
+    ) -> dict | None:
         """Detect quantization config from HF model's config.json.
 
         SGLang /server_info returns quantization=None for auto-detected FP8 models.
@@ -313,7 +344,13 @@ class InferenceEndpointsMixin:
             assert normalized_config is not None
             quant_config = normalized_config
 
-            reason = cls._unsupported_mtp_low_precision_reason(config_dict, quant_config)
+            # The HF checkpoint can contain MTP tensors even when the receiver
+            # did not load a speculative worker. Admit base-weight sync only
+            # when the receiver explicitly reports speculative decoding off;
+            # preserve the safety block for active and unreported runtimes.
+            reason = None
+            if receiver_speculative_decoding_active is not False:
+                reason = cls._unsupported_mtp_low_precision_reason(config_dict, quant_config)
             if reason is not None:
                 quant_config = {
                     **quant_config,
@@ -556,10 +593,14 @@ class InferenceEndpointsMixin:
                 require_allowlist=True,
             )
             worker_port = request.worker_port if request.worker_port is not None else endpoint_port
+            # ``endpoint_host`` is the IP pinned by the allowlisted hostname
+            # validation above. Requiring the allowlist again would reject
+            # that IP when the operator allowlisted an exact hostname rather
+            # than its cluster-specific address.
             _, worker_port = validate_outbound_endpoint(
                 endpoint_host,
                 worker_port,
-                require_allowlist=True,
+                require_allowlist=False,
             )
         except ValueError as exc:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
@@ -575,14 +616,14 @@ class InferenceEndpointsMixin:
             endpoint_host,
             endpoint_port,
             "/",
-            require_allowlist=True,
+            require_allowlist=False,
         ).rstrip("/")
         worker_port = request.worker_port if request.worker_port is not None else request.port
         worker_url = build_http_endpoint_url(
             endpoint_host,
             worker_port,
             "/",
-            require_allowlist=True,
+            require_allowlist=False,
         ).rstrip("/")
 
         # Check if endpoint already exists
@@ -649,6 +690,10 @@ class InferenceEndpointsMixin:
                     ),
                     cache_epoch=self._cache_epoch_from_mapping(info_data),
                     radix_cache_enabled=self._server_info_radix_cache_enabled(info_data),
+                    speculative_algorithm=info_data.get("speculative_algorithm"),
+                    speculative_num_steps=info_data.get("speculative_num_steps"),
+                    speculative_num_draft_tokens=info_data.get("speculative_num_draft_tokens"),
+                    speculative_decoding_active=self._server_info_speculative_decoding_active(info_data),
                     enable_lora=info_data.get("enable_lora"),
                     max_lora_rank=info_data.get("max_lora_rank"),
                     version=info_data.get("version"),
@@ -671,7 +716,10 @@ class InferenceEndpointsMixin:
 
         # Detect quantization from HF config.json
         if server_info is not None and server_info.model_path:
-            detected_config = self._detect_quantization_from_hf_config(server_info.model_path)
+            detected_config = self._detect_quantization_from_hf_config(
+                server_info.model_path,
+                receiver_speculative_decoding_active=server_info.speculative_decoding_active,
+            )
             if detected_config is not None:
                 server_info.quantization_config = detected_config
                 if server_info.quantization is None:

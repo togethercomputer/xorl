@@ -460,6 +460,20 @@ def load_server_arguments(config_path: str, overrides: Optional[Dict[str, any]] 
             else:
                 flat_config[k] = v
 
+        # zorl.* keys use a prefixed flat representation in ServerArguments.
+        zorl_key_map = {
+            "enabled": "enable_zorl",
+            "b_sigma": "zorl_b_sigma",
+            "num_perturbation_pairs": "zorl_num_perturbation_pairs",
+            "a_refresh_interval": "zorl_a_refresh_interval",
+            "antithetic_sampling": "zorl_antithetic_sampling",
+            "a_init": "zorl_a_init",
+            "seed": "zorl_seed",
+        }
+        for nested_key, flat_key in zorl_key_map.items():
+            if nested_key in config.get("zorl", {}):
+                flat_config[flat_key] = config["zorl"][nested_key]
+
         # data.* — only a few fields are relevant for the server
         data_config = config.get("data", {})
         if "sample_packing_sequence_len" not in flat_config:
@@ -806,6 +820,7 @@ class Launcher:
                     base_model=self.base_model or self.server_args.model_path,
                     train_config=config_dict.get("train", {}),
                     lora_config=self.server_lora_config,
+                    zorl_config=config_dict.get("zorl", {}),
                 )
                 logger.info(
                     "Using default multi-adapter session spec: "

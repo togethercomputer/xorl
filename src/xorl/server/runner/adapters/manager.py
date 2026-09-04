@@ -110,6 +110,18 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+_TORCH_MANUAL_SEED_MASK = 0x7FFFFFFFFFFFFFFF
+
+
+def _mix_torch_manual_seed(base_seed: int, *components: int) -> int:
+    """Mix deterministic seed components into PyTorch's signed 63-bit range."""
+    acc = int(base_seed) & _TORCH_MANUAL_SEED_MASK
+    for index, component in enumerate(components, start=1):
+        acc = (
+            acc * 6364136223846793005 + int(component) * 1442695040888963407 + index
+        ) & _TORCH_MANUAL_SEED_MASK
+    return acc
+
 
 _TARGET_MANIFEST_FILENAME = "lora_target_manifest.json"
 
@@ -1206,6 +1218,7 @@ class LoRAAdapterManager:
         """Return the structural part of a LoRA session spec without optimizer metadata."""
         stripped = deepcopy(session_spec)
         stripped.pop("optimizer_config", None)
+        stripped.pop("zorl_config", None)
         return stripped
 
     @staticmethod
@@ -2125,6 +2138,64 @@ class LoRAAdapterManager:
             fused=self.optimizer_fused,
             **build_kwargs,
         )
+
+    def _reset_adapter_optimizer(self, model_id: str) -> None:
+        state = self.get_adapter_state(model_id)
+        state.optimizer = self._build_adapter_optimizer_for_session(state.local_params, state.session_spec)
+
+    def reinitialize_adapter_for_zorl_family(
+        self,
+        model_id: str,
+        *,
+        a_seed: int,
+        a_init: str = "gaussian_jl",
+    ) -> None:
+        """Refresh LoRA-A deterministically and zero LoRA-B for a ZORL family."""
+        if a_init != "gaussian_jl":
+            raise ValueError(f"Unsupported ZORL LoRA-A init: {a_init!r}")
+
+        state = self.get_adapter_state(model_id)
+        try:
+            from xorl.distributed.parallel_state import get_parallel_state  # noqa: PLC0415
+
+            parallel_state = get_parallel_state()
+            ep_rank = parallel_state.ep_rank if parallel_state.ep_size > 1 else 0
+        except Exception:
+            ep_rank = 0
+
+        with torch.no_grad():
+            for name in sorted(state.local_params):
+                param = state.local_params[name]
+                if "lora_A" in name:
+                    if param.ndim == 3:
+                        num_local_experts = int(param.shape[0])
+                        input_dim = int(param.shape[1])
+                        inv_scale = 1.0 / math.sqrt(max(input_dim, 1))
+                        values = torch.empty(tuple(param.shape), dtype=torch.float32)
+                        for local_idx in range(num_local_experts):
+                            global_expert_idx = ep_rank * num_local_experts + local_idx
+                            generator = torch.Generator(device="cpu")
+                            generator.manual_seed(_mix_torch_manual_seed(a_seed, global_expert_idx))
+                            torch.randn(
+                                tuple(param.shape[1:]),
+                                generator=generator,
+                                dtype=torch.float32,
+                                out=values[local_idx],
+                            )
+                    else:
+                        input_dim = int(param.shape[1]) if param.ndim > 1 else int(param.numel())
+                        inv_scale = 1.0 / math.sqrt(max(input_dim, 1))
+                        generator = torch.Generator(device="cpu")
+                        generator.manual_seed(_mix_torch_manual_seed(a_seed))
+                        values = torch.randn(tuple(param.shape), generator=generator, dtype=torch.float32)
+                    param.data.copy_(values.mul_(inv_scale).to(device=param.device, dtype=param.dtype))
+                elif "lora_B" in name:
+                    param.zero_()
+                param.grad = None
+
+        self._reset_adapter_optimizer(model_id)
+        state.last_access_time = time.time()
+        logger.info("Reinitialized ZORL family for model_id=%s a_seed=%s", model_id, a_seed)
 
     @staticmethod
     def _has_pending_gradients(state: AdapterState) -> bool:

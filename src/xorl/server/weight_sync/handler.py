@@ -30,9 +30,11 @@ import atexit
 import hashlib
 import logging
 import os
+import re
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from fnmatch import fnmatch
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import torch
@@ -118,6 +120,11 @@ def _skip_param_patterns() -> Tuple[str, ...]:
     return tuple(part.strip() for part in raw.split(",") if part.strip())
 
 
+def _include_dense_param_patterns() -> Tuple[str, ...]:
+    raw = os.environ.get("XORL_WEIGHT_SYNC_INCLUDE_DENSE_PARAM_PATTERNS", "")
+    return tuple(part.strip() for part in raw.split(",") if part.strip())
+
+
 def _param_matches_skip_patterns(name: str, patterns: Tuple[str, ...]) -> bool:
     """Return whether a parameter name matches one of the skip patterns.
 
@@ -133,11 +140,26 @@ def _param_matches_skip_patterns(name: str, patterns: Tuple[str, ...]) -> bool:
     return False
 
 
+def _dense_param_selected(
+    name: str,
+    *,
+    include_patterns: Tuple[str, ...],
+    skip_patterns: Tuple[str, ...],
+) -> bool:
+    if include_patterns and not _param_matches_skip_patterns(name, include_patterns):
+        return False
+    return not (skip_patterns and _param_matches_skip_patterns(name, skip_patterns))
+
+
 def _inference_param_name(name: str) -> str:
     """Strip training-only wrapper modules from receiver-facing names."""
     if "_orig_mod" not in name:
         return name
     return ".".join(part for part in name.split(".") if part != "_orig_mod")
+
+
+def _safe_fold_token(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("_") or "weight_sync"
 
 
 def _prod(shape) -> int:
@@ -566,11 +588,28 @@ class WeightSyncHandler:
                 summary["backend_error"] = str(e)
         return summary
 
+    def _p2p_object_gather_group(self):
+        """Return the optional CPU group used for post-RDMA coordination."""
+
+        if os.environ.get(
+            "XORL_P2P_STATUS_GATHER_BACKEND", ""
+        ).strip().lower() != "gloo":
+            return None
+        group = getattr(self, "_p2p_gloo_group", None)
+        if group is None:
+            group = dist.new_group(backend="gloo")
+            self._p2p_gloo_group = group
+        return group
+
     def _gather_p2p_rank_summaries(self, local_summary: Dict[str, Any]) -> List[Dict[str, Any]]:
         if self.world_size <= 1 or not dist.is_available() or not dist.is_initialized():
             return [local_summary]
         gathered: List[Any] = [None for _ in range(self.world_size)]
-        dist.all_gather_object(gathered, local_summary)
+        group = self._p2p_object_gather_group()
+        if group is None:
+            dist.all_gather_object(gathered, local_summary)
+        else:
+            dist.all_gather_object(gathered, local_summary, group=group)
         return [item for item in gathered if isinstance(item, dict)]
 
     def _gather_p2p_transfer_statuses(self, local_error: Optional[Exception]) -> List[Dict[str, Any]]:
@@ -584,7 +623,11 @@ class WeightSyncHandler:
         if self.world_size <= 1 or not dist.is_available() or not dist.is_initialized():
             return [local_status]
         gathered: List[Any] = [None for _ in range(self.world_size)]
-        dist.all_gather_object(gathered, local_status)
+        group = self._p2p_object_gather_group()
+        if group is None:
+            dist.all_gather_object(gathered, local_status)
+        else:
+            dist.all_gather_object(gathered, local_status, group=group)
         return [item for item in gathered if isinstance(item, dict)]
 
     @staticmethod
@@ -838,23 +881,65 @@ class WeightSyncHandler:
                     "message": "sparse_delta_config.prepacked_only requires sparse_delta_paths; refusing dense streaming sparse-delta sync",
                 }
 
-            result = self._sync_weights(
-                endpoints=endpoints,
-                master_address=master_address,
-                master_port=master_port,
-                group_name=group_name,
-                buffer_size_mb=buffer_size_mb,
-                sync_method=sync_method,
-                flush_cache=flush_cache,
-                cache_invalidation_mode=cache_invalidation_mode,
-                fp8_kv_cache_enabled=fp8_kv_cache_enabled,
-                fp8_kv_cache_postprocess_required=fp8_kv_cache_postprocess_required,
-                fp8_kv_cache_static_scales=fp8_kv_cache_static_scales,
-                pause_mode=pause_mode,
-                weight_version=weight_version,
-                quantization=quantization,
-                sparse_delta_config=sparse_delta_config,
-            )
+            effective_sync_method = sync_method
+            fold_prime_store = None
+            from xorl.server.weight_sync import zorl_fold_sparse_delta as _zfsd  # noqa: PLC0415
+
+            if sync_method == "sparse_delta" and _zfsd.fold_sparse_delta_enabled(sparse_delta_config):
+                fold_outcome = self._sync_zorl_fold_sparse_delta(
+                    endpoints=endpoints,
+                    group_name=group_name,
+                    flush_cache=flush_cache,
+                    cache_invalidation_mode=cache_invalidation_mode,
+                    fp8_kv_cache_enabled=fp8_kv_cache_enabled,
+                    fp8_kv_cache_postprocess_required=fp8_kv_cache_postprocess_required,
+                    fp8_kv_cache_static_scales=fp8_kv_cache_static_scales,
+                    pause_mode=pause_mode,
+                    weight_version=weight_version,
+                    quantization=quantization,
+                    sparse_delta_config=sparse_delta_config,
+                )
+                if fold_outcome["handled"]:
+                    return fold_outcome["result"]
+                effective_sync_method = fold_outcome["fallback_method"]
+                fold_prime_store = fold_outcome.get("commit_store")
+                if fold_outcome.get("weight_version_override") and weight_version is None:
+                    weight_version = fold_outcome["weight_version_override"]
+                logger.info(
+                    "Rank %d: [FoldSparseDelta] falling back to full %s sync (%s)",
+                    self.rank,
+                    effective_sync_method,
+                    fold_outcome.get("reason", "unspecified"),
+                )
+
+            try:
+                result = self._sync_weights(
+                    endpoints=endpoints,
+                    master_address=master_address,
+                    master_port=master_port,
+                    group_name=group_name,
+                    buffer_size_mb=buffer_size_mb,
+                    sync_method=effective_sync_method,
+                    flush_cache=flush_cache,
+                    cache_invalidation_mode=cache_invalidation_mode,
+                    fp8_kv_cache_enabled=fp8_kv_cache_enabled,
+                    fp8_kv_cache_postprocess_required=fp8_kv_cache_postprocess_required,
+                    fp8_kv_cache_static_scales=fp8_kv_cache_static_scales,
+                    pause_mode=pause_mode,
+                    weight_version=weight_version,
+                    quantization=quantization,
+                    sparse_delta_config=sparse_delta_config,
+                )
+            except Exception:
+                if fold_prime_store is not None:
+                    fold_prime_store.rollback()
+                raise
+
+            if fold_prime_store is not None:
+                if result.get("success"):
+                    fold_prime_store.commit()
+                else:
+                    fold_prime_store.rollback()
 
             return result
 
@@ -880,12 +965,21 @@ class WeightSyncHandler:
         fp8_kv_cache_enabled: bool = False,
         fp8_kv_cache_postprocess_required: bool = False,
         fp8_kv_cache_static_scales: bool = False,
+        sparse_delta_payload: Optional[torch.Tensor] = None,
     ) -> Dict[str, Any]:
-        """POST already-packed sparse deltas through the normal xorl API path.
+        """Ship already-packed sparse deltas through the normal xorl API path.
 
         This bypasses trainer-side FSDP extraction and is the intended fast
         path when ``delta-encoding`` has already emitted inference-coordinate
-        packed files.
+        packed payloads. Two transports:
+
+        * file (``sparse_delta_paths``): POST shared-FS paths; every receiver
+          reads the whole packed file over NFS.
+        * rdma (``sparse_delta_payload``): RDMA-write the in-memory packed
+          payload into per-receiver Mooncake staging buffers BEFORE pausing
+          (staging touches no weights), then POST a staging apply to the
+          healthy endpoints. Falls back to the file transport within this
+          sync when RDMA is unavailable (no Mooncake / old receivers).
         """
         if self.rank != 0:
             return {
@@ -911,9 +1005,33 @@ class WeightSyncHandler:
         if not endpoints:
             return {"success": False, "message": "No endpoints provided"}
 
+        # Prepacked file paths + rdma transport: load the packed bytes into
+        # pinned host memory ONCE on rank 0 and distribute via RDMA instead of
+        # having every receiver read the same shared-storage file.
+        if sparse_delta_payload is None and sparse_delta_paths:
+            from xorl.server.weight_sync import zorl_fold_sparse_delta as _zfsd  # noqa: PLC0415
+
+            if _zfsd.fold_delta_transport(sparse_delta_config) == "rdma":
+                unique_paths = sorted(set(sparse_delta_paths))
+                if len(unique_paths) == 1:
+                    import numpy as np  # noqa: PLC0415
+
+                    t_load = time.perf_counter()
+                    raw = torch.from_numpy(np.fromfile(unique_paths[0], dtype=np.uint8))
+                    sparse_delta_payload = raw.pin_memory() if torch.cuda.is_available() else raw
+                    timing_breakdown["rdma_payload_load_s"] = time.perf_counter() - t_load
+                else:
+                    logger.warning(
+                        "Rank 0: [SparseDeltaRDMA] %d distinct per-rank sparse-delta paths; "
+                        "the RDMA transport ships one payload to all ranks — using the file "
+                        "transport for this sync",
+                        len(unique_paths),
+                    )
+
         endpoint_mgr = EndpointManager(endpoints)
         backend = None
         paused = False
+        pause_mgr = endpoint_mgr
         try:
             t_health = time.perf_counter()
             endpoint_mgr.health_check()
@@ -949,11 +1067,54 @@ class WeightSyncHandler:
                 return {"success": False, "message": "Failed to initialize sparse_delta backend"}
             timing_breakdown["backend_init_s"] = time.perf_counter() - t_init
 
+            # RDMA transport: distribute the payload into per-receiver staging
+            # buffers BEFORE pausing (staging writes touch no served weights,
+            # so the receivers keep generating through the fan-out). Falls
+            # back to the file transport when RDMA cannot run at all.
+            use_rdma = sparse_delta_payload is not None
+            if use_rdma:
+                from xorl.server.weight_sync.backends.sparse_delta_rdma import (  # noqa: PLC0415
+                    SparseDeltaRdmaUnavailable,
+                )
+
+                t_dist = time.perf_counter()
+                try:
+                    backend.distribute_payload_rdma(sparse_delta_payload)
+                except SparseDeltaRdmaUnavailable as exc:
+                    logger.warning(
+                        "Rank 0: [SparseDeltaRDMA] RDMA distribution unavailable (%s); "
+                        "falling back to the shared-FS file transport for this sync",
+                        exc,
+                    )
+                    use_rdma = False
+                    fallback_path = self._write_sparse_delta_payload_fallback_file(
+                        sparse_delta_payload, group_name, sparse_delta_config
+                    )
+                    sparse_delta_paths = [fallback_path]
+                    if hasattr(backend, "_written_files"):
+                        backend._written_files.append(Path(fallback_path))
+                finally:
+                    timing_breakdown["rdma_distribute_s"] = time.perf_counter() - t_dist
+
+            quarantined: Dict[int, str] = {}
+            if use_rdma:
+                quarantined = backend.rdma_quarantined_endpoint_errors()
+            if quarantined:
+                healthy_endpoints = [ep for idx, ep in enumerate(endpoints) if idx not in quarantined]
+                logger.warning(
+                    "Rank 0: [SparseDeltaRDMA] pausing/applying on %d/%d endpoints "
+                    "(quarantined: %s)",
+                    len(healthy_endpoints),
+                    len(endpoints),
+                    sorted(quarantined),
+                )
+                pause_mgr = EndpointManager(healthy_endpoints)
+
             t_pause = time.perf_counter()
-            pause_results, all_paused = endpoint_mgr.pause(pause_mode)
+            pause_results, all_paused = pause_mgr.pause(pause_mode)
             timing_breakdown["pause_s"] = time.perf_counter() - t_pause
             if not all_paused:
-                endpoint_mgr.resume()
+                pause_mgr.resume()
                 backend.destroy(complete_receiver=False)
                 return {
                     "success": False,
@@ -961,15 +1122,21 @@ class WeightSyncHandler:
                 }
             paused = True
 
-            if not hasattr(backend, "post_packed_delta_paths"):
-                raise RuntimeError("sparse_delta backend does not support prepacked sparse-delta paths")
-
             t_transfer = time.perf_counter()
-            backend.post_packed_delta_paths(
-                sparse_delta_paths,
-                flush_cache=flush_cache,
-                weight_version=weight_version,
-            )
+            if use_rdma:
+                backend.post_staged_delta(
+                    sparse_delta_payload,
+                    flush_cache=flush_cache,
+                    weight_version=weight_version,
+                )
+            else:
+                if not hasattr(backend, "post_packed_delta_paths"):
+                    raise RuntimeError("sparse_delta backend does not support prepacked sparse-delta paths")
+                backend.post_packed_delta_paths(
+                    sparse_delta_paths,
+                    flush_cache=flush_cache,
+                    weight_version=weight_version,
+                )
             transfer_time = time.perf_counter() - t_transfer
             timing_breakdown["transfer_s"] = transfer_time
             for key, value in backend.stats_summary().items():
@@ -983,15 +1150,25 @@ class WeightSyncHandler:
             backend = None
 
             t_resume = time.perf_counter()
-            endpoint_mgr.resume()
+            pause_mgr.resume()
             timing_breakdown["resume_s"] = time.perf_counter() - t_resume
             paused = False
 
             timing_breakdown["total_handler_s"] = time.perf_counter() - sync_start_time
             total_bytes = int(timing_breakdown.get("sparse_delta_total_packed_bytes", 0.0))
+            if use_rdma:
+                applied = len(endpoints) - len(quarantined)
+                message = f"RDMA-staged sparse delta applied on {applied}/{len(endpoints)} endpoint(s)"
+                if quarantined:
+                    message += f"; quarantined endpoints: {sorted(quarantined)}"
+            else:
+                message = (
+                    f"Posted {len(set(sparse_delta_paths))} sparse-delta file(s) "
+                    f"to {len(endpoints)} endpoint(s)"
+                )
             return {
                 "success": True,
-                "message": f"Posted {len(set(sparse_delta_paths))} sparse-delta file(s) to {len(endpoints)} endpoint(s)",
+                "message": message,
                 "transfer_time": transfer_time,
                 "total_bytes": total_bytes,
                 "num_parameters": 0,
@@ -1009,7 +1186,7 @@ class WeightSyncHandler:
         except Exception:
             if paused:
                 try:
-                    endpoint_mgr.resume()
+                    pause_mgr.resume()
                 except Exception as resume_err:
                     logger.warning(f"Rank 0: [WeightSync] Failed to resume inference during cleanup: {resume_err}")
             if backend is not None:
@@ -1297,42 +1474,81 @@ class WeightSyncHandler:
         # backends still designate one rank for HTTP pause/resume coordination.
         endpoint_mgr = EndpointManager(endpoints) if self.rank == 0 else None
 
-        if self.rank == 0:
-            if not endpoints:
-                return {"success": False, "message": "No endpoints provided"}
-            t_health = time.perf_counter()
-            endpoint_mgr.health_check()
-            timing_breakdown["health_check_s"] = time.perf_counter() - t_health
+        # Rank-divergent preparation must finish on every rank before the
+        # streaming loop opens with an FSDP collective. Carry any local error
+        # through a consensus gate instead of allowing one rank to return while
+        # its peers enter unshard.
+        preamble_error: Optional[str] = None
+        backend_initialized = False
+        inference_paused = False
+        try:
+            if self.rank == 0:
+                if not endpoints:
+                    raise RuntimeError("No endpoints provided")
+                t_health = time.perf_counter()
+                endpoint_mgr.health_check()
+                timing_breakdown["health_check_s"] = time.perf_counter() - t_health
 
-        # Backend init: all sender ranks participate (collective for NCCL).
-        if _is_sender:
-            logger.info(f"Rank {self.rank}: [WeightSync] Initializing {sync_method} backend...")
-            t_init = time.perf_counter()
-            if not backend.initialize():
-                return {
-                    "success": False,
-                    "message": f"Failed to initialize {sync_method} backend",
-                }
-            timing_breakdown["backend_init_s"] = time.perf_counter() - t_init
-            logger.info(f"Rank {self.rank}: [WeightSync] Backend initialized")
+            # Backend init: all sender ranks participate (collective for NCCL).
+            if _is_sender:
+                logger.info(
+                    f"Rank {self.rank}: [WeightSync] Initializing {sync_method} backend..."
+                )
+                t_init = time.perf_counter()
+                if not backend.initialize():
+                    raise RuntimeError(f"Failed to initialize {sync_method} backend")
+                backend_initialized = True
+                timing_breakdown["backend_init_s"] = time.perf_counter() - t_init
+                logger.info(f"Rank {self.rank}: [WeightSync] Backend initialized")
 
-        # Pause inference: coordinator only (after backend init).
-        if self.rank == 0:
-            logger.info(f"Rank {self.rank}: [WeightSync] Pausing inference (mode={pause_mode})...")
-            t_pause = time.perf_counter()
-            pause_results, all_paused = endpoint_mgr.pause(pause_mode)
-            timing_breakdown["pause_s"] = time.perf_counter() - t_pause
-            if not all_paused:
-                endpoint_mgr.resume()
-                if _is_sender:
+            # Pause inference: coordinator only (after backend init).
+            if self.rank == 0:
+                logger.info(
+                    f"Rank {self.rank}: [WeightSync] Pausing inference (mode={pause_mode})..."
+                )
+                t_pause = time.perf_counter()
+                pause_results, all_paused = endpoint_mgr.pause(pause_mode)
+                timing_breakdown["pause_s"] = time.perf_counter() - t_pause
+                if not all_paused:
+                    raise RuntimeError(
+                        f"Failed to pause inference endpoints: {pause_results}"
+                    )
+                inference_paused = True
+        except Exception as prep_err:  # noqa: BLE001 - synchronized below
+            logger.error(
+                "Rank %d: [WeightSync] preparation failed before the streaming loop: %s",
+                self.rank,
+                prep_err,
+                exc_info=True,
+            )
+            preamble_error = f"{type(prep_err).__name__}: {prep_err}"
+
+        preamble_error = self._sync_preamble_consensus(preamble_error)
+        if preamble_error is not None:
+            if inference_paused:
+                try:
+                    endpoint_mgr.resume()
+                except Exception as resume_err:
+                    logger.warning(
+                        "Rank %d: [WeightSync] failed to resume inference after aborted preparation: %s",
+                        self.rank,
+                        resume_err,
+                    )
+            if _is_sender:
+                try:
                     backend.destroy(complete_receiver=False)
-                    # Pause failure invalidates the cache; next sync starts fresh.
-                    _cached_p2p_backend = None
-                    _cached_backend_key = None
-                return {
-                    "success": False,
-                    "message": f"Failed to pause inference endpoints: {pause_results}",
-                }
+                except Exception as destroy_err:
+                    logger.warning(
+                        "Rank %d: [WeightSync] failed to destroy %s backend after aborted "
+                        "preparation (initialized=%s): %s",
+                        self.rank,
+                        sync_method,
+                        backend_initialized,
+                        destroy_err,
+                    )
+                _cached_p2p_backend = None
+                _cached_backend_key = None
+            return {"success": False, "message": preamble_error}
 
         # ------------------------------------------------------------------
         # Step 4: Stream weights — per-module unshard + broadcast pipeline
@@ -1360,6 +1576,7 @@ class WeightSyncHandler:
         self._p2p_tied_weight_aliases = {}
         self._reset_fp8_cpu_workspace_usage()
         skip_patterns = _skip_param_patterns()
+        include_dense_patterns = _include_dense_param_patterns()
         skip_moe_experts = _env_bool("XORL_P2P_SKIP_MOE_EXPERTS") or _env_bool(
             "XORL_WEIGHT_SYNC_SKIP_MOE_EXPERTS",
         )
@@ -1566,10 +1783,14 @@ class WeightSyncHandler:
                                 )
                             else:
                                 should_send_dense_param = None
-                            if skip_patterns or should_send_dense_param is not None:
+                            if include_dense_patterns or skip_patterns or should_send_dense_param is not None:
 
                                 def include_dense_param(name: str, _rank: int = self.rank) -> bool:
-                                    if skip_patterns and _param_matches_skip_patterns(name, skip_patterns):
+                                    if not _dense_param_selected(
+                                        name,
+                                        include_patterns=include_dense_patterns,
+                                        skip_patterns=skip_patterns,
+                                    ):
                                         return False
                                     if should_send_dense_param is not None:
                                         return bool(should_send_dense_param(name, _rank))
@@ -1587,11 +1808,15 @@ class WeightSyncHandler:
                                 tied_weight_aliases=self._p2p_tied_weight_aliases,
                                 include_param=include_dense_param,
                             )
-                            if skip_patterns and qlora_linear_buffer:
+                            if (include_dense_patterns or skip_patterns) and qlora_linear_buffer:
                                 qlora_linear_buffer = [
                                     (name, tensor)
                                     for name, tensor in qlora_linear_buffer
-                                    if not _param_matches_skip_patterns(name, skip_patterns)
+                                    if _dense_param_selected(
+                                        name,
+                                        include_patterns=include_dense_patterns,
+                                        skip_patterns=skip_patterns,
+                                    )
                                 ]
                             current_buffer.extend(qlora_linear_buffer)
                             _add_rank_phase("extract_s", t_phase)
@@ -4763,3 +4988,756 @@ class WeightSyncHandler:
                 layer_modules.append((fqn, mod))
 
         return root_module, layer_modules
+
+    def _write_sparse_delta_payload_fallback_file(
+        self,
+        payload: torch.Tensor,
+        group_name: str,
+        sparse_delta_config: Optional[Dict[str, Any]],
+    ) -> str:
+        """Write the in-memory packed payload to the shared FS (RDMA-unavailable
+        fallback). Byte-identical to what the file transport would have built."""
+        cfg = sparse_delta_config or {}
+        output_dir = Path(
+            str(
+                cfg.get("output_dir")
+                or os.environ.get("XORL_SPARSE_DELTA_OUTPUT_DIR", "/tmp/xorl-sparse-delta")
+            )
+        )
+        output_dir.mkdir(parents=True, exist_ok=True)
+        token = _safe_fold_token(group_name)
+        path = output_dir / f"{token}-rdma-fallback-{os.getpid()}-{time.time_ns()}.packed"
+        with open(path, "wb") as f:
+            f.write(payload.contiguous().numpy().tobytes())
+        logger.info(
+            "Rank 0: [SparseDeltaRDMA] wrote %.1f MB fallback packed file %s",
+            payload.numel() / 1e6,
+            path,
+        )
+        return str(path)
+
+    # ========================================================================
+    # Fold-aware sparse-delta sync (ZORL fresh_ab fast path)
+    # ========================================================================
+
+    def _fold_consensus_max(self, values: List[int]) -> List[int]:
+        """MAX-reduce small integer flags across all training ranks."""
+        if not (dist.is_available() and dist.is_initialized() and self.world_size > 1):
+            return list(values)
+        group = self._p2p_object_gather_group()
+        if group is not None:
+            flags = torch.tensor(values, dtype=torch.int64)
+            dist.all_reduce(flags, op=dist.ReduceOp.MAX, group=group)
+        else:
+            device = f"cuda:{self.rank % torch.cuda.device_count()}" if torch.cuda.is_available() else "cpu"
+            flags = torch.tensor(values, dtype=torch.int64, device=device)
+            dist.all_reduce(flags, op=dist.ReduceOp.MAX)
+        return [int(v) for v in flags.tolist()]
+
+    def _sync_zorl_fold_sparse_delta(
+        self,
+        *,
+        endpoints: List[Dict[str, Any]],
+        group_name: str,
+        flush_cache: bool,
+        pause_mode: str,
+        weight_version: Optional[str],
+        quantization: Optional[Dict[str, Any]],
+        sparse_delta_config: Optional[Dict[str, Any]] = None,
+        cache_invalidation_mode: str = "auto",
+        fp8_kv_cache_enabled: bool = False,
+        fp8_kv_cache_postprocess_required: bool = False,
+        fp8_kv_cache_static_scales: bool = False,
+    ) -> Dict[str, Any]:
+        """Fold-aware sparse-delta sync. All ranks participate.
+
+        Returns ``{"handled": True, "result": <sync result>}`` when the fast
+        path shipped the delta, or ``{"handled": False, "fallback_method": m,
+        "commit_store": store_or_None, "reason": str}`` when the caller must
+        run a full sync (first sync / baseline priming / unsupported layout).
+        """
+        from xorl.server.weight_sync import zorl_fold_sparse_delta as zfsd  # noqa: PLC0415
+
+        cfg = sparse_delta_config or {}
+        fallback_method = zfsd.fold_sparse_delta_fallback_method(cfg)
+        timer = zfsd.PhaseTimer()
+
+        fold_info = getattr(self.trainer, "_zorl_fresh_ab_last_fold", None) or {}
+        model = getattr(self.trainer, "model", None)
+        skip_patterns = _skip_param_patterns()
+        skip_fn = None
+        if skip_patterns:
+            skip_fn = lambda name: _param_matches_skip_patterns(name, skip_patterns)  # noqa: E731
+
+        block_row, block_col = self._fp8_block_size(quantization or {})
+        plan = None
+        fallback_reason: Optional[str] = None
+        if model is None:
+            fallback_reason = "trainer has no model"
+        elif not (quantization and quantization.get("quant_method") == "fp8"):
+            fallback_reason = "fold-aware sparse delta requires fp8 sync quantization"
+        elif not fold_info.get("base_param_names"):
+            fallback_reason = "no fresh_ab fold recorded on the trainer"
+        else:
+            try:
+                # The escape encoder + packed writer come from delta-encoding;
+                # unavailable => consensus fallback to the full sync path.
+                zfsd.load_delta_encoding_encode(
+                    delta_encoding_path=cfg.get("delta_encoding_path"),
+                    use_native_extension=cfg.get("use_native_extension"),
+                )
+                plan = zfsd.build_fold_sync_plan(
+                    model,
+                    fold_info["base_param_names"],
+                    fold_index=int(fold_info.get("fold_index", -1)),
+                    model_id=fold_info.get("model_id"),
+                    skip_param_fn=skip_fn,
+                )
+                if not plan.expert_params and not plan.dense_params:
+                    fallback_reason = "fold plan is empty"
+                else:
+                    zfsd_validate_error = self._validate_fold_plan(zfsd, plan, block_row, block_col)
+                    if zfsd_validate_error:
+                        fallback_reason = zfsd_validate_error
+                    else:
+                        max_b = zfsd.check_zero_lora_b(plan)
+                        if max_b != 0.0:
+                            fallback_reason = (
+                                f"parent lora_B is non-zero (max abs {max_b:.3e}); "
+                                "the fold-aware LoRA-merge mirror requires B == 0"
+                            )
+            except zfsd.FoldSparseDeltaUnsupported as exc:
+                fallback_reason = str(exc)
+            except Exception as exc:  # noqa: BLE001 - never hard-fail the sync from plan building
+                logger.warning("Rank %d: [FoldSparseDelta] plan build failed", self.rank, exc_info=True)
+                fallback_reason = f"plan build failed: {exc}"
+
+        # The receiver's process_weights_after_loading REQUANTIZES/mutates the
+        # fused MoE tensors; served bytes would no longer equal the shipped
+        # bytes and every later diff would be computed against a stale
+        # baseline. Refuse the fast path instead of corrupting silently (the
+        # deployed fp8 p2p config keeps post-process off — see
+        # _should_run_receiver_post_process_after_fp8_sync).
+        if fallback_reason is None and (
+            fp8_kv_cache_postprocess_required
+            or bool(cfg.get("run_post_process_weights"))
+            or _env_bool("XORL_SPARSE_DELTA_RUN_POST_PROCESS_WEIGHTS")
+        ):
+            fallback_reason = (
+                "receiver post-process after sync would mutate the served bytes; "
+                "fold-aware sparse deltas require post-process to stay off"
+            )
+
+        store = zfsd.FoldBaselineStore.for_scope(group_name)
+        reset_target = (
+            zfsd.FoldBaselineStore.for_scope(zfsd.PRIME_LITE_SCOPE)
+            if bool(fold_info.get("reset"))
+            else None
+        )
+        quantize_mode_tag = (
+            f"{WeightSyncHandler._fp8_quantization_execution_device()}|block{block_row}x{block_col}"
+        )
+        # Weight-version chain: each sync stamps the receivers with a version
+        # and the NEXT delta requires it as base_weight_version (enforced by
+        # the receiver before applying). A scorer that restarted onto
+        # checkpoint weights fails the precondition loudly instead of
+        # silently serving stale folds — and that failure schedules an
+        # automatic re-prime + full push below.
+        version_chain = str(
+            cfg.get("version_chain", os.environ.get("XORL_SPARSE_DELTA_FOLD_VERSION_CHAIN", "1"))
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        effective_weight_version = weight_version
+        if (
+            fallback_reason is None
+            and effective_weight_version is None
+            and version_chain
+            and plan.fold_index >= 0
+        ):
+            effective_weight_version = f"zorl-fold-{plan.fold_index}"
+
+        needs_prime = False
+        prime_reason = ""
+        if fallback_reason is None and store.force_prime:
+            needs_prime = True
+            prime_reason = "receiver base-version mismatch on a previous sync (scorer restart / version drift)"
+        if fallback_reason is None and not needs_prime:
+            for entry in plan.expert_params:
+                if not store.has(("expert", entry.train_name)):
+                    needs_prime = True
+                    prime_reason = f"no baseline for {entry.train_name}"
+                    break
+            if not needs_prime and self.rank == 0 and plan.dense_params:
+                dense_marker = ("dense_primed", tuple(sorted(e.train_name for e in plan.dense_params)))
+                if not store.has(dense_marker):
+                    needs_prime = True
+                    prime_reason = "no dense baseline"
+            meta = (store.get(("meta", "fold_sync")) or {}) if not needs_prime else {}
+            if not needs_prime and meta.get("quantize_mode") != quantize_mode_tag:
+                # CPU and GPU quantization are not bit-identical: a quantize-
+                # mode flip between syncs would diff cross-mode against bytes
+                # the receivers no longer hold. Force a full re-prime.
+                needs_prime = True
+                prime_reason = f"quantize mode changed ({meta.get('quantize_mode')} -> {quantize_mode_tag})"
+            if not needs_prime:
+                # Optional drift insurance: periodically re-establish ground
+                # truth with a full sync (guards against anything mutating
+                # base params outside the recorded fold).
+                resync_every = int(
+                    cfg.get(
+                        "full_resync_every",
+                        os.environ.get("XORL_SPARSE_DELTA_FOLD_FULL_RESYNC_EVERY", "0") or 0,
+                    )
+                )
+                last_primed = int(meta.get("last_primed_fold_index", -1))
+                if (
+                    resync_every > 0
+                    and plan.fold_index >= 0
+                    and last_primed >= 0
+                    and plan.fold_index - last_primed >= resync_every
+                ):
+                    needs_prime = True
+                    prime_reason = f"periodic full resync (every {resync_every} folds)"
+
+        # Prime-lite: a pre-fold capture (quantize(master@step0), digest-
+        # verified and corrected to the receivers' FP8-checkpoint bytes via
+        # the parity overlay — see the prime-lite notes in
+        # zorl_fold_sparse_delta) IS the fresh receivers' served state, so
+        # adopting it replaces the priming full push. Only for the
+        # missing-baseline case: a receiver base-version mismatch
+        # (force_prime) or a quantize-mode flip means receivers are mid-run
+        # and no longer serving checkpoint bytes.
+        if (
+            fallback_reason is None
+            and needs_prime
+            and not store.force_prime
+            and prime_reason.startswith("no ")
+        ):
+            adopted, adopt_reason = zfsd.adopt_prefold_baseline(
+                store,
+                plan,
+                quantize_mode_tag=quantize_mode_tag,
+                fold_index=int(plan.fold_index),
+                is_rank0=(self.rank == 0),
+            )
+            if adopted:
+                needs_prime = False
+                prime_reason = ""
+                logger.info(
+                    "Rank %d: [FoldSparseDelta] adopted the prime-lite checkpoint baseline "
+                    "(%d expert + %d dense fold params); skipping the priming full push — "
+                    "the first delta diffs against the receivers' load-time bytes",
+                    self.rank,
+                    len(plan.expert_params),
+                    len(plan.dense_params),
+                )
+            elif adopt_reason != "no prefold capture":
+                logger.warning(
+                    "Rank %d: [FoldSparseDelta] prime-lite capture present but not adopted (%s); "
+                    "priming via the full %s push instead",
+                    self.rank,
+                    adopt_reason,
+                    fallback_method,
+                )
+
+        must_fallback, must_prime = self._fold_consensus_max(
+            [1 if fallback_reason else 0, 1 if needs_prime else 0]
+        )
+        timer.lap("plan_s")
+        if must_fallback:
+            return {
+                "handled": False,
+                "fallback_method": fallback_method,
+                "commit_store": None,
+                "reason": fallback_reason or "another rank reported an unsupported fold plan",
+            }
+
+        fp8_dtype, fp8_max = self._fp8_dtype_and_max(quantization)
+        rank_phase: Dict[str, float] = {}
+        # In the gpu execution mode leave the quantized stack on GPU so the
+        # byte diff also runs there; the expert stacks always satisfy the GPU
+        # kernel's constraints (validated above), so target_device only moves
+        # bytes and never changes the quantization math/bit pattern.
+        exec_gpu = (
+            WeightSyncHandler._fp8_quantization_execution_device() in {"gpu", "cuda"}
+            and torch.cuda.is_available()
+            # target=None is only bit-safe when every expert stack takes the
+            # GPU kernel branch (guaranteed by the plan validation + these
+            # kernel preconditions); otherwise mirror the reference's
+            # copy-to-cpu-then-quantize exactly.
+            and fp8_dtype == torch.float8_e4m3fn
+            and block_row == block_col
+        )
+        fold_quant_target = None if exec_gpu else "cpu"
+        if not exec_gpu:
+            logger.warning(
+                "Rank %d: [FoldSparseDelta] running with slower CPU FP8 quantization; "
+                "set XORL_P2P_FP8_QUANTIZE_DEVICE=gpu "
+                "on the PS for the intended fast path (the first full sync after "
+                "the flip re-primes baselines automatically)",
+                self.rank,
+            )
+
+        def quantize_stack(stack: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+            # Same function + execution-device policy as the full sync path so
+            # the produced bytes are bit-identical to a full push (CPU and GPU
+            # quantization are NOT bit-identical to each other).
+            return WeightSyncHandler._quantize_fp8_stack(
+                stack,
+                fp8_dtype=fp8_dtype,
+                fp8_max=fp8_max,
+                block_size_row=block_row,
+                block_size_col=block_col,
+                target_device=fold_quant_target,
+                phase_s=rank_phase,
+                phase_prefix="fold_fp8",
+            )
+
+        def unfuse_buffer(buffer: List[Tuple[str, torch.Tensor]]) -> List[Tuple[str, torch.Tensor]]:
+            return self._unfuse_for_inference(buffer, model, clone_slices=False)
+
+        def quantize_buffer(buffer: List[Tuple[str, torch.Tensor]]) -> List[Tuple[str, torch.Tensor]]:
+            return WeightSyncHandler._quantize_buffer_for_fp8(
+                buffer,
+                quantization_config=quantization,
+                target_device="cpu",
+                phase_s=rank_phase,
+                phase_prefix="fold_dense_fp8",
+            )
+
+        if must_prime:
+            logger.info(
+                "Rank %d: [FoldSparseDelta] priming quantized baseline for %d expert + %d dense fold params "
+                "(%s); this sync goes through the full %s path",
+                self.rank,
+                len(plan.expert_params),
+                len(plan.dense_params),
+                prime_reason or "peer rank requested priming",
+                fallback_method,
+            )
+            prime_error: Optional[str] = None
+            try:
+                for entry in plan.expert_params:
+                    zfsd.process_expert_param(
+                        entry,
+                        store,
+                        quantize_stack_fn=quantize_stack,
+                        block_size=(block_row, block_col),
+                        prime_only=True,
+                    )
+            except Exception as exc:  # noqa: BLE001 - carried into the prime consensus below
+                logger.error(
+                    "Rank %d: [FoldSparseDelta] expert baseline staging failed", self.rank, exc_info=True
+                )
+                prime_error = f"{type(exc).__name__}: {exc}"
+            # Dense staging gathers with full_tensor() (collective): every
+            # rank must still post those gathers even after a local expert
+            # failure above, or the peers' gathers never complete.
+            try:
+                zfsd.process_dense_params(
+                    plan,
+                    store,
+                    is_rank0=(self.rank == 0),
+                    unfuse_fn=unfuse_buffer,
+                    quantize_buffer_fn=quantize_buffer,
+                    prime_only=True,
+                )
+            except Exception as exc:  # noqa: BLE001 - carried into the prime consensus below
+                logger.error(
+                    "Rank %d: [FoldSparseDelta] dense baseline staging failed", self.rank, exc_info=True
+                )
+                prime_error = prime_error or f"{type(exc).__name__}: {exc}"
+            if prime_error is None:
+                if self.rank == 0 and plan.dense_params:
+                    store.stage(("dense_primed", tuple(sorted(e.train_name for e in plan.dense_params))), {})
+                store.stage(
+                    ("meta", "fold_sync"),
+                    {
+                        "quantize_mode": quantize_mode_tag,
+                        "last_primed_fold_index": int(plan.fold_index),
+                        "weight_version": effective_weight_version,
+                    },
+                )
+            # Prime consensus: a rank whose staging failed must not bail out
+            # of the sync alone — its peers are about to enter the fallback
+            # full sync and its FSDP2 unshard collectives. On any-rank
+            # failure ALL ranks still run the full push, but nobody commits
+            # (the next sync re-primes from scratch).
+            (prime_failed,) = self._fold_consensus_max([1 if prime_error else 0])
+            timer.lap("prime_s")
+            if prime_failed:
+                store.rollback()
+                logger.warning(
+                    "Rank %d: [FoldSparseDelta] baseline staging failed (%s); falling back to the full %s "
+                    "sync WITHOUT committing baselines — the next sync re-primes",
+                    self.rank,
+                    prime_error or "on a peer rank",
+                    fallback_method,
+                )
+                return {
+                    "handled": False,
+                    "fallback_method": fallback_method,
+                    "commit_store": None,
+                    "reason": prime_error or "baseline priming failed on a peer rank",
+                }
+            logger.info(
+                "Rank %d: [FoldSparseDelta] baseline primed in %.2fs (staged; commits after the full sync succeeds)",
+                self.rank,
+                timer.phases.get("prime_s", 0.0),
+            )
+            return {
+                "handled": False,
+                "fallback_method": fallback_method,
+                "commit_store": store,
+                "reason": prime_reason or "baseline priming",
+                # The full fallback sync must stamp the receivers with the
+                # version the next delta will require as its base.
+                "weight_version_override": effective_weight_version,
+            }
+
+        # ------------------------------------------------------------------
+        # Fast path: rank-local quantize + byte-diff + encode
+        # ------------------------------------------------------------------
+        segments: List[Any] = []
+        dense_bytes = 0
+        changed_values = 0
+        fast_error: Optional[str] = None
+        if reset_target is not None:
+            try:
+                segments, dense_bytes, changed_values = zfsd.process_captured_target(
+                    plan, store, reset_target, is_rank0=(self.rank == 0)
+                )
+            except Exception as exc:  # noqa: BLE001 - carried through the gather below
+                logger.error("Rank %d: [FoldSparseDelta] exact reset diff failed", self.rank, exc_info=True)
+                fast_error = f"{type(exc).__name__}: {exc}"
+            timer.lap("expert_quant_diff_s")
+        else:
+            try:
+                for entry in plan.expert_params:
+                    segs, db, ch = zfsd.process_expert_param(
+                        entry,
+                        store,
+                        quantize_stack_fn=quantize_stack,
+                        block_size=(block_row, block_col),
+                    )
+                    segments.extend(segs)
+                    dense_bytes += db
+                    changed_values += ch
+            except Exception as exc:  # noqa: BLE001 - carried through the gather below
+                logger.error("Rank %d: [FoldSparseDelta] expert quantize+diff failed", self.rank, exc_info=True)
+                fast_error = f"{type(exc).__name__}: {exc}"
+            timer.lap("expert_quant_diff_s")
+            # Dense diff gathers with full_tensor() (collective): every rank must
+            # still post those gathers even after a local failure above, or the
+            # peers' gathers never complete.
+            try:
+                dsegs, ddb, dch = zfsd.process_dense_params(
+                    plan,
+                    store,
+                    is_rank0=(self.rank == 0),
+                    unfuse_fn=unfuse_buffer,
+                    quantize_buffer_fn=quantize_buffer,
+                )
+                segments.extend(dsegs)
+                dense_bytes += ddb
+                changed_values += dch
+            except Exception as exc:  # noqa: BLE001 - carried through the gather below
+                logger.error("Rank %d: [FoldSparseDelta] dense quantize+diff failed", self.rank, exc_info=True)
+                fast_error = fast_error or f"{type(exc).__name__}: {exc}"
+        meta_now = store.get(("meta", "fold_sync")) or {}
+        if fast_error is None:
+            store.stage(
+                ("meta", "fold_sync"),
+                {**meta_now, "quantize_mode": quantize_mode_tag, "weight_version": effective_weight_version},
+            )
+        # Require the receivers to be on a version this chain could have
+        # stamped: the last committed version, plus — after failed attempts —
+        # every version a failed sync may have left on a subset of receivers
+        # (those endpoints applied the failed delta; the cumulative
+        # absolute-value resend converges them). A receiver on NONE of these
+        # (e.g. a scorer that restarted onto checkpoint weights during the
+        # failure window) fails the precondition and lands in the
+        # force_prime + full-push convergence path instead of silently
+        # applying a delta against bytes it never held.
+        base_weight_version: Optional[Any] = None
+        if version_chain:
+            committed_version = meta_now.get("weight_version")
+            allowed_versions = [
+                v
+                for v in [committed_version, *store.failed_weight_versions]
+                if v is not None
+            ]
+            if store.last_attempt_failed and allowed_versions:
+                base_weight_version = allowed_versions
+            elif committed_version is not None:
+                base_weight_version = committed_version
+        post_cfg = dict(cfg)
+        if base_weight_version is not None and "base_weight_version" not in post_cfg:
+            post_cfg["base_weight_version"] = base_weight_version
+        timer.lap("dense_quant_diff_s")
+
+        # Gather encoded per-rank segments on rank 0 (delta-sized payloads).
+        # Each payload also carries the rank's local error (if any) so a
+        # rank-local failure surfaces as an ordinary failed sync on EVERY
+        # rank (rollback + cumulative resend) instead of one rank bailing
+        # out of the collectives its peers are still parked in.
+        local_payload = {"segments": segments if fast_error is None else [], "error": fast_error}
+        if dist.is_available() and dist.is_initialized() and self.world_size > 1:
+            gathered: Optional[List[Any]] = [None for _ in range(self.world_size)] if self.rank == 0 else None
+            dist.gather_object(local_payload, gathered, dst=0, group=self._p2p_object_gather_group())
+        else:
+            gathered = [local_payload]
+        timer.lap("segment_gather_s")
+
+        success = False
+        result: Optional[Dict[str, Any]] = None
+        delta_path: Optional[str] = None
+        file_stats: Dict[str, Any] = {}
+        error_message = ""
+        if self.rank == 0:
+            try:
+                rank_errors = [
+                    str(payload["error"])
+                    for payload in gathered
+                    if isinstance(payload, dict) and payload.get("error")
+                ]
+                if rank_errors:
+                    raise RuntimeError(
+                        f"fold fast path failed on {len(rank_errors)} rank(s): {rank_errors[0]}"
+                    )
+                all_rank_segments = [
+                    payload["segments"]
+                    for payload in gathered
+                    if isinstance(payload, dict) and payload.get("segments")
+                ]
+                delta_encoding_kwargs = {
+                    "delta_encoding_path": cfg.get("delta_encoding_path")
+                    or os.environ.get("XORL_DELTA_ENCODING_PATH"),
+                    "use_native_extension": bool(
+                        cfg.get("use_native_extension", _env_bool("XORL_DELTA_ENCODING_USE_NATIVE_EXTENSION"))
+                    ),
+                }
+                transport = zfsd.fold_delta_transport(cfg)
+                payload_tensor: Optional[torch.Tensor] = None
+                if transport == "rdma":
+                    # Keep the packed delta in (pinned) host memory; the RDMA
+                    # transport fans it out via Mooncake staging buffers and
+                    # never touches the shared filesystem. (Payload bytes are
+                    # identical to the file the file transport would write.)
+                    file_stats = zfsd.build_packed_delta_payload(
+                        all_rank_segments, **delta_encoding_kwargs
+                    )
+                    payload_tensor = file_stats["payload"]
+                else:
+                    output_dir = Path(
+                        str(
+                            cfg.get("output_dir")
+                            or os.environ.get("XORL_SPARSE_DELTA_OUTPUT_DIR", "/tmp/xorl-sparse-delta")
+                        )
+                    )
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    token = _safe_fold_token(group_name)
+                    delta_path = str(
+                        output_dir / f"{token}-fold-delta-f{plan.fold_index}-{os.getpid()}-{time.time_ns()}.packed"
+                    )
+                    file_stats = zfsd.build_packed_delta_file(
+                        all_rank_segments,
+                        delta_path,
+                        **delta_encoding_kwargs,
+                    )
+                timer.lap("pack_write_s")
+                result = self._sync_sparse_delta_paths(
+                    endpoints=endpoints,
+                    group_name=group_name,
+                    flush_cache=flush_cache,
+                    cache_invalidation_mode=cache_invalidation_mode,
+                    fp8_kv_cache_enabled=fp8_kv_cache_enabled,
+                    fp8_kv_cache_postprocess_required=fp8_kv_cache_postprocess_required,
+                    fp8_kv_cache_static_scales=fp8_kv_cache_static_scales,
+                    pause_mode=pause_mode,
+                    weight_version=effective_weight_version,
+                    sparse_delta_paths=[delta_path] if delta_path is not None else [],
+                    sparse_delta_config=post_cfg,
+                    sparse_delta_payload=payload_tensor,
+                )
+                timer.lap("post_s")
+                success = bool(result.get("success"))
+                error_message = str(result.get("message", ""))
+            except Exception as exc:  # noqa: BLE001 - peers wait in the broadcast below
+                logger.error("Rank 0: [FoldSparseDelta] fast-path sync failed", exc_info=True)
+                error_message = f"{type(exc).__name__}: {exc}"
+                success = False
+
+        if dist.is_available() and dist.is_initialized() and self.world_size > 1:
+            sync_obj = [success, error_message]
+            dist.broadcast_object_list(sync_obj, src=0, group=self._p2p_object_gather_group())
+            success, error_message = bool(sync_obj[0]), str(sync_obj[1])
+        timer.lap("status_broadcast_s")
+
+        if success:
+            committed = store.commit()
+            if reset_target is not None:
+                reset_target.clear()
+        else:
+            store.rollback()
+            committed = 0
+            if "base version mismatch" in error_message.lower():
+                # A receiver is not on the version our last confirmed sync
+                # stamped — most likely a scorer restarted onto checkpoint
+                # weights. Its served state is unknown, so diffs are invalid:
+                # schedule a re-prime + full push for the next sync.
+                store.force_prime = True
+                logger.warning(
+                    "Rank %d: [FoldSparseDelta] receiver base-version mismatch (%s); "
+                    "the next sync will re-prime and run a full %s push",
+                    self.rank,
+                    error_message[:200],
+                    fallback_method,
+                )
+            else:
+                store.last_attempt_failed = True
+                # A subset of receivers may have applied this attempt and now
+                # sits on its version; widen the next sync's precondition.
+                store.note_failed_weight_version(effective_weight_version)
+        if self.rank == 0 and delta_path is not None:
+            keep_files = bool(cfg.get("keep_files", _env_bool("XORL_SPARSE_DELTA_KEEP_FILES")))
+            if success and not keep_files:
+                try:
+                    os.unlink(delta_path)
+                except OSError:
+                    logger.debug("[FoldSparseDelta] failed to remove %s", delta_path, exc_info=True)
+            elif not success:
+                logger.warning(
+                    "Rank 0: [FoldSparseDelta] keeping failed delta file for inspection: %s "
+                    "(baseline NOT advanced; the next sync re-sends a cumulative diff)",
+                    delta_path,
+                )
+
+        if self.rank != 0:
+            result = {
+                "success": success,
+                "message": error_message or "Fold-aware sparse-delta sync coordinated by rank 0",
+                "transfer_time": 0.0,
+                "total_bytes": 0,
+                "num_parameters": 0,
+                "num_buckets": 0,
+                "timing_breakdown": {},
+                "p2p_rank_summaries": [],
+                "cache_invalidation_mode": cache_invalidation_mode,
+                "flush_cache": flush_cache,
+                "fp8_kv_cache_enabled": fp8_kv_cache_enabled,
+                "fp8_kv_cache_postprocess_requested": fp8_kv_cache_postprocess_required,
+                "fp8_kv_cache_static_scales": fp8_kv_cache_static_scales,
+                "cache_epoch": None,
+                "endpoint_results": [],
+            }
+        elif result is None:
+            result = {
+                "success": False,
+                "message": error_message or "Fold-aware sparse-delta sync failed before POST",
+                "transfer_time": 0.0,
+                "total_bytes": 0,
+                "num_parameters": 0,
+                "num_buckets": 0,
+                "timing_breakdown": {},
+                "p2p_rank_summaries": [],
+                "cache_invalidation_mode": cache_invalidation_mode,
+                "flush_cache": flush_cache,
+                "fp8_kv_cache_enabled": fp8_kv_cache_enabled,
+                "fp8_kv_cache_postprocess_requested": fp8_kv_cache_postprocess_required,
+                "fp8_kv_cache_static_scales": fp8_kv_cache_static_scales,
+                "cache_epoch": None,
+                "endpoint_results": [],
+            }
+
+        breakdown = result.setdefault("timing_breakdown", {})
+        for key, value in timer.phases.items():
+            breakdown[f"fold_{key}"] = float(value)
+        for key, value in rank_phase.items():
+            breakdown[f"fold_{key}"] = float(value)
+        breakdown["fold_source_dense_bytes"] = float(dense_bytes)
+        breakdown["fold_changed_values"] = float(changed_values)
+        for key in ("tensors", "nnz", "packed_bytes"):
+            if key in file_stats:
+                breakdown[f"fold_file_{key}"] = float(file_stats[key])
+        if success:
+            breakdown["fold_baseline_committed"] = float(committed)
+        result["num_parameters"] = len(plan.expert_params) * 2 + max(
+            int(result.get("num_parameters", 0) or 0), 0
+        )
+        logger.info(
+            "Rank %d: [FoldSparseDelta] %s: fold_index=%s changed_values=%d packed_bytes=%s phases=%s",
+            self.rank,
+            "sync complete" if success else "sync FAILED",
+            plan.fold_index,
+            changed_values,
+            file_stats.get("packed_bytes", "n/a"),
+            {k: round(v, 3) for k, v in timer.phases.items()},
+        )
+        return {"handled": True, "result": result}
+
+    @staticmethod
+    def _validate_fold_plan(zfsd, plan, block_row: int, block_col: int) -> Optional[str]:
+        """Rank-local plan validation (no data movement) so unsupported
+        layouts turn into a consensus fallback instead of a mid-sync raise."""
+        try:
+            for entry in plan.expert_params:
+                # Use the plan-aware accessor here as well as in the actual
+                # encoder.  EP+eFSDP expert tensors expose only Shard(1) on
+                # their orthogonal eFSDP mesh; ``entry`` carries the implicit
+                # EP coordinates and transport-owner decision needed to
+                # materialize that slab.  Calling ``local_expert_slab``
+                # directly rejects this otherwise supported live layout
+                # before the fast path can start.
+                local, _offset, e_total = zfsd.expert_slab(entry)
+                e_local, _k, n_dim = local.shape
+                hf_rows = n_dim  # rows after the GKN->HF permute
+                if entry.kind == "gate_up":
+                    if n_dim % 2 != 0:
+                        return f"{entry.train_name}: odd fused gate_up width {n_dim}"
+                    if (n_dim // 2) % block_row != 0:
+                        return (
+                            f"{entry.train_name}: intermediate {n_dim // 2} not divisible by "
+                            f"FP8 block {block_row} (per-expert gate/up scale rows would straddle)"
+                        )
+                if hf_rows % block_row != 0:
+                    return f"{entry.train_name}: HF rows {hf_rows} not divisible by FP8 block {block_row}"
+                full_numel = e_total * local.shape[1] * local.shape[2]
+                if full_numel > 2**31 - 1:
+                    return f"{entry.train_name}: numel {full_numel} exceeds int32 sparse index space"
+        except zfsd.FoldSparseDeltaUnsupported as exc:
+            return str(exc)
+        return None
+
+    def _sync_preamble_consensus(self, local_error: Optional[str]) -> Optional[str]:
+        """Agree across ALL training ranks that the rank-divergent sync
+        preparation (rank-0 endpoint health check + pause, sender-only
+        backend init) succeeded BEFORE any rank enters the streaming loop.
+
+        The module loop opens with an FSDP2 ``unshard()`` all-gather that
+        every rank must join. If one rank returns after a preparation failure
+        while peers have already entered that collective, the peers can wait
+        forever. This consensus gate makes every rank enter or abort together.
+
+        Returns ``None`` when every rank is clear to enter the loop,
+        otherwise the (possibly peer-reported) error string. Every rank
+        returns a non-``None`` value together, so all ranks abort the sync
+        in lockstep without touching any FSDP collective.
+        """
+        if not (dist.is_available() and dist.is_initialized() and self.world_size > 1):
+            return local_error
+        group = self._p2p_object_gather_group()
+        if group is not None:
+            gathered: List[Any] = [None for _ in range(self.world_size)]
+            dist.all_gather_object(gathered, local_error, group=group)
+            peer_errors = [err for err in gathered if err]
+            if peer_errors:
+                return local_error or str(peer_errors[0])
+            return None
+        (failed,) = self._fold_consensus_max([1 if local_error else 0])
+        if failed:
+            return local_error or "weight-sync preparation failed on a peer rank"
+        return None
+
+    # ========================================================================
+    # Streaming per-layer weight sync (backend-agnostic)
+    # ========================================================================

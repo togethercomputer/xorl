@@ -84,6 +84,10 @@ from xorl.server.protocol.operations import (
     SaveFullWeightsData,
     SaveLoraOnlyData,
     SaveStateData,
+    ZORLAbortGenerationData,
+    ZORLApplyRewardsData,
+    ZORLResetSessionData,
+    ZORLStartGenerationData,
 )
 from xorl.server.protocol.orchestrator_runner import (
     RunnerDispatchCommand,
@@ -252,6 +256,10 @@ class RunnerDispatcher:
         "optim_step",
         "abort_gradient_epoch",
         "register_session",
+        "start_zorl_generation",
+        "apply_zorl_rewards",
+        "abort_zorl_generation",
+        "reset_zorl_session",
     }
 
     def _sync_error_state(self) -> Optional[str]:
@@ -515,6 +523,10 @@ class RunnerDispatcher:
         "load_adapter_state": "_handle_load_adapter_state",
         "get_adapter_info": "_handle_get_adapter_info",
         "kill_session": "_handle_kill_session",
+        "start_zorl_generation": "_handle_start_zorl_generation",
+        "apply_zorl_rewards": "_handle_apply_zorl_rewards",
+        "abort_zorl_generation": "_handle_abort_zorl_generation",
+        "reset_zorl_session": "_handle_reset_zorl_session",
     }
 
     # Commands handled on rank 0 only (no broadcast needed)
@@ -2459,6 +2471,66 @@ class RunnerDispatcher:
 
     async def _handle_kill_session(self, command_dict: Dict[str, Any]) -> Dict[str, Any]:
         return await self._adapter_coordinator.handle_kill_session(command_dict)
+
+    async def _handle_start_zorl_generation(self, command_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """Handle start_zorl_generation collectively."""
+        p: ZORLStartGenerationData = command_dict.get("payload", ZORLStartGenerationData())
+        model_id = p.model_id or "default"
+        was_auto_loaded, auto_load_path = self._adapter_coordinator.auto_load_if_evicted(
+            model_id,
+            allow_fresh_materialization=False,
+        )
+        result = self.trainer.start_zorl_generation(
+            model_id=model_id,
+            num_pairs=p.num_pairs,
+            pair_seed_specs=p.pair_seed_specs,
+            materialization=p.materialization,
+            owner_url=p.owner_url,
+        )
+        if was_auto_loaded and self.rank == 0:
+            result["auto_loaded"] = True
+            result["auto_load_path"] = auto_load_path
+        return result if self.rank == 0 else {}
+
+    async def _handle_apply_zorl_rewards(self, command_dict: Dict[str, Any]) -> Dict[str, Any]:
+        """Handle apply_zorl_rewards collectively."""
+        p: ZORLApplyRewardsData = command_dict.get("payload", ZORLApplyRewardsData())
+        model_id = p.model_id or "default"
+        was_auto_loaded, auto_load_path = self._adapter_coordinator.auto_load_if_evicted(
+            model_id,
+            allow_fresh_materialization=False,
+        )
+        result = self.trainer.apply_zorl_rewards(
+            model_id=model_id,
+            generation_id=p.generation_id,
+            candidate_rewards=p.candidate_rewards,
+            learning_rate=p.learning_rate,
+        )
+        if was_auto_loaded and self.rank == 0:
+            result["auto_loaded"] = True
+            result["auto_load_path"] = auto_load_path
+        return result if self.rank == 0 else {}
+
+    async def _handle_abort_zorl_generation(self, command_dict: Dict[str, Any]) -> Dict[str, Any]:
+        p: ZORLAbortGenerationData = command_dict.get("payload", ZORLAbortGenerationData())
+        result = self.trainer.abort_zorl_generation(
+            model_id=p.model_id or "default",
+            generation_id=p.generation_id,
+        )
+        return result if self.rank == 0 else {}
+
+    async def _handle_reset_zorl_session(self, command_dict: Dict[str, Any]) -> Dict[str, Any]:
+        p: ZORLResetSessionData = command_dict.get("payload", ZORLResetSessionData())
+        model_id = p.model_id or "default"
+        self._adapter_coordinator.auto_load_if_evicted(model_id, allow_fresh_materialization=False)
+        result = self.trainer.reset_zorl_session(
+            model_id=model_id,
+            checkpoint_path=p.checkpoint_path,
+            a_seed=p.a_seed,
+            a_init=p.a_init,
+            zorl_seed=p.zorl_seed,
+        )
+        return result if self.rank == 0 else {}
 
 
 if __name__ == "__main__":

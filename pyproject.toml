@@ -48,6 +48,10 @@ dependencies = [
   "fastapi",
   # P2P / Mooncake weight sync
   "mooncake-transfer-engine==0.3.9",
+  # The Mooncake 0.3.9 Linux wheel links against libcudart.so.12 even when
+  # XoRL's serving environment uses the CUDA 13 PyTorch stack below. SGLang
+  # preloads this packaged compatibility runtime when Mooncake requests it.
+  "nvidia-cuda-runtime-cu12==12.9.79; sys_platform == 'linux' and platform_machine == 'x86_64'",
   "xorl-client @ git+https://github.com/togethercomputer/xorl-client.git@2a3a60a783c98e2a8ff722bad06dab18caee350c",
   # PyTorch 2.11 with its CUDA 13 runtime dependencies. These versions match
   # the checked-in xorl-sglang package metadata, so xorl, xorl-client, and the

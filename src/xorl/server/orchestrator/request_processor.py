@@ -67,6 +67,10 @@ from xorl.server.protocol.operations import (
     SaveLoraOnlyData,
     SaveStateData,
     SyncWeightsData,
+    ZORLAbortGenerationData,
+    ZORLApplyRewardsData,
+    ZORLResetSessionData,
+    ZORLStartGenerationData,
 )
 from xorl.server.runner.utils import batch_packed_rows
 from xorl.server.side_payloads import (
@@ -1243,6 +1247,7 @@ class RequestProcessor:
                 beta2=p.beta2,
                 eps=p.eps,
                 model_id=p.model_id,
+                sparse_delta_capture=p.sparse_delta_capture,
                 request_id=request.request_id,
             ),
             OutputType.OPTIM_STEP,
@@ -1261,6 +1266,74 @@ class RequestProcessor:
                 request_id=request.request_id,
             ),
             OutputType.ABORT_GRADIENT_EPOCH,
+            lambda result: [result],
+        )
+
+    async def execute_start_zorl_generation(self, request: OrchestratorRequest) -> OrchestratorOutputs:
+        """Execute ZORL generation planning on workers."""
+        p: ZORLStartGenerationData = request.payload
+        return await self._execute_operation(
+            request,
+            "start_zorl_generation",
+            self.backend.start_zorl_generation(
+                model_id=p.model_id,
+                num_pairs=p.num_pairs,
+                pair_seed_specs=p.pair_seed_specs,
+                materialization=p.materialization,
+                owner_url=p.owner_url,
+                request_id=request.request_id,
+            ),
+            OutputType.START_ZORL_GENERATION,
+            lambda result: [result],
+        )
+
+    async def execute_apply_zorl_rewards(self, request: OrchestratorRequest) -> OrchestratorOutputs:
+        """Execute ZORL reward application on workers."""
+        p: ZORLApplyRewardsData = request.payload
+        return await self._execute_operation(
+            request,
+            "apply_zorl_rewards",
+            self.backend.apply_zorl_rewards(
+                model_id=p.model_id,
+                generation_id=p.generation_id,
+                candidate_rewards=p.candidate_rewards,
+                learning_rate=p.learning_rate,
+                request_id=request.request_id,
+            ),
+            OutputType.APPLY_ZORL_REWARDS,
+            lambda result: [result],
+        )
+
+    async def execute_abort_zorl_generation(self, request: OrchestratorRequest) -> OrchestratorOutputs:
+        """Execute ZORL generation abort on workers."""
+        p: ZORLAbortGenerationData = request.payload
+        return await self._execute_operation(
+            request,
+            "abort_zorl_generation",
+            self.backend.abort_zorl_generation(
+                model_id=p.model_id,
+                generation_id=p.generation_id,
+                request_id=request.request_id,
+            ),
+            OutputType.ABORT_ZORL_GENERATION,
+            lambda result: [result],
+        )
+
+    async def execute_reset_zorl_session(self, request: OrchestratorRequest) -> OrchestratorOutputs:
+        """Restore one ZORL session to its configured base checkpoint."""
+        p: ZORLResetSessionData = request.payload
+        return await self._execute_operation(
+            request,
+            "reset_zorl_session",
+            self.backend.reset_zorl_session(
+                model_id=p.model_id,
+                checkpoint_path=p.checkpoint_path,
+                a_seed=p.a_seed,
+                a_init=p.a_init,
+                zorl_seed=p.zorl_seed,
+                request_id=request.request_id,
+            ),
+            OutputType.RESET_ZORL_SESSION,
             lambda result: [result],
         )
 

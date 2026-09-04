@@ -1151,6 +1151,39 @@ class ServerArguments:
     )
 
     # ========================================================================
+    # ZORL Configuration
+    # ========================================================================
+
+    enable_zorl: bool = field(
+        default=False,
+        metadata={"help": "Enable zeroth-order LoRA search metadata and session defaults for server training."},
+    )
+    zorl_b_sigma: float = field(
+        default=0.01,
+        metadata={"help": "Perturbation scale applied to LoRA-B when planning ZORL candidates."},
+    )
+    zorl_num_perturbation_pairs: int = field(
+        default=8,
+        metadata={"help": "Number of perturbation seeds per ZORL generation before antithetic expansion."},
+    )
+    zorl_a_refresh_interval: int = field(
+        default=16,
+        metadata={"help": "Generations between fresh LoRA-A family refreshes. 0 disables auto-refresh."},
+    )
+    zorl_antithetic_sampling: bool = field(
+        default=True,
+        metadata={"help": "Emit both positive and negative perturbations for each ZORL seed."},
+    )
+    zorl_a_init: Literal["gaussian_jl"] = field(
+        default="gaussian_jl",
+        metadata={"help": "Initialization scheme used for fresh ZORL LoRA-A families."},
+    )
+    zorl_seed: Optional[int] = field(
+        default=None,
+        metadata={"help": "Optional base RNG seed for ZORL family refresh and perturbation planning."},
+    )
+
+    # ========================================================================
     # MoE Training Configuration
     # ========================================================================
 
@@ -1335,6 +1368,8 @@ class ServerArguments:
             raise ValueError(f"lora_b_init_std must be nonnegative, got {self.lora_b_init_std}")
         if self.lora_b_init_std and not (self.enable_lora or self.enable_qlora):
             raise ValueError("lora_b_init_std requires LoRA or QLoRA")
+        if self.enable_zorl and not self.enable_lora:
+            raise ValueError("enable_zorl requires enable_lora=True")
         if self.block_fp8_qlora_training:
             from xorl.models.transformers.glm5.exact_lora_contract import (  # noqa: PLC0415
                 glm52_exact_lora_scaling,
@@ -1639,6 +1674,15 @@ class ServerArguments:
                 "merge_lora_interval": self.merge_lora_interval,
                 "reset_optimizer_on_merge": self.reset_optimizer_on_merge,
                 "adapter_state_load_mode": self.adapter_state_load_mode,
+            },
+            "zorl": {
+                "enabled": self.enable_zorl,
+                "b_sigma": self.zorl_b_sigma,
+                "num_perturbation_pairs": self.zorl_num_perturbation_pairs,
+                "a_refresh_interval": self.zorl_a_refresh_interval,
+                "antithetic_sampling": self.zorl_antithetic_sampling,
+                "a_init": self.zorl_a_init,
+                "seed": self.zorl_seed,
             },
         }
         return config

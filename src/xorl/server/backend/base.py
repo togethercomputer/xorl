@@ -59,6 +59,7 @@ class Backend(ABC):
         beta2: Optional[float] = None,
         eps: Optional[float] = None,
         model_id: Optional[str] = None,
+        sparse_delta_capture: Optional[Dict[str, Any]] = None,
         request_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Optimizer step. Returns {grad_norm, step, ...}."""
@@ -203,6 +204,50 @@ class Backend(ABC):
         request_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Kill training session. Returns {success, message, checkpoint_path, ...}."""
+
+    @abstractmethod
+    async def start_zorl_generation(
+        self,
+        model_id: str = "default",
+        num_pairs: Optional[int] = None,
+        pair_seed_specs: Optional[List[Dict[str, Optional[int]]]] = None,
+        materialization: Optional[Dict[str, Any]] = None,
+        owner_url: Optional[str] = None,
+        request_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Plan and export one ZORL generation."""
+
+    @abstractmethod
+    async def apply_zorl_rewards(
+        self,
+        model_id: str = "default",
+        generation_id: str = "",
+        candidate_rewards: Optional[List[Dict[str, Any]]] = None,
+        learning_rate: Optional[float] = None,
+        request_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Apply externally aggregated ZORL rewards."""
+
+    @abstractmethod
+    async def abort_zorl_generation(
+        self,
+        model_id: str = "default",
+        generation_id: str = "",
+        request_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Abort an active ZORL generation."""
+
+    @abstractmethod
+    async def reset_zorl_session(
+        self,
+        model_id: str = "default",
+        checkpoint_path: Optional[str] = None,
+        a_seed: int = 0,
+        a_init: str = "gaussian_jl",
+        zorl_seed: Optional[int] = None,
+        request_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Restore the configured base and reset a ZORL session."""
 
     @abstractmethod
     async def health_check(self, request_id: Optional[str] = None) -> Dict[str, Any]:

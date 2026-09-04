@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
+import os
 import time
 from typing import Any, Dict, Optional
 
@@ -13,6 +15,7 @@ from xorl.server.api_server.api_types import (
     AbortGradientEpochRequest,
     AbortGradientEpochResponse,
     AdamParams,
+    CreateSamplingSessionRequest,
     ForwardBackwardRequest,
     ForwardBackwardResponse,
     ForwardRequest,
@@ -24,8 +27,18 @@ from xorl.server.api_server.api_types import (
     RequestFailedResponse,
     SaveWeightsForSamplerRequest,
     SaveWeightsRequest,
+    SyncInferenceWeightsRequest,
     TryAgainResponse,
     UntypedAPIFuture,
+    ZORLAbortGenerationRequest,
+    ZORLAbortGenerationResponse,
+    ZORLApplyRewardsRequest,
+    ZORLApplyRewardsResponse,
+    ZORLCandidateInfo,
+    ZORLResetSessionRequest,
+    ZORLResetSessionResponse,
+    ZORLStartGenerationRequest,
+    ZORLStartGenerationResponse,
 )
 from xorl.server.api_server.future_store import (
     FutureStatus,
@@ -38,6 +51,10 @@ from xorl.server.protocol.operations import (
     AbortGradientEpochData,
     ModelPassData,
     OptimStepData,
+    ZORLAbortGenerationData,
+    ZORLApplyRewardsData,
+    ZORLResetSessionData,
+    ZORLStartGenerationData,
 )
 
 
@@ -246,6 +263,18 @@ class TrainingOpsMixin:
 
     async def submit_abort_gradient_epoch_async(self, request: AbortGradientEpochRequest) -> UntypedAPIFuture:
         return await self._submit_async(request, "abort_gradient_epoch", "abort_gradient_epoch")
+
+    async def submit_start_zorl_generation_async(self, request: ZORLStartGenerationRequest) -> UntypedAPIFuture:
+        return await self._submit_async(request, "start_zorl_generation", "start_zorl_generation")
+
+    async def submit_apply_zorl_rewards_async(self, request: ZORLApplyRewardsRequest) -> UntypedAPIFuture:
+        return await self._submit_async(request, "apply_zorl_rewards", "apply_zorl_rewards")
+
+    async def submit_abort_zorl_generation_async(self, request: ZORLAbortGenerationRequest) -> UntypedAPIFuture:
+        return await self._submit_async(request, "abort_zorl_generation", "abort_zorl_generation")
+
+    async def submit_reset_zorl_session_async(self, request: ZORLResetSessionRequest) -> UntypedAPIFuture:
+        return await self._submit_async(request, "reset_zorl_session", "reset_zorl_session")
 
     async def submit_save_weights_async(self, request: SaveWeightsRequest) -> UntypedAPIFuture:
         return await self._submit_async(request, "save_weights", "save_weights")
@@ -515,6 +544,7 @@ class TrainingOpsMixin:
                     beta2=adam_params.beta2 if adam_params is not None else None,
                     eps=adam_params.eps if adam_params is not None else None,
                     model_id=request.model_id,
+                    sparse_delta_capture=request.sparse_delta_capture,
                 ),
                 seq_id=request.seq_id,
             )
@@ -606,3 +636,356 @@ class TrainingOpsMixin:
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Gradient epoch abort failed; see server logs for the request ID",
             ) from e
+    def _zorl_candidate_uri(self, model_id: str, candidate_path: str) -> tuple[str, str]:
+        """Convert a worker-exported candidate path into a public sampler URI."""
+        sampler_root = os.path.abspath(os.path.join(self.output_dir, "sampler_weights"))
+        absolute_candidate_path = os.path.abspath(candidate_path)
+        if not (absolute_candidate_path == sampler_root or absolute_candidate_path.startswith(sampler_root + os.sep)):
+            raise ValueError(f"ZORL candidate path {candidate_path!r} is outside sampler_weights root {sampler_root!r}")
+
+        lora_name = os.path.relpath(absolute_candidate_path, sampler_root)
+        return self._to_xorl_uri(model_id, lora_name, "sampler_weights"), lora_name
+
+    def _zorl_generation_lora_names(self, *, model_id: str, generation_id: str) -> list[str]:
+        """Return tracked sampling adapters belonging to one ZORL generation."""
+        generation_prefix = f"zorl/{generation_id}/"
+        return [
+            str(lora_name)
+            for lora_name, _lora_path in self.loaded_sampling_loras.get(model_id, [])
+            if str(lora_name).startswith(generation_prefix)
+        ]
+
+    async def _cleanup_zorl_generation_sampling(self, *, model_id: str, generation_id: str) -> int:
+        """Best-effort unload of tracked inference adapters for one ZORL generation.
+
+        Holds the per-model_id sampling-loras lock across both the unload
+        awaits and the dict mutation. Without the lock, a concurrent
+        start_zorl_generation / cleanup on the same model_id could read the
+        same `loaded_sampling_loras[model_id]` list, produce two divergent
+        filtered lists, and have one overwrite the other — silently leaking
+        SGLang adapter slots.
+        """
+        lock = self._sampling_loras_locks.setdefault(model_id, asyncio.Lock())
+        async with lock:
+            generation_lora_names = self._zorl_generation_lora_names(model_id=model_id, generation_id=generation_id)
+            if not generation_lora_names:
+                return 0
+
+            for lora_name in generation_lora_names:
+                try:
+                    await self._unload_lora_on_inference_endpoints(lora_name)
+                except Exception as unload_error:
+                    logger.warning(f"Failed to unload ZORL adapter {lora_name}: {unload_error}")
+
+            tracked_lookup = set(generation_lora_names)
+            tracked_adapters = self.loaded_sampling_loras.get(model_id)
+            if tracked_adapters is not None:
+                self.loaded_sampling_loras[model_id] = [
+                    (lora_name, lora_path)
+                    for lora_name, lora_path in tracked_adapters
+                    if lora_name not in tracked_lookup
+                ]
+
+            return len(generation_lora_names)
+
+    async def _preload_zorl_candidates(
+        self,
+        *,
+        model_id: str,
+        candidates: list[ZORLCandidateInfo],
+    ) -> bool:
+        """Best-effort preload of candidate adapters onto registered inference endpoints."""
+        if not self.inference_endpoints:
+            return False
+
+        loaded_names: list[str] = []
+        try:
+            for candidate in candidates:
+                await self.create_sampling_session(
+                    CreateSamplingSessionRequest(
+                        model_id=model_id,
+                        model_path=candidate.model_path,
+                    )
+                )
+                loaded_names.append(candidate.lora_name)
+        except Exception:
+            for lora_name in reversed(loaded_names):
+                try:
+                    await self._unload_lora_on_inference_endpoints(lora_name)
+                except Exception as unload_error:
+                    logger.warning(f"Failed to unload preloaded ZORL adapter {lora_name}: {unload_error}")
+            raise
+
+        return True
+
+    async def start_zorl_generation(self, request: ZORLStartGenerationRequest) -> ZORLStartGenerationResponse:
+        """Plan and export one ZORL generation."""
+        self._require_engine()
+
+        try:
+            engine_request = OrchestratorRequest(
+                operation="start_zorl_generation",
+                payload=ZORLStartGenerationData(
+                    model_id=request.model_id,
+                    num_pairs=request.num_pairs,
+                    pair_seed_specs=(
+                        [spec.model_dump() for spec in request.pair_seed_specs]
+                        if request.pair_seed_specs is not None
+                        else None
+                    ),
+                    materialization=request.materialization.model_dump(exclude_none=True)
+                    if request.materialization is not None
+                    else None,
+                    owner_url=request.owner_url,
+                ),
+            )
+            response_future = await self.orchestrator_client.send_request(engine_request)
+            output = await self._wait_for_response(
+                response_future,
+                engine_request.request_id,
+                self.default_timeout,
+                "Start ZORL generation timeout",
+            )
+            result = _sanitize_nan_to_zero(output.outputs[0] if output.outputs else {})
+
+            candidates: list[ZORLCandidateInfo] = []
+            for candidate in result.get("candidates", []):
+                candidate_path = candidate.get("path")
+                if candidate_path:
+                    model_path, lora_name = self._zorl_candidate_uri(request.model_id, candidate_path)
+                else:
+                    # Seed-transport ('specs') candidate: no exported adapter.
+                    # The scorer registers/serves it under its candidate_id.
+                    model_path, lora_name = None, str(candidate["candidate_id"])
+                candidates.append(
+                    ZORLCandidateInfo(
+                        candidate_id=str(candidate["candidate_id"]),
+                        perturbation_index=int(candidate["perturbation_index"]),
+                        direction=str(candidate["direction"]),
+                        model_path=model_path,
+                        lora_name=lora_name,
+                        owner_url=candidate.get("owner_url") or request.owner_url,
+                        b_seed=candidate.get("b_seed"),
+                        a_seed=candidate.get("a_seed"),
+                        b_sigma=candidate.get("b_sigma", result.get("b_sigma")),
+                        perturbation_mode=candidate.get(
+                            "perturbation_mode", result.get("perturbation_mode")
+                        ),
+                        rank=candidate.get("rank", result.get("lora_rank")),
+                    )
+                )
+
+            sampling_ready = False
+            if request.preload_sampling:
+                if any(candidate.model_path is None for candidate in candidates):
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=(
+                            "preload_sampling=True is incompatible with materialization mode "
+                            "'specs' (no candidate adapters are exported; the driver posts the "
+                            "specs to the scorer replicas instead)"
+                        ),
+                    )
+                sampling_ready = await self._preload_zorl_candidates(model_id=request.model_id, candidates=candidates)
+
+            return ZORLStartGenerationResponse(
+                model_id=str(result["model_id"]),
+                generation_id=str(result["generation_id"]),
+                generation_index=int(result["generation_index"]),
+                family_id=str(result["family_id"]),
+                family_refreshed=bool(result["family_refreshed"]),
+                b_sigma=float(result["b_sigma"]),
+                num_pairs=int(result["num_pairs"]),
+                global_num_pairs=int(result.get("global_num_pairs", result["num_pairs"])),
+                global_population=int(result.get("global_population", len(candidates))),
+                shard_index=result.get("shard_index"),
+                num_shards=result.get("num_shards"),
+                local_num_pairs=result.get("local_num_pairs"),
+                sampling_ready=sampling_ready,
+                perturbation_mode=result.get("perturbation_mode"),
+                lora_rank=result.get("lora_rank"),
+                parent_path=result.get("parent_path"),
+                candidates=candidates,
+            )
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Start ZORL generation failed: {e}", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Start ZORL generation failed: {e}",
+            )
+
+    async def apply_zorl_rewards(self, request: ZORLApplyRewardsRequest) -> ZORLApplyRewardsResponse:
+        """Apply externally aggregated ZORL rewards to the parent adapter."""
+        self._require_engine()
+
+        try:
+            engine_request = OrchestratorRequest(
+                operation="apply_zorl_rewards",
+                payload=ZORLApplyRewardsData(
+                    model_id=request.model_id,
+                    generation_id=request.generation_id,
+                    candidate_rewards=[item.model_dump(exclude_none=True) for item in request.candidate_rewards],
+                    learning_rate=request.learning_rate,
+                ),
+            )
+            response_future = await self.orchestrator_client.send_request(engine_request)
+            output = await self._wait_for_response(
+                response_future,
+                engine_request.request_id,
+                self.default_timeout,
+                "Apply ZORL rewards timeout",
+            )
+            result = _sanitize_nan_to_zero(output.outputs[0] if output.outputs else {})
+            await self._cleanup_zorl_generation_sampling(model_id=request.model_id, generation_id=request.generation_id)
+            response = ZORLApplyRewardsResponse(**result)
+            if request.sync_after_apply:
+                response.sync = await self._sync_inference_weights_for_zorl_parent(request)
+            return response
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Apply ZORL rewards failed: {e}", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Apply ZORL rewards failed: {e}",
+            )
+
+    async def _sync_inference_weights_for_zorl_parent(
+        self, request: ZORLApplyRewardsRequest | ZORLResetSessionRequest
+    ) -> Dict[str, Any]:
+        """Push a post-apply or restored parent to registered inference endpoints.
+
+        Reuses the exact /api/v1/sync_inference_weights machinery (endpoint
+        registry, quantization normalization incl. trainer-side block-FP8,
+        cache invalidation). This exists for perturbation_mode='fresh_ab',
+        where the ES update is folded into the BASE weights so the served
+        base on every replica is stale after an apply. Failures are reported
+        in the returned summary instead of raising: the trainer update has
+        already been committed and must not be reported as failed.
+        """
+        # ZORL fresh_ab folds the ES update into ONLY LoRA-target base weights
+        # (attention q/k/v/o + MoE experts gate_up/down; see
+        # ModelRunner._resolve_zorl_fresh_ab_base_params and
+        # _resolve_lora_target_modules) -- it never touches the MTP/next-token
+        # head. The scorer replicas that receive this sync do not run
+        # speculative decoding, so their MTP head is never consumed. Both
+        # conditions that the receiver-MTP low-precision guard protects against
+        # therefore do not hold here, so we assert the MTP-excluded escape to
+        # let the block-FP8 sync through to MTP-advertising FP8 receivers.
+        # NOTE: if the scorers ever enable speculative decoding, condition (2)
+        # breaks and this escape becomes unsafe -- see the field docs on
+        # SyncInferenceWeightsRequest.allow_mtp_excluded_fp8_sync.
+        sync_kwargs: Dict[str, Any] = {
+            "model_id": request.model_id,
+            "allow_mtp_excluded_fp8_sync": True,
+        }
+        if request.sync_quantization is not None:
+            # "fp8" shorthand -> minimal HF-style quantization_config; dict
+            # payloads pass through to normalize_sync_quantization_config
+            # unchanged (xorl already implements trainer-side block-FP8).
+            if isinstance(request.sync_quantization, str):
+                sync_kwargs["quantization"] = {"quant_method": request.sync_quantization}
+            else:
+                sync_kwargs["quantization"] = dict(request.sync_quantization)
+        try:
+            sync_response = await self.sync_inference_weights(SyncInferenceWeightsRequest(**sync_kwargs))
+            return {
+                "success": bool(sync_response.success),
+                "message": sync_response.message,
+                "transfer_time": sync_response.transfer_time,
+                "total_bytes": sync_response.total_bytes,
+                "num_parameters": sync_response.num_parameters,
+                "num_buckets": sync_response.num_buckets,
+                # Do not collapse a multi-endpoint sync to one aggregate bit. ZORL's
+                # next generation is valid only when every intended scorer
+                # completed and resumed on the newly folded parent.
+                "endpoint_results": [
+                    endpoint.model_dump(exclude_none=True)
+                    for endpoint in sync_response.endpoints_synced
+                ],
+                "timing_breakdown": dict(sync_response.timing_breakdown),
+                "p2p_rank_summaries": list(sync_response.p2p_rank_summaries),
+            }
+        except HTTPException as exc:
+            logger.error(f"Post-apply ZORL weight sync failed: {exc.detail}")
+            return {"success": False, "message": f"Post-apply weight sync failed: {exc.detail}"}
+        except Exception as exc:
+            logger.error(f"Post-apply ZORL weight sync failed: {exc}", exc_info=True)
+            return {"success": False, "message": f"Post-apply weight sync failed: {exc}"}
+
+    async def reset_zorl_session(self, request: ZORLResetSessionRequest) -> ZORLResetSessionResponse:
+        """Restore a fresh parent and receipt-gate synchronization to all samplers."""
+        self._require_engine()
+        if not request.sync_after_reset:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="ZORL reset requires sync_after_reset=true so PS and sampler state cannot diverge silently",
+            )
+
+        try:
+            engine_request = OrchestratorRequest(
+                operation="reset_zorl_session",
+                payload=ZORLResetSessionData(
+                    model_id=request.model_id,
+                    checkpoint_path=request.checkpoint_path,
+                    a_seed=request.a_seed,
+                    a_init=request.a_init,
+                    zorl_seed=request.zorl_seed,
+                ),
+            )
+            response_future = await self.orchestrator_client.send_request(engine_request)
+            output = await self._wait_for_response(
+                response_future,
+                engine_request.request_id,
+                self.default_timeout,
+                "Reset ZORL session timeout",
+            )
+            result = _sanitize_nan_to_zero(output.outputs[0] if output.outputs else {})
+            response = ZORLResetSessionResponse(**result)
+            response.sync = await self._sync_inference_weights_for_zorl_parent(request)
+            response.success = bool(response.success and response.sync.get("success", False))
+            return response
+        except HTTPException:
+            raise
+        except Exception as exc:
+            logger.error("Reset ZORL session failed: %s", exc, exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Reset ZORL session failed: {exc}",
+            )
+
+    async def abort_zorl_generation(self, request: ZORLAbortGenerationRequest) -> ZORLAbortGenerationResponse:
+        """Abort the active ZORL generation without updating the parent adapter."""
+        self._require_engine()
+
+        try:
+            engine_request = OrchestratorRequest(
+                operation="abort_zorl_generation",
+                payload=ZORLAbortGenerationData(
+                    model_id=request.model_id,
+                    generation_id=request.generation_id,
+                ),
+            )
+            response_future = await self.orchestrator_client.send_request(engine_request)
+            output = await self._wait_for_response(
+                response_future,
+                engine_request.request_id,
+                self.default_timeout,
+                "Abort ZORL generation timeout",
+            )
+            result = _sanitize_nan_to_zero(output.outputs[0] if output.outputs else {})
+            await self._cleanup_zorl_generation_sampling(model_id=request.model_id, generation_id=request.generation_id)
+            return ZORLAbortGenerationResponse(**result)
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Abort ZORL generation failed: {e}", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Abort ZORL generation failed: {e}",
+            )
